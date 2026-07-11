@@ -1,0 +1,23 @@
+# Secrets — never commit credentials
+.env
+.env.*
+!.env.example
+
+# Run output — never commit results
+out/
+results/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.yarn/cache/
+.yarn/install-state.gz
+
+# Tooling / editor
+.claude/
+.DS_Store
+Thumbs.db
