@@ -33,7 +33,20 @@ export async function postJson(options: {
         redactSecrets(error instanceof Error ? error.message : String(error)),
       );
     }
-    const text = await response.text();
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
+      // fetch() resolves at headers; the abort timer can fire mid-body-read.
+      if (controller.signal.aborted) {
+        throw new ProviderTimeoutError(options.provider, options.timeoutMs);
+      }
+      throw new ProviderHttpError(
+        options.provider,
+        response.status,
+        `response body read failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+      );
+    }
     if (!response.ok) {
       throw new ProviderHttpError(
         options.provider,

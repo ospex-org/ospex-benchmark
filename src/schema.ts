@@ -260,7 +260,13 @@ export function detectChangedDecisions(
       if (
         prior.selection !== forecast.selection ||
         prior.selectedForExecution !== forecast.selectedForExecution ||
-        prior.wouldAbstain !== forecast.wouldAbstain
+        prior.wouldAbstain !== forecast.wouldAbstain ||
+        prior.line !== forecast.line ||
+        prior.observedDecimal !== forecast.observedDecimal ||
+        prior.confidence !== forecast.confidence ||
+        prior.probabilities.win !== forecast.probabilities.win ||
+        prior.probabilities.push !== forecast.probabilities.push ||
+        prior.probabilities.loss !== forecast.probabilities.loss
       ) {
         changes.push(`changed_decision_after_repair: ${game.gameId} ${forecast.market}`);
       }

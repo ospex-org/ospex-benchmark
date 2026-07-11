@@ -49,48 +49,58 @@ function buildGameBundle(
   if (total.line === null) return { reason: 'missing_line:total' };
 
   const gameId = game.gameId;
-  return {
-    bundle: {
-      gameId,
-      league: 'mlb',
-      scheduledStartUtc: game.matchTime,
-      awayTeam: game.awayTeam.name,
-      homeTeam: game.homeTeam.name,
-      probableStartingPitchers: null,
-      markets: {
-        moneyline: {
-          awayDecimal: americanToDecimal(moneyline.away_odds_american),
-          homeDecimal: americanToDecimal(moneyline.home_odds_american),
-          observedAt: moneyline.upstream_last_updated,
-          evidenceRef: evidenceRef(gameId, 'moneyline'),
+  const spreadLine = spread.line;
+  const totalLine = total.line;
+  try {
+    return {
+      bundle: {
+        gameId,
+        league: 'mlb',
+        scheduledStartUtc: game.matchTime,
+        awayTeam: game.awayTeam.name,
+        homeTeam: game.homeTeam.name,
+        probableStartingPitchers: null,
+        markets: {
+          moneyline: {
+            awayDecimal: americanToDecimal(moneyline.away_odds_american),
+            homeDecimal: americanToDecimal(moneyline.home_odds_american),
+            observedAt: moneyline.upstream_last_updated,
+            evidenceRef: evidenceRef(gameId, 'moneyline'),
+          },
+          runLine: {
+            line: spreadLine,
+            awayHandicap: -spreadLine,
+            homeHandicap: spreadLine,
+            awayDecimal: americanToDecimal(spread.away_odds_american),
+            homeDecimal: americanToDecimal(spread.home_odds_american),
+            observedAt: spread.upstream_last_updated,
+            evidenceRef: evidenceRef(gameId, 'runline'),
+          },
+          total: {
+            line: totalLine,
+            // Upstream storage convention: away column = Over, home column = Under.
+            overDecimal: americanToDecimal(total.away_odds_american),
+            underDecimal: americanToDecimal(total.home_odds_american),
+            observedAt: total.upstream_last_updated,
+            evidenceRef: evidenceRef(gameId, 'total'),
+          },
         },
-        runLine: {
-          line: spread.line,
-          awayHandicap: -spread.line,
-          homeHandicap: spread.line,
-          awayDecimal: americanToDecimal(spread.away_odds_american),
-          homeDecimal: americanToDecimal(spread.home_odds_american),
-          observedAt: spread.upstream_last_updated,
-          evidenceRef: evidenceRef(gameId, 'runline'),
-        },
-        total: {
-          line: total.line,
-          // Upstream storage convention: away column = Over, home column = Under.
-          overDecimal: americanToDecimal(total.away_odds_american),
-          underDecimal: americanToDecimal(total.home_odds_american),
-          observedAt: total.upstream_last_updated,
-          evidenceRef: evidenceRef(gameId, 'total'),
-        },
+        evidenceRefs: [
+          evidenceRef(gameId, 'identity'),
+          evidenceRef(gameId, 'schedule'),
+          evidenceRef(gameId, 'moneyline'),
+          evidenceRef(gameId, 'runline'),
+          evidenceRef(gameId, 'total'),
+        ],
       },
-      evidenceRefs: [
-        evidenceRef(gameId, 'identity'),
-        evidenceRef(gameId, 'schedule'),
-        evidenceRef(gameId, 'moneyline'),
-        evidenceRef(gameId, 'runline'),
-        evidenceRef(gameId, 'total'),
-      ],
-    },
-  };
+    };
+  } catch (error) {
+    // A corrupt upstream price (non-integer, |value| < 100) excludes this one
+    // game rather than aborting the whole slate.
+    return {
+      reason: `invalid_price (${error instanceof Error ? error.message : String(error)})`,
+    };
+  }
 }
 
 export function buildBundle(

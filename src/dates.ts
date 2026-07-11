@@ -21,7 +21,15 @@ export function easternCalendarDay(isoUtc: string): string {
 }
 
 export function isValidSlateDate(value: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [y, m, d] = value.split('-').map((part) => Number.parseInt(part, 10));
+  if (y === undefined || m === undefined || d === undefined) return false;
+  // Round-trip: Date.UTC rolls impossible days forward (Feb 30 → Mar 2),
+  // so the reconstructed components must match the input exactly.
+  const date = new Date(Date.UTC(y, m - 1, d));
+  return (
+    date.getUTCFullYear() === y && date.getUTCMonth() === m - 1 && date.getUTCDate() === d
+  );
 }
 
 /** Tomorrow's date relative to the current moment, as an ET calendar day. */
