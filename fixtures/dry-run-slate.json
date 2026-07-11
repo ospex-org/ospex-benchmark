@@ -1,0 +1,200 @@
+{
+  "note": "Synthetic dry-run fixture. Game IDs are reserved placeholder UUIDs and every price is invented; only the wire SHAPES mirror the real read path (core-api /v1/games rows and PostgREST current_odds rows, including the +00:00 timestamptz form). Game 4 deliberately lacks a total market to exercise the exclusion path.",
+  "games": [
+    {
+      "gameId": "00000000-0000-4000-8000-000000000001",
+      "slug": "mil-pit-2026-07-12",
+      "sport": "mlb",
+      "matchTime": "2026-07-12T16:15:00+00:00",
+      "status": "upcoming",
+      "homeTeam": { "name": "Pittsburgh Pirates", "abbreviation": "PIT" },
+      "awayTeam": { "name": "Milwaukee Brewers", "abbreviation": "MIL" },
+      "hasOdds": true,
+      "contestCreated": false,
+      "contestId": null,
+      "canCreateContest": true,
+      "externalIds": {
+        "jsonodds": "00000000-0000-4000-8000-000000000001",
+        "sportspage": "900001",
+        "rundown": "f0000000000000000000000000000001"
+      }
+    },
+    {
+      "gameId": "00000000-0000-4000-8000-000000000002",
+      "slug": "ari-lad-2026-07-12",
+      "sport": "mlb",
+      "matchTime": "2026-07-12T20:10:00+00:00",
+      "status": "upcoming",
+      "homeTeam": { "name": "Los Angeles Dodgers", "abbreviation": "LAD" },
+      "awayTeam": { "name": "Arizona Diamondbacks", "abbreviation": "ARI" },
+      "hasOdds": true,
+      "contestCreated": false,
+      "contestId": null,
+      "canCreateContest": true,
+      "externalIds": {
+        "jsonodds": "00000000-0000-4000-8000-000000000002",
+        "sportspage": "900002",
+        "rundown": "f0000000000000000000000000000002"
+      }
+    },
+    {
+      "gameId": "00000000-0000-4000-8000-000000000003",
+      "slug": "sea-tb-2026-07-12",
+      "sport": "mlb",
+      "matchTime": "2026-07-12T17:40:00+00:00",
+      "status": "upcoming",
+      "homeTeam": { "name": "Tampa Bay Rays", "abbreviation": "TB" },
+      "awayTeam": { "name": "Seattle Mariners", "abbreviation": "SEA" },
+      "hasOdds": true,
+      "contestCreated": false,
+      "contestId": null,
+      "canCreateContest": true,
+      "externalIds": {
+        "jsonodds": "00000000-0000-4000-8000-000000000003",
+        "sportspage": "900003",
+        "rundown": "f0000000000000000000000000000003"
+      }
+    },
+    {
+      "gameId": "00000000-0000-4000-8000-000000000004",
+      "slug": "kc-bal-2026-07-12",
+      "sport": "mlb",
+      "matchTime": "2026-07-12T17:35:00+00:00",
+      "status": "upcoming",
+      "homeTeam": { "name": "Baltimore Orioles", "abbreviation": "BAL" },
+      "awayTeam": { "name": "Kansas City Royals", "abbreviation": "KC" },
+      "hasOdds": true,
+      "contestCreated": false,
+      "contestId": null,
+      "canCreateContest": true,
+      "externalIds": {
+        "jsonodds": "00000000-0000-4000-8000-000000000004",
+        "sportspage": "900004",
+        "rundown": "f0000000000000000000000000000004"
+      }
+    }
+  ],
+  "currentOdds": [
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000001",
+      "market": "moneyline",
+      "line": null,
+      "away_odds_american": -134,
+      "home_odds_american": 117,
+      "upstream_last_updated": "2026-07-12T14:02:11+00:00",
+      "poll_captured_at": "2026-07-12T14:02:41.512345+00:00",
+      "changed_at": "2026-07-12T13:44:02.117+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000001",
+      "market": "spread",
+      "line": 1.5,
+      "away_odds_american": 130,
+      "home_odds_american": -150,
+      "upstream_last_updated": "2026-07-12T14:02:11+00:00",
+      "poll_captured_at": "2026-07-12T14:02:41.512345+00:00",
+      "changed_at": "2026-07-12T12:31:55+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000001",
+      "market": "total",
+      "line": 6.5,
+      "away_odds_american": -115,
+      "home_odds_american": -105,
+      "upstream_last_updated": "2026-07-12T14:02:11+00:00",
+      "poll_captured_at": "2026-07-12T14:02:41.512345+00:00",
+      "changed_at": "2026-07-12T11:20:00+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000002",
+      "market": "moneyline",
+      "line": null,
+      "away_odds_american": 170,
+      "home_odds_american": -199,
+      "upstream_last_updated": "2026-07-12T14:03:09+00:00",
+      "poll_captured_at": "2026-07-12T14:03:41.812+00:00",
+      "changed_at": "2026-07-12T13:58:31+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000002",
+      "market": "spread",
+      "line": -1.5,
+      "away_odds_american": -120,
+      "home_odds_american": -100,
+      "upstream_last_updated": "2026-07-12T14:03:09+00:00",
+      "poll_captured_at": "2026-07-12T14:03:41.812+00:00",
+      "changed_at": "2026-07-12T13:58:31+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000002",
+      "market": "total",
+      "line": 9.5,
+      "away_odds_american": -112,
+      "home_odds_american": -107,
+      "upstream_last_updated": "2026-07-12T14:03:09+00:00",
+      "poll_captured_at": "2026-07-12T14:03:41.812+00:00",
+      "changed_at": "2026-07-12T13:10:12+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000003",
+      "market": "moneyline",
+      "line": null,
+      "away_odds_american": -110,
+      "home_odds_american": -110,
+      "upstream_last_updated": "2026-07-12T14:01:47+00:00",
+      "poll_captured_at": "2026-07-12T14:02:41.09+00:00",
+      "changed_at": "2026-07-12T13:40:40+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000003",
+      "market": "spread",
+      "line": -1.5,
+      "away_odds_american": -220,
+      "home_odds_american": 185,
+      "upstream_last_updated": "2026-07-12T14:01:47+00:00",
+      "poll_captured_at": "2026-07-12T14:02:41.09+00:00",
+      "changed_at": "2026-07-12T13:40:40+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000003",
+      "market": "total",
+      "line": 8,
+      "away_odds_american": -107,
+      "home_odds_american": -112,
+      "upstream_last_updated": "2026-07-12T14:01:47+00:00",
+      "poll_captured_at": "2026-07-12T14:02:41.09+00:00",
+      "changed_at": "2026-07-12T12:55:21+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000004",
+      "market": "moneyline",
+      "line": null,
+      "away_odds_american": 145,
+      "home_odds_american": -165,
+      "upstream_last_updated": "2026-07-12T14:00:30+00:00",
+      "poll_captured_at": "2026-07-12T14:00:41.7+00:00",
+      "changed_at": "2026-07-12T13:12:09+00:00"
+    },
+    {
+      "network": "polygon",
+      "jsonodds_id": "00000000-0000-4000-8000-000000000004",
+      "market": "spread",
+      "line": -1.5,
+      "away_odds_american": -155,
+      "home_odds_american": 130,
+      "upstream_last_updated": "2026-07-12T14:00:30+00:00",
+      "poll_captured_at": "2026-07-12T14:00:41.7+00:00",
+      "changed_at": "2026-07-12T13:12:09+00:00"
+    }
+  ]
+}
