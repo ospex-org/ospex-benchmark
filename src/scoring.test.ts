@@ -113,8 +113,16 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
       gameId: game.gameId,
       requestSha256: request.requestSha256,
       outcome: 'valid',
+      cutoffAt: request.requestBundle.cutoffAt,
       repairUsed: false,
-      attempt: { reportedModelId: 'stub-model-1', providerResponseId: 'resp-1', rawResponse },
+      attempt: {
+        reportedModelId: 'stub-model-1',
+        providerResponseId: 'resp-1',
+        rawResponse,
+        requestAt: '2026-07-12T14:07:00.001Z',
+        responseAt: '2026-07-12T14:07:00.055Z',
+        latencyMs: 54,
+      },
       repair: null,
     });
     armResponseCount += 1;
@@ -130,8 +138,16 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
         gameId: game.gameId,
         requestSha256: request.requestSha256,
         outcome: options.extraArm.outcome,
+        cutoffAt: request.requestBundle.cutoffAt,
         repairUsed: false,
-        attempt: { reportedModelId: null, providerResponseId: null, rawResponse: null },
+        attempt: {
+          reportedModelId: null,
+          providerResponseId: null,
+          rawResponse: null,
+          requestAt: '2026-07-12T14:07:00.001Z',
+          responseAt: '2026-07-12T14:07:02.001Z',
+          latencyMs: 2000,
+        },
         repair: null,
       });
       armResponseCount += 1;
@@ -552,6 +568,75 @@ test('a record stamped with another run/cohort identity is caught', () => {
   });
   const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('cohortId does not match run_meta')));
+});
+
+test('the round-5 probe: a valid response demoted to cutoff_missed is caught by archived timing', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines
+    .filter((line) => {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      return !(record['recordType'] === 'decision' && record['gameId'] === GAME_A);
+    })
+    .map((line) => {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      if (record['recordType'] === 'arm_game_response' && record['gameId'] === GAME_A) {
+        record['outcome'] = 'cutoff_missed';
+      }
+      return JSON.stringify(record);
+    });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(violations.some((v) => v.includes('cannot be demoted to a timing failure')));
+});
+
+test('the round-5 probe: a valid response whose responseAt is after the cutoff is caught', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as {
+      recordType?: string;
+      gameId?: string;
+      attempt?: { requestAt?: string; responseAt?: string; latencyMs?: number };
+    };
+    if (record.recordType === 'arm_game_response' && record.gameId === GAME_A && record.attempt) {
+      // One second past this game's 16:15:00Z cutoff, latency kept consistent.
+      record.attempt.requestAt = '2026-07-12T16:14:59.000Z';
+      record.attempt.responseAt = '2026-07-12T16:15:01.000Z';
+      record.attempt.latencyMs = 2000;
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(violations.some((v) => v.includes('at or after the decision cutoff')));
+});
+
+test('the round-5 probe: inconsistent latency or a foreign cutoff on a response is caught', () => {
+  const { lines } = fixtureRun();
+  const badLatency = lines.map((line) => {
+    const record = JSON.parse(line) as {
+      recordType?: string;
+      gameId?: string;
+      attempt?: { latencyMs?: number };
+    };
+    if (record.recordType === 'arm_game_response' && record.gameId === GAME_A && record.attempt) {
+      record.attempt.latencyMs = 9999;
+    }
+    return JSON.stringify(record);
+  });
+  const latencyViolations = verifyRunIntegrity(parseRunRecords(badLatency), {
+    expectedArms: FIXTURE_ARMS,
+  });
+  assert.ok(latencyViolations.some((v) => v.includes('latencyMs does not equal')));
+
+  const badCutoff = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (record['recordType'] === 'arm_game_response' && record['gameId'] === GAME_A) {
+      record['cutoffAt'] = '2026-07-12T23:59:00+00:00';
+    }
+    return JSON.stringify(record);
+  });
+  const cutoffViolations = verifyRunIntegrity(parseRunRecords(badCutoff), {
+    expectedArms: FIXTURE_ARMS,
+  });
+  assert.ok(cutoffViolations.some((v) => v.includes('does not match the hash-verified game cutoff')));
 });
 
 test('parseRunRecords fails loudly without run_meta', () => {

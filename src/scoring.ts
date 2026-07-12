@@ -88,6 +88,9 @@ const attemptFieldsSchema = z
     reportedModelId: z.string().nullable(),
     providerResponseId: z.string().nullable(),
     rawResponse: z.string().nullable(),
+    requestAt: z.string().nullable(),
+    responseAt: z.string().nullable(),
+    latencyMs: z.number().nullable(),
   })
   .passthrough();
 
@@ -103,6 +106,7 @@ const armResponseSchema = z
     reportedModelId: z.string().nullable(),
     gameId: z.string().min(1),
     requestSha256: z.string().min(1),
+    cutoffAt: z.string().min(1),
     outcome: z.string().min(1),
     repairUsed: z.boolean(),
     attempt: attemptFieldsSchema,
@@ -209,6 +213,15 @@ export interface SourcePick {
   echoedSlateSha256: string | null;
 }
 
+export interface ArchivedAttempt {
+  reportedModelId: string | null;
+  providerResponseId: string | null;
+  rawResponse: string | null;
+  requestAt: string | null;
+  responseAt: string | null;
+  latencyMs: number | null;
+}
+
 export interface ArmResponseRef {
   participantId: string;
   provider: string;
@@ -217,10 +230,11 @@ export interface ArmResponseRef {
   gameId: string;
   requestSha256: string;
   outcome: string;
+  cutoffAt: string;
   repairUsed: boolean;
   /** Archived attempt evidence — the root of trust for recomputation. */
-  attempt: { reportedModelId: string | null; providerResponseId: string | null; rawResponse: string | null };
-  repair: { reportedModelId: string | null; providerResponseId: string | null; rawResponse: string | null } | null;
+  attempt: ArchivedAttempt;
+  repair: ArchivedAttempt | null;
   /** The ACCEPTED attempt (repair when a repair was used). */
   accepted: {
     reportedModelId: string | null;
@@ -330,11 +344,15 @@ export function parseRunRecords(lines: string[]): SourceRun {
           gameId: response.gameId,
           requestSha256: response.requestSha256,
           outcome: response.outcome,
+          cutoffAt: response.cutoffAt,
           repairUsed: response.repairUsed,
           attempt: {
             reportedModelId: response.attempt.reportedModelId,
             providerResponseId: response.attempt.providerResponseId,
             rawResponse: response.attempt.rawResponse,
+            requestAt: response.attempt.requestAt,
+            responseAt: response.attempt.responseAt,
+            latencyMs: response.attempt.latencyMs,
           },
           repair:
             response.repair === null
@@ -343,6 +361,9 @@ export function parseRunRecords(lines: string[]): SourceRun {
                   reportedModelId: response.repair.reportedModelId,
                   providerResponseId: response.repair.providerResponseId,
                   rawResponse: response.repair.rawResponse,
+                  requestAt: response.repair.requestAt,
+                  responseAt: response.repair.responseAt,
+                  latencyMs: response.repair.latencyMs,
                 },
           accepted: {
             reportedModelId: accepted.reportedModelId,
@@ -829,6 +850,31 @@ export function verifyRunIntegrity(
     }
   }
 
+  // Timing evidence is archived and therefore verified: each response's
+  // cutoff must equal the hash-verified game cutoff, and an attempt's
+  // timestamps must be parseable, ordered, latency-consistent, and (for
+  // accepted work) strictly before the cutoff.
+  const attemptTimingViolation = (
+    attempt: ArchivedAttempt,
+    cutoffMs: number,
+    label: string,
+  ): string | null => {
+    if (attempt.requestAt === null || attempt.responseAt === null || attempt.latencyMs === null) {
+      return `${label}: archived timing fields are missing`;
+    }
+    const requestMs = Date.parse(attempt.requestAt);
+    const responseMs = Date.parse(attempt.responseAt);
+    if (Number.isNaN(requestMs) || Number.isNaN(responseMs)) {
+      return `${label}: archived timestamps do not parse`;
+    }
+    if (requestMs > responseMs) return `${label}: responseAt precedes requestAt`;
+    if (attempt.latencyMs !== responseMs - requestMs) {
+      return `${label}: latencyMs does not equal the archived timestamp difference`;
+    }
+    if (responseMs >= cutoffMs) return `${label}: response arrived at or after the decision cutoff`;
+    return null;
+  };
+
   // Outcome-class consistency for NON-valid outcomes, mirroring the runner's
   // own rules from the archived attempts — a valid response cannot be demoted
   // to invalid_schema (hiding it from scoring), and transport outcomes cannot
@@ -838,6 +884,19 @@ export function verifyRunIntegrity(
     const requestBundle = requestBundleByGame.get(response.gameId);
     const game = run.games.get(response.gameId);
     if (requestBundle === undefined || game === undefined) continue;
+    if (response.cutoffAt !== game.cutoffAt) {
+      violations.push(`${key}: response cutoffAt does not match the hash-verified game cutoff`);
+      continue;
+    }
+    const cutoffMs = Date.parse(game.cutoffAt);
+    if (response.outcome === 'valid') {
+      const initialTiming = attemptTimingViolation(response.attempt, cutoffMs, `${key} initial attempt`);
+      if (initialTiming !== null) violations.push(initialTiming);
+      if (response.repairUsed && response.repair !== null) {
+        const repairTiming = attemptTimingViolation(response.repair, cutoffMs, `${key} repair attempt`);
+        if (repairTiming !== null) violations.push(repairTiming);
+      }
+    }
     const armSpecForValidation = {
       participantId: response.participantId,
       provider: response.provider,
@@ -899,8 +958,37 @@ export function verifyRunIntegrity(
         violations.push(`${key}: transport outcome ${response.outcome} cannot carry a response body`);
       }
     }
-    // cutoff_missed is timing-based and not recomputable from archives; its
-    // no-decisions invariant is enforced above.
+    else if (response.outcome === 'cutoff_missed') {
+      // A cutoff_missed outcome is legitimate only when the archived
+      // evidence supports it: an initial response that VALIDATES and
+      // demonstrably arrived before the cutoff cannot be demoted to a
+      // timing failure. (Legitimate cases pass: no response at dispatch,
+      // response after cutoff, or an invalid-before-cutoff response whose
+      // repair window closed or whose repair arrived late.)
+      const initialRaw = response.attempt.rawResponse;
+      const responseMs =
+        response.attempt.responseAt === null ? Number.NaN : Date.parse(response.attempt.responseAt);
+      if (initialRaw !== null && !Number.isNaN(responseMs) && responseMs < cutoffMs) {
+        const armSpecForTiming = {
+          participantId: response.participantId,
+          provider: response.provider,
+          requestedModelId: response.requestedModelId,
+          credentialEnvVar: '',
+        } as ArmSpec;
+        const initialValidation = validateResponseText(
+          initialRaw,
+          requestBundle,
+          game.requestSha256,
+          armSpecForTiming,
+          run.cohortId,
+        );
+        if (initialValidation.errors.length === 0) {
+          violations.push(
+            `${key}: recorded cutoff_missed but the archived initial response validates and arrived before the cutoff — a valid response cannot be demoted to a timing failure`,
+          );
+        }
+      }
+    }
   }
 
   // The identity/collision gate is RECOMPUTED from the archived reported
