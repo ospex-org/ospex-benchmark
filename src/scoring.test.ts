@@ -1,70 +1,147 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { canonicalize, sha256Hex } from './canonical.js';
 import {
   aggregateByParticipant,
   parseRunRecords,
   scoredRecords,
   scoreRun,
   sideForSelection,
+  verifyRunIntegrity,
 } from './scoring.js';
+import { makeRequest } from './testFactories.js';
+import type { GameRequest } from './bundle.js';
 import type { ClosingLineRow } from './types.js';
 
-const GAME_ID = '00000000-0000-4000-8000-0000000000s1';
+const GAME_A = '00000000-0000-4000-8000-0000000000a1';
+const GAME_B = '00000000-0000-4000-8000-0000000000b2';
+const LABEL = 'SMOKE_V0_NOT_A_COHORT';
+const BUNDLE_TS = '2026-07-12T14:05:00+00:00';
 
-function runLines(): string[] {
-  const meta = {
+/**
+ * Build a fully consistent run file (real hashes, correct echoes, arm
+ * responses backing every model decision) for the given games. The default
+ * game bundle prices are: ML away 1.74627 / home 2.17; run line +1.5 away
+ * 2.3 / home 1.66667; total 8.5 over 1.90909 / under 1.90909.
+ */
+function fixtureRun(options?: { extraArm?: { participantId: string; outcome: string } }): {
+  lines: string[];
+  requests: GameRequest[];
+  slateSha256: string;
+} {
+  const requests = [
+    makeRequest('2026-07-12T16:15:00+00:00', { gameId: GAME_A }),
+    makeRequest('2026-07-12T20:10:00+00:00', { gameId: GAME_B }),
+  ];
+
+  const slateBundle = {
+    schemaVersion: 1,
+    label: LABEL,
+    league: 'mlb',
+    slateDate: '2026-07-12',
+    bundleTimestamp: BUNDLE_TS,
+    cutoffAt: '2026-07-12T16:15:00+00:00',
+    games: requests.map((r) => r.game).sort((a, b) => (a.gameId < b.gameId ? -1 : 1)),
+  };
+  const slateSha256 = sha256Hex(canonicalize(slateBundle));
+
+  const lines: Array<Record<string, unknown>> = [];
+  lines.push({
     recordType: 'run_meta',
     runId: 'test-run',
     cohortId: 'test-cohort',
-    label: 'SMOKE_V0_NOT_A_COHORT',
+    label: LABEL,
     mode: 'live',
     slateDate: '2026-07-12',
-    slateSha256: 'f'.repeat(64),
-  };
-  const bundleGame = {
-    recordType: 'bundle_game',
-    gameId: GAME_ID,
-    slug: 'mil-pit-2026-07-12',
-    bundle: {
-      gameId: GAME_ID,
-      awayTeam: 'Milwaukee Brewers',
-      homeTeam: 'Pittsburgh Pirates',
-      scheduledStartUtc: '2026-07-12T16:15:00+00:00',
-    },
-  };
-  const decisionBase = {
-    recordType: 'decision',
-    participantId: 'model-arm',
-    gameId: GAME_ID,
-    probabilities: { win: 0.55, push: 0, loss: 0.45 },
-    confidence: 0.6,
-    selectedForExecution: true,
-    wouldAbstain: false,
-  };
-  const decisions = [
-    { ...decisionBase, market: 'moneyline', selection: 'Pittsburgh Pirates', line: null, observedDecimal: 1.8 },
-    { ...decisionBase, market: 'spread', selection: 'Milwaukee Brewers', line: -1.5, observedDecimal: 2.0, selectedForExecution: false },
-    { ...decisionBase, market: 'total', selection: 'over', line: 8, observedDecimal: 1.9 },
-  ];
-  const baseline = {
-    recordType: 'baseline_decision',
-    participantId: 'baseline-away-ml',
-    policyVersion: 'baselines-v0.1.0',
-    gameId: GAME_ID,
-    market: 'moneyline',
-    selection: 'Milwaukee Brewers',
-    line: null,
-    observedDecimal: 2.1,
-  };
-  return [meta, bundleGame, ...decisions, baseline].map((r) => JSON.stringify(r));
+    slateSha256,
+    bundleTimestamp: BUNDLE_TS,
+    slateCutoffAt: '2026-07-12T16:15:00+00:00',
+  });
+
+  for (const request of requests) {
+    const game = request.game;
+    const gameSha256 = sha256Hex(canonicalize(game));
+    lines.push({
+      recordType: 'bundle_game',
+      gameId: game.gameId,
+      slug: request.slug,
+      cutoffAt: request.requestBundle.cutoffAt,
+      gameSha256,
+      requestSha256: request.requestSha256,
+      bundle: game,
+    });
+    lines.push({
+      recordType: 'arm_game_response',
+      participantId: 'model-arm',
+      provider: 'openai',
+      requestedModelId: 'stub-model-1',
+      reportedModelId: 'stub-model-1',
+      gameId: game.gameId,
+      requestSha256: request.requestSha256,
+      outcome: 'valid',
+    });
+    if (options?.extraArm) {
+      lines.push({
+        recordType: 'arm_game_response',
+        participantId: options.extraArm.participantId,
+        provider: 'xai',
+        requestedModelId: 'stub-model-2',
+        reportedModelId: null,
+        gameId: game.gameId,
+        requestSha256: request.requestSha256,
+        outcome: options.extraArm.outcome,
+      });
+    }
+    const decisionBase = {
+      recordType: 'decision',
+      participantId: 'model-arm',
+      gameId: game.gameId,
+      probabilities: { win: 0.55, push: 0, loss: 0.45 },
+      confidence: 0.6,
+      selectedForExecution: true,
+      wouldAbstain: false,
+      provider: 'openai',
+      requestedModelId: 'stub-model-1',
+      reportedModelId: 'stub-model-1',
+      providerResponseId: 'resp-1',
+      attemptUsed: 'initial',
+      bundleSha256: request.requestSha256,
+      gameSha256,
+      slateSha256,
+    };
+    lines.push(
+      { ...decisionBase, market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: game.markets.moneyline.homeDecimal },
+      { ...decisionBase, market: 'spread', selection: game.awayTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.awayDecimal, selectedForExecution: false },
+      { ...decisionBase, market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal },
+    );
+    lines.push({
+      recordType: 'baseline_decision',
+      participantId: 'baseline-away-ml',
+      policyVersion: 'baselines-v0.1.0',
+      gameId: game.gameId,
+      market: 'moneyline',
+      selection: game.awayTeam,
+      line: null,
+      observedDecimal: game.markets.moneyline.awayDecimal,
+      slateSha256,
+      gameSha256,
+      requestSha256: request.requestSha256,
+    });
+  }
+
+  return { lines: lines.map((l) => JSON.stringify(l)), requests, slateSha256 };
 }
 
-function closeRow(overrides: Partial<ClosingLineRow>): ClosingLineRow {
+function closeRow(
+  gameId: string,
+  market: 'moneyline' | 'spread' | 'total',
+  overrides: Partial<ClosingLineRow> = {},
+): ClosingLineRow {
   return {
     network: 'polygon',
-    jsonodds_id: GAME_ID,
-    market: 'moneyline',
-    line: null,
+    jsonodds_id: gameId,
+    market,
+    line: market === 'moneyline' ? null : market === 'spread' ? 1.5 : 8.5,
     away_odds_decimal: 2.0,
     home_odds_decimal: 2.0,
     away_p_novig: 0.5,
@@ -79,25 +156,81 @@ function closeRow(overrides: Partial<ClosingLineRow>): ClosingLineRow {
   };
 }
 
-const CLOSES: ClosingLineRow[] = [
-  closeRow({}),
-  // spread closed at a DIFFERENT line: primary unavailable, movement reported
-  closeRow({ market: 'spread', line: -2.5, away_p_novig: 0.45, home_p_novig: 0.55 }),
-  // integer total at the same line: push-capable
-  closeRow({ market: 'total', line: 8 }),
-];
+test('a consistent run file passes integrity verification', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  assert.deepEqual(verifyRunIntegrity(run), []);
+});
 
-test('parseRunRecords extracts meta, games, model decisions, and baselines', () => {
-  const run = parseRunRecords(runLines());
-  assert.equal(run.runId, 'test-run');
-  assert.equal(run.games.size, 1);
-  assert.equal(run.picks.length, 4);
-  assert.equal(run.picks.filter((p) => p.kind === 'model').length, 3);
-  assert.equal(run.picks.filter((p) => p.kind === 'baseline').length, 1);
+test('a run with a recorded run_failure is refused', () => {
+  const { lines } = fixtureRun();
+  lines.push(
+    JSON.stringify({ recordType: 'run_failure', code: 'PROVIDER_COLLISION', failures: ['x'] }),
+  );
+  const violations = verifyRunIntegrity(parseRunRecords(lines));
+  assert.ok(violations.some((v) => v.includes('not scoreable')));
+});
+
+test('the review mutation — a changed entry price with unchanged hashes — is caught', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (record['recordType'] === 'decision' && record['market'] === 'moneyline' && record['gameId'] === GAME_A) {
+      record['observedDecimal'] = 99;
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  assert.ok(violations.some((v) => v.includes('does not match the frozen bundle price')));
+});
+
+test('a tampered bundle is caught by hash recomputation', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as {
+      recordType?: string;
+      gameId?: string;
+      bundle?: { markets: { moneyline: { awayDecimal: number } } };
+    };
+    if (record.recordType === 'bundle_game' && record.gameId === GAME_A && record.bundle) {
+      record.bundle.markets.moneyline.awayDecimal = 9.99;
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  assert.ok(violations.some((v) => v.includes('gameSha256')));
+});
+
+test('a fabricated decision with no backing arm response is caught', () => {
+  const { lines } = fixtureRun();
+  const anyDecision = lines.find(
+    (line) => (JSON.parse(line) as Record<string, unknown>)['recordType'] === 'decision',
+  );
+  assert.ok(anyDecision);
+  const decision = JSON.parse(anyDecision) as Record<string, unknown>;
+  decision['participantId'] = 'ghost-arm';
+  lines.push(JSON.stringify(decision));
+  const violations = verifyRunIntegrity(parseRunRecords(lines));
+  assert.ok(violations.some((v) => v.includes('no arm_game_response')));
+});
+
+test('a valid arm response with missing decisions is caught, as is a wrong per-market count', () => {
+  const { lines } = fixtureRun();
+  const withoutOneDecision = lines.filter((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    return !(
+      record['recordType'] === 'decision' &&
+      record['gameId'] === GAME_B &&
+      record['market'] === 'total'
+    );
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(withoutOneDecision));
+  assert.ok(violations.some((v) => v.includes('expected exactly one decision per market')));
 });
 
 test('parseRunRecords fails loudly without run_meta', () => {
-  assert.throws(() => parseRunRecords(runLines().slice(1)), /no run_meta/);
+  const { lines } = fixtureRun();
+  assert.throws(() => parseRunRecords(lines.slice(1)), /no run_meta/);
 });
 
 test('sideForSelection maps team names and over/under; rejects unknown labels', () => {
@@ -109,63 +242,74 @@ test('sideForSelection maps team names and over/under; rejects unknown labels', 
   assert.throws(() => sideForSelection('moneyline', 'Chicago Cubs', game), /matches neither/);
 });
 
-test('scoreRun end to end: moneyline scores, moved spread reports movement, integer total is conditional', () => {
-  const run = parseRunRecords(runLines());
-  const scored = scoreRun(run, CLOSES);
-
-  const ml = scored.find((p) => p.kind === 'model' && p.market === 'moneyline');
-  assert.ok(ml);
-  // Home at 1.8 against a 0.5 no-vig close: 100 * (1.8*0.5 - 1) = -10.
-  assert.equal(ml.result.primaryClvPct, -10.0);
-
-  const baseline = scored.find((p) => p.kind === 'baseline');
-  assert.ok(baseline);
-  // Away at 2.1 against 0.5: +5 — baselines score through the same path.
-  assert.equal(baseline.result.primaryClvPct, 5.0);
-
-  const spread = scored.find((p) => p.market === 'spread');
-  assert.ok(spread);
-  assert.equal(spread.result.unscoredReason, 'line_moved');
-  // Selected away (Milwaukee) at +1.5; closed +2.5: unfavorable -1.0.
-  assert.equal(spread.result.lineMovementFavorable, -1.0);
-
-  const total = scored.find((p) => p.market === 'total');
-  assert.ok(total);
-  assert.equal(total.result.unscoredReason, 'push_capable_line');
-  assert.equal(total.result.conditionalClvPct, -5.0);
-});
-
 test('missing close rows are unscored close_missing (pre-lock behavior)', () => {
-  const run = parseRunRecords(runLines());
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
   const scored = scoreRun(run, []);
   assert.ok(scored.every((p) => p.result.unscoredReason === 'close_missing'));
   assert.ok(scored.every((p) => p.result.primaryClvPct === null));
 });
 
-test('aggregateByParticipant: counts, reasons, and models-before-baselines ordering', () => {
-  const run = parseRunRecords(runLines());
-  const stats = aggregateByParticipant(scoreRun(run, CLOSES));
-  assert.equal(stats.length, 2);
+test('equal-weight game-level primary differs from per-pick pooling and is the primary summary', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  // Game A: all three markets close fresh at even no-vig.
+  //   home ML 2.17 @ 0.5  -> +8.5
+  //   away RL 2.3  @ 0.45 -> +3.5
+  //   over  8.5 1.90909 @ 0.5 -> -4.5455
+  //   game A mean = 2.4848
+  // Game B: only the moneyline closes (home 2.17 @ 0.6 -> +30.2).
+  const closes: ClosingLineRow[] = [
+    closeRow(GAME_A, 'moneyline'),
+    closeRow(GAME_A, 'spread', { away_p_novig: 0.45, home_p_novig: 0.55 }),
+    closeRow(GAME_A, 'total'),
+    closeRow(GAME_B, 'moneyline', { away_p_novig: 0.4, home_p_novig: 0.6 }),
+  ];
+  const scored = scoreRun(run, closes);
+  const stats = aggregateByParticipant(scored, run);
   const model = stats.find((s) => s.participantId === 'model-arm');
   assert.ok(model);
-  assert.equal(model.kind, 'model');
-  assert.equal(model.picks, 3);
-  assert.equal(model.primaryScoreable, 1);
-  assert.equal(model.meanClvPct, -10.0);
-  assert.equal(model.beatClosePct, 0);
-  assert.equal(model.conditionalOnly, 1);
-  assert.deepEqual(model.unscoredByReason, { line_moved: 1, push_capable_line: 1 });
-  assert.equal(stats[0]?.kind, 'model');
-  assert.equal(stats[1]?.kind, 'baseline');
+  assert.equal(model.primaryScoreable, 4);
+  assert.equal(model.gamesScoreable, 2);
+  // Primary: (2.4848 + 30.2) / 2 — each game weighs equally.
+  assert.equal(model.gameLevel.meanClvPct, 16.3424);
+  // Secondary per-pick pooling weighs game A 3x: (8.5+3.5-4.5455+30.2)/4.
+  assert.equal(model.perPick.meanClvPct, 9.4136);
+  assert.equal(model.gameLevel.beatClosePct, 100);
 });
 
-test('scoredRecords carry the label, the policy, and one record per pick plus scorecards', () => {
-  const run = parseRunRecords(runLines());
-  const scored = scoreRun(run, CLOSES);
-  const stats = aggregateByParticipant(scored);
+test('arms with zero valid decisions stay in the denominators (no survivor bias)', () => {
+  const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
+  const run = parseRunRecords(lines);
+  assert.deepEqual(verifyRunIntegrity(run), []);
+  const stats = aggregateByParticipant(scoreRun(run, []), run);
+  const timeoutArm = stats.find((s) => s.participantId === 'timeout-arm');
+  assert.ok(timeoutArm);
+  assert.equal(timeoutArm.kind, 'model');
+  assert.equal(timeoutArm.games, 2);
+  assert.equal(timeoutArm.eligibleMarkets, 6);
+  assert.equal(timeoutArm.validDecisions, 0);
+  assert.equal(timeoutArm.primaryScoreable, 0);
+  assert.deepEqual(timeoutArm.armOutcomes, { timeout: 2 });
+});
+
+test('scoredRecords carry provenance (reported model, response id, hashes) and the label', () => {
+  const { lines, slateSha256 } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [closeRow(GAME_A, 'moneyline')]);
+  const stats = aggregateByParticipant(scored, run);
   const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z');
-  assert.equal(records.filter((r) => r['recordType'] === 'scored_run_meta').length, 1);
-  assert.equal(records.filter((r) => r['recordType'] === 'scored_decision').length, 4);
-  assert.equal(records.filter((r) => r['recordType'] === 'participant_scorecard').length, 2);
+  const decisions = records.filter((r) => r['recordType'] === 'scored_decision');
+  assert.equal(decisions.length, 8);
+  const modelDecision = decisions.find((r) => r['kind'] === 'model');
+  assert.ok(modelDecision);
+  assert.equal(modelDecision['reportedModelId'], 'stub-model-1');
+  assert.equal(modelDecision['providerResponseId'], 'resp-1');
+  assert.equal(modelDecision['slateSha256'], slateSha256);
+  assert.ok(typeof modelDecision['gameSha256'] === 'string');
+  assert.ok(typeof modelDecision['requestSha256'] === 'string');
   assert.ok(records.every((r) => r['label'] === 'SMOKE_V0_NOT_A_COHORT'));
+  const meta = records.find((r) => r['recordType'] === 'scored_run_meta');
+  assert.ok(meta);
+  assert.equal(meta['integrityVerified'], true);
 });
