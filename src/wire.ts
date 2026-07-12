@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { CurrentOddsRow, GamesEndpointRow } from './types.js';
+import type { ClosingLineRow, CurrentOddsRow, GamesEndpointRow } from './types.js';
 
 /**
  * Zod validation of the two upstream wire shapes at the decode boundary.
@@ -75,4 +75,27 @@ export function parseGamesBody(body: unknown): {
 
 export function parseCurrentOddsRows(body: unknown): CurrentOddsRow[] {
   return z.array(currentOddsRowSchema).parse(body) as CurrentOddsRow[];
+}
+
+export const closingLineRowSchema = z
+  .object({
+    network: z.string().min(1),
+    jsonodds_id: z.string().min(1),
+    market: z.enum(['moneyline', 'spread', 'total']),
+    line: z.number().nullable(),
+    away_odds_decimal: z.number().nullable(),
+    home_odds_decimal: z.number().nullable(),
+    away_p_novig: z.number().nullable(),
+    home_p_novig: z.number().nullable(),
+    value_captured_at: z.string().nullable(),
+    last_polled_at: z.string().nullable(),
+    lock_time: z.string().min(1),
+    poll_gap_seconds: z.number().nullable(),
+    confidence: z.enum(['fresh', 'stale', 'missing']),
+    source: z.string().min(1),
+  })
+  .passthrough();
+
+export function parseClosingLineRows(body: unknown): ClosingLineRow[] {
+  return z.array(closingLineRowSchema).parse(body) as ClosingLineRow[];
 }

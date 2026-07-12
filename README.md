@@ -92,6 +92,31 @@ Artifact safety: every byte serialized to NDJSON or the summary passes through c
 
 **Store UTC, reason in ET, always.** A slate's date is the US Eastern calendar date of first pitch, and a single MLB slate legitimately spans two UTC dates — so a game's slate day is never derived from a UTC string prefix. The rule lives in one tested module, `src/slateDate.ts`.
 
+## Scoring (reference-closing CLV)
+
+```bash
+yarn score --run out/<runId>.ndjson
+```
+
+Joins a run's frozen decisions (and the deterministic baselines) to the production-captured closes by the verified game/market key and computes **reference-closing CLV** per the methodology: `q_s` is the proportional no-vig closing probability of the selected side, and the primary metric is `100 · (D_e · q_s − 1)` in expected-ROI percentage points — the frozen entry price is never de-vigged. Policy, preregistered in the scored output: `fresh`-confidence closes only; price CLV only at the unchanged line (a moved spread/total reports signed favorable line movement instead of a number — never zero); integer push-capable lines report a separately labeled push-excluded conditional CLV, never pooled into primary. Auxiliary diagnostics (probability-scale movement, raw price ratio) ride along.
+
+**Run integrity comes first — the trust model.** The scorer treats the run file's **archived raw provider responses and frozen bundles as the root of trust**, and re-derives every verdict from them; no recorded verdict, count, or label is trusted on its own. Before scoring, it recomputes every harness acceptance gate and refuses on any violation:
+
+- every game, request, and slate hash recomputed from the embedded bundles;
+- the **full harness validator** re-run on every archived accepted response against its hash-verified request bundle (a recorded `valid` that would not validate, or a valid response demoted to `invalid_schema`, is a violation), including the repair-acceptance rules (initial must fail with a complete fingerprint the accepted repair preserves);
+- every decision re-derived from the accepted response — content and provenance — and backed by exactly one `valid` arm response per game;
+- the six deterministic baselines re-derived via `runBaselines` and compared exactly;
+- the **identity/collision gate recomputed** from the archived reported model IDs and the approved-ID registry — the recomputed failure set must be empty regardless of whether `run_failure` records survive, and any surviving `run_failure` must correspond to a recomputed failure;
+- the frozen arm manifest, manifest counts, uniqueness, cross-products, and per-record run/label/cohort identity all enforced.
+
+What this cannot detect, by design: a forger who consistently rewrites the archived raw responses themselves (and the frozen bundles, and their hashes) is fabricating the primary evidence — no self-contained file format can distinguish that without provider-signed responses. The archived artifacts are the stated trust boundary.
+
+**Coverage keeps failures in the denominators.** Every dispatched arm appears in the scorecard with its outcome counts (valid/timeout/rate-limited/…), eligible market count, and valid-decision count — an arm that timed out on every game still shows `0/N`, never vanishes. The **primary summary is the equal-weight game-level aggregate** (per-game mean CLV, averaged across games) per the methodology; per-pick pooling and market-stratified numbers are reported as secondary.
+
+Output: `<runId>-scored.ndjson` (per-pick `scored_decision` records with full provenance — reported model IDs, response IDs, all three hashes — plus per-participant scorecards) and `<runId>-scorecard.md`, both in the run's directory (gitignored). Run it any time after the slate locks — before lock, every pick reports `close_missing` and the scorer says so. Decision CLV only: nothing here measures execution. This is a single reference source, so the metric is always labeled reference-closing CLV, not a market consensus.
+
+Requires only `SUPABASE_URL` + `SUPABASE_ANON_KEY` (the same public read-only anon key).
+
 ## Secrets discipline
 
 This repo is public. Credentials are read from environment variables only — never from a file in the repo. `.env.example` lists variable names with empty values. Nothing in this codebase prints, logs, or serializes a credential, and run output is gitignored.

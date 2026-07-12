@@ -62,8 +62,11 @@ export function makeGameBundle(overrides: Partial<GameBundle> = {}): GameBundle 
   };
 }
 
-export function makeRequest(cutoffAt = '2026-07-12T16:15:00+00:00'): GameRequest {
-  const game = makeGameBundle({ scheduledStartUtc: cutoffAt });
+export function makeRequest(
+  cutoffAt = '2026-07-12T16:15:00+00:00',
+  overrides: Partial<GameBundle> = {},
+): GameRequest {
+  const game = makeGameBundle({ scheduledStartUtc: cutoffAt, ...overrides });
   const requestBundle: SlateBundle = {
     schemaVersion: 1,
     label: SMOKE_LABEL,

@@ -1,0 +1,1410 @@
+import { z } from 'zod';
+import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
+import { canonicalize, sha256Hex } from './canonical.js';
+import { scoreDecision } from './clv.js';
+import { checkProviderCollision } from './providers/family.js';
+import { approvedReportedModelIds, ARMS } from './providers/index.js';
+import {
+  benchmarkResponseSchema,
+  compareFingerprints,
+  extractDecisionFingerprint,
+  extractJson,
+  fingerprintFromParsed,
+  validateResponseText,
+} from './schema.js';
+import { SMOKE_LABEL } from './types.js';
+import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
+import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } from './types.js';
+
+/**
+ * Pure scoring assembly, no I/O: parse a run's records, VERIFY THE RUN'S
+ * INTEGRITY (recomputed hashes, decision echoes, decision-to-response
+ * linkage, absence of recorded run failures), join picks to the captured
+ * closes, score each through the CLV module, and aggregate with full
+ * coverage accounting — the equal-weight game-level aggregate is the primary
+ * summary per the methodology, and arms that produced no valid decision
+ * still appear in the denominators. The CLI wraps this with file reading and
+ * the close fetch.
+ */
+
+// ---------------------------------------------------------------------------
+// Source-run parsing (the harness's own NDJSON records)
+// ---------------------------------------------------------------------------
+
+const runMetaSchema = z
+  .object({
+    recordType: z.literal('run_meta'),
+    runId: z.string().min(1),
+    cohortId: z.string().min(1),
+    label: z.string().min(1),
+    mode: z.string().min(1),
+    slateDate: z.string().min(1),
+    slateSha256: z.string().min(1),
+    bundleTimestamp: z.string().min(1),
+    slateCutoffAt: z.string().min(1),
+    eligibleGames: z.number().int().nonnegative(),
+    armGameResults: z.number().int().nonnegative(),
+    baselineDecisionCount: z.number().int().nonnegative(),
+  })
+  .passthrough();
+
+const bundleGameSchema = z
+  .object({
+    recordType: z.literal('bundle_game'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    gameId: z.string().min(1),
+    slug: z.string().min(1),
+    cutoffAt: z.string().min(1),
+    gameSha256: z.string().min(1),
+    requestSha256: z.string().min(1),
+    bundle: z
+      .object({
+        gameId: z.string().min(1),
+        league: z.string().min(1),
+        awayTeam: z.string().min(1),
+        homeTeam: z.string().min(1),
+        scheduledStartUtc: z.string().min(1),
+        markets: z
+          .object({
+            moneyline: z
+              .object({ awayDecimal: z.number(), homeDecimal: z.number() })
+              .passthrough(),
+            runLine: z
+              .object({ line: z.number(), awayDecimal: z.number(), homeDecimal: z.number() })
+              .passthrough(),
+            total: z
+              .object({ line: z.number(), overDecimal: z.number(), underDecimal: z.number() })
+              .passthrough(),
+          })
+          .passthrough(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const attemptFieldsSchema = z
+  .object({
+    reportedModelId: z.string().nullable(),
+    providerResponseId: z.string().nullable(),
+    rawResponse: z.string().nullable(),
+    requestAt: z.string().nullable(),
+    responseAt: z.string().nullable(),
+    latencyMs: z.number().nullable(),
+  })
+  .passthrough();
+
+const armResponseSchema = z
+  .object({
+    recordType: z.literal('arm_game_response'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    cohortId: z.string().min(1),
+    participantId: z.string().min(1),
+    provider: z.string().min(1),
+    requestedModelId: z.string().min(1),
+    reportedModelId: z.string().nullable(),
+    gameId: z.string().min(1),
+    requestSha256: z.string().min(1),
+    cutoffAt: z.string().min(1),
+    outcome: z.string().min(1),
+    repairUsed: z.boolean(),
+    attempt: attemptFieldsSchema,
+    repair: attemptFieldsSchema.nullable(),
+  })
+  .passthrough();
+
+const runFailureSchema = z
+  .object({
+    recordType: z.literal('run_failure'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    code: z.string().min(1),
+    failures: z.array(z.string()),
+  })
+  .passthrough();
+
+const decisionSchema = z
+  .object({
+    recordType: z.literal('decision'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    cohortId: z.string().min(1),
+    participantId: z.string().min(1),
+    gameId: z.string().min(1),
+    market: z.enum(['moneyline', 'spread', 'total']),
+    selection: z.string().min(1),
+    line: z.number().nullable(),
+    observedDecimal: z.number().gt(1),
+    probabilities: z
+      .object({ win: z.number(), push: z.number(), loss: z.number() })
+      .passthrough(),
+    confidence: z.number(),
+    selectedForExecution: z.boolean(),
+    wouldAbstain: z.boolean(),
+    provider: z.string().min(1),
+    requestedModelId: z.string().min(1),
+    reportedModelId: z.string().nullable(),
+    providerResponseId: z.string().nullable(),
+    attemptUsed: z.enum(['initial', 'repair']),
+    bundleSha256: z.string().min(1),
+    gameSha256: z.string().nullable(),
+    slateSha256: z.string().min(1),
+  })
+  .passthrough();
+
+const baselineDecisionSchema = z
+  .object({
+    recordType: z.literal('baseline_decision'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    cohortId: z.string().min(1),
+    participantId: z.string().min(1),
+    gameId: z.string().min(1),
+    market: z.enum(['moneyline', 'spread', 'total']),
+    selection: z.string().min(1),
+    line: z.number().nullable(),
+    observedDecimal: z.number().gt(1),
+    policyVersion: z.string().min(1),
+    slateSha256: z.string().min(1),
+    gameSha256: z.string().nullable(),
+    requestSha256: z.string().nullable(),
+  })
+  .passthrough();
+
+export interface SourceGame {
+  awayTeam: string;
+  homeTeam: string;
+  slug: string;
+  startUtc: string;
+  cutoffAt: string;
+  gameSha256: string;
+  requestSha256: string;
+  /** The bundle exactly as recorded, for hash recomputation. */
+  rawBundle: unknown;
+  prices: {
+    moneyline: { away: number; home: number };
+    runLine: { line: number; away: number; home: number };
+    total: { line: number; over: number; under: number };
+  };
+}
+
+export interface SourcePick {
+  kind: 'model' | 'baseline';
+  participantId: string;
+  gameId: string;
+  market: MarketKey;
+  selection: string;
+  line: number | null;
+  entryDecimal: number;
+  probabilities: { win: number; push: number; loss: number } | null;
+  confidenceValue: number | null;
+  policyVersion: string | null;
+  modelWinProbability: number | null;
+  wouldAbstain: boolean | null;
+  selectedForExecution: boolean | null;
+  provider: string | null;
+  requestedModelId: string | null;
+  reportedModelId: string | null;
+  providerResponseId: string | null;
+  attemptUsed: 'initial' | 'repair' | null;
+  echoedRequestSha256: string | null;
+  echoedGameSha256: string | null;
+  echoedSlateSha256: string | null;
+}
+
+export interface ArchivedAttempt {
+  reportedModelId: string | null;
+  providerResponseId: string | null;
+  rawResponse: string | null;
+  requestAt: string | null;
+  responseAt: string | null;
+  latencyMs: number | null;
+}
+
+export interface ArmResponseRef {
+  participantId: string;
+  provider: string;
+  requestedModelId: string;
+  reportedModelId: string | null;
+  gameId: string;
+  requestSha256: string;
+  outcome: string;
+  cutoffAt: string;
+  repairUsed: boolean;
+  /** Archived attempt evidence — the root of trust for recomputation. */
+  attempt: ArchivedAttempt;
+  repair: ArchivedAttempt | null;
+  /** The ACCEPTED attempt (repair when a repair was used). */
+  accepted: {
+    reportedModelId: string | null;
+    providerResponseId: string | null;
+    rawResponse: string | null;
+  };
+}
+
+export interface SourceRun {
+  runId: string;
+  cohortId: string;
+  label: string;
+  mode: string;
+  slateDate: string;
+  slateSha256: string;
+  bundleTimestamp: string;
+  slateCutoffAt: string;
+  /** Manifest counts recorded by the harness at write time. */
+  eligibleGames: number;
+  armGameResults: number;
+  baselineDecisionCount: number;
+  games: Map<string, SourceGame>;
+  picks: SourcePick[];
+  armResponses: ArmResponseRef[];
+  runFailures: Array<{ code: string; failures: string[] }>;
+  /** Identity stamps of every parsed record, for run/cohort/label checks. */
+  identities: Array<{ ref: string; runId: string; label: string; cohortId: string | null }>;
+}
+
+function parseRecordLine(trimmed: string, lineNumber: number): { recordType?: unknown } {
+  try {
+    return JSON.parse(trimmed) as { recordType?: unknown };
+  } catch {
+    throw new Error(`run file line ${lineNumber} is not valid JSON`);
+  }
+}
+
+export function parseRunRecords(lines: string[]): SourceRun {
+  let meta: z.infer<typeof runMetaSchema> | null = null;
+  const games = new Map<string, SourceGame>();
+  const picks: SourcePick[] = [];
+  const armResponses: ArmResponseRef[] = [];
+  const runFailures: Array<{ code: string; failures: string[] }> = [];
+  const identities: SourceRun['identities'] = [];
+
+  let lineNumber = 0;
+  for (const line of lines) {
+    lineNumber += 1;
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    const record = parseRecordLine(trimmed, lineNumber);
+    switch (record.recordType) {
+      case 'run_meta':
+        if (meta !== null) {
+          throw new Error('run file has more than one run_meta record — identity is ambiguous');
+        }
+        meta = runMetaSchema.parse(record);
+        break;
+      case 'bundle_game': {
+        const game = bundleGameSchema.parse(record);
+        if (games.has(game.gameId)) {
+          throw new Error(`run file has more than one bundle_game record for ${game.gameId}`);
+        }
+        identities.push({ ref: `bundle_game:${game.gameId}`, runId: game.runId, label: game.label, cohortId: null });
+        games.set(game.gameId, {
+          awayTeam: game.bundle.awayTeam,
+          homeTeam: game.bundle.homeTeam,
+          slug: game.slug,
+          startUtc: game.bundle.scheduledStartUtc,
+          cutoffAt: game.cutoffAt,
+          gameSha256: game.gameSha256,
+          requestSha256: game.requestSha256,
+          rawBundle: game.bundle,
+          prices: {
+            moneyline: {
+              away: game.bundle.markets.moneyline.awayDecimal,
+              home: game.bundle.markets.moneyline.homeDecimal,
+            },
+            runLine: {
+              line: game.bundle.markets.runLine.line,
+              away: game.bundle.markets.runLine.awayDecimal,
+              home: game.bundle.markets.runLine.homeDecimal,
+            },
+            total: {
+              line: game.bundle.markets.total.line,
+              over: game.bundle.markets.total.overDecimal,
+              under: game.bundle.markets.total.underDecimal,
+            },
+          },
+        });
+        break;
+      }
+      case 'arm_game_response': {
+        const response = armResponseSchema.parse(record);
+        const accepted = response.repairUsed && response.repair !== null ? response.repair : response.attempt;
+        identities.push({
+          ref: `arm_game_response:${response.participantId}:${response.gameId}`,
+          runId: response.runId,
+          label: response.label,
+          cohortId: response.cohortId,
+        });
+        armResponses.push({
+          participantId: response.participantId,
+          provider: response.provider,
+          requestedModelId: response.requestedModelId,
+          reportedModelId: response.reportedModelId,
+          gameId: response.gameId,
+          requestSha256: response.requestSha256,
+          outcome: response.outcome,
+          cutoffAt: response.cutoffAt,
+          repairUsed: response.repairUsed,
+          attempt: {
+            reportedModelId: response.attempt.reportedModelId,
+            providerResponseId: response.attempt.providerResponseId,
+            rawResponse: response.attempt.rawResponse,
+            requestAt: response.attempt.requestAt,
+            responseAt: response.attempt.responseAt,
+            latencyMs: response.attempt.latencyMs,
+          },
+          repair:
+            response.repair === null
+              ? null
+              : {
+                  reportedModelId: response.repair.reportedModelId,
+                  providerResponseId: response.repair.providerResponseId,
+                  rawResponse: response.repair.rawResponse,
+                  requestAt: response.repair.requestAt,
+                  responseAt: response.repair.responseAt,
+                  latencyMs: response.repair.latencyMs,
+                },
+          accepted: {
+            reportedModelId: accepted.reportedModelId,
+            providerResponseId: accepted.providerResponseId,
+            rawResponse: accepted.rawResponse,
+          },
+        });
+        break;
+      }
+      case 'run_failure': {
+        const failure = runFailureSchema.parse(record);
+        identities.push({ ref: `run_failure:${failure.code}`, runId: failure.runId, label: failure.label, cohortId: null });
+        runFailures.push({ code: failure.code, failures: failure.failures });
+        break;
+      }
+      case 'decision': {
+        const decision = decisionSchema.parse(record);
+        identities.push({
+          ref: `decision:${decision.participantId}:${decision.gameId}:${decision.market}`,
+          runId: decision.runId,
+          label: decision.label,
+          cohortId: decision.cohortId,
+        });
+        picks.push({
+          kind: 'model',
+          participantId: decision.participantId,
+          gameId: decision.gameId,
+          market: decision.market,
+          selection: decision.selection,
+          line: decision.line,
+          entryDecimal: decision.observedDecimal,
+          probabilities: decision.probabilities,
+          confidenceValue: decision.confidence,
+          policyVersion: null,
+          modelWinProbability: decision.probabilities.win,
+          wouldAbstain: decision.wouldAbstain,
+          selectedForExecution: decision.selectedForExecution,
+          provider: decision.provider,
+          requestedModelId: decision.requestedModelId,
+          reportedModelId: decision.reportedModelId,
+          providerResponseId: decision.providerResponseId,
+          attemptUsed: decision.attemptUsed,
+          echoedRequestSha256: decision.bundleSha256,
+          echoedGameSha256: decision.gameSha256,
+          echoedSlateSha256: decision.slateSha256,
+        });
+        break;
+      }
+      case 'baseline_decision': {
+        const baseline = baselineDecisionSchema.parse(record);
+        identities.push({
+          ref: `baseline_decision:${baseline.participantId}:${baseline.gameId}`,
+          runId: baseline.runId,
+          label: baseline.label,
+          cohortId: baseline.cohortId,
+        });
+        picks.push({
+          kind: 'baseline',
+          participantId: baseline.participantId,
+          gameId: baseline.gameId,
+          market: baseline.market,
+          selection: baseline.selection,
+          line: baseline.line,
+          entryDecimal: baseline.observedDecimal,
+          probabilities: null,
+          confidenceValue: null,
+          policyVersion: baseline.policyVersion,
+          modelWinProbability: null,
+          wouldAbstain: null,
+          selectedForExecution: null,
+          provider: null,
+          requestedModelId: null,
+          reportedModelId: null,
+          providerResponseId: null,
+          attemptUsed: null,
+          echoedRequestSha256: baseline.requestSha256,
+          echoedGameSha256: baseline.gameSha256,
+          echoedSlateSha256: baseline.slateSha256,
+        });
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  if (meta === null) {
+    throw new Error('run file has no run_meta record — is this a harness NDJSON file?');
+  }
+  if (games.size === 0) {
+    throw new Error('run file has no bundle_game records — nothing to score against');
+  }
+  return {
+    runId: meta.runId,
+    cohortId: meta.cohortId,
+    label: meta.label,
+    mode: meta.mode,
+    slateDate: meta.slateDate,
+    slateSha256: meta.slateSha256,
+    bundleTimestamp: meta.bundleTimestamp,
+    slateCutoffAt: meta.slateCutoffAt,
+    eligibleGames: meta.eligibleGames,
+    armGameResults: meta.armGameResults,
+    baselineDecisionCount: meta.baselineDecisionCount,
+    games,
+    picks,
+    armResponses,
+    runFailures,
+    identities,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Run integrity — a scorecard is only as trustworthy as its input
+// ---------------------------------------------------------------------------
+
+function expectedEntry(
+  game: SourceGame,
+  market: MarketKey,
+  side: SelectedSide,
+): { price: number; line: number | null } {
+  if (market === 'moneyline') {
+    return { price: side === 'away' ? game.prices.moneyline.away : game.prices.moneyline.home, line: null };
+  }
+  if (market === 'spread') {
+    return {
+      price: side === 'away' ? game.prices.runLine.away : game.prices.runLine.home,
+      line: game.prices.runLine.line,
+    };
+  }
+  return {
+    price: side === 'away' ? game.prices.total.over : game.prices.total.under,
+    line: game.prices.total.line,
+  };
+}
+
+/**
+ * Verify the run file is internally consistent before trusting a single
+ * number in it. Returns violations (empty = verified):
+ *
+ * - a recorded run_failure (identity/collision) makes the run unscoreable;
+ * - every recorded game/request/slate hash must match a recomputation from
+ *   the embedded bundles (a tampered price or bundle cannot hide);
+ * - every model decision must be backed by a VALID arm response for the same
+ *   participant/game/request hash, exactly three decisions per valid
+ *   response and none for non-valid ones (no fabricated decisions);
+ * - every decision's echoed selection/line/price must re-verify against the
+ *   hash-verified bundle, and its echoed hashes must match.
+ */
+export interface ExpectedArm {
+  participantId: string;
+  provider: string;
+  requestedModelId: string;
+  /** Exact approved response-reported model IDs for this arm. */
+  approvedReportedModelIds: string[];
+}
+
+/** The frozen smoke-v0 arm manifest, from the harness's own arm registry. */
+export function defaultExpectedArms(): ExpectedArm[] {
+  return ARMS.map((arm) => ({
+    participantId: arm.participantId,
+    provider: arm.provider,
+    requestedModelId: arm.requestedModelId,
+    approvedReportedModelIds: approvedReportedModelIds(arm.participantId),
+  }));
+}
+
+export function verifyRunIntegrity(
+  run: SourceRun,
+  options?: { expectedArms?: ExpectedArm[] },
+): string[] {
+  const violations: string[] = [];
+
+  // Record identity: every record must carry this run's runId, label, and
+  // (where applicable) cohortId — no record can belong to another run.
+  for (const identity of run.identities) {
+    if (identity.runId !== run.runId) violations.push(`${identity.ref}: runId does not match run_meta`);
+    if (identity.label !== run.label) violations.push(`${identity.ref}: label does not match run_meta`);
+    if (identity.cohortId !== null && identity.cohortId !== run.cohortId) {
+      violations.push(`${identity.ref}: cohortId does not match run_meta`);
+    }
+  }
+
+  // Frozen arm manifest: the arms are known ahead of time, never inferred
+  // from surviving records — a relabeled or missing arm is a violation.
+  const expectedArms = options?.expectedArms ?? defaultExpectedArms();
+  const expectedById = new Map(expectedArms.map((arm) => [arm.participantId, arm]));
+  const seenArmIds = new Set(run.armResponses.map((r) => r.participantId));
+  for (const arm of expectedArms) {
+    if (!seenArmIds.has(arm.participantId)) {
+      violations.push(`expected arm ${arm.participantId} has no responses in this run`);
+    }
+  }
+  for (const participantId of seenArmIds) {
+    if (!expectedById.has(participantId)) {
+      violations.push(`unexpected arm ${participantId} is not in the frozen arm manifest`);
+    }
+  }
+  for (const response of run.armResponses) {
+    const expected = expectedById.get(response.participantId);
+    if (
+      expected !== undefined &&
+      (response.provider !== expected.provider || response.requestedModelId !== expected.requestedModelId)
+    ) {
+      violations.push(
+        `arm ${response.participantId}: provider/requestedModelId does not match the frozen arm manifest`,
+      );
+    }
+  }
+
+  for (const failure of run.runFailures) {
+    violations.push(
+      `run recorded a hard failure (${failure.code}: ${failure.failures.length} finding(s)) — this run is not scoreable`,
+    );
+  }
+
+  // Hash recomputation, bottom-up: game -> request -> slate.
+  const sortedBundles: unknown[] = [...run.games.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([, game]) => game.rawBundle);
+  const requestBundleByGame = new Map<string, SlateBundle>();
+  for (const [gameId, game] of run.games) {
+    const recomputedGame = sha256Hex(canonicalize(game.rawBundle));
+    if (recomputedGame !== game.gameSha256) {
+      violations.push(`game ${gameId}: recorded gameSha256 does not match the recomputed bundle hash`);
+    }
+    const league = (game.rawBundle as { league?: unknown }).league;
+    const requestBundle = {
+      schemaVersion: 1,
+      label: run.label,
+      league,
+      slateDate: run.slateDate,
+      bundleTimestamp: run.bundleTimestamp,
+      cutoffAt: game.cutoffAt,
+      games: [game.rawBundle],
+    };
+    if (sha256Hex(canonicalize(requestBundle)) !== game.requestSha256) {
+      violations.push(`game ${gameId}: recorded requestSha256 does not match the recomputed request bundle hash`);
+    }
+    // The hash-verified request bundle is what the arm actually received;
+    // the full harness validator re-runs against it below.
+    requestBundleByGame.set(gameId, requestBundle as unknown as SlateBundle);
+  }
+  const firstGame = [...run.games.values()][0];
+  const slateBundle = {
+    schemaVersion: 1,
+    label: run.label,
+    league: (firstGame?.rawBundle as { league?: unknown } | undefined)?.league,
+    slateDate: run.slateDate,
+    bundleTimestamp: run.bundleTimestamp,
+    cutoffAt: run.slateCutoffAt,
+    games: sortedBundles,
+  };
+  if (sha256Hex(canonicalize(slateBundle)) !== run.slateSha256) {
+    violations.push('run_meta slateSha256 does not match the recomputed slate hash');
+  }
+
+  // Manifest counts: surviving records must match what the harness recorded
+  // at write time, so deleted arms/baselines cannot silently vanish.
+  if (run.games.size !== run.eligibleGames) {
+    violations.push(
+      `run_meta says ${run.eligibleGames} eligible games but ${run.games.size} bundle_game records survive`,
+    );
+  }
+  if (run.armResponses.length !== run.armGameResults) {
+    violations.push(
+      `run_meta says ${run.armGameResults} arm-game responses but ${run.armResponses.length} survive`,
+    );
+  }
+  const baselinePicks = run.picks.filter((p) => p.kind === 'baseline');
+  if (baselinePicks.length !== run.baselineDecisionCount) {
+    violations.push(
+      `run_meta says ${run.baselineDecisionCount} baseline decisions but ${baselinePicks.length} survive`,
+    );
+  }
+
+  // Response uniqueness and full arm×game cross-product: the harness
+  // dispatches every arm on every game exactly once.
+  const responseByKey = new Map<string, ArmResponseRef>();
+  const responsesByArm = new Map<string, Set<string>>();
+  for (const response of run.armResponses) {
+    const key = `${response.participantId}:${response.gameId}`;
+    if (responseByKey.has(key)) {
+      violations.push(`duplicate arm_game_response for ${key}`);
+      continue;
+    }
+    responseByKey.set(key, response);
+    const games = responsesByArm.get(response.participantId) ?? new Set<string>();
+    games.add(response.gameId);
+    responsesByArm.set(response.participantId, games);
+    const game = run.games.get(response.gameId);
+    if (!game) {
+      violations.push(`arm response ${key} references an unknown game`);
+    } else if (response.requestSha256 !== game.requestSha256) {
+      violations.push(`arm response ${key}: requestSha256 does not match the game's request hash`);
+    }
+  }
+  for (const [participantId, games] of responsesByArm) {
+    if (games.size !== run.games.size) {
+      violations.push(
+        `arm ${participantId} has responses for ${games.size} of ${run.games.size} games — the arm×game cross-product is incomplete`,
+      );
+    }
+  }
+
+  // Baselines are RE-DERIVED: the six deterministic policies are re-run on
+  // the hash-verified bundles and every recorded baseline decision must
+  // match its re-derivation exactly — a tampered comparator cannot hide
+  // behind bundle-valid sides and prices.
+  const sortedGames = [...run.games.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([, game]) => game.rawBundle);
+  const reconstructedSlate = {
+    schemaVersion: 1,
+    label: run.label,
+    league: 'mlb',
+    slateDate: run.slateDate,
+    bundleTimestamp: run.bundleTimestamp,
+    cutoffAt: run.slateCutoffAt,
+    games: sortedGames,
+  } as unknown as SlateBundle;
+  const expectedBaselines = new Map(
+    runBaselines(reconstructedSlate).map((d) => [`${d.participantId}:${d.gameId}`, d]),
+  );
+  const seenBaselineKeys = new Set<string>();
+  for (const pick of baselinePicks) {
+    const key = `${pick.participantId}:${pick.gameId}`;
+    if (seenBaselineKeys.has(key)) {
+      violations.push(`duplicate baseline decision for ${key}`);
+      continue;
+    }
+    seenBaselineKeys.add(key);
+    const expected = expectedBaselines.get(key);
+    if (!expected) {
+      violations.push(`baseline decision ${key} is not produced by the deterministic policies`);
+      continue;
+    }
+    if (pick.policyVersion !== BASELINE_POLICY_VERSION) {
+      violations.push(`baseline decision ${key}: unexpected policyVersion ${pick.policyVersion ?? 'null'}`);
+    }
+    if (
+      pick.market !== expected.market ||
+      pick.selection !== expected.selection ||
+      pick.line !== expected.line ||
+      pick.entryDecimal !== expected.observedDecimal
+    ) {
+      violations.push(`baseline decision ${key} does not match its deterministic re-derivation`);
+    }
+  }
+  for (const key of expectedBaselines.keys()) {
+    if (!seenBaselineKeys.has(key)) {
+      violations.push(`expected deterministic baseline decision ${key} is missing`);
+    }
+  }
+
+  // Decision-to-accepted-response correspondence: every decision must be
+  // re-derivable from the ARCHIVED accepted provider response, and its
+  // provenance metadata must match the accepted attempt — a decision cannot
+  // say something the model did not.
+  const modelPicksByKey = new Map<string, SourcePick[]>();
+  for (const pick of run.picks.filter((p) => p.kind === 'model')) {
+    const key = `${pick.participantId}:${pick.gameId}`;
+    const list = modelPicksByKey.get(key) ?? [];
+    list.push(pick);
+    modelPicksByKey.set(key, list);
+  }
+  for (const [key, list] of modelPicksByKey) {
+    const response = responseByKey.get(key);
+    if (!response) {
+      violations.push(`decisions for ${key} have no arm_game_response record backing them`);
+      continue;
+    }
+    if (response.outcome !== 'valid') {
+      violations.push(`decisions for ${key} are backed by a non-valid arm response (${response.outcome})`);
+      continue;
+    }
+    const markets = new Set(list.map((p) => p.market));
+    if (list.length !== 3 || markets.size !== 3) {
+      violations.push(`${key}: expected exactly one decision per market, found ${list.length}`);
+    }
+
+    if (response.accepted.rawResponse === null) {
+      violations.push(`${key}: accepted response retains no raw text — decisions cannot be re-derived`);
+      continue;
+    }
+    // The FULL harness validator re-runs on the archived accepted response
+    // against the hash-verified request bundle: a recorded 'valid' outcome
+    // that the harness's own gate would reject is a violation, not a shrug.
+    const requestBundle = requestBundleByGame.get(response.gameId);
+    const game = run.games.get(response.gameId);
+    if (requestBundle === undefined || game === undefined) {
+      violations.push(`${key}: no verified request bundle for game ${response.gameId}`);
+      continue;
+    }
+    const armSpecForValidation = {
+      participantId: response.participantId,
+      provider: response.provider,
+      requestedModelId: response.requestedModelId,
+      credentialEnvVar: '',
+    } as ArmSpec;
+    const revalidation = validateResponseText(
+      response.accepted.rawResponse,
+      requestBundle,
+      game.requestSha256,
+      armSpecForValidation,
+      run.cohortId,
+    );
+    if (revalidation.errors.length > 0 || revalidation.parsed === null) {
+      violations.push(
+        `${key}: accepted response fails the harness validator (${revalidation.errors[0] ?? 'no parse'}) — recorded 'valid' outcome is not reproducible`,
+      );
+      continue;
+    }
+    if (response.repairUsed) {
+      // The repair-acceptance rules re-run from the archived attempts: the
+      // initial must have failed validation with a complete fingerprint the
+      // accepted repair preserves exactly.
+      const initialRaw = response.attempt.rawResponse;
+      if (initialRaw === null) {
+        violations.push(`${key}: repair was used but no initial raw response is archived`);
+      } else {
+        const initialValidation = validateResponseText(
+          initialRaw,
+          requestBundle,
+          game.requestSha256,
+          armSpecForValidation,
+          run.cohortId,
+        );
+        if (initialValidation.errors.length === 0) {
+          violations.push(`${key}: repair was used but the archived initial response already validates`);
+        }
+        const initialFingerprint = extractDecisionFingerprint(initialRaw, requestBundle);
+        if (initialFingerprint === null) {
+          violations.push(`${key}: repair was used but the initial response has no complete decision fingerprint`);
+        } else if (
+          compareFingerprints(initialFingerprint, fingerprintFromParsed(revalidation.parsed)).length > 0
+        ) {
+          violations.push(`${key}: the accepted repair changed decisions relative to the initial response`);
+        }
+      }
+    }
+    const shapeData = revalidation.parsed;
+    const responseGame = shapeData.games.find((g) => g.gameId === response.gameId);
+    if (!responseGame) {
+      violations.push(`${key}: accepted raw response does not contain game ${response.gameId}`);
+      continue;
+    }
+    const forecastByMarket = new Map(responseGame.forecasts.map((f) => [f.market, f]));
+    for (const pick of list) {
+      const forecast = forecastByMarket.get(pick.market);
+      if (!forecast) {
+        violations.push(`${key} ${pick.market}: no matching forecast in the accepted response`);
+        continue;
+      }
+      const mismatch =
+        forecast.selection !== pick.selection ||
+        forecast.line !== pick.line ||
+        forecast.observedDecimal !== pick.entryDecimal ||
+        forecast.probabilities.win !== pick.probabilities?.win ||
+        forecast.probabilities.push !== pick.probabilities?.push ||
+        forecast.probabilities.loss !== pick.probabilities?.loss ||
+        forecast.confidence !== pick.confidenceValue ||
+        forecast.wouldAbstain !== pick.wouldAbstain ||
+        forecast.selectedForExecution !== pick.selectedForExecution;
+      if (mismatch) {
+        violations.push(`${key} ${pick.market}: decision does not match the accepted provider response`);
+      }
+      if (
+        pick.provider !== response.provider ||
+        pick.requestedModelId !== response.requestedModelId ||
+        pick.reportedModelId !== response.accepted.reportedModelId ||
+        pick.providerResponseId !== response.accepted.providerResponseId ||
+        pick.attemptUsed !== (response.repairUsed ? 'repair' : 'initial')
+      ) {
+        violations.push(`${key} ${pick.market}: decision provenance does not match the accepted attempt`);
+      }
+    }
+  }
+  for (const response of run.armResponses) {
+    if (response.outcome === 'valid' && !modelPicksByKey.has(`${response.participantId}:${response.gameId}`)) {
+      violations.push(
+        `valid arm response ${response.participantId}:${response.gameId} has no decision records`,
+      );
+    }
+  }
+
+  // Timing evidence is archived and therefore verified: each response's
+  // cutoff must equal the hash-verified game cutoff, and an attempt's
+  // timestamps must be parseable, ordered, latency-consistent, and (for
+  // accepted work) strictly before the cutoff.
+  const timingCompleteness = (attempt: ArchivedAttempt, label: string): string | null => {
+    if (attempt.requestAt === null || attempt.responseAt === null || attempt.latencyMs === null) {
+      return `${label}: archived timing fields are missing`;
+    }
+    const requestMs = Date.parse(attempt.requestAt);
+    const responseMs = Date.parse(attempt.responseAt);
+    if (Number.isNaN(requestMs) || Number.isNaN(responseMs)) {
+      return `${label}: archived timestamps do not parse`;
+    }
+    if (requestMs > responseMs) return `${label}: responseAt precedes requestAt`;
+    if (attempt.latencyMs !== responseMs - requestMs) {
+      return `${label}: latencyMs does not equal the archived timestamp difference`;
+    }
+    return null;
+  };
+  const attemptTimingViolation = (
+    attempt: ArchivedAttempt,
+    cutoffMs: number,
+    label: string,
+  ): string | null => {
+    const completeness = timingCompleteness(attempt, label);
+    if (completeness !== null) return completeness;
+    if (Date.parse(attempt.responseAt as string) >= cutoffMs) {
+      return `${label}: response arrived at or after the decision cutoff`;
+    }
+    return null;
+  };
+
+  // Outcome-class consistency for NON-valid outcomes, mirroring the runner's
+  // own rules from the archived attempts — a valid response cannot be demoted
+  // to invalid_schema (hiding it from scoring), and transport outcomes cannot
+  // carry response bodies.
+  for (const response of run.armResponses) {
+    const key = `${response.participantId}:${response.gameId}`;
+    const requestBundle = requestBundleByGame.get(response.gameId);
+    const game = run.games.get(response.gameId);
+    if (requestBundle === undefined || game === undefined) continue;
+    if (response.cutoffAt !== game.cutoffAt) {
+      violations.push(`${key}: response cutoffAt does not match the hash-verified game cutoff`);
+      continue;
+    }
+    const cutoffMs = Date.parse(game.cutoffAt);
+    // ANY attempt with an archived response body must carry complete,
+    // ordered, latency-consistent timing — for every outcome. Blanking the
+    // timing fields cannot exempt a body-bearing response from the rules.
+    const bodyBearing: Array<[ArchivedAttempt, string]> = [
+      [response.attempt, `${key} initial attempt`],
+      ...(response.repair !== null ? ([[response.repair, `${key} repair attempt`]] as Array<[ArchivedAttempt, string]>) : []),
+    ];
+    for (const [attempt, label] of bodyBearing) {
+      if (attempt.rawResponse !== null) {
+        const completeness = timingCompleteness(attempt, label);
+        if (completeness !== null) violations.push(completeness);
+      }
+    }
+    if (response.outcome === 'valid') {
+      const initialTiming = attemptTimingViolation(response.attempt, cutoffMs, `${key} initial attempt`);
+      if (initialTiming !== null) violations.push(initialTiming);
+      if (response.repairUsed && response.repair !== null) {
+        const repairTiming = attemptTimingViolation(response.repair, cutoffMs, `${key} repair attempt`);
+        if (repairTiming !== null) violations.push(repairTiming);
+      }
+    }
+    const armSpecForValidation = {
+      participantId: response.participantId,
+      provider: response.provider,
+      requestedModelId: response.requestedModelId,
+      credentialEnvVar: '',
+    } as ArmSpec;
+    if (response.outcome === 'invalid_schema') {
+      const initialRaw = response.attempt.rawResponse;
+      if (initialRaw === null) {
+        violations.push(`${key}: invalid_schema outcome with no archived initial response`);
+        continue;
+      }
+      const initialValidation = validateResponseText(
+        initialRaw,
+        requestBundle,
+        game.requestSha256,
+        armSpecForValidation,
+        run.cohortId,
+      );
+      if (initialValidation.errors.length === 0) {
+        violations.push(
+          `${key}: recorded invalid_schema but the archived initial response validates — a valid response cannot be demoted`,
+        );
+        continue;
+      }
+      const repairRaw = response.repair?.rawResponse ?? null;
+      if (response.repairUsed && repairRaw !== null) {
+        const repairValidation = validateResponseText(
+          repairRaw,
+          requestBundle,
+          game.requestSha256,
+          armSpecForValidation,
+          run.cohortId,
+        );
+        if (repairValidation.errors.length === 0 && repairValidation.parsed !== null) {
+          const initialFingerprint = extractDecisionFingerprint(initialRaw, requestBundle);
+          if (
+            initialFingerprint !== null &&
+            compareFingerprints(initialFingerprint, fingerprintFromParsed(repairValidation.parsed)).length === 0
+          ) {
+            violations.push(
+              `${key}: recorded invalid_schema but the archived repair validates and preserves the fingerprint — this response should be valid`,
+            );
+          }
+        }
+      }
+      if (!response.repairUsed && extractDecisionFingerprint(initialRaw, requestBundle) !== null) {
+        violations.push(
+          `${key}: invalid_schema without a repair, but the initial response has a complete fingerprint — the harness would have attempted a repair`,
+        );
+      }
+    } else if (
+      response.outcome === 'timeout' ||
+      response.outcome === 'rate_limited' ||
+      response.outcome === 'provider_error' ||
+      response.outcome === 'credential_missing'
+    ) {
+      if (response.attempt.rawResponse !== null || (response.repair?.rawResponse ?? null) !== null) {
+        violations.push(`${key}: transport outcome ${response.outcome} cannot carry a response body`);
+      }
+    }
+    else if (response.outcome === 'cutoff_missed') {
+      // A cutoff_missed outcome is legitimate only when the archived
+      // evidence supports it: an initial response that VALIDATES and
+      // demonstrably arrived before the cutoff cannot be demoted to a
+      // timing failure. (Legitimate cases pass: no response at dispatch,
+      // response after cutoff, or an invalid-before-cutoff response whose
+      // repair window closed or whose repair arrived late.)
+      const initialRaw = response.attempt.rawResponse;
+      const responseMs =
+        response.attempt.responseAt === null ? Number.NaN : Date.parse(response.attempt.responseAt);
+      if (initialRaw !== null && !Number.isNaN(responseMs) && responseMs < cutoffMs) {
+        const armSpecForTiming = {
+          participantId: response.participantId,
+          provider: response.provider,
+          requestedModelId: response.requestedModelId,
+          credentialEnvVar: '',
+        } as ArmSpec;
+        const initialValidation = validateResponseText(
+          initialRaw,
+          requestBundle,
+          game.requestSha256,
+          armSpecForTiming,
+          run.cohortId,
+        );
+        if (initialValidation.errors.length === 0) {
+          violations.push(
+            `${key}: recorded cutoff_missed but the archived initial response validates and arrived before the cutoff — a valid response cannot be demoted to a timing failure`,
+          );
+        }
+      }
+    }
+  }
+
+  // The identity/collision gate is RECOMPUTED from the archived reported
+  // model IDs and the approved-ID registry — the recomputed failure set must
+  // be empty regardless of whether run_failure records survived, and any
+  // recorded failures must correspond to recomputed ones.
+  const reportedByArm = new Map<string, Set<string>>();
+  const unidentifiedByArm = new Map<string, number>();
+  for (const response of run.armResponses) {
+    const reported = reportedByArm.get(response.participantId) ?? new Set<string>();
+    for (const attempt of [response.attempt, response.repair]) {
+      if (attempt === null) continue;
+      if (attempt.reportedModelId !== null) reported.add(attempt.reportedModelId);
+      if (attempt.rawResponse !== null && attempt.reportedModelId === null) {
+        unidentifiedByArm.set(response.participantId, (unidentifiedByArm.get(response.participantId) ?? 0) + 1);
+      }
+    }
+    reportedByArm.set(response.participantId, reported);
+  }
+  const recomputedIdentity = checkProviderCollision(
+    expectedArms.map((arm) => ({
+      participantId: arm.participantId,
+      provider: arm.provider as ProviderName,
+      requestedModelId: arm.requestedModelId,
+      approvedReportedModelIds: arm.approvedReportedModelIds,
+      reportedModelIds: [...(reportedByArm.get(arm.participantId) ?? new Set<string>())],
+      unidentifiedResponses: unidentifiedByArm.get(arm.participantId) ?? 0,
+    })),
+  );
+  for (const failure of recomputedIdentity.failures) {
+    violations.push(`recomputed identity gate: ${failure}`);
+  }
+  const recordedFailureTexts = new Set(run.runFailures.flatMap((f) => f.failures));
+  for (const recorded of recordedFailureTexts) {
+    if (!recomputedIdentity.failures.includes(recorded)) {
+      violations.push(`recorded run_failure does not correspond to any recomputed failure: ${recorded}`);
+    }
+  }
+
+  // Echo re-verification against the hash-verified bundles.
+  for (const pick of run.picks) {
+    const game = run.games.get(pick.gameId);
+    if (!game) {
+      violations.push(`pick ${pick.participantId}:${pick.gameId}:${pick.market} references an unknown game`);
+      continue;
+    }
+    let side: SelectedSide;
+    try {
+      side = sideForSelection(pick.market, pick.selection, game);
+    } catch (error) {
+      violations.push(error instanceof Error ? error.message : String(error));
+      continue;
+    }
+    const expected = expectedEntry(game, pick.market, side);
+    if (pick.entryDecimal !== expected.price) {
+      violations.push(
+        `${pick.participantId}:${pick.gameId}:${pick.market}: entry price ${pick.entryDecimal} does not match the frozen bundle price ${expected.price}`,
+      );
+    }
+    if (pick.line !== expected.line) {
+      violations.push(
+        `${pick.participantId}:${pick.gameId}:${pick.market}: line ${pick.line ?? 'null'} does not match the designated line ${expected.line ?? 'null'}`,
+      );
+    }
+    if (pick.echoedRequestSha256 !== null && pick.echoedRequestSha256 !== game.requestSha256) {
+      violations.push(`${pick.participantId}:${pick.gameId}:${pick.market}: echoed request hash mismatch`);
+    }
+    if (pick.echoedGameSha256 !== null && pick.echoedGameSha256 !== game.gameSha256) {
+      violations.push(`${pick.participantId}:${pick.gameId}:${pick.market}: echoed game hash mismatch`);
+    }
+    if (pick.echoedSlateSha256 !== null && pick.echoedSlateSha256 !== run.slateSha256) {
+      violations.push(`${pick.participantId}:${pick.gameId}:${pick.market}: echoed slate hash mismatch`);
+    }
+  }
+
+  return violations;
+}
+
+// ---------------------------------------------------------------------------
+// Join + score
+// ---------------------------------------------------------------------------
+
+export function closeQuoteFromRow(row: ClosingLineRow): CloseQuote {
+  return {
+    line: row.line,
+    awayDecimal: row.away_odds_decimal,
+    homeDecimal: row.home_odds_decimal,
+    awayPNovig: row.away_p_novig,
+    homePNovig: row.home_p_novig,
+    confidence: row.confidence,
+  };
+}
+
+export function closesByKey(rows: ClosingLineRow[]): Map<string, ClosingLineRow> {
+  return new Map(rows.map((row) => [`${row.jsonodds_id}:${row.market}`, row]));
+}
+
+export interface ScoredPick extends SourcePick {
+  side: SelectedSide;
+  result: ClvResult;
+  close: ClosingLineRow | null;
+}
+
+/**
+ * Selection label → close-column side. Moneyline/spread selections are exact
+ * team names; totals map over → away column, under → home column (the
+ * upstream storage convention).
+ */
+export function sideForSelection(
+  market: MarketKey,
+  selection: string,
+  game: { awayTeam: string; homeTeam: string },
+): SelectedSide {
+  if (market === 'total') {
+    if (selection === 'over') return 'away';
+    if (selection === 'under') return 'home';
+    throw new Error(`total selection must be over/under, got "${selection}"`);
+  }
+  if (selection === game.awayTeam) return 'away';
+  if (selection === game.homeTeam) return 'home';
+  throw new Error(
+    `selection "${selection}" matches neither "${game.awayTeam}" (away) nor "${game.homeTeam}" (home)`,
+  );
+}
+
+export function scoreRun(run: SourceRun, closeRows: ClosingLineRow[]): ScoredPick[] {
+  const closes = closesByKey(closeRows);
+  return run.picks.map((pick) => {
+    const game = run.games.get(pick.gameId);
+    if (!game) {
+      throw new Error(`pick references game ${pick.gameId} with no bundle_game record`);
+    }
+    const side = sideForSelection(pick.market, pick.selection, game);
+    const movementSelection =
+      pick.market === 'total' ? (pick.selection as 'over' | 'under') : side;
+    const close = closes.get(`${pick.gameId}:${pick.market}`) ?? null;
+    const result = scoreDecision(
+      pick.market,
+      side,
+      movementSelection,
+      pick.entryDecimal,
+      pick.line,
+      close === null ? null : closeQuoteFromRow(close),
+    );
+    return { ...pick, side, result, close };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Aggregation — equal-weight game-level primary, full coverage accounting
+// ---------------------------------------------------------------------------
+
+export interface ClvSummary {
+  meanClvPct: number | null;
+  medianClvPct: number | null;
+  beatClosePct: number | null;
+}
+
+export interface ParticipantStats {
+  participantId: string;
+  kind: 'model' | 'baseline';
+  /** Games this arm was dispatched (models) or picked in (baselines). */
+  games: number;
+  /** Market-decision opportunities: models 3 per dispatched game; baselines 1 per pick. */
+  eligibleMarkets: number;
+  /** Valid decisions present in the run file. */
+  validDecisions: number;
+  /** Arm-level outcome counts (models) — failures stay in the denominator. */
+  armOutcomes: Record<string, number>;
+  primaryScoreable: number;
+  /** PRIMARY: equal-weight game-level aggregate (mean of per-game mean CLV). */
+  gamesScoreable: number;
+  gameLevel: ClvSummary;
+  /** Secondary: per-pick aggregate. */
+  perPick: ClvSummary;
+  conditionalOnly: number;
+  unscoredByReason: Record<string, number>;
+  byMarket: Record<string, { picks: number; scoreable: number; meanClvPct: number | null }>;
+}
+
+function round4(value: number): number {
+  return Math.round(value * 1e4) / 1e4;
+}
+
+function mean(values: number[]): number | null {
+  if (values.length === 0) return null;
+  return round4(values.reduce((a, b) => a + b, 0) / values.length);
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const value =
+    sorted.length % 2 === 1
+      ? (sorted[mid] as number)
+      : ((sorted[mid - 1] as number) + (sorted[mid] as number)) / 2;
+  return round4(value);
+}
+
+function summary(values: number[]): ClvSummary {
+  return {
+    meanClvPct: mean(values),
+    medianClvPct: median(values),
+    beatClosePct:
+      values.length === 0
+        ? null
+        : round4((values.filter((v) => v > 0).length / values.length) * 100),
+  };
+}
+
+export function aggregateByParticipant(
+  scored: ScoredPick[],
+  run: SourceRun,
+): ParticipantStats[] {
+  const picksByParticipant = new Map<string, ScoredPick[]>();
+  for (const pick of scored) {
+    const list = picksByParticipant.get(pick.participantId) ?? [];
+    list.push(pick);
+    picksByParticipant.set(pick.participantId, list);
+  }
+  const responsesByParticipant = new Map<string, ArmResponseRef[]>();
+  for (const response of run.armResponses) {
+    const list = responsesByParticipant.get(response.participantId) ?? [];
+    list.push(response);
+    responsesByParticipant.set(response.participantId, list);
+  }
+
+  // Every arm that was dispatched appears, even with zero valid decisions —
+  // failures must never vanish from the denominators.
+  const participantIds = [
+    ...new Set([...responsesByParticipant.keys(), ...picksByParticipant.keys()]),
+  ];
+
+  const stats: ParticipantStats[] = [];
+  for (const participantId of participantIds) {
+    const picks = picksByParticipant.get(participantId) ?? [];
+    const responses = responsesByParticipant.get(participantId) ?? [];
+    const kind: 'model' | 'baseline' =
+      responses.length > 0 || picks[0]?.kind === 'model' ? 'model' : 'baseline';
+
+    const armOutcomes: Record<string, number> = {};
+    for (const response of responses) {
+      armOutcomes[response.outcome] = (armOutcomes[response.outcome] ?? 0) + 1;
+    }
+
+    const primary = picks
+      .map((p) => p.result.primaryClvPct)
+      .filter((v): v is number => v !== null);
+    const unscoredByReason: Record<string, number> = {};
+    for (const pick of picks) {
+      if (pick.result.unscoredReason !== null) {
+        unscoredByReason[pick.result.unscoredReason] =
+          (unscoredByReason[pick.result.unscoredReason] ?? 0) + 1;
+      }
+    }
+
+    // Equal-weight game level: average scoreable CLV within each game first.
+    const byGame = new Map<string, number[]>();
+    for (const pick of picks) {
+      if (pick.result.primaryClvPct === null) continue;
+      const list = byGame.get(pick.gameId) ?? [];
+      list.push(pick.result.primaryClvPct);
+      byGame.set(pick.gameId, list);
+    }
+    const gameMeans = [...byGame.values()]
+      .map((values) => mean(values))
+      .filter((v): v is number => v !== null);
+
+    const byMarket: ParticipantStats['byMarket'] = {};
+    for (const market of ['moneyline', 'spread', 'total']) {
+      const marketPicks = picks.filter((p) => p.market === market);
+      if (marketPicks.length === 0) continue;
+      const scoreable = marketPicks
+        .map((p) => p.result.primaryClvPct)
+        .filter((v): v is number => v !== null);
+      byMarket[market] = {
+        picks: marketPicks.length,
+        scoreable: scoreable.length,
+        meanClvPct: mean(scoreable),
+      };
+    }
+
+    stats.push({
+      participantId,
+      kind,
+      games: kind === 'model' ? responses.length : new Set(picks.map((p) => p.gameId)).size,
+      eligibleMarkets: kind === 'model' ? responses.length * 3 : picks.length,
+      validDecisions: picks.length,
+      armOutcomes,
+      primaryScoreable: primary.length,
+      gamesScoreable: gameMeans.length,
+      gameLevel: summary(gameMeans),
+      perPick: summary(primary),
+      conditionalOnly: picks.filter((p) => p.result.conditionalClvPct !== null).length,
+      unscoredByReason,
+      byMarket,
+    });
+  }
+
+  // Models first (by game-level mean CLV desc), then baselines.
+  const rank = (s: ParticipantStats): number =>
+    s.gameLevel.meanClvPct === null ? -1e9 : s.gameLevel.meanClvPct;
+  return stats.sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === 'model' ? -1 : 1;
+    return rank(b) - rank(a);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Scored records (NDJSON shape)
+// ---------------------------------------------------------------------------
+
+export function scoredRecords(
+  run: SourceRun,
+  scored: ScoredPick[],
+  stats: ParticipantStats[],
+  scoredAt: string,
+): Array<Record<string, unknown>> {
+  const records: Array<Record<string, unknown>> = [];
+  records.push({
+    recordType: 'scored_run_meta',
+    label: SMOKE_LABEL,
+    runId: run.runId,
+    cohortId: run.cohortId,
+    slateDate: run.slateDate,
+    slateSha256: run.slateSha256,
+    sourceMode: run.mode,
+    scoredAt,
+    integrityVerified: true,
+    metric: 'reference-closing CLV (single reference source, decision CLV only)',
+    primaryAggregate: 'equal-weight game-level mean (per-pick reported as secondary)',
+    closePolicy: {
+      confidenceRequired: 'fresh',
+      lineMatchRequired: true,
+      integerLinePrimary: 'unavailable (conditional CLV separately labeled)',
+    },
+    picks: scored.length,
+    primaryScoreable: scored.filter((p) => p.result.primaryClvPct !== null).length,
+    armGameResponses: run.armResponses.length,
+  });
+  for (const pick of scored) {
+    const game = run.games.get(pick.gameId);
+    records.push({
+      recordType: 'scored_decision',
+      label: SMOKE_LABEL,
+      runId: run.runId,
+      scoredAt,
+      kind: pick.kind,
+      participantId: pick.participantId,
+      provider: pick.provider,
+      requestedModelId: pick.requestedModelId,
+      reportedModelId: pick.reportedModelId,
+      providerResponseId: pick.providerResponseId,
+      attemptUsed: pick.attemptUsed,
+      gameId: pick.gameId,
+      slateSha256: run.slateSha256,
+      gameSha256: game?.gameSha256 ?? null,
+      requestSha256: game?.requestSha256 ?? null,
+      market: pick.market,
+      selection: pick.selection,
+      side: pick.side,
+      entryDecimal: pick.entryDecimal,
+      entryLine: pick.line,
+      modelWinProbability: pick.modelWinProbability,
+      wouldAbstain: pick.wouldAbstain,
+      selectedForExecution: pick.selectedForExecution,
+      closing:
+        pick.close === null
+          ? null
+          : {
+              line: pick.close.line,
+              awayDecimal: pick.close.away_odds_decimal,
+              homeDecimal: pick.close.home_odds_decimal,
+              awayPNovig: pick.close.away_p_novig,
+              homePNovig: pick.close.home_p_novig,
+              confidence: pick.close.confidence,
+              valueCapturedAt: pick.close.value_captured_at,
+              lockTime: pick.close.lock_time,
+            },
+      primaryClvPct: pick.result.primaryClvPct,
+      unscoredReason: pick.result.unscoredReason,
+      conditionalClvPct: pick.result.conditionalClvPct,
+      lineMovementFavorable: pick.result.lineMovementFavorable,
+      closingPNovigSelected: pick.result.closingPNovigSelected,
+      aux: pick.result.aux,
+    });
+  }
+  for (const stat of stats) {
+    records.push({
+      recordType: 'participant_scorecard',
+      label: SMOKE_LABEL,
+      runId: run.runId,
+      scoredAt,
+      ...stat,
+    });
+  }
+  return records;
+}
