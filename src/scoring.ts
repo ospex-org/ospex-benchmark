@@ -1,10 +1,12 @@
 import { z } from 'zod';
+import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { scoreDecision } from './clv.js';
+import { ARMS } from './providers/index.js';
 import { benchmarkResponseSchema, extractJson } from './schema.js';
 import { SMOKE_LABEL } from './types.js';
 import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
-import type { ClosingLineRow, MarketKey } from './types.js';
+import type { ClosingLineRow, MarketKey, SlateBundle } from './types.js';
 
 /**
  * Pure scoring assembly, no I/O: parse a run's records, VERIFY THE RUN'S
@@ -41,6 +43,8 @@ const runMetaSchema = z
 const bundleGameSchema = z
   .object({
     recordType: z.literal('bundle_game'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
     gameId: z.string().min(1),
     slug: z.string().min(1),
     cutoffAt: z.string().min(1),
@@ -82,6 +86,9 @@ const attemptFieldsSchema = z
 const armResponseSchema = z
   .object({
     recordType: z.literal('arm_game_response'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    cohortId: z.string().min(1),
     participantId: z.string().min(1),
     provider: z.string().min(1),
     requestedModelId: z.string().min(1),
@@ -98,6 +105,8 @@ const armResponseSchema = z
 const runFailureSchema = z
   .object({
     recordType: z.literal('run_failure'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
     code: z.string().min(1),
     failures: z.array(z.string()),
   })
@@ -106,6 +115,9 @@ const runFailureSchema = z
 const decisionSchema = z
   .object({
     recordType: z.literal('decision'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    cohortId: z.string().min(1),
     participantId: z.string().min(1),
     gameId: z.string().min(1),
     market: z.enum(['moneyline', 'spread', 'total']),
@@ -132,6 +144,9 @@ const decisionSchema = z
 const baselineDecisionSchema = z
   .object({
     recordType: z.literal('baseline_decision'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    cohortId: z.string().min(1),
     participantId: z.string().min(1),
     gameId: z.string().min(1),
     market: z.enum(['moneyline', 'spread', 'total']),
@@ -172,6 +187,7 @@ export interface SourcePick {
   entryDecimal: number;
   probabilities: { win: number; push: number; loss: number } | null;
   confidenceValue: number | null;
+  policyVersion: string | null;
   modelWinProbability: number | null;
   wouldAbstain: boolean | null;
   selectedForExecution: boolean | null;
@@ -219,6 +235,8 @@ export interface SourceRun {
   picks: SourcePick[];
   armResponses: ArmResponseRef[];
   runFailures: Array<{ code: string; failures: string[] }>;
+  /** Identity stamps of every parsed record, for run/cohort/label checks. */
+  identities: Array<{ ref: string; runId: string; label: string; cohortId: string | null }>;
 }
 
 function parseRecordLine(trimmed: string, lineNumber: number): { recordType?: unknown } {
@@ -235,6 +253,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
   const picks: SourcePick[] = [];
   const armResponses: ArmResponseRef[] = [];
   const runFailures: Array<{ code: string; failures: string[] }> = [];
+  const identities: SourceRun['identities'] = [];
 
   let lineNumber = 0;
   for (const line of lines) {
@@ -244,10 +263,17 @@ export function parseRunRecords(lines: string[]): SourceRun {
     const record = parseRecordLine(trimmed, lineNumber);
     switch (record.recordType) {
       case 'run_meta':
+        if (meta !== null) {
+          throw new Error('run file has more than one run_meta record — identity is ambiguous');
+        }
         meta = runMetaSchema.parse(record);
         break;
       case 'bundle_game': {
         const game = bundleGameSchema.parse(record);
+        if (games.has(game.gameId)) {
+          throw new Error(`run file has more than one bundle_game record for ${game.gameId}`);
+        }
+        identities.push({ ref: `bundle_game:${game.gameId}`, runId: game.runId, label: game.label, cohortId: null });
         games.set(game.gameId, {
           awayTeam: game.bundle.awayTeam,
           homeTeam: game.bundle.homeTeam,
@@ -279,6 +305,12 @@ export function parseRunRecords(lines: string[]): SourceRun {
       case 'arm_game_response': {
         const response = armResponseSchema.parse(record);
         const accepted = response.repairUsed && response.repair !== null ? response.repair : response.attempt;
+        identities.push({
+          ref: `arm_game_response:${response.participantId}:${response.gameId}`,
+          runId: response.runId,
+          label: response.label,
+          cohortId: response.cohortId,
+        });
         armResponses.push({
           participantId: response.participantId,
           provider: response.provider,
@@ -298,11 +330,18 @@ export function parseRunRecords(lines: string[]): SourceRun {
       }
       case 'run_failure': {
         const failure = runFailureSchema.parse(record);
+        identities.push({ ref: `run_failure:${failure.code}`, runId: failure.runId, label: failure.label, cohortId: null });
         runFailures.push({ code: failure.code, failures: failure.failures });
         break;
       }
       case 'decision': {
         const decision = decisionSchema.parse(record);
+        identities.push({
+          ref: `decision:${decision.participantId}:${decision.gameId}:${decision.market}`,
+          runId: decision.runId,
+          label: decision.label,
+          cohortId: decision.cohortId,
+        });
         picks.push({
           kind: 'model',
           participantId: decision.participantId,
@@ -313,6 +352,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
           entryDecimal: decision.observedDecimal,
           probabilities: decision.probabilities,
           confidenceValue: decision.confidence,
+          policyVersion: null,
           modelWinProbability: decision.probabilities.win,
           wouldAbstain: decision.wouldAbstain,
           selectedForExecution: decision.selectedForExecution,
@@ -329,6 +369,12 @@ export function parseRunRecords(lines: string[]): SourceRun {
       }
       case 'baseline_decision': {
         const baseline = baselineDecisionSchema.parse(record);
+        identities.push({
+          ref: `baseline_decision:${baseline.participantId}:${baseline.gameId}`,
+          runId: baseline.runId,
+          label: baseline.label,
+          cohortId: baseline.cohortId,
+        });
         picks.push({
           kind: 'baseline',
           participantId: baseline.participantId,
@@ -339,6 +385,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
           entryDecimal: baseline.observedDecimal,
           probabilities: null,
           confidenceValue: null,
+          policyVersion: baseline.policyVersion,
           modelWinProbability: null,
           wouldAbstain: null,
           selectedForExecution: null,
@@ -380,6 +427,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
     picks,
     armResponses,
     runFailures,
+    identities,
   };
 }
 
@@ -420,8 +468,63 @@ function expectedEntry(
  * - every decision's echoed selection/line/price must re-verify against the
  *   hash-verified bundle, and its echoed hashes must match.
  */
-export function verifyRunIntegrity(run: SourceRun): string[] {
+export interface ExpectedArm {
+  participantId: string;
+  provider: string;
+  requestedModelId: string;
+}
+
+/** The frozen smoke-v0 arm manifest, from the harness's own arm registry. */
+export function defaultExpectedArms(): ExpectedArm[] {
+  return ARMS.map((arm) => ({
+    participantId: arm.participantId,
+    provider: arm.provider,
+    requestedModelId: arm.requestedModelId,
+  }));
+}
+
+export function verifyRunIntegrity(
+  run: SourceRun,
+  options?: { expectedArms?: ExpectedArm[] },
+): string[] {
   const violations: string[] = [];
+
+  // Record identity: every record must carry this run's runId, label, and
+  // (where applicable) cohortId — no record can belong to another run.
+  for (const identity of run.identities) {
+    if (identity.runId !== run.runId) violations.push(`${identity.ref}: runId does not match run_meta`);
+    if (identity.label !== run.label) violations.push(`${identity.ref}: label does not match run_meta`);
+    if (identity.cohortId !== null && identity.cohortId !== run.cohortId) {
+      violations.push(`${identity.ref}: cohortId does not match run_meta`);
+    }
+  }
+
+  // Frozen arm manifest: the arms are known ahead of time, never inferred
+  // from surviving records — a relabeled or missing arm is a violation.
+  const expectedArms = options?.expectedArms ?? defaultExpectedArms();
+  const expectedById = new Map(expectedArms.map((arm) => [arm.participantId, arm]));
+  const seenArmIds = new Set(run.armResponses.map((r) => r.participantId));
+  for (const arm of expectedArms) {
+    if (!seenArmIds.has(arm.participantId)) {
+      violations.push(`expected arm ${arm.participantId} has no responses in this run`);
+    }
+  }
+  for (const participantId of seenArmIds) {
+    if (!expectedById.has(participantId)) {
+      violations.push(`unexpected arm ${participantId} is not in the frozen arm manifest`);
+    }
+  }
+  for (const response of run.armResponses) {
+    const expected = expectedById.get(response.participantId);
+    if (
+      expected !== undefined &&
+      (response.provider !== expected.provider || response.requestedModelId !== expected.requestedModelId)
+    ) {
+      violations.push(
+        `arm ${response.participantId}: provider/requestedModelId does not match the frozen arm manifest`,
+      );
+    }
+  }
 
   for (const failure of run.runFailures) {
     violations.push(
@@ -514,21 +617,53 @@ export function verifyRunIntegrity(run: SourceRun): string[] {
     }
   }
 
-  // Baseline uniqueness and baseline×game cross-product.
-  const baselineGamesByArm = new Map<string, Set<string>>();
+  // Baselines are RE-DERIVED: the six deterministic policies are re-run on
+  // the hash-verified bundles and every recorded baseline decision must
+  // match its re-derivation exactly — a tampered comparator cannot hide
+  // behind bundle-valid sides and prices.
+  const sortedGames = [...run.games.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([, game]) => game.rawBundle);
+  const reconstructedSlate = {
+    schemaVersion: 1,
+    label: run.label,
+    league: 'mlb',
+    slateDate: run.slateDate,
+    bundleTimestamp: run.bundleTimestamp,
+    cutoffAt: run.slateCutoffAt,
+    games: sortedGames,
+  } as unknown as SlateBundle;
+  const expectedBaselines = new Map(
+    runBaselines(reconstructedSlate).map((d) => [`${d.participantId}:${d.gameId}`, d]),
+  );
+  const seenBaselineKeys = new Set<string>();
   for (const pick of baselinePicks) {
-    const games = baselineGamesByArm.get(pick.participantId) ?? new Set<string>();
-    if (games.has(pick.gameId)) {
-      violations.push(`duplicate baseline decision for ${pick.participantId}:${pick.gameId}`);
+    const key = `${pick.participantId}:${pick.gameId}`;
+    if (seenBaselineKeys.has(key)) {
+      violations.push(`duplicate baseline decision for ${key}`);
+      continue;
     }
-    games.add(pick.gameId);
-    baselineGamesByArm.set(pick.participantId, games);
+    seenBaselineKeys.add(key);
+    const expected = expectedBaselines.get(key);
+    if (!expected) {
+      violations.push(`baseline decision ${key} is not produced by the deterministic policies`);
+      continue;
+    }
+    if (pick.policyVersion !== BASELINE_POLICY_VERSION) {
+      violations.push(`baseline decision ${key}: unexpected policyVersion ${pick.policyVersion ?? 'null'}`);
+    }
+    if (
+      pick.market !== expected.market ||
+      pick.selection !== expected.selection ||
+      pick.line !== expected.line ||
+      pick.entryDecimal !== expected.observedDecimal
+    ) {
+      violations.push(`baseline decision ${key} does not match its deterministic re-derivation`);
+    }
   }
-  for (const [participantId, games] of baselineGamesByArm) {
-    if (games.size !== run.games.size) {
-      violations.push(
-        `baseline ${participantId} has decisions for ${games.size} of ${run.games.size} games — the baseline×game cross-product is incomplete`,
-      );
+  for (const key of expectedBaselines.keys()) {
+    if (!seenBaselineKeys.has(key)) {
+      violations.push(`expected deterministic baseline decision ${key} is missing`);
     }
   }
 
@@ -566,6 +701,19 @@ export function verifyRunIntegrity(run: SourceRun): string[] {
     const shape = extracted === null ? null : benchmarkResponseSchema.safeParse(extracted);
     if (shape === null || !shape.success) {
       violations.push(`${key}: accepted raw response does not parse as a benchmark response`);
+      continue;
+    }
+    // Top-level identity of the archived response must match the verified
+    // run: a response minted for another cohort/participant/model/bundle
+    // cannot back these decisions.
+    const game = run.games.get(response.gameId);
+    if (
+      shape.data.cohortId !== run.cohortId ||
+      shape.data.participantId !== response.participantId ||
+      shape.data.requestedModelId !== response.requestedModelId ||
+      (game !== undefined && shape.data.bundleSha256 !== game.requestSha256)
+    ) {
+      violations.push(`${key}: accepted raw response identity does not match the verified run`);
       continue;
     }
     const responseGame = shape.data.games.find((g) => g.gameId === response.gameId);

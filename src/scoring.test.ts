@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import {
   aggregateByParticipant,
@@ -11,12 +12,20 @@ import {
 } from './scoring.js';
 import { makeRequest } from './testFactories.js';
 import type { GameRequest } from './bundle.js';
-import type { ClosingLineRow } from './types.js';
+import type { ClosingLineRow, SlateBundle } from './types.js';
 
 const GAME_A = '00000000-0000-4000-8000-0000000000a1';
 const GAME_B = '00000000-0000-4000-8000-0000000000b2';
 const LABEL = 'SMOKE_V0_NOT_A_COHORT';
 const BUNDLE_TS = '2026-07-12T14:05:00+00:00';
+
+const FIXTURE_ARMS = [
+  { participantId: 'model-arm', provider: 'openai', requestedModelId: 'stub-model-1' },
+];
+const FIXTURE_ARMS_WITH_TIMEOUT = [
+  ...FIXTURE_ARMS,
+  { participantId: 'timeout-arm', provider: 'xai', requestedModelId: 'stub-model-2' },
+];
 
 /**
  * Build a fully consistent run file (real hashes, correct echoes, arm
@@ -46,14 +55,18 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
   const slateSha256 = sha256Hex(canonicalize(slateBundle));
 
   const records: Array<Record<string, unknown>> = [];
+  const identity = { label: LABEL, runId: 'test-run' };
+  const shaByGame = new Map<string, { gameSha256: string; requestSha256: string }>();
   let armResponseCount = 0;
   let baselineCount = 0;
 
   for (const request of requests) {
     const game = request.game;
     const gameSha256 = sha256Hex(canonicalize(game));
+    shaByGame.set(game.gameId, { gameSha256, requestSha256: request.requestSha256 });
     records.push({
       recordType: 'bundle_game',
+      ...identity,
       gameId: game.gameId,
       slug: request.slug,
       cutoffAt: request.requestBundle.cutoffAt,
@@ -81,6 +94,8 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
 
     records.push({
       recordType: 'arm_game_response',
+      ...identity,
+      cohortId: 'test-cohort',
       participantId: 'model-arm',
       provider: 'openai',
       requestedModelId: 'stub-model-1',
@@ -96,6 +111,8 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
     if (options?.extraArm) {
       records.push({
         recordType: 'arm_game_response',
+        ...identity,
+        cohortId: 'test-cohort',
         participantId: options.extraArm.participantId,
         provider: 'xai',
         requestedModelId: 'stub-model-2',
@@ -113,6 +130,8 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
     for (const forecast of forecasts) {
       records.push({
         recordType: 'decision',
+        ...identity,
+        cohortId: 'test-cohort',
         participantId: 'model-arm',
         gameId: game.gameId,
         market: forecast.market,
@@ -133,18 +152,34 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
         slateSha256,
       });
     }
+  }
+
+  // The six deterministic baselines, re-derivable from the bundles.
+  const slateForBaselines: SlateBundle = {
+    schemaVersion: 1,
+    label: 'SMOKE_V0_NOT_A_COHORT',
+    league: 'mlb',
+    slateDate: '2026-07-12',
+    bundleTimestamp: BUNDLE_TS,
+    cutoffAt: '2026-07-12T16:15:00+00:00',
+    games: requests.map((r) => r.game),
+  };
+  for (const decision of runBaselines(slateForBaselines)) {
+    const shas = shaByGame.get(decision.gameId);
     records.push({
       recordType: 'baseline_decision',
-      participantId: 'baseline-away-ml',
-      policyVersion: 'baselines-v0.1.0',
-      gameId: game.gameId,
-      market: 'moneyline',
-      selection: game.awayTeam,
-      line: null,
-      observedDecimal: game.markets.moneyline.awayDecimal,
+      ...identity,
+      cohortId: 'test-cohort',
+      participantId: decision.participantId,
+      policyVersion: BASELINE_POLICY_VERSION,
+      gameId: decision.gameId,
+      market: decision.market,
+      selection: decision.selection,
+      line: decision.line,
+      observedDecimal: decision.observedDecimal,
       slateSha256,
-      gameSha256,
-      requestSha256: request.requestSha256,
+      gameSha256: shas?.gameSha256 ?? null,
+      requestSha256: shas?.requestSha256 ?? null,
     });
     baselineCount += 1;
   }
@@ -194,15 +229,21 @@ function closeRow(
 test('a consistent run file passes integrity verification', () => {
   const { lines } = fixtureRun();
   const run = parseRunRecords(lines);
-  assert.deepEqual(verifyRunIntegrity(run), []);
+  assert.deepEqual(verifyRunIntegrity(run, { expectedArms: FIXTURE_ARMS }), []);
 });
 
 test('a run with a recorded run_failure is refused', () => {
   const { lines } = fixtureRun();
   lines.push(
-    JSON.stringify({ recordType: 'run_failure', code: 'PROVIDER_COLLISION', failures: ['x'] }),
+    JSON.stringify({
+      recordType: 'run_failure',
+      label: LABEL,
+      runId: 'test-run',
+      code: 'PROVIDER_COLLISION',
+      failures: ['x'],
+    }),
   );
-  const violations = verifyRunIntegrity(parseRunRecords(lines));
+  const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('not scoreable')));
 });
 
@@ -215,7 +256,7 @@ test('the review mutation — a changed entry price with unchanged hashes — is
     }
     return JSON.stringify(record);
   });
-  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('does not match the frozen bundle price')));
 });
 
@@ -232,7 +273,7 @@ test('a tampered bundle is caught by hash recomputation', () => {
     }
     return JSON.stringify(record);
   });
-  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('gameSha256')));
 });
 
@@ -245,7 +286,7 @@ test('a fabricated decision with no backing arm response is caught', () => {
   const decision = JSON.parse(anyDecision) as Record<string, unknown>;
   decision['participantId'] = 'ghost-arm';
   lines.push(JSON.stringify(decision));
-  const violations = verifyRunIntegrity(parseRunRecords(lines));
+  const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('no arm_game_response')));
 });
 
@@ -259,7 +300,7 @@ test('a valid arm response with missing decisions is caught, as is a wrong per-m
       record['market'] === 'total'
     );
   });
-  const violations = verifyRunIntegrity(parseRunRecords(withoutOneDecision));
+  const violations = verifyRunIntegrity(parseRunRecords(withoutOneDecision), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('expected exactly one decision per market')));
 });
 
@@ -275,7 +316,7 @@ test('the round-2 probe: a decision swapped to the other bundle-valid side is ca
     }
     return JSON.stringify(record);
   });
-  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('does not match the accepted provider response')));
 });
 
@@ -289,7 +330,7 @@ test('forged decision provenance metadata is caught against the accepted attempt
     }
     return JSON.stringify(record);
   });
-  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('provenance does not match the accepted attempt')));
 });
 
@@ -302,7 +343,7 @@ test('an arm response whose request hash does not match the game is caught', () 
     }
     return JSON.stringify(record);
   });
-  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes("does not match the game's request hash")));
 });
 
@@ -314,7 +355,7 @@ test('deleting an arm entirely is caught by the manifest count and cross-product
       record['recordType'] === 'arm_game_response' && record['participantId'] === 'timeout-arm'
     );
   });
-  const violations = verifyRunIntegrity(parseRunRecords(withoutTimeoutArm));
+  const violations = verifyRunIntegrity(parseRunRecords(withoutTimeoutArm), { expectedArms: FIXTURE_ARMS_WITH_TIMEOUT });
   assert.ok(violations.some((v) => v.includes('arm-game responses but')));
 });
 
@@ -324,7 +365,7 @@ test('deleting baseline decisions is caught by the manifest count', () => {
     const record = JSON.parse(line) as Record<string, unknown>;
     return record['recordType'] !== 'baseline_decision';
   });
-  const violations = verifyRunIntegrity(parseRunRecords(withoutBaselines));
+  const violations = verifyRunIntegrity(parseRunRecords(withoutBaselines), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('baseline decisions but')));
 });
 
@@ -339,8 +380,89 @@ test('a partially deleted baseline breaks the baseline×game cross-product', () 
     }
     return true;
   });
-  const violations = verifyRunIntegrity(parseRunRecords(partial));
-  assert.ok(violations.some((v) => v.includes('cross-product is incomplete')));
+  const violations = verifyRunIntegrity(parseRunRecords(partial), { expectedArms: FIXTURE_ARMS });
+  assert.ok(violations.some((v) => v.includes('is missing')));
+});
+
+test('the round-3 probe: a tampered baseline at a bundle-valid price fails re-derivation', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (
+      record['recordType'] === 'baseline_decision' &&
+      record['participantId'] === 'baseline-away-ml' &&
+      record['gameId'] === GAME_A
+    ) {
+      // The HOME team at its valid frozen price — bundle-valid, policy-false.
+      record['selection'] = 'Pittsburgh Pirates';
+      record['observedDecimal'] = 2.17;
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(violations.some((v) => v.includes('does not match its deterministic re-derivation')));
+});
+
+test('duplicate run_meta and duplicate bundle_game records are structural errors', () => {
+  const { lines } = fixtureRun();
+  const meta = lines.find(
+    (line) => (JSON.parse(line) as Record<string, unknown>)['recordType'] === 'run_meta',
+  );
+  assert.ok(meta);
+  assert.throws(() => parseRunRecords([...lines, meta]), /more than one run_meta/);
+  const bundleGame = lines.find(
+    (line) => (JSON.parse(line) as Record<string, unknown>)['recordType'] === 'bundle_game',
+  );
+  assert.ok(bundleGame);
+  assert.throws(() => parseRunRecords([...lines, bundleGame]), /more than one bundle_game/);
+});
+
+test('a forged accepted-response top-level identity is caught', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as {
+      recordType?: string;
+      gameId?: string;
+      attempt?: { rawResponse?: string };
+    };
+    if (record.recordType === 'arm_game_response' && record.gameId === GAME_A && record.attempt?.rawResponse) {
+      const raw = JSON.parse(record.attempt.rawResponse) as Record<string, unknown>;
+      raw['cohortId'] = 'forged-cohort';
+      record.attempt.rawResponse = JSON.stringify(raw);
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(violations.some((v) => v.includes('raw response identity does not match')));
+});
+
+test('a relabeled arm is caught by the frozen arm manifest', () => {
+  const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (record['recordType'] === 'arm_game_response' && record['participantId'] === 'timeout-arm') {
+      record['participantId'] = 'fake-arm';
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), {
+    expectedArms: FIXTURE_ARMS_WITH_TIMEOUT,
+  });
+  assert.ok(violations.some((v) => v.includes('expected arm timeout-arm has no responses')));
+  assert.ok(violations.some((v) => v.includes('unexpected arm fake-arm')));
+});
+
+test('a record stamped with another run/cohort identity is caught', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (record['recordType'] === 'decision' && record['market'] === 'spread' && record['gameId'] === GAME_B) {
+      record['cohortId'] = 'someone-elses-cohort';
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(violations.some((v) => v.includes('cohortId does not match run_meta')));
 });
 
 test('parseRunRecords fails loudly without run_meta', () => {
@@ -396,7 +518,7 @@ test('equal-weight game-level primary differs from per-pick pooling and is the p
 test('arms with zero valid decisions stay in the denominators (no survivor bias)', () => {
   const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
   const run = parseRunRecords(lines);
-  assert.deepEqual(verifyRunIntegrity(run), []);
+  assert.deepEqual(verifyRunIntegrity(run, { expectedArms: FIXTURE_ARMS_WITH_TIMEOUT }), []);
   const stats = aggregateByParticipant(scoreRun(run, []), run);
   const timeoutArm = stats.find((s) => s.participantId === 'timeout-arm');
   assert.ok(timeoutArm);
@@ -415,7 +537,8 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
   const stats = aggregateByParticipant(scored, run);
   const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z');
   const decisions = records.filter((r) => r['recordType'] === 'scored_decision');
-  assert.equal(decisions.length, 8);
+  // 6 model decisions + 12 deterministic baseline decisions (6 × 2 games).
+  assert.equal(decisions.length, 18);
   const modelDecision = decisions.find((r) => r['kind'] === 'model');
   assert.ok(modelDecision);
   assert.equal(modelDecision['reportedModelId'], 'stub-model-1');
