@@ -20,11 +20,21 @@ const LABEL = 'SMOKE_V0_NOT_A_COHORT';
 const BUNDLE_TS = '2026-07-12T14:05:00+00:00';
 
 const FIXTURE_ARMS = [
-  { participantId: 'model-arm', provider: 'openai', requestedModelId: 'stub-model-1' },
+  {
+    participantId: 'model-arm',
+    provider: 'openai',
+    requestedModelId: 'stub-model-1',
+    approvedReportedModelIds: ['stub-model-1'],
+  },
 ];
 const FIXTURE_ARMS_WITH_TIMEOUT = [
   ...FIXTURE_ARMS,
-  { participantId: 'timeout-arm', provider: 'xai', requestedModelId: 'stub-model-2' },
+  {
+    participantId: 'timeout-arm',
+    provider: 'xai',
+    requestedModelId: 'stub-model-2',
+    approvedReportedModelIds: ['stub-model-2'],
+  },
 ];
 
 /**
@@ -433,7 +443,86 @@ test('a forged accepted-response top-level identity is caught', () => {
     return JSON.stringify(record);
   });
   const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
-  assert.ok(violations.some((v) => v.includes('raw response identity does not match')));
+  assert.ok(violations.some((v) => v.includes('fails the harness validator')));
+});
+
+test('the round-4 probe: stripped run_failure records cannot hide a recomputed identity failure', () => {
+  const { lines } = fixtureRun();
+  // Forge an unapproved reported model ID everywhere it is archived — the
+  // identity gate is recomputed from the archives, so no run_failure record
+  // is needed to catch it.
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as {
+      recordType?: string;
+      reportedModelId?: string | null;
+      attempt?: { reportedModelId?: string | null };
+    };
+    if (record.recordType === 'arm_game_response') {
+      record.reportedModelId = 'unapproved-model-x';
+      if (record.attempt) record.attempt.reportedModelId = 'unapproved-model-x';
+    }
+    if (record.recordType === 'decision') {
+      (record as Record<string, unknown>)['reportedModelId'] = 'unapproved-model-x';
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(
+    violations.some((v) => v.startsWith('recomputed identity gate:') && v.includes('unapproved-model-x')),
+  );
+});
+
+test('the round-4 probe: a semantically invalid accepted response is caught by the full harness validator', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as {
+      recordType?: string;
+      gameId?: string;
+      attempt?: { rawResponse?: string };
+    };
+    if (record.recordType === 'arm_game_response' && record.gameId === GAME_A && record.attempt?.rawResponse) {
+      const raw = JSON.parse(record.attempt.rawResponse) as {
+        executionPolicy: string;
+        games: Array<{ forecasts: Array<{ probabilities: { win: number; push: number; loss: number } }> }>;
+      };
+      raw.executionPolicy = 'model-choice-side-total';
+      const forecast = raw.games[0]?.forecasts[0];
+      if (forecast) forecast.probabilities = { win: 0.8, push: 0, loss: 0.8 };
+      record.attempt.rawResponse = JSON.stringify(raw);
+    }
+    // Mirror the broken probabilities in the decision record so the old
+    // correspondence check alone would not catch it.
+    if (record.recordType === 'decision' && record.gameId === GAME_A) {
+      const decision = record as Record<string, unknown>;
+      if (decision['market'] === 'moneyline') {
+        decision['probabilities'] = { win: 0.8, push: 0, loss: 0.8 };
+      }
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(violations.some((v) => v.includes('fails the harness validator')));
+});
+
+test('the round-4 symmetric probe: a valid response demoted to invalid_schema is caught', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines
+    .filter((line) => {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      // Delete the demoted response's decisions, as a forger would.
+      return !(record['recordType'] === 'decision' && record['gameId'] === GAME_B);
+    })
+    .map((line) => {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      if (record['recordType'] === 'arm_game_response' && record['gameId'] === GAME_B) {
+        record['outcome'] = 'invalid_schema';
+      }
+      return JSON.stringify(record);
+    });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(
+    violations.some((v) => v.includes('a valid response cannot be demoted')),
+  );
 });
 
 test('a relabeled arm is caught by the frozen arm manifest', () => {

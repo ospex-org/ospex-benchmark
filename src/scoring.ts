@@ -2,11 +2,19 @@ import { z } from 'zod';
 import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { scoreDecision } from './clv.js';
-import { ARMS } from './providers/index.js';
-import { benchmarkResponseSchema, extractJson } from './schema.js';
+import { checkProviderCollision } from './providers/family.js';
+import { approvedReportedModelIds, ARMS } from './providers/index.js';
+import {
+  benchmarkResponseSchema,
+  compareFingerprints,
+  extractDecisionFingerprint,
+  extractJson,
+  fingerprintFromParsed,
+  validateResponseText,
+} from './schema.js';
 import { SMOKE_LABEL } from './types.js';
 import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
-import type { ClosingLineRow, MarketKey, SlateBundle } from './types.js';
+import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } from './types.js';
 
 /**
  * Pure scoring assembly, no I/O: parse a run's records, VERIFY THE RUN'S
@@ -210,6 +218,9 @@ export interface ArmResponseRef {
   requestSha256: string;
   outcome: string;
   repairUsed: boolean;
+  /** Archived attempt evidence — the root of trust for recomputation. */
+  attempt: { reportedModelId: string | null; providerResponseId: string | null; rawResponse: string | null };
+  repair: { reportedModelId: string | null; providerResponseId: string | null; rawResponse: string | null } | null;
   /** The ACCEPTED attempt (repair when a repair was used). */
   accepted: {
     reportedModelId: string | null;
@@ -320,6 +331,19 @@ export function parseRunRecords(lines: string[]): SourceRun {
           requestSha256: response.requestSha256,
           outcome: response.outcome,
           repairUsed: response.repairUsed,
+          attempt: {
+            reportedModelId: response.attempt.reportedModelId,
+            providerResponseId: response.attempt.providerResponseId,
+            rawResponse: response.attempt.rawResponse,
+          },
+          repair:
+            response.repair === null
+              ? null
+              : {
+                  reportedModelId: response.repair.reportedModelId,
+                  providerResponseId: response.repair.providerResponseId,
+                  rawResponse: response.repair.rawResponse,
+                },
           accepted: {
             reportedModelId: accepted.reportedModelId,
             providerResponseId: accepted.providerResponseId,
@@ -472,6 +496,8 @@ export interface ExpectedArm {
   participantId: string;
   provider: string;
   requestedModelId: string;
+  /** Exact approved response-reported model IDs for this arm. */
+  approvedReportedModelIds: string[];
 }
 
 /** The frozen smoke-v0 arm manifest, from the harness's own arm registry. */
@@ -480,6 +506,7 @@ export function defaultExpectedArms(): ExpectedArm[] {
     participantId: arm.participantId,
     provider: arm.provider,
     requestedModelId: arm.requestedModelId,
+    approvedReportedModelIds: approvedReportedModelIds(arm.participantId),
   }));
 }
 
@@ -536,6 +563,7 @@ export function verifyRunIntegrity(
   const sortedBundles: unknown[] = [...run.games.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([, game]) => game.rawBundle);
+  const requestBundleByGame = new Map<string, SlateBundle>();
   for (const [gameId, game] of run.games) {
     const recomputedGame = sha256Hex(canonicalize(game.rawBundle));
     if (recomputedGame !== game.gameSha256) {
@@ -554,6 +582,9 @@ export function verifyRunIntegrity(
     if (sha256Hex(canonicalize(requestBundle)) !== game.requestSha256) {
       violations.push(`game ${gameId}: recorded requestSha256 does not match the recomputed request bundle hash`);
     }
+    // The hash-verified request bundle is what the arm actually received;
+    // the full harness validator re-runs against it below.
+    requestBundleByGame.set(gameId, requestBundle as unknown as SlateBundle);
   }
   const firstGame = [...run.games.values()][0];
   const slateBundle = {
@@ -697,26 +728,64 @@ export function verifyRunIntegrity(
       violations.push(`${key}: accepted response retains no raw text — decisions cannot be re-derived`);
       continue;
     }
-    const extracted = extractJson(response.accepted.rawResponse);
-    const shape = extracted === null ? null : benchmarkResponseSchema.safeParse(extracted);
-    if (shape === null || !shape.success) {
-      violations.push(`${key}: accepted raw response does not parse as a benchmark response`);
-      continue;
-    }
-    // Top-level identity of the archived response must match the verified
-    // run: a response minted for another cohort/participant/model/bundle
-    // cannot back these decisions.
+    // The FULL harness validator re-runs on the archived accepted response
+    // against the hash-verified request bundle: a recorded 'valid' outcome
+    // that the harness's own gate would reject is a violation, not a shrug.
+    const requestBundle = requestBundleByGame.get(response.gameId);
     const game = run.games.get(response.gameId);
-    if (
-      shape.data.cohortId !== run.cohortId ||
-      shape.data.participantId !== response.participantId ||
-      shape.data.requestedModelId !== response.requestedModelId ||
-      (game !== undefined && shape.data.bundleSha256 !== game.requestSha256)
-    ) {
-      violations.push(`${key}: accepted raw response identity does not match the verified run`);
+    if (requestBundle === undefined || game === undefined) {
+      violations.push(`${key}: no verified request bundle for game ${response.gameId}`);
       continue;
     }
-    const responseGame = shape.data.games.find((g) => g.gameId === response.gameId);
+    const armSpecForValidation = {
+      participantId: response.participantId,
+      provider: response.provider,
+      requestedModelId: response.requestedModelId,
+      credentialEnvVar: '',
+    } as ArmSpec;
+    const revalidation = validateResponseText(
+      response.accepted.rawResponse,
+      requestBundle,
+      game.requestSha256,
+      armSpecForValidation,
+      run.cohortId,
+    );
+    if (revalidation.errors.length > 0 || revalidation.parsed === null) {
+      violations.push(
+        `${key}: accepted response fails the harness validator (${revalidation.errors[0] ?? 'no parse'}) — recorded 'valid' outcome is not reproducible`,
+      );
+      continue;
+    }
+    if (response.repairUsed) {
+      // The repair-acceptance rules re-run from the archived attempts: the
+      // initial must have failed validation with a complete fingerprint the
+      // accepted repair preserves exactly.
+      const initialRaw = response.attempt.rawResponse;
+      if (initialRaw === null) {
+        violations.push(`${key}: repair was used but no initial raw response is archived`);
+      } else {
+        const initialValidation = validateResponseText(
+          initialRaw,
+          requestBundle,
+          game.requestSha256,
+          armSpecForValidation,
+          run.cohortId,
+        );
+        if (initialValidation.errors.length === 0) {
+          violations.push(`${key}: repair was used but the archived initial response already validates`);
+        }
+        const initialFingerprint = extractDecisionFingerprint(initialRaw, requestBundle);
+        if (initialFingerprint === null) {
+          violations.push(`${key}: repair was used but the initial response has no complete decision fingerprint`);
+        } else if (
+          compareFingerprints(initialFingerprint, fingerprintFromParsed(revalidation.parsed)).length > 0
+        ) {
+          violations.push(`${key}: the accepted repair changed decisions relative to the initial response`);
+        }
+      }
+    }
+    const shapeData = revalidation.parsed;
+    const responseGame = shapeData.games.find((g) => g.gameId === response.gameId);
     if (!responseGame) {
       violations.push(`${key}: accepted raw response does not contain game ${response.gameId}`);
       continue;
@@ -757,6 +826,117 @@ export function verifyRunIntegrity(
       violations.push(
         `valid arm response ${response.participantId}:${response.gameId} has no decision records`,
       );
+    }
+  }
+
+  // Outcome-class consistency for NON-valid outcomes, mirroring the runner's
+  // own rules from the archived attempts — a valid response cannot be demoted
+  // to invalid_schema (hiding it from scoring), and transport outcomes cannot
+  // carry response bodies.
+  for (const response of run.armResponses) {
+    const key = `${response.participantId}:${response.gameId}`;
+    const requestBundle = requestBundleByGame.get(response.gameId);
+    const game = run.games.get(response.gameId);
+    if (requestBundle === undefined || game === undefined) continue;
+    const armSpecForValidation = {
+      participantId: response.participantId,
+      provider: response.provider,
+      requestedModelId: response.requestedModelId,
+      credentialEnvVar: '',
+    } as ArmSpec;
+    if (response.outcome === 'invalid_schema') {
+      const initialRaw = response.attempt.rawResponse;
+      if (initialRaw === null) {
+        violations.push(`${key}: invalid_schema outcome with no archived initial response`);
+        continue;
+      }
+      const initialValidation = validateResponseText(
+        initialRaw,
+        requestBundle,
+        game.requestSha256,
+        armSpecForValidation,
+        run.cohortId,
+      );
+      if (initialValidation.errors.length === 0) {
+        violations.push(
+          `${key}: recorded invalid_schema but the archived initial response validates — a valid response cannot be demoted`,
+        );
+        continue;
+      }
+      const repairRaw = response.repair?.rawResponse ?? null;
+      if (response.repairUsed && repairRaw !== null) {
+        const repairValidation = validateResponseText(
+          repairRaw,
+          requestBundle,
+          game.requestSha256,
+          armSpecForValidation,
+          run.cohortId,
+        );
+        if (repairValidation.errors.length === 0 && repairValidation.parsed !== null) {
+          const initialFingerprint = extractDecisionFingerprint(initialRaw, requestBundle);
+          if (
+            initialFingerprint !== null &&
+            compareFingerprints(initialFingerprint, fingerprintFromParsed(repairValidation.parsed)).length === 0
+          ) {
+            violations.push(
+              `${key}: recorded invalid_schema but the archived repair validates and preserves the fingerprint — this response should be valid`,
+            );
+          }
+        }
+      }
+      if (!response.repairUsed && extractDecisionFingerprint(initialRaw, requestBundle) !== null) {
+        violations.push(
+          `${key}: invalid_schema without a repair, but the initial response has a complete fingerprint — the harness would have attempted a repair`,
+        );
+      }
+    } else if (
+      response.outcome === 'timeout' ||
+      response.outcome === 'rate_limited' ||
+      response.outcome === 'provider_error' ||
+      response.outcome === 'credential_missing'
+    ) {
+      if (response.attempt.rawResponse !== null || (response.repair?.rawResponse ?? null) !== null) {
+        violations.push(`${key}: transport outcome ${response.outcome} cannot carry a response body`);
+      }
+    }
+    // cutoff_missed is timing-based and not recomputable from archives; its
+    // no-decisions invariant is enforced above.
+  }
+
+  // The identity/collision gate is RECOMPUTED from the archived reported
+  // model IDs and the approved-ID registry — the recomputed failure set must
+  // be empty regardless of whether run_failure records survived, and any
+  // recorded failures must correspond to recomputed ones.
+  const reportedByArm = new Map<string, Set<string>>();
+  const unidentifiedByArm = new Map<string, number>();
+  for (const response of run.armResponses) {
+    const reported = reportedByArm.get(response.participantId) ?? new Set<string>();
+    for (const attempt of [response.attempt, response.repair]) {
+      if (attempt === null) continue;
+      if (attempt.reportedModelId !== null) reported.add(attempt.reportedModelId);
+      if (attempt.rawResponse !== null && attempt.reportedModelId === null) {
+        unidentifiedByArm.set(response.participantId, (unidentifiedByArm.get(response.participantId) ?? 0) + 1);
+      }
+    }
+    reportedByArm.set(response.participantId, reported);
+  }
+  const recomputedIdentity = checkProviderCollision(
+    expectedArms.map((arm) => ({
+      participantId: arm.participantId,
+      provider: arm.provider as ProviderName,
+      requestedModelId: arm.requestedModelId,
+      approvedReportedModelIds: arm.approvedReportedModelIds,
+      reportedModelIds: [...(reportedByArm.get(arm.participantId) ?? new Set<string>())],
+      unidentifiedResponses: unidentifiedByArm.get(arm.participantId) ?? 0,
+    })),
+  );
+  for (const failure of recomputedIdentity.failures) {
+    violations.push(`recomputed identity gate: ${failure}`);
+  }
+  const recordedFailureTexts = new Set(run.runFailures.flatMap((f) => f.failures));
+  for (const recorded of recordedFailureTexts) {
+    if (!recomputedIdentity.failures.includes(recorded)) {
+      violations.push(`recorded run_failure does not correspond to any recomputed failure: ${recorded}`);
     }
   }
 
