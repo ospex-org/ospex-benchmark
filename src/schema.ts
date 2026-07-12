@@ -65,16 +65,92 @@ export const benchmarkResponseSchema = z
   .strict();
 
 /**
- * The exact field names the validator enforces, derived from the live zod
- * shapes (never a hand-maintained copy). The prompt scaffold must name every
- * one of them explicitly — the first live run proved that four different
- * labs, given prose alone, each invent their own field names.
+ * Structural walk of the response schema, used to build the prompt's
+ * response template FROM the validator itself. The first live run proved
+ * that four different labs, given prose alone, each invent their own field
+ * names — so prompt/schema alignment must hold by construction, at every
+ * nesting depth, not by a hand-maintained name list.
  */
-export const RESPONSE_FIELD_NAMES = {
-  root: Object.keys(benchmarkResponseSchema.shape),
-  game: Object.keys(gameForecastsSchema.shape),
-  forecast: Object.keys(forecastSchema.shape),
-} as const;
+function unwrapSchema(node: z.ZodTypeAny): z.ZodTypeAny {
+  let current = node;
+  for (;;) {
+    if (current instanceof z.ZodOptional || current instanceof z.ZodNullable) {
+      current = current.unwrap() as z.ZodTypeAny;
+    } else if (current instanceof z.ZodEffects) {
+      current = current.innerType() as z.ZodTypeAny;
+    } else if (current instanceof z.ZodDefault) {
+      current = current.removeDefault() as z.ZodTypeAny;
+    } else {
+      return current;
+    }
+  }
+}
+
+/**
+ * Every LEAF path of a zod schema, recursively — objects descend by key
+ * (`a.b`), arrays by element (`a[]`). Shape changes are visible in the path
+ * set itself: turning the probabilities object into an array replaces
+ * `…probabilities.win/push/loss` with `…probabilities[]`.
+ */
+export function schemaLeafPaths(schema: z.ZodTypeAny, prefix = ''): string[] {
+  const node = unwrapSchema(schema);
+  if (node instanceof z.ZodObject) {
+    const paths: string[] = [];
+    for (const [key, child] of Object.entries(node.shape as Record<string, z.ZodTypeAny>)) {
+      paths.push(...schemaLeafPaths(child, prefix === '' ? key : `${prefix}.${key}`));
+    }
+    return paths;
+  }
+  if (node instanceof z.ZodArray) {
+    return schemaLeafPaths(node.element as z.ZodTypeAny, `${prefix}[]`);
+  }
+  return [prefix];
+}
+
+/**
+ * Render the response template text by walking the schema and substituting a
+ * placeholder per leaf path. Fails loudly — a schema leaf with no
+ * placeholder, or a placeholder naming a nonexistent leaf, throws. Because
+ * the scaffold is built through this function at module load, a schema
+ * change without a template update breaks every entry point and test.
+ */
+export function renderResponseTemplate(
+  schema: z.ZodTypeAny,
+  placeholders: Record<string, string>,
+): string {
+  const used = new Set<string>();
+  const render = (node: z.ZodTypeAny, path: string, indent: string): string => {
+    const unwrapped = unwrapSchema(node);
+    if (unwrapped instanceof z.ZodObject) {
+      const inner = Object.entries(unwrapped.shape as Record<string, z.ZodTypeAny>)
+        .map(
+          ([key, child]) =>
+            `${indent}  "${key}": ${render(child, path === '' ? key : `${path}.${key}`, `${indent}  `)}`,
+        )
+        .join(',\n');
+      return `{\n${inner}\n${indent}}`;
+    }
+    if (unwrapped instanceof z.ZodArray) {
+      return `[\n${indent}  ${render(unwrapped.element as z.ZodTypeAny, `${path}[]`, `${indent}  `)}\n${indent}]`;
+    }
+    const placeholder = placeholders[path];
+    if (placeholder === undefined) {
+      throw new Error(
+        `response template has no placeholder for schema field "${path}" — the output schema changed without updating the prompt scaffold`,
+      );
+    }
+    used.add(path);
+    return placeholder;
+  };
+  const rendered = render(schema, '', '');
+  const extra = Object.keys(placeholders).filter((key) => !used.has(key));
+  if (extra.length > 0) {
+    throw new Error(
+      `response-template placeholders name schema fields that do not exist: ${extra.join(', ')}`,
+    );
+  }
+  return rendered;
+}
 
 const PROBABILITY_SUM_TOLERANCE = 1e-6;
 
