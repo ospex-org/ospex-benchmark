@@ -30,6 +30,14 @@ The authoritative methodology lives in this repo:
 
 Per-game dispatch means one game's failure affects only that game, and each game carries its own decision cutoff (its scheduled first pitch) — a slate cannot be batched when each game's deadline is independent.
 
+**Deadline safety.** Games are dispatched in cutoff order (earliest first pitch first; canonical hash ordering is separate and stays by game ID). The clock is checked before each dispatch, before any repair, and on every response acceptance; each provider call is additionally bounded by the remaining time to its game's cutoff. A response that does not exist acceptably before first pitch records the explicit outcome `cutoff_missed` and never emits decision records.
+
+**Repair integrity.** A response gets at most one deterministic format repair, and the repair is accepted only when the initial response yields a complete, unambiguous decision fingerprint (every game/market with all decision-bearing fields) that the repair preserves exactly — selection, line, observed price, probabilities, confidence, abstention, and execution marking. An unparseable or incomplete initial response is unrepairable and stays `invalid_schema`; a repair blocked by transport (timeout/429/HTTP failure) records its transport outcome separately so a throttle is never readable as a schema failure.
+
+**Model identity, fail-closed.** Every response-reported model ID must match the arm's approved list exactly (`APPROVED_REPORTED_MODEL_IDS` — the live preflight verified all four labs echo the requested ID verbatim). An unapproved ID — including a same-family substitution — or reported-ID drift across games fails the run loudly, alongside the family-level `PROVIDER_COLLISION` assertions.
+
+**Frozen-input freshness.** Every market row must carry a parseable feed-side observation timestamp that is neither in the future (beyond a 2-minute skew allowance) nor older than 30 minutes at bundle assembly time; violations exclude the game with stable reason codes (`stale_quote:*`, `future_quote:*`, `invalid_quote_timestamp:*`). The bundle timestamp is the fetch **completion** time, so no observation postdates it.
+
 ### Requirements
 
 Node.js ≥ 20.6 and yarn. Install dependencies with `yarn install`.
@@ -48,7 +56,7 @@ Sends one trivial request per provider through the real adapter code path (the s
 yarn smoke:dry
 ```
 
-Runs the full pipeline against a synthetic fixture slate and four scripted mock arms that exercise every path: valid responses, a malformed response repaired into validity, a schema-violating response that stays invalid after the single deterministic repair (on one game only — proving the failure does not poison the rest of the slate), a simulated HTTP 429 producing `rate_limited`, and a timeout. Add `--simulate-collision` to watch the `PROVIDER_COLLISION` hard failure fire.
+Runs the full pipeline against a synthetic fixture slate (with a fixed capture timestamp and a fixed injected clock, so cutoff enforcement runs deterministically rather than being bypassed) and four scripted mock arms that exercise every path: valid responses, a wrong-echo response repaired into validity with identical decisions, a structurally incomplete response that is unrepairable (on one game only — proving the failure does not poison the rest of the slate), a simulated HTTP 429 producing `rate_limited`, and a timeout. Add `--simulate-collision` to watch the `PROVIDER_COLLISION` hard failure fire.
 
 ### Unit tests
 
@@ -56,7 +64,7 @@ Runs the full pipeline against a synthetic fixture slate and four scripted mock 
 yarn test
 ```
 
-Covers the slate-date rules and the bundle builder (including the probable-pitcher forward-compatibility and per-game request hashing).
+Covers the slate-date rules, the bundle builder (probable-pitcher forward-compatibility, quote freshness, dispatch-vs-hash ordering, per-game request hashing), the output schema and decision fingerprints, the runner's deadline/repair/transport behavior under an injected clock, the fail-closed model-identity checks, and record provenance plus the redaction chokepoint.
 
 ### Live shadow run
 
@@ -74,9 +82,11 @@ Environment (see `.env.example`): values come from environment variables; a loca
 
 Output lands in `out/` (gitignored): `<runId>.ndjson` (one record per line: run metadata, per-game bundles with hashes, per-arm-per-game responses, per-decision records, baseline decisions) and `<runId>-summary.md`.
 
-Every decision is keyed by `gameId` — the upstream odds-feed event UUID that the production closing-line capture also keys on — so each pick joins to its closing line for later scoring. Outcome codes are `valid`, `invalid_schema`, `timeout`, `credential_missing`, plus two deliberate extensions: `rate_limited` (HTTP 429 — a throttle must never read as a model failure) and `provider_error` (other transport/HTTP failures).
+Every decision is keyed by `gameId` — the upstream odds-feed event identifier that the production closing-line capture also keys on — so each pick joins to its closing line for later scoring. Outcome codes are `valid`, `invalid_schema`, `timeout`, `credential_missing`, plus three deliberate extensions: `rate_limited` (HTTP 429 — a throttle must never read as a model failure), `provider_error` (other transport/HTTP failures), and `cutoff_missed` (the decision window closed first; never emits decisions).
 
-Token accounting: each response's provider usage object is stored **verbatim** (`usageRaw`, including reasoning/thinking-token fields) alongside normalized counts. Dollar cost is never fabricated — a price table can be applied retroactively; token counts cannot be recovered after the fact.
+Token accounting: each response's provider usage object is stored **verbatim** (`usageRaw`, including reasoning/thinking-token fields and any provider-reported cost figure) alongside normalized counts. Every live call carries an explicit output-token bound (default 16000, `--max-output-tokens`), recorded in the request params. Dollar cost is never fabricated — a price table can be applied retroactively; token counts cannot be recovered after the fact.
+
+Artifact safety: every byte serialized to NDJSON or the summary passes through credential redaction at the write chokepoint — parsed rationales, validation errors, reported IDs, and raw usage objects included, not just raw response text.
 
 ### Slate-date rule
 

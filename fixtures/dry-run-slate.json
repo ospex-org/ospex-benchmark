@@ -1,5 +1,6 @@
 {
-  "note": "Synthetic dry-run fixture. Game IDs are reserved placeholder UUIDs and every price is invented; only the wire SHAPES mirror the real read path (core-api /v1/games rows and PostgREST current_odds rows, including the +00:00 timestamptz form). Game 4 deliberately lacks a total market to exercise the exclusion path.",
+  "note": "Synthetic dry-run fixture. Game IDs are reserved placeholder UUIDs and every price is invented; only the wire SHAPES mirror the real read path (core-api /v1/games rows and PostgREST current_odds rows, including the +00:00 timestamptz form). Game 4 deliberately lacks a total market to exercise the exclusion path. capturedAt is the fixed capture instant: every market observedAt <= capturedAt < every cutoff.",
+  "capturedAt": "2026-07-12T14:05:00+00:00",
   "games": [
     {
       "gameId": "00000000-0000-4000-8000-000000000001",

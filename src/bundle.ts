@@ -43,6 +43,27 @@ function evidenceRef(gameId: string, field: string): string {
   return `ev:${gameId}:${field}`;
 }
 
+/**
+ * Preregistered reference-quote freshness policy. A market row is usable only
+ * if its feed-side observation timestamp parses, is not in the future beyond
+ * a small clock-skew allowance, and is no older than the maximum quote age at
+ * bundle assembly time. Violations exclude the game with a stable reason code.
+ */
+export const MAX_QUOTE_AGE_MS = 30 * 60 * 1000;
+export const FUTURE_QUOTE_SKEW_MS = 2 * 60 * 1000;
+
+function quoteTimestampProblem(
+  row: CurrentOddsRow,
+  market: string,
+  assembledAtMs: number,
+): string | null {
+  const observedMs = Date.parse(row.upstream_last_updated);
+  if (Number.isNaN(observedMs)) return `invalid_quote_timestamp:${market}`;
+  if (observedMs > assembledAtMs + FUTURE_QUOTE_SKEW_MS) return `future_quote:${market}`;
+  if (assembledAtMs - observedMs > MAX_QUOTE_AGE_MS) return `stale_quote:${market}`;
+  return null;
+}
+
 function pitcherName(value: unknown): string | null {
   return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
 }
@@ -71,6 +92,7 @@ export function extractProbablePitchers(row: GamesEndpointRow): ProbablePitchers
 function buildGameBundle(
   game: GamesEndpointRow,
   odds: Map<string, CurrentOddsRow>,
+  assembledAtMs: number,
 ): { bundle: GameBundle } | { reason: string } {
   const moneyline = odds.get('moneyline');
   const spread = odds.get('spread');
@@ -90,6 +112,14 @@ function buildGameBundle(
     return { reason: 'one_sided_price:total' };
   }
   if (total.line === null) return { reason: 'missing_line:total' };
+  for (const [market, row] of [
+    ['moneyline', moneyline],
+    ['spread', spread],
+    ['total', total],
+  ] as const) {
+    const problem = quoteTimestampProblem(row, market, assembledAtMs);
+    if (problem !== null) return { reason: problem };
+  }
 
   const gameId = game.gameId;
   const spreadLine = spread.line;
@@ -166,6 +196,10 @@ export function buildBundle(
   const gameHashes: Record<string, string> = {};
   const provenance: BuildResult['provenance'] = {};
   const slugs = new Map<string, string>();
+  const assembledAtMs = Date.parse(inputs.fetchCompletedAt);
+  if (Number.isNaN(assembledAtMs)) {
+    throw new Error(`unparseable fetchCompletedAt: ${inputs.fetchCompletedAt}`);
+  }
 
   const slateRows = inputs.gamesRows
     .filter((g) => easternCalendarDay(g.matchTime) === slateDate)
@@ -176,7 +210,7 @@ export function buildBundle(
       excluded.push({ gameId: game.gameId, slug: game.slug, reason: `status:${game.status}` });
       continue;
     }
-    if (options.requireFuture && Date.parse(game.matchTime) <= Date.parse(inputs.fetchedAt)) {
+    if (options.requireFuture && Date.parse(game.matchTime) <= assembledAtMs) {
       excluded.push({ gameId: game.gameId, slug: game.slug, reason: 'already_started' });
       continue;
     }
@@ -184,7 +218,7 @@ export function buildBundle(
       excluded.push({ gameId: game.gameId, slug: game.slug, reason: 'has_odds_false' });
       continue;
     }
-    const result = buildGameBundle(game, oddsByGame.get(game.gameId) ?? new Map());
+    const result = buildGameBundle(game, oddsByGame.get(game.gameId) ?? new Map(), assembledAtMs);
     if ('reason' in result) {
       excluded.push({ gameId: game.gameId, slug: game.slug, reason: result.reason });
       continue;
@@ -216,7 +250,7 @@ export function buildBundle(
     label: SMOKE_LABEL,
     league: 'mlb',
     slateDate,
-    bundleTimestamp: inputs.fetchedAt,
+    bundleTimestamp: inputs.fetchCompletedAt,
     cutoffAt: slateCutoff,
     games: eligible,
   };
@@ -224,24 +258,36 @@ export function buildBundle(
   // The unit of dispatch: one frozen single-game bundle per eligible game,
   // each with its own cutoff (that game's first pitch). A slate cannot be
   // batched when each game's decision deadline is independent.
-  const requests: GameRequest[] = eligible.map((game) => {
-    const requestBundle: SlateBundle = {
-      schemaVersion: 1,
-      label: SMOKE_LABEL,
-      league: 'mlb',
-      slateDate,
-      bundleTimestamp: inputs.fetchedAt,
-      cutoffAt: game.scheduledStartUtc,
-      games: [game],
-    };
-    return {
-      gameId: game.gameId,
-      slug: slugs.get(game.gameId) ?? game.gameId,
-      game,
-      requestBundle,
-      requestSha256: sha256Hex(canonicalize(requestBundle)),
-    };
-  });
+  //
+  // Canonical hash ordering (slateBundle.games, by gameId) is deliberately
+  // separate from dispatch ordering: requests are sorted by cutoff so the
+  // earliest-starting game is always dispatched first, with the stable
+  // game-ID tie-breaker. Game IDs are opaque UUIDs and carry no time order.
+  const requests: GameRequest[] = eligible
+    .map((game) => {
+      const requestBundle: SlateBundle = {
+        schemaVersion: 1,
+        label: SMOKE_LABEL,
+        league: 'mlb',
+        slateDate,
+        bundleTimestamp: inputs.fetchCompletedAt,
+        cutoffAt: game.scheduledStartUtc,
+        games: [game],
+      };
+      return {
+        gameId: game.gameId,
+        slug: slugs.get(game.gameId) ?? game.gameId,
+        game,
+        requestBundle,
+        requestSha256: sha256Hex(canonicalize(requestBundle)),
+      };
+    })
+    .sort((a, b) => {
+      const timeDiff =
+        Date.parse(a.game.scheduledStartUtc) - Date.parse(b.game.scheduledStartUtc);
+      if (timeDiff !== 0) return timeDiff;
+      return a.gameId < b.gameId ? -1 : a.gameId > b.gameId ? 1 : 0;
+    });
 
   return {
     slateBundle,

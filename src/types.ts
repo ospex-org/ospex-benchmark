@@ -13,9 +13,11 @@ export type ProviderName = 'openai' | 'anthropic' | 'google' | 'xai';
 
 /**
  * Arm outcome codes, per (arm, game) request. The first four are the required
- * set; `rate_limited` (HTTP 429 — a throttle must never read as a model
- * failure) and `provider_error` (other transport/HTTP failures) are deliberate
- * extensions recorded honestly rather than shoehorned.
+ * set; the rest are deliberate extensions recorded honestly rather than
+ * shoehorned: `rate_limited` (HTTP 429 — a throttle must never read as a
+ * model failure), `provider_error` (other transport/HTTP failures), and
+ * `cutoff_missed` (the decision window closed before an acceptable response
+ * existed — never emits decision records).
  */
 export type ArmOutcome =
   | 'valid'
@@ -23,7 +25,11 @@ export type ArmOutcome =
   | 'timeout'
   | 'credential_missing'
   | 'rate_limited'
-  | 'provider_error';
+  | 'provider_error'
+  | 'cutoff_missed';
+
+/** Transport status of the repair attempt, recorded separately from outcome. */
+export type RepairTransport = 'ok' | 'timeout' | 'rate_limited' | 'provider_error' | null;
 
 export const SMOKE_LABEL = 'SMOKE_V0_NOT_A_COHORT';
 
@@ -151,7 +157,13 @@ export interface CurrentOddsRow {
 export interface SlateInputs {
   gamesRows: GamesEndpointRow[];
   oddsRows: CurrentOddsRow[];
-  fetchedAt: string;
+  /** Wall clock when fetching began (UTC ISO). */
+  fetchStartedAt: string;
+  /**
+   * Wall clock when fetching completed (UTC ISO) — the bundle assembly time.
+   * Every market observation must be at or before this instant.
+   */
+  fetchCompletedAt: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +253,11 @@ export interface ArmGameResult {
   attempt: AttemptRecord;
   repair: AttemptRecord | null;
   repairUsed: boolean;
+  /**
+   * Transport status of the repair attempt, separate from `outcome` so a
+   * throttled/failed repair is never readable as a schema failure alone.
+   */
+  repairTransport: RepairTransport;
   /** Parsed + validated response (present only when outcome === 'valid'). */
   parsed: BenchmarkResponse | null;
   validationErrors: string[];
@@ -261,6 +278,11 @@ export interface ForecastOutput {
   selectedForExecution: boolean;
   rationale: string;
   evidenceRefs: string[];
+  /**
+   * The supplied reason code the system prompt refers to: absent or null
+   * unless required information is missing or contradictory.
+   */
+  reasonCode?: 'missing_information' | 'contradictory_information' | null | undefined;
 }
 
 export interface GameForecastsOutput {

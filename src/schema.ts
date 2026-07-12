@@ -1,5 +1,12 @@
 import { z } from 'zod';
-import type { ArmSpec, BenchmarkResponse, GameBundle, SlateBundle } from './types.js';
+import type {
+  ArmSpec,
+  BenchmarkResponse,
+  ForecastOutput,
+  GameBundle,
+  MarketKey,
+  SlateBundle,
+} from './types.js';
 
 /**
  * Real-validator enforcement of the output contract in
@@ -26,8 +33,15 @@ const forecastSchema = z
     confidence: z.number().min(0).max(1),
     wouldAbstain: z.boolean(),
     selectedForExecution: z.boolean(),
-    rationale: z.string().min(1),
-    evidenceRefs: z.array(z.string().min(1)),
+    rationale: z
+      .string()
+      .min(1)
+      .refine((s) => s.trim().length > 0, 'rationale must not be whitespace-only'),
+    // Every rationale must be grounded: at least one bundle evidenceRef.
+    evidenceRefs: z.array(z.string().min(1)).min(1),
+    // The supplied reason codes the system prompt refers to. Absent or null
+    // unless required information is missing or contradictory.
+    reasonCode: z.enum(['missing_information', 'contradictory_information']).nullable().optional(),
   })
   .strict();
 
@@ -241,36 +255,124 @@ export function extractJson(rawText: string): unknown | null {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Decision fingerprints — repair-preservation proof
+// ---------------------------------------------------------------------------
+
 /**
- * A format repair may not change decisions. Where both attempts parsed,
- * compare the decision-bearing fields and reject changes.
+ * Every decision-bearing field of one forecast. A format repair is acceptable
+ * ONLY when the initial response yields a complete fingerprint and the
+ * accepted repair's fingerprint is identical — otherwise decision
+ * preservation cannot be proved and the result stays invalid.
  */
-export function detectChangedDecisions(
-  before: BenchmarkResponse,
-  after: BenchmarkResponse,
-): string[] {
-  const changes: string[] = [];
-  const beforeMap = new Map(
-    before.games.flatMap((g) => g.forecasts.map((f) => [`${g.gameId}:${f.market}`, f] as const)),
-  );
-  for (const game of after.games) {
+export interface ForecastFingerprint {
+  selection: string;
+  line: number | null;
+  observedDecimal: number;
+  win: number;
+  push: number;
+  loss: number;
+  confidence: number;
+  wouldAbstain: boolean;
+  selectedForExecution: boolean;
+}
+
+export type DecisionFingerprint = Map<string, ForecastFingerprint>;
+
+function forecastFingerprint(forecast: ForecastOutput): ForecastFingerprint {
+  return {
+    selection: forecast.selection,
+    line: forecast.line,
+    observedDecimal: forecast.observedDecimal,
+    win: forecast.probabilities.win,
+    push: forecast.probabilities.push,
+    loss: forecast.probabilities.loss,
+    confidence: forecast.confidence,
+    wouldAbstain: forecast.wouldAbstain,
+    selectedForExecution: forecast.selectedForExecution,
+  };
+}
+
+const REQUIRED_MARKETS: MarketKey[] = ['moneyline', 'spread', 'total'];
+
+/**
+ * A complete, unambiguous decision fingerprint of a raw response against the
+ * request bundle: the response must be parseable, shape-valid, and contain
+ * EXACTLY the bundle's games with exactly one forecast per market. Returns
+ * null otherwise — in which case no repair can prove decision preservation.
+ */
+export function extractDecisionFingerprint(
+  rawText: string,
+  bundle: SlateBundle,
+): DecisionFingerprint | null {
+  const extracted = extractJson(rawText);
+  if (extracted === null) return null;
+  const shape = benchmarkResponseSchema.safeParse(extracted);
+  if (!shape.success) return null;
+
+  const bundleIds = new Set(bundle.games.map((g) => g.gameId));
+  const fingerprint: DecisionFingerprint = new Map();
+  const seenGames = new Set<string>();
+  for (const game of shape.data.games) {
+    if (!bundleIds.has(game.gameId) || seenGames.has(game.gameId)) return null;
+    seenGames.add(game.gameId);
+    const markets = new Set<MarketKey>();
     for (const forecast of game.forecasts) {
-      const prior = beforeMap.get(`${game.gameId}:${forecast.market}`);
-      if (!prior) continue;
-      if (
-        prior.selection !== forecast.selection ||
-        prior.selectedForExecution !== forecast.selectedForExecution ||
-        prior.wouldAbstain !== forecast.wouldAbstain ||
-        prior.line !== forecast.line ||
-        prior.observedDecimal !== forecast.observedDecimal ||
-        prior.confidence !== forecast.confidence ||
-        prior.probabilities.win !== forecast.probabilities.win ||
-        prior.probabilities.push !== forecast.probabilities.push ||
-        prior.probabilities.loss !== forecast.probabilities.loss
-      ) {
-        changes.push(`changed_decision_after_repair: ${game.gameId} ${forecast.market}`);
+      if (markets.has(forecast.market)) return null;
+      markets.add(forecast.market);
+      fingerprint.set(`${game.gameId}:${forecast.market}`, forecastFingerprint(forecast));
+    }
+    if (REQUIRED_MARKETS.some((m) => !markets.has(m))) return null;
+  }
+  if (seenGames.size !== bundleIds.size) return null;
+  return fingerprint;
+}
+
+export function fingerprintFromParsed(parsed: BenchmarkResponse): DecisionFingerprint {
+  const fingerprint: DecisionFingerprint = new Map();
+  for (const game of parsed.games) {
+    for (const forecast of game.forecasts) {
+      fingerprint.set(`${game.gameId}:${forecast.market}`, forecastFingerprint(forecast));
+    }
+  }
+  return fingerprint;
+}
+
+/**
+ * Exact comparison of two fingerprints: identical key sets, identical values
+ * for every decision-bearing field. Added or missing games/forecasts count
+ * as changed decisions.
+ */
+export function compareFingerprints(
+  before: DecisionFingerprint,
+  after: DecisionFingerprint,
+): string[] {
+  const diffs: string[] = [];
+  for (const key of before.keys()) {
+    if (!after.has(key)) diffs.push(`changed_decision_after_repair: ${key} missing after repair`);
+  }
+  for (const key of after.keys()) {
+    if (!before.has(key)) diffs.push(`changed_decision_after_repair: ${key} added by repair`);
+  }
+  for (const [key, a] of before) {
+    const b = after.get(key);
+    if (!b) continue;
+    const fields: Array<keyof ForecastFingerprint> = [
+      'selection',
+      'line',
+      'observedDecimal',
+      'win',
+      'push',
+      'loss',
+      'confidence',
+      'wouldAbstain',
+      'selectedForExecution',
+    ];
+    for (const field of fields) {
+      if (a[field] !== b[field]) {
+        diffs.push(`changed_decision_after_repair: ${key} ${field} changed`);
       }
     }
   }
-  return changes;
+  return diffs;
 }

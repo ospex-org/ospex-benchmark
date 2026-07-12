@@ -1,5 +1,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { redactSecrets } from './config.js';
+import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
@@ -14,6 +16,9 @@ export interface RunContext {
   createdAt: string;
   executionPolicy: 'fixed-moneyline-total';
   timeoutMs: number;
+  maxOutputTokens: number;
+  fetchStartedAt: string;
+  fetchCompletedAt: string;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -24,6 +29,7 @@ function attemptFields(attempt: AttemptRecord | null): JsonRecord {
     responseAt: attempt?.responseAt ?? null,
     latencyMs: attempt?.latencyMs ?? null,
     httpStatus: attempt?.httpStatus ?? null,
+    reportedModelId: attempt?.reportedModelId ?? null,
     tokens: attempt?.usage ?? null,
     usageRaw: attempt?.usageRaw ?? null,
     providerResponseId: attempt?.providerResponseId ?? null,
@@ -33,7 +39,16 @@ function attemptFields(attempt: AttemptRecord | null): JsonRecord {
   };
 }
 
-/** The response-reported model ID for an arm-game, from whichever attempt reported one. */
+/**
+ * The attempt whose content was accepted for a valid result (the repair when
+ * a repair was used). Decision provenance — model ID, usage, response ID,
+ * timestamps — must come from THIS attempt.
+ */
+export function acceptedAttempt(result: ArmGameResult): AttemptRecord {
+  return result.repairUsed && result.repair !== null ? result.repair : result.attempt;
+}
+
+/** Informational reported ID for an arm-game, from whichever attempt reported one. */
 export function reportedModelId(result: ArmGameResult): string | null {
   return result.attempt.reportedModelId ?? result.repair?.reportedModelId ?? null;
 }
@@ -72,13 +87,20 @@ export function buildRecords(
     slateDate: ctx.slateDate,
     createdAt: ctx.createdAt,
     executionPolicy: ctx.executionPolicy,
-    dispatch: 'per-game',
+    dispatch: 'per-game-by-cutoff',
     slateSha256,
+    fetchStartedAt: ctx.fetchStartedAt,
+    fetchCompletedAt: ctx.fetchCompletedAt,
     bundleTimestamp: slateBundle.bundleTimestamp,
     slateCutoffAt: slateBundle.cutoffAt,
     promptScaffoldVersion: PROMPT_SCAFFOLD_VERSION,
     promptScaffoldSha256: promptScaffoldSha256(),
     timeoutMs: ctx.timeoutMs,
+    maxOutputTokens: ctx.maxOutputTokens,
+    quoteFreshnessPolicy: {
+      maxQuoteAgeMs: MAX_QUOTE_AGE_MS,
+      futureQuoteSkewMs: FUTURE_QUOTE_SKEW_MS,
+    },
     eligibleGames: slateBundle.games.length,
     excludedGames: excluded.length,
     armGameResults: armGameResults.length,
@@ -138,14 +160,16 @@ export function buildRecords(
       cutoffAt: result.cutoffAt,
       outcome: result.outcome,
       repairUsed: result.repairUsed,
+      repairTransport: result.repairTransport,
       validationErrors: result.validationErrors,
       costUsd: null,
       attempt: attemptFields(result.attempt),
       repair: result.repair === null ? null : attemptFields(result.repair),
     });
 
+    // cutoff_missed and every other non-valid outcome never emits decisions.
     if (result.outcome !== 'valid' || result.parsed === null) continue;
-    const accepted = result.repairUsed && result.repair !== null ? result.repair : result.attempt;
+    const accepted = acceptedAttempt(result);
     for (const game of result.parsed.games) {
       for (const forecast of game.forecasts) {
         records.push({
@@ -169,9 +193,13 @@ export function buildRecords(
           selectedForExecution: forecast.selectedForExecution,
           rationale: forecast.rationale,
           evidenceRefs: forecast.evidenceRefs,
+          reasonCode: forecast.reasonCode ?? null,
           provider: result.arm.provider,
           requestedModelId: result.arm.requestedModelId,
-          reportedModelId: reportedModelId(result),
+          // Provenance of the ACCEPTED attempt: for repaired decisions this
+          // is the repair's model ID, usage, response ID, and timestamps.
+          reportedModelId: accepted.reportedModelId,
+          providerResponseId: accepted.providerResponseId,
           attemptUsed: result.repairUsed ? 'repair' : 'initial',
           requestAt: accepted.requestAt,
           responseAt: accepted.responseAt,
@@ -198,13 +226,18 @@ export function buildRecords(
   return records;
 }
 
+/**
+ * Serialization chokepoint: EVERY byte written to disk passes through secret
+ * redaction — parsed fields, validation errors, reported IDs, and raw usage
+ * objects included, not just raw response text.
+ */
 export function writeNdjson(filePath: string, records: JsonRecord[]): void {
   mkdirSync(dirname(filePath), { recursive: true });
-  const lines = records.map((record) => JSON.stringify(record)).join('\n');
+  const lines = records.map((record) => redactSecrets(JSON.stringify(record))).join('\n');
   writeFileSync(filePath, `${lines}\n`, 'utf8');
 }
 
 export function writeText(filePath: string, content: string): void {
   mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, content, 'utf8');
+  writeFileSync(filePath, redactSecrets(content), 'utf8');
 }

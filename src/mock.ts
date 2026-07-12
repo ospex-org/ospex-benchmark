@@ -23,10 +23,17 @@ import type {
  * game's failure never poisons the rest of the slate:
  *
  * - openai arm    → valid, EXCEPT one game that returns HTTP 429 → rate_limited
- * - anthropic arm → schema-violating on ONE game (repair returns the same
- *                   violation → invalid_schema); valid on every other game
- * - google arm    → malformed on every first attempt; repair returns valid
+ * - anthropic arm → structurally incomplete on ONE game (no decision
+ *                   fingerprint → unrepairable → invalid_schema, repair
+ *                   skipped); valid on every other game
+ * - google arm    → prose+fenced JSON with a wrong cohortId echo on every
+ *                   first attempt; the repair fixes the echo with identical
+ *                   decisions → valid (fingerprint-preserving repair)
  * - xai arm       → never answers → timeout on every game
+ *
+ * The fixture carries a FIXED capture timestamp (observedAt <= capturedAt <
+ * every cutoff), and the dry run injects a fixed clock just after it, so
+ * cutoff enforcement runs for real yet deterministically.
  *
  * Game data is synthetic (reserved 00000000-… IDs); only the SHAPES are real.
  */
@@ -40,6 +47,7 @@ const RATE_LIMITED_GAME_ID = '00000000-0000-4000-8000-000000000003';
 
 const fixtureSchema = z.object({
   note: z.string(),
+  capturedAt: z.string().min(1),
   games: z.array(gamesEndpointRowSchema),
   currentOdds: z.array(currentOddsRowSchema),
 });
@@ -50,8 +58,14 @@ export function loadFixtureInputs(): SlateInputs {
   return {
     gamesRows: parsed.games as GamesEndpointRow[],
     oddsRows: parsed.currentOdds as CurrentOddsRow[],
-    fetchedAt: new Date().toISOString(),
+    fetchStartedAt: parsed.capturedAt,
+    fetchCompletedAt: parsed.capturedAt,
   };
+}
+
+/** Fixed dry-run clock: 2 minutes after capture, hours before every cutoff. */
+export function fixtureNowMs(): number {
+  return Date.parse('2026-07-12T14:07:00+00:00');
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +161,7 @@ function buildForecast(
     selectedForExecution: market !== 'spread',
     rationale: `Reference prices imply the selected side at ${observedDecimal}; no additional signal in the frozen bundle.`,
     evidenceRefs: [evidenceRef],
+    reasonCode: null,
   };
 }
 
@@ -244,8 +259,10 @@ export function createMockAdapters(options: {
         throw new ProviderHttpError('openai', 429, 'simulated throttle (mock)');
       }
       return mockResponse({
+        // Reported IDs mirror verified live behavior: exact echo of the
+        // requested ID (see the approved-alias identity policy).
         rawText: JSON.stringify(buildValidResponse(payload)),
-        reportedModelId: 'gpt-5.6-sol-2026-05-01',
+        reportedModelId: 'gpt-5.6-sol',
         responseId: `mock-openai-${gameId.slice(-4)}`,
         requestedModelId: 'gpt-5.6-sol',
         usage: { inputTokens: 1490, outputTokens: 512, totalTokens: 2002 },
@@ -287,11 +304,11 @@ export function createMockAdapters(options: {
     async chat(turns): Promise<ProviderResponse> {
       await sleep(50);
       const { payload, isRepair, gameId } = parseRequestPayload(turns);
-      const reported = options.simulateCollision
-        ? 'gpt-5.6-sol-2026-05-01'
-        : 'gemini-3.1-pro-preview-0611';
+      const reported = options.simulateCollision ? 'gpt-5.6-sol' : 'gemini-3.1-pro-preview';
       const usage: ProviderUsage = { inputTokens: 1465, outputTokens: 471, totalTokens: 2241 };
       if (isRepair) {
+        // The repair fixes only the echo; decisions are byte-identical, so
+        // the fingerprint-preservation check accepts it.
         return mockResponse({
           rawText: JSON.stringify(buildValidResponse(payload)),
           reportedModelId: reported,
@@ -301,13 +318,13 @@ export function createMockAdapters(options: {
           usageRaw: GOOGLE_USAGE_RAW,
         });
       }
-      const corrupted = JSON.stringify(buildValidResponse(payload)).replace(
-        '"schemaVersion":1',
-        '"schemaVersion":1,,',
-      );
-      const malformed = `Here are my forecasts:\n\`\`\`json\n${corrupted}\n\`\`\`\nGood luck!`;
+      // Initial attempt: complete, fingerprintable decisions wrapped in prose
+      // and fences, but echoing the WRONG cohortId — a semantic failure the
+      // single deterministic repair may fix without touching any decision.
+      const wrongEcho = { ...buildValidResponse(payload), cohortId: 'mock-wrong-cohort' };
+      const fenced = `Here are my forecasts:\n\`\`\`json\n${JSON.stringify(wrongEcho)}\n\`\`\`\nGood luck!`;
       return mockResponse({
-        rawText: malformed,
+        rawText: fenced,
         reportedModelId: reported,
         responseId: `mock-google-${gameId.slice(-4)}`,
         requestedModelId: 'gemini-3.1-pro-preview',

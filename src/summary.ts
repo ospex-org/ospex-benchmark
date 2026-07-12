@@ -9,6 +9,7 @@ const OUTCOME_ORDER: ArmOutcome[] = [
   'invalid_schema',
   'timeout',
   'rate_limited',
+  'cutoff_missed',
   'credential_missing',
   'provider_error',
 ];
@@ -129,7 +130,13 @@ export function buildSummaryMarkdown(
     lines.push('### Validation findings');
     lines.push('');
     for (const result of invalid) {
-      lines.push(`- **${result.arm.participantId}** on \`${result.gameId}\` (${result.outcome}):`);
+      const repairNote =
+        result.repairTransport !== null && result.repairTransport !== 'ok'
+          ? `; repair transport: ${result.repairTransport}`
+          : '';
+      lines.push(
+        `- **${result.arm.participantId}** on \`${result.gameId}\` (${result.outcome}${repairNote}):`,
+      );
       for (const error of result.validationErrors.slice(0, 6)) lines.push(`  - ${error}`);
       if (result.validationErrors.length > 6) {
         lines.push(`  - … ${result.validationErrors.length - 6} more (see NDJSON record)`);
@@ -184,17 +191,10 @@ export function buildSummaryMarkdown(
     '- Token accounting: the provider usage object is stored VERBATIM per response (`usageRaw`, including reasoning-token fields) alongside normalized counts; dollar cost is recorded as `null` rather than computed from a rate card that could go stale (never fabricated).',
   );
   for (const warning of collision.warnings) lines.push(`- ${warning}`);
-  const lateResults = armGameResults.filter((r) => {
-    const accepted = r.repairUsed && r.repair !== null ? r.repair : r.attempt;
-    return accepted.responseAt !== null && Date.parse(accepted.responseAt) > Date.parse(r.cutoffAt);
-  });
-  if (lateResults.length > 0) {
-    const suffix =
-      ctx.mode === 'dry-run'
-        ? ' (expected in a dry run: the fixture slate is not date-relative)'
-        : '';
+  const cutoffMissed = armGameResults.filter((r) => r.outcome === 'cutoff_missed').length;
+  if (cutoffMissed > 0) {
     lines.push(
-      `- Responses arriving after their game's decision cutoff: ${lateResults.length} arm-game(s)${suffix}.`,
+      `- Cutoff enforcement: ${cutoffMissed} arm-game(s) recorded \`cutoff_missed\` — the decision window closed before an acceptable response existed; no decision records were emitted for them.`,
     );
   }
   lines.push('');
@@ -202,7 +202,7 @@ export function buildSummaryMarkdown(
   lines.push('## Join key');
   lines.push('');
   lines.push(
-    'Every decision is keyed by `gameId` — the upstream odds-feed event UUID. The production closing-line capture stores closes under the same identifier (`(network, jsonodds_id, market)`), so each pick joins to its closing line for scoring after the All-Star break.',
+    'Every decision is keyed by `gameId` — the upstream odds-feed event identifier. The production closing-line capture stores closes per game and market under the same identifier, so each pick joins to its closing line for scoring after the All-Star break.',
   );
   lines.push('');
 

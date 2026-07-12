@@ -2,11 +2,16 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { runBaselines } from './baselines.js';
 import { buildBundle } from './bundle.js';
-import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
+import {
+  DEFAULT_OSPEX_API_URL,
+  describeErrorWithStack,
+  envValue,
+  redactSecrets,
+} from './config.js';
 import { loadDotEnv } from './env.js';
 import { fetchLiveInputs } from './fetchers.js';
-import { createMockAdapters, FIXTURE_SLATE_DATE, loadFixtureInputs } from './mock.js';
-import { ARMS, createRealAdapters } from './providers/index.js';
+import { createMockAdapters, FIXTURE_SLATE_DATE, fixtureNowMs, loadFixtureInputs } from './mock.js';
+import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
 import { checkProviderCollision } from './providers/family.js';
 import { buildRecords, reportedModelIdsByArm, writeNdjson, writeText } from './records.js';
 import { runSlate } from './runner.js';
@@ -36,6 +41,7 @@ interface CliOptions {
   timeoutSeconds: number | null;
   windowHours: number;
   cohortId: string | null;
+  maxOutputTokens: number;
 }
 
 const USAGE = `Usage: yarn smoke [options]
@@ -47,7 +53,9 @@ Options:
   --date YYYY-MM-DD      Slate calendar day in US Eastern time. Default: tomorrow (live),
                          fixture date (dry run).
   --out DIR              Output directory. Default: out/
-  --timeout-seconds N    Per-provider-call timeout. Default: 300 live, 2 dry run.
+  --timeout-seconds N    Per-provider-call timeout. Default: 300 live, 2 dry run. Each call is
+                         additionally bounded by the remaining time to its game's cutoff.
+  --max-output-tokens N  Explicit output-token bound on every provider call. Default: 16000.
   --window-hours N       Games-endpoint lookahead window (live). Default: 72, max 720.
   --cohort ID            Cohort identifier. Default: smoke-v0-<date>.
   -h, --help             Show this help.`;
@@ -61,6 +69,7 @@ function parseArgs(argv: string[]): CliOptions {
     timeoutSeconds: null,
     windowHours: 72,
     cohortId: null,
+    maxOutputTokens: 16000,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -97,6 +106,14 @@ function parseArgs(argv: string[]): CliOptions {
           throw new UsageError('--window-hours must be an integer between 1 and 720');
         }
         options.windowHours = value;
+        break;
+      }
+      case '--max-output-tokens': {
+        const value = Number.parseInt(next(), 10);
+        if (!Number.isInteger(value) || value <= 0) {
+          throw new UsageError('--max-output-tokens must be a positive integer');
+        }
+        options.maxOutputTokens = value;
         break;
       }
       case '--cohort':
@@ -174,6 +191,9 @@ async function main(): Promise<number> {
     createdAt: new Date().toISOString(),
     executionPolicy: 'fixed-moneyline-total',
     timeoutMs: (options.timeoutSeconds ?? (options.dryRun ? 2 : 300)) * 1000,
+    maxOutputTokens: options.maxOutputTokens,
+    fetchStartedAt: inputs.fetchStartedAt,
+    fetchCompletedAt: inputs.fetchCompletedAt,
   };
 
   const adapters = options.dryRun
@@ -181,12 +201,17 @@ async function main(): Promise<number> {
     : createRealAdapters();
 
   console.log(
-    `dispatching per game: ${build.requests.length} games sequential, ` +
+    `dispatching per game in cutoff order: ${build.requests.length} games sequential, ` +
       `${ARMS.length} arms concurrent per game (sealed per game) ...`,
   );
   const armGameResults = await runSlate(ARMS, adapters, build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
+    maxOutputTokens: ctx.maxOutputTokens,
+    // Cutoff enforcement clock: real in live mode; a fixed instant just after
+    // the fixture capture in dry runs, so enforcement is exercised
+    // deterministically rather than bypassed.
+    nowMs: options.dryRun ? fixtureNowMs : undefined,
     onGameComplete: (line) => console.log(`  ${line}`),
   });
 
@@ -197,6 +222,7 @@ async function main(): Promise<number> {
       participantId: arm.participantId,
       provider: arm.provider,
       requestedModelId: arm.requestedModelId,
+      approvedReportedModelIds: approvedReportedModelIds(arm.participantId),
       reportedModelIds: reportedByArm.get(arm.participantId) ?? [],
     })),
   );
@@ -216,6 +242,7 @@ async function main(): Promise<number> {
     'invalid_schema',
     'timeout',
     'rate_limited',
+    'cutoff_missed',
     'credential_missing',
     'provider_error',
   ];
@@ -228,8 +255,10 @@ async function main(): Promise<number> {
       .join(' · ');
     const reported = reportedByArm.get(arm.participantId) ?? [];
     console.log(
-      `  ${arm.participantId}: ${parts || 'no games'}` +
-        `${reported.length > 0 ? ` [reported: ${reported.join(', ')}]` : ''}`,
+      redactSecrets(
+        `  ${arm.participantId}: ${parts || 'no games'}` +
+          `${reported.length > 0 ? ` [reported: ${reported.join(', ')}]` : ''}`,
+      ),
     );
   }
   console.log('');

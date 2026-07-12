@@ -1,8 +1,7 @@
 import { loadDotEnv } from './env.js';
 import { describeErrorWithStack, redactSecrets } from './config.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
-import { ARMS, createRealAdapters } from './providers/index.js';
-import { classifyFamily } from './providers/family.js';
+import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
 import type { ChatTurn } from './types.js';
 
 /**
@@ -97,12 +96,13 @@ async function main(): Promise<number> {
       const warnings: string[] = [];
 
       if (response.reportedModelId === null) {
-        failures.push('response did not report a model ID — the PROVIDER_COLLISION check cannot run');
+        failures.push('response did not report a model ID — the model-identity check cannot run');
       } else {
-        const family = classifyFamily(response.reportedModelId);
-        if (family !== null && family !== arm.provider) {
+        const approved = approvedReportedModelIds(arm.participantId);
+        if (!approved.includes(response.reportedModelId)) {
           failures.push(
-            `reported model "${response.reportedModelId}" classifies as ${family}, not ${arm.provider}`,
+            `reported model "${response.reportedModelId}" is not an approved ID for this arm ` +
+              `(approved: ${approved.join(', ')}) — review it and, if legitimate, add it to APPROVED_REPORTED_MODEL_IDS`,
           );
         }
       }

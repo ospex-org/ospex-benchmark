@@ -1,15 +1,21 @@
 import type { ProviderName } from '../types.js';
 
 /**
- * PROVIDER_COLLISION — hard runtime assertion.
+ * Model identity — hard runtime assertions, fail-closed.
  *
- * The check works on RESPONSE-REPORTED model IDs, not requested ones: a
+ * The checks work on RESPONSE-REPORTED model IDs, not requested ones: a
  * gateway can happily accept "claude-fable-5" and route it to something else,
- * and the only trace is what the response metadata reports. If two arms
- * resolve to the same provider family — or an arm's reported family
- * contradicts the provider it was requested from — the run fails loudly and
- * names them. With per-game dispatch an arm reports an ID per game; an arm
- * whose reported IDs span multiple families is itself a failure.
+ * and the only trace is what the response metadata reports. Failures:
+ *
+ * - an arm reports any ID outside its approved list (exact requested ID plus
+ *   explicitly approved aliases) — same-family substitutions included;
+ * - an arm's reported IDs drift across games/attempts;
+ * - two arms resolve to the same provider family (PROVIDER_COLLISION);
+ * - an arm's reported family contradicts the provider it was requested from;
+ * - two arms report the byte-identical model ID.
+ *
+ * An arm that reports NO model ID cannot be verified and is surfaced as a
+ * loud warning on every artifact (absence is not a substitution).
  */
 export function classifyFamily(modelId: string): ProviderName | null {
   const id = modelId.toLowerCase();
@@ -24,6 +30,8 @@ export interface CollisionCheckInput {
   participantId: string;
   provider: ProviderName;
   requestedModelId: string;
+  /** Exact reported IDs accepted for this arm (requested ID + approved aliases). */
+  approvedReportedModelIds: string[];
   /** Distinct response-reported model IDs observed across the arm's games. */
   reportedModelIds: string[];
 }
@@ -38,7 +46,7 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
   const warnings: string[] = [];
 
   const byFamily = new Map<ProviderName, CollisionCheckInput[]>();
-  const unclassified: Array<{ arm: CollisionCheckInput; id: string }> = [];
+  const byReportedId = new Map<string, CollisionCheckInput>();
 
   for (const arm of arms) {
     if (arm.reportedModelIds.length === 0) {
@@ -47,34 +55,53 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
       );
       continue;
     }
+
+    // Fail-closed: every reported ID must be exactly approved for this arm.
+    const approved = new Set(arm.approvedReportedModelIds);
+    for (const id of arm.reportedModelIds) {
+      if (!approved.has(id)) {
+        failures.push(
+          `MODEL_IDENTITY: ${arm.participantId} reported unapproved model ID "${id}" (approved: ${[...approved].join(', ')})`,
+        );
+      }
+    }
+
+    // Model drift across games/attempts is a failure even among approved IDs.
+    if (arm.reportedModelIds.length > 1) {
+      failures.push(
+        `MODEL_IDENTITY: ${arm.participantId} reported model drift across games/attempts: ${arm.reportedModelIds.join(', ')}`,
+      );
+    }
+
     const families = new Set<ProviderName>();
     for (const id of arm.reportedModelIds) {
       const family = classifyFamily(id);
       if (family === null) {
         warnings.push(
-          `${arm.participantId}: reported model "${id}" does not match any known family — provider identity unverified`,
+          `${arm.participantId}: reported model "${id}" does not match any known family`,
         );
-        unclassified.push({ arm, id });
       } else {
         families.add(family);
       }
+      const prior = byReportedId.get(id.trim().toLowerCase());
+      if (prior && prior.participantId !== arm.participantId) {
+        failures.push(
+          `PROVIDER_COLLISION: ${prior.participantId} and ${arm.participantId} report the identical model ID "${id}"`,
+        );
+      } else {
+        byReportedId.set(id.trim().toLowerCase(), arm);
+      }
     }
-    if (families.size > 1) {
-      failures.push(
-        `PROVIDER_COLLISION: ${arm.participantId} reported models from multiple families across games: ${arm.reportedModelIds.join(', ')}`,
-      );
-      continue;
+    for (const family of families) {
+      if (family !== arm.provider) {
+        failures.push(
+          `PROVIDER_COLLISION: ${arm.participantId} was requested from ${arm.provider} but responses report the ${family} family (${arm.reportedModelIds.join(', ')})`,
+        );
+      }
+      const list = byFamily.get(family) ?? [];
+      if (!list.includes(arm)) list.push(arm);
+      byFamily.set(family, list);
     }
-    const family = [...families][0];
-    if (family === undefined) continue;
-    if (family !== arm.provider) {
-      failures.push(
-        `PROVIDER_COLLISION: ${arm.participantId} was requested from ${arm.provider} but responses report "${arm.reportedModelIds.join(', ')}" (${family} family)`,
-      );
-    }
-    const list = byFamily.get(family) ?? [];
-    list.push(arm);
-    byFamily.set(family, list);
   }
 
   for (const [family, members] of byFamily) {
@@ -83,21 +110,6 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
         .map((m) => `${m.participantId} (reported "${m.reportedModelIds.join(', ')}")`)
         .join(', ');
       failures.push(`PROVIDER_COLLISION: multiple arms resolve to the ${family} family: ${names}`);
-    }
-  }
-
-  // Fallback for unclassifiable IDs: byte-identical reported IDs across two
-  // different arms are still a collision even when the family is unknown.
-  const seen = new Map<string, CollisionCheckInput>();
-  for (const { arm, id } of unclassified) {
-    const key = id.trim().toLowerCase();
-    const prior = seen.get(key);
-    if (prior && prior.participantId !== arm.participantId) {
-      failures.push(
-        `PROVIDER_COLLISION: ${prior.participantId} and ${arm.participantId} report the identical model ID "${id}"`,
-      );
-    } else {
-      seen.set(key, arm);
     }
   }
 

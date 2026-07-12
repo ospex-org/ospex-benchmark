@@ -82,7 +82,7 @@ export async function fetchLiveInputs(options: {
   supabaseAnonKey: string;
   windowHours: number;
 }): Promise<SlateInputs> {
-  const fetchedAt = new Date().toISOString();
+  const fetchStartedAt = new Date().toISOString();
   const gamesRows = await fetchGamesForWindow(options.apiUrl, options.windowHours);
   const oddsRows =
     gamesRows.length === 0
@@ -93,5 +93,8 @@ export async function fetchLiveInputs(options: {
           'polygon',
           gamesRows.map((g) => g.gameId),
         );
-  return { gamesRows, oddsRows, fetchedAt };
+  // Completion time is the bundle assembly time: every observation in the
+  // inputs happened at or before this instant, never after it.
+  const fetchCompletedAt = new Date().toISOString();
+  return { gamesRows, oddsRows, fetchStartedAt, fetchCompletedAt };
 }
