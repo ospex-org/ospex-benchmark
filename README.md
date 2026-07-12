@@ -92,6 +92,18 @@ Artifact safety: every byte serialized to NDJSON or the summary passes through c
 
 **Store UTC, reason in ET, always.** A slate's date is the US Eastern calendar date of first pitch, and a single MLB slate legitimately spans two UTC dates — so a game's slate day is never derived from a UTC string prefix. The rule lives in one tested module, `src/slateDate.ts`.
 
+## Scoring (reference-closing CLV)
+
+```bash
+yarn score --run out/<runId>.ndjson
+```
+
+Joins a run's frozen decisions (and the deterministic baselines) to the production-captured closes by the verified game/market key and computes **reference-closing CLV** per the methodology: `q_s` is the proportional no-vig closing probability of the selected side, and the primary metric is `100 · (D_e · q_s − 1)` in expected-ROI percentage points — the frozen entry price is never de-vigged. Policy, preregistered in the scored output: `fresh`-confidence closes only; price CLV only at the unchanged line (a moved spread/total reports signed favorable line movement instead of a number — never zero); integer push-capable lines report a separately labeled push-excluded conditional CLV, never pooled into primary. Auxiliary diagnostics (probability-scale movement, raw price ratio) ride along.
+
+Output: `<runId>-scored.ndjson` (per-pick `scored_decision` records plus per-participant scorecards) and `<runId>-scorecard.md`, both in the run's directory (gitignored). Run it any time after the slate locks — before lock, every pick reports `close_missing` and the scorer says so. Decision CLV only: nothing here measures execution. This is a single reference source, so the metric is always labeled reference-closing CLV, not a market consensus.
+
+Requires only `SUPABASE_URL` + `SUPABASE_ANON_KEY` (the same public read-only anon key).
+
 ## Secrets discipline
 
 This repo is public. Credentials are read from environment variables only — never from a file in the repo. `.env.example` lists variable names with empty values. Nothing in this codebase prints, logs, or serializes a credential, and run output is gitignored.

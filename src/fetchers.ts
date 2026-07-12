@@ -1,6 +1,11 @@
 import { redactAndTruncate } from './config.js';
-import { parseCurrentOddsRows, parseGamesBody } from './wire.js';
-import type { CurrentOddsRow, GamesEndpointRow, SlateInputs } from './types.js';
+import { parseClosingLineRows, parseCurrentOddsRows, parseGamesBody } from './wire.js';
+import type {
+  ClosingLineRow,
+  CurrentOddsRow,
+  GamesEndpointRow,
+  SlateInputs,
+} from './types.js';
 
 /**
  * Live read path. Two existing public surfaces, nothing new:
@@ -72,6 +77,33 @@ export async function fetchCurrentOdds(
       `${supabaseUrl}/rest/v1/current_odds?select=${select}` +
       `&network=eq.${network}&jsonodds_id=in.(${batch.join(',')})`;
     rows.push(...parseCurrentOddsRows(await getJson(url, headers)));
+  }
+  return rows;
+}
+
+/**
+ * Captured reference closes for a set of games — the read side of the
+ * scoring join. Same public anon read path as the reference-odds snapshot.
+ */
+export async function fetchClosingLines(
+  supabaseUrl: string,
+  anonKey: string,
+  network: string,
+  gameIds: string[],
+): Promise<ClosingLineRow[]> {
+  const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
+  const rows: ClosingLineRow[] = [];
+  const batchSize = 40;
+  for (let i = 0; i < gameIds.length; i += batchSize) {
+    const batch = gameIds.slice(i, i + batchSize);
+    const select =
+      'network,jsonodds_id,market,line,away_odds_decimal,home_odds_decimal,' +
+      'away_p_novig,home_p_novig,value_captured_at,last_polled_at,lock_time,' +
+      'poll_gap_seconds,confidence,source';
+    const url =
+      `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
+      `&network=eq.${network}&jsonodds_id=in.(${batch.join(',')})`;
+    rows.push(...parseClosingLineRows(await getJson(url, headers)));
   }
   return rows;
 }

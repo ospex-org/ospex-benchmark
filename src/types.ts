@@ -154,6 +154,24 @@ export interface CurrentOddsRow {
   changed_at: string;
 }
 
+/** A captured reference close, keyed upstream by (network, game, market). */
+export interface ClosingLineRow {
+  network: string;
+  jsonodds_id: string;
+  market: MarketKey;
+  line: number | null;
+  away_odds_decimal: number | null;
+  home_odds_decimal: number | null;
+  away_p_novig: number | null;
+  home_p_novig: number | null;
+  value_captured_at: string | null;
+  last_polled_at: string | null;
+  lock_time: string;
+  poll_gap_seconds: number | null;
+  confidence: 'fresh' | 'stale' | 'missing';
+  source: string;
+}
+
 export interface SlateInputs {
   gamesRows: GamesEndpointRow[];
   oddsRows: CurrentOddsRow[];
