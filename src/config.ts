@@ -54,6 +54,16 @@ export function redactSecrets(text: string): string {
   return result;
 }
 
+/**
+ * Redaction ALWAYS precedes truncation: truncating first can split a
+ * credential at the boundary, leaving a prefix the full-value redactor can
+ * no longer recognize. Every truncated provider-derived string goes through
+ * this helper.
+ */
+export function redactAndTruncate(text: string, limit: number): string {
+  return redactSecrets(text).slice(0, limit);
+}
+
 export function describeError(error: unknown): string {
   if (error instanceof Error) {
     return redactSecrets(`${error.name}: ${error.message}`);

@@ -129,7 +129,7 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case '-h':
       case '--help':
-        console.log(USAGE);
+        printLine(USAGE);
         process.exit(0);
         break;
       default:
@@ -165,7 +165,7 @@ async function loadInputs(options: CliOptions): Promise<{ inputs: SlateInputs; s
   }
   const apiUrl = envValue('OSPEX_API_URL') ?? DEFAULT_OSPEX_API_URL;
   const slateDate = options.date ?? tomorrowEastern(new Date());
-  console.log(`fetching MLB slate for ${slateDate} (ET) from ${apiUrl} ...`);
+  printLine(`fetching MLB slate for ${slateDate} (ET) from ${apiUrl} ...`);
   const inputs = await fetchLiveInputs({
     apiUrl,
     supabaseUrl,
@@ -292,12 +292,12 @@ main()
   })
   .catch((error: unknown) => {
     if (error instanceof UsageError) {
-      console.error(`error: ${error.message}`);
-      console.error('');
-      console.error(USAGE);
+      printError(`error: ${error.message}`);
+      printError('');
+      printError(USAGE);
       process.exitCode = 2;
       return;
     }
-    console.error(describeErrorWithStack(error));
+    printError(describeErrorWithStack(error));
     process.exitCode = 1;
   });

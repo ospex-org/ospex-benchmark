@@ -1,5 +1,5 @@
 import { loadDotEnv } from './env.js';
-import { describeErrorWithStack } from './config.js';
+import { describeErrorWithStack, redactAndTruncate } from './config.js';
 import { printError, printLine } from './console.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
@@ -130,7 +130,7 @@ async function main(): Promise<number> {
       printLine(`  http: ${response.httpStatus} in ${latency}ms`);
       printLine(`  reported model: ${response.reportedModelId ?? '(none)'}`);
       printLine(`  response id: ${response.providerResponseId ?? '(none)'}`);
-      printLine(`  text: ${response.rawText.trim().slice(0, 120) || '(empty)'}`);
+      printLine(`  text: ${redactAndTruncate(response.rawText.trim(), 120) || '(empty)'}`);
       printLine(`  usage (verbatim): ${JSON.stringify(response.usageRaw)}`);
       for (const warning of warnings) printLine(`  warn: ${warning}`);
       if (failures.length > 0) {

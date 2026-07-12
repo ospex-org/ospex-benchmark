@@ -1,4 +1,4 @@
-import { redactSecrets } from './config.js';
+import { redactAndTruncate } from './config.js';
 import { parseCurrentOddsRows, parseGamesBody } from './wire.js';
 import type { CurrentOddsRow, GamesEndpointRow, SlateInputs } from './types.js';
 
@@ -23,7 +23,7 @@ async function getJson(url: string, headers: Record<string, string>): Promise<un
     if (!response.ok) {
       const body = await response.text().catch(() => '');
       throw new Error(
-        `GET ${url} failed with HTTP ${response.status}: ${redactSecrets(body.slice(0, 500))}`,
+        `GET ${url} failed with HTTP ${response.status}: ${redactAndTruncate(body, 500)}`,
       );
     }
     return (await response.json()) as unknown;

@@ -1,4 +1,4 @@
-import { redactSecrets } from '../config.js';
+import { redactAndTruncate, redactSecrets } from '../config.js';
 import { ProviderHttpError, ProviderTimeoutError } from './errors.js';
 
 /**
@@ -53,7 +53,7 @@ export async function postJson(options: {
       throw new ProviderHttpError(
         options.provider,
         response.status,
-        redactSecrets(text.slice(0, 2000)),
+        redactAndTruncate(text, 2000),
       );
     }
     try {
@@ -62,7 +62,7 @@ export async function postJson(options: {
       throw new ProviderHttpError(
         options.provider,
         response.status,
-        `non-JSON response body: ${redactSecrets(text.slice(0, 500))}`,
+        `non-JSON response body: ${redactAndTruncate(text, 500)}`,
       );
     }
   } finally {
