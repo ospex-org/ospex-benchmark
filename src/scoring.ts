@@ -854,11 +854,7 @@ export function verifyRunIntegrity(
   // cutoff must equal the hash-verified game cutoff, and an attempt's
   // timestamps must be parseable, ordered, latency-consistent, and (for
   // accepted work) strictly before the cutoff.
-  const attemptTimingViolation = (
-    attempt: ArchivedAttempt,
-    cutoffMs: number,
-    label: string,
-  ): string | null => {
+  const timingCompleteness = (attempt: ArchivedAttempt, label: string): string | null => {
     if (attempt.requestAt === null || attempt.responseAt === null || attempt.latencyMs === null) {
       return `${label}: archived timing fields are missing`;
     }
@@ -871,7 +867,18 @@ export function verifyRunIntegrity(
     if (attempt.latencyMs !== responseMs - requestMs) {
       return `${label}: latencyMs does not equal the archived timestamp difference`;
     }
-    if (responseMs >= cutoffMs) return `${label}: response arrived at or after the decision cutoff`;
+    return null;
+  };
+  const attemptTimingViolation = (
+    attempt: ArchivedAttempt,
+    cutoffMs: number,
+    label: string,
+  ): string | null => {
+    const completeness = timingCompleteness(attempt, label);
+    if (completeness !== null) return completeness;
+    if (Date.parse(attempt.responseAt as string) >= cutoffMs) {
+      return `${label}: response arrived at or after the decision cutoff`;
+    }
     return null;
   };
 
@@ -889,6 +896,19 @@ export function verifyRunIntegrity(
       continue;
     }
     const cutoffMs = Date.parse(game.cutoffAt);
+    // ANY attempt with an archived response body must carry complete,
+    // ordered, latency-consistent timing — for every outcome. Blanking the
+    // timing fields cannot exempt a body-bearing response from the rules.
+    const bodyBearing: Array<[ArchivedAttempt, string]> = [
+      [response.attempt, `${key} initial attempt`],
+      ...(response.repair !== null ? ([[response.repair, `${key} repair attempt`]] as Array<[ArchivedAttempt, string]>) : []),
+    ];
+    for (const [attempt, label] of bodyBearing) {
+      if (attempt.rawResponse !== null) {
+        const completeness = timingCompleteness(attempt, label);
+        if (completeness !== null) violations.push(completeness);
+      }
+    }
     if (response.outcome === 'valid') {
       const initialTiming = attemptTimingViolation(response.attempt, cutoffMs, `${key} initial attempt`);
       if (initialTiming !== null) violations.push(initialTiming);

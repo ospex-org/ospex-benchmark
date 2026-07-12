@@ -588,6 +588,31 @@ test('the round-5 probe: a valid response demoted to cutoff_missed is caught by 
   assert.ok(violations.some((v) => v.includes('cannot be demoted to a timing failure')));
 });
 
+test('the round-6 probe: blanked timing on a body-bearing cutoff_missed response is caught', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines
+    .filter((line) => {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      return !(record['recordType'] === 'decision' && record['gameId'] === GAME_A);
+    })
+    .map((line) => {
+      const record = JSON.parse(line) as {
+        recordType?: string;
+        gameId?: string;
+        outcome?: string;
+        attempt?: { responseAt?: string | null; latencyMs?: number | null };
+      };
+      if (record.recordType === 'arm_game_response' && record.gameId === GAME_A && record.attempt) {
+        record.outcome = 'cutoff_missed';
+        record.attempt.responseAt = null;
+        record.attempt.latencyMs = null;
+      }
+      return JSON.stringify(record);
+    });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(violations.some((v) => v.includes('archived timing fields are missing')));
+});
+
 test('the round-5 probe: a valid response whose responseAt is after the cutoff is caught', () => {
   const { lines } = fixtureRun();
   const mutated = lines.map((line) => {
