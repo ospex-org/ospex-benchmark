@@ -2,8 +2,9 @@
  * Shared types for the v0 shadow smoke harness.
  *
  * The information bundle is deliberately thin (see docs/BENCHMARK_PROMPT_V0.md
- * and the v0 data policy): game identity, scheduled start, and timestamped
- * reference prices for the three fixed markets. Nothing else.
+ * and the v0 data policy): game identity, scheduled start, probable starting
+ * pitchers when the read path exposes them, and timestamped reference prices
+ * for the three fixed markets. Nothing else.
  */
 
 export type MarketKey = 'moneyline' | 'spread' | 'total';
@@ -11,16 +12,17 @@ export type MarketKey = 'moneyline' | 'spread' | 'total';
 export type ProviderName = 'openai' | 'anthropic' | 'google' | 'xai';
 
 /**
- * Arm-level outcome codes. The first four are the required set;
- * `provider_error` is a deliberate extension covering transport/HTTP
- * failures (4xx/5xx, DNS, connection reset) that are neither a timeout nor
- * a schema violation — recorded honestly rather than shoehorned.
+ * Arm outcome codes, per (arm, game) request. The first four are the required
+ * set; `rate_limited` (HTTP 429 — a throttle must never read as a model
+ * failure) and `provider_error` (other transport/HTTP failures) are deliberate
+ * extensions recorded honestly rather than shoehorned.
  */
 export type ArmOutcome =
   | 'valid'
   | 'invalid_schema'
   | 'timeout'
   | 'credential_missing'
+  | 'rate_limited'
   | 'provider_error';
 
 export const SMOKE_LABEL = 'SMOKE_V0_NOT_A_COHORT';
@@ -63,6 +65,11 @@ export interface TotalBlock {
   evidenceRef: string;
 }
 
+export interface ProbablePitchers {
+  away: string | null;
+  home: string | null;
+}
+
 export interface GameBundle {
   /** Canonical game ID — joins to the closing-line capture keyed on the same ID. */
   gameId: string;
@@ -71,11 +78,12 @@ export interface GameBundle {
   awayTeam: string;
   homeTeam: string;
   /**
-   * Probable starting pitchers are NOT exposed by the existing public read
-   * path (v0 finding) — carried explicitly as null rather than omitted, so
-   * the absence is visible in the hashed bundle.
+   * Probable starting pitchers when the games read path exposes them; null
+   * otherwise. The upstream ingest does not store them today, so this is
+   * null until that lands — carried explicitly so the absence is visible in
+   * the hashed bundle, and populated automatically once the fields appear.
    */
-  probableStartingPitchers: null;
+  probableStartingPitchers: ProbablePitchers | null;
   markets: {
     moneyline: MoneylineBlock;
     runLine: RunLineBlock;
@@ -85,6 +93,11 @@ export interface GameBundle {
   evidenceRefs: string[];
 }
 
+/**
+ * A frozen, content-hashed bundle: the whole slate (recorded for audit), and
+ * one single-game instance per dispatch (what each arm actually receives —
+ * games has exactly one entry and cutoffAt is that game's first pitch).
+ */
 export interface SlateBundle {
   schemaVersion: 1;
   label: typeof SMOKE_LABEL;
@@ -93,7 +106,7 @@ export interface SlateBundle {
   slateDate: string;
   /** When the bundle was assembled (UTC ISO). */
   bundleTimestamp: string;
-  /** Decision deadline: earliest scheduled start among eligible games. */
+  /** Decision deadline (UTC ISO). Per-game requests: that game's first pitch. */
   cutoffAt: string;
   games: GameBundle[];
 }
@@ -152,6 +165,7 @@ export interface ArmSpec {
   credentialEnvVar: string;
 }
 
+/** Normalized token counts (for quick reading; the raw object is canonical). */
 export interface ProviderUsage {
   inputTokens: number | null;
   outputTokens: number | null;
@@ -162,7 +176,16 @@ export interface ProviderResponse {
   rawText: string;
   reportedModelId: string | null;
   providerResponseId: string | null;
+  httpStatus: number;
   usage: ProviderUsage;
+  /**
+   * The provider's entire usage/token object VERBATIM — every field, no
+   * normalization, nothing dropped. Reasoning/thinking tokens are billed
+   * separately and dominate cost on high-reasoning modes; they only survive
+   * here. Dollar cost can be applied retroactively from a price table; the
+   * token counts cannot be recovered after the fact.
+   */
+  usageRaw: unknown;
   /** Exact request parameters sent (model, endpoint, options) — no credentials. */
   requestParams: Record<string, unknown>;
 }
@@ -172,12 +195,21 @@ export interface ChatTurn {
   content: string;
 }
 
+export interface ProviderCallOptions {
+  /** Cap on generated tokens; used by preflight. Omitted = provider default. */
+  maxOutputTokens?: number | undefined;
+}
+
 export interface ProviderAdapter {
   readonly provider: ProviderName;
   readonly requestedModelId: string;
   readonly credentialEnvVar: string;
   hasCredential(): boolean;
-  chat(turns: ChatTurn[], timeoutMs: number): Promise<ProviderResponse>;
+  chat(
+    turns: ChatTurn[],
+    timeoutMs: number,
+    options?: ProviderCallOptions,
+  ): Promise<ProviderResponse>;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +220,9 @@ export interface AttemptRecord {
   rawText: string | null;
   reportedModelId: string | null;
   providerResponseId: string | null;
+  httpStatus: number | null;
   usage: ProviderUsage | null;
+  usageRaw: unknown;
   requestParams: Record<string, unknown> | null;
   requestAt: string | null;
   responseAt: string | null;
@@ -196,8 +230,13 @@ export interface AttemptRecord {
   errorDetail: string | null;
 }
 
-export interface ArmRunResult {
+/** Result of one arm on one game's frozen request. */
+export interface ArmGameResult {
   arm: ArmSpec;
+  gameId: string;
+  requestSha256: string;
+  /** The game's own decision cutoff (its scheduled first pitch). */
+  cutoffAt: string;
   outcome: ArmOutcome;
   attempt: AttemptRecord;
   repair: AttemptRecord | null;

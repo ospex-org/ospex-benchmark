@@ -1,8 +1,17 @@
-import { reportedModelId } from './records.js';
+import { reportedModelIdsByArm } from './records.js';
 import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
 import type { CollisionCheckResult } from './providers/family.js';
-import type { ArmRunResult, BaselineDecision, GameBundle } from './types.js';
+import type { ArmGameResult, ArmOutcome, BaselineDecision, GameBundle } from './types.js';
+
+const OUTCOME_ORDER: ArmOutcome[] = [
+  'valid',
+  'invalid_schema',
+  'timeout',
+  'rate_limited',
+  'credential_missing',
+  'provider_error',
+];
 
 function formatHandicap(value: number): string {
   return value > 0 ? `+${value}` : `${value}`;
@@ -26,18 +35,25 @@ function slateRow(game: GameBundle): string {
     `${game.awayTeam} ${formatHandicap(rl.awayHandicap)} @ ${rl.awayDecimal} · ` +
     `${game.homeTeam} ${formatHandicap(rl.homeHandicap)} @ ${rl.homeDecimal}`;
   const totals = `${total.line} (o ${total.overDecimal} / u ${total.underDecimal})`;
-  return `| ${matchup} | ${game.scheduledStartUtc} | ${moneyline} | ${runLine} | ${totals} | ${describeFavorite(game)} |`;
+  const pitchers = game.probableStartingPitchers
+    ? `${game.probableStartingPitchers.away ?? '—'} / ${game.probableStartingPitchers.home ?? '—'}`
+    : '—';
+  return `| ${matchup} | ${game.scheduledStartUtc} | ${moneyline} | ${runLine} | ${totals} | ${pitchers} | ${describeFavorite(game)} |`;
 }
 
 export function buildSummaryMarkdown(
   ctx: RunContext,
   build: BuildResult,
-  armResults: ArmRunResult[],
+  armGameResults: ArmGameResult[],
   baselineDecisions: BaselineDecision[],
   collision: CollisionCheckResult,
 ): string {
-  const { bundle, bundleSha256, excluded } = build;
+  const { slateBundle, slateSha256, excluded } = build;
   const lines: string[] = [];
+  const arms = [...new Map(armGameResults.map((r) => [r.arm.participantId, r.arm])).values()];
+  const byArm = (participantId: string): ArmGameResult[] =>
+    armGameResults.filter((r) => r.arm.participantId === participantId);
+  const reportedByArm = reportedModelIdsByArm(armGameResults);
 
   lines.push(`# Ospex shadow smoke run — ${ctx.slateDate}`);
   lines.push('');
@@ -48,8 +64,10 @@ export function buildSummaryMarkdown(
   lines.push('');
   lines.push(`- Run: \`${ctx.runId}\` (${ctx.mode})`);
   lines.push(`- Generated: ${ctx.createdAt}`);
-  lines.push(`- Bundle SHA-256: \`${bundleSha256}\``);
-  lines.push(`- Decision cutoff: ${bundle.cutoffAt} (earliest first pitch)`);
+  lines.push(`- Slate SHA-256: \`${slateSha256}\``);
+  lines.push(
+    `- Dispatch: per game (sequential games, four arms concurrent per game; each game's cutoff is its own first pitch)`,
+  );
   lines.push(`- Execution policy (declared, not executed): \`${ctx.executionPolicy}\``);
   lines.push('');
 
@@ -60,11 +78,13 @@ export function buildSummaryMarkdown(
     lines.push('');
   }
 
-  lines.push(`## Slate (${bundle.games.length} eligible games)`);
+  lines.push(`## Slate (${slateBundle.games.length} eligible games)`);
   lines.push('');
-  lines.push('| Game (away at home) | First pitch (UTC) | Moneyline (away/home) | Run line | Total | ML favorite |');
-  lines.push('|---|---|---|---|---|---|');
-  for (const game of bundle.games) lines.push(slateRow(game));
+  lines.push(
+    '| Game (away at home) | First pitch (UTC) | Moneyline (away/home) | Run line | Total | Probable pitchers (away/home) | ML favorite |',
+  );
+  lines.push('|---|---|---|---|---|---|---|');
+  for (const game of slateBundle.games) lines.push(slateRow(game));
   lines.push('');
   if (excluded.length > 0) {
     lines.push(`Excluded games (${excluded.length}):`);
@@ -73,45 +93,63 @@ export function buildSummaryMarkdown(
     lines.push('');
   }
 
-  lines.push('## Arms');
+  lines.push('## Arms (outcomes across the slate)');
   lines.push('');
-  lines.push('| Participant | Outcome | Reported model | Repair used | Latency (ms) | Tokens (in/out) |');
-  lines.push('|---|---|---|---|---|---|');
-  for (const result of armResults) {
-    const accepted = result.repairUsed && result.repair !== null ? result.repair : result.attempt;
-    const tokens = accepted.usage
-      ? `${accepted.usage.inputTokens ?? '?'} / ${accepted.usage.outputTokens ?? '?'}`
-      : '—';
+  lines.push(`| Participant | ${OUTCOME_ORDER.join(' | ')} | Repairs | Reported model(s) |`);
+  lines.push(`|---|${OUTCOME_ORDER.map(() => '---').join('|')}|---|---|`);
+  for (const arm of arms) {
+    const results = byArm(arm.participantId);
+    const counts = OUTCOME_ORDER.map(
+      (outcome) => results.filter((r) => r.outcome === outcome).length,
+    );
+    const repairs = results.filter((r) => r.repairUsed).length;
+    const reported = reportedByArm.get(arm.participantId) ?? [];
     lines.push(
-      `| ${result.arm.participantId} | **${result.outcome}** | ${reportedModelId(result) ?? '—'} | ${result.repairUsed ? 'yes' : 'no'} | ${accepted.latencyMs ?? '—'} | ${tokens} |`,
+      `| ${arm.participantId} | ${counts.join(' | ')} | ${repairs} | ${reported.length > 0 ? reported.join(', ') : '—'} |`,
     );
   }
   lines.push('');
 
-  const invalidArms = armResults.filter((r) => r.validationErrors.length > 0);
-  if (invalidArms.length > 0) {
+  lines.push('## Per-game outcomes');
+  lines.push('');
+  lines.push(`| Game | ${arms.map((a) => a.provider).join(' | ')} |`);
+  lines.push(`|---|${arms.map(() => '---').join('|')}|`);
+  for (const game of slateBundle.games) {
+    const cells = arms.map((arm) => {
+      const result = byArm(arm.participantId).find((r) => r.gameId === game.gameId);
+      if (!result) return '—';
+      return `${result.outcome}${result.repairUsed ? ' (r)' : ''}`;
+    });
+    lines.push(`| ${game.awayTeam} at ${game.homeTeam} | ${cells.join(' | ')} |`);
+  }
+  lines.push('');
+
+  const invalid = armGameResults.filter((r) => r.validationErrors.length > 0);
+  if (invalid.length > 0) {
     lines.push('### Validation findings');
     lines.push('');
-    for (const result of invalidArms) {
-      lines.push(`- **${result.arm.participantId}** (${result.outcome}):`);
-      for (const error of result.validationErrors.slice(0, 8)) lines.push(`  - ${error}`);
-      if (result.validationErrors.length > 8) {
-        lines.push(`  - … ${result.validationErrors.length - 8} more (see NDJSON record)`);
+    for (const result of invalid) {
+      lines.push(`- **${result.arm.participantId}** on \`${result.gameId}\` (${result.outcome}):`);
+      for (const error of result.validationErrors.slice(0, 6)) lines.push(`  - ${error}`);
+      if (result.validationErrors.length > 6) {
+        lines.push(`  - … ${result.validationErrors.length - 6} more (see NDJSON record)`);
       }
     }
     lines.push('');
   }
 
-  const validArms = armResults.filter((r) => r.outcome === 'valid' && r.parsed !== null);
-  if (validArms.length > 0) {
-    lines.push('## Moneyline picks (valid arms)');
+  const validResults = armGameResults.filter((r) => r.outcome === 'valid' && r.parsed !== null);
+  if (validResults.length > 0) {
+    lines.push('## Moneyline picks (valid arm-games)');
     lines.push('');
-    const header = validArms.map((r) => r.arm.participantId).join(' | ');
-    lines.push(`| Game | ${header} |`);
-    lines.push(`|---|${validArms.map(() => '---').join('|')}|`);
-    for (const game of bundle.games) {
-      const picks = validArms.map((result) => {
-        const forecast = result.parsed?.games
+    lines.push(`| Game | ${arms.map((a) => a.participantId).join(' | ')} |`);
+    lines.push(`|---|${arms.map(() => '---').join('|')}|`);
+    for (const game of slateBundle.games) {
+      const picks = arms.map((arm) => {
+        const result = validResults.find(
+          (r) => r.arm.participantId === arm.participantId && r.gameId === game.gameId,
+        );
+        const forecast = result?.parsed?.games
           .find((g) => g.gameId === game.gameId)
           ?.forecasts.find((f) => f.market === 'moneyline');
         return forecast ? `${forecast.selection} (${forecast.probabilities.win})` : '—';
@@ -126,31 +164,37 @@ export function buildSummaryMarkdown(
   lines.push('');
   lines.push(
     `${baselineParticipants.length} baseline participants produced ${baselineDecisions.length} common-cutoff decisions ` +
-      `(${bundle.games.length} games): ${baselineParticipants.map((p) => `\`${p}\``).join(', ')}.`,
+      `(${slateBundle.games.length} games): ${baselineParticipants.map((p) => `\`${p}\``).join(', ')}.`,
   );
   lines.push('');
 
   lines.push('## Findings and caveats');
   lines.push('');
+  const withPitchers = slateBundle.games.filter((g) => g.probableStartingPitchers !== null).length;
+  if (withPitchers === 0) {
+    lines.push(
+      '- Probable starting pitchers are not exposed by the existing public read path; the bundle ships without them (`probableStartingPitchers: null`). They populate automatically if the upstream read path gains the fields.',
+    );
+  } else {
+    lines.push(
+      `- Probable starting pitchers present for ${withPitchers}/${slateBundle.games.length} games (read from the games row).`,
+    );
+  }
   lines.push(
-    '- Probable starting pitchers are not exposed by the existing public read path; the bundle ships without them (`probableStartingPitchers: null`).',
-  );
-  lines.push(
-    '- Token/cost accounting: token counts are recorded verbatim from provider usage metadata; dollar cost is recorded as `null` rather than computed from a rate card that could go stale (never fabricated).',
+    '- Token accounting: the provider usage object is stored VERBATIM per response (`usageRaw`, including reasoning-token fields) alongside normalized counts; dollar cost is recorded as `null` rather than computed from a rate card that could go stale (never fabricated).',
   );
   for (const warning of collision.warnings) lines.push(`- ${warning}`);
-  const cutoffMs = Date.parse(bundle.cutoffAt);
-  const lateArms = armResults.filter((r) => {
+  const lateResults = armGameResults.filter((r) => {
     const accepted = r.repairUsed && r.repair !== null ? r.repair : r.attempt;
-    return accepted.responseAt !== null && Date.parse(accepted.responseAt) > cutoffMs;
+    return accepted.responseAt !== null && Date.parse(accepted.responseAt) > Date.parse(r.cutoffAt);
   });
-  if (lateArms.length > 0) {
+  if (lateResults.length > 0) {
     const suffix =
       ctx.mode === 'dry-run'
         ? ' (expected in a dry run: the fixture slate is not date-relative)'
         : '';
     lines.push(
-      `- Responses arriving after the decision cutoff: ${lateArms.map((r) => r.arm.participantId).join(', ')}${suffix}.`,
+      `- Responses arriving after their game's decision cutoff: ${lateResults.length} arm-game(s)${suffix}.`,
     );
   }
   lines.push('');

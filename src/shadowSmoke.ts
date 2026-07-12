@@ -3,25 +3,27 @@ import { join } from 'node:path';
 import { runBaselines } from './baselines.js';
 import { buildBundle } from './bundle.js';
 import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
-import { isValidSlateDate, tomorrowEastern } from './dates.js';
+import { loadDotEnv } from './env.js';
 import { fetchLiveInputs } from './fetchers.js';
 import { createMockAdapters, FIXTURE_SLATE_DATE, loadFixtureInputs } from './mock.js';
 import { ARMS, createRealAdapters } from './providers/index.js';
 import { checkProviderCollision } from './providers/family.js';
-import { buildRecords, reportedModelId, writeNdjson, writeText } from './records.js';
-import { runAllArms } from './runner.js';
+import { buildRecords, reportedModelIdsByArm, writeNdjson, writeText } from './records.js';
+import { runSlate } from './runner.js';
+import { isValidSlateDate, tomorrowEastern } from './slateDate.js';
 import { buildSummaryMarkdown } from './summary.js';
 import type { RunContext } from './records.js';
-import type { SlateInputs } from './types.js';
+import type { ArmOutcome, SlateInputs } from './types.js';
 
 /**
  * ospex-benchmark shadow smoke (v0) — SMOKE_V0_NOT_A_COHORT.
  *
  * Fetches an MLB slate with reference odds from the existing public read
- * path, freezes it into a content-hashed bundle, sends the identical bundle
- * to four frontier-model arms concurrently, validates their forecasts
- * against the strict output schema, records everything with provenance, and
- * stops. No scoring, no wallets, no chain access, no SSE.
+ * path, freezes a content-hashed single-game bundle per game, dispatches the
+ * four arms concurrently per game (games sequential, outputs sealed per
+ * game), validates every forecast against the strict output schema, records
+ * everything with provenance, and stops. No scoring, no wallets, no chain
+ * access, no SSE.
  */
 
 class UsageError extends Error {}
@@ -45,7 +47,7 @@ Options:
   --date YYYY-MM-DD      Slate calendar day in US Eastern time. Default: tomorrow (live),
                          fixture date (dry run).
   --out DIR              Output directory. Default: out/
-  --timeout-seconds N    Per-provider-call timeout. Default: 600 live, 2 dry run.
+  --timeout-seconds N    Per-provider-call timeout. Default: 300 live, 2 dry run.
   --window-hours N       Games-endpoint lookahead window (live). Default: 72, max 720.
   --cohort ID            Cohort identifier. Default: smoke-v0-<date>.
   -h, --help             Show this help.`;
@@ -149,15 +151,19 @@ async function loadInputs(options: CliOptions): Promise<{ inputs: SlateInputs; s
 }
 
 async function main(): Promise<number> {
+  const loaded = loadDotEnv();
   const options = parseArgs(process.argv.slice(2));
   const mode = options.dryRun ? 'dry-run' : 'live';
   console.log(`ospex-benchmark shadow smoke v0 — ${mode} — label SMOKE_V0_NOT_A_COHORT`);
+  if (loaded.length > 0) {
+    console.log(`loaded ${loaded.length} env var(s) from .env: ${loaded.join(', ')}`);
+  }
 
   const { inputs, slateDate } = await loadInputs(options);
   const build = buildBundle(inputs, slateDate, { requireFuture: !options.dryRun });
   console.log(
-    `bundle: ${build.bundle.games.length} eligible games, ${build.excluded.length} excluded, ` +
-      `sha256 ${build.bundleSha256.slice(0, 16)}…, cutoff ${build.bundle.cutoffAt}`,
+    `bundle: ${build.requests.length} eligible games, ${build.excluded.length} excluded, ` +
+      `slate sha256 ${build.slateSha256.slice(0, 16)}…, earliest cutoff ${build.slateBundle.cutoffAt}`,
   );
 
   const ctx: RunContext = {
@@ -167,7 +173,7 @@ async function main(): Promise<number> {
     slateDate,
     createdAt: new Date().toISOString(),
     executionPolicy: 'fixed-moneyline-total',
-    timeoutMs: (options.timeoutSeconds ?? (options.dryRun ? 2 : 600)) * 1000,
+    timeoutMs: (options.timeoutSeconds ?? (options.dryRun ? 2 : 300)) * 1000,
   };
 
   const adapters = options.dryRun
@@ -175,41 +181,55 @@ async function main(): Promise<number> {
     : createRealAdapters();
 
   console.log(
-    `dispatching ${ARMS.length} arms concurrently (outputs sealed until all settle) ...`,
+    `dispatching per game: ${build.requests.length} games sequential, ` +
+      `${ARMS.length} arms concurrent per game (sealed per game) ...`,
   );
-  const armResults = await runAllArms(ARMS, adapters, {
-    bundle: build.bundle,
-    bundleSha256: build.bundleSha256,
+  const armGameResults = await runSlate(ARMS, adapters, build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
+    onGameComplete: (line) => console.log(`  ${line}`),
   });
 
-  const baselineDecisions = runBaselines(build.bundle);
+  const baselineDecisions = runBaselines(build.slateBundle);
+  const reportedByArm = reportedModelIdsByArm(armGameResults);
   const collision = checkProviderCollision(
-    armResults.map((result) => ({
-      participantId: result.arm.participantId,
-      provider: result.arm.provider,
-      requestedModelId: result.arm.requestedModelId,
-      reportedModelId: reportedModelId(result),
+    ARMS.map((arm) => ({
+      participantId: arm.participantId,
+      provider: arm.provider,
+      requestedModelId: arm.requestedModelId,
+      reportedModelIds: reportedByArm.get(arm.participantId) ?? [],
     })),
   );
 
-  const records = buildRecords(ctx, build, armResults, baselineDecisions, collision);
+  const records = buildRecords(ctx, build, armGameResults, baselineDecisions, collision);
   const ndjsonPath = join(options.outDir, `${ctx.runId}.ndjson`);
   const summaryPath = join(options.outDir, `${ctx.runId}-summary.md`);
   writeNdjson(ndjsonPath, records);
   writeText(
     summaryPath,
-    buildSummaryMarkdown(ctx, build, armResults, baselineDecisions, collision),
+    buildSummaryMarkdown(ctx, build, armGameResults, baselineDecisions, collision),
   );
 
   console.log('');
-  for (const result of armResults) {
-    const reported = reportedModelId(result);
+  const outcomes: ArmOutcome[] = [
+    'valid',
+    'invalid_schema',
+    'timeout',
+    'rate_limited',
+    'credential_missing',
+    'provider_error',
+  ];
+  for (const arm of ARMS) {
+    const results = armGameResults.filter((r) => r.arm.participantId === arm.participantId);
+    const parts = outcomes
+      .map((o) => [o, results.filter((r) => r.outcome === o).length] as const)
+      .filter(([, count]) => count > 0)
+      .map(([o, count]) => `${o} ${count}`)
+      .join(' · ');
+    const reported = reportedByArm.get(arm.participantId) ?? [];
     console.log(
-      `  ${result.arm.participantId}: ${result.outcome}` +
-        `${result.repairUsed ? ' (repair used)' : ''}` +
-        `${reported !== null ? ` [reported: ${reported}]` : ''}`,
+      `  ${arm.participantId}: ${parts || 'no games'}` +
+        `${reported.length > 0 ? ` [reported: ${reported.join(', ')}]` : ''}`,
     );
   }
   console.log('');

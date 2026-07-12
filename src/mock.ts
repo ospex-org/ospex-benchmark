@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
-import { ProviderTimeoutError } from './providers/errors.js';
+import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { currentOddsRowSchema, gamesEndpointRowSchema } from './wire.js';
 import type {
   BenchmarkResponse,
@@ -11,6 +11,7 @@ import type {
   GamesEndpointRow,
   ProviderAdapter,
   ProviderResponse,
+  ProviderUsage,
   SlateBundle,
   SlateInputs,
 } from './types.js';
@@ -18,18 +19,24 @@ import type {
 /**
  * Dry-run backing: a synthetic fixture slate shaped byte-for-byte like the
  * real wire (core-api games rows + PostgREST current_odds rows), and four
- * scripted mock adapters that exercise every pipeline path end to end:
+ * scripted mock adapters. With per-game dispatch the scenarios prove that one
+ * game's failure never poisons the rest of the slate:
  *
- * - openai arm    → valid on the first attempt
- * - anthropic arm → schema-violating JSON; deterministic repair returns the
- *                   same violation → final outcome invalid_schema
- * - google arm    → malformed (prose + broken JSON); repair returns valid
- * - xai arm       → never answers → timeout
+ * - openai arm    → valid, EXCEPT one game that returns HTTP 429 → rate_limited
+ * - anthropic arm → schema-violating on ONE game (repair returns the same
+ *                   violation → invalid_schema); valid on every other game
+ * - google arm    → malformed on every first attempt; repair returns valid
+ * - xai arm       → never answers → timeout on every game
  *
  * Game data is synthetic (reserved 00000000-… IDs); only the SHAPES are real.
  */
 
 export const FIXTURE_SLATE_DATE = '2026-07-12';
+
+/** Fixture game that the anthropic mock corrupts (schema-invalid). */
+const INVALID_SCHEMA_GAME_ID = '00000000-0000-4000-8000-000000000001';
+/** Fixture game on which the openai mock simulates an HTTP 429 throttle. */
+const RATE_LIMITED_GAME_ID = '00000000-0000-4000-8000-000000000003';
 
 const fixtureSchema = z.object({
   note: z.string(),
@@ -60,14 +67,19 @@ interface RequestPayload {
   bundle: SlateBundle;
 }
 
-function parseRequestPayload(turns: ChatTurn[]): { payload: RequestPayload; isRepair: boolean } {
+function parseRequestPayload(turns: ChatTurn[]): {
+  payload: RequestPayload;
+  isRepair: boolean;
+  gameId: string;
+} {
   const userTurn = turns.find((t) => t.role === 'user');
   if (!userTurn) throw new Error('mock adapter: no user turn in request');
   const marker = '\nRequest:\n';
   const at = userTurn.content.indexOf(marker);
   if (at === -1) throw new Error('mock adapter: request payload marker not found');
   const payload = JSON.parse(userTurn.content.slice(at + marker.length)) as RequestPayload;
-  return { payload, isRepair: turns.some((t) => t.role === 'assistant') };
+  const gameId = payload.bundle.games[0]?.gameId ?? '';
+  return { payload, isRepair: turns.some((t) => t.role === 'assistant'), gameId };
 }
 
 function round6(value: number): number {
@@ -159,16 +171,15 @@ function buildValidResponse(payload: RequestPayload): BenchmarkResponse {
 
 function buildSchemaInvalidResponse(payload: RequestPayload): BenchmarkResponse {
   const invalid = structuredClone(buildValidResponse(payload));
-  const firstGame = invalid.games[0];
-  if (firstGame) {
+  const game = invalid.games[0];
+  if (game) {
     // Drop the spread forecast: violates the exactly-three-forecasts contract.
-    firstGame.forecasts = firstGame.forecasts.filter((f) => f.market !== 'spread');
-  }
-  const secondGame = invalid.games[1];
-  const forecast = secondGame?.forecasts[0];
-  if (forecast) {
-    // Break probability coherence: win/push/loss no longer sum to 1.
-    forecast.probabilities.win = round6(Math.min(1, forecast.probabilities.win + 0.2));
+    game.forecasts = game.forecasts.filter((f) => f.market !== 'spread');
+    const forecast = game.forecasts[0];
+    if (forecast) {
+      // Break probability coherence: win/push/loss no longer sum to 1.
+      forecast.probabilities.win = round6(Math.min(1, forecast.probabilities.win + 0.2));
+    }
   }
   return invalid;
 }
@@ -181,20 +192,40 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function mockResponse(
-  rawText: string,
-  reportedModelId: string,
-  responseId: string,
-  requestedModelId: string,
-): ProviderResponse {
+function mockResponse(options: {
+  rawText: string;
+  reportedModelId: string;
+  responseId: string;
+  requestedModelId: string;
+  usage: ProviderUsage;
+  usageRaw: unknown;
+}): ProviderResponse {
   return {
-    rawText,
-    reportedModelId,
-    providerResponseId: responseId,
-    usage: { inputTokens: 4213, outputTokens: 1877, totalTokens: 6090 },
-    requestParams: { mock: true, model: requestedModelId },
+    rawText: options.rawText,
+    reportedModelId: options.reportedModelId,
+    providerResponseId: options.responseId,
+    httpStatus: 200,
+    usage: options.usage,
+    usageRaw: options.usageRaw,
+    requestParams: { mock: true, model: options.requestedModelId },
   };
 }
+
+/** Provider-realistic raw usage shapes, so the dry run proves verbatim capture. */
+const OPENAI_USAGE_RAW = {
+  prompt_tokens: 1490,
+  completion_tokens: 512,
+  total_tokens: 2002,
+  prompt_tokens_details: { cached_tokens: 0 },
+  completion_tokens_details: { reasoning_tokens: 256 },
+};
+const ANTHROPIC_USAGE_RAW = { input_tokens: 1512, output_tokens: 498 };
+const GOOGLE_USAGE_RAW = {
+  promptTokenCount: 1465,
+  candidatesTokenCount: 471,
+  thoughtsTokenCount: 305,
+  totalTokenCount: 2241,
+};
 
 export function createMockAdapters(options: {
   simulateCollision: boolean;
@@ -208,13 +239,18 @@ export function createMockAdapters(options: {
     hasCredential: () => true,
     async chat(turns): Promise<ProviderResponse> {
       await sleep(40);
-      const { payload } = parseRequestPayload(turns);
-      return mockResponse(
-        JSON.stringify(buildValidResponse(payload)),
-        'gpt-5.6-sol-2026-05-01',
-        'mock-openai-1',
-        'gpt-5.6-sol',
-      );
+      const { payload, gameId } = parseRequestPayload(turns);
+      if (gameId === RATE_LIMITED_GAME_ID) {
+        throw new ProviderHttpError('openai', 429, 'simulated throttle (mock)');
+      }
+      return mockResponse({
+        rawText: JSON.stringify(buildValidResponse(payload)),
+        reportedModelId: 'gpt-5.6-sol-2026-05-01',
+        responseId: `mock-openai-${gameId.slice(-4)}`,
+        requestedModelId: 'gpt-5.6-sol',
+        usage: { inputTokens: 1490, outputTokens: 512, totalTokens: 2002 },
+        usageRaw: OPENAI_USAGE_RAW,
+      });
     },
   });
 
@@ -225,15 +261,21 @@ export function createMockAdapters(options: {
     hasCredential: () => true,
     async chat(turns): Promise<ProviderResponse> {
       await sleep(60);
-      const { payload } = parseRequestPayload(turns);
-      // Returns the same schema violation on the repair attempt too — the
-      // dry run's guaranteed invalid_schema outcome.
-      return mockResponse(
-        JSON.stringify(buildSchemaInvalidResponse(payload)),
-        'claude-fable-5',
-        'mock-anthropic-1',
-        'claude-fable-5',
-      );
+      const { payload, gameId } = parseRequestPayload(turns);
+      // One game stays schema-invalid through the repair; the others are
+      // valid — proving one game's failure does not poison the slate.
+      const body =
+        gameId === INVALID_SCHEMA_GAME_ID
+          ? buildSchemaInvalidResponse(payload)
+          : buildValidResponse(payload);
+      return mockResponse({
+        rawText: JSON.stringify(body),
+        reportedModelId: 'claude-fable-5',
+        responseId: `mock-anthropic-${gameId.slice(-4)}`,
+        requestedModelId: 'claude-fable-5',
+        usage: { inputTokens: 1512, outputTokens: 498, totalTokens: 2010 },
+        usageRaw: ANTHROPIC_USAGE_RAW,
+      });
     },
   });
 
@@ -244,24 +286,34 @@ export function createMockAdapters(options: {
     hasCredential: () => true,
     async chat(turns): Promise<ProviderResponse> {
       await sleep(50);
-      const { payload, isRepair } = parseRequestPayload(turns);
+      const { payload, isRepair, gameId } = parseRequestPayload(turns);
       const reported = options.simulateCollision
         ? 'gpt-5.6-sol-2026-05-01'
         : 'gemini-3.1-pro-preview-0611';
+      const usage: ProviderUsage = { inputTokens: 1465, outputTokens: 471, totalTokens: 2241 };
       if (isRepair) {
-        return mockResponse(
-          JSON.stringify(buildValidResponse(payload)),
-          reported,
-          'mock-google-2',
-          'gemini-3.1-pro-preview',
-        );
+        return mockResponse({
+          rawText: JSON.stringify(buildValidResponse(payload)),
+          reportedModelId: reported,
+          responseId: `mock-google-r-${gameId.slice(-4)}`,
+          requestedModelId: 'gemini-3.1-pro-preview',
+          usage,
+          usageRaw: GOOGLE_USAGE_RAW,
+        });
       }
       const corrupted = JSON.stringify(buildValidResponse(payload)).replace(
         '"schemaVersion":1',
         '"schemaVersion":1,,',
       );
-      const malformed = `Here are my forecasts for the slate:\n\`\`\`json\n${corrupted}\n\`\`\`\nGood luck!`;
-      return mockResponse(malformed, reported, 'mock-google-1', 'gemini-3.1-pro-preview');
+      const malformed = `Here are my forecasts:\n\`\`\`json\n${corrupted}\n\`\`\`\nGood luck!`;
+      return mockResponse({
+        rawText: malformed,
+        reportedModelId: reported,
+        responseId: `mock-google-${gameId.slice(-4)}`,
+        requestedModelId: 'gemini-3.1-pro-preview',
+        usage,
+        usageRaw: GOOGLE_USAGE_RAW,
+      });
     },
   });
 

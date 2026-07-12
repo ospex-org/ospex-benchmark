@@ -4,6 +4,8 @@ import { ProviderHttpError, ProviderTimeoutError } from './errors.js';
 /**
  * POST JSON with a hard timeout. Every error path is redacted before it can
  * reach a record or the console; response bodies in errors are truncated.
+ * HTTP 429 is surfaced via ProviderHttpError.status so the runner can
+ * classify it as rate_limited rather than a model failure.
  */
 export async function postJson(options: {
   provider: string;
@@ -11,7 +13,7 @@ export async function postJson(options: {
   headers: Record<string, string>;
   body: unknown;
   timeoutMs: number;
-}): Promise<unknown> {
+}): Promise<{ status: number; json: unknown }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs);
   try {
@@ -55,7 +57,7 @@ export async function postJson(options: {
       );
     }
     try {
-      return JSON.parse(text) as unknown;
+      return { status: response.status, json: JSON.parse(text) as unknown };
     } catch {
       throw new ProviderHttpError(
         options.provider,

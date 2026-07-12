@@ -4,7 +4,7 @@ import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
 import type { CollisionCheckResult } from './providers/family.js';
-import type { ArmRunResult, AttemptRecord, BaselineDecision } from './types.js';
+import type { ArmGameResult, AttemptRecord, BaselineDecision } from './types.js';
 
 export interface RunContext {
   runId: string;
@@ -23,7 +23,9 @@ function attemptFields(attempt: AttemptRecord | null): JsonRecord {
     requestAt: attempt?.requestAt ?? null,
     responseAt: attempt?.responseAt ?? null,
     latencyMs: attempt?.latencyMs ?? null,
+    httpStatus: attempt?.httpStatus ?? null,
     tokens: attempt?.usage ?? null,
+    usageRaw: attempt?.usageRaw ?? null,
     providerResponseId: attempt?.providerResponseId ?? null,
     requestParams: attempt?.requestParams ?? null,
     rawResponse: attempt?.rawText ?? null,
@@ -31,20 +33,35 @@ function attemptFields(attempt: AttemptRecord | null): JsonRecord {
   };
 }
 
-/** The response-reported model ID for an arm, from whichever attempt reported one. */
-export function reportedModelId(result: ArmRunResult): string | null {
+/** The response-reported model ID for an arm-game, from whichever attempt reported one. */
+export function reportedModelId(result: ArmGameResult): string | null {
   return result.attempt.reportedModelId ?? result.repair?.reportedModelId ?? null;
+}
+
+/** Distinct non-null reported model IDs per arm across all its games. */
+export function reportedModelIdsByArm(results: ArmGameResult[]): Map<string, string[]> {
+  const byArm = new Map<string, Set<string>>();
+  for (const result of results) {
+    const set = byArm.get(result.arm.participantId) ?? new Set<string>();
+    for (const id of [result.attempt.reportedModelId, result.repair?.reportedModelId ?? null]) {
+      if (id !== null) set.add(id);
+    }
+    byArm.set(result.arm.participantId, set);
+  }
+  return new Map([...byArm].map(([participantId, set]) => [participantId, [...set]]));
 }
 
 export function buildRecords(
   ctx: RunContext,
   build: BuildResult,
-  armResults: ArmRunResult[],
+  armGameResults: ArmGameResult[],
   baselineDecisions: BaselineDecision[],
   collision: CollisionCheckResult,
 ): JsonRecord[] {
   const records: JsonRecord[] = [];
-  const { bundle, bundleSha256, gameHashes, excluded, provenance } = build;
+  const { slateBundle, slateSha256, requests, gameHashes, excluded, provenance } = build;
+  const requestShaByGame = new Map(requests.map((r) => [r.gameId, r.requestSha256]));
+  const cutoffByGame = new Map(requests.map((r) => [r.gameId, r.requestBundle.cutoffAt]));
 
   records.push({
     recordType: 'run_meta',
@@ -55,28 +72,31 @@ export function buildRecords(
     slateDate: ctx.slateDate,
     createdAt: ctx.createdAt,
     executionPolicy: ctx.executionPolicy,
-    bundleSha256,
-    bundleTimestamp: bundle.bundleTimestamp,
-    cutoffAt: bundle.cutoffAt,
+    dispatch: 'per-game',
+    slateSha256,
+    bundleTimestamp: slateBundle.bundleTimestamp,
+    slateCutoffAt: slateBundle.cutoffAt,
     promptScaffoldVersion: PROMPT_SCAFFOLD_VERSION,
     promptScaffoldSha256: promptScaffoldSha256(),
     timeoutMs: ctx.timeoutMs,
-    eligibleGames: bundle.games.length,
+    eligibleGames: slateBundle.games.length,
     excludedGames: excluded.length,
-    armCount: armResults.length,
+    armGameResults: armGameResults.length,
     baselineDecisionCount: baselineDecisions.length,
   });
 
-  for (const game of bundle.games) {
+  for (const request of requests) {
     records.push({
       recordType: 'bundle_game',
       label: SMOKE_LABEL,
       runId: ctx.runId,
-      gameId: game.gameId,
-      gameSha256: gameHashes[game.gameId] ?? null,
-      slug: provenance[game.gameId]?.slug ?? null,
-      bundle: game,
-      sourceOddsRows: provenance[game.gameId]?.oddsRows ?? [],
+      gameId: request.gameId,
+      gameSha256: gameHashes[request.gameId] ?? null,
+      requestSha256: request.requestSha256,
+      cutoffAt: request.requestBundle.cutoffAt,
+      slug: request.slug,
+      bundle: request.game,
+      sourceOddsRows: provenance[request.gameId]?.oddsRows ?? [],
     });
   }
 
@@ -95,16 +115,17 @@ export function buildRecords(
       label: SMOKE_LABEL,
       runId: ctx.runId,
       cohortId: ctx.cohortId,
-      bundleSha256,
+      slateSha256,
       gameSha256: gameHashes[decision.gameId] ?? null,
-      cutoffAt: bundle.cutoffAt,
+      requestSha256: requestShaByGame.get(decision.gameId) ?? null,
+      cutoffAt: cutoffByGame.get(decision.gameId) ?? null,
       ...decision,
     });
   }
 
-  for (const result of armResults) {
+  for (const result of armGameResults) {
     records.push({
-      recordType: 'arm_response',
+      recordType: 'arm_game_response',
       label: SMOKE_LABEL,
       runId: ctx.runId,
       cohortId: ctx.cohortId,
@@ -112,6 +133,9 @@ export function buildRecords(
       provider: result.arm.provider,
       requestedModelId: result.arm.requestedModelId,
       reportedModelId: reportedModelId(result),
+      gameId: result.gameId,
+      requestSha256: result.requestSha256,
+      cutoffAt: result.cutoffAt,
       outcome: result.outcome,
       repairUsed: result.repairUsed,
       validationErrors: result.validationErrors,
@@ -130,9 +154,10 @@ export function buildRecords(
           runId: ctx.runId,
           cohortId: ctx.cohortId,
           participantId: result.arm.participantId,
-          bundleSha256,
+          slateSha256,
           gameSha256: gameHashes[game.gameId] ?? null,
-          cutoffAt: bundle.cutoffAt,
+          bundleSha256: result.requestSha256,
+          cutoffAt: result.cutoffAt,
           gameId: game.gameId,
           market: forecast.market,
           selection: forecast.selection,
@@ -152,6 +177,7 @@ export function buildRecords(
           responseAt: accepted.responseAt,
           latencyMs: accepted.latencyMs,
           tokens: accepted.usage,
+          usageRaw: accepted.usageRaw,
           costUsd: null,
           outcome: 'valid',
         });

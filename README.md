@@ -26,11 +26,21 @@ The authoritative methodology lives in this repo:
 
 ## Shadow smoke test (v0)
 
-`src/shadowSmoke.ts` is the B0 shadow harness: it fetches an MLB slate with reference odds from the existing public read path, freezes it into a content-hashed bundle, sends the identical bundle to four frontier-model arms concurrently (outputs sealed until all four settle), validates every response against the strict schema with a real validator, runs the six deterministic baselines, records everything with full provenance as NDJSON plus a human-readable summary — and stops. No scoring, no wallets, no chain access, no SSE.
+`src/shadowSmoke.ts` is the B0 shadow harness: it fetches an MLB slate with reference odds from the existing public read path, freezes a content-hashed single-game bundle per game, dispatches the four frontier-model arms **per game** (games sequential, the four arms concurrent within each game, outputs sealed per game so no arm can be conditioned on another's answer), validates every response against the strict schema with a real validator, runs the six deterministic baselines, records everything with full provenance as NDJSON plus a human-readable summary — and stops. No scoring, no wallets, no chain access, no SSE.
+
+Per-game dispatch means one game's failure affects only that game, and each game carries its own decision cutoff (its scheduled first pitch) — a slate cannot be batched when each game's deadline is independent.
 
 ### Requirements
 
 Node.js ≥ 20.6 and yarn. Install dependencies with `yarn install`.
+
+### Provider preflight
+
+```bash
+yarn preflight
+```
+
+Sends one trivial request per provider through the real adapter code path (the same `chat()` the smoke run uses) and prints, per arm: HTTP status, the **response-reported model ID**, the provider's verbatim usage object (the actual token field names), and latency. It asserts every metadata field the harness depends on is present, and exits non-zero naming any credentialed arm that fails. Arms without a credential report `credential_missing` and do not fail the preflight. Costs roughly a penny across all four providers. Flags: `--timeout-seconds` (default 120), `--max-output-tokens` (default 1024).
 
 ### Dry run (no credentials, no network)
 
@@ -38,7 +48,15 @@ Node.js ≥ 20.6 and yarn. Install dependencies with `yarn install`.
 yarn smoke:dry
 ```
 
-Runs the full pipeline against a synthetic fixture slate and four scripted mock arms that exercise every path: a valid response, a malformed response repaired into validity, a schema-violating response that stays invalid after the single deterministic repair, and a timeout. Add `--simulate-collision` to watch the `PROVIDER_COLLISION` hard failure fire.
+Runs the full pipeline against a synthetic fixture slate and four scripted mock arms that exercise every path: valid responses, a malformed response repaired into validity, a schema-violating response that stays invalid after the single deterministic repair (on one game only — proving the failure does not poison the rest of the slate), a simulated HTTP 429 producing `rate_limited`, and a timeout. Add `--simulate-collision` to watch the `PROVIDER_COLLISION` hard failure fire.
+
+### Unit tests
+
+```bash
+yarn test
+```
+
+Covers the slate-date rules and the bundle builder (including the probable-pitcher forward-compatibility and per-game request hashing).
 
 ### Live shadow run
 
@@ -46,17 +64,23 @@ Runs the full pipeline against a synthetic fixture slate and four scripted mock 
 yarn smoke --date 2026-07-12
 ```
 
-Environment (see `.env.example`; values via environment variables only — with Node ≥ 20.6 you can keep them in a local gitignored `.env` and run `node --env-file=.env node_modules/.bin/tsx src/shadowSmoke.ts`):
+Environment (see `.env.example`): values come from environment variables; a local gitignored `.env` in the repo root is loaded automatically at startup (real environment variables always win, and only variable *names* are ever printed).
 
 | Variable | Purpose |
 |---|---|
 | `SUPABASE_URL`, `SUPABASE_ANON_KEY` | Read-only reference-odds snapshot (`current_odds`), public anon key |
 | `OSPEX_API_URL` | Core API base URL (optional; defaults to production) |
-| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY` | Provider arms; a missing key yields an explicit `credential_missing` result, never a crash |
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `XAI_API_KEY` | Provider arms; a missing key yields an explicit `credential_missing` result, never a crash |
 
-Output lands in `out/` (gitignored): `<runId>.ndjson` (one record per line: run metadata, per-game bundles with hashes, arm responses, per-decision records, baseline decisions) and `<runId>-summary.md`.
+Output lands in `out/` (gitignored): `<runId>.ndjson` (one record per line: run metadata, per-game bundles with hashes, per-arm-per-game responses, per-decision records, baseline decisions) and `<runId>-summary.md`.
 
-Every decision is keyed by `gameId` — the upstream odds-feed event UUID that the production closing-line capture also keys on — so each pick joins to its closing line for later scoring. Outcome codes are `valid`, `invalid_schema`, `timeout`, `credential_missing`, plus `provider_error` as a deliberate extension for transport/HTTP failures that are none of the above.
+Every decision is keyed by `gameId` — the upstream odds-feed event UUID that the production closing-line capture also keys on — so each pick joins to its closing line for later scoring. Outcome codes are `valid`, `invalid_schema`, `timeout`, `credential_missing`, plus two deliberate extensions: `rate_limited` (HTTP 429 — a throttle must never read as a model failure) and `provider_error` (other transport/HTTP failures).
+
+Token accounting: each response's provider usage object is stored **verbatim** (`usageRaw`, including reasoning/thinking-token fields) alongside normalized counts. Dollar cost is never fabricated — a price table can be applied retroactively; token counts cannot be recovered after the fact.
+
+### Slate-date rule
+
+**Store UTC, reason in ET, always.** A slate's date is the US Eastern calendar date of first pitch, and a single MLB slate legitimately spans two UTC dates — so a game's slate day is never derived from a UTC string prefix. The rule lives in one tested module, `src/slateDate.ts`.
 
 ## Secrets discipline
 

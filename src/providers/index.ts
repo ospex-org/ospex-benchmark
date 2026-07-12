@@ -43,6 +43,7 @@ export function createRealAdapters(): Map<string, ProviderAdapter> {
       requestedModelId: 'gpt-5.6-sol',
       credentialEnvVar: 'OPENAI_API_KEY',
       baseUrl: 'https://api.openai.com/v1',
+      maxTokensParam: 'max_completion_tokens',
     }),
   );
   adapters.set('anthropic-claude-fable-5', createAnthropicAdapter('claude-fable-5'));
@@ -54,6 +55,7 @@ export function createRealAdapters(): Map<string, ProviderAdapter> {
       requestedModelId: 'grok-4.5',
       credentialEnvVar: 'XAI_API_KEY',
       baseUrl: 'https://api.x.ai/v1',
+      maxTokensParam: 'max_tokens',
     }),
   );
   return adapters;

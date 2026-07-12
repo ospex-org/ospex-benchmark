@@ -11,6 +11,8 @@
   "scripts": {
     "smoke": "tsx src/shadowSmoke.ts",
     "smoke:dry": "tsx src/shadowSmoke.ts --dry-run",
+    "preflight": "tsx src/preflight.ts",
+    "test": "tsx --test src/slateDate.test.ts src/bundle.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

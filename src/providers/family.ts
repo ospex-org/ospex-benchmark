@@ -8,7 +8,8 @@ import type { ProviderName } from '../types.js';
  * and the only trace is what the response metadata reports. If two arms
  * resolve to the same provider family — or an arm's reported family
  * contradicts the provider it was requested from — the run fails loudly and
- * names them.
+ * names them. With per-game dispatch an arm reports an ID per game; an arm
+ * whose reported IDs span multiple families is itself a failure.
  */
 export function classifyFamily(modelId: string): ProviderName | null {
   const id = modelId.toLowerCase();
@@ -23,7 +24,8 @@ export interface CollisionCheckInput {
   participantId: string;
   provider: ProviderName;
   requestedModelId: string;
-  reportedModelId: string | null;
+  /** Distinct response-reported model IDs observed across the arm's games. */
+  reportedModelIds: string[];
 }
 
 export interface CollisionCheckResult {
@@ -36,26 +38,38 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
   const warnings: string[] = [];
 
   const byFamily = new Map<ProviderName, CollisionCheckInput[]>();
-  const unclassified: CollisionCheckInput[] = [];
+  const unclassified: Array<{ arm: CollisionCheckInput; id: string }> = [];
 
   for (const arm of arms) {
-    if (arm.reportedModelId === null) {
+    if (arm.reportedModelIds.length === 0) {
       warnings.push(
         `${arm.participantId}: no response-reported model ID available — provider identity unverified`,
       );
       continue;
     }
-    const family = classifyFamily(arm.reportedModelId);
-    if (family === null) {
-      warnings.push(
-        `${arm.participantId}: reported model "${arm.reportedModelId}" does not match any known family — provider identity unverified`,
+    const families = new Set<ProviderName>();
+    for (const id of arm.reportedModelIds) {
+      const family = classifyFamily(id);
+      if (family === null) {
+        warnings.push(
+          `${arm.participantId}: reported model "${id}" does not match any known family — provider identity unverified`,
+        );
+        unclassified.push({ arm, id });
+      } else {
+        families.add(family);
+      }
+    }
+    if (families.size > 1) {
+      failures.push(
+        `PROVIDER_COLLISION: ${arm.participantId} reported models from multiple families across games: ${arm.reportedModelIds.join(', ')}`,
       );
-      unclassified.push(arm);
       continue;
     }
+    const family = [...families][0];
+    if (family === undefined) continue;
     if (family !== arm.provider) {
       failures.push(
-        `PROVIDER_COLLISION: ${arm.participantId} was requested from ${arm.provider} but the response reports "${arm.reportedModelId}" (${family} family)`,
+        `PROVIDER_COLLISION: ${arm.participantId} was requested from ${arm.provider} but responses report "${arm.reportedModelIds.join(', ')}" (${family} family)`,
       );
     }
     const list = byFamily.get(family) ?? [];
@@ -66,21 +80,21 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
   for (const [family, members] of byFamily) {
     if (members.length > 1) {
       const names = members
-        .map((m) => `${m.participantId} (reported "${m.reportedModelId ?? 'unknown'}")`)
+        .map((m) => `${m.participantId} (reported "${m.reportedModelIds.join(', ')}")`)
         .join(', ');
       failures.push(`PROVIDER_COLLISION: multiple arms resolve to the ${family} family: ${names}`);
     }
   }
 
-  // Fallback for unclassifiable IDs: byte-identical reported IDs across arms
-  // are still a collision even when the family is unknown.
+  // Fallback for unclassifiable IDs: byte-identical reported IDs across two
+  // different arms are still a collision even when the family is unknown.
   const seen = new Map<string, CollisionCheckInput>();
-  for (const arm of unclassified) {
-    const key = (arm.reportedModelId ?? '').trim().toLowerCase();
+  for (const { arm, id } of unclassified) {
+    const key = id.trim().toLowerCase();
     const prior = seen.get(key);
-    if (prior) {
+    if (prior && prior.participantId !== arm.participantId) {
       failures.push(
-        `PROVIDER_COLLISION: ${prior.participantId} and ${arm.participantId} report the identical model ID "${arm.reportedModelId}"`,
+        `PROVIDER_COLLISION: ${prior.participantId} and ${arm.participantId} report the identical model ID "${id}"`,
       );
     } else {
       seen.set(key, arm);

@@ -15,6 +15,7 @@ const SECRET_ENV_VARS = [
   'OPENAI_API_KEY',
   'ANTHROPIC_API_KEY',
   'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
   'XAI_API_KEY',
   'SUPABASE_ANON_KEY',
 ] as const;
@@ -24,6 +25,11 @@ export function envValue(name: string): string | undefined {
   if (raw === undefined) return undefined;
   const trimmed = raw.trim();
   return trimmed === '' ? undefined : trimmed;
+}
+
+/** The Gemini credential; both common variable names are accepted. */
+export function googleApiKey(): string | undefined {
+  return envValue('GEMINI_API_KEY') ?? envValue('GOOGLE_API_KEY');
 }
 
 function presentSecretValues(): string[] {

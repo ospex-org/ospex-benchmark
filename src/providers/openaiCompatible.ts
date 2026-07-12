@@ -3,6 +3,7 @@ import { postJson } from './http.js';
 import type {
   ChatTurn,
   ProviderAdapter,
+  ProviderCallOptions,
   ProviderName,
   ProviderResponse,
   ProviderUsage,
@@ -14,34 +15,44 @@ import type {
  * overrides, so reasoning-model parameter restrictions cannot reject the
  * call. Whatever the provider defaults to is recorded as the configuration.
  */
-export function createOpenAiCompatibleAdapter(options: {
+export function createOpenAiCompatibleAdapter(config: {
   provider: ProviderName;
   requestedModelId: string;
   credentialEnvVar: string;
   baseUrl: string;
+  /** Param name for the output cap ('max_completion_tokens' on OpenAI, 'max_tokens' on xAI). */
+  maxTokensParam: string;
 }): ProviderAdapter {
   return {
-    provider: options.provider,
-    requestedModelId: options.requestedModelId,
-    credentialEnvVar: options.credentialEnvVar,
+    provider: config.provider,
+    requestedModelId: config.requestedModelId,
+    credentialEnvVar: config.credentialEnvVar,
     hasCredential(): boolean {
-      return envValue(options.credentialEnvVar) !== undefined;
+      return envValue(config.credentialEnvVar) !== undefined;
     },
-    async chat(turns: ChatTurn[], timeoutMs: number): Promise<ProviderResponse> {
-      const apiKey = envValue(options.credentialEnvVar);
-      if (apiKey === undefined) throw new Error(`${options.credentialEnvVar} is not set`);
-      const url = `${options.baseUrl}/chat/completions`;
-      const requestBody = {
-        model: options.requestedModelId,
+    async chat(
+      turns: ChatTurn[],
+      timeoutMs: number,
+      options?: ProviderCallOptions,
+    ): Promise<ProviderResponse> {
+      const apiKey = envValue(config.credentialEnvVar);
+      if (apiKey === undefined) throw new Error(`${config.credentialEnvVar} is not set`);
+      const url = `${config.baseUrl}/chat/completions`;
+      const requestBody: Record<string, unknown> = {
+        model: config.requestedModelId,
         messages: turns.map((t) => ({ role: t.role, content: t.content })),
       };
-      const json = (await postJson({
-        provider: options.provider,
+      if (options?.maxOutputTokens !== undefined) {
+        requestBody[config.maxTokensParam] = options.maxOutputTokens;
+      }
+      const { status, json: raw } = await postJson({
+        provider: config.provider,
         url,
         headers: { authorization: `Bearer ${apiKey}` },
         body: requestBody,
         timeoutMs,
-      })) as {
+      });
+      const json = raw as {
         id?: unknown;
         model?: unknown;
         choices?: Array<{ message?: { content?: unknown } }>;
@@ -55,12 +66,21 @@ export function createOpenAiCompatibleAdapter(options: {
           typeof json.usage?.completion_tokens === 'number' ? json.usage.completion_tokens : null,
         totalTokens: typeof json.usage?.total_tokens === 'number' ? json.usage.total_tokens : null,
       };
+      const requestParams: Record<string, unknown> = {
+        endpoint: url,
+        model: config.requestedModelId,
+      };
+      if (options?.maxOutputTokens !== undefined) {
+        requestParams[config.maxTokensParam] = options.maxOutputTokens;
+      }
       return {
         rawText: typeof content === 'string' ? content : '',
         reportedModelId: typeof json.model === 'string' ? json.model : null,
         providerResponseId: typeof json.id === 'string' ? json.id : null,
+        httpStatus: status,
         usage,
-        requestParams: { endpoint: url, model: options.requestedModelId },
+        usageRaw: json.usage ?? null,
+        requestParams,
       };
     },
   };

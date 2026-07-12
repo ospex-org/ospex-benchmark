@@ -1,8 +1,12 @@
 /**
- * Slate-day helpers. MLB slates are calendar days in US Eastern time; game
- * start times arrive as UTC ISO strings, so a Saturday night ET game carries
- * a Sunday UTC date. Every "which day is this game" decision goes through
- * the ET calendar day, never a UTC string prefix.
+ * Slate-date rules — the single home for UTC/ET reasoning.
+ *
+ * THE RULE: store UTC, reason in ET, always. A slate's date is the US Eastern
+ * calendar date of first pitch. A single MLB slate legitimately spans two UTC
+ * dates (a 9:40 pm ET game on Jul 11 starts at 01:40 UTC on Jul 12), so a
+ * game's slate day must NEVER be derived from the UTC string prefix — only
+ * from the instant converted into America/New_York, which also absorbs
+ * EST/EDT transitions.
  */
 
 const ET_DAY_FORMAT = new Intl.DateTimeFormat('en-CA', {
@@ -12,6 +16,7 @@ const ET_DAY_FORMAT = new Intl.DateTimeFormat('en-CA', {
   day: '2-digit',
 });
 
+/** The US Eastern calendar day (YYYY-MM-DD) of a UTC instant. */
 export function easternCalendarDay(isoUtc: string): string {
   const date = new Date(isoUtc);
   if (Number.isNaN(date.getTime())) {
@@ -20,6 +25,7 @@ export function easternCalendarDay(isoUtc: string): string {
   return ET_DAY_FORMAT.format(date);
 }
 
+/** True only for a well-formed, actually-existing calendar day. */
 export function isValidSlateDate(value: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const [y, m, d] = value.split('-').map((part) => Number.parseInt(part, 10));
@@ -32,13 +38,14 @@ export function isValidSlateDate(value: string): boolean {
   );
 }
 
-/** Tomorrow's date relative to the current moment, as an ET calendar day. */
+/** Tomorrow relative to the given instant, as an ET calendar day. */
 export function tomorrowEastern(now: Date): string {
   const todayEt = ET_DAY_FORMAT.format(now);
   const [y, m, d] = todayEt.split('-').map((part) => Number.parseInt(part, 10));
   if (y === undefined || m === undefined || d === undefined) {
     throw new Error(`unexpected ET day format: ${todayEt}`);
   }
+  // Noon UTC is DST-safe: adding 24h can never skip or repeat an ET day.
   const noonUtc = Date.UTC(y, m - 1, d, 12);
   const tomorrow = new Date(noonUtc + 24 * 60 * 60 * 1000);
   const yyyy = tomorrow.getUTCFullYear();
