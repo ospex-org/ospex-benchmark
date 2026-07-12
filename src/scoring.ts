@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { scoreDecision } from './clv.js';
+import { benchmarkResponseSchema, extractJson } from './schema.js';
 import { SMOKE_LABEL } from './types.js';
 import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
 import type { ClosingLineRow, MarketKey } from './types.js';
@@ -31,6 +32,9 @@ const runMetaSchema = z
     slateSha256: z.string().min(1),
     bundleTimestamp: z.string().min(1),
     slateCutoffAt: z.string().min(1),
+    eligibleGames: z.number().int().nonnegative(),
+    armGameResults: z.number().int().nonnegative(),
+    baselineDecisionCount: z.number().int().nonnegative(),
   })
   .passthrough();
 
@@ -67,6 +71,14 @@ const bundleGameSchema = z
   })
   .passthrough();
 
+const attemptFieldsSchema = z
+  .object({
+    reportedModelId: z.string().nullable(),
+    providerResponseId: z.string().nullable(),
+    rawResponse: z.string().nullable(),
+  })
+  .passthrough();
+
 const armResponseSchema = z
   .object({
     recordType: z.literal('arm_game_response'),
@@ -77,6 +89,9 @@ const armResponseSchema = z
     gameId: z.string().min(1),
     requestSha256: z.string().min(1),
     outcome: z.string().min(1),
+    repairUsed: z.boolean(),
+    attempt: attemptFieldsSchema,
+    repair: attemptFieldsSchema.nullable(),
   })
   .passthrough();
 
@@ -155,6 +170,8 @@ export interface SourcePick {
   selection: string;
   line: number | null;
   entryDecimal: number;
+  probabilities: { win: number; push: number; loss: number } | null;
+  confidenceValue: number | null;
   modelWinProbability: number | null;
   wouldAbstain: boolean | null;
   selectedForExecution: boolean | null;
@@ -176,6 +193,13 @@ export interface ArmResponseRef {
   gameId: string;
   requestSha256: string;
   outcome: string;
+  repairUsed: boolean;
+  /** The ACCEPTED attempt (repair when a repair was used). */
+  accepted: {
+    reportedModelId: string | null;
+    providerResponseId: string | null;
+    rawResponse: string | null;
+  };
 }
 
 export interface SourceRun {
@@ -187,6 +211,10 @@ export interface SourceRun {
   slateSha256: string;
   bundleTimestamp: string;
   slateCutoffAt: string;
+  /** Manifest counts recorded by the harness at write time. */
+  eligibleGames: number;
+  armGameResults: number;
+  baselineDecisionCount: number;
   games: Map<string, SourceGame>;
   picks: SourcePick[];
   armResponses: ArmResponseRef[];
@@ -250,6 +278,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
       }
       case 'arm_game_response': {
         const response = armResponseSchema.parse(record);
+        const accepted = response.repairUsed && response.repair !== null ? response.repair : response.attempt;
         armResponses.push({
           participantId: response.participantId,
           provider: response.provider,
@@ -258,6 +287,12 @@ export function parseRunRecords(lines: string[]): SourceRun {
           gameId: response.gameId,
           requestSha256: response.requestSha256,
           outcome: response.outcome,
+          repairUsed: response.repairUsed,
+          accepted: {
+            reportedModelId: accepted.reportedModelId,
+            providerResponseId: accepted.providerResponseId,
+            rawResponse: accepted.rawResponse,
+          },
         });
         break;
       }
@@ -276,6 +311,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
           selection: decision.selection,
           line: decision.line,
           entryDecimal: decision.observedDecimal,
+          probabilities: decision.probabilities,
+          confidenceValue: decision.confidence,
           modelWinProbability: decision.probabilities.win,
           wouldAbstain: decision.wouldAbstain,
           selectedForExecution: decision.selectedForExecution,
@@ -300,6 +337,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
           selection: baseline.selection,
           line: baseline.line,
           entryDecimal: baseline.observedDecimal,
+          probabilities: null,
+          confidenceValue: null,
           modelWinProbability: null,
           wouldAbstain: null,
           selectedForExecution: null,
@@ -334,6 +373,9 @@ export function parseRunRecords(lines: string[]): SourceRun {
     slateSha256: meta.slateSha256,
     bundleTimestamp: meta.bundleTimestamp,
     slateCutoffAt: meta.slateCutoffAt,
+    eligibleGames: meta.eligibleGames,
+    armGameResults: meta.armGameResults,
+    baselineDecisionCount: meta.baselineDecisionCount,
     games,
     picks,
     armResponses,
@@ -424,8 +466,76 @@ export function verifyRunIntegrity(run: SourceRun): string[] {
     violations.push('run_meta slateSha256 does not match the recomputed slate hash');
   }
 
-  // Decision-to-response linkage.
-  const responseByKey = new Map(run.armResponses.map((r) => [`${r.participantId}:${r.gameId}`, r]));
+  // Manifest counts: surviving records must match what the harness recorded
+  // at write time, so deleted arms/baselines cannot silently vanish.
+  if (run.games.size !== run.eligibleGames) {
+    violations.push(
+      `run_meta says ${run.eligibleGames} eligible games but ${run.games.size} bundle_game records survive`,
+    );
+  }
+  if (run.armResponses.length !== run.armGameResults) {
+    violations.push(
+      `run_meta says ${run.armGameResults} arm-game responses but ${run.armResponses.length} survive`,
+    );
+  }
+  const baselinePicks = run.picks.filter((p) => p.kind === 'baseline');
+  if (baselinePicks.length !== run.baselineDecisionCount) {
+    violations.push(
+      `run_meta says ${run.baselineDecisionCount} baseline decisions but ${baselinePicks.length} survive`,
+    );
+  }
+
+  // Response uniqueness and full arm×game cross-product: the harness
+  // dispatches every arm on every game exactly once.
+  const responseByKey = new Map<string, ArmResponseRef>();
+  const responsesByArm = new Map<string, Set<string>>();
+  for (const response of run.armResponses) {
+    const key = `${response.participantId}:${response.gameId}`;
+    if (responseByKey.has(key)) {
+      violations.push(`duplicate arm_game_response for ${key}`);
+      continue;
+    }
+    responseByKey.set(key, response);
+    const games = responsesByArm.get(response.participantId) ?? new Set<string>();
+    games.add(response.gameId);
+    responsesByArm.set(response.participantId, games);
+    const game = run.games.get(response.gameId);
+    if (!game) {
+      violations.push(`arm response ${key} references an unknown game`);
+    } else if (response.requestSha256 !== game.requestSha256) {
+      violations.push(`arm response ${key}: requestSha256 does not match the game's request hash`);
+    }
+  }
+  for (const [participantId, games] of responsesByArm) {
+    if (games.size !== run.games.size) {
+      violations.push(
+        `arm ${participantId} has responses for ${games.size} of ${run.games.size} games — the arm×game cross-product is incomplete`,
+      );
+    }
+  }
+
+  // Baseline uniqueness and baseline×game cross-product.
+  const baselineGamesByArm = new Map<string, Set<string>>();
+  for (const pick of baselinePicks) {
+    const games = baselineGamesByArm.get(pick.participantId) ?? new Set<string>();
+    if (games.has(pick.gameId)) {
+      violations.push(`duplicate baseline decision for ${pick.participantId}:${pick.gameId}`);
+    }
+    games.add(pick.gameId);
+    baselineGamesByArm.set(pick.participantId, games);
+  }
+  for (const [participantId, games] of baselineGamesByArm) {
+    if (games.size !== run.games.size) {
+      violations.push(
+        `baseline ${participantId} has decisions for ${games.size} of ${run.games.size} games — the baseline×game cross-product is incomplete`,
+      );
+    }
+  }
+
+  // Decision-to-accepted-response correspondence: every decision must be
+  // re-derivable from the ARCHIVED accepted provider response, and its
+  // provenance metadata must match the accepted attempt — a decision cannot
+  // say something the model did not.
   const modelPicksByKey = new Map<string, SourcePick[]>();
   for (const pick of run.picks.filter((p) => p.kind === 'model')) {
     const key = `${pick.participantId}:${pick.gameId}`;
@@ -441,10 +551,57 @@ export function verifyRunIntegrity(run: SourceRun): string[] {
     }
     if (response.outcome !== 'valid') {
       violations.push(`decisions for ${key} are backed by a non-valid arm response (${response.outcome})`);
+      continue;
     }
     const markets = new Set(list.map((p) => p.market));
     if (list.length !== 3 || markets.size !== 3) {
       violations.push(`${key}: expected exactly one decision per market, found ${list.length}`);
+    }
+
+    if (response.accepted.rawResponse === null) {
+      violations.push(`${key}: accepted response retains no raw text — decisions cannot be re-derived`);
+      continue;
+    }
+    const extracted = extractJson(response.accepted.rawResponse);
+    const shape = extracted === null ? null : benchmarkResponseSchema.safeParse(extracted);
+    if (shape === null || !shape.success) {
+      violations.push(`${key}: accepted raw response does not parse as a benchmark response`);
+      continue;
+    }
+    const responseGame = shape.data.games.find((g) => g.gameId === response.gameId);
+    if (!responseGame) {
+      violations.push(`${key}: accepted raw response does not contain game ${response.gameId}`);
+      continue;
+    }
+    const forecastByMarket = new Map(responseGame.forecasts.map((f) => [f.market, f]));
+    for (const pick of list) {
+      const forecast = forecastByMarket.get(pick.market);
+      if (!forecast) {
+        violations.push(`${key} ${pick.market}: no matching forecast in the accepted response`);
+        continue;
+      }
+      const mismatch =
+        forecast.selection !== pick.selection ||
+        forecast.line !== pick.line ||
+        forecast.observedDecimal !== pick.entryDecimal ||
+        forecast.probabilities.win !== pick.probabilities?.win ||
+        forecast.probabilities.push !== pick.probabilities?.push ||
+        forecast.probabilities.loss !== pick.probabilities?.loss ||
+        forecast.confidence !== pick.confidenceValue ||
+        forecast.wouldAbstain !== pick.wouldAbstain ||
+        forecast.selectedForExecution !== pick.selectedForExecution;
+      if (mismatch) {
+        violations.push(`${key} ${pick.market}: decision does not match the accepted provider response`);
+      }
+      if (
+        pick.provider !== response.provider ||
+        pick.requestedModelId !== response.requestedModelId ||
+        pick.reportedModelId !== response.accepted.reportedModelId ||
+        pick.providerResponseId !== response.accepted.providerResponseId ||
+        pick.attemptUsed !== (response.repairUsed ? 'repair' : 'initial')
+      ) {
+        violations.push(`${key} ${pick.market}: decision provenance does not match the accepted attempt`);
+      }
     }
   }
   for (const response of run.armResponses) {

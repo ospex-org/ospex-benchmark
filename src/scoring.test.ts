@@ -45,23 +45,14 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
   };
   const slateSha256 = sha256Hex(canonicalize(slateBundle));
 
-  const lines: Array<Record<string, unknown>> = [];
-  lines.push({
-    recordType: 'run_meta',
-    runId: 'test-run',
-    cohortId: 'test-cohort',
-    label: LABEL,
-    mode: 'live',
-    slateDate: '2026-07-12',
-    slateSha256,
-    bundleTimestamp: BUNDLE_TS,
-    slateCutoffAt: '2026-07-12T16:15:00+00:00',
-  });
+  const records: Array<Record<string, unknown>> = [];
+  let armResponseCount = 0;
+  let baselineCount = 0;
 
   for (const request of requests) {
     const game = request.game;
     const gameSha256 = sha256Hex(canonicalize(game));
-    lines.push({
+    records.push({
       recordType: 'bundle_game',
       gameId: game.gameId,
       slug: request.slug,
@@ -70,7 +61,25 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
       requestSha256: request.requestSha256,
       bundle: game,
     });
-    lines.push({
+
+    // The forecasts drive BOTH the archived raw response and the decision
+    // records, so they correspond exactly (as the harness guarantees).
+    const forecasts = [
+      { market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: game.markets.moneyline.homeDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: true, rationale: 'reference-price read', evidenceRefs: [game.markets.moneyline.evidenceRef] },
+      { market: 'spread', selection: game.awayTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.awayDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: false, rationale: 'reference-price read', evidenceRefs: [game.markets.runLine.evidenceRef] },
+      { market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: true, rationale: 'reference-price read', evidenceRefs: [game.markets.total.evidenceRef] },
+    ];
+    const rawResponse = JSON.stringify({
+      schemaVersion: 1,
+      cohortId: 'test-cohort',
+      participantId: 'model-arm',
+      requestedModelId: 'stub-model-1',
+      bundleSha256: request.requestSha256,
+      executionPolicy: 'fixed-moneyline-total',
+      games: [{ gameId: game.gameId, forecasts }],
+    });
+
+    records.push({
       recordType: 'arm_game_response',
       participantId: 'model-arm',
       provider: 'openai',
@@ -79,9 +88,13 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
       gameId: game.gameId,
       requestSha256: request.requestSha256,
       outcome: 'valid',
+      repairUsed: false,
+      attempt: { reportedModelId: 'stub-model-1', providerResponseId: 'resp-1', rawResponse },
+      repair: null,
     });
+    armResponseCount += 1;
     if (options?.extraArm) {
-      lines.push({
+      records.push({
         recordType: 'arm_game_response',
         participantId: options.extraArm.participantId,
         provider: 'xai',
@@ -90,31 +103,37 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
         gameId: game.gameId,
         requestSha256: request.requestSha256,
         outcome: options.extraArm.outcome,
+        repairUsed: false,
+        attempt: { reportedModelId: null, providerResponseId: null, rawResponse: null },
+        repair: null,
+      });
+      armResponseCount += 1;
+    }
+
+    for (const forecast of forecasts) {
+      records.push({
+        recordType: 'decision',
+        participantId: 'model-arm',
+        gameId: game.gameId,
+        market: forecast.market,
+        selection: forecast.selection,
+        line: forecast.line,
+        observedDecimal: forecast.observedDecimal,
+        probabilities: forecast.probabilities,
+        confidence: forecast.confidence,
+        selectedForExecution: forecast.selectedForExecution,
+        wouldAbstain: forecast.wouldAbstain,
+        provider: 'openai',
+        requestedModelId: 'stub-model-1',
+        reportedModelId: 'stub-model-1',
+        providerResponseId: 'resp-1',
+        attemptUsed: 'initial',
+        bundleSha256: request.requestSha256,
+        gameSha256,
+        slateSha256,
       });
     }
-    const decisionBase = {
-      recordType: 'decision',
-      participantId: 'model-arm',
-      gameId: game.gameId,
-      probabilities: { win: 0.55, push: 0, loss: 0.45 },
-      confidence: 0.6,
-      selectedForExecution: true,
-      wouldAbstain: false,
-      provider: 'openai',
-      requestedModelId: 'stub-model-1',
-      reportedModelId: 'stub-model-1',
-      providerResponseId: 'resp-1',
-      attemptUsed: 'initial',
-      bundleSha256: request.requestSha256,
-      gameSha256,
-      slateSha256,
-    };
-    lines.push(
-      { ...decisionBase, market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: game.markets.moneyline.homeDecimal },
-      { ...decisionBase, market: 'spread', selection: game.awayTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.awayDecimal, selectedForExecution: false },
-      { ...decisionBase, market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal },
-    );
-    lines.push({
+    records.push({
       recordType: 'baseline_decision',
       participantId: 'baseline-away-ml',
       policyVersion: 'baselines-v0.1.0',
@@ -127,9 +146,25 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
       gameSha256,
       requestSha256: request.requestSha256,
     });
+    baselineCount += 1;
   }
 
-  return { lines: lines.map((l) => JSON.stringify(l)), requests, slateSha256 };
+  records.unshift({
+    recordType: 'run_meta',
+    runId: 'test-run',
+    cohortId: 'test-cohort',
+    label: LABEL,
+    mode: 'live',
+    slateDate: '2026-07-12',
+    slateSha256,
+    bundleTimestamp: BUNDLE_TS,
+    slateCutoffAt: '2026-07-12T16:15:00+00:00',
+    eligibleGames: requests.length,
+    armGameResults: armResponseCount,
+    baselineDecisionCount: baselineCount,
+  });
+
+  return { lines: records.map((l) => JSON.stringify(l)), requests, slateSha256 };
 }
 
 function closeRow(
@@ -226,6 +261,86 @@ test('a valid arm response with missing decisions is caught, as is a wrong per-m
   });
   const violations = verifyRunIntegrity(parseRunRecords(withoutOneDecision));
   assert.ok(violations.some((v) => v.includes('expected exactly one decision per market')));
+});
+
+test('the round-2 probe: a decision swapped to the other bundle-valid side is caught against the accepted response', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (record['recordType'] === 'decision' && record['market'] === 'moneyline' && record['gameId'] === GAME_A) {
+      // Milwaukee at its VALID frozen-bundle price — bundle checks alone
+      // cannot catch this; only correspondence with the archived response can.
+      record['selection'] = 'Milwaukee Brewers';
+      record['observedDecimal'] = 1.74627;
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  assert.ok(violations.some((v) => v.includes('does not match the accepted provider response')));
+});
+
+test('forged decision provenance metadata is caught against the accepted attempt', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (record['recordType'] === 'decision' && record['market'] === 'total' && record['gameId'] === GAME_A) {
+      record['reportedModelId'] = 'some-other-model';
+      record['providerResponseId'] = 'forged-response-id';
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  assert.ok(violations.some((v) => v.includes('provenance does not match the accepted attempt')));
+});
+
+test('an arm response whose request hash does not match the game is caught', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (record['recordType'] === 'arm_game_response' && record['gameId'] === GAME_B) {
+      record['requestSha256'] = '0'.repeat(64);
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated));
+  assert.ok(violations.some((v) => v.includes("does not match the game's request hash")));
+});
+
+test('deleting an arm entirely is caught by the manifest count and cross-product', () => {
+  const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
+  const withoutTimeoutArm = lines.filter((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    return !(
+      record['recordType'] === 'arm_game_response' && record['participantId'] === 'timeout-arm'
+    );
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(withoutTimeoutArm));
+  assert.ok(violations.some((v) => v.includes('arm-game responses but')));
+});
+
+test('deleting baseline decisions is caught by the manifest count', () => {
+  const { lines } = fixtureRun();
+  const withoutBaselines = lines.filter((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    return record['recordType'] !== 'baseline_decision';
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(withoutBaselines));
+  assert.ok(violations.some((v) => v.includes('baseline decisions but')));
+});
+
+test('a partially deleted baseline breaks the baseline×game cross-product', () => {
+  const { lines } = fixtureRun();
+  let removed = false;
+  const partial = lines.filter((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (!removed && record['recordType'] === 'baseline_decision' && record['gameId'] === GAME_B) {
+      removed = true;
+      return false;
+    }
+    return true;
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(partial));
+  assert.ok(violations.some((v) => v.includes('cross-product is incomplete')));
 });
 
 test('parseRunRecords fails loudly without run_meta', () => {
