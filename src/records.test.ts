@@ -3,7 +3,13 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { buildRecords, writeNdjson, writeText } from './records.js';
+import {
+  buildRecords,
+  failuresByCode,
+  unidentifiedResponsesByArm,
+  writeNdjson,
+  writeText,
+} from './records.js';
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
 import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
@@ -33,6 +39,7 @@ function makeCtx(): RunContext {
     maxOutputTokens: 16000,
     fetchStartedAt: '2026-07-12T14:05:00+00:00',
     fetchCompletedAt: '2026-07-12T14:05:00+00:00',
+    clockMode: 'synthetic-fixture',
   };
 }
 
@@ -127,6 +134,62 @@ test('cutoff_missed results never emit decision records', () => {
   };
   const records = buildRecords(makeCtx(), build, [result], [], { failures: [], warnings: [] });
   assert.equal(records.filter((r) => r['recordType'] === 'decision').length, 0);
+});
+
+test('identity-only failures get their own MODEL_IDENTITY run_failure record, never PROVIDER_COLLISION', () => {
+  const build = makeBuild();
+  const records = buildRecords(makeCtx(), build, [], [], {
+    failures: [
+      'MODEL_IDENTITY: some-arm returned 1 response(s) without a reported model ID — accepted decisions require verified identity',
+      'PROVIDER_COLLISION: two arms resolve to the openai family',
+    ],
+    warnings: [],
+  });
+  const runFailures = records.filter((r) => r['recordType'] === 'run_failure');
+  assert.equal(runFailures.length, 2);
+  const codes = runFailures.map((r) => r['code']).sort();
+  assert.deepEqual(codes, ['MODEL_IDENTITY', 'PROVIDER_COLLISION']);
+  const identity = runFailures.find((r) => r['code'] === 'MODEL_IDENTITY');
+  assert.ok(identity);
+  const identityFailures = identity['failures'] as string[];
+  assert.equal(identityFailures.length, 1);
+  assert.ok(identityFailures[0]?.startsWith('MODEL_IDENTITY'));
+});
+
+test('failuresByCode classifies by machine-code prefix', () => {
+  const grouped = failuresByCode(['MODEL_IDENTITY: a', 'PROVIDER_COLLISION: b', 'MODEL_IDENTITY: c']);
+  assert.deepEqual(grouped.get('MODEL_IDENTITY'), ['MODEL_IDENTITY: a', 'MODEL_IDENTITY: c']);
+  assert.deepEqual(grouped.get('PROVIDER_COLLISION'), ['PROVIDER_COLLISION: b']);
+});
+
+test('unidentifiedResponsesByArm counts successful responses lacking a model ID, not transport failures', () => {
+  const build = makeBuild();
+  const request = build.requests[0];
+  assert.ok(request);
+  const base = {
+    arm: TEST_ARM,
+    gameId: request.gameId,
+    requestSha256: request.requestSha256,
+    cutoffAt: request.requestBundle.cutoffAt,
+    repair: null,
+    repairUsed: false,
+    repairTransport: null,
+    parsed: null,
+    validationErrors: [],
+  };
+  const results: ArmGameResult[] = [
+    // successful response, no reported ID → counts
+    { ...base, outcome: 'valid', attempt: attempt({ rawText: '{}', reportedModelId: null }) },
+    // transport failure (no body) → exempt
+    { ...base, outcome: 'timeout', attempt: attempt({ rawText: null, reportedModelId: null }) },
+    // successful response with an ID → does not count
+    {
+      ...base,
+      outcome: 'valid',
+      attempt: attempt({ rawText: '{}', reportedModelId: 'stub-model-1' }),
+    },
+  ];
+  assert.equal(unidentifiedResponsesByArm(results).get(TEST_ARM.participantId), 1);
 });
 
 test('every serialized byte passes secret redaction — rationale and validation errors included', () => {

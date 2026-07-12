@@ -19,6 +19,13 @@ export interface RunContext {
   maxOutputTokens: number;
   fetchStartedAt: string;
   fetchCompletedAt: string;
+  /**
+   * 'wall' in live mode; 'synthetic-fixture' in dry runs, where ONE injected
+   * clock anchored at the fixture capture instant drives both cutoff
+   * enforcement and every recorded timestamp, keeping artifacts temporally
+   * consistent.
+   */
+  clockMode: 'wall' | 'synthetic-fixture';
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -66,6 +73,40 @@ export function reportedModelIdsByArm(results: ArmGameResult[]): Map<string, str
   return new Map([...byArm].map(([participantId, set]) => [participantId, [...set]]));
 }
 
+/**
+ * Per arm: how many SUCCESSFUL responses (a body came back) carried no
+ * reported model ID. Feeds the fail-closed identity check — transport
+ * failures with no response body are exempt.
+ */
+export function unidentifiedResponsesByArm(results: ArmGameResult[]): Map<string, number> {
+  const byArm = new Map<string, number>();
+  for (const result of results) {
+    let count = byArm.get(result.arm.participantId) ?? 0;
+    if (result.attempt.rawText !== null && result.attempt.reportedModelId === null) count += 1;
+    if (
+      result.repair !== null &&
+      result.repair.rawText !== null &&
+      result.repair.reportedModelId === null
+    ) {
+      count += 1;
+    }
+    byArm.set(result.arm.participantId, count);
+  }
+  return byArm;
+}
+
+/** Group identity/collision failure strings by their machine code prefix. */
+export function failuresByCode(failures: string[]): Map<string, string[]> {
+  const byCode = new Map<string, string[]>();
+  for (const failure of failures) {
+    const code = failure.startsWith('MODEL_IDENTITY') ? 'MODEL_IDENTITY' : 'PROVIDER_COLLISION';
+    const list = byCode.get(code) ?? [];
+    list.push(failure);
+    byCode.set(code, list);
+  }
+  return byCode;
+}
+
 export function buildRecords(
   ctx: RunContext,
   build: BuildResult,
@@ -97,6 +138,7 @@ export function buildRecords(
     promptScaffoldSha256: promptScaffoldSha256(),
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
+    clockMode: ctx.clockMode,
     quoteFreshnessPolicy: {
       maxQuoteAgeMs: MAX_QUOTE_AGE_MS,
       futureQuoteSkewMs: FUTURE_QUOTE_SKEW_MS,
@@ -213,13 +255,15 @@ export function buildRecords(
     }
   }
 
-  if (collision.failures.length > 0) {
+  // One run_failure record per accurate machine code: identity-only failures
+  // are never mislabeled as provider collisions.
+  for (const [code, failures] of failuresByCode(collision.failures)) {
     records.push({
       recordType: 'run_failure',
       label: SMOKE_LABEL,
       runId: ctx.runId,
-      code: 'PROVIDER_COLLISION',
-      failures: collision.failures,
+      code,
+      failures,
     });
   }
 

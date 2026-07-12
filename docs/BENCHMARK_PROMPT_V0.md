@@ -76,7 +76,8 @@ Provider/source brands should not be displayed on user-facing decision surfaces.
           "wouldAbstain": false,
           "selectedForExecution": false,
           "rationale": "short grounded rationale",
-          "evidenceRefs": ["string"]
+          "evidenceRefs": ["string"],
+          "reasonCode": "missing_information | contradictory_information | null (optional)"
         }
       ]
     }
@@ -84,7 +85,7 @@ Provider/source brands should not be displayed on user-facing decision surfaces.
 }
 ```
 
-Each game must contain exactly one moneyline, one designated spread, and one designated total forecast. Exactly two forecasts must be marked for execution under the declared policy. For spread/total, `line` is required; for moneyline it is `null`. Win/push/loss probabilities and confidence are values from 0 through 1; probabilities sum to 1, with push set to zero for binary contracts. The final implementation must enforce a provider-neutral JSON Schema rather than prose validation.
+Each game must contain exactly one moneyline, one designated spread, and one designated total forecast. Exactly two forecasts must be marked for execution under the declared policy. For spread/total, `line` is required; for moneyline it is `null`. Win/push/loss probabilities and confidence are values from 0 through 1; probabilities sum to 1, with push set to zero for binary contracts. `evidenceRefs` carries at least one bundle evidenceRef per forecast. `reasonCode` is optional and defaults to null; it carries the supplied reason codes the system prompt refers to (`missing_information`, `contradictory_information`) when required information is missing or contradictory. The final implementation must enforce a provider-neutral JSON Schema rather than prose validation.
 
 ## Deterministic baseline contract
 

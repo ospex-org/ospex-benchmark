@@ -1,4 +1,4 @@
-import { reportedModelIdsByArm } from './records.js';
+import { failuresByCode, reportedModelIdsByArm } from './records.js';
 import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
 import type { CollisionCheckResult } from './providers/family.js';
@@ -63,7 +63,9 @@ export function buildSummaryMarkdown(
     'Entry prices were captured late (lines opened days earlier); nothing here may appear on a leaderboard.',
   );
   lines.push('');
-  lines.push(`- Run: \`${ctx.runId}\` (${ctx.mode})`);
+  lines.push(
+    `- Run: \`${ctx.runId}\` (${ctx.mode}${ctx.clockMode === 'synthetic-fixture' ? ', synthetic fixture clock' : ''})`,
+  );
   lines.push(`- Generated: ${ctx.createdAt}`);
   lines.push(`- Slate SHA-256: \`${slateSha256}\``);
   lines.push(
@@ -73,7 +75,8 @@ export function buildSummaryMarkdown(
   lines.push('');
 
   if (collision.failures.length > 0) {
-    lines.push('## ❌ RUN FAILED — PROVIDER_COLLISION');
+    const codes = [...failuresByCode(collision.failures).keys()];
+    lines.push(`## ❌ RUN FAILED — ${codes.join(' + ')}`);
     lines.push('');
     for (const failure of collision.failures) lines.push(`- ${failure}`);
     lines.push('');

@@ -63,9 +63,21 @@ export function loadFixtureInputs(): SlateInputs {
   };
 }
 
-/** Fixed dry-run clock: 2 minutes after capture, hours before every cutoff. */
+/** Dry-run clock anchor: 2 minutes after capture, hours before every cutoff. */
 export function fixtureNowMs(): number {
   return Date.parse('2026-07-12T14:07:00+00:00');
+}
+
+/**
+ * The dry run's ONE synthetic clock: anchored at the fixture instant and
+ * advancing at real speed. It drives cutoff enforcement AND every recorded
+ * timestamp, so dry artifacts are temporally consistent (observedAt <=
+ * bundleTimestamp < requestAt < cutoffAt) and latencies stay real.
+ */
+export function createFixtureClock(): () => number {
+  const base = fixtureNowMs();
+  const realStart = Date.now();
+  return () => base + (Date.now() - realStart);
 }
 
 // ---------------------------------------------------------------------------

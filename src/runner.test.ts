@@ -98,6 +98,38 @@ test('repair crossing the cutoff: cutoff_missed even though the repaired content
   assert.equal(result.parsed, null);
 });
 
+test('repair window closing after acceptance yields cutoff_missed, not invalid_schema', async () => {
+  // Reproduction clock sequence from the review: the initial response is
+  // accepted at 16:14:59.999Z, but by the repair-window check the clock has
+  // crossed 16:15:00Z. The decision window closed before an acceptable
+  // response existed → cutoff_missed. The queue mirrors the runner's exact
+  // nowMs read order: dispatch check, request start, response stamp,
+  // acceptance check, repair-window check.
+  const request = makeRequest(CUTOFF);
+  const reads = [
+    CUTOFF_MS - 61_000, // dispatch check
+    CUTOFF_MS - 60_000, // timedChat request start
+    CUTOFF_MS - 2, // timedChat response stamp
+    CUTOFF_MS - 1, // acceptance check: 16:14:59.999 < cutoff → accepted in time
+    CUTOFF_MS + 1, // repair-window check: 16:15:00.001 → window closed
+  ];
+  let index = 0;
+  const nowMs = (): number => reads[Math.min(index++, reads.length - 1)] as number;
+  const adapter = stubAdapter([
+    async () => stubResponse(wrongEcho(makeValidResponse(request))),
+  ]);
+  const result = await runOneArmGame(TEST_ARM, adapter, request, {
+    cohortId: TEST_COHORT,
+    timeoutMs: 600_000,
+    maxOutputTokens: 16000,
+    nowMs,
+  });
+  assert.equal(result.outcome, 'cutoff_missed');
+  assert.equal(result.repair, null);
+  assert.equal(adapter.calls.length, 1);
+  assert.ok(result.validationErrors.some((e) => e.includes('repair not dispatched')));
+});
+
 test('repair blocked by HTTP 429: transport recorded separately, never schema failure alone', async () => {
   const request = makeRequest(CUTOFF);
   const adapter = stubAdapter([

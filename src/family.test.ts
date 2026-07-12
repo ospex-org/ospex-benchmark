@@ -10,6 +10,7 @@ function arm(overrides: Partial<CollisionCheckInput>): CollisionCheckInput {
     requestedModelId: 'gpt-5.6-sol',
     approvedReportedModelIds: ['gpt-5.6-sol'],
     reportedModelIds: ['gpt-5.6-sol'],
+    unidentifiedResponses: 0,
     ...overrides,
   };
 }
@@ -52,8 +53,28 @@ test('two arms resolving to the same family is a collision', () => {
   );
 });
 
-test('an arm reporting no model ID is a loud warning, not a silent pass', () => {
-  const result = checkProviderCollision([arm({ reportedModelIds: [] })]);
+test('a SUCCESSFUL response without a reported model ID fails the run', () => {
+  const result = checkProviderCollision([
+    arm({ reportedModelIds: [], unidentifiedResponses: 2 }),
+  ]);
+  assert.ok(
+    result.failures.some(
+      (f) => f.startsWith('MODEL_IDENTITY') && f.includes('without a reported model ID'),
+    ),
+  );
+});
+
+test('a mix of identified and unidentified successful responses still fails', () => {
+  const result = checkProviderCollision([
+    arm({ reportedModelIds: ['gpt-5.6-sol'], unidentifiedResponses: 1 }),
+  ]);
+  assert.ok(result.failures.some((f) => f.includes('without a reported model ID')));
+});
+
+test('an arm with no successful response at all is a loud warning, not a failure', () => {
+  const result = checkProviderCollision([
+    arm({ reportedModelIds: [], unidentifiedResponses: 0 }),
+  ]);
   assert.deepEqual(result.failures, []);
   assert.ok(result.warnings.some((w) => w.includes('provider identity unverified')));
 });

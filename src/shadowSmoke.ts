@@ -2,18 +2,26 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { runBaselines } from './baselines.js';
 import { buildBundle } from './bundle.js';
-import {
-  DEFAULT_OSPEX_API_URL,
-  describeErrorWithStack,
-  envValue,
-  redactSecrets,
-} from './config.js';
+import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
+import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
 import { fetchLiveInputs } from './fetchers.js';
-import { createMockAdapters, FIXTURE_SLATE_DATE, fixtureNowMs, loadFixtureInputs } from './mock.js';
+import {
+  createFixtureClock,
+  createMockAdapters,
+  FIXTURE_SLATE_DATE,
+  loadFixtureInputs,
+} from './mock.js';
 import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
 import { checkProviderCollision } from './providers/family.js';
-import { buildRecords, reportedModelIdsByArm, writeNdjson, writeText } from './records.js';
+import {
+  buildRecords,
+  failuresByCode,
+  reportedModelIdsByArm,
+  unidentifiedResponsesByArm,
+  writeNdjson,
+  writeText,
+} from './records.js';
 import { runSlate } from './runner.js';
 import { isValidSlateDate, tomorrowEastern } from './slateDate.js';
 import { buildSummaryMarkdown } from './summary.js';
@@ -171,36 +179,42 @@ async function main(): Promise<number> {
   const loaded = loadDotEnv();
   const options = parseArgs(process.argv.slice(2));
   const mode = options.dryRun ? 'dry-run' : 'live';
-  console.log(`ospex-benchmark shadow smoke v0 — ${mode} — label SMOKE_V0_NOT_A_COHORT`);
+  printLine(`ospex-benchmark shadow smoke v0 — ${mode} — label SMOKE_V0_NOT_A_COHORT`);
   if (loaded.length > 0) {
-    console.log(`loaded ${loaded.length} env var(s) from .env: ${loaded.join(', ')}`);
+    printLine(`loaded ${loaded.length} env var(s) from .env: ${loaded.join(', ')}`);
   }
 
   const { inputs, slateDate } = await loadInputs(options);
   const build = buildBundle(inputs, slateDate, { requireFuture: !options.dryRun });
-  console.log(
+  printLine(
     `bundle: ${build.requests.length} eligible games, ${build.excluded.length} excluded, ` +
       `slate sha256 ${build.slateSha256.slice(0, 16)}…, earliest cutoff ${build.slateBundle.cutoffAt}`,
   );
+
+  // ONE clock per run: the wall clock live, or a synthetic clock anchored to
+  // the fixture capture instant in dry runs. It drives cutoff enforcement AND
+  // every recorded timestamp, so dry artifacts stay temporally consistent.
+  const nowMs = options.dryRun ? createFixtureClock() : (): number => Date.now();
 
   const ctx: RunContext = {
     runId: `smoke-v0-${slateDate}-${randomBytes(3).toString('hex')}`,
     cohortId: options.cohortId ?? `smoke-v0-${slateDate}`,
     mode,
     slateDate,
-    createdAt: new Date().toISOString(),
+    createdAt: new Date(nowMs()).toISOString(),
     executionPolicy: 'fixed-moneyline-total',
     timeoutMs: (options.timeoutSeconds ?? (options.dryRun ? 2 : 300)) * 1000,
     maxOutputTokens: options.maxOutputTokens,
     fetchStartedAt: inputs.fetchStartedAt,
     fetchCompletedAt: inputs.fetchCompletedAt,
+    clockMode: options.dryRun ? 'synthetic-fixture' : 'wall',
   };
 
   const adapters = options.dryRun
     ? createMockAdapters({ simulateCollision: options.simulateCollision })
     : createRealAdapters();
 
-  console.log(
+  printLine(
     `dispatching per game in cutoff order: ${build.requests.length} games sequential, ` +
       `${ARMS.length} arms concurrent per game (sealed per game) ...`,
   );
@@ -208,15 +222,13 @@ async function main(): Promise<number> {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
-    // Cutoff enforcement clock: real in live mode; a fixed instant just after
-    // the fixture capture in dry runs, so enforcement is exercised
-    // deterministically rather than bypassed.
-    nowMs: options.dryRun ? fixtureNowMs : undefined,
-    onGameComplete: (line) => console.log(`  ${line}`),
+    nowMs,
+    onGameComplete: (line) => printLine(`  ${line}`),
   });
 
   const baselineDecisions = runBaselines(build.slateBundle);
   const reportedByArm = reportedModelIdsByArm(armGameResults);
+  const unidentifiedByArm = unidentifiedResponsesByArm(armGameResults);
   const collision = checkProviderCollision(
     ARMS.map((arm) => ({
       participantId: arm.participantId,
@@ -224,6 +236,7 @@ async function main(): Promise<number> {
       requestedModelId: arm.requestedModelId,
       approvedReportedModelIds: approvedReportedModelIds(arm.participantId),
       reportedModelIds: reportedByArm.get(arm.participantId) ?? [],
+      unidentifiedResponses: unidentifiedByArm.get(arm.participantId) ?? 0,
     })),
   );
 
@@ -236,7 +249,7 @@ async function main(): Promise<number> {
     buildSummaryMarkdown(ctx, build, armGameResults, baselineDecisions, collision),
   );
 
-  console.log('');
+  printLine('');
   const outcomes: ArmOutcome[] = [
     'valid',
     'invalid_schema',
@@ -254,21 +267,20 @@ async function main(): Promise<number> {
       .map(([o, count]) => `${o} ${count}`)
       .join(' · ');
     const reported = reportedByArm.get(arm.participantId) ?? [];
-    console.log(
-      redactSecrets(
-        `  ${arm.participantId}: ${parts || 'no games'}` +
-          `${reported.length > 0 ? ` [reported: ${reported.join(', ')}]` : ''}`,
-      ),
+    printLine(
+      `  ${arm.participantId}: ${parts || 'no games'}` +
+        `${reported.length > 0 ? ` [reported: ${reported.join(', ')}]` : ''}`,
     );
   }
-  console.log('');
-  console.log(`records: ${ndjsonPath} (${records.length} lines)`);
-  console.log(`summary: ${summaryPath}`);
+  printLine('');
+  printLine(`records: ${ndjsonPath} (${records.length} lines)`);
+  printLine(`summary: ${summaryPath}`);
 
   if (collision.failures.length > 0) {
-    console.error('');
-    console.error('!!! RUN FAILED — PROVIDER_COLLISION !!!');
-    for (const failure of collision.failures) console.error(`  ${failure}`);
+    const codes = [...failuresByCode(collision.failures).keys()];
+    printError('');
+    printError(`!!! RUN FAILED — ${codes.join(' + ')} !!!`);
+    for (const failure of collision.failures) printError(`  ${failure}`);
     return 1;
   }
   return 0;

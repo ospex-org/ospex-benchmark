@@ -1,5 +1,6 @@
 import { loadDotEnv } from './env.js';
-import { describeErrorWithStack, redactSecrets } from './config.js';
+import { describeErrorWithStack } from './config.js';
+import { printError, printLine } from './console.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
 import type { ChatTurn } from './types.js';
@@ -17,6 +18,8 @@ import type { ChatTurn } from './types.js';
  * - an arm with no credential reports credential_missing and does not fail
  *   the preflight;
  * - exits non-zero if any credentialed arm fails, naming which and why.
+ *
+ * Every line prints through the redacted console chokepoint.
  */
 
 const PREFLIGHT_SYSTEM = 'You are a connectivity preflight for a benchmark harness. Follow the user instruction exactly.';
@@ -59,7 +62,9 @@ function parseArgs(argv: string[]): PreflightArgs {
 
 async function main(): Promise<number> {
   const loaded = loadDotEnv();
-  if (loaded.length > 0) console.log(`loaded ${loaded.length} env var(s) from .env: ${loaded.join(', ')}`);
+  if (loaded.length > 0) {
+    printLine(`loaded ${loaded.length} env var(s) from .env: ${loaded.join(', ')}`);
+  }
   const args = parseArgs(process.argv.slice(2));
   const adapters = createRealAdapters();
   const turns: ChatTurn[] = [
@@ -72,16 +77,18 @@ async function main(): Promise<number> {
 
   for (const arm of ARMS) {
     const adapter = adapters.get(arm.participantId);
-    console.log('');
-    console.log(`== ${arm.participantId} (requested: ${arm.requestedModelId}) ==`);
+    printLine('');
+    printLine(`== ${arm.participantId} (requested: ${arm.requestedModelId}) ==`);
     if (!adapter) {
-      console.log('  FAIL — no adapter registered');
+      printLine('  FAIL — no adapter registered');
       anyFailure = true;
       rollup.push(`${arm.participantId}: FAIL (no adapter)`);
       continue;
     }
     if (!adapter.hasCredential()) {
-      console.log(`  credential_missing (${arm.credentialEnvVar} not set) — arm skipped, not a failure`);
+      printLine(
+        `  credential_missing (${arm.credentialEnvVar} not set) — arm skipped, not a failure`,
+      );
       rollup.push(`${arm.participantId}: credential_missing`);
       continue;
     }
@@ -120,18 +127,18 @@ async function main(): Promise<number> {
         warnings.push('no provider response ID (recorded as null; not fatal)');
       }
 
-      console.log(`  http: ${response.httpStatus} in ${latency}ms`);
-      console.log(`  reported model: ${response.reportedModelId ?? '(none)'}`);
-      console.log(`  response id: ${response.providerResponseId ?? '(none)'}`);
-      console.log(`  text: ${redactSecrets(response.rawText.trim()).slice(0, 120) || '(empty)'}`);
-      console.log(`  usage (verbatim): ${redactSecrets(JSON.stringify(response.usageRaw))}`);
-      for (const warning of warnings) console.log(`  warn: ${warning}`);
+      printLine(`  http: ${response.httpStatus} in ${latency}ms`);
+      printLine(`  reported model: ${response.reportedModelId ?? '(none)'}`);
+      printLine(`  response id: ${response.providerResponseId ?? '(none)'}`);
+      printLine(`  text: ${response.rawText.trim().slice(0, 120) || '(empty)'}`);
+      printLine(`  usage (verbatim): ${JSON.stringify(response.usageRaw)}`);
+      for (const warning of warnings) printLine(`  warn: ${warning}`);
       if (failures.length > 0) {
         anyFailure = true;
-        for (const failure of failures) console.log(`  FAIL: ${failure}`);
+        for (const failure of failures) printLine(`  FAIL: ${failure}`);
         rollup.push(`${arm.participantId}: FAIL (${failures.length} check(s))`);
       } else {
-        console.log('  checks: PASS');
+        printLine('  checks: PASS');
         rollup.push(
           `${arm.participantId}: PASS (reported ${response.reportedModelId ?? '?'} in ${latency}ms)`,
         );
@@ -145,17 +152,16 @@ async function main(): Promise<number> {
           : error instanceof ProviderHttpError && error.status === 429
             ? 'rate_limited'
             : 'provider_error';
-      const message =
-        error instanceof Error ? redactSecrets(error.message) : redactSecrets(String(error));
-      console.log(`  FAIL (${kind}) after ${latency}ms: ${message}`);
+      const message = error instanceof Error ? error.message : String(error);
+      printLine(`  FAIL (${kind}) after ${latency}ms: ${message}`);
       rollup.push(`${arm.participantId}: FAIL (${kind})`);
     }
   }
 
-  console.log('');
-  console.log('== preflight summary ==');
-  for (const line of rollup) console.log(`  ${line}`);
-  console.log(anyFailure ? 'PREFLIGHT FAILED' : 'PREFLIGHT PASSED');
+  printLine('');
+  printLine('== preflight summary ==');
+  for (const line of rollup) printLine(`  ${line}`);
+  printLine(anyFailure ? 'PREFLIGHT FAILED' : 'PREFLIGHT PASSED');
   return anyFailure ? 1 : 0;
 }
 
@@ -164,6 +170,6 @@ main()
     process.exitCode = code;
   })
   .catch((error: unknown) => {
-    console.error(describeErrorWithStack(error));
+    printError(describeErrorWithStack(error));
     process.exitCode = 1;
   });

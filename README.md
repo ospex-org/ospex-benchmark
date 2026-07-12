@@ -30,13 +30,13 @@ The authoritative methodology lives in this repo:
 
 Per-game dispatch means one game's failure affects only that game, and each game carries its own decision cutoff (its scheduled first pitch) — a slate cannot be batched when each game's deadline is independent.
 
-**Deadline safety.** Games are dispatched in cutoff order (earliest first pitch first; canonical hash ordering is separate and stays by game ID). The clock is checked before each dispatch, before any repair, and on every response acceptance; each provider call is additionally bounded by the remaining time to its game's cutoff. A response that does not exist acceptably before first pitch records the explicit outcome `cutoff_missed` and never emits decision records.
+**Deadline safety.** Games are dispatched in cutoff order (earliest first pitch first; canonical hash ordering is separate and stays by game ID). The clock is checked before each dispatch, before any repair, and on every response acceptance; each provider call is additionally bounded by the remaining time to its game's cutoff. A response that does not exist acceptably before first pitch — including when the decision window closes before a needed repair could even be dispatched — records the explicit outcome `cutoff_missed` and never emits decision records.
 
 **Repair integrity.** A response gets at most one deterministic format repair, and the repair is accepted only when the initial response yields a complete, unambiguous decision fingerprint (every game/market with all decision-bearing fields) that the repair preserves exactly — selection, line, observed price, probabilities, confidence, abstention, and execution marking. An unparseable or incomplete initial response is unrepairable and stays `invalid_schema`; a repair blocked by transport (timeout/429/HTTP failure) records its transport outcome separately so a throttle is never readable as a schema failure.
 
-**Model identity, fail-closed.** Every response-reported model ID must match the arm's approved list exactly (`APPROVED_REPORTED_MODEL_IDS` — the live preflight verified all four labs echo the requested ID verbatim). An unapproved ID — including a same-family substitution — or reported-ID drift across games fails the run loudly, alongside the family-level `PROVIDER_COLLISION` assertions.
+**Model identity, fail-closed.** Every response-reported model ID must match the arm's approved list exactly (`APPROVED_REPORTED_MODEL_IDS` — the live preflight verified all four labs echo the requested ID verbatim). An unapproved ID — including a same-family substitution — reported-ID drift across games, or a successful response that reports no model ID at all fails the run loudly (only arms that never produced a response body, e.g. pure timeouts, are exempt and surfaced as warnings). Identity failures carry the machine code `MODEL_IDENTITY`; family-level collisions carry `PROVIDER_COLLISION`.
 
-**Frozen-input freshness.** Every market row must carry a parseable feed-side observation timestamp that is neither in the future (beyond a 2-minute skew allowance) nor older than 30 minutes at bundle assembly time; violations exclude the game with stable reason codes (`stale_quote:*`, `future_quote:*`, `invalid_quote_timestamp:*`). The bundle timestamp is the fetch **completion** time, so no observation postdates it.
+**Frozen-input freshness.** Every market row must carry a parseable feed-side observation timestamp that is neither in the future beyond a 2-minute clock-skew allowance nor older than 30 minutes at bundle assembly time; violations exclude the game with stable reason codes (`stale_quote:*`, `future_quote:*`, `invalid_quote_timestamp:*`). The bundle timestamp is the fetch **completion** time; an observation may nominally postdate it only within that explicit skew allowance (feed-side clocks are not our own), never beyond it.
 
 ### Requirements
 
@@ -56,7 +56,7 @@ Sends one trivial request per provider through the real adapter code path (the s
 yarn smoke:dry
 ```
 
-Runs the full pipeline against a synthetic fixture slate (with a fixed capture timestamp and a fixed injected clock, so cutoff enforcement runs deterministically rather than being bypassed) and four scripted mock arms that exercise every path: valid responses, a wrong-echo response repaired into validity with identical decisions, a structurally incomplete response that is unrepairable (on one game only — proving the failure does not poison the rest of the slate), a simulated HTTP 429 producing `rate_limited`, and a timeout. Add `--simulate-collision` to watch the `PROVIDER_COLLISION` hard failure fire.
+Runs the full pipeline against a synthetic fixture slate with ONE injected synthetic clock anchored at the fixture's capture instant — it drives cutoff enforcement and every recorded timestamp, so dry artifacts are temporally consistent (`observedAt ≤ bundleTimestamp < requestAt < cutoffAt`) and enforcement is exercised rather than bypassed (run records carry `clockMode: synthetic-fixture`). Four scripted mock arms exercise every path: valid responses, a wrong-echo response repaired into validity with identical decisions, a structurally incomplete response that is unrepairable (on one game only — proving the failure does not poison the rest of the slate), a simulated HTTP 429 producing `rate_limited`, and a timeout. Add `--simulate-collision` to watch the `PROVIDER_COLLISION` hard failure fire.
 
 ### Unit tests
 
@@ -86,7 +86,7 @@ Every decision is keyed by `gameId` — the upstream odds-feed event identifier 
 
 Token accounting: each response's provider usage object is stored **verbatim** (`usageRaw`, including reasoning/thinking-token fields and any provider-reported cost figure) alongside normalized counts. Every live call carries an explicit output-token bound (default 16000, `--max-output-tokens`), recorded in the request params. Dollar cost is never fabricated — a price table can be applied retroactively; token counts cannot be recovered after the fact.
 
-Artifact safety: every byte serialized to NDJSON or the summary passes through credential redaction at the write chokepoint — parsed rationales, validation errors, reported IDs, and raw usage objects included, not just raw response text.
+Artifact safety: every byte serialized to NDJSON or the summary passes through credential redaction at the write chokepoint — parsed rationales, validation errors, reported IDs, and raw usage objects included, not just raw response text — and every dynamic console line prints through the same redactor.
 
 ### Slate-date rule
 

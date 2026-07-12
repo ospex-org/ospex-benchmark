@@ -24,9 +24,11 @@ export interface SlateRunOptions {
   /** Explicit output-token bound applied to every live call and recorded. */
   maxOutputTokens: number;
   /**
-   * Injected clock (epoch ms) used for ALL cutoff enforcement — checked
-   * before initial dispatch, before repair, and on response acceptance.
-   * Defaults to the wall clock; tests and the dry run inject a fixed one.
+   * Injected clock (epoch ms) used BOTH for cutoff enforcement (checked
+   * before initial dispatch, before repair, and on response acceptance) AND
+   * for every recorded timestamp (requestAt/responseAt/latency), so records
+   * and enforcement can never disagree temporally. Defaults to the wall
+   * clock; the dry run injects a synthetic clock anchored to the fixture.
    */
   nowMs?: (() => number) | undefined;
   /** Called after each game's four arms have all settled (sealed per game). */
@@ -61,16 +63,18 @@ async function timedChat(
   turns: ChatTurn[],
   timeoutMs: number,
   maxOutputTokens: number,
+  nowMs: () => number,
 ): Promise<
   AttemptRecord & {
     response: ProviderResponse | null;
     failure: 'timeout' | 'rate_limited' | 'provider_error' | null;
   }
 > {
-  const requestAt = new Date().toISOString();
-  const startedAt = Date.now();
+  const startedAt = nowMs();
+  const requestAt = new Date(startedAt).toISOString();
   try {
     const response = await adapter.chat(turns, timeoutMs, { maxOutputTokens });
+    const respondedAt = nowMs();
     return {
       rawText: redactSecrets(response.rawText),
       reportedModelId: response.reportedModelId,
@@ -80,8 +84,8 @@ async function timedChat(
       usageRaw: response.usageRaw,
       requestParams: response.requestParams,
       requestAt,
-      responseAt: new Date().toISOString(),
-      latencyMs: Date.now() - startedAt,
+      responseAt: new Date(respondedAt).toISOString(),
+      latencyMs: respondedAt - startedAt,
       errorDetail: null,
       response,
       failure: null,
@@ -91,12 +95,13 @@ async function timedChat(
       error instanceof ProviderHttpError || error instanceof ProviderTimeoutError
         ? error.message
         : describeError(error);
+    const respondedAt = nowMs();
     return {
       ...emptyAttempt(),
       httpStatus: error instanceof ProviderHttpError ? error.status : null,
       requestAt,
-      responseAt: new Date().toISOString(),
-      latencyMs: Date.now() - startedAt,
+      responseAt: new Date(respondedAt).toISOString(),
+      latencyMs: respondedAt - startedAt,
       errorDetail: redactSecrets(detail),
       response: null,
       failure: classifyFailure(error),
@@ -180,6 +185,7 @@ export async function runOneArmGame(
     baseTurns,
     Math.min(options.timeoutMs, remainingAtDispatch),
     options.maxOutputTokens,
+    nowMs,
   );
   const { response: firstResponse, failure: firstFailure, ...attemptRecord } = attempt;
   if (firstFailure !== null || firstResponse === null) {
@@ -229,12 +235,14 @@ export async function runOneArmGame(
     ]);
   }
 
-  // Clock check BEFORE repair.
+  // Clock check BEFORE repair: if the decision window closed before the
+  // repair could be dispatched, no acceptable response can exist any more —
+  // that is a missed cutoff, not a schema verdict.
   const remainingAtRepair = cutoffMs - nowMs();
   if (remainingAtRepair <= 0) {
-    return failed('invalid_schema', attemptRecord, null, false, null, [
+    return failed('cutoff_missed', attemptRecord, null, false, null, [
       ...firstValidation.errors,
-      'repair skipped: decision cutoff passed before the repair could be dispatched',
+      'repair not dispatched: decision cutoff passed before the repair window opened',
     ]);
   }
 
@@ -248,6 +256,7 @@ export async function runOneArmGame(
     repairTurns,
     Math.min(options.timeoutMs, remainingAtRepair),
     options.maxOutputTokens,
+    nowMs,
   );
   const { response: repairResponse, failure: repairFailure, ...repairRecord } = repair;
   if (repairFailure !== null || repairResponse === null) {
@@ -326,9 +335,8 @@ export async function runSlate(
       const cells = results
         .map((r) => `${r.arm.provider} ${r.outcome}${r.repairUsed ? ' (repair)' : ''}`)
         .join(' · ');
-      options.onGameComplete(
-        redactSecrets(`game ${index}/${requests.length} ${request.slug}: ${cells}`),
-      );
+      // The caller prints through the redacted console chokepoint.
+      options.onGameComplete(`game ${index}/${requests.length} ${request.slug}: ${cells}`);
     }
   }
   return all;

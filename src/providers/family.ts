@@ -14,8 +14,11 @@ import type { ProviderName } from '../types.js';
  * - an arm's reported family contradicts the provider it was requested from;
  * - two arms report the byte-identical model ID.
  *
- * An arm that reports NO model ID cannot be verified and is surfaced as a
- * loud warning on every artifact (absence is not a substitution).
+ * A SUCCESSFUL response that reports no model ID is itself a failure —
+ * accepted decisions require verified identity. Only arms that never
+ * produced a response body (timeouts, HTTP failures, missing credentials)
+ * are exempt from the reported-ID requirement; they surface as loud
+ * warnings instead.
  */
 export function classifyFamily(modelId: string): ProviderName | null {
   const id = modelId.toLowerCase();
@@ -34,6 +37,11 @@ export interface CollisionCheckInput {
   approvedReportedModelIds: string[];
   /** Distinct response-reported model IDs observed across the arm's games. */
   reportedModelIds: string[];
+  /**
+   * Number of SUCCESSFUL provider responses (a body came back) that carried
+   * no reported model ID. Any such response fails the run.
+   */
+  unidentifiedResponses: number;
 }
 
 export interface CollisionCheckResult {
@@ -49,10 +57,17 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
   const byReportedId = new Map<string, CollisionCheckInput>();
 
   for (const arm of arms) {
-    if (arm.reportedModelIds.length === 0) {
-      warnings.push(
-        `${arm.participantId}: no response-reported model ID available — provider identity unverified`,
+    if (arm.unidentifiedResponses > 0) {
+      failures.push(
+        `MODEL_IDENTITY: ${arm.participantId} returned ${arm.unidentifiedResponses} response(s) without a reported model ID — accepted decisions require verified identity`,
       );
+    }
+    if (arm.reportedModelIds.length === 0) {
+      if (arm.unidentifiedResponses === 0) {
+        warnings.push(
+          `${arm.participantId}: no successful response, so no reported model ID — provider identity unverified`,
+        );
+      }
       continue;
     }
 
