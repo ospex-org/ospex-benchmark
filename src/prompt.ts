@@ -25,9 +25,44 @@ Return only JSON matching the requested schema. Do not add prose outside the JSO
 /**
  * Fixed output-contract notes: operational details the schema draft leaves to
  * the harness (exact selection labels, line echoing, execution marking under
- * the declared policy). Identical for every arm; part of the hashed scaffold.
+ * the declared policy), plus the EXACT response template. Identical for every
+ * arm; part of the hashed scaffold. The template is load-bearing: the first
+ * live run showed that without it, every lab invents its own field names
+ * (wouldOrdinarilyAbstain / wouldNormallyAbstain / abstain / ordinarilyAbstain)
+ * and none of them emits "confidence" unprompted.
  */
 export const CONTRACT_NOTES = `Declared execution policy: fixed-moneyline-total. In every game, set "selectedForExecution": true on the moneyline forecast and the total forecast, and false on the spread forecast.
+
+Response template — use EXACTLY this structure and these field names. Do not add, rename, or omit any field:
+{
+  "schemaVersion": 1,
+  "cohortId": "<echo the supplied cohortId>",
+  "participantId": "<echo the supplied participantId>",
+  "requestedModelId": "<echo the supplied requestedModelId>",
+  "bundleSha256": "<echo the supplied bundleSha256>",
+  "executionPolicy": "<echo the supplied executionPolicy>",
+  "games": [
+    {
+      "gameId": "<the bundle gameId>",
+      "forecasts": [
+        {
+          "market": "<moneyline | spread | total>",
+          "selection": "<exact supplied label>",
+          "line": <number, or null for moneyline>,
+          "observedDecimal": <number>,
+          "probabilities": { "win": <0..1>, "push": <0..1>, "loss": <0..1> },
+          "confidence": <0..1>,
+          "wouldAbstain": <true | false>,
+          "selectedForExecution": <true | false>,
+          "rationale": "<short grounded rationale>",
+          "evidenceRefs": ["<bundle evidenceRef>"],
+          "reasonCode": null
+        }
+      ]
+    }
+  ]
+}
+Each "games" entry carries ONLY "gameId" and "forecasts". "probabilities" is an object with exactly the keys "win", "push", "loss" — never an array. "confidence" is your overall confidence in the forecast, from 0 through 1. "wouldAbstain" is whether you would ordinarily abstain from this market — a non-executing signal.
 
 Output contract:
 - Return one "games" entry for every game in the bundle, each with exactly three forecasts: one "market": "moneyline", one "market": "spread" (the designated run line), and one "market": "total".

@@ -64,6 +64,18 @@ export const benchmarkResponseSchema = z
   })
   .strict();
 
+/**
+ * The exact field names the validator enforces, derived from the live zod
+ * shapes (never a hand-maintained copy). The prompt scaffold must name every
+ * one of them explicitly — the first live run proved that four different
+ * labs, given prose alone, each invent their own field names.
+ */
+export const RESPONSE_FIELD_NAMES = {
+  root: Object.keys(benchmarkResponseSchema.shape),
+  game: Object.keys(gameForecastsSchema.shape),
+  forecast: Object.keys(forecastSchema.shape),
+} as const;
+
 const PROBABILITY_SUM_TOLERANCE = 1e-6;
 
 function isHalfLine(line: number): boolean {
