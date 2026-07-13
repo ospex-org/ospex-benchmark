@@ -8,6 +8,19 @@ import type { BuildResult } from './bundle.js';
 import type { CollisionCheckResult } from './providers/family.js';
 import type { ArmGameResult, AttemptRecord, BaselineDecision } from './types.js';
 
+/**
+ * Watch-mode gate provenance, recorded in run_meta so the entry-timing claim
+ * is verifiable from the artifact itself (the scorer fail-closes on it for
+ * watch runs): when detection happened, when the full board had completed,
+ * the resulting opener age, and the configured late threshold it passed.
+ */
+export interface WatchProvenance {
+  detectedAt: string;
+  boardCompletedAt: string;
+  openerAgeMinutes: number;
+  lateThresholdMinutes: number;
+}
+
 export interface RunContext {
   runId: string;
   cohortId: string;
@@ -26,6 +39,8 @@ export interface RunContext {
    * consistent.
    */
   clockMode: 'wall' | 'synthetic-fixture';
+  /** Present on watch-mode runs only. */
+  watch?: WatchProvenance | undefined;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -147,6 +162,7 @@ export function buildRecords(
     excludedGames: excluded.length,
     armGameResults: armGameResults.length,
     baselineDecisionCount: baselineDecisions.length,
+    ...(ctx.watch !== undefined ? { watch: ctx.watch } : {}),
   });
 
   for (const request of requests) {

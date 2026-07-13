@@ -205,6 +205,15 @@ export interface LedgerEntry {
   fireError?: string | undefined;
 }
 
+/** Watch-gate provenance, recorded into run_meta so the entry-timing claim
+ *  is verifiable from the artifact (the scorer fail-closes on it). */
+export interface WatchGateProvenance {
+  detectedAt: string;
+  boardCompletedAt: string;
+  openerAgeMinutes: number;
+  lateThresholdMinutes: number;
+}
+
 /** The pick-recording seam: when wallets and a book to bet into exist, the
  *  validated picks recorded by the fire path become signed on-chain
  *  commitments here — nothing upstream of this point changes. */
@@ -224,12 +233,25 @@ export const DEFAULT_MAX_FIRES_PER_TICK = 10;
  *  tick from fresh inputs (nothing built is retained — this is re-detection,
  *  not deferred firing). */
 export const MAX_INPUT_AGE_MS = 10 * 60_000;
+/** Fire-at-detection means firing on a CURRENT snapshot: before evaluating
+ *  each candidate, the working inputs are re-fetched whenever they are older
+ *  than this, so every fired game's entry is built on seconds-old prices no
+ *  matter how long earlier fires in the same tick took. */
+export const FRESH_FIRE_MS = 30_000;
+/** Feed-clock skew allowance when rejecting future board-appearance stamps
+ *  (mirrors the bundle builder's future-quote skew). */
+export const FUTURE_APPEARANCE_SKEW_MS = 2 * 60_000;
 
 export interface WatchDeps {
   fetchInputs: () => Promise<SlateInputs>;
   /** First board appearance for (game, market); null = history not yet visible (transient). */
   fetchFirstBoardAppearance: (gameId: string, market: MarketKey) => Promise<string | null>;
-  fireGame: (build: BuildResult, inputs: SlateInputs, slateDate: string) => Promise<FireOutcome>;
+  fireGame: (
+    build: BuildResult,
+    inputs: SlateInputs,
+    slateDate: string,
+    provenance: WatchGateProvenance,
+  ) => Promise<FireOutcome>;
   ledgerDir: string;
   /** In-memory handled set, pre-populated from disk BEFORE the first tick. */
   ledger: Map<string, LedgerEntry>;
@@ -253,6 +275,9 @@ export interface TickSummary {
   fired: number;
   late: number;
   deferred: number;
+  /** Per-game failures (fire errors, ledger write failures, malformed rows).
+   *  Surfaced so schedulers and --once can distinguish a healthy pass. */
+  failed: number;
 }
 
 function ledgerPath(ledgerDir: string, gameId: string): string {
@@ -325,6 +350,14 @@ async function boardCompletedAt(
         );
         return null;
       }
+      if (first !== null && Date.parse(first) > deps.nowMs() + FUTURE_APPEARANCE_SKEW_MS) {
+        // An appearance AFTER detection is impossible — fail closed: never
+        // cached, never fired (a bogus stamp must not defeat the late gate).
+        deps.logError(
+          `future first-appearance timestamp for ${gameId} ${market}: ${first} — deferring, not caching`,
+        );
+        return null;
+      }
       if (first !== null) deps.boardFirstSeen.set(cacheKey, first);
     }
     if (first === null) return null;
@@ -348,11 +381,13 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
     fired: 0,
     late: 0,
     deferred: 0,
+    failed: 0,
   };
-  const assembledAtMs = Date.parse(inputs.fetchCompletedAt);
 
   // Dedupe by gameId (offset pagination under concurrent upstream writes can
-  // repeat a row) and drop handled games; ordered by first pitch.
+  // repeat a row) and drop handled games; ordered chronologically by parsed
+  // first pitch (NOT lexically — mixed UTC offsets are valid), unparseable
+  // last, gameId as the deterministic tiebreak.
   const seenThisTick = new Set<string>();
   const candidates = inputs.gamesRows
     .filter((row) => {
@@ -360,9 +395,27 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
       seenThisTick.add(row.gameId);
       return true;
     })
-    .sort((a, b) => (a.matchTime < b.matchTime ? -1 : a.matchTime > b.matchTime ? 1 : 0));
+    .sort((a, b) => {
+      const ta = Date.parse(a.matchTime);
+      const tb = Date.parse(b.matchTime);
+      const aBad = !Number.isFinite(ta);
+      const bBad = !Number.isFinite(tb);
+      if (aBad !== bBad) return aBad ? 1 : -1;
+      if (!aBad && ta !== tb) return ta - tb;
+      return a.gameId < b.gameId ? -1 : a.gameId > b.gameId ? 1 : 0;
+    });
 
-  for (const row of candidates) {
+  // The working snapshot: refreshed per candidate whenever it is older than
+  // FRESH_FIRE_MS, so every game is evaluated AND fired on current prices no
+  // matter how long earlier fires in this tick took — fire-at-detection
+  // holds per game, not merely per tick.
+  let currentInputs = inputs;
+  // The spend cap bounds dispatch ATTEMPTS (claims), not successes — a
+  // failing fire may already have billed providers.
+  let fireAttempts = 0;
+
+  for (const candidate of candidates) {
+    let row = candidate;
     try {
       // Never-double-fire is enforced at the consumption site too, not just
       // in the upfront filter.
@@ -370,28 +423,39 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
 
       // Circuit breaker: model calls bill real money. Unclaimed candidates
       // are re-evaluated next tick, where the late gate re-applies.
-      if (summary.fired >= deps.maxFiresPerTick) {
+      if (fireAttempts >= deps.maxFiresPerTick) {
         deps.logError(
-          `fire cap reached (${deps.maxFiresPerTick}) — stopping this tick; remaining candidates re-detected next tick`,
+          `fire cap reached (${deps.maxFiresPerTick} attempts) — stopping this tick; remaining candidates re-detected next tick`,
         );
         break;
       }
 
-      // Entries must never be made on aged inputs: sequential fires consume
-      // wall time, so once this tick's snapshot is too old, stop. Unclaimed
-      // games are re-DETECTED next tick from fresh inputs (nothing built is
-      // retained — re-detection, not deferred firing).
+      // Refresh the working snapshot when stale, and re-locate this game in
+      // it (the game may have left the window between snapshots).
+      if (deps.nowMs() - Date.parse(currentInputs.fetchCompletedAt) > FRESH_FIRE_MS) {
+        currentInputs = await deps.fetchInputs();
+        const liveRow = currentInputs.gamesRows.find((g) => g.gameId === row.gameId);
+        if (liveRow === undefined) {
+          summary.watched += 1;
+          continue;
+        }
+        row = liveRow;
+      }
+
+      // Backstop only — the refresh above keeps the snapshot young. If the
+      // fetch itself returns aged stamps, entries must still never be made.
+      const assembledAtMs = Date.parse(currentInputs.fetchCompletedAt);
       if (Number.isFinite(assembledAtMs) && deps.nowMs() - assembledAtMs > deps.maxInputAgeMs) {
-        deps.log('tick inputs aged out — remaining candidates re-detected next tick');
+        deps.logError('inputs still aged after refresh — stopping this tick');
         break;
       }
 
       const slateDate = easternCalendarDay(row.matchTime);
       const singleInputs: SlateInputs = {
         gamesRows: [row],
-        oddsRows: inputs.oddsRows.filter((o) => o.jsonodds_id === row.gameId),
-        fetchStartedAt: inputs.fetchStartedAt,
-        fetchCompletedAt: inputs.fetchCompletedAt,
+        oddsRows: currentInputs.oddsRows.filter((o) => o.jsonodds_id === row.gameId),
+        fetchStartedAt: currentInputs.fetchStartedAt,
+        fetchCompletedAt: currentInputs.fetchCompletedAt,
       };
 
       let build: BuildResult;
@@ -483,14 +547,21 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
       // disk claim itself fails, the in-memory claim stands and no dispatch
       // happens — no spend, and a later process re-detects the game.
       const claimed: LedgerEntry = { ...base, decision: 'fired' };
+      fireAttempts += 1;
       deps.ledger.set(row.gameId, claimed);
       persistLedgerEntry(deps.ledgerDir, claimed);
       deps.log(
         `firing ${row.slug} (${row.gameId}): board completed ${openerAgeMinutes}m ago, ` +
           `first pitch ${row.matchTime}, request sha256 ${request.requestSha256.slice(0, 16)}…`,
       );
+      const provenance: WatchGateProvenance = {
+        detectedAt: base.decidedAt,
+        boardCompletedAt: completedAt,
+        openerAgeMinutes,
+        lateThresholdMinutes: Math.round(deps.lateMs / 60_000),
+      };
       try {
-        const outcome = await deps.fireGame(build, singleInputs, slateDate);
+        const outcome = await deps.fireGame(build, singleInputs, slateDate, provenance);
         const completed: LedgerEntry = {
           ...claimed,
           runId: outcome.runId,
@@ -506,11 +577,14 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         const failed: LedgerEntry = { ...claimed, fireError: describeError(error) };
         deps.ledger.set(row.gameId, failed);
         persistLedgerEntry(deps.ledgerDir, failed);
+        summary.failed += 1;
         deps.logError(`fire failed for ${row.slug} (${row.gameId}): ${describeError(error)}`);
       }
     } catch (error) {
       // Per-game isolation: one malformed row or failed ledger write must
-      // never stall the rest of the tick (or recur as a tick-killer).
+      // never stall the rest of the tick (or recur as a tick-killer) — but
+      // it is a FAILURE, and the summary says so.
+      summary.failed += 1;
       deps.logError(
         `game ${row.gameId} failed this tick (${describeError(error)}) — continuing`,
       );
@@ -544,6 +618,7 @@ export async function fireEligibleGame(
   build: BuildResult,
   inputs: SlateInputs,
   slateDate: string,
+  provenance: WatchGateProvenance,
   cfg: FireConfig,
 ): Promise<FireOutcome> {
   const ctx: RunContext = {
@@ -558,6 +633,9 @@ export async function fireEligibleGame(
     fetchStartedAt: inputs.fetchStartedAt,
     fetchCompletedAt: inputs.fetchCompletedAt,
     clockMode: cfg.clockMode,
+    // Recorded in run_meta so the entry-timing claim is verifiable from the
+    // artifact itself; the scorer fail-closes on it for watch runs.
+    watch: provenance,
   };
 
   const armGameResults = await runSlate(cfg.arms, cfg.adapters, build.requests, {

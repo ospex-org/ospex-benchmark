@@ -117,7 +117,8 @@ async function main(): Promise<number> {
   const deps: WatchDeps = {
     fetchInputs,
     fetchFirstBoardAppearance: firstBoardAppearance,
-    fireGame: (build, inputs, slateDate) => fireEligibleGame(build, inputs, slateDate, fireConfig),
+    fireGame: (build, inputs, slateDate, provenance) =>
+      fireEligibleGame(build, inputs, slateDate, provenance, fireConfig),
     ledgerDir,
     ledger,
     boardFirstSeen: new Map(),
@@ -140,8 +141,12 @@ async function main(): Promise<number> {
       const summary = await watchTick(deps);
       printLine(
         `tick ${startedAt}: ${summary.gamesInWindow} in window · ${summary.watched} watched · ` +
-          `${summary.fired} fired · ${summary.late} late · ${summary.deferred} deferred`,
+          `${summary.fired} fired · ${summary.late} late · ${summary.deferred} deferred · ` +
+          `${summary.failed} failed`,
       );
+      // Per-game failures are isolated inside the tick but they are still
+      // failures — a pass with any is not a healthy pass.
+      if (summary.failed > 0) tickFailed = true;
     } catch (error) {
       // A tick failure (fetch outage, transient API error) is logged and the
       // loop keeps watching — per-game failures are already isolated inside

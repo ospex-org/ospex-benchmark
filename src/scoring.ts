@@ -31,6 +31,15 @@ import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } fr
 // Source-run parsing (the harness's own NDJSON records)
 // ---------------------------------------------------------------------------
 
+const watchProvenanceSchema = z
+  .object({
+    detectedAt: z.string().min(1),
+    boardCompletedAt: z.string().min(1),
+    openerAgeMinutes: z.number().int(),
+    lateThresholdMinutes: z.number().int().positive(),
+  })
+  .passthrough();
+
 const runMetaSchema = z
   .object({
     recordType: z.literal('run_meta'),
@@ -45,8 +54,11 @@ const runMetaSchema = z
     eligibleGames: z.number().int().nonnegative(),
     armGameResults: z.number().int().nonnegative(),
     baselineDecisionCount: z.number().int().nonnegative(),
+    watch: watchProvenanceSchema.optional(),
   })
   .passthrough();
+
+export type WatchProvenanceMeta = z.infer<typeof watchProvenanceSchema>;
 
 const bundleGameSchema = z
   .object({
@@ -256,6 +268,8 @@ export interface SourceRun {
   eligibleGames: number;
   armGameResults: number;
   baselineDecisionCount: number;
+  /** Watch-mode gate provenance; required (and verified) for watch runs. */
+  watch: WatchProvenanceMeta | null;
   games: Map<string, SourceGame>;
   picks: SourcePick[];
   armResponses: ArmResponseRef[];
@@ -468,6 +482,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
     eligibleGames: meta.eligibleGames,
     armGameResults: meta.armGameResults,
     baselineDecisionCount: meta.baselineDecisionCount,
+    watch: meta.watch ?? null,
     games,
     picks,
     armResponses,
@@ -536,6 +551,44 @@ export function verifyRunIntegrity(
   options?: { expectedArms?: ExpectedArm[] },
 ): string[] {
   const violations: string[] = [];
+
+  // Watch runs must prove their entry-timing claim from the artifact itself:
+  // a watch-v0 run without recorded, internally consistent gate provenance is
+  // unscoreable. Fail-closed — the fire-at-detection property is the whole
+  // point of watch mode, so it is verified, never assumed from the prefix.
+  if (run.runId.startsWith('watch-v0-')) {
+    if (run.watch === null) {
+      violations.push('watch run has no watch provenance in run_meta — entry timing unverifiable');
+    } else {
+      const detectedMs = Date.parse(run.watch.detectedAt);
+      const boardMs = Date.parse(run.watch.boardCompletedAt);
+      if (!Number.isFinite(detectedMs)) {
+        violations.push('watch provenance detectedAt is unparseable');
+      }
+      if (!Number.isFinite(boardMs)) {
+        violations.push('watch provenance boardCompletedAt is unparseable');
+      }
+      if (Number.isFinite(detectedMs) && Number.isFinite(boardMs)) {
+        if (boardMs > detectedMs) {
+          violations.push('watch provenance boardCompletedAt is after detection — impossible ordering');
+        }
+        if (run.watch.openerAgeMinutes < 0) {
+          violations.push('watch provenance openerAgeMinutes is negative — impossible gate result');
+        }
+        if (run.watch.openerAgeMinutes > run.watch.lateThresholdMinutes) {
+          violations.push(
+            'watch provenance opener age exceeds the recorded late threshold — this game should never have fired',
+          );
+        }
+        const recomputedAgeMinutes = Math.round((detectedMs - boardMs) / 60_000);
+        if (Math.abs(recomputedAgeMinutes - run.watch.openerAgeMinutes) > 1) {
+          violations.push(
+            'watch provenance openerAgeMinutes does not match detectedAt - boardCompletedAt',
+          );
+        }
+      }
+    }
+  }
 
   // Record identity: every record must carry this run's runId, label, and
   // (where applicable) cohortId — no record can belong to another run.

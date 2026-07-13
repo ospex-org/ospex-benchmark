@@ -62,17 +62,26 @@ retry, no deferred fire, no backfill.
 
 For one game, once, at detection:
 
-1. Assemble inputs fetched *this* poll cycle (games read path + public odds
-   read path), filtered to the game; build and hash the bundle.
-2. Verify the late-detection gate.
-3. Fire: dispatch all four model arms concurrently (existing per-game
+1. Assemble a CURRENT snapshot (games read path + public odds read path):
+   the working inputs are re-fetched whenever they are more than thirty
+   seconds old, so every game is evaluated and fired on seconds-old prices
+   no matter how long earlier fires in the same tick took —
+   fire-at-detection holds per game, not merely per tick. Build and hash
+   the bundle from that snapshot.
+2. Verify the late-detection gate (future-dated board timestamps fail
+   closed: never cached, never fired).
+3. Claim the game in the ledger — memory first, then disk — BEFORE any
+   dispatch, so neither a crash nor a restart can ever double-bill.
+4. Fire: dispatch all four model arms concurrently (existing per-game
    runner: injected clock, cutoff enforcement, repair rules, identity
    checks) and run all six baselines against the same bundle.
-4. Write one self-contained run file for the game (`out/`,
-   `watch-v0-<slateDate>-<hex>.ndjson`) — run metadata, the frozen bundle,
-   every attempt with provenance, decisions, baselines. The existing scorer
-   consumes these files unchanged.
-5. Append the game to the ledger. Done forever.
+5. Write one self-contained run file for the game (`out/`,
+   `watch-v0-<slateDate>-<hex>.ndjson`) — run metadata **including the
+   watch-gate provenance** (detection time, board-completion time, opener
+   age, configured threshold — the scorer fail-closes on it for watch
+   runs), the frozen bundle, every attempt with provenance, decisions,
+   baselines. The existing scorer consumes these files unchanged.
+6. Finalize the ledger entry with the outcome. Done forever.
 
 Games are independent events: a provider failure, identity failure, or
 integrity problem on one game poisons only that game's file; the watcher
