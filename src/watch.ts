@@ -238,9 +238,6 @@ export const MAX_INPUT_AGE_MS = 10 * 60_000;
  *  than this, so every fired game's entry is built on seconds-old prices no
  *  matter how long earlier fires in the same tick took. */
 export const FRESH_FIRE_MS = 30_000;
-/** Feed-clock skew allowance when rejecting future board-appearance stamps
- *  (mirrors the bundle builder's future-quote skew). */
-export const FUTURE_APPEARANCE_SKEW_MS = 2 * 60_000;
 
 export interface WatchDeps {
   fetchInputs: () => Promise<SlateInputs>;
@@ -278,6 +275,9 @@ export interface TickSummary {
   /** Per-game failures (fire errors, ledger write failures, malformed rows).
    *  Surfaced so schedulers and --once can distinguish a healthy pass. */
   failed: number;
+  /** True when the per-tick spend cap stopped the loop with work remaining —
+   *  by design, but never silently: schedulers see a non-healthy pass. */
+  capHit: boolean;
 }
 
 function ledgerPath(ledgerDir: string, gameId: string): string {
@@ -350,9 +350,11 @@ async function boardCompletedAt(
         );
         return null;
       }
-      if (first !== null && Date.parse(first) > deps.nowMs() + FUTURE_APPEARANCE_SKEW_MS) {
-        // An appearance AFTER detection is impossible — fail closed: never
-        // cached, never fired (a bogus stamp must not defeat the late gate).
+      if (first !== null && Date.parse(first) > deps.nowMs()) {
+        // ANY appearance after detection is rejected — fail closed, never
+        // cached, never fired. The runtime and the scorer must accept the
+        // same domain (the scorer rejects negative opener ages), and a
+        // legitimately skewed stamp becomes past within one tick anyway.
         deps.logError(
           `future first-appearance timestamp for ${gameId} ${market}: ${first} — deferring, not caching`,
         );
@@ -382,6 +384,7 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
     late: 0,
     deferred: 0,
     failed: 0,
+    capHit: false,
   };
 
   // Dedupe by gameId (offset pagination under concurrent upstream writes can
@@ -414,86 +417,93 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
   // failing fire may already have billed providers.
   let fireAttempts = 0;
 
+  interface Prepared {
+    row: (typeof candidates)[number];
+    slateDate: string;
+    singleInputs: SlateInputs;
+    build: BuildResult;
+    request: NonNullable<BuildResult['requests'][number]>;
+  }
+
+  // Ensure the working snapshot is fresh, locate the game in it, and verify
+  // eligibility + first pitch. Called immediately before the gate AND again
+  // after the (potentially slow) board-history reads, so the inputs a game
+  // actually fires on are always seconds old.
+  const prepare = async (gameId: string): Promise<Prepared | 'watched' | 'stop'> => {
+    if (deps.nowMs() - Date.parse(currentInputs.fetchCompletedAt) > FRESH_FIRE_MS) {
+      currentInputs = await deps.fetchInputs();
+    }
+    // Backstop only — the refresh above keeps the snapshot young. If the
+    // fetch itself returns aged stamps, entries must still never be made.
+    const assembledAtMs = Date.parse(currentInputs.fetchCompletedAt);
+    if (Number.isFinite(assembledAtMs) && deps.nowMs() - assembledAtMs > deps.maxInputAgeMs) {
+      deps.logError('inputs still aged after refresh — stopping this tick');
+      return 'stop';
+    }
+    const row = currentInputs.gamesRows.find((g) => g.gameId === gameId);
+    if (row === undefined) return 'watched'; // left the window between snapshots
+    const slateDate = easternCalendarDay(row.matchTime);
+    const singleInputs: SlateInputs = {
+      gamesRows: [row],
+      oddsRows: currentInputs.oddsRows.filter((o) => o.jsonodds_id === row.gameId),
+      fetchStartedAt: currentInputs.fetchStartedAt,
+      fetchCompletedAt: currentInputs.fetchCompletedAt,
+    };
+    let build: BuildResult;
+    try {
+      build = buildBundle(singleInputs, slateDate, { requireFuture: true });
+    } catch (error) {
+      // The expected signal: not yet eligible (incomplete board, one-sided
+      // or stale quotes, non-upcoming status, ...). No ledger entry — the
+      // game stays watched. Anything else is surfaced, never swallowed.
+      if (!(error instanceof Error && error.message.startsWith('no eligible games'))) {
+        deps.logError(`bundle build failed unexpectedly for ${gameId}: ${describeError(error)}`);
+      }
+      return 'watched';
+    }
+    const request = build.requests[0];
+    if (request === undefined) return 'watched';
+    // First pitch may have passed while earlier candidates fired — never
+    // claim (and burn) a game whose decision window is already gone.
+    if (Date.parse(row.matchTime) <= deps.nowMs()) return 'watched';
+    return { row, slateDate, singleInputs, build, request };
+  };
+
   for (const candidate of candidates) {
-    let row = candidate;
     try {
       // Never-double-fire is enforced at the consumption site too, not just
       // in the upfront filter.
-      if (deps.ledger.has(row.gameId)) continue;
+      if (deps.ledger.has(candidate.gameId)) continue;
 
       // Circuit breaker: model calls bill real money. Unclaimed candidates
-      // are re-evaluated next tick, where the late gate re-applies.
+      // are re-evaluated next tick, where the late gate re-applies. Hitting
+      // the cap is surfaced to schedulers (summary.capHit → nonzero exit).
       if (fireAttempts >= deps.maxFiresPerTick) {
+        summary.capHit = true;
         deps.logError(
           `fire cap reached (${deps.maxFiresPerTick} attempts) — stopping this tick; remaining candidates re-detected next tick`,
         );
         break;
       }
 
-      // Refresh the working snapshot when stale, and re-locate this game in
-      // it (the game may have left the window between snapshots).
-      if (deps.nowMs() - Date.parse(currentInputs.fetchCompletedAt) > FRESH_FIRE_MS) {
-        currentInputs = await deps.fetchInputs();
-        const liveRow = currentInputs.gamesRows.find((g) => g.gameId === row.gameId);
-        if (liveRow === undefined) {
-          summary.watched += 1;
-          continue;
-        }
-        row = liveRow;
-      }
-
-      // Backstop only — the refresh above keeps the snapshot young. If the
-      // fetch itself returns aged stamps, entries must still never be made.
-      const assembledAtMs = Date.parse(currentInputs.fetchCompletedAt);
-      if (Number.isFinite(assembledAtMs) && deps.nowMs() - assembledAtMs > deps.maxInputAgeMs) {
-        deps.logError('inputs still aged after refresh — stopping this tick');
-        break;
-      }
-
-      const slateDate = easternCalendarDay(row.matchTime);
-      const singleInputs: SlateInputs = {
-        gamesRows: [row],
-        oddsRows: currentInputs.oddsRows.filter((o) => o.jsonodds_id === row.gameId),
-        fetchStartedAt: currentInputs.fetchStartedAt,
-        fetchCompletedAt: currentInputs.fetchCompletedAt,
-      };
-
-      let build: BuildResult;
-      try {
-        build = buildBundle(singleInputs, slateDate, { requireFuture: true });
-      } catch (error) {
-        // The expected signal: not yet eligible (incomplete board, one-sided
-        // or stale quotes, non-upcoming status, ...). No ledger entry — the
-        // game stays watched. Anything else is surfaced, never swallowed.
-        if (!(error instanceof Error && error.message.startsWith('no eligible games'))) {
-          deps.logError(
-            `bundle build failed unexpectedly for ${row.gameId}: ${describeError(error)}`,
-          );
-        }
-        summary.watched += 1;
-        continue;
-      }
-      const request = build.requests[0];
-      if (request === undefined) {
-        summary.watched += 1;
-        continue;
-      }
-
-      // First pitch may have passed while earlier candidates fired — never
-      // claim (and burn) a game whose decision window is already gone.
-      if (Date.parse(row.matchTime) <= deps.nowMs()) {
+      let prep = await prepare(candidate.gameId);
+      if (prep === 'stop') break;
+      if (prep === 'watched') {
         summary.watched += 1;
         continue;
       }
 
       let completedAt: string | null;
       try {
-        completedAt = await boardCompletedAt(deps, row.gameId);
+        completedAt = await boardCompletedAt(deps, candidate.gameId);
       } catch (error) {
+        // A THROWN read is a failure (network/permission), not the benign
+        // history-lags-snapshot deferral — schedulers must see it.
+        summary.failed += 1;
         deps.logError(
-          `board-appearance read failed for ${row.gameId} (${describeError(error)}) — retrying next tick`,
+          `board-appearance read failed for ${candidate.gameId} (${describeError(error)}) — retrying next tick`,
         );
-        completedAt = null;
+        continue;
       }
       if (completedAt === null) {
         // History rows lag the snapshot by less than one ingest cycle — a
@@ -501,26 +511,45 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         // (e.g. a permission regression reads as 200-with-empty-array), so
         // escalate once instead of looking healthy while firing nothing.
         summary.deferred += 1;
-        const since = deps.deferredSince.get(row.gameId) ?? deps.nowMs();
-        deps.deferredSince.set(row.gameId, since);
-        if (deps.nowMs() - since > deps.lateMs && !deps.deferralWarned.has(row.gameId)) {
-          deps.deferralWarned.add(row.gameId);
+        const since = deps.deferredSince.get(candidate.gameId) ?? deps.nowMs();
+        deps.deferredSince.set(candidate.gameId, since);
+        if (deps.nowMs() - since > deps.lateMs && !deps.deferralWarned.has(candidate.gameId)) {
+          deps.deferralWarned.add(candidate.gameId);
           deps.logError(
-            `${row.gameId} has been deferred longer than the late threshold — ` +
+            `${candidate.gameId} has been deferred longer than the late threshold — ` +
               'the first-appearance history read path may be broken (check the public read grants)',
           );
         }
         continue;
       }
-      deps.deferredSince.delete(row.gameId);
+      deps.deferredSince.delete(candidate.gameId);
 
-      const openerAgeMs = deps.nowMs() - Date.parse(completedAt);
-      const openerAgeMinutes = Math.round(openerAgeMs / 60_000);
+      // The board-history reads above can be slow (up to three network
+      // round-trips on a game's first evaluation). Detection is what fires,
+      // so re-ensure the snapshot is fresh and the game still eligible on
+      // the inputs that will actually be dispatched. Board data is cached,
+      // so this re-preparation costs no history reads.
+      if (deps.nowMs() - Date.parse(currentInputs.fetchCompletedAt) > FRESH_FIRE_MS) {
+        prep = await prepare(candidate.gameId);
+        if (prep === 'stop') break;
+        if (prep === 'watched') {
+          summary.watched += 1;
+          continue;
+        }
+      }
+      const { row, slateDate, singleInputs, build, request } = prep;
+
+      // The detection instant: taken AFTER the final preparation, so
+      // bundle-assembly ≤ detection ≤ dispatch holds by construction (the
+      // scorer verifies exactly this chain from the artifact).
+      const detectedAtMs = deps.nowMs();
+      const openerAgeMs = detectedAtMs - Date.parse(completedAt);
+      const openerAgeMinutes = Math.max(0, Math.round(openerAgeMs / 60_000));
       const base: LedgerEntry = {
         gameId: row.gameId,
         slug: row.slug,
         decision: 'late_detection',
-        decidedAt: new Date(deps.nowMs()).toISOString(),
+        decidedAt: new Date(detectedAtMs).toISOString(),
         slateDate,
         scheduledStartUtc: row.matchTime,
         boardCompletedAt: completedAt,
@@ -572,7 +601,13 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         };
         deps.ledger.set(row.gameId, completed);
         persistLedgerEntry(deps.ledgerDir, completed);
-        summary.fired += 1;
+        if (outcome.collisionFailed) {
+          // A hard identity/collision failure is a FAILED pass, exactly as
+          // the smoke CLI treats it — the file exists but is unscoreable.
+          summary.failed += 1;
+        } else {
+          summary.fired += 1;
+        }
       } catch (error) {
         const failed: LedgerEntry = { ...claimed, fireError: describeError(error) };
         deps.ledger.set(row.gameId, failed);
@@ -586,7 +621,7 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
       // it is a FAILURE, and the summary says so.
       summary.failed += 1;
       deps.logError(
-        `game ${row.gameId} failed this tick (${describeError(error)}) — continuing`,
+        `game ${candidate.gameId} failed this tick (${describeError(error)}) — continuing`,
       );
     }
   }

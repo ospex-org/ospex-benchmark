@@ -64,12 +64,16 @@ For one game, once, at detection:
 
 1. Assemble a CURRENT snapshot (games read path + public odds read path):
    the working inputs are re-fetched whenever they are more than thirty
-   seconds old, so every game is evaluated and fired on seconds-old prices
-   no matter how long earlier fires in the same tick took —
-   fire-at-detection holds per game, not merely per tick. Build and hash
-   the bundle from that snapshot.
-2. Verify the late-detection gate (future-dated board timestamps fail
-   closed: never cached, never fired).
+   seconds old — including AGAIN after the gate's board-history reads,
+   which are network calls and can be slow — so every game is evaluated
+   and fired on seconds-old prices no matter how long anything earlier
+   took. Fire-at-detection holds per game, not merely per tick. Build and
+   hash the bundle from that snapshot; the detection instant is stamped
+   after final assembly, so bundle-assembly ≤ detection ≤ dispatch holds
+   by construction (and the scorer verifies exactly that chain).
+2. Verify the late-detection gate (ANY board timestamp after detection
+   fails closed — never cached, never fired; the runtime accepts only
+   what the scorer will).
 3. Claim the game in the ledger — memory first, then disk — BEFORE any
    dispatch, so neither a crash nor a restart can ever double-bill.
 4. Fire: dispatch all four model arms concurrently (existing per-game
@@ -113,9 +117,11 @@ leaderboard.
 - `yarn watch` — long-running loop; `--poll-seconds` (default 300),
   `--window-hours` (default 168), `--late-minutes` (default 60, max 1440),
   `--max-fires-per-tick` (default 10 — a circuit breaker on per-tick spend:
-  once hit, the tick stops loudly and unclaimed games re-evaluate next tick),
-  `--out` (default `out`), `--once` (single pass, for external schedulers
-  and tests; exits nonzero when the pass failed), `--dry-run` (fixture
+  once hit, the tick stops loudly, unclaimed games re-evaluate next tick,
+  and the pass reports non-healthy), `--out` (default `out`), `--once`
+  (single pass, for external schedulers and tests; exits nonzero when the
+  pass failed — including per-game failures, collision-failed fires, and a
+  hit spend cap), `--dry-run` (fixture
   inputs + mock adapters + synthetic clock; no credentials, no spend,
   writes to an ephemeral directory unless `--out` is given; exercised by
   tests).

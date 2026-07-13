@@ -587,7 +587,45 @@ export function verifyRunIntegrity(
           );
         }
       }
+      // "Fired at detection" is verified as a timing CHAIN through the
+      // artifact, not taken on faith: the bundle is assembled from fetched
+      // inputs, detection is evaluated on that bundle, and dispatch follows
+      // detection — so bundleTimestamp ≤ detectedAt ≤ every body-bearing
+      // attempt's requestAt. A provenance shifted away from the run's own
+      // recorded instants breaks one of these links.
+      const bundleMs = Date.parse(run.bundleTimestamp);
+      if (Number.isFinite(detectedMs) && Number.isFinite(bundleMs) && detectedMs < bundleMs) {
+        violations.push(
+          'watch provenance detectedAt precedes bundle assembly — detection cannot predate its inputs',
+        );
+      }
+      if (Number.isFinite(detectedMs)) {
+        for (const response of run.armResponses) {
+          for (const [label, attempt] of [
+            ['attempt', response.attempt],
+            ['repair', response.repair],
+          ] as const) {
+            if (attempt === null || attempt.requestAt === null) continue;
+            const requestMs = Date.parse(attempt.requestAt);
+            if (Number.isFinite(requestMs) && requestMs < detectedMs) {
+              violations.push(
+                `${response.participantId}/${response.gameId}: ${label} was dispatched before the recorded detection instant`,
+              );
+            }
+          }
+        }
+      }
+      // Watch fires are one decision event per game, by construction.
+      if (run.games.size !== 1) {
+        violations.push(
+          `watch run must contain exactly one game (found ${run.games.size})`,
+        );
+      }
     }
+  } else if (run.watch !== null) {
+    // Bidirectional: watch provenance on a non-watch run is as suspect as a
+    // watch run without it — prose renderers key on this metadata.
+    violations.push('non-watch run carries watch provenance in run_meta');
   }
 
   // Record identity: every record must carry this run's runId, label, and

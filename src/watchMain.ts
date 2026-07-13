@@ -142,11 +142,12 @@ async function main(): Promise<number> {
       printLine(
         `tick ${startedAt}: ${summary.gamesInWindow} in window · ${summary.watched} watched · ` +
           `${summary.fired} fired · ${summary.late} late · ${summary.deferred} deferred · ` +
-          `${summary.failed} failed`,
+          `${summary.failed} failed${summary.capHit ? ' · CAP HIT' : ''}`,
       );
       // Per-game failures are isolated inside the tick but they are still
-      // failures — a pass with any is not a healthy pass.
-      if (summary.failed > 0) tickFailed = true;
+      // failures — and a hit spend cap left work undone. Neither is a
+      // healthy pass.
+      if (summary.failed > 0 || summary.capHit) tickFailed = true;
     } catch (error) {
       // A tick failure (fetch outage, transient API error) is logged and the
       // loop keeps watching — per-game failures are already isolated inside

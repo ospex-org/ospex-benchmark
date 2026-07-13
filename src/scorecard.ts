@@ -55,7 +55,7 @@ export function buildScorecardMarkdown(
   lines.push('');
   lines.push('**Label: `SMOKE_V0_NOT_A_COHORT`** — pipeline shakedown, not a scored cohort.');
   lines.push(
-    run.watch !== null
+    run.watch !== null && run.runId.startsWith('watch-v0-')
       ? `Entry prices are the first-eligible board, fired at detection under the late-detection gate ` +
           `(board completed ${run.watch.boardCompletedAt}, detected ${run.watch.detectedAt}, ` +
           `opener age ${run.watch.openerAgeMinutes}m ≤ threshold ${run.watch.lateThresholdMinutes}m — ` +

@@ -100,7 +100,12 @@ function fullBoardInputs(overrides: Partial<SlateInputs> = {}): SlateInputs {
 }
 
 interface FakeFire {
-  calls: Array<{ gameId: string; slateDate: string; provenance: WatchGateProvenance }>;
+  calls: Array<{
+    gameId: string;
+    slateDate: string;
+    provenance: WatchGateProvenance;
+    fetchCompletedAt: string;
+  }>;
   fire: WatchDeps['fireGame'];
 }
 
@@ -110,12 +115,17 @@ function fakeFire(outcome?: Partial<FireOutcome>, fail = false): FakeFire {
     calls,
     fire: (
       build: BuildResult,
-      _inputs: SlateInputs,
+      inputs: SlateInputs,
       slateDate: string,
       provenance: WatchGateProvenance,
     ): Promise<FireOutcome> => {
       const request = build.requests[0];
-      calls.push({ gameId: request?.gameId ?? 'missing', slateDate, provenance });
+      calls.push({
+        gameId: request?.gameId ?? 'missing',
+        slateDate,
+        provenance,
+        fetchCompletedAt: inputs.fetchCompletedAt,
+      });
       if (fail) return Promise.reject(new Error('synthetic fire failure'));
       return Promise.resolve({
         runId: 'watch-v0-2026-07-20-abc123',
@@ -459,6 +469,41 @@ test('a fired game produces a run file that passes full scorer integrity verific
     ],
   });
   assert.ok(lateViolations.some((v) => v.includes('exceeds the recorded late threshold')));
+
+  const expected = [
+    {
+      participantId: TEST_ARM.participantId,
+      provider: TEST_ARM.provider,
+      requestedModelId: TEST_ARM.requestedModelId,
+      approvedReportedModelIds: ['stub-model-1'],
+    },
+  ];
+
+  // Shifting detection forward past the recorded dispatch instants breaks
+  // the bundle → detection → request chain.
+  const shifted = [...lines];
+  const shiftedWatch = {
+    ...provenance,
+    detectedAt: new Date(NOW_MS + 5 * 60_000).toISOString(),
+    boardCompletedAt: new Date(Date.parse(BOARD_FIRST_SEEN) + 5 * 60_000).toISOString(),
+  };
+  shifted[metaIndex] = JSON.stringify({ ...meta, watch: shiftedWatch });
+  const shiftedViolations = verifyRunIntegrity(parseRunRecords(shifted), { expectedArms: expected });
+  assert.ok(shiftedViolations.some((v) => v.includes('dispatched before the recorded detection instant')));
+
+  // Detection cannot predate the inputs it was evaluated on.
+  const predated = [...lines];
+  predated[metaIndex] = JSON.stringify({
+    ...meta,
+    watch: { ...provenance, detectedAt: '2026-07-20T11:00:00.000Z', boardCompletedAt: '2026-07-20T10:30:00.000Z' },
+  });
+  const predatedViolations = verifyRunIntegrity(parseRunRecords(predated), { expectedArms: expected });
+  assert.ok(predatedViolations.some((v) => v.includes('precedes bundle assembly')));
+
+  // Bidirectional identity: watch metadata on a non-watch run is a violation.
+  const relabeled = lines.map((l) => l.replaceAll(outcome.runId, `smoke-v0-${slateDate}-abcdef`));
+  const relabeledViolations = verifyRunIntegrity(parseRunRecords(relabeled), { expectedArms: expected });
+  assert.ok(relabeledViolations.some((v) => v.includes('non-watch run carries watch provenance')));
 });
 
 // ---------------------------------------------------------------------------
@@ -527,6 +572,7 @@ test('the per-tick fire cap stops dispatch loudly; uncapped games stay unclaimed
   });
   const summary = await watchTick(deps);
   assert.equal(summary.fired, 1);
+  assert.equal(summary.capHit, true); // schedulers see the hit cap
   assert.equal(fire.calls.length, 1);
   assert.equal(deps.ledger.size, 1);
   assert.ok(deps.errors.some((line) => line.includes('fire cap reached')));
@@ -726,6 +772,102 @@ test('a future-dated first appearance fails closed: logged, never cached, never 
   assert.equal(fire.calls.length, 0);
   assert.equal(deps.boardFirstSeen.size, 0);
   assert.ok(deps.errors.some((line) => line.includes('future first-appearance')));
+});
+
+test('a future stamp within minutes still defers — the runtime accepts only what the scorer will', async () => {
+  const fire = fakeFire();
+  let now = NOW_MS;
+  const futureStamp = new Date(NOW_MS + 60_000).toISOString(); // 60s after detection
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    nowMs: () => now,
+    fetchFirstBoardAppearance: () => Promise.resolve(futureStamp),
+    fetchInputs: () =>
+      Promise.resolve(
+        fullBoardInputs({
+          fetchStartedAt: new Date(now - 2_000).toISOString(),
+          fetchCompletedAt: new Date(now).toISOString(),
+          oddsRows: [
+            { ...oddsRow('moneyline', null), upstream_last_updated: new Date(now - 60_000).toISOString() },
+            { ...oddsRow('spread', 1.5), upstream_last_updated: new Date(now - 60_000).toISOString() },
+            { ...oddsRow('total', 8.5), upstream_last_updated: new Date(now - 60_000).toISOString() },
+          ],
+        }),
+      ),
+  });
+  const first = await watchTick(deps);
+  assert.equal(first.deferred, 1);
+  assert.equal(fire.calls.length, 0);
+  assert.equal(deps.boardFirstSeen.size, 0);
+  assert.ok(deps.errors.some((line) => line.includes('future first-appearance')));
+
+  // One tick later the stamp is in the past: fires with a non-negative age.
+  now += 5 * 60_000;
+  const second = await watchTick(deps);
+  assert.equal(second.fired, 1);
+  const prov = fire.calls[0]?.provenance;
+  assert.ok(prov);
+  assert.ok(prov.openerAgeMinutes >= 0);
+});
+
+test('slow board-history reads trigger re-preparation — fires never use aged inputs', async () => {
+  const fire = fakeFire();
+  let now = NOW_MS;
+  let fetches = 0;
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    nowMs: () => now,
+    fetchInputs: () => {
+      fetches += 1;
+      return Promise.resolve(
+        fullBoardInputs({
+          fetchStartedAt: new Date(now - 2_000).toISOString(),
+          fetchCompletedAt: new Date(now).toISOString(),
+          oddsRows: [
+            { ...oddsRow('moneyline', null), upstream_last_updated: new Date(now - 10_000).toISOString() },
+            { ...oddsRow('spread', 1.5), upstream_last_updated: new Date(now - 10_000).toISOString() },
+            { ...oddsRow('total', 8.5), upstream_last_updated: new Date(now - 10_000).toISOString() },
+          ],
+        }),
+      );
+    },
+    // Each history read consumes 40 simulated seconds — three reads push the
+    // snapshot far past FRESH_FIRE_MS before the claim.
+    fetchFirstBoardAppearance: () => {
+      now += 40_000;
+      return Promise.resolve(new Date(now - 5 * 60_000).toISOString());
+    },
+  });
+  const summary = await watchTick(deps);
+  assert.equal(summary.fired, 1);
+  assert.equal(fetches, 2); // tick snapshot + post-history-read re-preparation
+  const call = fire.calls[0];
+  assert.ok(call);
+  // The fired inputs are the RE-FETCHED snapshot, seconds old at dispatch.
+  assert.equal(call.fetchCompletedAt, new Date(now).toISOString());
+  // And detection is stamped after that assembly (the chain the scorer checks).
+  assert.ok(Date.parse(call.provenance.detectedAt) >= Date.parse(call.fetchCompletedAt));
+});
+
+test('a collision-failed fire is a FAILED pass, not a fired one', async () => {
+  const fire = fakeFire({ collisionFailed: true });
+  const deps = makeDeps({ fireGame: fire.fire });
+  const summary = await watchTick(deps);
+  assert.equal(summary.fired, 0);
+  assert.equal(summary.failed, 1);
+  assert.equal(deps.ledger.get(GAME_ID)?.collisionFailed, true);
+});
+
+test('a thrown board-history read is a failure, not a benign deferral', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchFirstBoardAppearance: () => Promise.reject(new Error('read denied')),
+  });
+  const summary = await watchTick(deps);
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.deferred, 0);
+  assert.equal(fire.calls.length, 0);
 });
 
 test('the fired provenance matches the gate evaluation', async () => {
