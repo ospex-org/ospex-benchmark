@@ -58,9 +58,12 @@ export interface WatchCliOptions {
   dryRun: boolean;
   once: boolean;
   outDir: string;
+  /** True when --out was passed explicitly (dry runs default elsewhere). */
+  outDirExplicit: boolean;
   pollSeconds: number;
   windowHours: number;
   lateMinutes: number;
+  maxFiresPerTick: number;
   timeoutSeconds: number | null;
   maxOutputTokens: number;
 }
@@ -76,7 +79,10 @@ Options:
   --window-hours N       Games-endpoint lookahead window. Default: 168, max 720.
   --late-minutes N       Late-detection threshold: a game whose full board completed
                          more than N minutes before detection is excluded (recorded
-                         as late_detection, never fired). Default: 60.
+                         as late_detection, never fired). Default: 60, max 1440.
+  --max-fires-per-tick N Circuit breaker on per-tick spend: once N games have fired
+                         in one tick, stop loudly; the rest re-evaluate next tick.
+                         Default: 10.
   --timeout-seconds N    Per-provider-call timeout. Default: 300 live, 2 dry run.
   --max-output-tokens N  Output-token bound per provider call. Default: 16000.
   -h, --help             Show this help.`;
@@ -88,9 +94,11 @@ export function parseWatchArgs(argv: string[], onHelp: () => void): WatchCliOpti
     dryRun: false,
     once: false,
     outDir: 'out',
+    outDirExplicit: false,
     pollSeconds: 300,
     windowHours: 168,
     lateMinutes: 60,
+    maxFiresPerTick: DEFAULT_MAX_FIRES_PER_TICK,
     timeoutSeconds: null,
     maxOutputTokens: 16000,
   };
@@ -112,6 +120,7 @@ export function parseWatchArgs(argv: string[], onHelp: () => void): WatchCliOpti
         break;
       case '--out':
         options.outDir = next();
+        options.outDirExplicit = true;
         break;
       case '--poll-seconds': {
         const value = Number.parseInt(next(), 10);
@@ -131,10 +140,18 @@ export function parseWatchArgs(argv: string[], onHelp: () => void): WatchCliOpti
       }
       case '--late-minutes': {
         const value = Number.parseInt(next(), 10);
-        if (!Number.isInteger(value) || value < 1) {
-          throw new WatchUsageError('--late-minutes must be a positive integer');
+        if (!Number.isInteger(value) || value < 1 || value > 1440) {
+          throw new WatchUsageError('--late-minutes must be an integer between 1 and 1440');
         }
         options.lateMinutes = value;
+        break;
+      }
+      case '--max-fires-per-tick': {
+        const value = Number.parseInt(next(), 10);
+        if (!Number.isInteger(value) || value < 1) {
+          throw new WatchUsageError('--max-fires-per-tick must be a positive integer');
+        }
+        options.maxFiresPerTick = value;
         break;
       }
       case '--timeout-seconds': {
@@ -199,6 +216,15 @@ export interface FireOutcome {
   collisionFailed: boolean;
 }
 
+/** Default per-tick fire circuit breaker — model calls bill real money, so a
+ *  surprise flood of "eligible" games must stop loudly, not spend quietly. */
+export const DEFAULT_MAX_FIRES_PER_TICK = 10;
+/** A tick's inputs age as sequential fires run; entries must never be made on
+ *  prices older than this. Unclaimed candidates are simply re-DETECTED next
+ *  tick from fresh inputs (nothing built is retained — this is re-detection,
+ *  not deferred firing). */
+export const MAX_INPUT_AGE_MS = 10 * 60_000;
+
 export interface WatchDeps {
   fetchInputs: () => Promise<SlateInputs>;
   /** First board appearance for (game, market); null = history not yet visible (transient). */
@@ -209,8 +235,14 @@ export interface WatchDeps {
   ledger: Map<string, LedgerEntry>;
   /** Cache of first-board-appearance instants (immutable once seen). */
   boardFirstSeen: Map<string, string>;
+  /** First time each game was deferred on a missing history row, for escalation. */
+  deferredSince: Map<string, number>;
+  /** Games whose prolonged deferral has already been escalated (log once). */
+  deferralWarned: Set<string>;
   nowMs: () => number;
   lateMs: number;
+  maxFiresPerTick: number;
+  maxInputAgeMs: number;
   log: (line: string) => void;
   logError: (line: string) => void;
 }
@@ -285,11 +317,18 @@ async function boardCompletedAt(
     let first = deps.boardFirstSeen.get(cacheKey) ?? null;
     if (first === null) {
       first = await deps.fetchFirstBoardAppearance(gameId, market);
+      if (first !== null && !Number.isFinite(Date.parse(first))) {
+        // Never cache an unparseable instant — surfacing it each tick beats
+        // silently deferring the game forever on a poisoned cache entry.
+        deps.logError(
+          `unparseable first-appearance timestamp for ${gameId} ${market}: ${first} — deferring`,
+        );
+        return null;
+      }
       if (first !== null) deps.boardFirstSeen.set(cacheKey, first);
     }
     if (first === null) return null;
     const firstMs = Date.parse(first);
-    if (!Number.isFinite(firstMs)) return null;
     if (newest === null || firstMs > Date.parse(newest)) newest = first;
   }
   return newest;
@@ -310,103 +349,171 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
     late: 0,
     deferred: 0,
   };
+  const assembledAtMs = Date.parse(inputs.fetchCompletedAt);
 
+  // Dedupe by gameId (offset pagination under concurrent upstream writes can
+  // repeat a row) and drop handled games; ordered by first pitch.
+  const seenThisTick = new Set<string>();
   const candidates = inputs.gamesRows
-    .filter((row) => !deps.ledger.has(row.gameId))
+    .filter((row) => {
+      if (deps.ledger.has(row.gameId) || seenThisTick.has(row.gameId)) return false;
+      seenThisTick.add(row.gameId);
+      return true;
+    })
     .sort((a, b) => (a.matchTime < b.matchTime ? -1 : a.matchTime > b.matchTime ? 1 : 0));
 
   for (const row of candidates) {
-    const slateDate = easternCalendarDay(row.matchTime);
-    const singleInputs: SlateInputs = {
-      gamesRows: [row],
-      oddsRows: inputs.oddsRows.filter((o) => o.jsonodds_id === row.gameId),
-      fetchStartedAt: inputs.fetchStartedAt,
-      fetchCompletedAt: inputs.fetchCompletedAt,
-    };
-
-    let build: BuildResult;
     try {
-      build = buildBundle(singleInputs, slateDate, { requireFuture: true });
-    } catch {
-      // Not yet eligible (incomplete board, one-sided or stale quotes,
-      // non-upcoming status, ...). No ledger entry — the game stays watched.
-      summary.watched += 1;
-      continue;
-    }
-    const request = build.requests[0];
-    if (request === undefined) {
-      summary.watched += 1;
-      continue;
-    }
+      // Never-double-fire is enforced at the consumption site too, not just
+      // in the upfront filter.
+      if (deps.ledger.has(row.gameId)) continue;
 
-    let completedAt: string | null;
-    try {
-      completedAt = await boardCompletedAt(deps, row.gameId);
-    } catch (error) {
-      deps.logError(`board-appearance read failed for ${row.gameId} (${describeError(error)}) — retrying next tick`);
-      summary.deferred += 1;
-      continue;
-    }
-    if (completedAt === null) {
-      // History rows lag the snapshot by less than one ingest cycle.
-      summary.deferred += 1;
-      continue;
-    }
+      // Circuit breaker: model calls bill real money. Unclaimed candidates
+      // are re-evaluated next tick, where the late gate re-applies.
+      if (summary.fired >= deps.maxFiresPerTick) {
+        deps.logError(
+          `fire cap reached (${deps.maxFiresPerTick}) — stopping this tick; remaining candidates re-detected next tick`,
+        );
+        break;
+      }
 
-    const openerAgeMs = deps.nowMs() - Date.parse(completedAt);
-    const openerAgeMinutes = Math.round(openerAgeMs / 60_000);
-    const base: LedgerEntry = {
-      gameId: row.gameId,
-      slug: row.slug,
-      decision: 'late_detection',
-      decidedAt: new Date(deps.nowMs()).toISOString(),
-      slateDate,
-      scheduledStartUtc: row.matchTime,
-      boardCompletedAt: completedAt,
-      openerAgeMinutes,
-      gameSha256: build.gameHashes[row.gameId] ?? 'unknown',
-      requestSha256: request.requestSha256,
-    };
+      // Entries must never be made on aged inputs: sequential fires consume
+      // wall time, so once this tick's snapshot is too old, stop. Unclaimed
+      // games are re-DETECTED next tick from fresh inputs (nothing built is
+      // retained — re-detection, not deferred firing).
+      if (Number.isFinite(assembledAtMs) && deps.nowMs() - assembledAtMs > deps.maxInputAgeMs) {
+        deps.log('tick inputs aged out — remaining candidates re-detected next tick');
+        break;
+      }
 
-    if (openerAgeMs > deps.lateMs) {
-      // Entry honesty: a stale opportunity is excluded, never entered late.
-      persistLedgerEntry(deps.ledgerDir, base);
-      deps.ledger.set(row.gameId, base);
-      summary.late += 1;
-      deps.log(
-        `late_detection ${row.slug} (${row.gameId}): board completed ${openerAgeMinutes}m ago — excluded, never fired`,
-      );
-      continue;
-    }
-
-    // Fire-at-detection. The ledger entry is claimed BEFORE dispatch so a
-    // crash mid-fire can never lead to a second (double-billed) fire on
-    // restart — losing one game's data is acceptable; double-firing is not.
-    const claimed: LedgerEntry = { ...base, decision: 'fired' };
-    persistLedgerEntry(deps.ledgerDir, claimed);
-    deps.ledger.set(row.gameId, claimed);
-    deps.log(
-      `firing ${row.slug} (${row.gameId}): board completed ${openerAgeMinutes}m ago, ` +
-        `first pitch ${row.matchTime}, request sha256 ${request.requestSha256.slice(0, 16)}…`,
-    );
-    try {
-      const outcome = await deps.fireGame(build, singleInputs, slateDate);
-      const completed: LedgerEntry = {
-        ...claimed,
-        runId: outcome.runId,
-        runFile: outcome.runFile,
-        armOutcomes: outcome.armOutcomes,
-        baselineDecisions: outcome.baselineDecisions,
-        collisionFailed: outcome.collisionFailed,
+      const slateDate = easternCalendarDay(row.matchTime);
+      const singleInputs: SlateInputs = {
+        gamesRows: [row],
+        oddsRows: inputs.oddsRows.filter((o) => o.jsonodds_id === row.gameId),
+        fetchStartedAt: inputs.fetchStartedAt,
+        fetchCompletedAt: inputs.fetchCompletedAt,
       };
-      persistLedgerEntry(deps.ledgerDir, completed);
-      deps.ledger.set(row.gameId, completed);
-      summary.fired += 1;
+
+      let build: BuildResult;
+      try {
+        build = buildBundle(singleInputs, slateDate, { requireFuture: true });
+      } catch (error) {
+        // The expected signal: not yet eligible (incomplete board, one-sided
+        // or stale quotes, non-upcoming status, ...). No ledger entry — the
+        // game stays watched. Anything else is surfaced, never swallowed.
+        if (!(error instanceof Error && error.message.startsWith('no eligible games'))) {
+          deps.logError(
+            `bundle build failed unexpectedly for ${row.gameId}: ${describeError(error)}`,
+          );
+        }
+        summary.watched += 1;
+        continue;
+      }
+      const request = build.requests[0];
+      if (request === undefined) {
+        summary.watched += 1;
+        continue;
+      }
+
+      // First pitch may have passed while earlier candidates fired — never
+      // claim (and burn) a game whose decision window is already gone.
+      if (Date.parse(row.matchTime) <= deps.nowMs()) {
+        summary.watched += 1;
+        continue;
+      }
+
+      let completedAt: string | null;
+      try {
+        completedAt = await boardCompletedAt(deps, row.gameId);
+      } catch (error) {
+        deps.logError(
+          `board-appearance read failed for ${row.gameId} (${describeError(error)}) — retrying next tick`,
+        );
+        completedAt = null;
+      }
+      if (completedAt === null) {
+        // History rows lag the snapshot by less than one ingest cycle — a
+        // PROLONGED deferral means the history read path itself is broken
+        // (e.g. a permission regression reads as 200-with-empty-array), so
+        // escalate once instead of looking healthy while firing nothing.
+        summary.deferred += 1;
+        const since = deps.deferredSince.get(row.gameId) ?? deps.nowMs();
+        deps.deferredSince.set(row.gameId, since);
+        if (deps.nowMs() - since > deps.lateMs && !deps.deferralWarned.has(row.gameId)) {
+          deps.deferralWarned.add(row.gameId);
+          deps.logError(
+            `${row.gameId} has been deferred longer than the late threshold — ` +
+              'the first-appearance history read path may be broken (check the public read grants)',
+          );
+        }
+        continue;
+      }
+      deps.deferredSince.delete(row.gameId);
+
+      const openerAgeMs = deps.nowMs() - Date.parse(completedAt);
+      const openerAgeMinutes = Math.round(openerAgeMs / 60_000);
+      const base: LedgerEntry = {
+        gameId: row.gameId,
+        slug: row.slug,
+        decision: 'late_detection',
+        decidedAt: new Date(deps.nowMs()).toISOString(),
+        slateDate,
+        scheduledStartUtc: row.matchTime,
+        boardCompletedAt: completedAt,
+        openerAgeMinutes,
+        gameSha256: build.gameHashes[row.gameId] ?? 'unknown',
+        requestSha256: request.requestSha256,
+      };
+
+      if (openerAgeMs > deps.lateMs) {
+        // Entry honesty: a stale opportunity is excluded, never entered late.
+        deps.ledger.set(row.gameId, base);
+        persistLedgerEntry(deps.ledgerDir, base);
+        summary.late += 1;
+        deps.log(
+          `late_detection ${row.slug} (${row.gameId}): board completed ${openerAgeMinutes}m ago — excluded, never fired`,
+        );
+        continue;
+      }
+
+      // Fire-at-detection. The claim is taken BEFORE dispatch — in memory
+      // first (so nothing in this process can re-enter), then on disk (so a
+      // restart cannot re-fire). A crash mid-fire loses one game's data;
+      // double-billing is the failure mode that must never happen. If the
+      // disk claim itself fails, the in-memory claim stands and no dispatch
+      // happens — no spend, and a later process re-detects the game.
+      const claimed: LedgerEntry = { ...base, decision: 'fired' };
+      deps.ledger.set(row.gameId, claimed);
+      persistLedgerEntry(deps.ledgerDir, claimed);
+      deps.log(
+        `firing ${row.slug} (${row.gameId}): board completed ${openerAgeMinutes}m ago, ` +
+          `first pitch ${row.matchTime}, request sha256 ${request.requestSha256.slice(0, 16)}…`,
+      );
+      try {
+        const outcome = await deps.fireGame(build, singleInputs, slateDate);
+        const completed: LedgerEntry = {
+          ...claimed,
+          runId: outcome.runId,
+          runFile: outcome.runFile,
+          armOutcomes: outcome.armOutcomes,
+          baselineDecisions: outcome.baselineDecisions,
+          collisionFailed: outcome.collisionFailed,
+        };
+        deps.ledger.set(row.gameId, completed);
+        persistLedgerEntry(deps.ledgerDir, completed);
+        summary.fired += 1;
+      } catch (error) {
+        const failed: LedgerEntry = { ...claimed, fireError: describeError(error) };
+        deps.ledger.set(row.gameId, failed);
+        persistLedgerEntry(deps.ledgerDir, failed);
+        deps.logError(`fire failed for ${row.slug} (${row.gameId}): ${describeError(error)}`);
+      }
     } catch (error) {
-      const failed: LedgerEntry = { ...claimed, fireError: describeError(error) };
-      persistLedgerEntry(deps.ledgerDir, failed);
-      deps.ledger.set(row.gameId, failed);
-      deps.logError(`fire failed for ${row.slug} (${row.gameId}): ${describeError(error)}`);
+      // Per-game isolation: one malformed row or failed ledger write must
+      // never stall the rest of the tick (or recur as a tick-killer).
+      deps.logError(
+        `game ${row.gameId} failed this tick (${describeError(error)}) — continuing`,
+      );
     }
   }
 

@@ -56,11 +56,18 @@ export function buildSummaryMarkdown(
     armGameResults.filter((r) => r.arm.participantId === participantId);
   const reportedByArm = reportedModelIdsByArm(armGameResults);
 
-  lines.push(`# Ospex shadow smoke run — ${ctx.slateDate}`);
+  const watchRun = ctx.runId.startsWith('watch-v0-');
+  lines.push(
+    watchRun
+      ? `# Ospex line-open watch run — ${ctx.slateDate}`
+      : `# Ospex shadow smoke run — ${ctx.slateDate}`,
+  );
   lines.push('');
   lines.push(`**Label: \`SMOKE_V0_NOT_A_COHORT\`** — pipeline shakedown, not a scored cohort.`);
   lines.push(
-    'Entry prices were captured late (lines opened days earlier); nothing here may appear on a leaderboard.',
+    watchRun
+      ? 'Entry prices are the first-eligible board, fired at detection (board-completion age in the watch ledger); still plumbing validation — nothing here may appear on a leaderboard.'
+      : 'Entry prices were captured late (lines opened days earlier); nothing here may appear on a leaderboard.',
   );
   lines.push('');
   lines.push(

@@ -55,7 +55,9 @@ export function buildScorecardMarkdown(
   lines.push('');
   lines.push('**Label: `SMOKE_V0_NOT_A_COHORT`** — pipeline shakedown, not a scored cohort.');
   lines.push(
-    'Entry prices were captured LATE (lines opened days earlier), so this CLV does not reflect a real early-entry policy. This data must never appear on a leaderboard.',
+    run.runId.startsWith('watch-v0-')
+      ? 'Entry prices are the first-eligible board, fired at detection under the late-detection gate (board-completion age in the watch ledger). Still plumbing validation — this data must never appear on a leaderboard.'
+      : 'Entry prices were captured LATE (lines opened days earlier), so this CLV does not reflect a real early-entry policy. This data must never appear on a leaderboard.',
   );
   lines.push('');
   lines.push(`- Source run: \`${run.runId}\` (slate sha \`${run.slateSha256.slice(0, 16)}…\`, integrity verified)`);

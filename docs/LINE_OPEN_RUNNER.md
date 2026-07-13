@@ -102,10 +102,22 @@ leaderboard.
 ## Operations
 
 - `yarn watch` — long-running loop; `--poll-seconds` (default 300),
-  `--window-hours` (default 168), `--late-minutes` (default 60),
+  `--window-hours` (default 168), `--late-minutes` (default 60, max 1440),
+  `--max-fires-per-tick` (default 10 — a circuit breaker on per-tick spend:
+  once hit, the tick stops loudly and unclaimed games re-evaluate next tick),
   `--out` (default `out`), `--once` (single pass, for external schedulers
-  and tests), `--dry-run` (fixture inputs + mock adapters + synthetic clock;
-  no credentials, no spend, exercised by tests).
+  and tests; exits nonzero when the pass failed), `--dry-run` (fixture
+  inputs + mock adapters + synthetic clock; no credentials, no spend,
+  writes to an ephemeral directory unless `--out` is given; exercised by
+  tests).
+- Entries are never made on aged inputs: sequential fires consume wall time,
+  and once a tick's fetched snapshot is older than ten minutes the tick
+  stops — unclaimed games are re-DETECTED next tick from fresh inputs
+  (re-detection, not deferred firing). A game whose first pitch passes
+  mid-tick is likewise never claimed.
+- A game deferred on a missing first-appearance history row for longer than
+  the late threshold triggers a one-time loud warning — a prolonged deferral
+  means the history read path itself is broken, not that data is slow.
 - One instance at a time (model calls cost real money; the ledger makes
   double-fire impossible across restarts but not across two concurrent
   processes).

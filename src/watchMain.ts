@@ -1,3 +1,5 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
@@ -8,6 +10,7 @@ import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/
 import {
   fireEligibleGame,
   loadLedger,
+  MAX_INPUT_AGE_MS,
   parseWatchArgs,
   WATCH_USAGE,
   WatchUsageError,
@@ -50,6 +53,17 @@ async function main(): Promise<number> {
     ? createMockAdapters({ simulateCollision: false })
     : createRealAdapters();
 
+  // Dry runs are repeatable demos: unless --out was passed explicitly, they
+  // write into an ephemeral directory so synthetic fixture entries never
+  // intermix with (or pre-handle games in) the live audit ledger.
+  const outDir =
+    options.dryRun && !options.outDirExplicit
+      ? mkdtempSync(join(tmpdir(), 'watch-dry-run-'))
+      : options.outDir;
+  if (outDir !== options.outDir) {
+    printLine(`dry run: writing to ephemeral ${outDir}`);
+  }
+
   if (options.dryRun) {
     // Fixture inputs + mock providers + one synthetic clock anchored at the
     // fixture capture instant, mirroring the smoke's dry-run story. The
@@ -86,7 +100,7 @@ async function main(): Promise<number> {
     arms: ARMS,
     adapters,
     approvedReportedModelIds,
-    outDir: options.outDir,
+    outDir,
     timeoutMs: (options.timeoutSeconds ?? (options.dryRun ? 2 : 300)) * 1000,
     maxOutputTokens: options.maxOutputTokens,
     mode,
@@ -96,7 +110,7 @@ async function main(): Promise<number> {
     logError: printError,
   };
 
-  const ledgerDir = join(options.outDir, 'watch-ledger');
+  const ledgerDir = join(outDir, 'watch-ledger');
   const ledger = loadLedger(ledgerDir, printError);
   printLine(`ledger: ${ledger.size} game(s) already handled (${ledgerDir})`);
 
@@ -107,14 +121,21 @@ async function main(): Promise<number> {
     ledgerDir,
     ledger,
     boardFirstSeen: new Map(),
+    deferredSince: new Map(),
+    deferralWarned: new Set(),
     nowMs,
     lateMs: options.lateMinutes * 60_000,
+    maxFiresPerTick: options.maxFiresPerTick,
+    maxInputAgeMs: MAX_INPUT_AGE_MS,
     log: printLine,
     logError: printError,
   };
 
   for (;;) {
-    const startedAt = new Date().toISOString();
+    // The same injected clock stamps the banner that drives enforcement and
+    // records — never a second clock.
+    const startedAt = new Date(nowMs()).toISOString();
+    let tickFailed = false;
     try {
       const summary = await watchTick(deps);
       printLine(
@@ -125,12 +146,15 @@ async function main(): Promise<number> {
       // A tick failure (fetch outage, transient API error) is logged and the
       // loop keeps watching — per-game failures are already isolated inside
       // the tick and can never reach here.
+      tickFailed = true;
       printError(`tick ${startedAt} failed: ${describeErrorWithStack(error)}`);
     }
-    if (options.once) break;
+    if (options.once) {
+      // External schedulers need the pass/fail distinction by exit code.
+      return tickFailed ? 1 : 0;
+    }
     await sleep(options.pollSeconds * 1000);
   }
-  return 0;
 }
 
 main()
