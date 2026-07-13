@@ -69,10 +69,12 @@ function pitcherName(value: unknown): string | null {
 }
 
 /**
- * Forward-compatible probable-pitcher read: the upstream ingest does not
- * store pitchers today, so this returns null — but if the games read path
- * gains the fields (object or flat, camel or snake), they populate
- * automatically. This repo never sources pitchers from anywhere else.
+ * Probable-pitcher read from the games read path, tolerant of shape (object
+ * or flat, camel or snake). The games endpoint serves the nested
+ * `probablePitchers: { home, away }` form (advisory MLB starters as last
+ * reported by the upstream odds feed; both sides null until announced), so
+ * bundles populate whenever starters are known. This repo never sources
+ * pitchers from anywhere else.
  */
 export function extractProbablePitchers(row: GamesEndpointRow): ProbablePitchers | null {
   const raw = row as unknown as Record<string, unknown>;

@@ -85,9 +85,8 @@ export interface GameBundle {
   homeTeam: string;
   /**
    * Probable starting pitchers when the games read path exposes them; null
-   * otherwise. The upstream ingest does not store them today, so this is
-   * null until that lands — carried explicitly so the absence is visible in
-   * the hashed bundle, and populated automatically once the fields appear.
+   * otherwise (unannounced starters, or non-MLB). Carried explicitly so the
+   * absence is visible in the hashed bundle.
    */
   probableStartingPitchers: ProbablePitchers | null;
   markets: {

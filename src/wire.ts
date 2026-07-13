@@ -99,3 +99,19 @@ export const closingLineRowSchema = z
 export function parseClosingLineRows(body: unknown): ClosingLineRow[] {
   return z.array(closingLineRowSchema).parse(body) as ClosingLineRow[];
 }
+
+export const historyFirstRowSchema = z
+  .object({
+    captured_at: z.string().min(1),
+  })
+  .passthrough();
+
+/**
+ * First price-history row for one (game, market) — the moment the market
+ * first appeared on the board. Used by watch mode's late-detection gate;
+ * an empty array means the history row has not landed yet (transient).
+ */
+export function parseHistoryFirstRow(body: unknown): string | null {
+  const rows = z.array(historyFirstRowSchema).max(1).parse(body);
+  return rows.length === 1 && rows[0] !== undefined ? rows[0].captured_at : null;
+}

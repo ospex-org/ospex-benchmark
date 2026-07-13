@@ -92,6 +92,41 @@ Artifact safety: every byte serialized to NDJSON or the summary passes through c
 
 **Store UTC, reason in ET, always.** A slate's date is the US Eastern calendar date of first pitch, and a single MLB slate legitimately spans two UTC dates — so a game's slate day is never derived from a UTC string prefix. The rule lives in one tested module, `src/slateDate.ts`.
 
+## Line-open watch mode (fire-at-detection only)
+
+```bash
+yarn watch                 # long-running; polls every 5 minutes
+yarn watch --once          # single pass (external schedulers)
+yarn watch --dry-run       # fixture slate + mock providers, no credentials
+```
+
+The smoke enters a slate whenever it is run — often hours after lines
+matured, where closing-line value is structurally ≈ −vig. Watch mode is the
+methodology's *first eligible* cutoff made real: it polls the same public
+read path and, the moment a game becomes eligible (the bundle builder yields
+a request — full board, two-sided, fresh quotes), it assembles, hashes, and
+fires that one game to all ten participants **in the same instant**, then
+records it in a per-game ledger (`out/watch-ledger/`) and never touches it
+again. One self-contained run file per fired game (`out/watch-v0-*.ndjson`)
+— scored with the same `yarn score` command, verified by the same integrity
+gates.
+
+There is deliberately no deferred firing and no replay: a bundle is used the
+instant it is built or not at all. A harness that fires later has watched
+the line move in between — a cherry-pick surface no matter how honest the
+operator. Entry honesty is enforced by the late-detection gate
+(`--late-minutes`, default 60): a game whose full board completed longer ago
+than that at detection is recorded as `late_detection` and excluded — never
+entered late, never revisited. Watcher downtime therefore costs coverage,
+not integrity.
+
+Run files keep the `SMOKE_V0_NOT_A_COHORT` label (typed and
+hash-load-bearing); watch runs are identified by the `watch-v0-` runId /
+cohortId prefix and remain plumbing validation, not a cohort. Run one
+watcher at a time — the ledger makes double-firing impossible across
+restarts, not across concurrent processes. Full contract:
+[`docs/LINE_OPEN_RUNNER.md`](docs/LINE_OPEN_RUNNER.md).
+
 ## Scoring (reference-closing CLV)
 
 ```bash
