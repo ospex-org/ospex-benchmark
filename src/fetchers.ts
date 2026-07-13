@@ -1,5 +1,10 @@
 import { redactAndTruncate } from './config.js';
-import { parseClosingLineRows, parseCurrentOddsRows, parseGamesBody } from './wire.js';
+import {
+  parseClosingLineRows,
+  parseCurrentOddsRows,
+  parseGamesBody,
+  parseHistoryFirstRow,
+} from './wire.js';
 import type {
   ClosingLineRow,
   CurrentOddsRow,
@@ -106,6 +111,27 @@ export async function fetchClosingLines(
     rows.push(...parseClosingLineRows(await getJson(url, headers)));
   }
   return rows;
+}
+
+/**
+ * First board appearance of one (game, market): the earliest price-history
+ * row from the board feed. Immutable once it exists — callers should cache.
+ * Returns the captured_at instant, or null when the history row has not
+ * landed yet (the ingest writes history before the snapshot, so null is
+ * transient and the caller should simply retry next cycle).
+ */
+export async function fetchFirstBoardAppearance(
+  supabaseUrl: string,
+  anonKey: string,
+  gameId: string,
+  market: 'moneyline' | 'spread' | 'total',
+): Promise<string | null> {
+  const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
+  const url =
+    `${supabaseUrl}/rest/v1/odds_history?select=captured_at` +
+    `&jsonodds_id=eq.${gameId}&market=eq.${market}&source=eq.jsonodds` +
+    `&order=captured_at.asc&limit=1`;
+  return parseHistoryFirstRow(await getJson(url, headers));
 }
 
 export async function fetchLiveInputs(options: {
