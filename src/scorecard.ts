@@ -1,13 +1,24 @@
-import type { ParticipantStats, ScoredPick, SourceRun } from './scoring.js';
+import { MARKETS, SCORING_POLICY_VERSION } from './scoring.js';
+import type { MarketStats, ParticipantStats, ScoredPick, SourceRun } from './scoring.js';
+import type { MarketKey } from './types.js';
 
 /**
  * Human-readable scorecard. Never starts with raw JSON; leads with the
  * honest-labeling banner and states the metric precisely: single-source
  * reference-closing CLV on decisions (no execution), late entries. The
  * primary summary is the equal-weight game-level aggregate; per-pick numbers
- * are secondary. Coverage comes first — arm failures never leave the
- * denominators.
+ * are secondary. Cross-participant comparison lives in the per-market
+ * section — vig differs by market, so pooled numbers are context, never the
+ * comparison surface for participants with different market exposure.
+ * Coverage comes first — arm failures never leave the denominators.
  */
+
+/** Exhaustive by construction: adding a MarketKey without a label is a compile error. */
+const MARKET_LABEL: Record<MarketKey, string> = {
+  moneyline: 'Moneyline',
+  spread: 'Spread (run line)',
+  total: 'Total',
+};
 
 function fmt(value: number | null, suffix = ''): string {
   return value === null ? '—' : `${value}${suffix}`;
@@ -19,8 +30,8 @@ function outcomes(stat: ParticipantStats): string {
   return entries.map(([outcome, count]) => `${outcome} ${count}`).join(' · ');
 }
 
-function unscored(stat: ParticipantStats): string {
-  const entries = Object.entries(stat.unscoredByReason);
+function reasons(counts: Record<string, number>): string {
+  const entries = Object.entries(counts);
   if (entries.length === 0) return '—';
   return entries.map(([reason, count]) => `${reason} ${count}`).join(', ');
 }
@@ -28,7 +39,7 @@ function unscored(stat: ParticipantStats): string {
 function coverageRow(stat: ParticipantStats): string {
   return (
     `| ${stat.participantId} | ${stat.games} | ${outcomes(stat)} | ${stat.eligibleMarkets} | ` +
-    `${stat.validDecisions} | ${stat.primaryScoreable} | ${stat.conditionalOnly} | ${unscored(stat)} |`
+    `${stat.validDecisions} | ${stat.primaryScoreable} | ${stat.conditionalOnly} | ${reasons(stat.unscoredByReason)} |`
   );
 }
 
@@ -38,6 +49,14 @@ function clvRow(stat: ParticipantStats): string {
     `${fmt(stat.gameLevel.medianClvPct)} | ${fmt(stat.gameLevel.beatClosePct, '%')} | ` +
     `${stat.primaryScoreable}/${stat.eligibleMarkets} | ${fmt(stat.perPick.meanClvPct)} | ` +
     `${fmt(stat.perPick.medianClvPct)} | ${fmt(stat.perPick.beatClosePct, '%')} |`
+  );
+}
+
+function marketRow(stat: ParticipantStats, market: MarketStats): string {
+  return (
+    `| ${stat.participantId} | ${market.picks} | ${market.scoreable}/${market.eligible} | ${market.gamesScoreable} | ` +
+    `${fmt(market.gameLevel.meanClvPct)} | ${fmt(market.gameLevel.medianClvPct)} | ` +
+    `${fmt(market.gameLevel.beatClosePct, '%')} | ${reasons(market.unscoredByReason)} |`
   );
 }
 
@@ -65,11 +84,15 @@ export function buildScorecardMarkdown(
   lines.push('');
   lines.push(`- Source run: \`${run.runId}\` (slate sha \`${run.slateSha256.slice(0, 16)}…\`, integrity verified)`);
   lines.push(`- Scored: ${scoredAt}`);
+  lines.push(`- Scoring policy: \`${SCORING_POLICY_VERSION}\` (stamped on every scored record)`);
   lines.push(
     '- Metric: **reference-closing CLV** in expected-ROI percentage points — the frozen entry price against the proportional no-vig close of the same contract from a single reference source. Decision CLV only; nothing was executed.',
   );
   lines.push(
     '- Primary summary: **equal-weight game-level aggregate** (per-game mean CLV, averaged across games). Per-pick numbers are secondary.',
+  );
+  lines.push(
+    '- Comparison rule: **never pool CLV across markets when comparing participants with different market exposure** — vig differs by market (a moneyline-only baseline and a three-market model are not on the same footing). Pooled tables are context; cross-participant comparison belongs in the per-market section.',
   );
   lines.push(
     '- Policy: `fresh`-confidence closes only; price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable lines report separately-labeled conditional CLV, never pooled into primary.',
@@ -86,7 +109,11 @@ export function buildScorecardMarkdown(
   for (const stat of baselines) lines.push(coverageRow(stat));
   lines.push('');
 
-  lines.push('## Reference-closing CLV');
+  lines.push('## Reference-closing CLV (pooled across each participant’s markets — context only)');
+  lines.push('');
+  lines.push(
+    'Model rows pool moneyline, spread, and total exposure; single-market baselines pool nothing. Compare participants in the per-market section below.',
+  );
   lines.push('');
   lines.push(
     '| Participant | Games scoreable | Game-level mean | Game-level median | Game-level beat close | Scoreable/eligible | Per-pick mean | Per-pick median | Per-pick beat close |',
@@ -103,18 +130,36 @@ export function buildScorecardMarkdown(
   for (const stat of baselines) lines.push(clvRow(stat));
   lines.push('');
 
-  lines.push('## By market (models, per-pick)');
+  lines.push('## By market (game-level — the cross-participant comparison surface)');
   lines.push('');
-  lines.push('| Participant | Market | Picks | Scoreable | Mean CLV % |');
-  lines.push('|---|---|---|---|---|');
-  for (const stat of models) {
-    for (const [market, m] of Object.entries(stat.byMarket)) {
-      lines.push(
-        `| ${stat.participantId} | ${market} | ${m.picks} | ${m.scoreable} | ${fmt(m.meanClvPct)} |`,
-      );
-    }
+  lines.push(
+    'One table per market, every participant active in it — the only like-for-like comparison when market exposure differs. Rows are ordered by the market’s own game-level mean (not the pooled aggregate). Within a market each game contributes at most one pick per participant, so game-level and per-pick aggregates coincide today; the within-game clustering is applied regardless.',
+  );
+  lines.push('');
+  for (const marketKey of MARKETS) {
+    const active = stats
+      .map((stat) => ({ stat, market: stat.byMarket[marketKey] }))
+      .filter((entry): entry is { stat: ParticipantStats; market: MarketStats } => entry.market !== undefined);
+    if (active.length === 0) continue;
+    // Ranked by THIS market's result — the pooled ordering must not leak
+    // into the per-market comparison surface. Nulls (nothing scoreable) last.
+    active.sort((a, b) => {
+      const aMean = a.market.gameLevel.meanClvPct;
+      const bMean = b.market.gameLevel.meanClvPct;
+      if (aMean === null && bMean === null) return 0;
+      if (aMean === null) return 1;
+      if (bMean === null) return -1;
+      return bMean - aMean;
+    });
+    lines.push(`### ${MARKET_LABEL[marketKey]}`);
+    lines.push('');
+    lines.push(
+      '| Participant | Picks | Scoreable/eligible | Games scoreable | Game-level mean | Game-level median | Game-level beat close | Unscored (reason) |',
+    );
+    lines.push('|---|---|---|---|---|---|---|---|');
+    for (const { stat, market } of active) lines.push(marketRow(stat, market));
+    lines.push('');
   }
-  lines.push('');
 
   const moved = scored.filter((p) => p.result.unscoredReason === 'line_moved');
   if (moved.length > 0) {

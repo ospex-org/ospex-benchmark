@@ -10,6 +10,7 @@ import { buildScorecardMarkdown } from './scorecard.js';
 import {
   aggregateByParticipant,
   parseRunRecords,
+  SCORING_POLICY_VERSION,
   scoredRecords,
   scoreRun,
   verifyRunIntegrity,
@@ -74,7 +75,9 @@ function parseArgs(argv: string[]): CliOptions {
 async function main(): Promise<number> {
   const loaded = loadDotEnv();
   const options = parseArgs(process.argv.slice(2));
-  printLine('ospex-benchmark scorer — reference-closing CLV — label SMOKE_V0_NOT_A_COHORT');
+  printLine(
+    `ospex-benchmark scorer — reference-closing CLV — ${SCORING_POLICY_VERSION} — label SMOKE_V0_NOT_A_COHORT`,
+  );
   if (loaded.length > 0) {
     printLine(`loaded ${loaded.length} env var(s) from .env: ${loaded.join(', ')}`);
   }
@@ -140,6 +143,9 @@ async function main(): Promise<number> {
   writeText(scorecardPath, buildScorecardMarkdown(run, scored, stats, scoredAt));
 
   printLine('');
+  printLine(
+    'participant summaries (CLV pooled across each participant\'s markets — context only; cross-participant comparison lives in the scorecard\'s per-market tables):',
+  );
   for (const stat of stats) {
     const outcomes = Object.entries(stat.armOutcomes)
       .map(([outcome, count]) => `${outcome} ${count}`)
