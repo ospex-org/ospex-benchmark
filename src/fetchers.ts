@@ -125,19 +125,28 @@ export async function fetchClosingLines(
  * strictly increasing ids across the whole result (uniqueness + order), and
  * refuses anything else. Correctness assumes the key is append-only
  * monotone (a GENERATED IDENTITY column), which closing_lines.id is.
+ *
+ * Termination is an EMPTY page only. A short page must not be trusted as
+ * end-of-data: a server-side row cap below the requested limit would make
+ * every page "short" and silently truncate the walk — the walker
+ * deliberately does not know or assume any page size. Every appended page
+ * passes the maxRows bound before the walk can return, so no result ever
+ * exceeds it. Termination is guaranteed: each page must strictly advance
+ * the id cursor (else the non-increasing refusal fires), and unbounded
+ * growth hits maxRows.
  */
 export async function keysetWalk<T>(options: {
   fetchPage: (afterId: number) => Promise<T[]>;
   idOf: (row: T) => number;
-  pageSize: number;
   maxRows?: number;
 }): Promise<T[]> {
-  const { fetchPage, idOf, pageSize } = options;
+  const { fetchPage, idOf } = options;
   const maxRows = options.maxRows ?? 1_000_000;
   const rows: T[] = [];
   let afterId = 0;
   for (;;) {
     const page = await fetchPage(afterId);
+    if (page.length === 0) return rows;
     let previous = afterId;
     for (const row of page) {
       const id = idOf(row);
@@ -150,11 +159,12 @@ export async function keysetWalk<T>(options: {
       previous = id;
       rows.push(row);
     }
-    if (page.length < pageSize) return rows;
-    afterId = previous;
     if (rows.length > maxRows) {
-      throw new Error('keyset pagination did not terminate — aborting rather than looping');
+      throw new Error(
+        `keyset pagination exceeded ${maxRows} rows — refusing an unbounded walk`,
+      );
     }
+    afterId = previous;
   }
 }
 
@@ -174,6 +184,8 @@ export async function fetchTotalsClosingLines(
     'id,network,jsonodds_id,market,line,away_odds_decimal,home_odds_decimal,' +
     'away_p_novig,home_p_novig,value_captured_at,last_polled_at,lock_time,' +
     'poll_gap_seconds,confidence,source';
+  // The requested page size is a hint to the server, not a contract the
+  // walker relies on — termination is the empty final page.
   const pageSize = 1000;
   return keysetWalk({
     fetchPage: async (afterId) => {
@@ -184,7 +196,6 @@ export async function fetchTotalsClosingLines(
       return parseClosingLineRowsWithId(await getJson(url, headers));
     },
     idOf: (row) => row.id,
-    pageSize,
   });
 }
 

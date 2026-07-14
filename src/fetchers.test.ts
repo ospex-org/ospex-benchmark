@@ -4,10 +4,15 @@ import { keysetWalk } from './fetchers.js';
 
 /**
  * Keyset-pagination invariants. The fake below emulates PostgREST semantics
- * over a mutable table (`order=id.asc&id=gt.N&limit=pageSize`) so the
- * insertion race that breaks offset pagination — a concurrent insert shifts
- * page boundaries, duplicating one row and dropping another — can be
- * reproduced deterministically against the walker.
+ * over a mutable table (`order=id.asc&id=gt.N`) with a SERVER-enforced page
+ * cap the walker does not know about, so both failure classes are
+ * reproduced deterministically:
+ *
+ * 1. the insertion race that breaks offset pagination (a concurrent insert
+ *    shifts page boundaries, duplicating one row and dropping another), and
+ * 2. short-page truncation (a server row cap below the requested limit
+ *    makes every page "short"; a walker that treats a short page as
+ *    end-of-data silently truncates).
  */
 
 interface Row {
@@ -15,7 +20,7 @@ interface Row {
   name: string;
 }
 
-function pageSource(table: Row[], pageSize: number, onPage?: (pageIndex: number) => void) {
+function pageSource(table: Row[], serverCap: number, onPage?: (pageIndex: number) => void) {
   let pageIndex = 0;
   return async (afterId: number): Promise<Row[]> => {
     onPage?.(pageIndex);
@@ -23,7 +28,7 @@ function pageSource(table: Row[], pageSize: number, onPage?: (pageIndex: number)
     return table
       .filter((row) => row.id > afterId)
       .sort((a, b) => a.id - b.id)
-      .slice(0, pageSize);
+      .slice(0, serverCap);
   };
 }
 
@@ -36,12 +41,24 @@ test('keysetWalk returns every row exactly once across multiple pages', async ()
   const rows = await keysetWalk({
     fetchPage: pageSource(table, 10),
     idOf: (row: Row) => row.id,
-    pageSize: 10,
   });
   assert.deepEqual(
     rows.map((row) => row.id),
     table.map((row) => row.id),
   );
+});
+
+test('REGRESSION: a server page cap below the requested size must not truncate the walk', async () => {
+  // 120 rows behind a server that caps every response at 50 rows. A walker
+  // that treats a short page as end-of-data returns 50 and stops; the walk
+  // must instead continue to the empty page and return all 120.
+  const table = makeTable(120);
+  const rows = await keysetWalk({
+    fetchPage: pageSource(table, 50),
+    idOf: (row: Row) => row.id,
+  });
+  assert.equal(rows.length, 120, 'every row returned despite the server cap');
+  assert.equal(new Set(rows.map((row) => row.id)).size, 120, 'no duplicates');
 });
 
 test('REGRESSION: a row inserted mid-walk never duplicates or drops a pre-existing row', async () => {
@@ -57,7 +74,6 @@ test('REGRESSION: a row inserted mid-walk never duplicates or drops a pre-existi
       if (pageIndex === 5) table.push({ id: 1001, name: 'inserted-mid-walk' });
     }),
     idOf: (row: Row) => row.id,
-    pageSize: 100,
   });
   const ids = rows.map((row) => row.id);
   assert.equal(new Set(ids).size, ids.length, 'no duplicates');
@@ -77,29 +93,40 @@ test('keysetWalk refuses non-increasing ids (duplicate or disordered pages)', as
     keysetWalk({
       fetchPage: async () => table,
       idOf: (row: Row) => row.id,
-      pageSize: 10,
     }),
     /non-increasing id/,
   );
 });
 
-test('keysetWalk refuses unsafe ids and runaway result sets', async () => {
+test('keysetWalk refuses unsafe ids', async () => {
   await assert.rejects(
     keysetWalk({
       fetchPage: async () => [{ id: Number.NaN, name: 'bad' }],
       idOf: (row: Row) => row.id,
-      pageSize: 10,
     }),
     /non-increasing id/,
   );
-  const table = makeTable(50);
+});
+
+test('maxRows is enforced on EVERY page, including a short final one', async () => {
+  // 29 rows in server pages of 10 against maxRows 25: the bound must refuse
+  // on the final (short) page, never return 29 rows through an early exit.
+  const shortFinal = makeTable(29);
   await assert.rejects(
     keysetWalk({
-      fetchPage: pageSource(table, 10),
+      fetchPage: pageSource(shortFinal, 10),
       idOf: (row: Row) => row.id,
-      pageSize: 10,
       maxRows: 25,
     }),
-    /did not terminate/,
+    /unbounded walk/,
+  );
+  const runaway = makeTable(50);
+  await assert.rejects(
+    keysetWalk({
+      fetchPage: pageSource(runaway, 10),
+      idOf: (row: Row) => row.id,
+      maxRows: 25,
+    }),
+    /unbounded walk/,
   );
 });
