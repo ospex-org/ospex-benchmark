@@ -3,18 +3,28 @@ import { fileURLToPath } from 'node:url';
 import { nbPmf, totalsDispersionArtifactSchema } from './dispersion.js';
 import { proportionalTwoWay } from './devig.js';
 import type { CloseQuote, UnscoredReason } from './clv.js';
-import type { ClvResult } from './clv.js';
 
 /**
  * TOTALS_V1 totals ladder — pure math, no I/O except the artifact loader.
  *
- * The ladder prices win/push probabilities for ANY totals line from one
- * closing quote, so line movement never disqualifies a totals pick: a pick
- * whose line moved gets a ladder CLV instead of silence, and an integer
- * same-line pick gets the push probability that two-sided prices alone
- * cannot identify. The close-quality gates still apply — SHARED with the
- * exact-line metrics — so a missing/stale/inconsistent close refuses the
- * ladder with the same typed reason it refuses everything else with.
+ * The ladder prices win/push probabilities for any totals line inside its
+ * method domain from one closing quote, so LINE MOVEMENT ALONE never
+ * disqualifies a totals pick: a pick whose line moved gets a ladder CLV
+ * instead of silence. What still can refuse a pick, each with a typed
+ * reason: the close-quality gates (SHARED with the exact-line metrics — a
+ * missing/stale/inconsistent close refuses the ladder with the same reason
+ * it refuses everything else with), the METHOD DOMAIN (MLB only — the
+ * dispersion parameter is fit on MLB finals; half-step lines within the
+ * finite rail below), and SOLVABILITY (a close whose implied mean falls
+ * outside the solver bounds refuses rather than extrapolates).
+ *
+ * STATUS: TOTALS_V1 is the preregistered CANDIDATE line-value method. Its
+ * independent validation — mean absolute error of ladder prices against a
+ * real sportsbook alternate-totals ladder — is pending a one-time manual
+ * capture, so ladder output is sensitivity/diagnostic: separately labeled,
+ * never pooled into the primary columns, and integer same-line totals stay
+ * conditional-only in the primary metrics until the validation artifact is
+ * published.
  *
  * Model: the final combined total T is negative binomial with dispersion k
  * (the published, versioned parameter — docs/TOTALS_DISPERSION.md) and a
@@ -43,6 +53,10 @@ import type { ClvResult } from './clv.js';
  * unchanged integer line it equals the push-excluded conditional CLV shrunk
  * by the push mass: clv_conditional * (1 - q_P).
  *
+ * The tail walk is a single pmf recurrence (O(line) total, never a fresh
+ * pmf per term), and the finite line rail bounds the work — a schema-valid
+ * but absurd line refuses fast instead of grinding.
+ *
  * Known approximation, published rather than smoothed over: the smooth NB
  * cannot reproduce the odd/even parity oscillation of MLB totals, so q_P
  * runs roughly one to two percentage points HIGH at even integer lines and
@@ -60,6 +74,23 @@ export class LadderError extends Error {}
  */
 export const MU_MIN = 0.5;
 export const MU_MAX = 40;
+
+/**
+ * Method domain, runtime-bound (refusals are `outside_method_domain`):
+ * - The dispersion parameter is fit on MLB finals; the ladder never prices
+ *   another league's totals with it.
+ * - Lines must sit on the half-step lattice (the model has no meaning at a
+ *   quarter line) within a finite rail — generous next to real MLB totals
+ *   (max captured close: 15) but a hard bound, both because the model is
+ *   unvalidated out there and because the CDF walk cost grows with the line.
+ */
+export const LADDER_LEAGUE = 'mlb';
+export const MAX_LADDER_LINE = 30;
+
+/** On the half-step lattice, positive, and inside the finite rail. */
+export function ladderLineInDomain(line: number): boolean {
+  return Number.isFinite(line) && line > 0 && line <= MAX_LADDER_LINE && Number.isInteger(line * 2);
+}
 
 export interface LadderParams {
   /** Negative-binomial dispersion (Var = mu + mu^2/k). */
@@ -81,16 +112,29 @@ function assertHalfStepLine(line: number, label: string): void {
   if (!Number.isFinite(line) || line < 0 || !Number.isInteger(line * 2)) {
     throw new LadderError(`${label} must be a non-negative multiple of 0.5, got ${line}`);
   }
+  if (line > MAX_LADDER_LINE) {
+    throw new LadderError(
+      `${label} ${line} exceeds the method's line rail (${MAX_LADDER_LINE}) — refusing unbounded work`,
+    );
+  }
 }
 
-/** Win/push/loss mass around a (half-integer or integer) totals line. */
+/**
+ * Win/push/loss mass around a (half-integer or integer) totals line. One
+ * incremental pmf recurrence — P(t) = P(t-1) * ((t-1+k)/t) * (mu/(k+mu)) —
+ * so the whole walk is O(line); the float sequence is identical to
+ * evaluating nbPmf at each t.
+ */
 export function tailProbabilities(mu: number, k: number, line: number): TailProbabilities {
   assertHalfStepLine(line, 'line');
   const floor = Math.floor(line);
-  let cdf = 0;
-  let at = 0;
-  for (let t = 0; t <= floor; t += 1) {
-    const p = nbPmf(t, mu, k);
+  // nbPmf(0) also validates mu and k — single source for both.
+  let p = nbPmf(0, mu, k);
+  const ratio = mu / (k + mu);
+  let cdf = p;
+  let at = line === 0 ? p : 0;
+  for (let t = 1; t <= floor; t += 1) {
+    p *= ((t - 1 + k) / t) * ratio;
     cdf += p;
     if (t === line) at = p;
   }
@@ -145,6 +189,7 @@ export type LadderUnscoredReason =
   | 'close_not_captured'
   | 'close_stale'
   | 'close_inconsistent'
+  | 'outside_method_domain'
   | 'ladder_unsolvable';
 
 const SHARED_GATE_REASONS: ReadonlySet<UnscoredReason> = new Set([
@@ -197,9 +242,12 @@ function ladderUnscored(
  * coverage can never diverge from exact-line coverage on close quality;
  * `line_moved` and `push_capable_line` are precisely what the ladder exists
  * to price, and a null reason (scored half-line) is priced for the identity
- * columns.
+ * columns. The method domain (league, line lattice + rail) is checked
+ * BEFORE any numeric work — a schema-valid but out-of-domain pick refuses
+ * fast with `outside_method_domain`, never grinds or extrapolates.
  */
 export function scoreTotalsLadder(options: {
+  league: string;
   selection: 'over' | 'under';
   entryDecimal: number;
   entryOppositeDecimal: number | null;
@@ -208,8 +256,16 @@ export function scoreTotalsLadder(options: {
   gateReason: UnscoredReason | null;
   params: LadderParams;
 }): TotalsLadderResult {
-  const { selection, entryDecimal, entryOppositeDecimal, entryLine, close, gateReason, params } =
-    options;
+  const {
+    league,
+    selection,
+    entryDecimal,
+    entryOppositeDecimal,
+    entryLine,
+    close,
+    gateReason,
+    params,
+  } = options;
   if (gateReason !== null && SHARED_GATE_REASONS.has(gateReason)) {
     return ladderUnscored(params, gateReason as LadderUnscoredReason);
   }
@@ -217,6 +273,13 @@ export function scoreTotalsLadder(options: {
   // and (for totals) carries a line — anything else here is a defect.
   if (close === null || close.line === null || close.awayPNovig === null) {
     return ladderUnscored(params, 'close_not_captured');
+  }
+  if (
+    league !== LADDER_LEAGUE ||
+    !ladderLineInDomain(entryLine) ||
+    !ladderLineInDomain(close.line)
+  ) {
+    return ladderUnscored(params, 'outside_method_domain');
   }
   let mu: number;
   let quantities: TailProbabilities;
@@ -244,26 +307,6 @@ export function scoreTotalsLadder(options: {
       entryNovig === null
         ? null
         : round4(100 * (qWin / entryNovig.pSelected + qPush - 1)),
-  };
-}
-
-/**
- * The integer same-line PRIMARY upgrade (docs/AGENT_BENCHMARK.md
- * "Push-capable lines"): with TOTALS_V1 as the preregistered independent
- * q_P source, an integer-line pick whose line did not move upgrades from
- * conditional-only to primary — both metrics take the ladder's generalized
- * value, which at the unchanged line equals the push-excluded conditional
- * CLV shrunk by the push mass (clv_cond * (1 - q_P)). The separately
- * labeled conditional columns are kept unchanged.
- */
-export function applyLadderUpgrade(result: ClvResult, ladder: TotalsLadderResult): ClvResult {
-  if (result.unscoredReason !== 'push_capable_line') return result;
-  if (ladder.unscoredReason !== null || ladder.economicClvPct === null) return result;
-  return {
-    ...result,
-    primaryClvPct: ladder.economicClvPct,
-    marginAdjustedClvPct: ladder.marginAdjustedClvPct,
-    unscoredReason: null,
   };
 }
 

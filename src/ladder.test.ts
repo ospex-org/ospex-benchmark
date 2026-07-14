@@ -1,17 +1,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  applyLadderUpgrade,
   LADDER_VERSION,
   LadderError,
+  ladderLineInDomain,
   loadLadderParams,
+  MAX_LADDER_LINE,
   MU_MAX,
   MU_MIN,
   scoreTotalsLadder,
   solveCloseImpliedMean,
   tailProbabilities,
 } from './ladder.js';
-import type { ClvResult, CloseQuote } from './clv.js';
+import type { CloseQuote } from './clv.js';
 
 /**
  * Golden values computed INDEPENDENTLY (lgamma-form NB pmf + bisection to
@@ -113,6 +114,7 @@ const PARAMS = { k: K, parameterVersion: 'TOTALS_V1_PROVISIONAL' };
 
 test('same-line half-line ladder reduces exactly to the exact-line metrics', () => {
   const result = scoreTotalsLadder({
+    league: 'mlb',
     selection: 'over',
     entryDecimal: 1.95,
     entryOppositeDecimal: 1.95,
@@ -137,6 +139,7 @@ test('moved line: the ladder prices the ENTRY line from the close (over golden)'
   // Entry over 8 at 1.95, close 8.5 @ 0.52 (golden G5): q_W = P(T>8) = 0.52,
   // q_P = P(T=8) = 0.0943376..., econ = 100*(0.52*1.95 + 0.0943377 - 1).
   const result = scoreTotalsLadder({
+    league: 'mlb',
     selection: 'over',
     entryDecimal: 1.95,
     entryOppositeDecimal: 1.95,
@@ -156,6 +159,7 @@ test('moved line: the ladder prices the ENTRY line from the close (over golden)'
 test('moved line: under direction uses the below-mass at the entry line', () => {
   // Entry under 9 vs close 8.5 @ 0.52: q_W = P(T<9) = 0.48, q_P = P(T=9).
   const result = scoreTotalsLadder({
+    league: 'mlb',
     selection: 'under',
     entryDecimal: 2.0,
     entryOppositeDecimal: 2.0,
@@ -175,6 +179,7 @@ test('integer same-line ladder equals the conditional CLV shrunk by the push mas
   // Close 9 @ conditional 0.5 (G2), entry under 9 at 1.9: conditional CLV is
   // 100*(1.9*0.5 - 1) = -5; the generalized value is -5 * (1 - q_P).
   const result = scoreTotalsLadder({
+    league: 'mlb',
     selection: 'under',
     entryDecimal: 1.9,
     entryOppositeDecimal: 1.9,
@@ -201,6 +206,7 @@ test('shared availability gates are honored verbatim, with version stamps riding
     'close_inconsistent',
   ] as const) {
     const result = scoreTotalsLadder({
+      league: 'mlb',
       selection: 'over',
       entryDecimal: 1.95,
       entryOppositeDecimal: 1.95,
@@ -218,6 +224,7 @@ test('shared availability gates are honored verbatim, with version stamps riding
 
 test('an unsolvable close is a typed refusal, never a number', () => {
   const result = scoreTotalsLadder({
+    league: 'mlb',
     selection: 'over',
     entryDecimal: 1.95,
     entryOppositeDecimal: 1.95,
@@ -232,6 +239,7 @@ test('an unsolvable close is a typed refusal, never a number', () => {
 
 test('a missing entry de-vig disables only the margin-adjusted ladder value', () => {
   const result = scoreTotalsLadder({
+    league: 'mlb',
     selection: 'over',
     entryDecimal: 1.95,
     entryOppositeDecimal: null,
@@ -245,26 +253,17 @@ test('a missing entry de-vig disables only the margin-adjusted ladder value', ()
 });
 
 // ---------------------------------------------------------------------------
-// applyLadderUpgrade
+// method domain — runtime-bound, fast typed refusals
 // ---------------------------------------------------------------------------
 
-function pushCapableResult(): ClvResult {
-  return {
-    primaryClvPct: null,
-    unscoredReason: 'push_capable_line',
-    conditionalClvPct: -5,
-    marginAdjustedClvPct: null,
-    marginAdjustedConditionalClvPct: 0,
-    lineMovementFavorable: null,
-    closingPNovigSelected: 0.5,
-    entryPNovigSelected: 0.5,
-    sensitivity: null,
-    aux: null,
-  };
-}
-
-test('the integer same-line upgrade promotes the ladder values into primary', () => {
-  const ladder = scoreTotalsLadder({
+test('integer same-line picks stay conditional-only: the ladder value is sensitivity output', () => {
+  // The candidate method's generalized value at an unchanged integer line
+  // exists in the ladder block (see the shrinkage identity above) but is
+  // NEVER promoted into the primary columns while validation is pending —
+  // that wiring lives in scoreRun, which leaves the exact-line result
+  // untouched (asserted end-to-end in scoring.test.ts).
+  const result = scoreTotalsLadder({
+    league: 'mlb',
     selection: 'under',
     entryDecimal: 1.9,
     entryOppositeDecimal: 1.9,
@@ -273,38 +272,71 @@ test('the integer same-line upgrade promotes the ladder values into primary', ()
     gateReason: 'push_capable_line',
     params: PARAMS,
   });
-  const upgraded = applyLadderUpgrade(pushCapableResult(), ladder);
-  assert.equal(upgraded.primaryClvPct, ladder.economicClvPct);
-  assert.equal(upgraded.marginAdjustedClvPct, ladder.marginAdjustedClvPct);
-  assert.equal(upgraded.unscoredReason, null);
-  // The push-excluded conditional stays, separately labeled.
-  assert.equal(upgraded.conditionalClvPct, -5);
+  assert.equal(result.unscoredReason, null, 'the sensitivity value itself is computed');
+  assert.ok(result.economicClvPct !== null, 'ladder block carries the generalized value');
 });
 
-test('the upgrade never touches non-push-capable or ladder-unscored results', () => {
-  const movedResult: ClvResult = { ...pushCapableResult(), unscoredReason: 'line_moved' };
-  const ladder = scoreTotalsLadder({
+test('a non-MLB league refuses fast with outside_method_domain', () => {
+  const result = scoreTotalsLadder({
+    league: 'nhl',
     selection: 'over',
     entryDecimal: 1.95,
     entryOppositeDecimal: 1.95,
-    entryLine: 8,
+    entryLine: 5.5,
+    close: close({ line: 5.5, awayPNovig: 0.52, homePNovig: 0.48 }),
+    gateReason: null,
+    params: PARAMS,
+  });
+  assert.equal(result.unscoredReason, 'outside_method_domain');
+  assert.equal(result.economicClvPct, null);
+  assert.equal(result.ladderVersion, LADDER_VERSION, 'stamps ride along');
+});
+
+test('quarter lines are outside the half-step lattice (entry and close alike)', () => {
+  const quarterEntry = scoreTotalsLadder({
+    league: 'mlb',
+    selection: 'over',
+    entryDecimal: 1.95,
+    entryOppositeDecimal: 1.95,
+    entryLine: 8.25,
     close: close(),
     gateReason: 'line_moved',
     params: PARAMS,
   });
-  assert.equal(applyLadderUpgrade(movedResult, ladder), movedResult);
-  const unsolvable = scoreTotalsLadder({
+  assert.equal(quarterEntry.unscoredReason, 'outside_method_domain');
+  const quarterClose = scoreTotalsLadder({
+    league: 'mlb',
     selection: 'over',
     entryDecimal: 1.95,
     entryOppositeDecimal: 1.95,
     entryLine: 8.5,
-    close: close({ line: 6.5, awayPNovig: 1e-7, homePNovig: 1 - 1e-7 }),
-    gateReason: null,
+    close: close({ line: 8.25 }),
+    gateReason: 'line_moved',
     params: PARAMS,
   });
-  const notUpgraded = applyLadderUpgrade(pushCapableResult(), unsolvable);
-  assert.equal(notUpgraded.primaryClvPct, null);
-  assert.equal(notUpgraded.unscoredReason, 'push_capable_line');
+  assert.equal(quarterClose.unscoredReason, 'outside_method_domain');
+});
+
+test('the finite line rail refuses absurd lines FAST instead of grinding', () => {
+  const startedAt = Date.now();
+  const result = scoreTotalsLadder({
+    league: 'mlb',
+    selection: 'over',
+    entryDecimal: 1.95,
+    entryOppositeDecimal: 1.95,
+    entryLine: 1_000_000,
+    close: close(),
+    gateReason: 'line_moved',
+    params: PARAMS,
+  });
+  assert.equal(result.unscoredReason, 'outside_method_domain');
+  assert.ok(Date.now() - startedAt < 250, 'refusal is immediate, not a CDF grind');
+  // The pure walker enforces the same rail.
+  assert.throws(() => tailProbabilities(9, K, MAX_LADDER_LINE + 0.5), /line rail/);
+  assert.ok(ladderLineInDomain(MAX_LADDER_LINE), 'rail boundary is inside the domain');
+  assert.ok(!ladderLineInDomain(MAX_LADDER_LINE + 0.5), 'past the rail is outside');
+  assert.ok(!ladderLineInDomain(0), 'zero is outside');
+  assert.ok(!ladderLineInDomain(8.25), 'quarter lines are outside');
 });
 
 // ---------------------------------------------------------------------------

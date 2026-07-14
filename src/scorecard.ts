@@ -1,5 +1,5 @@
 import { PROPORTIONAL_DEVIG_METHOD, SHIN_DEVIG_METHOD } from './clv.js';
-import { LADDER_VERSION } from './ladder.js';
+import { LADDER_VERSION, MAX_LADDER_LINE } from './ladder.js';
 import { MARKETS, SCORING_POLICY_VERSION } from './scoring.js';
 import type { LadderParams } from './ladder.js';
 import type { MarketStats, ParticipantStats, ScoredPick, SourceRun } from './scoring.js';
@@ -132,10 +132,10 @@ export function buildScorecardMarkdown(
     '- Comparison rule: **never pool CLV across markets when comparing participants with different market exposure** — vig differs by market (a moneyline-only baseline and a three-market model are not on the same footing). Pooled tables are context; cross-participant comparison belongs in the per-market section.',
   );
   lines.push(
-    '- Policy: `fresh`-confidence closes only; a close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (`close_inconsistent`); exact-line price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable totals score as primary via the ladder q_P below, with the push-excluded conditional variants of BOTH metrics still separately labeled.',
+    '- Policy: `fresh`-confidence closes only; a close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (`close_inconsistent`); price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable lines report separately-labeled conditional variants of BOTH metrics, never pooled into primary.',
   );
   lines.push(
-    `- Totals ladder: \`${LADDER_VERSION}\` (dispersion parameter \`${ladderParams.parameterVersion}\`, k = ${ladderParams.k}) prices every totals pick whose close passes the shared quality gates at its ENTRY line — line movement never disqualifies a pick, and gate-refused picks carry the same typed reasons as the exact-line metrics. Ladder columns are separately labeled; moved-line values never enter the same-line columns. Known approximation: the smooth model's push probability runs roughly 1-2 percentage points HIGH at even integer lines and LOW at odd ones (parity oscillation; see docs/TOTALS_DISPERSION.md).`,
+    `- Totals ladder: \`${LADDER_VERSION}\` is the preregistered CANDIDATE line-value method (dispersion parameter \`${ladderParams.parameterVersion}\`, k = ${ladderParams.k}) — its independent alternate-ladder validation is pending, so ladder columns are sensitivity output: separately labeled, never pooled into the primary columns. Line movement alone never disqualifies a totals pick; the shared close-quality gates and the method domain (MLB, half-step lines up to ${MAX_LADDER_LINE}, solvable closes) still can, each disclosed with a typed reason. Known approximation: the smooth model's push probability runs roughly 1-2 percentage points HIGH at even integer lines and LOW at odd ones (parity oscillation; see docs/TOTALS_DISPERSION.md).`,
   );
   lines.push('');
 
@@ -212,14 +212,14 @@ export function buildScorecardMarkdown(
       if (bMean === null) return -1;
       return bMean - aMean;
     });
-    lines.push(`## Totals ladder (\`${LADDER_VERSION}\` — line movement never disqualifies a totals pick)`);
+    lines.push(`## Totals ladder (\`${LADDER_VERSION}\` candidate — sensitivity output pending validation)`);
     lines.push('');
     lines.push(
-      `Generalized push-aware CLV \`100·(q_W·D_e + q_P − 1)\` (economic) and \`100·(q_W/q_entry + q_P − 1)\` (margin-adjusted), with q_W/q_P from the \`${LADDER_VERSION}\` negative-binomial ladder — mean solved from the close (push-conditioned at integer lines), evaluated at the ENTRY line, so moved lines are priced instead of discarded (close-quality gates still apply, shared with the exact-line metrics). At an unchanged half-line the ladder value equals the exact-line value; at an unchanged integer line it equals the conditional CLV shrunk by the push mass. The same-line column repeats the same-line-only reading from the per-market table above (integer same-line picks use the ladder q_P per the push-capable policy; moved lines never enter it); signed movement needs no model (0 = unmoved) and is averaged over the ladder-scored picks.`,
+      `Generalized push-aware CLV \`100·(q_W·D_e + q_P − 1)\` (economic) and \`100·(q_W/q_entry + q_P − 1)\` (margin-adjusted), with q_W/q_P from the \`${LADDER_VERSION}\` negative-binomial ladder — mean solved from the close (push-conditioned at integer lines), evaluated at the ENTRY line, so line movement alone never disqualifies a pick (the shared close-quality gates and the method domain still can; refusals are typed in the Unscored column). At an unchanged half-line the ladder value equals the exact-line value; at an unchanged integer line it equals the conditional CLV shrunk by the push mass. \`${LADDER_VERSION}\` is the preregistered CANDIDATE line-value method: until its independent alternate-ladder validation artifact is published these columns are sensitivity output, never pooled into primary, and integer same-line picks remain conditional-only in the primary metrics. The exact-line column repeats the conservative same-line-only reading from the per-market table above; signed movement needs no model (0 = unmoved) and is averaged over the ladder-scored picks.`,
     );
     lines.push('');
     lines.push(
-      '| Participant | Totals picks | Ladder-scored | Ladder econ mean | Ladder econ median | Ladder margin-adj mean | Ladder margin-adj median | Same-line econ mean (n) | Mean signed movement | Unscored (reason) |',
+      '| Participant | Totals picks | Ladder-scored | Ladder econ mean | Ladder econ median | Ladder margin-adj mean | Ladder margin-adj median | Exact-line econ mean (n) | Mean signed movement | Unscored (reason) |',
     );
     lines.push('|---|---|---|---|---|---|---|---|---|---|');
     for (const stat of withLadder) lines.push(ladderRow(stat));

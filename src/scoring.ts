@@ -3,7 +3,7 @@ import { BASELINE_POLICY_VERSION, isBaselinePolicyVersion, runBaselines } from '
 import { canonicalize, sha256Hex } from './canonical.js';
 import { PROPORTIONAL_DEVIG_METHOD, scoreDecision, SHIN_DEVIG_METHOD } from './clv.js';
 import { favorableLineMovement } from './clv.js';
-import { applyLadderUpgrade, LADDER_VERSION, scoreTotalsLadder } from './ladder.js';
+import { LADDER_VERSION, scoreTotalsLadder } from './ladder.js';
 import { checkProviderCollision } from './providers/family.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
@@ -39,10 +39,11 @@ import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } fr
  * output produced before stamping existed is `scoring-v0.1.0` by definition.
  * v0.3.0 adds margin-adjusted CLV (+ conditional mirror) and the shin-v1
  * de-vig sensitivity block alongside the unchanged economic primary.
- * v0.4.0 adds the TOTALS_V1 ladder: every totals pick carries a ladder
- * block (generalized push-aware CLV at the entry line, moved lines
- * included), and integer SAME-line totals upgrade from conditional-only to
- * primary via the ladder's q_P. All previously scored values are unchanged.
+ * v0.4.0 adds the TOTALS_V1 candidate ladder: every totals pick carries a
+ * ladder block (generalized push-aware CLV at the entry line, moved lines
+ * included) — sensitivity output, separately labeled, never pooled into the
+ * primary columns while the method's independent alternate-ladder
+ * validation is pending. All previously scored values are unchanged.
  */
 export const SCORING_POLICY_VERSION = 'scoring-v0.4.0';
 
@@ -215,6 +216,8 @@ const baselineDecisionSchema = z
 export interface SourceGame {
   awayTeam: string;
   homeTeam: string;
+  /** Bundle league — the ladder's method domain is runtime-bound to MLB. */
+  league: string;
   slug: string;
   startUtc: string;
   cutoffAt: string;
@@ -346,6 +349,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
         games.set(game.gameId, {
           awayTeam: game.bundle.awayTeam,
           homeTeam: game.bundle.homeTeam,
+          league: game.bundle.league,
           slug: game.slug,
           startUtc: game.bundle.scheduledStartUtc,
           cutoffAt: game.cutoffAt,
@@ -1331,14 +1335,15 @@ export function scoreRun(
       pick.line,
       closeQuote,
     );
-    // Every totals pick additionally gets the TOTALS_V1 ladder block. The
+    // Every totals pick additionally gets the TOTALS_V1 candidate ladder
+    // block — sensitivity output, separately labeled, never entering the
+    // primary columns while the method's validation is pending. The
     // close-quality gates are SHARED (taken from the exact-line verdict,
-    // never re-derived), and an integer same-line pick promotes the
-    // ladder's generalized value into primary per the methodology.
+    // never re-derived) and the method domain is runtime-bound.
     let ladder: TotalsLadderResult | null = null;
-    let result = exactLine;
     if (pick.market === 'total' && pick.line !== null) {
       ladder = scoreTotalsLadder({
+        league: game.league,
         selection: pick.selection as 'over' | 'under',
         entryDecimal: pick.entryDecimal,
         entryOppositeDecimal,
@@ -1347,9 +1352,8 @@ export function scoreRun(
         gateReason: exactLine.unscoredReason,
         params: ladderParams,
       });
-      result = applyLadderUpgrade(exactLine, ladder);
     }
-    return { ...pick, side, entryOppositeDecimal, result, ladder, close };
+    return { ...pick, side, entryOppositeDecimal, result: exactLine, ladder, close };
   });
 }
 
@@ -1438,11 +1442,12 @@ export interface ParticipantStats {
   unscoredByReason: Record<string, number>;
   byMarket: Record<string, MarketStats>;
   /**
-   * TOTALS_V1 ladder aggregates over this participant's totals picks — the
-   * moved-lines-included column set (line movement never disqualifies a
-   * pick; the shared close-quality gates still apply), reported ALONGSIDE
-   * the same-line totals numbers in byMarket.total — moved-line values
-   * never enter those. Null for participants with no totals exposure.
+   * TOTALS_V1 candidate-ladder aggregates over this participant's totals
+   * picks — sensitivity output pending the method's independent validation,
+   * reported ALONGSIDE the exact-line totals numbers in byMarket.total and
+   * never entering them. Line movement alone never disqualifies a pick; the
+   * shared close-quality gates and the method domain still can. Null for
+   * participants with no totals exposure.
    */
   totalsLadder: {
     ladderVersion: typeof LADDER_VERSION;
@@ -1741,7 +1746,7 @@ export function scoredRecords(
       marginAdjusted:
         'de-vigged entry vs no-vig close, 100*(q_close/q_entry - 1) on push-free contracts — 0 means the forecast exactly matched the market (always reported alongside, never a replacement)',
       totalsLadder:
-        'generalized push-aware CLV at the ENTRY line, 100*(q_W*D_e + q_P - 1) economic and 100*(q_W/q_entry + q_P - 1) margin-adjusted, with q_W/q_P from the TOTALS_V1 negative-binomial ladder solved at the close — line movement never disqualifies a totals pick: every totals pick whose close passes the shared quality gates is priced at its entry line, and gate-refused picks carry the same typed reasons as the exact-line metrics; separately labeled, and moved-line values never enter the same-line columns',
+        'generalized push-aware CLV at the ENTRY line, 100*(q_W*D_e + q_P - 1) economic and 100*(q_W/q_entry + q_P - 1) margin-adjusted, with q_W/q_P from the TOTALS_V1 negative-binomial ladder solved at the close. CANDIDATE method pending independent alternate-ladder validation: sensitivity output, separately labeled, never pooled into the primary columns. Line movement alone never disqualifies a totals pick; the shared close-quality gates and the method domain (MLB, half-step lines within the rail, solvable closes) still can, each with a typed disclosed reason',
     },
     devigMethods: {
       primary: PROPORTIONAL_DEVIG_METHOD,
@@ -1757,7 +1762,7 @@ export function scoredRecords(
       confidenceRequired: 'fresh',
       lineMatchRequired: true,
       integerLinePrimary:
-        'totals: computed via the TOTALS_V1 ladder q_P at the unchanged line (generalized push-aware formula), push-excluded conditional CLV still separately labeled, both metrics; other markets: unavailable (conditional CLV separately labeled, both metrics)',
+        'unavailable (push-excluded conditional CLV separately labeled, both metrics); the TOTALS_V1 candidate ladder reports the generalized push-aware value as separately labeled sensitivity output, pending validation',
     },
     picks: scored.length,
     primaryScoreable: scored.filter((p) => p.result.primaryClvPct !== null).length,

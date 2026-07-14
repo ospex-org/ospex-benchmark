@@ -160,7 +160,9 @@ and low at odd lines** by roughly one to two percentage points. This is
 published rather than
 smoothed over; whether TOTALS_V1 adds a parity adjustment is a refit-time
 decision, to be judged against the accrued in-house pairs and the
-alternate-line ladder validation planned for the ladder PR.
+alternate-line ladder validation (pending a one-time manual capture of a
+real sportsbook alternate-totals ladder; until that artifact is published
+the ladder remains the preregistered candidate method, sensitivity-only).
 
 ## Known approximations (accepted for the provisional fit)
 

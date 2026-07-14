@@ -1326,7 +1326,7 @@ test('every totals pick carries a ladder block; other markets carry none', () =>
   }
 });
 
-test('integer same-line totals upgrade to primary via the ladder q_P (E2E)', () => {
+test('integer same-line totals stay conditional-only; the ladder value is sensitivity output (E2E)', () => {
   // GAME_A bundle total moved to the push-capable line 9; the close is at
   // the same line with an even conditional split (2.0/2.0 -> 0.5/0.5).
   const { lines } = fixtureRun({ totalLineGameA: 9 });
@@ -1336,28 +1336,29 @@ test('integer same-line totals upgrade to primary via the ladder q_P (E2E)', () 
     (p) => p.participantId === 'model-arm' && p.market === 'total' && p.gameId === GAME_A,
   );
   assert.ok(over && over.selection === 'over' && over.line === 9, 'fixture premise');
-  // Push-excluded conditional: 100*(1.90909*0.5 - 1) = -4.5455. Generalized
-  // primary = conditional shrunk by the push mass q_P = 0.089517251326 (the
-  // independent golden at mu solved from (9, 0.5)): -4.1386.
+  // The primary columns are untouched while the candidate method's
+  // validation is pending: conditional-only, exactly as before the ladder.
   assert.equal(over.result.conditionalClvPct, -4.5455);
-  assert.equal(over.result.primaryClvPct, -4.1386);
-  assert.equal(over.result.unscoredReason, null);
+  assert.equal(over.result.primaryClvPct, null);
+  assert.equal(over.result.unscoredReason, 'push_capable_line');
+  assert.equal(over.result.marginAdjustedConditionalClvPct, 0);
+  // The ladder block carries the generalized value as separately labeled
+  // sensitivity output: conditional shrunk by the push mass q_P =
+  // 0.089517251326 (the independent golden at mu solved from (9, 0.5)).
   assert.ok(over.ladder !== null, 'ladder block present');
+  assert.equal(over.ladder.unscoredReason, null);
   assert.equal(over.ladder.economicClvPct, -4.1386);
-  assert.equal(over.result.primaryClvPct, over.ladder.economicClvPct, 'primary IS the ladder value');
   assert.equal(over.ladder.qPushEntry, 0.0895);
   // Margin-adjusted zero-point survives the generalization EXACTLY: entry
   // and close both split 0.5/0.5, so q_W/q_e + q_P = (1-q_P) + q_P = 1.
   assert.equal(over.ladder.marginAdjustedClvPct, 0);
-  assert.equal(over.result.marginAdjustedClvPct, 0);
-  // Coverage semantics of the upgrade: the pick enters the same-line primary
-  // aggregates and is no longer conditional-ONLY (it kept its conditional
-  // column but has a primary).
+  // Coverage semantics: nothing enters the primary aggregates, and the pick
+  // counts as conditional-only.
   const stats = aggregateByParticipant(scored, run);
   const model = stats.find((s) => s.participantId === 'model-arm');
   assert.ok(model);
-  assert.equal(model.byMarket['total']?.scoreable, 1);
-  assert.equal(model.conditionalOnly, 0);
+  assert.equal(model.byMarket['total']?.scoreable, 0);
+  assert.equal(model.conditionalOnly, 1);
 });
 
 test('moved totals lines are priced by the ladder while exact-line stays unavailable (E2E)', () => {
@@ -1431,8 +1432,16 @@ test('the scorecard renders the ladder table, policy bullet, and moved-line ladd
   const stats = aggregateByParticipant(scored, run);
   const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   assert.ok(
-    markdown.includes('## Totals ladder (`TOTALS_V1` — line movement never disqualifies a totals pick)'),
+    markdown.includes('## Totals ladder (`TOTALS_V1` candidate — sensitivity output pending validation)'),
     'ladder section present',
+  );
+  assert.ok(
+    markdown.includes('preregistered CANDIDATE line-value method'),
+    'candidate status disclosed in the policy bullet',
+  );
+  assert.ok(
+    markdown.includes('Line movement alone never disqualifies a totals pick'),
+    'the precise coverage claim, not an unconditional one',
   );
   assert.ok(
     markdown.includes(`dispersion parameter \`TOTALS_V1_PROVISIONAL\`, k = ${TEST_LADDER.k}`),
@@ -1489,6 +1498,40 @@ test('the scorecard renders the ladder table, policy bullet, and moved-line ladd
     ),
     'moved-lines table has ladder columns',
   );
+});
+
+test('a gate-passing pick the ladder cannot solve is typed and DISCLOSED in the rendered scorecard', () => {
+  // Same-line close at 6.5 with an extreme de-vigged over probability: the
+  // exact-line metrics score it (fresh, consistent close), but the implied
+  // mean falls below the solver bound — the ladder must refuse with a typed
+  // reason that surfaces in the rendered table, never a silent hole. This is
+  // exactly why every public surface says line movement ALONE never
+  // disqualifies a pick, not that every gate-passing pick is priced.
+  const { lines } = fixtureRun({ totalLineGameA: 6.5 });
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(
+    run,
+    [
+      closeRow(GAME_A, 'total', {
+        line: 6.5,
+        ...NOVIG_ONLY,
+        away_p_novig: 1e-7,
+        home_p_novig: 1 - 1e-7,
+      }),
+    ],
+    TEST_LADDER,
+  );
+  const over = scored.find(
+    (p) => p.participantId === 'model-arm' && p.market === 'total' && p.gameId === GAME_A,
+  );
+  assert.ok(over && over.selection === 'over' && over.line === 6.5, 'fixture premise');
+  assert.equal(over.result.unscoredReason, null, 'exact-line metrics scored this pick');
+  assert.ok(over.result.primaryClvPct !== null, 'primary is a number');
+  assert.equal(over.ladder?.unscoredReason, 'ladder_unsolvable');
+  assert.equal(over.ladder?.economicClvPct, null);
+  const stats = aggregateByParticipant(scored, run);
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
+  assert.match(markdown, /\| model-arm \| 2 \| 0 \| — \| — \| — \| — \| .* \| — \| ladder_unsolvable 1, close_missing 1 \|/);
 });
 
 test('ladder participant aggregates are value-pinned: MA summaries, movement, unscored reasons', () => {

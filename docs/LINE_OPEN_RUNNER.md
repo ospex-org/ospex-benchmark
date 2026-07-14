@@ -114,6 +114,141 @@ participates in every content hash); watch runs are identified by their
 plumbing validation, not a cohort** — nothing from it belongs on a
 leaderboard.
 
+## Reading the tick line
+
+Every poll prints exactly one line:
+
+```
+tick 2026-07-14T19:05:19.302Z: 1 in window · 1 watched · 0 fired · 0 late · 0 deferred · 0 failed
+```
+
+The timestamp is when the pass *started*, taken from the same injected clock
+that stamps the records. The six counters are per-tick, and they count
+**games**, not markets:
+
+- **in window** — rows the games read path returned: MLB games whose first
+  pitch falls between now and now + `--window-hours` (default 168). It is the
+  raw row count from the tick's first fetch, taken *before* dedupe and
+  *before* the ledger filter, so it also counts games already handled in an
+  earlier tick, games with no odds posted at all, and any duplicate row. A
+  census, not a denominator.
+- **watched** — candidates evaluated this tick and found not (yet)
+  actionable, leaving no ledger entry: the bundle builder refused to produce a
+  request (the usual case — the board is not complete yet), or the game left
+  the refreshed snapshot, or its first pitch passed mid-tick. This is the
+  resting state; a watched game is re-detected from scratch every tick.
+- **fired** — games that became eligible and were dispatched to all twelve
+  participants this tick, run file written, ledger entry finalized. Terminal:
+  a game fires exactly once, ever.
+- **late** — games that became eligible but whose board completed more than
+  `--late-minutes` (default 60) before detection. Recorded `late_detection`
+  and never fired. Also terminal — excluded means excluded.
+- **deferred** — eligible games whose late gate could not be evaluated yet
+  because a first-appearance history row was not readable. Benign for a tick
+  or two (history lags the snapshot). Deferral happens only *after* a game is
+  eligible, so a game still waiting on its board reads as `watched`, never as
+  `deferred`.
+- **failed** — per-game failures: a board-history read that *threw*, a fire
+  that errored, a fire that came back collision-failed (the identity check —
+  file kept, permanently unscoreable), or a malformed row / failed ledger
+  write. Any `failed` makes the pass non-healthy, and `--once` exits nonzero.
+- **CAP HIT** — appended only when `--max-fires-per-tick` (default 10) stopped
+  the loop with candidates remaining. By design, but never silent; the
+  unclaimed games are re-detected next tick.
+
+The counters **do not sum**, and are not meant to. `in window` is the raw
+census; the other five count only *unhandled candidates*. A game in the ledger
+is filtered out before the loop and contributes to `in window` and to nothing
+else — so the healthy steady state *after* a slate is handled is
+`N in window · 0 watched · 0 fired · …`, all zeros. Within one tick a candidate
+increments at most one counter; across ticks the same game legitimately moves
+between buckets, so summing a column over time double-counts games.
+
+Two counts read backwards from the obvious:
+
+- A **collision-failed fire counts as `failed`, not `fired`** — but the
+  providers were already billed and the run file was written. `failed` does
+  not mean "no spend."
+- **`fired` means dispatched without a collision failure.** It does not mean
+  the models answered: every arm can time out and the game still counts as
+  fired. Arm health lives in the ledger entry's `armOutcomes` and in the run
+  file, never in the tick line.
+
+## Is the watcher healthy?
+
+Healthy and idle is `N in window · M watched` with the last four counters at
+zero. Most ticks look like that: lines open in bursts, and most games in a
+168h window have no complete board yet. `fired`, `late`, `deferred` and
+`failed` are the only counters that report that something *happened*.
+
+- `0 in window` — no MLB game has a first pitch inside the window. Correct
+  during the All-Star break and the off-season. The games table mirrors what
+  the odds feed has published, not the full published MLB schedule, so a
+  post-break slate appears a few days out rather than all at once.
+- `watched` pinned with no fires — the normal pre-fire holding pattern. The
+  common cause is a half-open board: MLB books hang the moneyline and total
+  before the run line, and there is no partial-board eligibility.
+- `deferred` on one tick, gone the next — a one-cycle history lag, by design.
+- `deferred` on the same game every tick — the first-appearance read path is
+  broken, not slow. The runner escalates once past the late threshold, but
+  that warning is in-memory only and its clock resets on every restart.
+- `late` — the watcher was not running, or not looking, when that board
+  completed. Expected on first boot against an already-open board; otherwise
+  it is the direct cost of downtime, and the game is burned permanently.
+  **Downtime is destructive:** a board that completes while the watcher is
+  down is excluded forever, not entered late. That is the entry-honesty
+  guarantee working, and it is also the reason to keep the process up.
+- `failed` — always real. The reason is on stderr immediately above the tick
+  line, and the ledger entry names it (`fireError`, `collisionFailed`).
+- No tick line at all, only `tick <ts> failed: …` — the tick's first fetch
+  threw (API down, timeout, a rejected wire body). Loud and correct: the loop
+  sleeps and ticks again.
+
+What the tick line will **not** tell you — the states that read healthy while
+nothing will ever fire:
+
+- **`watched` never says why.** A game waiting for its run line and a game
+  whose odds read silently returned an empty array look identical on the tick
+  line. The exclusion reason (`missing_market:spread`, `stale_quote:total`,
+  `no_odds_rows`, …) is computed inside the bundle builder and then discarded.
+  If `watched` stays pinned, read the board directly rather than trusting the
+  counter.
+- **A quiet `deferred` loop is the worst case.** A read that is *filtered* to
+  an empty result rather than *denied* (a narrowed row policy rather than a
+  revoked grant) returns 200 with `[]`: every candidate defers forever,
+  `failed` stays 0, and `--once` exits 0. A denied read throws and lands in
+  `failed`, which is the loud case.
+- **The aged-inputs stop is invisible.** `inputs still aged after refresh —
+  stopping this tick` breaks the candidate loop early, increments no counter
+  and sets no summary field, so the tick still reports healthy. The stderr
+  line is its only trace.
+- **A fire with dead credentials still counts as `fired`.** A missing or
+  expired provider key is an arm *outcome*, not a throw, so a fire in which
+  every arm failed prints `1 fired · 0 failed` — and the game is ledgered
+  forever. `yarn preflight` before a board completes is the cheap way to know
+  the arms are alive; there is no un-fire.
+- Nothing about `watched` / `deferred` / `CAP HIT` is written to disk. That
+  history exists only in the terminal — capture stdout if it should outlive
+  the session.
+
+Checking state by hand, when the counters are not enough:
+
+- **Why is this game only `watched`?** Read its board — all three markets must
+  be present and two-sided, with non-null `line` on spread and total, and no
+  quote older than thirty minutes:
+  `GET $SUPABASE_URL/rest/v1/current_odds?select=market,line,away_odds_american,home_odds_american,upstream_last_updated&network=eq.polygon&jsonodds_id=eq.<gameId>`
+  Two rows (moneyline, total) and no spread is the ordinary half-open board:
+  `missing_market:spread`.
+- **Is the history read path alive?** (the silent-deferral hole)
+  `GET $SUPABASE_URL/rest/v1/odds_history?select=captured_at,market&order=captured_at.desc&limit=3`
+  Rows means the grant and the row policy are both intact; `[]` here, while
+  `current_odds` still reads, is the regression the deferral warning is about.
+- **What has been handled?** `ls out/watch-ledger/` — one file per game,
+  existence means handled forever. The startup banner prints the same count.
+  A ledger entry's `decision` is written *before* dispatch, so `"fired"` there
+  means *claimed*, not *succeeded*: reconcile on `fireError` / `collisionFailed`
+  and the run file, never on `decision` alone.
+
 ## Operations
 
 - `yarn watch` — long-running loop; `--poll-seconds` (default 300),
