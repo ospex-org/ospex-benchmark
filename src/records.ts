@@ -162,6 +162,14 @@ export function buildRecords(
     excludedGames: excluded.length,
     armGameResults: armGameResults.length,
     baselineDecisionCount: baselineDecisions.length,
+    // Redundant top-level stamp of the (single) baseline policy version,
+    // mirroring baselineDecisionCount: the scorer cross-checks it against
+    // the per-decision stamps, so a version-downgrade edit must now also
+    // rewrite run_meta coherently. Derived from the decisions themselves so
+    // it can never disagree with what was actually derived.
+    ...(new Set(baselineDecisions.map((d) => d.policyVersion)).size === 1
+      ? { baselinePolicyVersion: baselineDecisions[0]?.policyVersion }
+      : {}),
     ...(ctx.watch !== undefined ? { watch: ctx.watch } : {}),
   });
 

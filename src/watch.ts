@@ -32,7 +32,7 @@ import type {
  * The watcher polls the same public read path the smoke uses and, the moment
  * a game becomes ELIGIBLE (the existing bundle builder yields a request for
  * it — full board, two-sided, fresh quotes), it assembles, hashes, and fires
- * that one game to all ten participants in the same breath, then records it
+ * that one game to all twelve participants in the same breath, then records it
  * in a per-game ledger and never touches it again.
  *
  * There is deliberately NO separate detection predicate: eligibility is

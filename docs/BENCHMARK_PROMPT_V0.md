@@ -1,6 +1,6 @@
 # Canonical MLB Benchmark Prompt Contract — v0 Draft
 
-- Last updated UTC: 2026-07-11T15:01:40Z
+- Last updated UTC: 2026-07-14T05:45:00Z
 - Status: draft for B0 shadow testing; not preregistered and not approved for a public cohort
 - Parent methodology: [AGENT_BENCHMARK.md](AGENT_BENCHMARK.md)
 
@@ -89,16 +89,18 @@ Each game must contain exactly one moneyline, one designated spread, and one des
 
 ## Deterministic baseline contract
 
-The six baseline participants bypass the language-model prompt entirely and run through versioned deterministic code:
+The eight baseline participants (`baselines-v0.2.0`; v0.1.0 was the same set without the run-line pair) bypass the language-model prompt entirely and run through versioned deterministic code:
 
 - `baseline-favorite-ml`: lower decimal moneyline; exact tie → home;
 - `baseline-underdog-ml`: higher decimal moneyline; exact tie → away;
 - `baseline-home-ml`: home moneyline;
 - `baseline-away-ml`: away moneyline;
 - `baseline-over-total`: Over at designated total;
-- `baseline-under-total`: Under at designated total.
+- `baseline-under-total`: Under at designated total;
+- `baseline-favorite-rl`: the designated run line's laying side (negative handicap; price-independent; zero handicap → home);
+- `baseline-underdog-rl`: the other side of the same run line.
 
-Each returns the same participant/cohort/game/market/side/line/observed-price identity fields and policy/input hashes, but no rationale or model metadata. Fixtures must prove mirrored choices, tie behavior, missing/stale market exclusion, no randomness, and byte-stable output for identical input.
+Each returns the same participant/cohort/game/market/side/line/observed-price identity fields and policy/input hashes, but no rationale or model metadata. Fixtures must prove mirrored choices, tie behavior, no randomness, and byte-stable output for identical input; missing/stale-market exclusion is enforced upstream at the bundle layer — a game without fresh two-sided odds in every designated market never reaches the baselines.
 
 Generate two records without conflating them: a same-snapshot common-cutoff decision used in primary model comparison and an optional first-eligible execution record used only in the early-entry strategy track.
 

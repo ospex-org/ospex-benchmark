@@ -1,6 +1,6 @@
 # Ospex Agent Benchmark — Canonical MVE Design
 
-- Last updated UTC: `2026-07-14T02:26:51Z`
+- Last updated UTC: `2026-07-14T04:05:00Z`
 - Status: accepted application-layer direction; methodology and harness gates remain in progress
 - Scope: MLB-first, one fixed canonical cohort plus separately labeled open/community cohorts
 - Prompt/schema working draft: [BENCHMARK_PROMPT_V0.md](BENCHMARK_PROMPT_V0.md)
@@ -65,7 +65,7 @@ One week is a useful release-response/instrumentation datapoint, not a definitiv
 
 ## Deterministic baselines and paired design
 
-Canonical v1 uses six transparent, deterministic policy participants rather than asking LLMs to imitate simple behavior:
+Canonical v1 uses eight transparent, deterministic policy participants rather than asking LLMs to imitate simple behavior:
 
 | Participant ID | Fixed action on every eligible game |
 |---|---|
@@ -75,6 +75,10 @@ Canonical v1 uses six transparent, deterministic policy participants rather than
 | `baseline-away-ml` | Take the away moneyline side. |
 | `baseline-over-total` | Take Over at the designated total. |
 | `baseline-under-total` | Take Under at the designated total. |
+| `baseline-favorite-rl` | Take the designated run line's LAYING side — the negative-handicap side, price-independent; a zero handicap (pick'em) breaks to home. |
+| `baseline-underdog-rl` | Take the other side of the same designated run line. |
+
+The baseline policy set is versioned (`baselines-vX.Y.Z`, stamped on every baseline decision): v0.1.0 is the six-policy set without the run-line pair; v0.2.0 adds it. The scorer re-derives baselines under the version recorded in the run, so earlier archived runs keep verifying unchanged.
 
 Each baseline produces one action per eligible game on its declared market. It has no language-model call, rationale, discretion, stake sizing, rerun, or hidden tool. Record the policy version, frozen input hash, selected side/line/price, timestamps, eligibility/exclusion reason, and eventual fill/close/settlement exactly as for a model arm.
 
@@ -85,7 +89,7 @@ Score each policy in two clearly separated tracks:
 
 Never compare an early-fill baseline's execution CLV directly with a later model's common-cutoff decision CLV as if the difference were model reasoning. The early track intentionally measures the combined fixed rule plus timing/execution policy.
 
-The six policies form three mirrored pairs—favorite/underdog, home/away, over/under—and are not six independent sources of evidence. Pair model moneyline results with the four moneyline controls and model total results with the two total controls. Cluster uncertainty by game/day and emphasize within-game model-to-baseline differences with preregistered multiplicity handling.
+The eight policies form four mirrored pairs—favorite/underdog moneyline, home/away moneyline, over/under total, favorite/underdog run line—and are not eight independent sources of evidence. Pair model moneyline results with the four moneyline controls, model total results with the two total controls, and model spread results with the two run-line controls. Cluster uncertainty by game/day and emphasize within-game model-to-baseline differences with preregistered multiplicity handling.
 
 ## Frozen-input and anti-leakage controls
 
@@ -137,11 +141,11 @@ Minimum canonical topology after live-wallet gates pass:
 
 - two dedicated maker wallets;
 - four dedicated benchmark-taker wallets, one per lab model participant;
-- six dedicated deterministic-policy wallets, one per baseline participant;
+- eight dedicated deterministic-policy wallets, one per baseline participant;
 - Vince's separate user wallet;
 - optional separate creator/postgame/operator wallet where operationally useful.
 
-This produces 13 public/economic fishbowl participants before support roles: two makers, four lab-model agents, six deterministic baselines, and Vince.
+This produces 15 public/economic fishbowl participants before support roles: two makers, four lab-model agents, eight deterministic baselines, and Vince.
 
 Creating keystores and role manifests is separate from funding. Wallets should be created and dry-verified before funding; funding and approvals remain bounded and staged. No benchmark key or provider credential enters public docs/artifacts.
 
