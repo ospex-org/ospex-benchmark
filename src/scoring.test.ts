@@ -30,15 +30,19 @@ const FIXTURE_ARMS = [
     approvedReportedModelIds: ['stub-model-1'],
   },
 ];
-const FIXTURE_ARMS_WITH_TIMEOUT = [
-  ...FIXTURE_ARMS,
-  {
-    participantId: 'timeout-arm',
-    provider: 'xai',
-    requestedModelId: 'stub-model-2',
-    approvedReportedModelIds: ['stub-model-2'],
-  },
-];
+const TIMEOUT_ARM = {
+  participantId: 'timeout-arm',
+  provider: 'xai',
+  requestedModelId: 'stub-model-2',
+  approvedReportedModelIds: ['stub-model-2'],
+};
+const FIXTURE_ARMS_WITH_TIMEOUT = [...FIXTURE_ARMS, TIMEOUT_ARM];
+const SECOND_MODEL_ARM = {
+  participantId: 'model-arm-2',
+  provider: 'anthropic',
+  requestedModelId: 'stub-model-3',
+  approvedReportedModelIds: ['stub-model-3'],
+};
 
 /**
  * Build a fully consistent run file (real hashes, correct echoes, arm
@@ -46,7 +50,11 @@ const FIXTURE_ARMS_WITH_TIMEOUT = [
  * game bundle prices are: ML away 1.74627 / home 2.17; run line +1.5 away
  * 2.3 / home 1.66667; total 8.5 over 1.90909 / under 1.90909.
  */
-function fixtureRun(options?: { extraArm?: { participantId: string; outcome: string } }): {
+function fixtureRun(options?: {
+  extraArm?: { participantId: string; outcome: string };
+  /** Adds a second VALID model arm that takes the OPPOSITE side of every market. */
+  secondModelArm?: boolean;
+}): {
   lines: string[];
   requests: GameRequest[];
   slateSha256: string;
@@ -73,6 +81,27 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
   let armResponseCount = 0;
   let baselineCount = 0;
 
+  const modelArms = [
+    {
+      participantId: 'model-arm',
+      provider: 'openai',
+      requestedModelId: 'stub-model-1',
+      providerResponseId: 'resp-1',
+      flipped: false,
+    },
+    ...(options?.secondModelArm
+      ? [
+          {
+            participantId: SECOND_MODEL_ARM.participantId,
+            provider: SECOND_MODEL_ARM.provider,
+            requestedModelId: SECOND_MODEL_ARM.requestedModelId,
+            providerResponseId: 'resp-2',
+            flipped: true,
+          },
+        ]
+      : []),
+  ];
+
   for (const request of requests) {
     const game = request.game;
     const gameSha256 = sha256Hex(canonicalize(game));
@@ -88,47 +117,84 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
       bundle: game,
     });
 
-    // The forecasts drive BOTH the archived raw response and the decision
-    // records, so they correspond exactly (as the harness guarantees).
-    const forecasts = [
-      { market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: game.markets.moneyline.homeDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: true, rationale: 'reference-price read', evidenceRefs: [game.markets.moneyline.evidenceRef] },
-      { market: 'spread', selection: game.awayTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.awayDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: false, rationale: 'reference-price read', evidenceRefs: [game.markets.runLine.evidenceRef] },
-      { market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: true, rationale: 'reference-price read', evidenceRefs: [game.markets.total.evidenceRef] },
-    ];
-    const rawResponse = JSON.stringify({
-      schemaVersion: 1,
-      cohortId: 'test-cohort',
-      participantId: 'model-arm',
-      requestedModelId: 'stub-model-1',
-      bundleSha256: request.requestSha256,
-      executionPolicy: 'fixed-moneyline-total',
-      games: [{ gameId: game.gameId, forecasts }],
-    });
+    for (const arm of modelArms) {
+      // The forecasts drive BOTH the archived raw response and the decision
+      // records, so they correspond exactly (as the harness guarantees). The
+      // flipped arm takes the opposite side of every market at its own
+      // bundle-valid price.
+      const common = { probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, rationale: 'reference-price read' };
+      const forecasts = arm.flipped
+        ? [
+            { market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: game.markets.moneyline.awayDecimal, selectedForExecution: true, evidenceRefs: [game.markets.moneyline.evidenceRef], ...common },
+            { market: 'spread', selection: game.homeTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.homeDecimal, selectedForExecution: false, evidenceRefs: [game.markets.runLine.evidenceRef], ...common },
+            { market: 'total', selection: 'under', line: game.markets.total.line, observedDecimal: game.markets.total.underDecimal, selectedForExecution: true, evidenceRefs: [game.markets.total.evidenceRef], ...common },
+          ]
+        : [
+            { market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: game.markets.moneyline.homeDecimal, selectedForExecution: true, evidenceRefs: [game.markets.moneyline.evidenceRef], ...common },
+            { market: 'spread', selection: game.awayTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.awayDecimal, selectedForExecution: false, evidenceRefs: [game.markets.runLine.evidenceRef], ...common },
+            { market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, selectedForExecution: true, evidenceRefs: [game.markets.total.evidenceRef], ...common },
+          ];
+      const rawResponse = JSON.stringify({
+        schemaVersion: 1,
+        cohortId: 'test-cohort',
+        participantId: arm.participantId,
+        requestedModelId: arm.requestedModelId,
+        bundleSha256: request.requestSha256,
+        executionPolicy: 'fixed-moneyline-total',
+        games: [{ gameId: game.gameId, forecasts }],
+      });
 
-    records.push({
-      recordType: 'arm_game_response',
-      ...identity,
-      cohortId: 'test-cohort',
-      participantId: 'model-arm',
-      provider: 'openai',
-      requestedModelId: 'stub-model-1',
-      reportedModelId: 'stub-model-1',
-      gameId: game.gameId,
-      requestSha256: request.requestSha256,
-      outcome: 'valid',
-      cutoffAt: request.requestBundle.cutoffAt,
-      repairUsed: false,
-      attempt: {
-        reportedModelId: 'stub-model-1',
-        providerResponseId: 'resp-1',
-        rawResponse,
-        requestAt: '2026-07-12T14:07:00.001Z',
-        responseAt: '2026-07-12T14:07:00.055Z',
-        latencyMs: 54,
-      },
-      repair: null,
-    });
-    armResponseCount += 1;
+      records.push({
+        recordType: 'arm_game_response',
+        ...identity,
+        cohortId: 'test-cohort',
+        participantId: arm.participantId,
+        provider: arm.provider,
+        requestedModelId: arm.requestedModelId,
+        reportedModelId: arm.requestedModelId,
+        gameId: game.gameId,
+        requestSha256: request.requestSha256,
+        outcome: 'valid',
+        cutoffAt: request.requestBundle.cutoffAt,
+        repairUsed: false,
+        attempt: {
+          reportedModelId: arm.requestedModelId,
+          providerResponseId: arm.providerResponseId,
+          rawResponse,
+          requestAt: '2026-07-12T14:07:00.001Z',
+          responseAt: '2026-07-12T14:07:00.055Z',
+          latencyMs: 54,
+        },
+        repair: null,
+      });
+      armResponseCount += 1;
+
+      for (const forecast of forecasts) {
+        records.push({
+          recordType: 'decision',
+          ...identity,
+          cohortId: 'test-cohort',
+          participantId: arm.participantId,
+          gameId: game.gameId,
+          market: forecast.market,
+          selection: forecast.selection,
+          line: forecast.line,
+          observedDecimal: forecast.observedDecimal,
+          probabilities: forecast.probabilities,
+          confidence: forecast.confidence,
+          selectedForExecution: forecast.selectedForExecution,
+          wouldAbstain: forecast.wouldAbstain,
+          provider: arm.provider,
+          requestedModelId: arm.requestedModelId,
+          reportedModelId: arm.requestedModelId,
+          providerResponseId: arm.providerResponseId,
+          attemptUsed: 'initial',
+          bundleSha256: request.requestSha256,
+          gameSha256,
+          slateSha256,
+        });
+      }
+    }
     if (options?.extraArm) {
       records.push({
         recordType: 'arm_game_response',
@@ -154,32 +220,6 @@ function fixtureRun(options?: { extraArm?: { participantId: string; outcome: str
         repair: null,
       });
       armResponseCount += 1;
-    }
-
-    for (const forecast of forecasts) {
-      records.push({
-        recordType: 'decision',
-        ...identity,
-        cohortId: 'test-cohort',
-        participantId: 'model-arm',
-        gameId: game.gameId,
-        market: forecast.market,
-        selection: forecast.selection,
-        line: forecast.line,
-        observedDecimal: forecast.observedDecimal,
-        probabilities: forecast.probabilities,
-        confidence: forecast.confidence,
-        selectedForExecution: forecast.selectedForExecution,
-        wouldAbstain: forecast.wouldAbstain,
-        provider: 'openai',
-        requestedModelId: 'stub-model-1',
-        reportedModelId: 'stub-model-1',
-        providerResponseId: 'resp-1',
-        attemptUsed: 'initial',
-        bundleSha256: request.requestSha256,
-        gameSha256,
-        slateSha256,
-      });
     }
   }
 
@@ -922,11 +962,73 @@ test('the scorecard renders per-market game-level tables for every participant a
   assert.ok(markdown.indexOf('| baseline-home-ml | 2 | 2/2 | 2 | 19.35 |') > byMarketAt);
   // Per-market unscored reasons are visible where the quarantine happens.
   assert.ok(markdown.includes('line_moved 1, close_missing 1'));
-  // Per-market rows rank by THIS market's game-level mean, not the pooled
-  // aggregate: away-ml (-21.4182) sorts below home-ml (19.35) on moneyline.
-  const homeRowAt = markdown.indexOf('| baseline-home-ml | 2 | 2/2 |');
-  const awayRowAt = markdown.indexOf('| baseline-away-ml | 2 | 2/2 |');
-  assert.ok(homeRowAt > byMarketAt && awayRowAt > homeRowAt);
+  // The ordering CONTRACT (market's own mean, never the pooled aggregate) is
+  // pinned by the dedicated opposing-order test below — single-market
+  // baselines cannot distinguish the two comparators.
+});
+
+test('per-market tables rank by the market’s own mean even when the pooled order is OPPOSITE', () => {
+  // Review-round probe: an ordering test only has teeth when the correct
+  // comparator (byMarket gameLevel mean) and the prohibited one (pooled
+  // gameLevel mean) disagree on the fixture. Two multi-market arms take
+  // opposite sides of every market; game A closes are chosen so model-arm
+  // wins the MONEYLINE while model-arm-2 wins the POOLED aggregate:
+  //   ML:     model-arm home 2.17@0.6 → +30.2 ; model-arm-2 away 1.74627@0.4 → −30.15
+  //   spread: model-arm away 2.3@0.1  → −77   ; model-arm-2 home 1.66667@0.9 → +50
+  //   total:  model-arm over @0.1     → −80.9 ; model-arm-2 under @0.9      → +71.8
+  //   pooled: model-arm −42.57 < model-arm-2 +30.56 — the REVERSE of the ML order.
+  const { lines } = fixtureRun({
+    secondModelArm: true,
+    extraArm: { participantId: 'timeout-arm', outcome: 'timeout' },
+  });
+  const run = parseRunRecords(lines);
+  const expectedArms = [...FIXTURE_ARMS, SECOND_MODEL_ARM, TIMEOUT_ARM];
+  assert.deepEqual(verifyRunIntegrity(run, { expectedArms }), []);
+  const closes: ClosingLineRow[] = [
+    closeRow(GAME_A, 'moneyline', { away_p_novig: 0.4, home_p_novig: 0.6 }),
+    closeRow(GAME_A, 'spread', { away_p_novig: 0.1, home_p_novig: 0.9 }),
+    closeRow(GAME_A, 'total', { away_p_novig: 0.1, home_p_novig: 0.9 }),
+  ];
+  const scored = scoreRun(run, closes);
+  const stats = aggregateByParticipant(scored, run);
+  const arm1 = stats.find((s) => s.participantId === 'model-arm');
+  const arm2 = stats.find((s) => s.participantId === 'model-arm-2');
+  assert.ok(arm1 && arm2);
+
+  // Pin the premise: the two comparators disagree on this fixture.
+  const pooled1 = arm1.gameLevel.meanClvPct;
+  const pooled2 = arm2.gameLevel.meanClvPct;
+  const ml1 = arm1.byMarket['moneyline']?.gameLevel.meanClvPct;
+  const ml2 = arm2.byMarket['moneyline']?.gameLevel.meanClvPct;
+  assert.ok(pooled1 !== null && pooled2 !== null && ml1 != null && ml2 != null);
+  assert.ok(pooled2 > pooled1, 'fixture premise: model-arm-2 must win the pooled aggregate');
+  assert.ok(ml1 > ml2, 'fixture premise: model-arm must win the moneyline market');
+
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  const mlAt = markdown.indexOf('### Moneyline');
+  const spreadAt = markdown.indexOf('### Spread (run line)');
+  const totalAt = markdown.indexOf('### Total');
+  assert.ok(mlAt > 0 && spreadAt > mlAt && totalAt > spreadAt);
+
+  // Moneyline table: model-arm above model-arm-2 (the pooled comparator
+  // would render the opposite). '| model-arm |' cannot match inside the
+  // '| model-arm-2 |' cell, so the cell match is exact.
+  const arm1MlRow = markdown.indexOf('| model-arm |', mlAt);
+  const arm2MlRow = markdown.indexOf('| model-arm-2 |', mlAt);
+  assert.ok(arm1MlRow > mlAt && arm2MlRow > mlAt && arm1MlRow < spreadAt && arm2MlRow < spreadAt);
+  assert.ok(arm1MlRow < arm2MlRow, 'moneyline table must follow the moneyline means');
+
+  // Spread table: the market's own order flips — model-arm-2 first.
+  const arm1SpreadRow = markdown.indexOf('| model-arm |', spreadAt);
+  const arm2SpreadRow = markdown.indexOf('| model-arm-2 |', spreadAt);
+  assert.ok(arm1SpreadRow > spreadAt && arm2SpreadRow > spreadAt && arm1SpreadRow < totalAt && arm2SpreadRow < totalAt);
+  assert.ok(arm2SpreadRow < arm1SpreadRow, 'spread table must follow the spread means');
+
+  // Nothing-scoreable rows sort last: the timeout arm renders below both
+  // scoring arms in the moneyline table.
+  const timeoutMlRow = markdown.indexOf('| timeout-arm |', mlAt);
+  assert.ok(timeoutMlRow > mlAt && timeoutMlRow < spreadAt);
+  assert.ok(timeoutMlRow > arm1MlRow && timeoutMlRow > arm2MlRow, 'null results must sort last');
 });
 
 test('a fully-failed arm keeps 0/N rows in every rendered per-market table', () => {
