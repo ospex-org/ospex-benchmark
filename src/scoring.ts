@@ -179,6 +179,20 @@ const runFailureSchema = z
   })
   .passthrough();
 
+const speculationStatusSchema = z
+  .object({
+    recordType: z.literal('speculation_status'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    gameId: z.string().min(1),
+    market: z.enum(['moneyline', 'spread', 'total']),
+    decision: z.enum(['entered', 'not_entered']),
+    reason: z.string().min(1),
+    firstAppearanceAt: z.string().nullable(),
+    openerAgeSeconds: z.number().nullable(),
+  })
+  .passthrough();
+
 const decisionSchema = z
   .object({
     recordType: z.literal('decision'),
@@ -322,6 +336,16 @@ export interface SourceRun {
   picks: SourcePick[];
   armResponses: ArmResponseRef[];
   runFailures: Array<{ code: string; failures: string[] }>;
+  /** The published denominator: every (game, market) disposition the runner
+   *  recorded for the fired game(s) — entered or not_entered with a reason. */
+  dispositions: Array<{
+    gameId: string;
+    market: MarketKey;
+    decision: 'entered' | 'not_entered';
+    reason: string;
+    firstAppearanceAt: string | null;
+    openerAgeSeconds: number | null;
+  }>;
   /** Identity stamps of every parsed record, for run/cohort/label checks. */
   identities: Array<{ ref: string; runId: string; label: string; cohortId: string | null }>;
 }
@@ -340,6 +364,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
   const picks: SourcePick[] = [];
   const armResponses: ArmResponseRef[] = [];
   const runFailures: Array<{ code: string; failures: string[] }> = [];
+  const dispositions: SourceRun['dispositions'] = [];
   const identities: SourceRun['identities'] = [];
 
   let lineNumber = 0;
@@ -454,6 +479,24 @@ export function parseRunRecords(lines: string[]): SourceRun {
         runFailures.push({ code: failure.code, failures: failure.failures });
         break;
       }
+      case 'speculation_status': {
+        const status = speculationStatusSchema.parse(record);
+        identities.push({
+          ref: `speculation_status:${status.gameId}:${status.market}`,
+          runId: status.runId,
+          label: status.label,
+          cohortId: null,
+        });
+        dispositions.push({
+          gameId: status.gameId,
+          market: status.market,
+          decision: status.decision,
+          reason: status.reason,
+          firstAppearanceAt: status.firstAppearanceAt,
+          openerAgeSeconds: status.openerAgeSeconds,
+        });
+        break;
+      }
       case 'decision': {
         const decision = decisionSchema.parse(record);
         identities.push({
@@ -549,6 +592,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
     picks,
     armResponses,
     runFailures,
+    dispositions,
     identities,
   };
 }
@@ -679,6 +723,7 @@ export function verifyRunIntegrity(
       // market (and vice versa) — the fire entered exactly the gated set.
       const gatedSet = new Set(gateMarkets.map(([m]) => m));
       const singleGame = [...run.games.values()][0];
+      const singleGameId = [...run.games.keys()][0];
       if (singleGame !== undefined) {
         const bundleMarkets = bundleMarketKeysFromPrices(singleGame);
         for (const market of bundleMarkets) {
@@ -689,6 +734,42 @@ export function verifyRunIntegrity(
         for (const market of gatedSet) {
           if (!bundleMarkets.includes(market as MarketKey)) {
             violations.push(`watch provenance gates ${market} but the bundle did not enter it`);
+          }
+        }
+
+        // The published denominator (speculation_status): per-market firing
+        // creates a selective-retention surface — a dropped market would look
+        // exactly like one that never opened. The corpus must therefore carry
+        // the negative space, and it must be CONSISTENT with what fired:
+        //  - every ENTERED disposition ⇔ a bundle market (no phantom entries,
+        //    no entered market missing from the denominator);
+        //  - a NOT_ENTERED market is never also in the bundle.
+        // This makes a silently-dropped market a detectable contradiction.
+        const forGame = run.dispositions.filter((d) => d.gameId === singleGameId);
+        if (forGame.length === 0) {
+          violations.push('watch run carries no speculation_status denominator — coverage is unverifiable');
+        }
+        const enteredSet = new Set(forGame.filter((d) => d.decision === 'entered').map((d) => d.market));
+        const notEnteredSet = new Set(forGame.filter((d) => d.decision === 'not_entered').map((d) => d.market));
+        for (const market of bundleMarkets) {
+          if (!enteredSet.has(market)) {
+            violations.push(`watch run entered ${market} but its denominator does not mark it entered`);
+          }
+        }
+        for (const market of enteredSet) {
+          if (!bundleMarkets.includes(market as MarketKey)) {
+            violations.push(`denominator marks ${market} entered but the bundle did not enter it`);
+          }
+        }
+        for (const market of notEnteredSet) {
+          if (bundleMarkets.includes(market as MarketKey)) {
+            violations.push(`denominator marks ${market} not_entered but the bundle DID enter it — contradiction`);
+          }
+        }
+        // An entered disposition must carry its entry-timing evidence.
+        for (const d of forGame) {
+          if (d.decision === 'entered' && d.firstAppearanceAt === null) {
+            violations.push(`denominator marks ${d.market} entered but records no first-appearance evidence`);
           }
         }
       }
@@ -1335,6 +1416,102 @@ export function verifyRunIntegrity(
   }
 
   return violations;
+}
+
+// ---------------------------------------------------------------------------
+// Independent entry-timing verification (§3.6)
+// ---------------------------------------------------------------------------
+
+/** Cross-clock allowance between the runner host and the writer host, mirroring
+ *  the bundle's future-quote skew: `captured_at` is stamped by a different
+ *  machine than `detectedAt`. */
+export const FIRST_APPEARANCE_SKEW_MS = 2 * 60_000;
+
+/** A market whose independent first appearance could not be re-derived — a
+ *  typed UNKNOWN, never a pass and never a fail. */
+export interface EntryTimingUnknown {
+  market: MarketKey;
+  detail: string;
+}
+
+export interface EntryTimingResult {
+  /** Reconciliation failures — a claimed opener the append-only log refutes. */
+  violations: string[];
+  /** Markets the oracle could not resolve (history not visible / read failed).
+   *  Surfaced as UNKNOWN so the caller decides; NOT silently passed. */
+  unknown: EntryTimingUnknown[];
+}
+
+/**
+ * Re-derive each entered market's first board appearance from the append-only
+ * `odds_history` (via an injected oracle) and reconcile the run's self-reported
+ * entry timing against it. This converts the fire-at-detection claim from
+ * self-attested to independently verified: the runner cannot claim an opener
+ * age the source log refutes.
+ *
+ * A market the oracle cannot resolve is a typed UNKNOWN — never fail-closed
+ * forever (that would strand exactly the fresh-open path), never silently
+ * passed. Negative reconciled ages within the cross-clock skew are tolerated;
+ * beyond it, they are a violation.
+ */
+export async function verifyWatchEntryTiming(
+  run: SourceRun,
+  oracle: (gameId: string, market: MarketKey) => Promise<string | null>,
+): Promise<EntryTimingResult> {
+  const violations: string[] = [];
+  const unknown: EntryTimingUnknown[] = [];
+  if (run.watch === null || !run.runId.startsWith('watch-v0-')) {
+    return { violations, unknown };
+  }
+  const detectedMs = Date.parse(run.watch.detectedAt);
+  const gameId = [...run.games.keys()][0];
+  if (gameId === undefined) return { violations, unknown };
+
+  for (const [marketStr, gate] of Object.entries(run.watch.markets)) {
+    const market = marketStr as MarketKey;
+    let observed: string | null;
+    try {
+      observed = await oracle(gameId, market);
+    } catch (error) {
+      unknown.push({ market, detail: `oracle read failed: ${error instanceof Error ? error.message : String(error)}` });
+      continue;
+    }
+    if (observed === null) {
+      unknown.push({ market, detail: 'no odds_history first-appearance row available' });
+      continue;
+    }
+    const observedMs = Date.parse(observed);
+    if (!Number.isFinite(observedMs)) {
+      unknown.push({ market, detail: `odds_history first appearance is unparseable: ${observed}` });
+      continue;
+    }
+    // The claimed first appearance must match the independent source.
+    const claimedMs = Date.parse(gate.firstAppearanceAt);
+    if (Number.isFinite(claimedMs) && Math.abs(claimedMs - observedMs) > FIRST_APPEARANCE_SKEW_MS) {
+      violations.push(
+        `${market}: recorded first appearance ${gate.firstAppearanceAt} does not reconcile with odds_history (${observed})`,
+      );
+    }
+    // The opener age re-derived from the INDEPENDENT source must match the
+    // recorded one, within skew. This is the load-bearing check: it does not
+    // trust the runner's own firstAppearanceAt.
+    if (Number.isFinite(detectedMs)) {
+      const reDerivedSeconds = (detectedMs - observedMs) / 1000;
+      if (reDerivedSeconds < -(FIRST_APPEARANCE_SKEW_MS / 1000)) {
+        violations.push(
+          `${market}: odds_history first appearance ${observed} is after detection ${run.watch.detectedAt} beyond the skew allowance`,
+        );
+      } else if (
+        Math.abs(reDerivedSeconds - gate.openerAgeSeconds) >
+        FIRST_APPEARANCE_SKEW_MS / 1000 + 1
+      ) {
+        violations.push(
+          `${market}: recorded opener age ${gate.openerAgeSeconds}s does not reconcile with odds_history (${Math.round(reDerivedSeconds)}s)`,
+        );
+      }
+    }
+  }
+  return { violations, unknown };
 }
 
 // ---------------------------------------------------------------------------

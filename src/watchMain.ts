@@ -8,7 +8,7 @@ import { fetchFirstBoardAppearance, fetchLiveInputs } from './fetchers.js';
 import { enabledMarkets, MARKET_POLICY, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import { createFixtureClock, createMockAdapters, loadFixtureInputs } from './mock.js';
 import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
-import { writeText } from './records.js';
+import { appendNdjson, writeText } from './records.js';
 import {
   fireEligibleGame,
   LATE_THRESHOLD_MS,
@@ -134,23 +134,49 @@ async function main(): Promise<number> {
   printLine(`ledger: ${ledger.size} speculation(s) already handled (${ledgerDir})`);
 
   // Observability: each tick's per-speculation status snapshot to disk, so
-  // "is it working / why is this only watched" is answerable from a file
+  // "is it working / why is this only blocked" is answerable from a file
   // rather than inferred from the tick counters. Skipped in rehearsal.
   const statusFile = join(outDir, 'line-open-status.json');
+  // The published denominator, part 2: an append-only coverage log of every
+  // (game, market) disposition, emitted on state CHANGE. Fired games record
+  // their full denominator in the run file; this log covers games that never
+  // fire any market (no run file), so their negative space is not invisible.
+  const coverageFile = join(outDir, 'line-open-coverage.ndjson');
+  const lastDisposition = new Map<string, string>();
   const onStatuses = options.rehearse
     ? undefined
     : (statuses: SpecStatus[]): void => {
-        writeText(
-          statusFile,
-          `${JSON.stringify({ snapshotAt: new Date(nowMs()).toISOString(), statuses }, null, 2)}\n`,
+        const snapshotAt = new Date(nowMs()).toISOString();
+        writeText(statusFile, `${JSON.stringify({ snapshotAt, statuses }, null, 2)}\n`);
+        const changed = statuses.filter((s) => {
+          const stateKey = `${s.state}:${s.reason}`;
+          if (lastDisposition.get(`${s.gameId}:${s.market}`) === stateKey) return false;
+          lastDisposition.set(`${s.gameId}:${s.market}`, stateKey);
+          return true;
+        });
+        appendNdjson(
+          coverageFile,
+          changed.map((s) => ({
+            recordType: 'coverage_status',
+            snapshotAt,
+            gameId: s.gameId,
+            slug: s.slug,
+            league: s.league,
+            market: s.market,
+            state: s.state,
+            reason: s.reason,
+            firstAppearanceAt: s.firstAppearanceAt,
+            openerAgeSeconds: s.openerAgeSeconds,
+            scheduledStartUtc: s.scheduledStartUtc,
+          })),
         );
       };
 
   const deps: WatchDeps = {
     fetchInputs,
     fetchFirstBoardAppearance: firstBoardAppearance,
-    fireGame: (build, inputs, slateDate, provenance) =>
-      fireEligibleGame(build, inputs, slateDate, provenance, fireConfig),
+    fireGame: (build, inputs, slateDate, provenance, dispositions) =>
+      fireEligibleGame(build, inputs, slateDate, provenance, fireConfig, dispositions),
     ledgerDir,
     ledger,
     boardFirstSeen: new Map(),

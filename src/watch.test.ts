@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { buildBundle } from './bundle.js';
 import { enabledMarkets, isMarketEnabled } from './marketPolicy.js';
-import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
+import { parseRunRecords, verifyRunIntegrity, verifyWatchEntryTiming } from './scoring.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
 import {
   fireEligibleGame,
@@ -509,6 +509,13 @@ test('a scoped watch fire (moneyline + total) produces a run file that passes fu
     },
   };
   const outDir = tempDir('watch-fire-');
+  // The published denominator: moneyline + total entered, the run line seen but
+  // policy-disabled (not entered).
+  const dispositions = [
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'moneyline', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: openedAt, openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'total', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: openedAt, openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'spread', decision: 'not_entered' as const, reason: 'policy_disabled', firstAppearanceAt: null, openerAgeSeconds: null, scheduledStartUtc: MATCH_TIME },
+  ];
   const outcome = await fireEligibleGame(build, inputs, slateDate, provenance, {
     arms: [TEST_ARM],
     adapters: new Map([[TEST_ARM.participantId, adapter]]),
@@ -521,7 +528,7 @@ test('a scoped watch fire (moneyline + total) produces a run file that passes fu
     nowMs,
     log: () => undefined,
     logError: () => undefined,
-  });
+  }, dispositions);
 
   assert.equal(outcome.collisionFailed, false);
   assert.match(outcome.runId, /^watch-v0-2026-07-20-[0-9a-f]{6}$/);
@@ -537,6 +544,29 @@ test('a scoped watch fire (moneyline + total) produces a run file that passes fu
   ];
   const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms });
   assert.deepEqual(violations, []);
+
+  // The published denominator is in the corpus: the run line's not-entered
+  // disposition sits next to the two entered markets — a dropped market would
+  // be a detectable contradiction, not an invisible gap.
+  const statusRecords = lines
+    .filter((l) => l.includes('"recordType":"speculation_status"'))
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+  assert.equal(statusRecords.length, 3);
+  assert.equal(statusRecords.filter((r) => r['decision'] === 'entered').length, 2);
+  const spread = statusRecords.find((r) => r['market'] === 'spread');
+  assert.equal(spread?.['decision'], 'not_entered');
+  assert.equal(spread?.['reason'], 'policy_disabled');
+
+  // Tamper: drop the total's decision but keep its "entered" denominator →
+  // the coverage cross-check catches the missing entry.
+  const droppedTotal = lines.filter(
+    (l) => !(l.includes('"recordType":"decision"') && l.includes('"market":"total"')),
+  );
+  // Also drop the total from the bundle-derived markets by removing its
+  // bundle_game price? Simpler: the denominator says total entered, but with no
+  // total decision the arm cross-product check and coverage both fire.
+  const droppedViolations = verifyRunIntegrity(parseRunRecords(droppedTotal), { expectedArms });
+  assert.ok(droppedViolations.length > 0);
 
   const metaIndex = lines.findIndex((l) => l.includes('"recordType":"run_meta"'));
   assert.ok(metaIndex >= 0);
@@ -840,6 +870,114 @@ test('the fired provenance carries each market\'s own first appearance and age',
   assert.equal(prov.markets.moneyline?.firstAppearanceAt, OPENED_AT);
   assert.ok((prov.markets.moneyline?.openerAgeSeconds ?? -1) >= 600);
   assert.ok((prov.markets.total?.openerAgeSeconds ?? -1) >= 600);
+});
+
+// ---------------------------------------------------------------------------
+// PR B: the published denominator + independent first-appearance verification
+// ---------------------------------------------------------------------------
+
+/** Fire a real scoped moneyline+total watch run and return its parsed records. */
+async function fireScopedRun(dispositions: Parameters<typeof fireEligibleGame>[5]): Promise<{
+  lines: string[];
+  openedAt: string;
+  gameId: string;
+}> {
+  const inputs = inputsWith([oddsRow('moneyline', null), oddsRow('total', 8.5)]);
+  const slateDate = '2026-07-20';
+  const build = buildBundle(inputs, slateDate, { requireFuture: false });
+  const request = build.requests[0];
+  assert.ok(request);
+  const cohortId = `watch-v0-${slateDate}`;
+  const adapter = stubAdapter(() => JSON.stringify(makeValidResponse(request, TEST_ARM, cohortId)));
+  let t = NOW_MS;
+  const nowMs = (): number => (t += 5);
+  const openedAt = new Date(NOW_MS - 10 * 60_000).toISOString();
+  const provenance: WatchGateProvenance = {
+    detectedAt: new Date(NOW_MS).toISOString(),
+    lateThresholdSeconds: LATE_THRESHOLD_MS / 1000,
+    markets: {
+      moneyline: { firstAppearanceAt: openedAt, openerAgeSeconds: 600 },
+      total: { firstAppearanceAt: openedAt, openerAgeSeconds: 600 },
+    },
+  };
+  const outDir = tempDir('watch-prb-');
+  const outcome = await fireEligibleGame(build, inputs, slateDate, provenance, {
+    arms: [TEST_ARM],
+    adapters: new Map([[TEST_ARM.participantId, adapter]]),
+    approvedReportedModelIds: () => ['stub-model-1'],
+    outDir,
+    timeoutMs: 60_000,
+    maxOutputTokens: 16000,
+    mode: 'live',
+    clockMode: 'wall',
+    nowMs,
+    log: () => undefined,
+    logError: () => undefined,
+  }, dispositions);
+  const lines = readFileSync(outcome.runFile, 'utf8').split(/\r?\n/).filter((l) => l.trim() !== '');
+  return { lines, openedAt, gameId: request.gameId };
+}
+
+const EXPECTED_ARMS = [
+  { participantId: TEST_ARM.participantId, provider: TEST_ARM.provider, requestedModelId: TEST_ARM.requestedModelId, approvedReportedModelIds: ['stub-model-1'] },
+];
+
+test('PR B: denominator contradiction (fired market marked not_entered) fails integrity', async () => {
+  // Build the run first to learn the gameId, then assert on a doctored copy.
+  const { lines, gameId } = await fireScopedRun([]);
+  // Inject a denominator that marks the entered total as not_entered.
+  const doctored = [
+    ...lines,
+    JSON.stringify({
+      recordType: 'speculation_status', label: 'SMOKE_V0_NOT_A_COHORT', runId: JSON.parse(lines[0] ?? '{}').runId,
+      gameId, slug: 'x', league: 'mlb', market: 'moneyline', decision: 'entered', reason: 'entered',
+      firstAppearanceAt: '2026-07-20T11:50:00.000Z', openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME,
+    }),
+    JSON.stringify({
+      recordType: 'speculation_status', label: 'SMOKE_V0_NOT_A_COHORT', runId: JSON.parse(lines[0] ?? '{}').runId,
+      gameId, slug: 'x', league: 'mlb', market: 'total', decision: 'not_entered', reason: 'market_never_opened',
+      firstAppearanceAt: null, openerAgeSeconds: null, scheduledStartUtc: MATCH_TIME,
+    }),
+  ];
+  const violations = verifyRunIntegrity(parseRunRecords(doctored), { expectedArms: EXPECTED_ARMS });
+  assert.ok(violations.some((v) => v.includes('not_entered but the bundle DID enter it')));
+});
+
+test('PR B: a watch run with NO denominator is unscoreable (coverage unverifiable)', async () => {
+  const { lines } = await fireScopedRun([]); // no speculation_status records
+  const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms: EXPECTED_ARMS });
+  assert.ok(violations.some((v) => v.includes('no speculation_status denominator')));
+});
+
+test('PR B: verifyWatchEntryTiming reconciles the opener against odds_history — agree, disagree, and UNKNOWN', async () => {
+  const openedAt = new Date(NOW_MS - 10 * 60_000).toISOString();
+  const { lines, gameId } = await fireScopedRun([
+    { gameId: 'ignored', slug: 'x', league: 'mlb', market: 'moneyline', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: openedAt, openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+    { gameId: 'ignored', slug: 'x', league: 'mlb', market: 'total', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: openedAt, openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+  ]);
+  const run = parseRunRecords(lines);
+  void gameId;
+
+  // Oracle AGREES with the recorded first appearance → no violations.
+  const agree = await verifyWatchEntryTiming(run, () => Promise.resolve(openedAt));
+  assert.deepEqual(agree.violations, []);
+  assert.deepEqual(agree.unknown, []);
+
+  // Oracle DISAGREES (the market actually opened hours earlier) → the claimed
+  // opener age is refuted by the independent log.
+  const earlier = new Date(NOW_MS - 5 * 3_600_000).toISOString();
+  const disagree = await verifyWatchEntryTiming(run, () => Promise.resolve(earlier));
+  assert.ok(disagree.violations.some((v) => v.includes('does not reconcile with odds_history')));
+
+  // Oracle cannot resolve → typed UNKNOWN, never a silent pass or a hard fail.
+  const unknown = await verifyWatchEntryTiming(run, () => Promise.resolve(null));
+  assert.deepEqual(unknown.violations, []);
+  assert.equal(unknown.unknown.length, 2);
+
+  // A non-watch run yields nothing to verify.
+  const nonWatch = { ...run, watch: null };
+  const none = await verifyWatchEntryTiming(nonWatch, () => Promise.resolve(openedAt));
+  assert.deepEqual(none.violations, []);
 });
 
 test('prolonged deferral escalates exactly once, per speculation', async () => {

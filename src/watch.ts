@@ -18,7 +18,7 @@ import { runSlate } from './runner.js';
 import { easternCalendarDay } from './slateDate.js';
 import { buildSummaryMarkdown } from './summary.js';
 import type { BuildResult, GameMarketsEval } from './bundle.js';
-import type { RunContext, WatchProvenance } from './records.js';
+import type { RunContext, SpeculationDisposition, WatchProvenance } from './records.js';
 import type {
   ArmOutcome,
   ArmSpec,
@@ -359,6 +359,7 @@ export interface WatchDeps {
     inputs: SlateInputs,
     slateDate: string,
     provenance: WatchGateProvenance,
+    dispositions: SpeculationDisposition[],
   ) => Promise<FireOutcome>;
   ledgerDir: string;
   /** Handled speculations, pre-populated from disk BEFORE the first tick; keyed `${gameId}:${market}`. */
@@ -803,8 +804,22 @@ async function fireReadySpeculations(
     fetchStartedAt: plan.fetchStartedAt,
     fetchCompletedAt: plan.fetchCompletedAt,
   };
+  // The published denominator for this game: every market's disposition, so a
+  // market that did NOT enter (disabled, never opened, late) is a recorded fact
+  // in the run file next to the entered ones — never an invisible gap.
+  const dispositions: SpeculationDisposition[] = plan.statuses.map((status) => ({
+    gameId: status.gameId,
+    slug: status.slug,
+    league: status.league,
+    market: status.market,
+    decision: status.state === 'ready' ? 'entered' : 'not_entered',
+    reason: status.state === 'ready' ? 'entered' : status.reason,
+    firstAppearanceAt: status.firstAppearanceAt,
+    openerAgeSeconds: status.openerAgeSeconds,
+    scheduledStartUtc: status.scheduledStartUtc,
+  }));
   try {
-    const outcome = await deps.fireGame(build, fireInputs, plan.slateDate, provenance);
+    const outcome = await deps.fireGame(build, fireInputs, plan.slateDate, provenance, dispositions);
     for (const entry of claimed) {
       const completed: SpecLedgerEntry = {
         ...entry,
@@ -858,6 +873,7 @@ export async function fireEligibleGame(
   slateDate: string,
   provenance: WatchGateProvenance,
   cfg: FireConfig,
+  dispositions: SpeculationDisposition[] = [],
 ): Promise<FireOutcome> {
   const watch: WatchProvenance = {
     detectedAt: provenance.detectedAt,
@@ -901,7 +917,7 @@ export async function fireEligibleGame(
     })),
   );
 
-  const records = buildRecords(ctx, build, armGameResults, baselineDecisions, collision);
+  const records = buildRecords(ctx, build, armGameResults, baselineDecisions, collision, dispositions);
   const runFile = join(cfg.outDir, `${ctx.runId}.ndjson`);
   writeNdjson(runFile, records);
   writeText(

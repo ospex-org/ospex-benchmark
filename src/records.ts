@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { redactSecrets } from './config.js';
 import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
@@ -32,6 +32,27 @@ export interface WatchProvenance {
   detectedAt: string;
   lateThresholdSeconds: number;
   markets: Partial<Record<MarketKey, MarketGateProvenance>>;
+}
+
+/**
+ * The disposition of ONE speculation (game, market) as the runner saw it — the
+ * published denominator. `entered` speculations correspond to decisions in this
+ * run; `not_entered` ones carry a machine-readable reason and their
+ * first-appearance evidence. Recording the negative space closes the
+ * cherry-pick surface per-market firing would otherwise create: a market that
+ * was dropped is a detectable `not_entered` fact next to the entered ones, not
+ * an invisible gap.
+ */
+export interface SpeculationDisposition {
+  gameId: string;
+  slug: string;
+  league: string;
+  market: string;
+  decision: 'entered' | 'not_entered';
+  reason: string;
+  firstAppearanceAt: string | null;
+  openerAgeSeconds: number | null;
+  scheduledStartUtc: string;
 }
 
 export interface RunContext {
@@ -141,6 +162,9 @@ export function buildRecords(
   armGameResults: ArmGameResult[],
   baselineDecisions: BaselineDecision[],
   collision: CollisionCheckResult,
+  /** Per-market dispositions for the fired game(s) — the published denominator
+   *  (watch runs only; empty for the smoke). */
+  dispositions: SpeculationDisposition[] = [],
 ): JsonRecord[] {
   const records: JsonRecord[] = [];
   const { slateBundle, slateSha256, requests, gameHashes, excluded, provenance } = build;
@@ -216,6 +240,16 @@ export function buildRecords(
       label: SMOKE_LABEL,
       runId: ctx.runId,
       ...exclusion,
+    });
+  }
+
+  // The published denominator: every market of the fired game, entered or not.
+  for (const disposition of dispositions) {
+    records.push({
+      recordType: 'speculation_status',
+      label: SMOKE_LABEL,
+      runId: ctx.runId,
+      ...disposition,
     });
   }
 
@@ -330,4 +364,18 @@ export function writeNdjson(filePath: string, records: JsonRecord[]): void {
 export function writeText(filePath: string, content: string): void {
   mkdirSync(dirname(filePath), { recursive: true });
   writeFileSync(filePath, redactSecrets(content), 'utf8');
+}
+
+/**
+ * Append records to an NDJSON log through the same redaction chokepoint. Used
+ * for the append-only coverage log — the published denominator for every
+ * (game, market) the runner sees, including games that never fire any market
+ * (those produce no run file, so their negative space would otherwise be
+ * invisible).
+ */
+export function appendNdjson(filePath: string, records: JsonRecord[]): void {
+  if (records.length === 0) return;
+  mkdirSync(dirname(filePath), { recursive: true });
+  const lines = records.map((record) => redactSecrets(JSON.stringify(record))).join('\n');
+  appendFileSync(filePath, `${lines}\n`, 'utf8');
 }

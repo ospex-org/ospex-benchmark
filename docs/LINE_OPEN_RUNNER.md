@@ -102,6 +102,39 @@ appearance and opener age, the bundle and request hashes, the run file, and the
 outcome. A corrupt file is treated as handled (never risk a double-fire). Ledger
 writes pass the same redaction chokepoint as every other artifact.
 
+## The published denominator (what makes per-market firing safe)
+
+Per-market firing creates a selective-retention surface: once the moneyline can
+fire without the total, "moneyline entered, total not" is the ordinary case, and
+a total that was quietly dropped looks exactly like one that never opened. So
+the corpus must carry the **negative space**, not just what fired:
+
+- Every fired run file embeds a `speculation_status` record for **every market
+  of that game** — `entered` (with its first-appearance evidence), or
+  `not_entered` with a machine-readable reason (`policy_disabled`,
+  `market_never_opened`, `late_detection`, `one_sided`, `stale_quote`, …). A
+  game that fires only its moneyline still records, in the same file, that its
+  total never opened and its run line was policy-disabled.
+- A game that fires **nothing** produces no run file, so an append-only coverage
+  log (`out/line-open-coverage.ndjson`, emitted on state change) carries those
+  dispositions too.
+- The scorer **enforces** consistency: for a watch run, the `entered` set must
+  equal the bundle's market set and the gated set — a market marked `not_entered`
+  that actually fired, or an entry with no denominator, is a hard violation.
+  Coverage becomes a published number, and a silently-dropped market becomes a
+  detectable contradiction rather than an invisible gap.
+
+## Independently verified entry timing
+
+The recorded opener age is not taken on faith. `verifyWatchEntryTiming`
+re-derives each entered market's first board appearance from the append-only
+`odds_history` and reconciles the run's self-reported timing against it, within
+a bounded cross-clock skew (the runner and the writer stamp on different hosts).
+A claimed opener the log refutes is a violation; a market the log cannot resolve
+is a typed UNKNOWN (surfaced, never a silent pass and never a permanent
+fail-closed — that would strand the fresh-open path). This converts the
+fire-at-detection claim from self-attested to independently checked.
+
 ## Rehearsal mode (mandatory before a first live boot)
 
 On first boot, every enabled market already open in the window is hours old and
