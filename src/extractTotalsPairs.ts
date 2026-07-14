@@ -2,7 +2,11 @@ import { describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
 import { fetchClosingLines, fetchGamesTableRows } from './fetchers.js';
-import { closingTotalRecord } from './inhouseTotals.js';
+import {
+  closingTotalRecord,
+  rederivedConfidence,
+  rederivedLockTimeRange,
+} from './inhouseTotals.js';
 import { writeNdjson } from './records.js';
 import type { ClosingTotalRecord, InhouseTotalsMetaRecord } from './inhouseTotals.js';
 
@@ -117,14 +121,10 @@ async function main(): Promise<number> {
       : a.lockTime.localeCompare(b.lockTime),
   );
 
-  const confidence: Record<string, number> = {};
-  for (const record of records) {
-    confidence[record.confidence] = (confidence[record.confidence] ?? 0) + 1;
-  }
   const pairs = records.filter((record) => record.final !== null).length;
-  const first = records[0];
-  const last = records[records.length - 1];
 
+  // The record-derivable meta fields come from the SAME helpers the dataset
+  // reader re-derives with, so writer and integrity check cannot drift.
   const meta: InhouseTotalsMetaRecord = {
     recordType: 'inhouse_totals_meta',
     network: NETWORK,
@@ -134,9 +134,8 @@ async function main(): Promise<number> {
     pairs,
     droppedNullLine,
     finalsWithheldNotFinished,
-    confidence,
-    lockTimeRange:
-      first !== undefined && last !== undefined ? [first.lockTime, last.lockTime] : null,
+    confidence: rederivedConfidence(records),
+    lockTimeRange: rederivedLockTimeRange(records),
     generatedAt: new Date().toISOString(),
   };
 

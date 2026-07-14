@@ -135,3 +135,21 @@ test('parseInhouseTotalsDataset: pair-count mismatch is refused', () => {
   ]);
   assert.throws(() => parseInhouseTotalsDataset(text), /truncated or edited/);
 });
+
+test('parseInhouseTotalsDataset: an edited confidence histogram is refused', () => {
+  // Both records are fresh; a meta claiming one stale must not load — this
+  // field flows verbatim into the published artifact.
+  const text = datasetText(meta({ confidence: { fresh: 1, stale: 1 } }), [
+    record({ awayScore: 3, homeScore: 4, total: 7, finalType: 'Finished' }),
+    record(null),
+  ]);
+  assert.throws(() => parseInhouseTotalsDataset(text), /confidence histogram/);
+});
+
+test('parseInhouseTotalsDataset: an edited lockTimeRange is refused', () => {
+  const text = datasetText(
+    meta({ lockTimeRange: ['2026-01-01T00:00:00+00:00', '2026-07-12T20:10:00+00:00'] }),
+    [record({ awayScore: 3, homeScore: 4, total: 7, finalType: 'Finished' }), record(null)],
+  );
+  assert.throws(() => parseInhouseTotalsDataset(text), /lockTimeRange/);
+});

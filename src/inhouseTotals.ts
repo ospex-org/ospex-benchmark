@@ -107,8 +107,10 @@ export interface InhouseTotalsDataset {
 
 /**
  * Parse + integrity-check a committed in-house totals dataset: exactly one
- * leading meta record, record count and pair count both re-derived and
- * compared against the meta (a truncated or edited file refuses to load).
+ * leading meta record, and every record-derivable meta field re-derived from
+ * the records and compared — record count, pair count, the confidence
+ * histogram, and the lock-time range (all of which flow verbatim into the
+ * published artifact). A truncated or edited file refuses to load.
  */
 export function parseInhouseTotalsDataset(text: string): InhouseTotalsDataset {
   const lines = text.split(/\r?\n/).filter((line) => line.trim() !== '');
@@ -126,5 +128,41 @@ export function parseInhouseTotalsDataset(text: string): InhouseTotalsDataset {
       `meta says ${meta.pairs} pairs but the dataset holds ${pairs} — truncated or edited?`,
     );
   }
+  const confidence = rederivedConfidence(records);
+  for (const key of new Set([...Object.keys(confidence), ...Object.keys(meta.confidence)])) {
+    if ((confidence[key] ?? 0) !== (meta.confidence[key] ?? 0)) {
+      throw new InhouseTotalsError(
+        `meta confidence histogram disagrees with the records at "${key}" — truncated or edited?`,
+      );
+    }
+  }
+  const range = rederivedLockTimeRange(records);
+  if (JSON.stringify(range) !== JSON.stringify(meta.lockTimeRange)) {
+    throw new InhouseTotalsError(
+      'meta lockTimeRange disagrees with the records — truncated or edited?',
+    );
+  }
   return { meta, records };
+}
+
+/** Confidence histogram re-derived from the records themselves. */
+export function rederivedConfidence(records: readonly ClosingTotalRecord[]): Record<string, number> {
+  const confidence: Record<string, number> = {};
+  for (const record of records) {
+    confidence[record.confidence] = (confidence[record.confidence] ?? 0) + 1;
+  }
+  return confidence;
+}
+
+/** [min, max] lock time re-derived from the records themselves; null when empty. */
+export function rederivedLockTimeRange(
+  records: readonly ClosingTotalRecord[],
+): [string, string] | null {
+  let min: string | null = null;
+  let max: string | null = null;
+  for (const record of records) {
+    if (min === null || record.lockTime < min) min = record.lockTime;
+    if (max === null || record.lockTime > max) max = record.lockTime;
+  }
+  return min !== null && max !== null ? [min, max] : null;
 }

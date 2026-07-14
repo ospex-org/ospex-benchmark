@@ -13,7 +13,10 @@ provisional version.
 — the machine-readable source of truth (full-precision values; this page
 quotes rounded figures). The artifact is regenerated, never hand-edited: a
 unit test recomputes every published number from the committed input datasets
-and requires exact equality.
+with exact equality, re-derives the provenance fields (seasons, confidence
+histogram, lock-time range) from the records, and pins every
+method/description field to its published constant — only `generatedAt`
+floats between regenerations.
 
 ## Model
 
@@ -148,12 +151,13 @@ distribution of the 7,277 finals:
 
 The visible disagreement pattern is the **parity oscillation**: MLB games
 cannot end tied, so even totals (which permit a tie through nine innings)
-are systematically depleted into mostly-odd resolutions — empirically, odd
-totals 7 and 9 are enriched and even totals 8 and 10 depleted by 1.5–2
-percentage points relative to any smooth count model. A smooth NB cannot
-reproduce this, and it matters exactly at the ladder's most sensitive
+are systematically depleted into mostly-odd resolutions — in the table
+above, odd totals 7 and 9 are enriched by +1.6pp and +1.2pp against the
+model, and even totals 8 and 10 depleted by −2.1pp and −1.2pp. A smooth NB
+cannot reproduce this, and it matters exactly at the ladder's most sensitive
 output: push probabilities at integer lines will run **high at even lines
-and low at odd lines** by roughly that much. This is published rather than
+and low at odd lines** by roughly one to two percentage points. This is
+published rather than
 smoothed over; whether TOTALS_V1 adds a parity adjustment is a refit-time
 decision, to be judged against the accrued in-house pairs and the
 alternate-line ladder validation planned for the ladder PR.
@@ -205,6 +209,7 @@ yarn fit:totals --inhouse data/inhouse-totals-<date>.ndjson
 
 The fit is deterministic given the two input datasets — re-running changes
 only `generatedAt`. `yarn test` includes an integrity test that recomputes
-the committed artifact from the committed datasets and requires exact
-equality, plus golden tests of the NB pmf against independently computed
-reference values.
+the committed artifact — every number, the record-derived provenance
+fields, the full pmf-check range, and every pinned method string — from the
+committed datasets and published constants, plus golden tests of the NB pmf
+against independently computed reference values.

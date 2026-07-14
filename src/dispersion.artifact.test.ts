@@ -2,20 +2,38 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import {
+  CLOSE_SPREAD_SOURCE,
   fitTotalsDispersionMoments,
+  KNOWN_APPROXIMATIONS,
   marginalPmfCheck,
+  PMF_CHECK_T_MAX,
+  PMF_CHECK_T_MIN,
+  PRIMARY_FIT_BASIS,
+  PRIMARY_FIT_METHOD,
   PUSH_ANCHOR_BAND,
+  REFIT_PLAN,
+  RETROSHEET_FIT_WINDOW,
+  TOTALS_DISPERSION_PARAMETERIZATION,
   totalsDispersionArtifactSchema,
 } from './dispersion.js';
-import { parseInhouseTotalsDataset } from './inhouseTotals.js';
+import {
+  parseInhouseTotalsDataset,
+  rederivedConfidence,
+  rederivedLockTimeRange,
+} from './inhouseTotals.js';
 import { classifyOuts, parseRetrosheetDataset } from './retrosheet.js';
 
 /**
  * Committed-artifact integrity: the published TOTALS_V1_PROVISIONAL parameter
  * must be EXACTLY what the committed datasets produce through the production
- * fit path. Recomputes everything from data/ and compares bit-for-bit — a
- * hand-edited parameter, a swapped dataset, or a silent formula change all
- * fail here. (The datasets' own meta cross-checks run as part of loading.)
+ * fit path, and every method/provenance field must equal its published
+ * constant. Recomputes every numeric from data/ and compares bit-for-bit,
+ * re-derives the provenance fields from the records (not the copied meta),
+ * and pins the pmf-check table to the full published range — a hand-edited
+ * parameter, a reworded method, a trimmed evidence table, a swapped dataset,
+ * or a silent formula change all fail here. Only generatedAt and the dataset
+ * paths float (the paths are pinned implicitly: the datasets are loaded FROM
+ * them). The datasets' own meta cross-checks run as part of loading.
  */
 
 const ARTIFACT_PATH = 'data/totals-dispersion-TOTALS_V1_PROVISIONAL.json';
@@ -47,6 +65,32 @@ test('the committed artifact is exactly reproducible from the committed datasets
 
   const primary = fitTotalsDispersionMoments({ totals: fullTotals, closeLines });
   const regulation = fitTotalsDispersionMoments({ totals: regulationTotals, closeLines });
+
+  // Method/provenance prose: pinned to the published constants.
+  assert.equal(artifact.parameterization, TOTALS_DISPERSION_PARAMETERIZATION, 'parameterization');
+  assert.equal(artifact.primaryFit.basis, PRIMARY_FIT_BASIS, 'basis');
+  assert.equal(artifact.primaryFit.method, PRIMARY_FIT_METHOD, 'method');
+  assert.equal(artifact.primaryFit.retrosheet.window, RETROSHEET_FIT_WINDOW, 'window');
+  assert.equal(artifact.primaryFit.closeSpread.source, CLOSE_SPREAD_SOURCE, 'source');
+  assert.deepEqual(artifact.knownApproximations, [...KNOWN_APPROXIMATIONS], 'knownApproximations');
+  assert.equal(artifact.refitPlan, REFIT_PLAN, 'refitPlan');
+
+  // Provenance re-derived from the RECORDS (not the copied meta fields).
+  assert.deepEqual(
+    artifact.primaryFit.retrosheet.seasons,
+    [...new Set(retrosheet.games.map((game) => game.season))].sort((a, b) => a - b),
+    'seasons',
+  );
+  assert.deepEqual(
+    artifact.primaryFit.closeSpread.confidence,
+    rederivedConfidence(inhouse.records),
+    'confidence histogram',
+  );
+  assert.deepEqual(
+    artifact.primaryFit.closeSpread.lockTimeRange,
+    rederivedLockTimeRange(inhouse.records),
+    'lockTimeRange',
+  );
 
   // Headline parameter and every published moment: exact equality.
   assert.equal(artifact.k, primary.k, 'k');
@@ -120,13 +164,12 @@ test('the committed artifact is exactly reproducible from the committed datasets
     [PUSH_ANCHOR_BAND[0], PUSH_ANCHOR_BAND[1]],
     'acceptance band',
   );
-  const tValues = artifact.anchors.marginalPmfCheck.rows.map((row) => row.t);
-  const tMin = tValues[0];
-  const tMax = tValues[tValues.length - 1];
-  assert.ok(tMin !== undefined && tMax !== undefined, 'pmf check rows exist');
+  // The misfit-evidence table is recomputed over the PUBLISHED range
+  // constants, never a range read back from the artifact under test —
+  // trimming awkward rows out of the committed table fails here.
   assert.deepEqual(
     artifact.anchors.marginalPmfCheck,
-    marginalPmfCheck(fullTotals, closeLines, primary.k, tMin, tMax),
+    marginalPmfCheck(fullTotals, closeLines, primary.k, PMF_CHECK_T_MIN, PMF_CHECK_T_MAX),
     'marginal pmf check',
   );
 

@@ -165,7 +165,7 @@ yarn extract:totals                 # captured closing totals + finals -> data/i
 yarn fit:totals --inhouse data/inhouse-totals-<date>.ndjson   # -> data/totals-dispersion-TOTALS_V1_PROVISIONAL.json
 ```
 
-The fit is deterministic given its committed inputs, refuses to publish on any gate failure, and the test suite recomputes the committed artifact from the committed datasets and requires exact equality. The historical finals derive from Retrosheet game logs — the information used here was obtained free of charge from and is copyrighted by Retrosheet; interested parties may contact Retrosheet at "www.retrosheet.org".
+The fit is deterministic given its committed inputs, refuses to publish on any gate failure, and the test suite recomputes the committed artifact from the committed datasets and requires exact equality. The historical finals derive from Retrosheet game logs. The information used here was obtained free of charge from and is copyrighted by Retrosheet. Interested parties may contact Retrosheet at "www.retrosheet.org".
 
 ## Secrets discipline
 

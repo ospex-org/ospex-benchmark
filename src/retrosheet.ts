@@ -211,8 +211,10 @@ export interface RetrosheetDataset {
 
 /**
  * Parse + integrity-check a committed Retrosheet dataset: exactly one leading
- * meta record, and the meta's game count must match the records actually
- * present (a truncated or edited file refuses to load).
+ * meta record, the meta's game count matching the records actually present,
+ * and the meta's season list (which flows into the published artifact)
+ * matching the distinct seasons of the records (a truncated or edited file
+ * refuses to load).
  */
 export function parseRetrosheetDataset(text: string): RetrosheetDataset {
   const lines = text.split(/\r?\n/).filter((line) => line.trim() !== '');
@@ -222,6 +224,13 @@ export function parseRetrosheetDataset(text: string): RetrosheetDataset {
   if (games.length !== meta.games) {
     throw new RetrosheetParseError(
       `meta says ${meta.games} games but the dataset holds ${games.length} — truncated or edited?`,
+    );
+  }
+  const seasons = [...new Set(games.map((game) => game.season))].sort((a, b) => a - b);
+  if (JSON.stringify(seasons) !== JSON.stringify(meta.seasons)) {
+    throw new RetrosheetParseError(
+      `meta seasons [${meta.seasons.join(', ')}] disagree with the records' seasons ` +
+        `[${seasons.join(', ')}] — truncated or edited?`,
     );
   }
   return { meta, games };

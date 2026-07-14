@@ -167,6 +167,14 @@ test('parseRetrosheetDataset: meta/record count mismatch is refused', () => {
   assert.throws(() => parseRetrosheetDataset(text), /truncated or edited/);
 });
 
+test('parseRetrosheetDataset: a season list disagreeing with the records is refused', () => {
+  // meta claims 2023+2024 but every record is 2023 — the seasons field flows
+  // into the published artifact, so it must be record-backed.
+  const meta = { ...metaRecord(1), seasons: [2023, 2024] };
+  const text = [meta, gameRecord()].map((record) => JSON.stringify(record)).join('\n');
+  assert.throws(() => parseRetrosheetDataset(text), /seasons/);
+});
+
 test('parseRetrosheetDataset: a dataset without the exact attribution notice is invalid', () => {
   const meta = { ...metaRecord(1), attribution: 'data from retrosheet dot org' };
   const text = [meta, gameRecord()].map((record) => JSON.stringify(record)).join('\n');

@@ -34,6 +34,47 @@ import { RETROSHEET_ATTRIBUTION } from './retrosheet.js';
 
 export const TOTALS_DISPERSION_PARAMETER_VERSION = 'TOTALS_V1_PROVISIONAL';
 
+/**
+ * The published method/provenance prose of THIS parameter version — exported
+ * so the fit CLI writes them and the artifact integrity test pins them; a
+ * hand-edit to any of these fields in the committed artifact fails the suite
+ * exactly like a hand-edited number would.
+ */
+export const TOTALS_DISPERSION_PARAMETERIZATION =
+  'negative binomial with mean mu and dispersion k: Var(T | mu) = mu + mu^2 / k';
+export const PRIMARY_FIT_BASIS =
+  'settlement: all completed finals including extra innings; forfeits and ' +
+  'rain-shortened (under 51 outs) games excluded';
+export const PRIMARY_FIT_METHOD =
+  'moment decomposition with the Jensen term retained: ' +
+  'k = (mean^2 + Var(lines)) / (Var(T) - Var(lines) - mean), with Var(T) and mean ' +
+  'from Retrosheet finals and Var(lines) from our captured closing totals';
+export const RETROSHEET_FIT_WINDOW = 'MLB regular seasons 2023-2025';
+export const CLOSE_SPREAD_SOURCE =
+  'production closing_lines capture (MLB totals, polygon network) over the ' +
+  'public anon read path';
+export const KNOWN_APPROXIMATIONS: readonly string[] = [
+  'closing line used as the market mean; price-implied skew ignored',
+  'close-spread window (May-Jul 2026) vs fit window (2023-2025 full seasons): era and seasonal-coverage mismatch',
+  'closing-line sample variance includes market noise and 0.5-run quantization, over-subtracting Var(mu)',
+  'a smooth NB cannot reproduce the odd/even parity oscillation of MLB totals (see marginalPmfCheck)',
+  'dispersion k assumed constant across means',
+  'walk-off truncation is absorbed into the marginal, not modeled',
+];
+export const REFIT_PLAN =
+  'TOTALS_V1: maximum-likelihood refit on in-house (closing total, prices, final) ' +
+  'pairs conditional on the close-implied mean, same reference feed, once pairs reach ' +
+  'a workable n (~300, expected mid-August 2026); ladder_version distinguishes the ' +
+  'two and history recomputes';
+
+/**
+ * The published pmf-check row range. Part of the artifact contract: the
+ * integrity test recomputes the table over exactly this range, so the
+ * committed misfit evidence cannot be silently narrowed to friendlier rows.
+ */
+export const PMF_CHECK_T_MIN = 4;
+export const PMF_CHECK_T_MAX = 14;
+
 export class DispersionFitError extends Error {}
 
 /**

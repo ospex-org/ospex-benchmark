@@ -2,10 +2,19 @@ import { readFileSync } from 'node:fs';
 import { describeErrorWithStack } from './config.js';
 import { printError, printLine } from './console.js';
 import {
+  CLOSE_SPREAD_SOURCE,
   fitTotalsDispersionMoments,
+  KNOWN_APPROXIMATIONS,
   marginalPmfCheck,
+  PMF_CHECK_T_MAX,
+  PMF_CHECK_T_MIN,
+  PRIMARY_FIT_BASIS,
+  PRIMARY_FIT_METHOD,
   PUSH_ANCHOR_BAND,
+  REFIT_PLAN,
+  RETROSHEET_FIT_WINDOW,
   TOTALS_DISPERSION_PARAMETER_VERSION,
+  TOTALS_DISPERSION_PARAMETERIZATION,
   totalsDispersionArtifactSchema,
 } from './dispersion.js';
 import { parseInhouseTotalsDataset } from './inhouseTotals.js';
@@ -23,9 +32,6 @@ import type { TotalsDispersionArtifact } from './dispersion.js';
  */
 
 class UsageError extends Error {}
-
-const PMF_CHECK_T_MIN = 4;
-const PMF_CHECK_T_MAX = 14;
 
 const USAGE = `Usage: yarn fit:totals --inhouse PATH [options]
 
@@ -136,21 +142,15 @@ function main(): number {
     sport: 'mlb',
     market: 'total',
     distribution: 'negative-binomial',
-    parameterization:
-      'negative binomial with mean mu and dispersion k: Var(T | mu) = mu + mu^2 / k',
+    parameterization: TOTALS_DISPERSION_PARAMETERIZATION,
     k: primary.k,
     primaryFit: {
-      basis:
-        'settlement: all completed finals including extra innings; forfeits and ' +
-        'rain-shortened (under 51 outs) games excluded',
-      method:
-        'moment decomposition with the Jensen term retained: ' +
-        'k = (mean^2 + Var(lines)) / (Var(T) - Var(lines) - mean), with Var(T) and mean ' +
-        'from Retrosheet finals and Var(lines) from our captured closing totals',
+      basis: PRIMARY_FIT_BASIS,
+      method: PRIMARY_FIT_METHOD,
       retrosheet: {
         dataset: options.retrosheetPath,
         seasons: retrosheet.meta.seasons,
-        window: 'MLB regular seasons 2023-2025',
+        window: RETROSHEET_FIT_WINDOW,
         nGames: primary.n,
         nForfeitsExcluded,
         nShortenedExcluded,
@@ -161,9 +161,7 @@ function main(): number {
       },
       closeSpread: {
         dataset: options.inhousePath,
-        source:
-          'production closing_lines capture (MLB totals, polygon network) over the ' +
-          'public anon read path',
+        source: CLOSE_SPREAD_SOURCE,
         n: primary.closeN,
         confidence: inhouse.meta.confidence,
         lockTimeRange,
@@ -191,19 +189,8 @@ function main(): number {
         pushes: pushes.length,
       },
     },
-    knownApproximations: [
-      'closing line used as the market mean; price-implied skew ignored',
-      'close-spread window (May-Jul 2026) vs fit window (2023-2025 full seasons): era and seasonal-coverage mismatch',
-      'closing-line sample variance includes market noise and 0.5-run quantization, over-subtracting Var(mu)',
-      'a smooth NB cannot reproduce the odd/even parity oscillation of MLB totals (see marginalPmfCheck)',
-      'dispersion k assumed constant across means',
-      'walk-off truncation is absorbed into the marginal, not modeled',
-    ],
-    refitPlan:
-      'TOTALS_V1: maximum-likelihood refit on in-house (closing total, prices, final) ' +
-      'pairs conditional on the close-implied mean, same reference feed, once pairs reach ' +
-      'a workable n (~300, expected mid-August 2026); ladder_version distinguishes the ' +
-      'two and history recomputes',
+    knownApproximations: [...KNOWN_APPROXIMATIONS],
+    refitPlan: REFIT_PLAN,
     attribution: RETROSHEET_ATTRIBUTION,
     generatedAt: new Date().toISOString(),
   };
