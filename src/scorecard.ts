@@ -1,3 +1,4 @@
+import { PROPORTIONAL_DEVIG_METHOD, SHIN_DEVIG_METHOD } from './clv.js';
 import { MARKETS, SCORING_POLICY_VERSION } from './scoring.js';
 import type { MarketStats, ParticipantStats, ScoredPick, SourceRun } from './scoring.js';
 import type { MarketKey } from './types.js';
@@ -47,8 +48,9 @@ function clvRow(stat: ParticipantStats): string {
   return (
     `| ${stat.participantId} | ${stat.gamesScoreable} | ${fmt(stat.gameLevel.meanClvPct)} | ` +
     `${fmt(stat.gameLevel.medianClvPct)} | ${fmt(stat.gameLevel.beatClosePct, '%')} | ` +
+    `${fmt(stat.gameLevelMarginAdjusted.meanClvPct)} | ${fmt(stat.gameLevelMarginAdjusted.beatClosePct, '%')} | ` +
     `${stat.primaryScoreable}/${stat.eligibleMarkets} | ${fmt(stat.perPick.meanClvPct)} | ` +
-    `${fmt(stat.perPick.medianClvPct)} | ${fmt(stat.perPick.beatClosePct, '%')} |`
+    `${fmt(stat.perPickMarginAdjusted.meanClvPct)} |`
   );
 }
 
@@ -56,7 +58,20 @@ function marketRow(stat: ParticipantStats, market: MarketStats): string {
   return (
     `| ${stat.participantId} | ${market.picks} | ${market.scoreable}/${market.eligible} | ${market.gamesScoreable} | ` +
     `${fmt(market.gameLevel.meanClvPct)} | ${fmt(market.gameLevel.medianClvPct)} | ` +
-    `${fmt(market.gameLevel.beatClosePct, '%')} | ${reasons(market.unscoredByReason)} |`
+    `${fmt(market.gameLevel.beatClosePct, '%')} | ${fmt(market.gameLevelMarginAdjusted.meanClvPct)} | ` +
+    `${fmt(market.gameLevelMarginAdjusted.beatClosePct, '%')} | ${reasons(market.unscoredByReason)} |`
+  );
+}
+
+function sensitivityRow(stat: ParticipantStats): string {
+  const delta = (a: number | null, b: number | null): string =>
+    a === null || b === null ? '—' : `${Math.round((b - a) * 1e4) / 1e4}`;
+  return (
+    `| ${stat.participantId} | ${stat.gamesScoreable}/${stat.shinGamesScoreable} | ` +
+    `${fmt(stat.gameLevel.meanClvPct)} | ${fmt(stat.gameLevelShin.economic.meanClvPct)} | ` +
+    `${delta(stat.gameLevel.meanClvPct, stat.gameLevelShin.economic.meanClvPct)} | ` +
+    `${fmt(stat.gameLevelMarginAdjusted.meanClvPct)} | ${fmt(stat.gameLevelShin.marginAdjusted.meanClvPct)} | ` +
+    `${delta(stat.gameLevelMarginAdjusted.meanClvPct, stat.gameLevelShin.marginAdjusted.meanClvPct)} |`
   );
 }
 
@@ -86,7 +101,10 @@ export function buildScorecardMarkdown(
   lines.push(`- Scored: ${scoredAt}`);
   lines.push(`- Scoring policy: \`${SCORING_POLICY_VERSION}\` (stamped on every scored record)`);
   lines.push(
-    '- Metric: **reference-closing CLV** in expected-ROI percentage points — the frozen entry price against the proportional no-vig close of the same contract from a single reference source. Decision CLV only; nothing was executed.',
+    '- Metrics: **reference-closing CLV** in expected-ROI percentage points, computed BOTH ways from the same formula and always shown side by side — **economic** (the vig-in entry price against the proportional no-vig close: the industry-standard reading, which sits at about minus the vig when nothing moves) and **margin-adjusted** (the proportionally de-vigged entry against the same close: 0 means the forecast exactly matched the market). Neither replaces the other. Decision CLV only; nothing was executed.',
+  );
+  lines.push(
+    `- De-vig method: \`${PROPORTIONAL_DEVIG_METHOD}\` (primary, both metrics; identical to the production closing-line capture). A \`${SHIN_DEVIG_METHOD}\` sensitivity recompute of both metrics is reported separately below — the proportional-vs-Shin choice is published, not hidden.`,
   );
   lines.push(
     '- Primary summary: **equal-weight game-level aggregate** (per-game mean CLV, averaged across games). Per-pick numbers are secondary.',
@@ -95,7 +113,7 @@ export function buildScorecardMarkdown(
     '- Comparison rule: **never pool CLV across markets when comparing participants with different market exposure** — vig differs by market (a moneyline-only baseline and a three-market model are not on the same footing). Pooled tables are context; cross-participant comparison belongs in the per-market section.',
   );
   lines.push(
-    '- Policy: `fresh`-confidence closes only; price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable lines report separately-labeled conditional CLV, never pooled into primary.',
+    '- Policy: `fresh`-confidence closes only; price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable lines report separately-labeled conditional variants of BOTH metrics, never pooled into primary.',
   );
   lines.push('');
 
@@ -115,18 +133,17 @@ export function buildScorecardMarkdown(
     'Model rows pool moneyline, spread, and total exposure; single-market baselines pool nothing. Compare participants in the per-market section below.',
   );
   lines.push('');
-  lines.push(
-    '| Participant | Games scoreable | Game-level mean | Game-level median | Game-level beat close | Scoreable/eligible | Per-pick mean | Per-pick median | Per-pick beat close |',
-  );
-  lines.push('|---|---|---|---|---|---|---|---|---|');
+  const CLV_HEADER =
+    '| Participant | Games scoreable | Econ game-mean | Econ median | Econ beat close | Margin-adj game-mean | Margin-adj beat close | Scoreable/eligible | Per-pick econ mean | Per-pick margin-adj mean |';
+  const CLV_DIVIDER = '|---|---|---|---|---|---|---|---|---|---|';
+  lines.push(CLV_HEADER);
+  lines.push(CLV_DIVIDER);
   for (const stat of models) lines.push(clvRow(stat));
   lines.push('');
   lines.push('### Deterministic baselines');
   lines.push('');
-  lines.push(
-    '| Participant | Games scoreable | Game-level mean | Game-level median | Game-level beat close | Scoreable/eligible | Per-pick mean | Per-pick median | Per-pick beat close |',
-  );
-  lines.push('|---|---|---|---|---|---|---|---|---|');
+  lines.push(CLV_HEADER);
+  lines.push(CLV_DIVIDER);
   for (const stat of baselines) lines.push(clvRow(stat));
   lines.push('');
 
@@ -154,12 +171,26 @@ export function buildScorecardMarkdown(
     lines.push(`### ${MARKET_LABEL[marketKey]}`);
     lines.push('');
     lines.push(
-      '| Participant | Picks | Scoreable/eligible | Games scoreable | Game-level mean | Game-level median | Game-level beat close | Unscored (reason) |',
+      '| Participant | Picks | Scoreable/eligible | Games scoreable | Econ mean | Econ median | Econ beat close | Margin-adj mean | Margin-adj beat close | Unscored (reason) |',
     );
-    lines.push('|---|---|---|---|---|---|---|---|');
+    lines.push('|---|---|---|---|---|---|---|---|---|---|');
     for (const { stat, market } of active) lines.push(marketRow(stat, market));
     lines.push('');
   }
+
+  lines.push(`## De-vig sensitivity (\`${SHIN_DEVIG_METHOD}\` vs \`${PROPORTIONAL_DEVIG_METHOD}\`)`);
+  lines.push('');
+  lines.push(
+    'Both metrics recomputed under the Shin de-vig, from the raw two-sided quotes at entry and close. This is a within-participant method-sensitivity readout (pooled game-level means), not a comparison surface — if the deltas are small, the conclusions do not depend on the de-vig choice. The deltas are method-only when the game counts match; shin needs the raw closing quotes, so its count can trail when a close lacks them (the n column discloses both).',
+  );
+  lines.push('');
+  lines.push(
+    '| Participant | Games n (prop/shin) | Econ (proportional) | Econ (shin) | Δ | Margin-adj (proportional) | Margin-adj (shin) | Δ |',
+  );
+  lines.push('|---|---|---|---|---|---|---|---|');
+  for (const stat of models) lines.push(sensitivityRow(stat));
+  for (const stat of baselines) lines.push(sensitivityRow(stat));
+  lines.push('');
 
   const moved = scored.filter((p) => p.result.unscoredReason === 'line_moved');
   if (moved.length > 0) {

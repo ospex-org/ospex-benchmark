@@ -1,6 +1,6 @@
 # Ospex Agent Benchmark — Canonical MVE Design
 
-- Last updated UTC: `2026-07-14T04:05:00Z`
+- Last updated UTC: `2026-07-14T07:40:00Z`
 - Status: accepted application-layer direction; methodology and harness gates remain in progress
 - Scope: MLB-first, one fixed canonical cohort plus separately labeled open/community cohorts
 - Prompt/schema working draft: [BENCHMARK_PROMPT_V0.md](BENCHMARK_PROMPT_V0.md)
@@ -153,7 +153,7 @@ This rule is a durable lesson from Block K (artifact PR #49): all model fills we
 
 ## Closing snapshot policy
 
-Preregister one neutral reference-closing path or a fixed source list, the de-vig method, fallback order, maximum quote age, delayed/postponed-game rules, and treatment of missing sides/feed errors. Use the last source-timestamped quote before official first pitch/in-play status; never select a later or alternative close because it improves an arm's score.
+Preregister one neutral reference-closing path or a fixed source list, the de-vig method (named and versioned — `proportional-v1` is primary, with sensitivity variants separately labeled), fallback order, maximum quote age, delayed/postponed-game rules, and treatment of missing sides/feed errors. Use the last source-timestamped quote before official first pitch/in-play status; never select a later or alternative close because it improves an arm's score.
 
 If multiple fixed sources are eventually used, de-vig each source first and aggregate their closing probabilities with one frozen rule such as the median. Until then, describe the metric as **reference-closing CLV** rather than a universal market consensus.
 
@@ -188,9 +188,29 @@ Primary ticket CLV, expressed as closing-implied expected ROI percentage points,
 reference_clv_pct = 100 * (D_e * q_s - 1)
 ```
 
-Positive means the entry price beat the no-vig reference close. Do **not** de-vig the Ospex/common entry price: it is the price actually offered. Remove vig only from the external two-sided closing reference.
+Positive means the entry price beat the no-vig reference close. For this ECONOMIC metric, do **not** de-vig the Ospex/common entry price: it is the price actually offered, so a flat market reads at about minus the vig by construction. Remove vig only from the external two-sided closing reference.
 
-Also preserve and report the raw entry/closing odds, simple/log decimal-price ratio, and the auxiliary probability-scale movement `100 * (q_s - 1 / D_e)`. These are diagnostics, not competing undisclosed primary formulas.
+### Margin-adjusted reference-closing CLV
+
+Whether closing-line value should account for the bookmaker's margin at the entry is a live, documented debate among betting analysts. The benchmark does not take a side by hiding anything: it computes the same formula a second time with the margin removed from the entry as well, and always reports the two side by side. The economic metric is never replaced.
+
+With `q_e` the proportional no-vig entry probability of the selected side (from both sides of the same frozen entry quote) and `q_P_e` its push probability, the fair entry price is:
+
+```text
+D_fair = (1 - q_P_e) / q_e
+```
+
+and margin-adjusted CLV is the primary formula at that price, which on push-free contracts reduces to:
+
+```text
+margin_adjusted_clv_pct = 100 * (q_s / q_e - 1)
+```
+
+Zero means the forecast exactly matched the market. The margin-adjusted metric answers "was the forecast better than the market's?"; the economic metric answers "would this ticket have made money at the posted price?".
+
+The de-vig method is part of the metric, so it is named and versioned on every scored record: `proportional-v1` is primary at both ends (the identical formula behind the production closing-line capture), and a `shin-v1` sensitivity recompute of both metrics from the raw two-sided quotes is reported separately labeled — proportional-vs-Shin is a known methodological argument, and the choice is published, never hidden and never silently pooled.
+
+Also preserve and report the raw entry/closing odds, simple/log decimal-price ratio, and the auxiliary probability-scale movement `100 * (q_s - 1 / D_e)`. These are diagnostics; the two named CLV metrics and their labeled sensitivity variants are the only preregistered formulas.
 
 If the close comes from one designated reference path rather than a fixed multi-book consensus, call the metric **reference-closing CLV** rather than implying a universal market close.
 
@@ -202,7 +222,7 @@ For v1, half-run spreads/totals have the cleanest binary CLV. For integer lines,
 reference_clv_pct = 100 * (q_W * D_e + q_P - 1)
 ```
 
-Ordinary two-sided prices generally do not identify push probability. Without a preregistered independent `q_P`, mark integer-line primary CLV unavailable or separately label it conditional CLV; do not pool it silently with directly observed binary CLV.
+Ordinary two-sided prices generally do not identify push probability. Without a preregistered independent `q_P`, mark integer-line primary CLV unavailable or separately label it conditional CLV; do not pool it silently with directly observed binary CLV. The margin-adjusted metric mirrors this exactly: integer-line primary is unavailable, and a separately labeled push-excluded conditional variant (`100 * (q_cond_close / q_cond_entry - 1)`) is reported, never pooled.
 
 ### Spread and total line movement
 
@@ -226,8 +246,9 @@ The current Ospex closing-line path has already produced a line-mismatch/null-CL
 
 Primary benchmark outputs:
 
-- mean and median no-vig reference-closing CLV in expected-ROI percentage points;
-- percentage beating the no-vig reference close;
+- mean and median reference-closing CLV in expected-ROI percentage points, economic and margin-adjusted side by side;
+- percentage beating the no-vig reference close, under both metrics;
+- a de-vig-method sensitivity readout (`shin-v1` vs `proportional-v1`) of both metrics;
 - auxiliary raw/log price ratio and probability-scale movement;
 - CLV-measurable `n`, total eligible `n`, and exclusion counts;
 - equal-weight game-level aggregate as the primary summary, with market-stratified results also reported;
@@ -250,7 +271,7 @@ ROI remains important because actual funds move through Ospex, but it should not
 
 ## Publication and claims policy
 
-Before a canonical cohort starts, publish or timestamp the methodology manifest, prompt/tool hashes, model IDs/settings, cutoff/exclusion rules, stake rule, and CLV formula. Afterward publish sanitized inputs, decisions, fills/transactions, closing snapshots, outcomes, costs, and caveats.
+Before a canonical cohort starts, publish or timestamp the methodology manifest, prompt/tool hashes, model IDs/settings, cutoff/exclusion rules, stake rule, and CLV formulas (economic and margin-adjusted, with the de-vig methods named and versioned). Afterward publish sanitized inputs, decisions, fills/transactions, closing snapshots, outcomes, costs, and caveats.
 
 Defensible wording:
 

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { BASELINE_POLICY_VERSION, isBaselinePolicyVersion, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
-import { scoreDecision } from './clv.js';
+import { PROPORTIONAL_DEVIG_METHOD, scoreDecision, SHIN_DEVIG_METHOD } from './clv.js';
 import { checkProviderCollision } from './providers/family.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
@@ -34,8 +34,10 @@ import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } fr
  * math, aggregation, or the scored-record/scorecard shape, so two scored
  * artifacts are never silently compared across engine behaviors. Scored
  * output produced before stamping existed is `scoring-v0.1.0` by definition.
+ * v0.3.0 adds margin-adjusted CLV (+ conditional mirror) and the shin-v1
+ * de-vig sensitivity block alongside the unchanged economic primary.
  */
-export const SCORING_POLICY_VERSION = 'scoring-v0.2.0';
+export const SCORING_POLICY_VERSION = 'scoring-v0.3.0';
 
 /** The scored markets, anchored to MarketKey so drift is a compile error. */
 export const MARKETS: ReadonlyArray<MarketKey> = ['moneyline', 'spread', 'total'];
@@ -93,14 +95,19 @@ const bundleGameSchema = z
         scheduledStartUtc: z.string().min(1),
         markets: z
           .object({
+            // Every bundle price must be a valid decimal quote (>1), exactly
+            // like decision observedDecimal: BOTH sides feed the
+            // margin-adjusted entry de-vig, so an invalid opposite side must
+            // refuse the file at parse time rather than silently dropping
+            // margin-adjusted values while economic ones still score.
             moneyline: z
-              .object({ awayDecimal: z.number(), homeDecimal: z.number() })
+              .object({ awayDecimal: z.number().gt(1), homeDecimal: z.number().gt(1) })
               .passthrough(),
             runLine: z
-              .object({ line: z.number(), awayDecimal: z.number(), homeDecimal: z.number() })
+              .object({ line: z.number(), awayDecimal: z.number().gt(1), homeDecimal: z.number().gt(1) })
               .passthrough(),
             total: z
-              .object({ line: z.number(), overDecimal: z.number(), underDecimal: z.number() })
+              .object({ line: z.number(), overDecimal: z.number().gt(1), underDecimal: z.number().gt(1) })
               .passthrough(),
           })
           .passthrough(),
@@ -1254,6 +1261,8 @@ export function closesByKey(rows: ClosingLineRow[]): Map<string, ClosingLineRow>
 
 export interface ScoredPick extends SourcePick {
   side: SelectedSide;
+  /** The opposite side's frozen bundle price — the margin-adjusted entry de-vig input. */
+  entryOppositeDecimal: number;
   result: ClvResult;
   close: ClosingLineRow | null;
 }
@@ -1290,16 +1299,25 @@ export function scoreRun(run: SourceRun, closeRows: ClosingLineRow[]): ScoredPic
     const side = sideForSelection(pick.market, pick.selection, game);
     const movementSelection =
       pick.market === 'total' ? (pick.selection as 'over' | 'under') : side;
+    // The opposite side of the same contract, from the same hash-verified
+    // bundle the entry price was verified against — the margin-adjusted
+    // entry de-vig needs both sides.
+    const entryOppositeDecimal = expectedEntry(
+      game,
+      pick.market,
+      side === 'away' ? 'home' : 'away',
+    ).price;
     const close = closes.get(`${pick.gameId}:${pick.market}`) ?? null;
     const result = scoreDecision(
       pick.market,
       side,
       movementSelection,
       pick.entryDecimal,
+      entryOppositeDecimal,
       pick.line,
       close === null ? null : closeQuoteFromRow(close),
     );
-    return { ...pick, side, result, close };
+    return { ...pick, side, entryOppositeDecimal, result, close };
   });
 }
 
@@ -1336,6 +1354,9 @@ export interface MarketStats {
    */
   gameLevel: ClvSummary;
   perPick: ClvSummary;
+  /** Margin-adjusted mirrors of gameLevel/perPick (same clustering). */
+  gameLevelMarginAdjusted: ClvSummary;
+  perPickMarginAdjusted: ClvSummary;
   unscoredByReason: Record<string, number>;
 }
 
@@ -1351,11 +1372,32 @@ export interface ParticipantStats {
   /** Arm-level outcome counts (models) — failures stay in the denominator. */
   armOutcomes: Record<string, number>;
   primaryScoreable: number;
+  /**
+   * Rows with a margin-adjusted value — equals primaryScoreable by
+   * construction: the two metrics share every availability gate, and the
+   * bundle schema refuses files whose opposite-side prices are not valid
+   * quotes (>1), so the entry de-vig can never fail on a parsed run.
+   */
+  marginAdjustedScoreable: number;
   /** PRIMARY: equal-weight game-level aggregate (mean of per-game mean CLV). */
   gamesScoreable: number;
   gameLevel: ClvSummary;
   /** Secondary: per-pick aggregate. */
   perPick: ClvSummary;
+  /** Margin-adjusted mirrors of gameLevel/perPick (same clustering). */
+  gameLevelMarginAdjusted: ClvSummary;
+  perPickMarginAdjusted: ClvSummary;
+  /**
+   * shin-v1 sensitivity: pooled game-level summaries of both metrics under
+   * the Shin de-vig — a within-participant method-sensitivity readout, not
+   * a comparison surface (per-row values live on scored_decision records).
+   * shinGamesScoreable can trail gamesScoreable when a close row carries
+   * p_novig without raw decimals (shin needs the raw quotes); the scorecard
+   * discloses both counts so the deltas are never read across different
+   * game sets unknowingly.
+   */
+  gameLevelShin: { economic: ClvSummary; marginAdjusted: ClvSummary };
+  shinGamesScoreable: number;
   conditionalOnly: number;
   unscoredByReason: Record<string, number>;
   byMarket: Record<string, MarketStats>;
@@ -1390,6 +1432,32 @@ function summary(values: number[]): ClvSummary {
         ? null
         : round4((values.filter((v) => v > 0).length / values.length) * 100),
   };
+}
+
+/**
+ * Equal-weight game-first clustering for one metric extractor: collect the
+ * non-null values and the per-game means (average within each game first).
+ * Every metric (economic, margin-adjusted, shin variants) aggregates through
+ * this one path so the clustering can never diverge between metrics.
+ */
+function clusterByGame(
+  picks: ScoredPick[],
+  value: (pick: ScoredPick) => number | null,
+): { values: number[]; gameMeans: number[] } {
+  const values: number[] = [];
+  const byGame = new Map<string, number[]>();
+  for (const pick of picks) {
+    const v = value(pick);
+    if (v === null) continue;
+    values.push(v);
+    const list = byGame.get(pick.gameId) ?? [];
+    list.push(v);
+    byGame.set(pick.gameId, list);
+  }
+  const gameMeans = [...byGame.values()]
+    .map((vs) => mean(vs))
+    .filter((v): v is number => v !== null);
+  return { values, gameMeans };
 }
 
 export function aggregateByParticipant(
@@ -1427,9 +1495,6 @@ export function aggregateByParticipant(
       armOutcomes[response.outcome] = (armOutcomes[response.outcome] ?? 0) + 1;
     }
 
-    const primary = picks
-      .map((p) => p.result.primaryClvPct)
-      .filter((v): v is number => v !== null);
     const unscoredByReason: Record<string, number> = {};
     for (const pick of picks) {
       if (pick.result.unscoredReason !== null) {
@@ -1438,17 +1503,15 @@ export function aggregateByParticipant(
       }
     }
 
-    // Equal-weight game level: average scoreable CLV within each game first.
-    const byGame = new Map<string, number[]>();
-    for (const pick of picks) {
-      if (pick.result.primaryClvPct === null) continue;
-      const list = byGame.get(pick.gameId) ?? [];
-      list.push(pick.result.primaryClvPct);
-      byGame.set(pick.gameId, list);
-    }
-    const gameMeans = [...byGame.values()]
-      .map((values) => mean(values))
-      .filter((v): v is number => v !== null);
+    // Equal-weight game level: average scoreable CLV within each game first
+    // — identically for every metric.
+    const economic = clusterByGame(picks, (p) => p.result.primaryClvPct);
+    const marginAdjusted = clusterByGame(picks, (p) => p.result.marginAdjustedClvPct);
+    const shinEconomic = clusterByGame(picks, (p) => p.result.sensitivity?.economicClvPct ?? null);
+    const shinMarginAdjusted = clusterByGame(
+      picks,
+      (p) => p.result.sensitivity?.marginAdjustedClvPct ?? null,
+    );
 
     // Per-market aggregates use the same game-first clustering as the
     // pooled primary, scoped to one market — never pooled across markets.
@@ -1459,19 +1522,11 @@ export function aggregateByParticipant(
       const marketPicks = picks.filter((p) => p.market === market);
       const eligible = kind === 'model' ? responses.length : marketPicks.length;
       if (eligible === 0 && marketPicks.length === 0) continue;
-      const scoreable = marketPicks
-        .map((p) => p.result.primaryClvPct)
-        .filter((v): v is number => v !== null);
-      const marketByGame = new Map<string, number[]>();
-      for (const pick of marketPicks) {
-        if (pick.result.primaryClvPct === null) continue;
-        const list = marketByGame.get(pick.gameId) ?? [];
-        list.push(pick.result.primaryClvPct);
-        marketByGame.set(pick.gameId, list);
-      }
-      const marketGameMeans = [...marketByGame.values()]
-        .map((values) => mean(values))
-        .filter((v): v is number => v !== null);
+      const marketEconomic = clusterByGame(marketPicks, (p) => p.result.primaryClvPct);
+      const marketMarginAdjusted = clusterByGame(
+        marketPicks,
+        (p) => p.result.marginAdjustedClvPct,
+      );
       const marketUnscored: Record<string, number> = {};
       for (const pick of marketPicks) {
         if (pick.result.unscoredReason !== null) {
@@ -1482,10 +1537,12 @@ export function aggregateByParticipant(
       byMarket[market] = {
         eligible,
         picks: marketPicks.length,
-        scoreable: scoreable.length,
-        gamesScoreable: marketGameMeans.length,
-        gameLevel: summary(marketGameMeans),
-        perPick: summary(scoreable),
+        scoreable: marketEconomic.values.length,
+        gamesScoreable: marketEconomic.gameMeans.length,
+        gameLevel: summary(marketEconomic.gameMeans),
+        perPick: summary(marketEconomic.values),
+        gameLevelMarginAdjusted: summary(marketMarginAdjusted.gameMeans),
+        perPickMarginAdjusted: summary(marketMarginAdjusted.values),
         unscoredByReason: marketUnscored,
       };
     }
@@ -1497,10 +1554,18 @@ export function aggregateByParticipant(
       eligibleMarkets: kind === 'model' ? responses.length * 3 : picks.length,
       validDecisions: picks.length,
       armOutcomes,
-      primaryScoreable: primary.length,
-      gamesScoreable: gameMeans.length,
-      gameLevel: summary(gameMeans),
-      perPick: summary(primary),
+      primaryScoreable: economic.values.length,
+      marginAdjustedScoreable: marginAdjusted.values.length,
+      gamesScoreable: economic.gameMeans.length,
+      gameLevel: summary(economic.gameMeans),
+      perPick: summary(economic.values),
+      gameLevelMarginAdjusted: summary(marginAdjusted.gameMeans),
+      perPickMarginAdjusted: summary(marginAdjusted.values),
+      gameLevelShin: {
+        economic: summary(shinEconomic.gameMeans),
+        marginAdjusted: summary(shinMarginAdjusted.gameMeans),
+      },
+      shinGamesScoreable: shinEconomic.gameMeans.length,
       conditionalOnly: picks.filter((p) => p.result.conditionalClvPct !== null).length,
       unscoredByReason,
       byMarket,
@@ -1538,15 +1603,27 @@ export function scoredRecords(
     scoredAt,
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     integrityVerified: true,
-    metric: 'reference-closing CLV (single reference source, decision CLV only)',
+    metric:
+      'reference-closing CLV, economic + margin-adjusted (single reference source, decision CLV only)',
+    metrics: {
+      economic:
+        'vig-in entry vs no-vig close, 100*(D_e*q_close - 1) — the industry-standard reading; a flat market reads at about minus the vig (PRIMARY)',
+      marginAdjusted:
+        'de-vigged entry vs no-vig close, 100*(q_close/q_entry - 1) on push-free contracts — 0 means the forecast exactly matched the market (always reported alongside, never a replacement)',
+    },
+    devigMethods: {
+      primary: PROPORTIONAL_DEVIG_METHOD,
+      sensitivity: [SHIN_DEVIG_METHOD],
+    },
     primaryAggregate: 'equal-weight game-level mean (per-pick reported as secondary)',
     closePolicy: {
       confidenceRequired: 'fresh',
       lineMatchRequired: true,
-      integerLinePrimary: 'unavailable (conditional CLV separately labeled)',
+      integerLinePrimary: 'unavailable (conditional CLV separately labeled, both metrics)',
     },
     picks: scored.length,
     primaryScoreable: scored.filter((p) => p.result.primaryClvPct !== null).length,
+    marginAdjustedScoreable: scored.filter((p) => p.result.marginAdjustedClvPct !== null).length,
     armGameResponses: run.armResponses.length,
   });
   for (const pick of scored) {
@@ -1572,7 +1649,9 @@ export function scoredRecords(
       selection: pick.selection,
       side: pick.side,
       entryDecimal: pick.entryDecimal,
+      entryOppositeDecimal: pick.entryOppositeDecimal,
       entryLine: pick.line,
+      devigMethod: PROPORTIONAL_DEVIG_METHOD,
       modelWinProbability: pick.modelWinProbability,
       wouldAbstain: pick.wouldAbstain,
       selectedForExecution: pick.selectedForExecution,
@@ -1592,8 +1671,12 @@ export function scoredRecords(
       primaryClvPct: pick.result.primaryClvPct,
       unscoredReason: pick.result.unscoredReason,
       conditionalClvPct: pick.result.conditionalClvPct,
+      marginAdjustedClvPct: pick.result.marginAdjustedClvPct,
+      marginAdjustedConditionalClvPct: pick.result.marginAdjustedConditionalClvPct,
       lineMovementFavorable: pick.result.lineMovementFavorable,
       closingPNovigSelected: pick.result.closingPNovigSelected,
+      entryPNovigSelected: pick.result.entryPNovigSelected,
+      sensitivity: pick.result.sensitivity,
       aux: pick.result.aux,
     });
   }

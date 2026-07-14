@@ -1,25 +1,47 @@
+import {
+  PROPORTIONAL_DEVIG_METHOD,
+  proportionalTwoWay,
+  SHIN_DEVIG_METHOD,
+  shinTwoWay,
+} from './devig.js';
+
 /**
  * Reference-closing CLV — pure math and classification, no I/O.
  *
- * Implements the methodology in docs/AGENT_BENCHMARK.md ("CLV methodology"):
+ * Implements the methodology in docs/AGENT_BENCHMARK.md ("CLV methodology").
+ * TWO metrics are computed side by side on every scoreable pick — one
+ * formula, two entry prices:
  *
- * - Decision CLV compares the frozen entry price with the no-vig reference
- *   close of the exact same contract: `q_s` is the proportional no-vig
- *   closing probability of the selected side, and the primary metric is
- *   `reference_clv_pct = 100 * (D_e * q_s - 1)`. The entry price is NEVER
- *   de-vigged — it is the price actually offered.
+ * - ECONOMIC CLV (primary, the industry-standard reading): the frozen
+ *   VIG-IN entry price against the no-vig reference close of the same
+ *   contract — `100 * (D_e * q_s - 1)`. The entry price is never de-vigged
+ *   for THIS metric: it is the price actually offered, so a flat market
+ *   reads at about minus the vig by construction.
+ * - MARGIN-ADJUSTED CLV (companion, always reported alongside — never a
+ *   replacement): the same formula with the FAIR entry price derived from
+ *   the proportionally de-vigged two-sided entry quote, which reduces to
+ *   `100 * (q_close / q_entry - 1)` on push-free contracts. Zero means the
+ *   forecast exactly matched the market; the bookmaker's margin is removed
+ *   from BOTH ends, so it answers "was the forecast better than the
+ *   market's?" rather than "would this ticket have made money?".
+ * - De-vig methods are named and versioned (`proportional-v1` primary); a
+ *   `shin-v1` SENSITIVITY variant of both metrics is recomputed from the
+ *   raw two-sided quotes at entry and close and separately labeled — the
+ *   proportional-vs-Shin choice is published, never hidden, and never
+ *   primary.
  * - Price-only CLV is valid only at the same line. A moved spread/total
- *   makes primary CLV unavailable (never zero); favorable signed line
+ *   makes both metrics unavailable (never zero); favorable signed line
  *   movement is reported separately.
  * - Integer (push-capable) lines do not identify a push probability from
- *   two-sided prices: primary CLV is unavailable, and a separately labeled
- *   push-excluded conditional CLV is reported — never pooled with primary.
- * - Only `fresh`-confidence closes feed the primary metric (the market was
- *   still being polled at lock); stale or missing closes are unscored with
+ *   two-sided prices: both metrics are unavailable as primary, and
+ *   separately labeled push-excluded conditional variants are reported —
+ *   never pooled with primary.
+ * - Only `fresh`-confidence closes feed the metrics (the market was still
+ *   being polled at lock); stale or missing closes are unscored with
  *   stable reason codes.
  *
- * This is a SINGLE-source reference close, so the metric is always labeled
- * reference-closing CLV, not a universal market consensus.
+ * This is a SINGLE-source reference close, so the metrics are always
+ * labeled reference-closing CLV, not a universal market consensus.
  */
 
 export type SelectedSide = 'away' | 'home';
@@ -50,21 +72,46 @@ export interface AuxDiagnostics {
   logPriceRatio: number | null;
 }
 
+/**
+ * Shin-de-vigged (`shin-v1`) sensitivity variants of both metrics,
+ * recomputed from the raw two-sided quotes at entry and close. Separately
+ * labeled; never pooled with the proportional-v1 primaries.
+ */
+export interface ShinSensitivity {
+  devigMethod: typeof SHIN_DEVIG_METHOD;
+  economicClvPct: number | null;
+  economicConditionalClvPct: number | null;
+  marginAdjustedClvPct: number | null;
+  marginAdjustedConditionalClvPct: number | null;
+  entryPShinSelected: number | null;
+  closingPShinSelected: number | null;
+}
+
 export interface ClvResult {
-  /** Primary reference-closing CLV in expected-ROI percentage points, or null. */
+  /** Primary ECONOMIC reference-closing CLV (vig-in entry), or null. */
   primaryClvPct: number | null;
   unscoredReason: UnscoredReason | null;
   /**
-   * Push-excluded conditional CLV for integer lines — separately labeled,
-   * never pooled with primary.
+   * Push-excluded conditional ECONOMIC CLV for integer lines — separately
+   * labeled, never pooled with primary.
    */
   conditionalClvPct: number | null;
+  /** MARGIN-ADJUSTED CLV (proportionally de-vigged entry), or null. */
+  marginAdjustedClvPct: number | null;
+  /** Push-excluded conditional MARGIN-ADJUSTED CLV for integer lines. */
+  marginAdjustedConditionalClvPct: number | null;
   /** Favorable signed line movement (spread/total, when the line moved). */
   lineMovementFavorable: number | null;
   /** q_s actually used (or that would have been used), when derivable. */
   closingPNovigSelected: number | null;
+  /** Proportionally de-vigged ENTRY probability of the selected side. */
+  entryPNovigSelected: number | null;
+  /** shin-v1 sensitivity variants (null when nothing was scoreable). */
+  sensitivity: ShinSensitivity | null;
   aux: AuxDiagnostics | null;
 }
+
+export { PROPORTIONAL_DEVIG_METHOD, SHIN_DEVIG_METHOD };
 
 function round4(value: number): number {
   return Math.round(value * 1e4) / 1e4;
@@ -101,8 +148,12 @@ function unscored(
     primaryClvPct: null,
     unscoredReason: reason,
     conditionalClvPct: null,
+    marginAdjustedClvPct: null,
+    marginAdjustedConditionalClvPct: null,
     lineMovementFavorable: null,
     closingPNovigSelected: null,
+    entryPNovigSelected: null,
+    sensitivity: null,
     aux: null,
     ...extras,
   };
@@ -134,34 +185,82 @@ export function favorableLineMovement(
 /**
  * Score one decision against its close.
  *
- * @param market       decision market
- * @param side         selected side mapped onto the close's away/home columns
- *                     (totals: over = away column, under = home column)
- * @param entryDecimal frozen entry price D_e (vig-in, as offered)
- * @param entryLine    decision line (home-handicap spread / total; null for moneyline)
- * @param close        the captured reference close, or null if no row exists
+ * @param market               decision market
+ * @param side                 selected side mapped onto the close's away/home
+ *                             columns (totals: over = away column, under =
+ *                             home column)
+ * @param movementSelection    selection label used for favorable-movement
+ *                             signing
+ * @param entryDecimal         frozen entry price D_e of the SELECTED side
+ *                             (vig-in, as offered)
+ * @param entryOppositeDecimal frozen entry price of the OPPOSITE side of the
+ *                             same contract, from the same hash-verified
+ *                             bundle — what the margin-adjusted entry de-vig
+ *                             needs; null disables the margin-adjusted and
+ *                             sensitivity outputs (never the economic ones)
+ * @param entryLine            decision line (home-handicap spread / total;
+ *                             null for moneyline)
+ * @param close                the captured reference close, or null if no
+ *                             row exists
  */
 export function scoreDecision(
   market: 'moneyline' | 'spread' | 'total',
   side: SelectedSide,
   movementSelection: SelectedSide | 'over' | 'under',
   entryDecimal: number,
+  entryOppositeDecimal: number | null,
   entryLine: number | null,
   close: CloseQuote | null,
 ): ClvResult {
-  if (close === null) return unscored('close_missing');
-  if (close.confidence === 'missing') return unscored('close_not_captured');
-  if (close.confidence === 'stale') return unscored('close_stale');
+  // The entry de-vig depends only on the frozen bundle, so it is recorded
+  // even on unscored rows (exact-line and ladder methods reuse it later).
+  const entryNovig = proportionalTwoWay(entryDecimal, entryOppositeDecimal);
+  const entryExtras: Partial<ClvResult> =
+    entryNovig === null ? {} : { entryPNovigSelected: round4(entryNovig.pSelected) };
+
+  if (close === null) return unscored('close_missing', entryExtras);
+  if (close.confidence === 'missing') return unscored('close_not_captured', entryExtras);
+  if (close.confidence === 'stale') return unscored('close_stale', entryExtras);
 
   const selected = selectedValues(close, side);
-  if (selected === null) return unscored('close_not_captured');
+  if (selected === null) return unscored('close_not_captured', entryExtras);
+
+  const closeShin =
+    side === 'away'
+      ? shinTwoWay(close.awayDecimal, close.homeDecimal)
+      : shinTwoWay(close.homeDecimal, close.awayDecimal);
+  const entryShin = shinTwoWay(entryDecimal, entryOppositeDecimal);
+
+  // One formula, two entry prices — and a shin-v1 recompute of both. The
+  // margin-adjusted ratio form `q_close / q_entry - 1` is the push-free
+  // specialization of `q_W * D_fair + q_P - 1` with D_fair = 1/q_entry.
+  const economic = (qClose: number): number => round4(100 * (entryDecimal * qClose - 1));
+  const marginAdjusted = (qClose: number, qEntry: number | null): number | null =>
+    qEntry === null ? null : round4(100 * (qClose / qEntry - 1));
+  const shinBlock = (conditional: boolean): ShinSensitivity => ({
+    devigMethod: SHIN_DEVIG_METHOD,
+    economicClvPct: conditional || closeShin === null ? null : economic(closeShin.pSelected),
+    economicConditionalClvPct:
+      conditional && closeShin !== null ? economic(closeShin.pSelected) : null,
+    marginAdjustedClvPct:
+      conditional || closeShin === null
+        ? null
+        : marginAdjusted(closeShin.pSelected, entryShin?.pSelected ?? null),
+    marginAdjustedConditionalClvPct:
+      conditional && closeShin !== null
+        ? marginAdjusted(closeShin.pSelected, entryShin?.pSelected ?? null)
+        : null,
+    entryPShinSelected: entryShin === null ? null : round4(entryShin.pSelected),
+    closingPShinSelected: closeShin === null ? null : round4(closeShin.pSelected),
+  });
 
   if (market !== 'moneyline') {
-    if (entryLine === null || close.line === null) return unscored('close_not_captured');
+    if (entryLine === null || close.line === null) return unscored('close_not_captured', entryExtras);
     if (entryLine !== close.line) {
-      // Price-only CLV is valid only at the same line: primary unavailable
-      // (never zero), favorable movement reported separately.
+      // Price-only CLV is valid only at the same line: both metrics
+      // unavailable (never zero), favorable movement reported separately.
       return unscored('line_moved', {
+        ...entryExtras,
         lineMovementFavorable: favorableLineMovement(
           market,
           movementSelection,
@@ -173,22 +272,33 @@ export function scoreDecision(
     }
     if (Number.isInteger(entryLine)) {
       // Push-capable contract: two-sided prices do not identify the push
-      // probability. Conditional (push-excluded) CLV is separately labeled.
+      // probability. Both metrics report separately labeled push-excluded
+      // conditional variants (the two-way de-vig of push-refund prices IS
+      // the conditional-on-no-push split, at entry and at close alike).
       return unscored('push_capable_line', {
-        conditionalClvPct: round4(100 * (entryDecimal * selected.pNovig - 1)),
+        ...entryExtras,
+        conditionalClvPct: economic(selected.pNovig),
+        marginAdjustedConditionalClvPct: marginAdjusted(
+          selected.pNovig,
+          entryNovig?.pSelected ?? null,
+        ),
         closingPNovigSelected: round4(selected.pNovig),
+        sensitivity: shinBlock(true),
         aux: auxDiagnostics(entryDecimal, selected.pNovig, selected.decimal),
       });
     }
   }
 
-  const clv = 100 * (entryDecimal * selected.pNovig - 1);
   return {
-    primaryClvPct: round4(clv),
+    primaryClvPct: economic(selected.pNovig),
     unscoredReason: null,
     conditionalClvPct: null,
+    marginAdjustedClvPct: marginAdjusted(selected.pNovig, entryNovig?.pSelected ?? null),
+    marginAdjustedConditionalClvPct: null,
     lineMovementFavorable: null,
     closingPNovigSelected: round4(selected.pNovig),
+    entryPNovigSelected: entryNovig === null ? null : round4(entryNovig.pSelected),
+    sensitivity: shinBlock(false),
     aux: auxDiagnostics(entryDecimal, selected.pNovig, selected.decimal),
   };
 }

@@ -946,7 +946,7 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
 test('the scoring policy version is pinned to its literal value', () => {
   // A bump must be a conscious edit HERE too. 'scoring-v0.1.0' is reserved
   // for pre-stamp output by definition and must never be emitted.
-  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.2.0');
+  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.3.0');
 });
 
 test('every scored record type is stamped with the scoring policy version', () => {
@@ -961,6 +961,59 @@ test('every scored record type is stamped with the scoring policy version', () =
   assert.deepEqual(
     [...byType].sort(),
     ['participant_scorecard', 'scored_decision', 'scored_run_meta'],
+  );
+});
+
+test('margin-adjusted CLV rides every scored surface: rows, aggregates, run meta', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const closes: ClosingLineRow[] = [
+    closeRow(GAME_A, 'moneyline'),
+    closeRow(GAME_B, 'moneyline', { away_p_novig: 0.4, home_p_novig: 0.6 }),
+  ];
+  const scored = scoreRun(run, closes);
+  const stats = aggregateByParticipant(scored, run);
+
+  // The wiring: the opposite side comes from the same bundle, so the model's
+  // home-ML margin-adjusted CLV must equal 100*(q_close/q_entry - 1) with
+  // q_entry from the bundle's two-sided quote (2.17 home / 1.74627 away).
+  // The de-vig math itself is golden-pinned in clv.test.ts.
+  const entryPHome = (1 / 2.17) / (1 / 2.17 + 1 / 1.74627);
+  const expectGameA = Math.round(100 * (0.5 / entryPHome - 1) * 1e4) / 1e4;
+  const modelMlPick = scored.find(
+    (p) => p.participantId === 'model-arm' && p.market === 'moneyline' && p.gameId === GAME_A,
+  );
+  assert.ok(modelMlPick);
+  assert.equal(modelMlPick.entryOppositeDecimal, 1.74627);
+  assert.equal(modelMlPick.result.marginAdjustedClvPct, expectGameA);
+
+  // Availability parity: the two metrics share every gate.
+  for (const stat of stats) {
+    assert.equal(stat.marginAdjustedScoreable, stat.primaryScoreable, stat.participantId);
+  }
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model);
+  assert.ok(model.gameLevelMarginAdjusted.meanClvPct !== null);
+  assert.ok(model.byMarket['moneyline']?.gameLevelMarginAdjusted.meanClvPct !== null);
+  assert.ok(model.gameLevelShin.economic.meanClvPct !== null);
+
+  // Scored records are self-contained: both entry sides, both metrics, the
+  // named de-vig method, and the shin sensitivity block on scored rows.
+  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  const meta = records.find((r) => r['recordType'] === 'scored_run_meta');
+  assert.ok(meta);
+  assert.ok(meta['metrics']);
+  assert.deepEqual(meta['devigMethods'], { primary: 'proportional-v1', sensitivity: ['shin-v1'] });
+  const decisions = records.filter((r) => r['recordType'] === 'scored_decision');
+  assert.ok(decisions.every((r) => r['devigMethod'] === 'proportional-v1'));
+  assert.ok(decisions.every((r) => typeof r['entryOppositeDecimal'] === 'number'));
+  const scoredRows = decisions.filter((r) => r['primaryClvPct'] !== null);
+  assert.ok(scoredRows.length > 0);
+  assert.ok(scoredRows.every((r) => r['marginAdjustedClvPct'] !== null));
+  assert.ok(
+    scoredRows.every(
+      (r) => (r['sensitivity'] as { devigMethod?: string } | null)?.devigMethod === 'shin-v1',
+    ),
   );
 });
 
@@ -1040,12 +1093,17 @@ function syntheticScored(gameId: string, primaryClvPct: number | null): ScoredPi
     echoedGameSha256: null,
     echoedSlateSha256: null,
     side: 'away',
+    entryOppositeDecimal: 2,
     result: {
       primaryClvPct,
       unscoredReason: primaryClvPct === null ? 'close_missing' : null,
       conditionalClvPct: null,
+      marginAdjustedClvPct: primaryClvPct,
+      marginAdjustedConditionalClvPct: null,
       lineMovementFavorable: null,
       closingPNovigSelected: null,
+      entryPNovigSelected: null,
+      sensitivity: null,
       aux: null,
     },
     close: null,
@@ -1091,6 +1149,14 @@ test('the scorecard renders per-market game-level tables for every participant a
 
   assert.ok(markdown.includes(`- Scoring policy: \`${SCORING_POLICY_VERSION}\``));
   assert.ok(markdown.includes('never pool CLV across markets'));
+  // Both metrics side by side, the named de-vig methods, and the shin
+  // sensitivity section.
+  assert.ok(markdown.includes('**margin-adjusted**'));
+  assert.ok(markdown.includes('Margin-adj game-mean'));
+  assert.ok(markdown.includes('Margin-adj mean'));
+  assert.ok(markdown.includes('proportional-v1'));
+  assert.ok(markdown.includes('## De-vig sensitivity'));
+  assert.ok(markdown.indexOf('| model-arm |', markdown.indexOf('## De-vig sensitivity')) > 0);
   assert.ok(markdown.includes('pooled across each participant’s markets — context only'));
   const byMarketAt = markdown.indexOf('## By market');
   assert.ok(byMarketAt > 0);
@@ -1183,7 +1249,7 @@ test('a fully-failed arm keeps 0/N rows in every rendered per-market table', () 
   const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z');
   const byMarketAt = markdown.indexOf('## By market');
   assert.ok(byMarketAt > 0);
-  const failedRows = [...markdown.matchAll(/\| timeout-arm \| 0 \| 0\/2 \| 0 \| — \| — \| — \| — \|/g)];
+  const failedRows = [...markdown.matchAll(/\| timeout-arm \| 0 \| 0\/2 \| 0 \| — \| — \| — \| — \| — \| — \|/g)];
   assert.equal(failedRows.length, 3, 'the failed arm must appear in all three per-market tables');
   assert.ok(failedRows.every((m) => (m.index ?? -1) > byMarketAt));
 });

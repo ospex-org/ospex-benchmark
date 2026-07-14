@@ -101,7 +101,9 @@ yarn watch --dry-run       # fixture slate + mock providers, no credentials
 ```
 
 The smoke enters a slate whenever it is run — often hours after lines
-matured, where closing-line value is structurally ≈ −vig. Watch mode is the
+matured, where economic closing-line value is structurally ≈ −vig and
+margin-adjusted CLV ≈ 0: the entry matches the market either way, and the
+two metrics just state that on different scales. Watch mode is the
 methodology's *first eligible* cutoff made real: it polls the same public
 read path and, the moment a game becomes eligible (the bundle builder yields
 a request — full board, two-sided, fresh quotes), it assembles, hashes, and
@@ -133,7 +135,7 @@ restarts, not across concurrent processes. Full contract:
 yarn score --run out/<runId>.ndjson
 ```
 
-Joins a run's frozen decisions (and the deterministic baselines) to the production-captured closes by the verified game/market key and computes **reference-closing CLV** per the methodology: `q_s` is the proportional no-vig closing probability of the selected side, and the primary metric is `100 · (D_e · q_s − 1)` in expected-ROI percentage points — the frozen entry price is never de-vigged. Policy, preregistered in the scored output: `fresh`-confidence closes only; price CLV only at the unchanged line (a moved spread/total reports signed favorable line movement instead of a number — never zero); integer push-capable lines report a separately labeled push-excluded conditional CLV, never pooled into primary. Auxiliary diagnostics (probability-scale movement, raw price ratio) ride along.
+Joins a run's frozen decisions (and the deterministic baselines) to the production-captured closes by the verified game/market key and computes **reference-closing CLV** both ways per the methodology — one formula, two entry prices, always reported side by side. The **economic** metric keeps the frozen entry price vig-in: `100 · (D_e · q_s − 1)` with `q_s` the proportional no-vig closing probability of the selected side — the industry-standard reading, which sits at about minus the vig when nothing moves. The **margin-adjusted** metric replaces `D_e` with the fair price from the proportionally de-vigged two-sided entry quote, reducing to `100 · (q_close / q_entry − 1)` on push-free contracts — zero means the forecast exactly matched the market. De-vig methods are named and versioned on every scored record (`proportional-v1` primary at both ends, identical to the production closing-line capture; a `shin-v1` sensitivity recompute of both metrics is reported separately labeled). Policy, preregistered in the scored output: `fresh`-confidence closes only; price CLV only at the unchanged line (a moved spread/total reports signed favorable line movement instead of a number — never zero); integer push-capable lines report separately labeled push-excluded conditional variants of both metrics, never pooled into primary. Auxiliary diagnostics (probability-scale movement, raw price ratio) ride along.
 
 **Run integrity comes first — the trust model.** The scorer treats the run file's **archived raw provider responses and frozen bundles as the root of trust**, and re-derives every verdict from them; no recorded verdict, count, or label is trusted on its own. Before scoring, it recomputes every harness acceptance gate and refuses on any violation:
 

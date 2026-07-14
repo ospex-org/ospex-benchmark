@@ -153,8 +153,9 @@ async function main(): Promise<number> {
     printLine(
       `  ${stat.participantId} (${stat.kind}): scoreable ${stat.primaryScoreable}/${stat.eligibleMarkets}` +
         `${outcomes !== '' ? ` [${outcomes}]` : ''}` +
-        `${stat.gameLevel.meanClvPct !== null ? ` · game-level mean CLV ${stat.gameLevel.meanClvPct}%` : ''}` +
-        `${stat.gameLevel.beatClosePct !== null ? ` · beat close ${stat.gameLevel.beatClosePct}%` : ''}`,
+        `${stat.gameLevel.meanClvPct !== null ? ` · econ CLV ${stat.gameLevel.meanClvPct}%` : ''}` +
+        `${stat.gameLevelMarginAdjusted.meanClvPct !== null ? ` · margin-adj ${stat.gameLevelMarginAdjusted.meanClvPct}%` : ''}` +
+        `${stat.gameLevel.beatClosePct !== null ? ` · econ beat close ${stat.gameLevel.beatClosePct}%` : ''}`,
     );
   }
   printLine('');
