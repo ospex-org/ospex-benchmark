@@ -38,59 +38,68 @@ export function runBaselines(
     const ml = game.markets.moneyline;
     const total = game.markets.total;
 
-    // Favorite = lower decimal price; exact-price tie breaks to home.
-    const favoriteSelection =
-      ml.homeDecimal <= ml.awayDecimal ? game.homeTeam : game.awayTeam;
-    // Underdog = higher decimal price; exact-price tie breaks to away.
-    const underdogSelection =
-      ml.awayDecimal >= ml.homeDecimal ? game.awayTeam : game.homeTeam;
+    // A baseline is emitted only for a market the bundle actually carries: a
+    // scoped line-open fire may contain the moneyline but not the total (or
+    // vice versa), and a baseline for an absent market is not derivable. An
+    // archived full board carries all three, so its re-derivation is
+    // unchanged and byte-stable.
+    if (ml !== undefined) {
+      // Favorite = lower decimal price; exact-price tie breaks to home.
+      const favoriteSelection =
+        ml.homeDecimal <= ml.awayDecimal ? game.homeTeam : game.awayTeam;
+      // Underdog = higher decimal price; exact-price tie breaks to away.
+      const underdogSelection =
+        ml.awayDecimal >= ml.homeDecimal ? game.awayTeam : game.homeTeam;
 
-    const mlDecimal = (team: string): number =>
-      team === game.awayTeam ? ml.awayDecimal : ml.homeDecimal;
+      const mlDecimal = (team: string): number =>
+        team === game.awayTeam ? ml.awayDecimal : ml.homeDecimal;
 
-    const moneylineBaselines: Array<{ participantId: string; selection: string }> = [
-      { participantId: 'baseline-favorite-ml', selection: favoriteSelection },
-      { participantId: 'baseline-underdog-ml', selection: underdogSelection },
-      { participantId: 'baseline-home-ml', selection: game.homeTeam },
-      { participantId: 'baseline-away-ml', selection: game.awayTeam },
-    ];
-    for (const { participantId, selection } of moneylineBaselines) {
-      decisions.push({
-        participantId,
-        policyVersion,
-        gameId: game.gameId,
-        market: 'moneyline',
-        selection,
-        line: null,
-        observedDecimal: mlDecimal(selection),
-        track: 'common-cutoff',
-      });
+      const moneylineBaselines: Array<{ participantId: string; selection: string }> = [
+        { participantId: 'baseline-favorite-ml', selection: favoriteSelection },
+        { participantId: 'baseline-underdog-ml', selection: underdogSelection },
+        { participantId: 'baseline-home-ml', selection: game.homeTeam },
+        { participantId: 'baseline-away-ml', selection: game.awayTeam },
+      ];
+      for (const { participantId, selection } of moneylineBaselines) {
+        decisions.push({
+          participantId,
+          policyVersion,
+          gameId: game.gameId,
+          market: 'moneyline',
+          selection,
+          line: null,
+          observedDecimal: mlDecimal(selection),
+          track: 'common-cutoff',
+        });
+      }
     }
 
-    decisions.push(
-      {
-        participantId: 'baseline-over-total',
-        policyVersion,
-        gameId: game.gameId,
-        market: 'total',
-        selection: 'over',
-        line: total.line,
-        observedDecimal: total.overDecimal,
-        track: 'common-cutoff',
-      },
-      {
-        participantId: 'baseline-under-total',
-        policyVersion,
-        gameId: game.gameId,
-        market: 'total',
-        selection: 'under',
-        line: total.line,
-        observedDecimal: total.underDecimal,
-        track: 'common-cutoff',
-      },
-    );
+    if (total !== undefined) {
+      decisions.push(
+        {
+          participantId: 'baseline-over-total',
+          policyVersion,
+          gameId: game.gameId,
+          market: 'total',
+          selection: 'over',
+          line: total.line,
+          observedDecimal: total.overDecimal,
+          track: 'common-cutoff',
+        },
+        {
+          participantId: 'baseline-under-total',
+          policyVersion,
+          gameId: game.gameId,
+          market: 'total',
+          selection: 'under',
+          line: total.line,
+          observedDecimal: total.underDecimal,
+          track: 'common-cutoff',
+        },
+      );
+    }
 
-    if (policyVersion !== 'baselines-v0.1.0') {
+    if (policyVersion !== 'baselines-v0.1.0' && game.markets.runLine !== undefined) {
       const runLine = game.markets.runLine;
       // Run-line favorite = the side LAYING the runs. The line is stored as
       // the HOME handicap: home lays when the line is negative, away lays

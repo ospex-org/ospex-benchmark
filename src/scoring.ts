@@ -54,12 +54,20 @@ export const MARKETS: ReadonlyArray<MarketKey> = ['moneyline', 'spread', 'total'
 // Source-run parsing (the harness's own NDJSON records)
 // ---------------------------------------------------------------------------
 
+const marketGateSchema = z
+  .object({
+    firstAppearanceAt: z.string().min(1),
+    openerAgeSeconds: z.number().int(),
+  })
+  .passthrough();
+
 const watchProvenanceSchema = z
   .object({
     detectedAt: z.string().min(1),
-    boardCompletedAt: z.string().min(1),
-    openerAgeMinutes: z.number().int(),
-    lateThresholdMinutes: z.number().int().positive(),
+    lateThresholdSeconds: z.number().int().positive(),
+    // Per-market gate provenance: each dispatched market carries its own first
+    // appearance and opener age, verified independently against the threshold.
+    markets: z.record(z.enum(['moneyline', 'spread', 'total']), marketGateSchema),
   })
   .passthrough();
 
@@ -103,20 +111,26 @@ const bundleGameSchema = z
         scheduledStartUtc: z.string().min(1),
         markets: z
           .object({
-            // Every bundle price must be a valid decimal quote (>1), exactly
+            // Each market block is optional — a scoped line-open fire carries
+            // only the markets that were open (e.g. moneyline + total), while
+            // an archived full board carries all three. When a block IS
+            // present, every price must be a valid decimal quote (>1), exactly
             // like decision observedDecimal: BOTH sides feed the
             // margin-adjusted entry de-vig, so an invalid opposite side must
             // refuse the file at parse time rather than silently dropping
             // margin-adjusted values while economic ones still score.
             moneyline: z
               .object({ awayDecimal: z.number().gt(1), homeDecimal: z.number().gt(1) })
-              .passthrough(),
+              .passthrough()
+              .optional(),
             runLine: z
               .object({ line: z.number(), awayDecimal: z.number().gt(1), homeDecimal: z.number().gt(1) })
-              .passthrough(),
+              .passthrough()
+              .optional(),
             total: z
               .object({ line: z.number(), overDecimal: z.number().gt(1), underDecimal: z.number().gt(1) })
-              .passthrough(),
+              .passthrough()
+              .optional(),
           })
           .passthrough(),
       })
@@ -225,10 +239,11 @@ export interface SourceGame {
   requestSha256: string;
   /** The bundle exactly as recorded, for hash recomputation. */
   rawBundle: unknown;
+  /** Prices for the markets the bundle carries — a scoped fire has a subset. */
   prices: {
-    moneyline: { away: number; home: number };
-    runLine: { line: number; away: number; home: number };
-    total: { line: number; over: number; under: number };
+    moneyline?: { away: number; home: number };
+    runLine?: { line: number; away: number; home: number };
+    total?: { line: number; over: number; under: number };
   };
 }
 
@@ -357,20 +372,32 @@ export function parseRunRecords(lines: string[]): SourceRun {
           requestSha256: game.requestSha256,
           rawBundle: game.bundle,
           prices: {
-            moneyline: {
-              away: game.bundle.markets.moneyline.awayDecimal,
-              home: game.bundle.markets.moneyline.homeDecimal,
-            },
-            runLine: {
-              line: game.bundle.markets.runLine.line,
-              away: game.bundle.markets.runLine.awayDecimal,
-              home: game.bundle.markets.runLine.homeDecimal,
-            },
-            total: {
-              line: game.bundle.markets.total.line,
-              over: game.bundle.markets.total.overDecimal,
-              under: game.bundle.markets.total.underDecimal,
-            },
+            ...(game.bundle.markets.moneyline
+              ? {
+                  moneyline: {
+                    away: game.bundle.markets.moneyline.awayDecimal,
+                    home: game.bundle.markets.moneyline.homeDecimal,
+                  },
+                }
+              : {}),
+            ...(game.bundle.markets.runLine
+              ? {
+                  runLine: {
+                    line: game.bundle.markets.runLine.line,
+                    away: game.bundle.markets.runLine.awayDecimal,
+                    home: game.bundle.markets.runLine.homeDecimal,
+                  },
+                }
+              : {}),
+            ...(game.bundle.markets.total
+              ? {
+                  total: {
+                    line: game.bundle.markets.total.line,
+                    over: game.bundle.markets.total.overDecimal,
+                    under: game.bundle.markets.total.underDecimal,
+                  },
+                }
+              : {}),
           },
         });
         break;
@@ -530,24 +557,38 @@ export function parseRunRecords(lines: string[]): SourceRun {
 // Run integrity — a scorecard is only as trustworthy as its input
 // ---------------------------------------------------------------------------
 
+/** The markets a parsed source game carries, in canonical order. */
+function bundleMarketKeysFromPrices(game: SourceGame): MarketKey[] {
+  const present: MarketKey[] = [];
+  if (game.prices.moneyline !== undefined) present.push('moneyline');
+  if (game.prices.runLine !== undefined) present.push('spread');
+  if (game.prices.total !== undefined) present.push('total');
+  return present;
+}
+
+/**
+ * The bundle's own entry price + line for a (market, side). Returns null when
+ * the bundle does not carry that market — a decision for a market absent from
+ * its own bundle is a violation the caller surfaces, not a crash.
+ */
 function expectedEntry(
   game: SourceGame,
   market: MarketKey,
   side: SelectedSide,
-): { price: number; line: number | null } {
+): { price: number; line: number | null } | null {
   if (market === 'moneyline') {
-    return { price: side === 'away' ? game.prices.moneyline.away : game.prices.moneyline.home, line: null };
+    const ml = game.prices.moneyline;
+    if (ml === undefined) return null;
+    return { price: side === 'away' ? ml.away : ml.home, line: null };
   }
   if (market === 'spread') {
-    return {
-      price: side === 'away' ? game.prices.runLine.away : game.prices.runLine.home,
-      line: game.prices.runLine.line,
-    };
+    const rl = game.prices.runLine;
+    if (rl === undefined) return null;
+    return { price: side === 'away' ? rl.away : rl.home, line: rl.line };
   }
-  return {
-    price: side === 'away' ? game.prices.total.over : game.prices.total.under,
-    line: game.prices.total.line,
-  };
+  const total = game.prices.total;
+  if (total === undefined) return null;
+  return { price: side === 'away' ? total.over : total.under, line: total.line };
 }
 
 /**
@@ -596,30 +637,59 @@ export function verifyRunIntegrity(
       violations.push('watch run has no watch provenance in run_meta — entry timing unverifiable');
     } else {
       const detectedMs = Date.parse(run.watch.detectedAt);
-      const boardMs = Date.parse(run.watch.boardCompletedAt);
       if (!Number.isFinite(detectedMs)) {
         violations.push('watch provenance detectedAt is unparseable');
       }
-      if (!Number.isFinite(boardMs)) {
-        violations.push('watch provenance boardCompletedAt is unparseable');
+      const gateMarkets = Object.entries(run.watch.markets);
+      if (gateMarkets.length === 0) {
+        violations.push('watch provenance carries no per-market gate — nothing was entered');
       }
-      if (Number.isFinite(detectedMs) && Number.isFinite(boardMs)) {
-        if (boardMs > detectedMs) {
-          violations.push('watch provenance boardCompletedAt is after detection — impossible ordering');
+      // Each dispatched market is gated INDEPENDENTLY on its OWN first board
+      // appearance: a stale market can never ride in on a fresh one. Every
+      // market's opener age must be within the recorded threshold, and its
+      // first appearance must precede detection.
+      for (const [market, gate] of gateMarkets) {
+        const firstMs = Date.parse(gate.firstAppearanceAt);
+        if (!Number.isFinite(firstMs)) {
+          violations.push(`watch provenance ${market} firstAppearanceAt is unparseable`);
+          continue;
         }
-        if (run.watch.openerAgeMinutes < 0) {
-          violations.push('watch provenance openerAgeMinutes is negative — impossible gate result');
+        if (Number.isFinite(detectedMs) && firstMs > detectedMs) {
+          violations.push(`watch provenance ${market} first appearance is after detection — impossible ordering`);
         }
-        if (run.watch.openerAgeMinutes > run.watch.lateThresholdMinutes) {
+        if (gate.openerAgeSeconds < 0) {
+          violations.push(`watch provenance ${market} openerAgeSeconds is negative — impossible gate result`);
+        }
+        if (gate.openerAgeSeconds > run.watch.lateThresholdSeconds) {
           violations.push(
-            'watch provenance opener age exceeds the recorded late threshold — this game should never have fired',
+            `watch provenance ${market} opener age exceeds the recorded late threshold — this market should never have fired`,
           );
         }
-        const recomputedAgeMinutes = Math.round((detectedMs - boardMs) / 60_000);
-        if (Math.abs(recomputedAgeMinutes - run.watch.openerAgeMinutes) > 1) {
-          violations.push(
-            'watch provenance openerAgeMinutes does not match detectedAt - boardCompletedAt',
-          );
+        if (Number.isFinite(detectedMs)) {
+          const recomputed = Math.round((detectedMs - firstMs) / 1000);
+          // One-second tolerance absorbs the round at record time.
+          if (Math.abs(recomputed - gate.openerAgeSeconds) > 1) {
+            violations.push(
+              `watch provenance ${market} openerAgeSeconds does not match detectedAt - firstAppearanceAt`,
+            );
+          }
+        }
+      }
+      // Every gated market must have a corresponding decision-bearing bundle
+      // market (and vice versa) — the fire entered exactly the gated set.
+      const gatedSet = new Set(gateMarkets.map(([m]) => m));
+      const singleGame = [...run.games.values()][0];
+      if (singleGame !== undefined) {
+        const bundleMarkets = bundleMarketKeysFromPrices(singleGame);
+        for (const market of bundleMarkets) {
+          if (!gatedSet.has(market)) {
+            violations.push(`watch run entered ${market} but recorded no gate provenance for it`);
+          }
+        }
+        for (const market of gatedSet) {
+          if (!bundleMarkets.includes(market as MarketKey)) {
+            violations.push(`watch provenance gates ${market} but the bundle did not enter it`);
+          }
         }
       }
       // "Fired at detection" is verified as a timing CHAIN through the
@@ -904,9 +974,19 @@ export function verifyRunIntegrity(
       violations.push(`decisions for ${key} are backed by a non-valid arm response (${response.outcome})`);
       continue;
     }
+    // Exactly one decision per market the BUNDLE carries — a scoped fire's
+    // decision set is its market subset, not always three.
     const markets = new Set(list.map((p) => p.market));
-    if (list.length !== 3 || markets.size !== 3) {
-      violations.push(`${key}: expected exactly one decision per market, found ${list.length}`);
+    const countGame = run.games.get(response.gameId);
+    const expectedMarkets = countGame ? bundleMarketKeysFromPrices(countGame) : [];
+    if (
+      list.length !== markets.size ||
+      markets.size !== expectedMarkets.length ||
+      expectedMarkets.some((m) => !markets.has(m))
+    ) {
+      violations.push(
+        `${key}: expected exactly one decision per bundle market (${expectedMarkets.join(', ') || 'none'}), found ${list.length}`,
+      );
     }
 
     if (response.accepted.rawResponse === null) {
@@ -1227,6 +1307,12 @@ export function verifyRunIntegrity(
       continue;
     }
     const expected = expectedEntry(game, pick.market, side);
+    if (expected === null) {
+      violations.push(
+        `${pick.participantId}:${pick.gameId}:${pick.market}: decision for a market absent from its own bundle`,
+      );
+      continue;
+    }
     if (pick.entryDecimal !== expected.price) {
       violations.push(
         `${pick.participantId}:${pick.gameId}:${pick.market}: entry price ${pick.entryDecimal} does not match the frozen bundle price ${expected.price}`,
@@ -1318,12 +1404,15 @@ export function scoreRun(
       pick.market === 'total' ? (pick.selection as 'over' | 'under') : side;
     // The opposite side of the same contract, from the same hash-verified
     // bundle the entry price was verified against — the margin-adjusted
-    // entry de-vig needs both sides.
-    const entryOppositeDecimal = expectedEntry(
-      game,
-      pick.market,
-      side === 'away' ? 'home' : 'away',
-    ).price;
+    // entry de-vig needs both sides. verifyRunIntegrity has already refused any
+    // decision whose market is absent from its bundle, so the market is present.
+    const opposite = expectedEntry(game, pick.market, side === 'away' ? 'home' : 'away');
+    if (opposite === null) {
+      throw new Error(
+        `pick ${pick.participantId}:${pick.gameId}:${pick.market} has no bundle price — run must pass verifyRunIntegrity before scoring`,
+      );
+    }
+    const entryOppositeDecimal = opposite.price;
     const close = closes.get(`${pick.gameId}:${pick.market}`) ?? null;
     const closeQuote = close === null ? null : closeQuoteFromRow(close);
     const exactLine = scoreDecision(

@@ -146,7 +146,9 @@ test('compareFingerprints: changed probability, selection, and missing forecast 
   const swappedForecast = swapped.games[0]?.forecasts[0];
   assert.ok(swappedForecast);
   swappedForecast.selection = request.game.homeTeam;
-  swappedForecast.observedDecimal = request.game.markets.moneyline.homeDecimal;
+  const swapMl = request.game.markets.moneyline;
+  assert.ok(swapMl);
+  swappedForecast.observedDecimal = swapMl.homeDecimal;
   const swapDiffs = compareFingerprints(before, fingerprintFromParsed(swapped));
   assert.ok(swapDiffs.some((d) => d.includes('selection changed')));
 

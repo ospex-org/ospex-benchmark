@@ -5,149 +5,181 @@
 CLV asks one question: did you get a better number than the closing line?
 Enter at (or near) the close and no forecast can look good — the line has
 already absorbed everything, so economic CLV is structurally ≈ −vig and
-margin-adjusted CLV ≈ 0 (the entry matches the market; the two metrics just
-state that on different scales). The first live smoke proved it: every arm
-landed within a point of −vig, because the slate was bundled hours after
-the lines had matured. The methodology's
-cutoff has always been *first eligible*; watch mode is the machinery that
-actually honors it.
+margin-adjusted CLV ≈ 0. The first live smoke proved it: every arm landed
+within a point of −vig, because the slate was bundled hours after the lines
+had matured. The methodology's cutoff has always been *first eligible*; watch
+mode is the machinery that actually honors it.
 
-**Fire-at-detection only.** The runner never freezes a bundle for later use.
-A harness that detects at time T and fires at T+Δ has watched the line move
-for Δ — a cherry-pick surface indistinguishable from tout math, no matter how
-honest the operator. Detection and firing are one event: the moment a game
-becomes eligible, the bundle is assembled, hashed, and dispatched to all
-twelve participants in the same breath, and the game is never touched again.
+## The one idea: the speculation is the unit
 
-Two mechanisms, two jobs — they are complements, not substitutes:
+**Each market on each game is an independent entity.** It is detected on its
+own, gated on its own first appearance, claimed on its own, fired on its own,
+and recorded on its own. A "game" is only a label some speculations share.
+There is no game-level fire, no game-level bundle, and no game-level readiness
+check — those concepts were a bug (a stale moneyline riding in on a fresh run
+line), and they are gone.
 
-- **The frozen bundle** is the *fairness* mechanism: all twelve participants
-  (four model arms + eight deterministic baselines) receive identical
-  information at the identical instant, entering at the same prices. Without
-  it, a leaderboard measures fetch latency and plumbing differences, not
-  forecasting.
-- **The recorded pick** is the *commitment* mechanism. Today it is an NDJSON
-  record with full provenance (hashes, timestamps, raw responses). The
-  recording step is deliberately the single seam where, once wallets and a
-  market to bet into exist, the pick becomes a signed on-chain commitment —
-  etched, unfakeable, ordered by the chain before the outcome. Nothing
-  upstream of that seam changes when that day comes.
+A professional bettor fires the instant a number they want appears; they do
+not wait for the rest of the board. The runner behaves the same:
+**odds appear → that speculation fires → done**, regardless of what any other
+market on that game is doing. Nothing ever waits for another market.
 
-## What "eligible" means (the fire condition)
+## Detection and policy are different layers
 
-A game fires the moment the existing bundle builder produces a request for
-it — no separate detection predicate exists, so detection can never drift
-from what participants are actually given. Concretely that means all of:
+- **Detection is universal.** Every market a league sends is detected,
+  timestamped, and recorded — moneyline, total, run line — no exceptions.
+- **Policy decides what to ACT ON.** `src/marketPolicy.ts` is a preregistered
+  allow-list keyed on `(league, market)`. MLB acts on the moneyline and the
+  total; the run line is detected and recorded `policy_disabled`, never
+  dispatched. The policy is versioned code hashed into every run record, not a
+  CLI flag — a per-invocation lever over which markets are entered would be a
+  cherry-pick surface. A league absent from the allow-list dispatches nothing
+  until its markets are explicitly listed in a version bump.
 
-- status `upcoming`, first pitch in the future;
-- all three markets (moneyline, spread, total) present with two-sided prices
-  and lines where applicable;
-- every quote fresh under the harness's existing quote-age policy.
+## Fire-at-detection (preserved verbatim)
 
-MLB books typically hang the full board (totals wait on pitcher
-confirmation) somewhat after the first moneyline appears; *first eligible*
-is first complete board, which is also the first moment the fixed
-moneyline+total execution policy is playable at all.
+The runner never freezes a bundle for later use. A harness that detects at
+time T and fires at T+Δ has watched the line move for Δ — a cherry-pick
+surface indistinguishable from tout math. Detection and firing are one event:
+the bundle is built from the same `current_odds` snapshot detection reads and
+dispatched in the same breath.
 
-## Late-detection gate (entry honesty)
+Batching is a transport detail, not a coupling. When two enabled markets are
+ready in the same tick (MLB's moneyline and total open in the same feed cycle),
+they share ONE dispatch to all twelve participants — but each is claimed,
+gated, and recorded independently. A batched dispatch and N separate
+dispatches produce the same per-speculation records.
 
-Firing is only honest if the entry price is genuinely the early number. At
-detection, the runner computes the **board-completion time** — the newest of
-the three markets' first price-history rows — and if that moment is older
-than the late threshold (default 60 minutes), the game is recorded as
-`late_detection` and **never fired**. This covers watcher downtime and first
-boot against an already-open board: stale opportunities are excluded from
-the cohort, not silently entered late. Excluded means excluded — there is no
-retry, no deferred fire, no backfill.
+## The per-market late gate (entry honesty)
 
-## The per-game decision event
+Firing is only honest if the entry price is genuinely the early number. Each
+speculation is gated on its OWN first board appearance:
 
-For one game, once, at detection:
+```
+openerAge = detectedAt − firstAppearance(game, market)
+```
 
-1. Assemble a CURRENT snapshot (games read path + public odds read path):
-   the working inputs are re-fetched whenever they are more than thirty
-   seconds old — including AGAIN after the gate's board-history reads,
-   which are network calls and can be slow — so every game is evaluated
-   and fired on seconds-old prices no matter how long anything earlier
-   took. Fire-at-detection holds per game, not merely per tick. Build and
-   hash the bundle from that snapshot; the detection instant is stamped
-   after final assembly, so bundle-assembly ≤ detection ≤ dispatch holds
-   by construction (and the scorer verifies exactly that chain).
-2. Verify the late-detection gate (ANY board timestamp after detection
-   fails closed — never cached, never fired; the runtime accepts only
-   what the scorer will).
-3. Claim the game in the ledger — memory first, then disk — BEFORE any
-   dispatch, so neither a crash nor a restart can ever double-bill.
-4. Fire: dispatch all four model arms concurrently (existing per-game
-   runner: injected clock, cutoff enforcement, repair rules, identity
-   checks) and run all eight baselines against the same bundle.
-5. Write one self-contained run file for the game (`out/`,
-   `watch-v0-<slateDate>-<hex>.ndjson`) — run metadata **including the
-   watch-gate provenance** (detection time, board-completion time, opener
-   age, configured threshold — the scorer fail-closes on it for watch
-   runs), the frozen bundle, every attempt with provenance, decisions,
-   baselines. The existing scorer consumes these files unchanged.
-6. Finalize the ledger entry with the outcome. Done forever.
+A speculation fires only if its own age is within the threshold — a committed
+constant of **30 minutes**, not a flag. A market whose opener is older is
+recorded `late_detection` and **never fired**. This covers watcher downtime and
+first boot against an already-open board: a stale opportunity is excluded, not
+silently entered late. Excluded means excluded — no retry, no deferred fire, no
+backfill. Because the gate is per market, a stale moneyline can never ride in
+on a fresh total.
 
-Games are independent events: a provider failure, identity failure, or
-integrity problem on one game poisons only that game's file; the watcher
-logs it and keeps watching.
+## The per-fire decision event
+
+For one game's ready speculations, once, at detection:
+
+1. Assemble a CURRENT snapshot (games read path + public odds read path),
+   re-fetched whenever more than thirty seconds old — including again after the
+   gate's board-history reads. Build and hash the bundle carrying exactly the
+   ready markets; detection is stamped after assembly, so
+   bundle-assembly ≤ detection ≤ dispatch holds by construction.
+2. Apply the per-market late gate (a first appearance after detection fails
+   closed — never cached, never fired; a small skew allowance mirrors the
+   bundle's future-quote tolerance).
+3. Claim each ready speculation in the ledger — memory first, then disk —
+   BEFORE any dispatch, so neither a crash nor a restart can double-bill.
+4. Fire: dispatch all four model arms concurrently and run all eight baselines
+   against the same bundle. The prompt, required forecasts, baselines, and the
+   scorer's denominator all derive from the bundle's own market set — every
+   hard-coded "3" is gone.
+5. Write one self-contained run file (`out/`, `watch-v0-<slateDate>-<hex>.ndjson`)
+   — run metadata **including per-market watch-gate provenance** (detection
+   time, and each market's first appearance + opener age + the committed
+   threshold), the frozen bundle, every attempt, decisions, baselines. The
+   scorer re-verifies each market's opener age from this artifact.
+6. Finalize each speculation's ledger entry. Done forever.
 
 ## The ledger (idempotency + audit)
 
-`out/watch-ledger/<gameId>.json` — one file per handled game (existence =
-handled; state is re-derived from disk on restart, so the watcher can never
-double-fire across restarts). Each entry records the decision (`fired` |
-`late_detection`), the board-completion timestamp and opener age, the bundle
-and request hashes, the run file, and outcome tallies. Ledger writes go
-through the same redaction chokepoint as every other artifact.
+`out/line-open-ledger/<gameId>/<market>.json` — one file per handled
+speculation. Existence means handled forever; the set is re-derived from disk
+on restart, so a speculation fires at most once, ever, across restarts. Each
+entry records the decision (`fired` | `late_detection`), the market's first
+appearance and opener age, the bundle and request hashes, the run file, and the
+outcome. A corrupt file is treated as handled (never risk a double-fire). Ledger
+writes pass the same redaction chokepoint as every other artifact.
 
-The bundle hash in the ledger is the future anchor for input-commitment
-publication (publishing hashes at fire time to the public evidence layer),
-which is deliberately out of scope here.
+## Rehearsal mode (mandatory before a first live boot)
 
-## Labels and cohorts
+On first boot, every enabled market already open in the window is hours old and
+would be correctly-but-irreversibly ledgered `late_detection` — one accidental
+live boot burns the whole board. `yarn watch --rehearse` evaluates every
+speculation and prints what it WOULD do (fire / exclude late, with reasons),
+writing no ledger and dispatching nothing. Review its output before any live
+run.
 
-Run files keep the existing frozen record label (it is typed and
-participates in every content hash); watch runs are identified by their
-`runId`/`cohortId` prefix `watch-v0-`. Like the smoke, **watch-v0 output is
-plumbing validation, not a cohort** — nothing from it belongs on a
-leaderboard.
+## Reading the tick line
+
+Every poll prints one line:
+
+```
+tick <ts>: 4 games · 12 specs · 7 fired (4 dispatches) · 0 late · 0 deferred · 1 blocked · 4 disabled · 0 handled · 0 failed
+```
+
+The counters are per tick and count **speculations** (game × market), not
+games, except `games` and `dispatches`:
+
+- **games** — games in the lookahead window (the raw census).
+- **specs** — (game, market) pairs evaluated this tick, excluding ones already
+  terminal in the ledger.
+- **fired** — speculations newly dispatched this tick.
+- **dispatches** — billing events (a batched co-arrival is one dispatch of four
+  model calls, however many markets it carries).
+- **late** — speculations newly excluded `late_detection` (their opener was
+  older than the 30-minute threshold). Terminal.
+- **deferred** — buildable speculations whose first-appearance history row is
+  not visible yet (transient; retried next tick).
+- **blocked** — enabled speculations not fireable now: the market has not opened
+  (`market_never_opened`), is one-sided, is stale, or the first pitch has
+  passed.
+- **disabled** — speculations withheld by policy (the MLB run line).
+- **handled** — speculations already terminal in the ledger (census-only).
+- **failed** — per-speculation failures (a thrown history read, a fire error, a
+  collision-failed fire, a malformed row). Any `failed` makes the pass
+  non-healthy and `--once` exits nonzero.
+- **CAP HIT** / **REHEARSAL** — suffixes for a hit dispatch cap or report-only
+  mode.
+
+Healthy and idle is `N games · M specs` with `fired/late/deferred/failed` at
+zero and the rest census. A per-speculation status snapshot is written to
+`out/line-open-status.json` each tick (state + reason + first appearance per
+speculation), so "why is this only blocked" is answerable from a file rather
+than inferred from the counters — the exclusion reason a naive counter hides.
 
 ## Operations
 
-- `yarn watch` — long-running loop; `--poll-seconds` (default 300),
-  `--window-hours` (default 168), `--late-minutes` (default 60, max 1440),
-  `--max-fires-per-tick` (default 10 — a circuit breaker on per-tick spend:
-  once hit, the tick stops loudly, unclaimed games re-evaluate next tick,
-  and the pass reports non-healthy), `--out` (default `out`), `--once`
-  (single pass, for external schedulers and tests; exits nonzero when the
-  pass failed — including per-game failures, collision-failed fires, and a
-  hit spend cap), `--dry-run` (fixture
-  inputs + mock adapters + synthetic clock; no credentials, no spend,
-  writes to an ephemeral directory unless `--out` is given; exercised by
-  tests).
-- Entries are never made on aged inputs: sequential fires consume wall time,
-  and once a tick's fetched snapshot is older than ten minutes the tick
-  stops — unclaimed games are re-DETECTED next tick from fresh inputs
-  (re-detection, not deferred firing). A game whose first pitch passes
-  mid-tick is likewise never claimed.
-- A game deferred on a missing first-appearance history row for longer than
-  the late threshold triggers a one-time loud warning — a prolonged deferral
-  means the history read path itself is broken, not that data is slow.
-- One instance at a time (model calls cost real money; the ledger makes
-  double-fire impossible across restarts but not across two concurrent
+- `yarn watch` — long-running loop; `--poll-seconds` (default 60, min 30),
+  `--window-hours` (default 168), `--max-dispatches-per-tick` (default 20 — a
+  circuit breaker on per-tick spend; once hit, the tick stops loudly and
+  unclaimed speculations re-evaluate next tick), `--out` (default `out`),
+  `--once` (single pass; exits nonzero on any failure or a hit cap),
+  `--rehearse` (report-only, implies `--once`), `--dry-run` (fixture inputs +
+  mock adapters + synthetic clock; ephemeral out dir unless `--out` given;
+  implies `--once`). The late-detection threshold and the market policy are
+  committed constants, not flags.
+- One instance per `--out` directory (model calls cost real money; the ledger
+  makes double-fire impossible across restarts but not across two concurrent
   processes).
-- `yarn preflight` before a live session remains the ritual.
+- `yarn preflight` before a live session remains the ritual — a fire with dead
+  credentials still counts as fired, and the ledger is one-shot.
 - Scoring is unchanged: after closes land, `yarn score --run out/<runId>.ndjson`
   per fired game.
 
+## Labels and cohorts
+
+Run files keep the frozen record label `SMOKE_V0_NOT_A_COHORT` (typed and
+hash-load-bearing); watch runs are identified by the `watch-v0-` runId /
+cohortId prefix. Like the smoke, **watch-v0 output is plumbing validation, not
+a cohort** — nothing from it belongs on a leaderboard. A scoped fire's market
+subset and its bumped prompt scaffold mean new runs are not scaffold-comparable
+with the archived three-market smoke corpus (which was never a cohort either).
+
 ## Non-goals (this change)
 
-- No deferred firing or replay tooling of any kind.
-- No per-market re-entry (one fire per game at full-board detection).
-- No publication of bundles/hashes to the public evidence layer (follow-up).
-- No on-chain commitments (the seam is documented above; the upgrade slots
-  into the recording step when wallets and a book to bet into exist).
-- No changes to bundle eligibility, the runner, records, prompts, or the
-  scorer.
+- No host/deployment change — it runs where it runs today.
+- No new leagues enabled, no spread ladder, no Shin de-vig.
+- No on-chain commitments (the recording step is the documented seam for that
+  upgrade when wallets and a book to bet into exist).

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { z } from 'zod';
 import {
-  CONTRACT_NOTES,
+  buildContractNotes,
   RESPONSE_TEMPLATE,
   SYSTEM_PROMPT,
   TEMPLATE_PLACEHOLDERS,
@@ -45,7 +45,23 @@ test('nested decision fields are individually covered', () => {
 test('the scaffold carries the rendered JSON template block, not just prose names', () => {
   assert.ok(RESPONSE_TEMPLATE.startsWith('{'));
   assert.ok(RESPONSE_TEMPLATE.includes('"probabilities": {'));
-  assert.ok(CONTRACT_NOTES.includes(RESPONSE_TEMPLATE));
+  // The contract notes are rendered per market set; the enabled MLB set carries
+  // the template verbatim and names exactly the two dispatched markets.
+  const notes = buildContractNotes(['moneyline', 'total']);
+  assert.ok(notes.includes(RESPONSE_TEMPLATE));
+  assert.ok(notes.includes('exactly 2 forecasts'));
+  assert.ok(!notes.includes('"spread"'));
+});
+
+test('contract notes name exactly the supplied markets (scoped vs full board)', () => {
+  const mlOnly = buildContractNotes(['moneyline']);
+  assert.ok(mlOnly.includes('exactly 1 forecast'));
+  assert.ok(!mlOnly.includes('"total"'));
+  const full = buildContractNotes(['moneyline', 'spread', 'total']);
+  assert.ok(full.includes('exactly 3 forecasts'));
+  assert.ok(full.includes('"spread"'));
+  // The run line is present but explicitly not executed.
+  assert.ok(full.includes('false on the spread forecast'));
 });
 
 test('mutation: a schema leaf without a placeholder throws (nested field addition is caught)', () => {

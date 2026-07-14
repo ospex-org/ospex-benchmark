@@ -107,14 +107,23 @@ export function buildScorecardMarkdown(
   lines.push(`# Reference-closing CLV scorecard — ${run.slateDate}`);
   lines.push('');
   lines.push('**Label: `SMOKE_V0_NOT_A_COHORT`** — pipeline shakedown, not a scored cohort.');
-  lines.push(
-    run.watch !== null && run.runId.startsWith('watch-v0-')
-      ? `Entry prices are the first-eligible board, fired at detection under the late-detection gate ` +
-          `(board completed ${run.watch.boardCompletedAt}, detected ${run.watch.detectedAt}, ` +
-          `opener age ${run.watch.openerAgeMinutes}m ≤ threshold ${run.watch.lateThresholdMinutes}m — ` +
-          'verified from run_meta by the integrity gate). Still plumbing validation — this data must never appear on a leaderboard.'
-      : 'Entry prices were captured LATE (lines opened days earlier), so this CLV does not reflect a real early-entry policy. This data must never appear on a leaderboard.',
-  );
+  if (run.watch !== null && run.runId.startsWith('watch-v0-')) {
+    const perMarket = (Object.keys(run.watch.markets) as Array<keyof typeof run.watch.markets>)
+      .map((m) => {
+        const gate = run.watch?.markets[m];
+        return gate ? `${m} ${gate.openerAgeSeconds}s` : null;
+      })
+      .filter((s): s is string => s !== null);
+    lines.push(
+      `Entry prices are each market's own opener, fired at detection ${run.watch.detectedAt} under the ` +
+        `per-market late-detection gate (threshold ${run.watch.lateThresholdSeconds}s; opener age ${perMarket.join(', ')} — ` +
+        'each verified from run_meta by the integrity gate). Still plumbing validation — this data must never appear on a leaderboard.',
+    );
+  } else {
+    lines.push(
+      'Entry prices were captured LATE (lines opened days earlier), so this CLV does not reflect a real early-entry policy. This data must never appear on a leaderboard.',
+    );
+  }
   lines.push('');
   lines.push(`- Source run: \`${run.runId}\` (slate sha \`${run.slateSha256.slice(0, 16)}…\`, integrity verified)`);
   lines.push(`- Scored: ${scoredAt}`);

@@ -20,6 +20,7 @@ function formatHandicap(value: number): string {
 
 function describeFavorite(game: GameBundle): string {
   const ml = game.markets.moneyline;
+  if (ml === undefined) return '—';
   if (ml.awayDecimal === ml.homeDecimal) return 'pick-em';
   return ml.awayDecimal < ml.homeDecimal
     ? `${game.awayTeam} (away)`
@@ -31,11 +32,14 @@ function slateRow(game: GameBundle): string {
   const rl = game.markets.runLine;
   const total = game.markets.total;
   const matchup = `${game.awayTeam} at ${game.homeTeam}`;
-  const moneyline = `${ml.awayDecimal} / ${ml.homeDecimal}`;
-  const runLine =
-    `${game.awayTeam} ${formatHandicap(rl.awayHandicap)} @ ${rl.awayDecimal} · ` +
-    `${game.homeTeam} ${formatHandicap(rl.homeHandicap)} @ ${rl.homeDecimal}`;
-  const totals = `${total.line} (o ${total.overDecimal} / u ${total.underDecimal})`;
+  // A scoped fire carries only the markets that were open; absent markets
+  // render as an em dash rather than assuming a full board.
+  const moneyline = ml ? `${ml.awayDecimal} / ${ml.homeDecimal}` : '—';
+  const runLine = rl
+    ? `${game.awayTeam} ${formatHandicap(rl.awayHandicap)} @ ${rl.awayDecimal} · ` +
+      `${game.homeTeam} ${formatHandicap(rl.homeHandicap)} @ ${rl.homeDecimal}`
+    : '—';
+  const totals = total ? `${total.line} (o ${total.overDecimal} / u ${total.underDecimal})` : '—';
   const pitchers = game.probableStartingPitchers
     ? `${game.probableStartingPitchers.away ?? '—'} / ${game.probableStartingPitchers.home ?? '—'}`
     : '—';
@@ -64,13 +68,23 @@ export function buildSummaryMarkdown(
   );
   lines.push('');
   lines.push(`**Label: \`SMOKE_V0_NOT_A_COHORT\`** — pipeline shakedown, not a scored cohort.`);
-  lines.push(
-    watch !== undefined
-      ? `Entry prices are the first-eligible board, fired at detection: board completed ${watch.boardCompletedAt}, ` +
-          `detected ${watch.detectedAt} (opener age ${watch.openerAgeMinutes}m, threshold ${watch.lateThresholdMinutes}m). ` +
-          'Still plumbing validation — nothing here may appear on a leaderboard.'
-      : 'Entry prices were captured late (lines opened days earlier); nothing here may appear on a leaderboard.',
-  );
+  if (watch !== undefined) {
+    const perMarket = (Object.keys(watch.markets) as Array<keyof typeof watch.markets>)
+      .map((m) => {
+        const gate = watch.markets[m];
+        return gate ? `${m} ${gate.openerAgeSeconds}s (opened ${gate.firstAppearanceAt})` : null;
+      })
+      .filter((s): s is string => s !== null);
+    lines.push(
+      `Entry prices are each market's own opener, fired at detection ${watch.detectedAt} ` +
+        `(late threshold ${watch.lateThresholdSeconds}s). Per-market opener age: ${perMarket.join('; ') || '—'}. ` +
+        'Still plumbing validation — nothing here may appear on a leaderboard.',
+    );
+  } else {
+    lines.push(
+      'Entry prices were captured late (lines opened days earlier); nothing here may appear on a leaderboard.',
+    );
+  }
   lines.push('');
   lines.push(
     `- Run: \`${ctx.runId}\` (${ctx.mode}${ctx.clockMode === 'synthetic-fixture' ? ', synthetic fixture clock' : ''})`,

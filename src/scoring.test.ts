@@ -69,6 +69,8 @@ function fixtureRun(options?: {
   slateSha256: string;
 } {
   const gameABase = makeGameBundle({ gameId: GAME_A });
+  const baseTotal = gameABase.markets.total;
+  if (baseTotal === undefined) throw new Error('fixture: base bundle must carry a total');
   const requests = [
     makeRequest('2026-07-12T16:15:00+00:00', {
       gameId: GAME_A,
@@ -76,7 +78,7 @@ function fixtureRun(options?: {
         ? {
             markets: {
               ...gameABase.markets,
-              total: { ...gameABase.markets.total, line: options.totalLineGameA },
+              total: { ...baseTotal, line: options.totalLineGameA },
             },
           }
         : {}),
@@ -124,6 +126,13 @@ function fixtureRun(options?: {
 
   for (const request of requests) {
     const game = request.game;
+    // These fixtures are full three-market boards; narrow the optional blocks.
+    const ml = game.markets.moneyline;
+    const rl = game.markets.runLine;
+    const tot = game.markets.total;
+    if (ml === undefined || rl === undefined || tot === undefined) {
+      throw new Error('fixture game must be a full three-market board');
+    }
     const gameSha256 = sha256Hex(canonicalize(game));
     shaByGame.set(game.gameId, { gameSha256, requestSha256: request.requestSha256 });
     records.push({
@@ -145,14 +154,14 @@ function fixtureRun(options?: {
       const common = { probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, rationale: 'reference-price read' };
       const forecasts = arm.flipped
         ? [
-            { market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: game.markets.moneyline.awayDecimal, selectedForExecution: true, evidenceRefs: [game.markets.moneyline.evidenceRef], ...common },
-            { market: 'spread', selection: game.homeTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.homeDecimal, selectedForExecution: false, evidenceRefs: [game.markets.runLine.evidenceRef], ...common },
-            { market: 'total', selection: 'under', line: game.markets.total.line, observedDecimal: game.markets.total.underDecimal, selectedForExecution: true, evidenceRefs: [game.markets.total.evidenceRef], ...common },
+            { market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: ml.awayDecimal, selectedForExecution: true, evidenceRefs: [ml.evidenceRef], ...common },
+            { market: 'spread', selection: game.homeTeam, line: rl.line, observedDecimal: rl.homeDecimal, selectedForExecution: false, evidenceRefs: [rl.evidenceRef], ...common },
+            { market: 'total', selection: 'under', line: tot.line, observedDecimal: tot.underDecimal, selectedForExecution: true, evidenceRefs: [tot.evidenceRef], ...common },
           ]
         : [
-            { market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: game.markets.moneyline.homeDecimal, selectedForExecution: true, evidenceRefs: [game.markets.moneyline.evidenceRef], ...common },
-            { market: 'spread', selection: game.awayTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.awayDecimal, selectedForExecution: false, evidenceRefs: [game.markets.runLine.evidenceRef], ...common },
-            { market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, selectedForExecution: true, evidenceRefs: [game.markets.total.evidenceRef], ...common },
+            { market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: ml.homeDecimal, selectedForExecution: true, evidenceRefs: [ml.evidenceRef], ...common },
+            { market: 'spread', selection: game.awayTeam, line: rl.line, observedDecimal: rl.awayDecimal, selectedForExecution: false, evidenceRefs: [rl.evidenceRef], ...common },
+            { market: 'total', selection: 'over', line: tot.line, observedDecimal: tot.overDecimal, selectedForExecution: true, evidenceRefs: [tot.evidenceRef], ...common },
           ];
       const rawResponse = JSON.stringify({
         schemaVersion: 1,
@@ -405,7 +414,7 @@ test('a valid arm response with missing decisions is caught, as is a wrong per-m
     );
   });
   const violations = verifyRunIntegrity(parseRunRecords(withoutOneDecision), { expectedArms: FIXTURE_ARMS });
-  assert.ok(violations.some((v) => v.includes('expected exactly one decision per market')));
+  assert.ok(violations.some((v) => v.includes('expected exactly one decision per bundle market')));
 });
 
 test('the round-2 probe: a decision swapped to the other bundle-valid side is caught against the accepted response', () => {

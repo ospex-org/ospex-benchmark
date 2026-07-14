@@ -117,7 +117,8 @@ test('stale reference quotes are excluded with a stable reason code', () => {
   assert.equal(build.requests.length, 1);
   const exclusion = build.excluded.find((e) => e.gameId === sickId);
   assert.ok(exclusion);
-  assert.ok(exclusion.reason.startsWith('stale_quote:'));
+  // Every enabled market is stale, so the game builds nothing and is excluded.
+  assert.equal(exclusion.reason, 'stale_quote');
 });
 
 test('future reference quotes beyond the skew allowance are excluded', () => {
@@ -126,7 +127,7 @@ test('future reference quotes beyond the skew allowance are excluded', () => {
   assert.equal(build.requests.length, 1);
   const exclusion = build.excluded.find((e) => e.gameId === sickId);
   assert.ok(exclusion);
-  assert.ok(exclusion.reason.startsWith('future_quote:'));
+  assert.equal(exclusion.reason, 'future_quote');
 });
 
 test('unparseable quote timestamps are excluded', () => {
@@ -135,7 +136,7 @@ test('unparseable quote timestamps are excluded', () => {
   assert.equal(build.requests.length, 1);
   const exclusion = build.excluded.find((e) => e.gameId === sickId);
   assert.ok(exclusion);
-  assert.ok(exclusion.reason.startsWith('invalid_quote_timestamp:'));
+  assert.equal(exclusion.reason, 'invalid_quote_timestamp');
 });
 
 function twoGameInputs(): SlateInputs {

@@ -5,10 +5,13 @@ import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './confi
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
 import { fetchFirstBoardAppearance, fetchLiveInputs } from './fetchers.js';
+import { enabledMarkets, MARKET_POLICY, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import { createFixtureClock, createMockAdapters, loadFixtureInputs } from './mock.js';
 import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
+import { writeText } from './records.js';
 import {
   fireEligibleGame,
+  LATE_THRESHOLD_MS,
   loadLedger,
   MAX_INPUT_AGE_MS,
   parseWatchArgs,
@@ -16,20 +19,34 @@ import {
   WatchUsageError,
   watchTick,
 } from './watch.js';
-import type { FireConfig, WatchDeps } from './watch.js';
+import type { FireConfig, SpecStatus, WatchDeps } from './watch.js';
 
 /**
- * Line-open watch mode CLI — fire-at-detection only. See
- * docs/LINE_OPEN_RUNNER.md for the full contract; the testable core lives in
- * src/watch.ts (this entry file only wires real dependencies and loops).
+ * Line-open watch mode CLI — the speculation is the unit; fire-at-detection
+ * only. See docs/LINE_OPEN_RUNNER.md for the full contract; the testable core
+ * lives in src/watch.ts (this entry file only wires real dependencies + loops).
  *
- * Output remains labeled SMOKE_V0_NOT_A_COHORT (the record label is typed
- * and hash-load-bearing); watch runs are identified by the watch-v0 runId /
+ * Output remains labeled SMOKE_V0_NOT_A_COHORT (the record label is typed and
+ * hash-load-bearing); watch runs are identified by the watch-v0 runId /
  * cohortId prefix and are plumbing validation, not a cohort.
  */
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Print the enabled market policy on boot so "what will it act on" is
+ *  answerable in one screen without a database client. */
+function printPolicyBanner(): void {
+  const entries = Object.entries(MARKET_POLICY);
+  printLine(`market policy ${MARKET_POLICY_VERSION} (detection is universal; these are ACTED ON):`);
+  if (entries.length === 0) {
+    printLine('  (no league enabled — nothing will be dispatched)');
+    return;
+  }
+  for (const [league, markets] of entries) {
+    printLine(`  ${league}: ${markets.join(', ')}`);
+  }
 }
 
 async function main(): Promise<number> {
@@ -39,12 +56,15 @@ async function main(): Promise<number> {
     process.exit(0);
   });
   const mode = options.dryRun ? 'dry-run' : 'live';
+  const modeLabel = options.rehearse ? `${mode} — REHEARSAL (report-only)` : mode;
   printLine(
-    `ospex-benchmark line-open watch — ${mode} — fire-at-detection only — label SMOKE_V0_NOT_A_COHORT`,
+    `ospex-benchmark line-open watch — ${modeLabel} — the speculation is the unit — label SMOKE_V0_NOT_A_COHORT`,
   );
   if (loaded.length > 0) {
     printLine(`loaded ${loaded.length} env var(s) from .env: ${loaded.join(', ')}`);
   }
+  printPolicyBanner();
+  printLine(`late-detection threshold: ${LATE_THRESHOLD_MS / 60_000} min (committed constant, not a flag)`);
 
   let fetchInputs: WatchDeps['fetchInputs'];
   let firstBoardAppearance: WatchDeps['fetchFirstBoardAppearance'];
@@ -55,7 +75,7 @@ async function main(): Promise<number> {
 
   // Dry runs are repeatable demos: unless --out was passed explicitly, they
   // write into an ephemeral directory so synthetic fixture entries never
-  // intermix with (or pre-handle games in) the live audit ledger.
+  // intermix with (or pre-handle speculations in) the live audit ledger.
   const outDir =
     options.dryRun && !options.outDirExplicit
       ? mkdtempSync(join(tmpdir(), 'watch-dry-run-'))
@@ -66,8 +86,7 @@ async function main(): Promise<number> {
 
   if (options.dryRun) {
     // Fixture inputs + mock providers + one synthetic clock anchored at the
-    // fixture capture instant, mirroring the smoke's dry-run story. The
-    // fixture board "just completed": every first appearance is the fixture
+    // fixture capture instant. Every first appearance is the fixture
     // fetch-completion instant, so the late gate reads an age of ~zero.
     const fixture = loadFixtureInputs();
     fetchInputs = () => Promise.resolve(fixture);
@@ -87,7 +106,7 @@ async function main(): Promise<number> {
     }
     const apiUrl = envValue('OSPEX_API_URL') ?? DEFAULT_OSPEX_API_URL;
     printLine(
-      `watching MLB via ${apiUrl} (window ${options.windowHours}h, poll ${options.pollSeconds}s, late ${options.lateMinutes}m)`,
+      `watching MLB via ${apiUrl} (window ${options.windowHours}h, poll ${options.pollSeconds}s)`,
     );
     fetchInputs = () =>
       fetchLiveInputs({ apiUrl, supabaseUrl, supabaseAnonKey, windowHours: options.windowHours });
@@ -110,9 +129,22 @@ async function main(): Promise<number> {
     logError: printError,
   };
 
-  const ledgerDir = join(outDir, 'watch-ledger');
+  const ledgerDir = join(outDir, 'line-open-ledger');
   const ledger = loadLedger(ledgerDir, printError);
-  printLine(`ledger: ${ledger.size} game(s) already handled (${ledgerDir})`);
+  printLine(`ledger: ${ledger.size} speculation(s) already handled (${ledgerDir})`);
+
+  // Observability: each tick's per-speculation status snapshot to disk, so
+  // "is it working / why is this only watched" is answerable from a file
+  // rather than inferred from the tick counters. Skipped in rehearsal.
+  const statusFile = join(outDir, 'line-open-status.json');
+  const onStatuses = options.rehearse
+    ? undefined
+    : (statuses: SpecStatus[]): void => {
+        writeText(
+          statusFile,
+          `${JSON.stringify({ snapshotAt: new Date(nowMs()).toISOString(), statuses }, null, 2)}\n`,
+        );
+      };
 
   const deps: WatchDeps = {
     fetchInputs,
@@ -124,39 +156,37 @@ async function main(): Promise<number> {
     boardFirstSeen: new Map(),
     deferredSince: new Map(),
     deferralWarned: new Set(),
+    onStatuses,
+    enabledMarketsFor: enabledMarkets,
     nowMs,
-    lateMs: options.lateMinutes * 60_000,
-    maxFiresPerTick: options.maxFiresPerTick,
+    lateMs: LATE_THRESHOLD_MS,
+    maxDispatchesPerTick: options.maxDispatchesPerTick,
     maxInputAgeMs: MAX_INPUT_AGE_MS,
+    rehearse: options.rehearse,
     log: printLine,
     logError: printError,
   };
 
   for (;;) {
-    // The same injected clock stamps the banner that drives enforcement and
-    // records — never a second clock.
     const startedAt = new Date(nowMs()).toISOString();
     let tickFailed = false;
     try {
-      const summary = await watchTick(deps);
+      const s = await watchTick(deps);
       printLine(
-        `tick ${startedAt}: ${summary.gamesInWindow} in window · ${summary.watched} watched · ` +
-          `${summary.fired} fired · ${summary.late} late · ${summary.deferred} deferred · ` +
-          `${summary.failed} failed${summary.capHit ? ' · CAP HIT' : ''}`,
+        `tick ${startedAt}: ${s.gamesInWindow} games · ${s.speculations} specs · ` +
+          `${s.fired} fired (${s.dispatches} dispatch${s.dispatches === 1 ? '' : 'es'}) · ` +
+          `${s.late} late · ${s.deferred} deferred · ${s.blocked} blocked · ` +
+          `${s.disabled} disabled · ${s.handled} handled · ${s.failed} failed` +
+          `${s.capHit ? ' · CAP HIT' : ''}${s.rehearsal ? ' · REHEARSAL' : ''}`,
       );
-      // Per-game failures are isolated inside the tick but they are still
-      // failures — and a hit spend cap left work undone. Neither is a
-      // healthy pass.
-      if (summary.failed > 0 || summary.capHit) tickFailed = true;
+      // Per-speculation failures are isolated inside the tick but they are
+      // still failures — and a hit dispatch cap left work undone.
+      if (s.failed > 0 || s.capHit) tickFailed = true;
     } catch (error) {
-      // A tick failure (fetch outage, transient API error) is logged and the
-      // loop keeps watching — per-game failures are already isolated inside
-      // the tick and can never reach here.
       tickFailed = true;
       printError(`tick ${startedAt} failed: ${describeErrorWithStack(error)}`);
     }
     if (options.once) {
-      // External schedulers need the pass/fail distinction by exit code.
       return tickFailed ? 1 : 0;
     }
     await sleep(options.pollSeconds * 1000);

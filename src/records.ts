@@ -2,23 +2,36 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { redactSecrets } from './config.js';
 import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
+import { MARKET_POLICY_VERSION } from './marketPolicy.js';
+import { bundleMarketKeys } from './markets.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
 import type { CollisionCheckResult } from './providers/family.js';
-import type { ArmGameResult, AttemptRecord, BaselineDecision } from './types.js';
+import type { ArmGameResult, AttemptRecord, BaselineDecision, MarketKey } from './types.js';
+
+/**
+ * Per-speculation gate provenance: for ONE market on the fired game, its first
+ * board appearance and the resulting opener age at detection. Each dispatched
+ * market carries its own — a stale market can never ride in on a fresh one, so
+ * the scorer verifies every market's age independently against the committed
+ * late threshold.
+ */
+export interface MarketGateProvenance {
+  firstAppearanceAt: string;
+  openerAgeSeconds: number;
+}
 
 /**
  * Watch-mode gate provenance, recorded in run_meta so the entry-timing claim
  * is verifiable from the artifact itself (the scorer fail-closes on it for
- * watch runs): when detection happened, when the full board had completed,
- * the resulting opener age, and the configured late threshold it passed.
+ * watch runs): when detection happened, the committed late threshold, and the
+ * per-market first-appearance + opener age for each market this fire entered.
  */
 export interface WatchProvenance {
   detectedAt: string;
-  boardCompletedAt: string;
-  openerAgeMinutes: number;
-  lateThresholdMinutes: number;
+  lateThresholdSeconds: number;
+  markets: Partial<Record<MarketKey, MarketGateProvenance>>;
 }
 
 export interface RunContext {
@@ -143,14 +156,18 @@ export function buildRecords(
     slateDate: ctx.slateDate,
     createdAt: ctx.createdAt,
     executionPolicy: ctx.executionPolicy,
-    dispatch: 'per-game-by-cutoff',
+    dispatch: 'per-speculation-at-detection',
+    // The preregistered market allow-list this run dispatched under. Hashed
+    // into the record so a run always declares the policy it actually ran.
+    marketPolicyVersion: MARKET_POLICY_VERSION,
     slateSha256,
     fetchStartedAt: ctx.fetchStartedAt,
     fetchCompletedAt: ctx.fetchCompletedAt,
     bundleTimestamp: slateBundle.bundleTimestamp,
     slateCutoffAt: slateBundle.cutoffAt,
+    // The scaffold VERSION is a run-level constant; its per-request hash is a
+    // function of that request's market set, so it rides on each bundle_game.
     promptScaffoldVersion: PROMPT_SCAFFOLD_VERSION,
-    promptScaffoldSha256: promptScaffoldSha256(),
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
     clockMode: ctx.clockMode,
@@ -174,6 +191,7 @@ export function buildRecords(
   });
 
   for (const request of requests) {
+    const markets = bundleMarketKeys(request.game);
     records.push({
       recordType: 'bundle_game',
       label: SMOKE_LABEL,
@@ -183,6 +201,10 @@ export function buildRecords(
       requestSha256: request.requestSha256,
       cutoffAt: request.requestBundle.cutoffAt,
       slug: request.slug,
+      // The markets this request actually dispatched, and the scaffold hash
+      // for exactly that set — a scoped fire and a full board differ here.
+      markets,
+      promptScaffoldSha256: promptScaffoldSha256(markets),
       bundle: request.game,
       sourceOddsRows: provenance[request.gameId]?.oddsRows ?? [],
     });

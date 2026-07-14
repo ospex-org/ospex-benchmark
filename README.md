@@ -4,7 +4,7 @@ A sports-market decision benchmark running through [Ospex](https://ospex.org), t
 
 **The question:** given the same frozen pregame information bundle, the same decision deadline, and the same strict output contract, how do different frontier models perform at making sports-market decisions?
 
-Each participating model receives an identical, content-hashed bundle (game identity, scheduled start, and timestamped reference odds for moneyline, run line, and total), returns forced forecasts for all three markets per game under a strict JSON schema, and is recorded with full provenance — requested and response-reported model IDs, timestamps, latency, token usage, and the raw response. Forecasts are scored later against no-vig reference closing lines (closing-line value), which evaluates the price obtained rather than the noisy game result.
+Each participating model receives an identical, content-hashed bundle (game identity, scheduled start, and timestamped reference odds for the markets that were open and policy-enabled — moneyline, run line, and/or total), returns a forced forecast for each market the bundle supplies under a strict JSON schema, and is recorded with full provenance — requested and response-reported model IDs, timestamps, latency, token usage, and the raw response. Forecasts are scored later against no-vig reference closing lines (closing-line value), which evaluates the price obtained rather than the noisy game result.
 
 ## ⚠️ v0 is a shakedown, not a scored cohort
 
@@ -93,41 +93,47 @@ Artifact safety: every byte serialized to NDJSON or the summary passes through c
 
 **Store UTC, reason in ET, always.** A slate's date is the US Eastern calendar date of first pitch, and a single MLB slate legitimately spans two UTC dates — so a game's slate day is never derived from a UTC string prefix. The rule lives in one tested module, `src/slateDate.ts`.
 
-## Line-open watch mode (fire-at-detection only)
+## Line-open watch mode (the speculation is the unit)
 
 ```bash
-yarn watch                 # long-running; polls every 5 minutes
+yarn watch                 # long-running; polls every 60 seconds
 yarn watch --once          # single pass (external schedulers)
+yarn watch --rehearse      # report-only: what it WOULD fire, no writes
 yarn watch --dry-run       # fixture slate + mock providers, no credentials
 ```
 
 The smoke enters a slate whenever it is run — often hours after lines
 matured, where economic closing-line value is structurally ≈ −vig and
-margin-adjusted CLV ≈ 0: the entry matches the market either way, and the
-two metrics just state that on different scales. Watch mode is the
-methodology's *first eligible* cutoff made real: it polls the same public
-read path and, the moment a game becomes eligible (the bundle builder yields
-a request — full board, two-sided, fresh quotes), it assembles, hashes, and
-fires that one game to all twelve participants **in the same instant**, then
-records it in a per-game ledger (`out/watch-ledger/`) and never touches it
-again. One self-contained run file per fired game (`out/watch-v0-*.ndjson`)
-— scored with the same `yarn score` command, verified by the same integrity
-gates.
+margin-adjusted CLV ≈ 0. Watch mode is the methodology's *first eligible*
+cutoff made real, and its atom is the **speculation** — one market on one
+game. Each market is detected on its own, gated on its own first appearance,
+claimed on its own, fired on its own, and recorded on its own: odds appear →
+that speculation fires → done, never waiting for the rest of the board. A
+stale moneyline can never ride in on a fresh total.
+
+Detection is universal (every market is seen and recorded); a committed
+per-`(league, market)` policy (`src/marketPolicy.ts`, hashed into the record)
+decides what is dispatched — MLB acts on the moneyline and total, and the run
+line is recorded `policy_disabled`, never entered. When two enabled markets
+open in the same tick they share one dispatch as a transport optimization, but
+each is claimed and gated independently. Fires are recorded per speculation in
+`out/line-open-ledger/<gameId>/<market>.json` (handled once, ever, across
+restarts); one self-contained run file per dispatch (`out/watch-v0-*.ndjson`)
+is scored with the same `yarn score` command and verified by the same
+integrity gates, now checking each market's opener age.
 
 There is deliberately no deferred firing and no replay: a bundle is used the
-instant it is built or not at all. A harness that fires later has watched
-the line move in between — a cherry-pick surface no matter how honest the
-operator. Entry honesty is enforced by the late-detection gate
-(`--late-minutes`, default 60): a game whose full board completed longer ago
-than that at detection is recorded as `late_detection` and excluded — never
-entered late, never revisited. Watcher downtime therefore costs coverage,
-not integrity.
+instant it is built or not at all. Entry honesty is a per-market late gate
+against each market's own first board appearance, with a **committed 30-minute
+threshold** (not a flag): a market whose opener is older is recorded
+`late_detection` and never entered. On first boot every already-open market is
+hours old, so `--rehearse` (report-only, writes nothing) is mandatory before a
+first live run.
 
 Run files keep the `SMOKE_V0_NOT_A_COHORT` label (typed and
 hash-load-bearing); watch runs are identified by the `watch-v0-` runId /
 cohortId prefix and remain plumbing validation, not a cohort. Run one
-watcher at a time — the ledger makes double-firing impossible across
-restarts, not across concurrent processes. Full contract:
+watcher at a time per `--out` directory. Full contract:
 [`docs/LINE_OPEN_RUNNER.md`](docs/LINE_OPEN_RUNNER.md).
 
 ## Scoring (reference-closing CLV)

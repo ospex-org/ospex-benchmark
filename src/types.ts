@@ -89,10 +89,19 @@ export interface GameBundle {
    * absence is visible in the hashed bundle.
    */
   probableStartingPitchers: ProbablePitchers | null;
+  /**
+   * Reference prices for the markets THIS bundle carries. Each block is
+   * present only when its market is being dispatched in this request — a
+   * scoped line-open fire carries the subset of policy-enabled markets that
+   * were open at detection (e.g. moneyline + total, no run line), while an
+   * archived full-board bundle carries all three. Consumers must read the
+   * present set (see `bundleMarketKeys`), never assume all three: the run line
+   * (`runLine`) key name is retained deliberately for corpus replay.
+   */
   markets: {
-    moneyline: MoneylineBlock;
-    runLine: RunLineBlock;
-    total: TotalBlock;
+    moneyline?: MoneylineBlock;
+    runLine?: RunLineBlock;
+    total?: TotalBlock;
   };
   /** Every evidenceRef a rationale may cite for this game. */
   evidenceRefs: string[];

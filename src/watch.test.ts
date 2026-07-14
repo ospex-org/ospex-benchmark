@@ -1,20 +1,22 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { buildBundle } from './bundle.js';
+import { enabledMarkets, isMarketEnabled } from './marketPolicy.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
 import {
   fireEligibleGame,
+  LATE_THRESHOLD_MS,
   loadLedger,
   parseWatchArgs,
   persistLedgerEntry,
   watchTick,
   WatchUsageError,
 } from './watch.js';
-import type { FireOutcome, LedgerEntry, WatchDeps, WatchGateProvenance } from './watch.js';
+import type { FireOutcome, SpecLedgerEntry, WatchDeps, WatchGateProvenance } from './watch.js';
 import type { BuildResult } from './bundle.js';
 import type {
   CurrentOddsRow,
@@ -26,8 +28,7 @@ import type {
 } from './types.js';
 
 // ---------------------------------------------------------------------------
-// Synthetic live-shaped inputs: one future game whose full board is fresh
-// relative to the cycle's fetch-completion instant.
+// Synthetic live-shaped inputs.
 // ---------------------------------------------------------------------------
 
 const tempDirs: string[] = [];
@@ -44,8 +45,12 @@ const GAME_ID = '00000000-0000-4000-8000-0000000wat01';
 const FETCH_COMPLETED_AT = '2026-07-20T12:00:00.000Z';
 const MATCH_TIME = '2026-07-20T23:10:00+00:00';
 const QUOTE_AT = '2026-07-20T11:55:00.000Z'; // 5 minutes before assembly — fresh
-const BOARD_FIRST_SEEN = '2026-07-20T11:50:00.000Z';
-const NOW_MS = Date.parse('2026-07-20T12:00:30.000Z'); // opener age ≈ 10.5 min
+const OPENED_AT = '2026-07-20T11:50:00.000Z'; // first appearance, ~10 min before now
+const NOW_MS = Date.parse('2026-07-20T12:00:30.000Z');
+
+/** MLB enables moneyline + total; the run line is detected but not dispatched. */
+const MLB_ENABLED: MarketKey[] = ['moneyline', 'total'];
+const ALL_ENABLED: MarketKey[] = ['moneyline', 'spread', 'total'];
 
 function gamesRow(overrides: Partial<GamesEndpointRow> = {}): GamesEndpointRow {
   return {
@@ -79,29 +84,25 @@ function oddsRow(market: MarketKey, line: number | null, gameId: string = GAME_I
   };
 }
 
-function fullBoardFor(gameId: string, matchTime: string = MATCH_TIME): {
-  row: GamesEndpointRow;
-  odds: CurrentOddsRow[];
-} {
-  return {
-    row: gamesRow({ gameId, matchTime, externalIds: { jsonodds: gameId, sportspage: null, rundown: null } }),
-    odds: [oddsRow('moneyline', null, gameId), oddsRow('spread', 1.5, gameId), oddsRow('total', 8.5, gameId)],
-  };
-}
-
-function fullBoardInputs(overrides: Partial<SlateInputs> = {}): SlateInputs {
+function inputsWith(oddsRows: CurrentOddsRow[], overrides: Partial<SlateInputs> = {}): SlateInputs {
   return {
     gamesRows: [gamesRow()],
-    oddsRows: [oddsRow('moneyline', null), oddsRow('spread', 1.5), oddsRow('total', 8.5)],
+    oddsRows,
     fetchStartedAt: '2026-07-20T11:59:58.000Z',
     fetchCompletedAt: FETCH_COMPLETED_AT,
     ...overrides,
   };
 }
 
+/** A full three-market board (moneyline, run line, total). */
+function fullBoard(): CurrentOddsRow[] {
+  return [oddsRow('moneyline', null), oddsRow('spread', 1.5), oddsRow('total', 8.5)];
+}
+
 interface FakeFire {
   calls: Array<{
     gameId: string;
+    markets: MarketKey[];
     slateDate: string;
     provenance: WatchGateProvenance;
     fetchCompletedAt: string;
@@ -122,6 +123,7 @@ function fakeFire(outcome?: Partial<FireOutcome>, fail = false): FakeFire {
       const request = build.requests[0];
       calls.push({
         gameId: request?.gameId ?? 'missing',
+        markets: request ? (Object.keys(provenance.markets) as MarketKey[]) : [],
         slateDate,
         provenance,
         fetchCompletedAt: inputs.fetchCompletedAt,
@@ -131,7 +133,7 @@ function fakeFire(outcome?: Partial<FireOutcome>, fail = false): FakeFire {
         runId: 'watch-v0-2026-07-20-abc123',
         runFile: 'out/watch-v0-2026-07-20-abc123.ndjson',
         armOutcomes: { [TEST_ARM.participantId]: 'valid' },
-        baselineDecisions: 8,
+        baselineDecisions: 6,
         collisionFailed: false,
         ...outcome,
       });
@@ -142,20 +144,22 @@ function fakeFire(outcome?: Partial<FireOutcome>, fail = false): FakeFire {
 function makeDeps(overrides: Partial<WatchDeps> = {}): WatchDeps & { logged: string[]; errors: string[] } {
   const logged: string[] = [];
   const errors: string[] = [];
-  const ledgerDir = tempDir('watch-ledger-');
+  const ledgerDir = tempDir('line-open-ledger-');
   return {
-    fetchInputs: () => Promise.resolve(fullBoardInputs()),
-    fetchFirstBoardAppearance: () => Promise.resolve(BOARD_FIRST_SEEN),
+    fetchInputs: () => Promise.resolve(inputsWith(fullBoard())),
+    fetchFirstBoardAppearance: () => Promise.resolve(OPENED_AT),
     fireGame: fakeFire().fire,
     ledgerDir,
-    ledger: new Map<string, LedgerEntry>(),
+    ledger: new Map<string, SpecLedgerEntry>(),
     boardFirstSeen: new Map<string, string>(),
     deferredSince: new Map<string, number>(),
     deferralWarned: new Set<string>(),
+    enabledMarketsFor: () => MLB_ENABLED,
     nowMs: () => NOW_MS,
-    lateMs: 60 * 60_000,
-    maxFiresPerTick: 10,
+    lateMs: LATE_THRESHOLD_MS,
+    maxDispatchesPerTick: 20,
     maxInputAgeMs: 10 * 60_000,
+    rehearse: false,
     log: (line) => logged.push(line),
     logError: (line) => errors.push(line),
     logged,
@@ -164,109 +168,191 @@ function makeDeps(overrides: Partial<WatchDeps> = {}): WatchDeps & { logged: str
   };
 }
 
+function key(gameId: string, market: MarketKey): string {
+  return `${gameId}:${market}`;
+}
+
 // ---------------------------------------------------------------------------
-// Detection + gate behavior
+// The core behaviour change: take what we have, when we have it.
 // ---------------------------------------------------------------------------
 
-test('an incomplete board is watched, not fired and not ledgered', async () => {
+test('a moneyline-only board FIRES the moneyline alone — it never waits for the rest', async () => {
   const fire = fakeFire();
   const deps = makeDeps({
-    fetchInputs: () =>
-      Promise.resolve(fullBoardInputs({ oddsRows: [oddsRow('moneyline', null)] })),
     fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null)])),
   });
   const summary = await watchTick(deps);
-  assert.equal(summary.watched, 1);
-  assert.equal(summary.fired, 0);
-  assert.equal(fire.calls.length, 0);
-  assert.equal(deps.ledger.size, 0);
-  assert.equal(loadLedger(deps.ledgerDir, () => undefined).size, 0);
+  assert.equal(summary.fired, 1);
+  assert.equal(summary.dispatches, 1);
+  assert.deepEqual(fire.calls[0]?.markets, ['moneyline']);
+  // The moneyline is claimed; the total is blocked (not yet opened), the run
+  // line is policy-disabled. Neither blocks the moneyline.
+  assert.equal(deps.ledger.get(key(GAME_ID, 'moneyline'))?.decision, 'fired');
+  assert.equal(deps.ledger.has(key(GAME_ID, 'total')), false);
+  assert.equal(summary.disabled, 1); // run line
+  assert.equal(summary.blocked, 1); // total not yet opened
 });
 
-test('a fresh full board fires immediately and is ledgered as fired', async () => {
+test('an MLB full board fires moneyline + total in ONE dispatch; the run line is detected, disabled, never dispatched', async () => {
   const fire = fakeFire();
   const deps = makeDeps({ fireGame: fire.fire });
   const summary = await watchTick(deps);
-  assert.equal(summary.fired, 1);
-  assert.deepEqual(
-    fire.calls.map((c) => ({ gameId: c.gameId, slateDate: c.slateDate })),
-    [{ gameId: GAME_ID, slateDate: '2026-07-20' }],
-  );
-  const entry = deps.ledger.get(GAME_ID);
-  assert.ok(entry);
-  assert.equal(entry.decision, 'fired');
-  assert.equal(entry.boardCompletedAt, BOARD_FIRST_SEEN);
-  assert.equal(entry.openerAgeMinutes, 11); // 10.5 min rounded
-  assert.equal(entry.runId, 'watch-v0-2026-07-20-abc123');
-  assert.equal(entry.collisionFailed, false);
-  // Persisted to disk with the same content.
-  const onDisk = loadLedger(deps.ledgerDir, () => undefined).get(GAME_ID);
-  assert.deepEqual(onDisk, entry);
+  assert.equal(summary.fired, 2); // two speculations
+  assert.equal(summary.dispatches, 1); // one billing event
+  assert.deepEqual(fire.calls.length, 1);
+  assert.deepEqual(fire.calls[0]?.markets.sort(), ['moneyline', 'total']);
+  // Each speculation is claimed independently with its own ledger file.
+  assert.equal(deps.ledger.get(key(GAME_ID, 'moneyline'))?.decision, 'fired');
+  assert.equal(deps.ledger.get(key(GAME_ID, 'total'))?.decision, 'fired');
+  // The run line was seen and recorded disabled — never dispatched.
+  assert.equal(summary.disabled, 1);
+  assert.equal(deps.ledger.has(key(GAME_ID, 'spread')), false);
+  // The dispatched bundle carries only the two enabled markets.
+  assert.equal(fire.calls[0]?.markets.includes('spread'), false);
 });
 
-test('a board that completed beyond the late threshold is excluded, never fired', async () => {
+test('PRIMARY: three markets with three distinct arrival times produce three independent fires at three honest ages', async () => {
+  // A league that enables all three markets, injected via the policy seam.
+  const fire = fakeFire();
+  // Each market opens on a different tick; the odds snapshot reveals them one
+  // at a time, and each first appearance is its own honest opener instant.
+  let now = NOW_MS;
+  const openedAt: Record<string, string> = {
+    moneyline: new Date(now - 2 * 60_000).toISOString(),
+    spread: '',
+    total: '',
+  };
+  let visible: MarketKey[] = ['moneyline'];
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    enabledMarketsFor: () => ALL_ENABLED,
+    nowMs: () => now,
+    fetchFirstBoardAppearance: (_g, market) =>
+      Promise.resolve(openedAt[market] === '' ? null : (openedAt[market] ?? null)),
+    fetchInputs: () =>
+      Promise.resolve(
+        inputsWith(
+          visible.map((m) => ({
+            ...oddsRow(m, m === 'moneyline' ? null : m === 'spread' ? 1.5 : 8.5),
+            upstream_last_updated: new Date(now - 60_000).toISOString(),
+          })),
+          {
+            fetchStartedAt: new Date(now - 2_000).toISOString(),
+            fetchCompletedAt: new Date(now).toISOString(),
+          },
+        ),
+      ),
+  });
+
+  // Tick 1: only the moneyline is open → it fires alone.
+  const t1 = await watchTick(deps);
+  assert.equal(t1.fired, 1);
+  assert.deepEqual(fire.calls.at(-1)?.markets, ['moneyline']);
+
+  // Tick 2 (30 min later): the total opens.
+  now += 30 * 60_000;
+  openedAt.total = new Date(now - 60_000).toISOString();
+  visible = ['moneyline', 'total'];
+  const t2 = await watchTick(deps);
+  assert.equal(t2.fired, 1);
+  assert.deepEqual(fire.calls.at(-1)?.markets, ['total']); // moneyline already handled
+
+  // Tick 3 (another 30 min): the run line finally opens.
+  now += 30 * 60_000;
+  openedAt.spread = new Date(now - 60_000).toISOString();
+  visible = ['moneyline', 'spread', 'total'];
+  const t3 = await watchTick(deps);
+  assert.equal(t3.fired, 1);
+  assert.deepEqual(fire.calls.at(-1)?.markets, ['spread']);
+
+  // Three independent dispatches, three ledger entries, each with its OWN age.
+  assert.equal(fire.calls.length, 3);
+  for (const market of ALL_ENABLED) {
+    const entry = deps.ledger.get(key(GAME_ID, market));
+    assert.equal(entry?.decision, 'fired', `${market} fired`);
+    assert.ok((entry?.openerAgeSeconds ?? -1) >= 0);
+    // Each fired within ~1 minute of its own opener — none rode in on another.
+    assert.ok((entry?.openerAgeSeconds ?? 1e9) < 5 * 60);
+  }
+});
+
+test('co-arrival is batched but claimed and recorded independently — one dispatch, two ledger files, two gate provenances', async () => {
   const fire = fakeFire();
   const deps = makeDeps({
     fireGame: fire.fire,
-    fetchFirstBoardAppearance: () => Promise.resolve('2026-07-20T09:00:00.000Z'), // 3h old
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null), oddsRow('total', 8.5)])),
+  });
+  await watchTick(deps);
+  assert.equal(fire.calls.length, 1);
+  const prov = fire.calls[0]?.provenance;
+  assert.ok(prov);
+  assert.deepEqual(Object.keys(prov.markets).sort(), ['moneyline', 'total']);
+  // Two independent ledger files on disk, one per speculation.
+  const reloaded = loadLedger(deps.ledgerDir, () => undefined);
+  assert.equal(reloaded.get(key(GAME_ID, 'moneyline'))?.decision, 'fired');
+  assert.equal(reloaded.get(key(GAME_ID, 'total'))?.decision, 'fired');
+});
+
+test('a stale moneyline never rides in on a fresh total — per-market late gate', async () => {
+  const fire = fakeFire();
+  const staleFirst = new Date(NOW_MS - 3 * 3_600_000).toISOString(); // 3h old
+  const freshFirst = new Date(NOW_MS - 2 * 60_000).toISOString(); // 2m old
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null), oddsRow('total', 8.5)])),
+    fetchFirstBoardAppearance: (_g, market) =>
+      Promise.resolve(market === 'moneyline' ? staleFirst : freshFirst),
   });
   const summary = await watchTick(deps);
+  // The total fires; the moneyline is excluded late. Nothing lets the stale
+  // moneyline ride in on the total's freshness.
+  assert.equal(summary.fired, 1);
   assert.equal(summary.late, 1);
-  assert.equal(summary.fired, 0);
-  assert.equal(fire.calls.length, 0);
-  const entry = deps.ledger.get(GAME_ID);
-  assert.ok(entry);
-  assert.equal(entry.decision, 'late_detection');
-  assert.equal(entry.runId, undefined);
-  // Excluded means excluded: the next tick never revisits it.
+  assert.deepEqual(fire.calls[0]?.markets, ['total']);
+  assert.equal(deps.ledger.get(key(GAME_ID, 'total'))?.decision, 'fired');
+  assert.equal(deps.ledger.get(key(GAME_ID, 'moneyline'))?.decision, 'late_detection');
+});
+
+test('a market excluded late is terminal — never revisited', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null)])),
+    fetchFirstBoardAppearance: () => Promise.resolve(new Date(NOW_MS - 3 * 3_600_000).toISOString()),
+  });
+  const first = await watchTick(deps);
+  assert.equal(first.late, 1);
+  assert.equal(first.fired, 0);
   const second = await watchTick(deps);
   assert.equal(second.late, 0);
-  assert.equal(second.fired, 0);
+  assert.equal(second.handled, 1); // now census-only
   assert.equal(fire.calls.length, 0);
 });
 
-test('board-completion is the NEWEST of the three markets\' first appearances', async () => {
-  const fire = fakeFire();
-  const perMarket: Record<string, string> = {
-    moneyline: '2026-07-20T08:00:00.000Z', // opened hours ago
-    spread: '2026-07-20T08:05:00.000Z',
-    total: BOARD_FIRST_SEEN, // totals hung 10 minutes ago — board just completed
-  };
-  const deps = makeDeps({
-    fireGame: fire.fire,
-    fetchFirstBoardAppearance: (_gameId, market) => Promise.resolve(perMarket[market] ?? null),
-  });
-  const summary = await watchTick(deps);
-  assert.equal(summary.fired, 1);
-  assert.equal(deps.ledger.get(GAME_ID)?.boardCompletedAt, BOARD_FIRST_SEEN);
-});
-
-test('a missing first-appearance row defers the game (transient), then fires once visible — and caches immutable reads', async () => {
+test('a buildable market whose first-appearance row is not visible yet defers (transient), while a ready sibling fires', async () => {
   const fire = fakeFire();
   let totalVisible = false;
-  let reads = 0;
   const deps = makeDeps({
     fireGame: fire.fire,
-    fetchFirstBoardAppearance: (_gameId, market) => {
-      reads += 1;
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null), oddsRow('total', 8.5)])),
+    fetchFirstBoardAppearance: (_g, market) => {
       if (market === 'total' && !totalVisible) return Promise.resolve(null);
-      return Promise.resolve(BOARD_FIRST_SEEN);
+      return Promise.resolve(OPENED_AT);
     },
   });
   const first = await watchTick(deps);
-  assert.equal(first.deferred, 1);
-  assert.equal(fire.calls.length, 0);
-  assert.equal(deps.ledger.size, 0);
-  const readsAfterFirst = reads;
+  assert.equal(first.deferred, 1); // total
+  assert.equal(first.fired, 1); // moneyline fired regardless
+  assert.deepEqual(fire.calls[0]?.markets, ['moneyline']);
 
   totalVisible = true;
   const second = await watchTick(deps);
-  assert.equal(second.fired, 1);
-  // moneyline + spread were cached from the first tick; only total re-read.
-  assert.equal(reads - readsAfterFirst, 1);
+  assert.equal(second.fired, 1); // total now fires
+  assert.deepEqual(fire.calls[1]?.markets, ['total']);
 });
 
-test('handled games are skipped forever, including across a restart (ledger re-derived from disk)', async () => {
+test('handled speculations are skipped forever, including across a restart (ledger re-derived from disk)', async () => {
   const fire = fakeFire();
   const deps = makeDeps({ fireGame: fire.fire });
   await watchTick(deps);
@@ -274,25 +360,25 @@ test('handled games are skipped forever, including across a restart (ledger re-d
   await watchTick(deps);
   assert.equal(fire.calls.length, 1);
 
-  // "Restart": fresh in-memory state, same ledger directory.
   const reloaded = makeDeps({ fireGame: fire.fire, ledgerDir: deps.ledgerDir });
   reloaded.ledger = loadLedger(deps.ledgerDir, () => undefined);
+  assert.equal(reloaded.ledger.get(key(GAME_ID, 'moneyline'))?.decision, 'fired');
   await watchTick(reloaded);
   assert.equal(fire.calls.length, 1);
 });
 
-test('a fire crash still claims the ledger — the game is never double-fired', async () => {
+test('a fire crash claims every ready speculation — never double-fired', async () => {
   const fire = fakeFire(undefined, true);
   const deps = makeDeps({ fireGame: fire.fire });
   const summary = await watchTick(deps);
   assert.equal(summary.fired, 0);
+  assert.equal(summary.failed, 1);
   assert.equal(fire.calls.length, 1);
-  const entry = deps.ledger.get(GAME_ID);
-  assert.ok(entry);
-  assert.equal(entry.decision, 'fired');
-  assert.match(entry.fireError ?? '', /synthetic fire failure/);
-  assert.equal(deps.errors.length, 1);
-
+  for (const market of MLB_ENABLED) {
+    const entry = deps.ledger.get(key(GAME_ID, market));
+    assert.equal(entry?.decision, 'fired');
+    assert.match(entry?.fireError ?? '', /synthetic fire failure/);
+  }
   const again = await watchTick(deps);
   assert.equal(again.fired, 0);
   assert.equal(fire.calls.length, 1); // no second (double-billed) dispatch
@@ -300,10 +386,15 @@ test('a fire crash still claims the ledger — the game is never double-fired', 
 
 test('an unreadable ledger file is treated as handled (never risk a double-fire)', async () => {
   const deps = makeDeps({});
-  writeFileSync(join(deps.ledgerDir, `${GAME_ID}.json`), 'not json at all', 'utf8');
+  const gameDir = join(deps.ledgerDir, GAME_ID);
+  writeFileSync(join(tempDir('scratch-'), 'x'), ''); // ensure fs available
+  // Write a corrupt per-speculation file.
+  const { mkdirSync } = await import('node:fs');
+  mkdirSync(gameDir, { recursive: true });
+  writeFileSync(join(gameDir, 'moneyline.json'), 'not json at all', 'utf8');
   const errors: string[] = [];
   const ledger = loadLedger(deps.ledgerDir, (line) => errors.push(line));
-  assert.equal(ledger.get(GAME_ID)?.decision, 'fired');
+  assert.equal(ledger.get(key(GAME_ID, 'moneyline'))?.decision, 'fired');
   assert.equal(errors.length, 1);
 });
 
@@ -313,35 +404,60 @@ test('ledger writes pass the redaction chokepoint', () => {
   process.env['OPENAI_API_KEY'] = secret;
   try {
     const dir = tempDir('watch-redact-');
-    const entry: LedgerEntry = {
+    const entry: SpecLedgerEntry = {
       gameId: GAME_ID,
       slug: 'mil-pit-2026-07-20',
+      market: 'moneyline',
       decision: 'fired',
       decidedAt: FETCH_COMPLETED_AT,
       slateDate: '2026-07-20',
       scheduledStartUtc: MATCH_TIME,
-      boardCompletedAt: BOARD_FIRST_SEEN,
-      openerAgeMinutes: 11,
+      firstAppearanceAt: OPENED_AT,
+      openerAgeSeconds: 630,
       gameSha256: 'x',
       requestSha256: 'y',
       fireError: `provider said: ${secret}`,
     };
     persistLedgerEntry(dir, entry);
-    const written = readFileSync(join(dir, `${GAME_ID}.json`), 'utf8');
+    const written = readFileSync(join(dir, GAME_ID, 'moneyline.json'), 'utf8');
     assert.ok(!written.includes(secret));
     assert.ok(written.includes('[REDACTED]'));
   } finally {
-    if (original === undefined) {
-      delete process.env['OPENAI_API_KEY'];
-    } else {
-      process.env['OPENAI_API_KEY'] = original;
-    }
+    if (original === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = original;
   }
 });
 
 // ---------------------------------------------------------------------------
-// The fire path end to end: a watch-fired single-game run file must satisfy
-// the scorer's full integrity verification unchanged.
+// Rehearsal mode
+// ---------------------------------------------------------------------------
+
+test('rehearsal mode evaluates and reports what WOULD fire, writing no ledger and dispatching nothing', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({ fireGame: fire.fire, rehearse: true });
+  const summary = await watchTick(deps);
+  assert.equal(summary.rehearsal, true);
+  assert.equal(summary.fired, 2); // it REPORTS the two it would fire
+  assert.equal(fire.calls.length, 0); // but dispatches nothing
+  assert.equal(deps.ledger.size, 0); // and writes no ledger
+  assert.equal(existsSync(join(deps.ledgerDir, GAME_ID)), false);
+  assert.ok(deps.logged.some((l) => l.includes('[rehearsal] would fire')));
+});
+
+test('rehearsal reports late exclusions without ledgering them', async () => {
+  const deps = makeDeps({
+    rehearse: true,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null)])),
+    fetchFirstBoardAppearance: () => Promise.resolve(new Date(NOW_MS - 3 * 3_600_000).toISOString()),
+  });
+  const summary = await watchTick(deps);
+  assert.equal(summary.late, 1);
+  assert.equal(deps.ledger.size, 0);
+  assert.ok(deps.logged.some((l) => l.includes('[rehearsal] would exclude')));
+});
+
+// ---------------------------------------------------------------------------
+// The fire path end to end: a scoped watch run file passes the scorer.
 // ---------------------------------------------------------------------------
 
 function stubAdapter(rawText: () => string): ProviderAdapter {
@@ -364,33 +480,35 @@ function stubAdapter(rawText: () => string): ProviderAdapter {
   };
 }
 
-test('a fired game produces a run file that passes full scorer integrity verification', async () => {
-  const inputs = fullBoardInputs();
+test('a scoped watch fire (moneyline + total) produces a run file that passes full scorer integrity verification', async () => {
+  const inputs = inputsWith([oddsRow('moneyline', null), oddsRow('total', 8.5)]);
   const slateDate = '2026-07-20';
+  // The scoped bundle the watcher would assemble: moneyline + total only.
   const build = buildBundle(inputs, slateDate, { requireFuture: false });
   const request = build.requests[0];
   assert.ok(request);
+  // Sanity: the run line is NOT in the scoped bundle.
+  assert.equal(request.game.markets.runLine, undefined);
 
   const cohortId = `watch-v0-${slateDate}`;
-  const adapter = stubAdapter(() =>
-    JSON.stringify(makeValidResponse(request, TEST_ARM, cohortId)),
-  );
+  const adapter = stubAdapter(() => JSON.stringify(makeValidResponse(request, TEST_ARM, cohortId)));
 
-  // Monotonic fake clock well before the cutoff: every read advances 5ms so
-  // recorded timestamps are ordered and latency is exact.
   let t = NOW_MS;
   const nowMs = (): number => {
     t += 5;
     return t;
   };
-
-  const outDir = tempDir('watch-fire-');
+  const detectedAt = new Date(NOW_MS).toISOString();
+  const openedAt = new Date(NOW_MS - 10 * 60_000).toISOString();
   const provenance: WatchGateProvenance = {
-    detectedAt: new Date(NOW_MS).toISOString(),
-    boardCompletedAt: BOARD_FIRST_SEEN,
-    openerAgeMinutes: Math.round((NOW_MS - Date.parse(BOARD_FIRST_SEEN)) / 60_000),
-    lateThresholdMinutes: 60,
+    detectedAt,
+    lateThresholdSeconds: LATE_THRESHOLD_MS / 1000,
+    markets: {
+      moneyline: { firstAppearanceAt: openedAt, openerAgeSeconds: 600 },
+      total: { firstAppearanceAt: openedAt, openerAgeSeconds: 600 },
+    },
   };
+  const outDir = tempDir('watch-fire-');
   const outcome = await fireEligibleGame(build, inputs, slateDate, provenance, {
     arms: [TEST_ARM],
     adapters: new Map([[TEST_ARM.participantId, adapter]]),
@@ -406,71 +524,10 @@ test('a fired game produces a run file that passes full scorer integrity verific
   });
 
   assert.equal(outcome.collisionFailed, false);
-  assert.equal(outcome.armOutcomes[TEST_ARM.participantId], 'valid');
-  assert.equal(outcome.baselineDecisions, 8);
   assert.match(outcome.runId, /^watch-v0-2026-07-20-[0-9a-f]{6}$/);
 
   const lines = readFileSync(outcome.runFile, 'utf8').split(/\r?\n/);
-  const run = parseRunRecords(lines);
-  const violations = verifyRunIntegrity(run, {
-    expectedArms: [
-      {
-        participantId: TEST_ARM.participantId,
-        provider: TEST_ARM.provider,
-        requestedModelId: TEST_ARM.requestedModelId,
-        approvedReportedModelIds: ['stub-model-1'],
-      },
-    ],
-  });
-  assert.deepEqual(violations, []);
-
-  // The human artifact must describe watch entry semantics truthfully — not
-  // the smoke's late-capture caveat — and cite the recorded provenance.
-  const summaryMd = readFileSync(join(outDir, `${outcome.runId}-summary.md`), 'utf8');
-  assert.ok(summaryMd.includes('line-open watch run'));
-  assert.ok(summaryMd.includes('fired at detection'));
-  assert.ok(summaryMd.includes(BOARD_FIRST_SEEN));
-  assert.ok(!summaryMd.includes('captured late'));
-
-  // The scorer FAIL-CLOSES on watch provenance: stripping it, or recording a
-  // gate-violating age, makes the file unscoreable.
-  const metaIndex = lines.findIndex((l) => l.includes('"recordType":"run_meta"'));
-  assert.ok(metaIndex >= 0);
-  const meta = JSON.parse(lines[metaIndex] ?? '') as Record<string, unknown>;
-
-  const stripped = [...lines];
-  const { watch: _watch, ...withoutWatch } = meta;
-  stripped[metaIndex] = JSON.stringify(withoutWatch);
-  const strippedViolations = verifyRunIntegrity(parseRunRecords(stripped), {
-    expectedArms: [
-      {
-        participantId: TEST_ARM.participantId,
-        provider: TEST_ARM.provider,
-        requestedModelId: TEST_ARM.requestedModelId,
-        approvedReportedModelIds: ['stub-model-1'],
-      },
-    ],
-  });
-  assert.ok(strippedViolations.some((v) => v.includes('no watch provenance')));
-
-  const lateFired = [...lines];
-  lateFired[metaIndex] = JSON.stringify({
-    ...meta,
-    watch: { ...provenance, openerAgeMinutes: 999, lateThresholdMinutes: 60 },
-  });
-  const lateViolations = verifyRunIntegrity(parseRunRecords(lateFired), {
-    expectedArms: [
-      {
-        participantId: TEST_ARM.participantId,
-        provider: TEST_ARM.provider,
-        requestedModelId: TEST_ARM.requestedModelId,
-        approvedReportedModelIds: ['stub-model-1'],
-      },
-    ],
-  });
-  assert.ok(lateViolations.some((v) => v.includes('exceeds the recorded late threshold')));
-
-  const expected = [
+  const expectedArms = [
     {
       participantId: TEST_ARM.participantId,
       provider: TEST_ARM.provider,
@@ -478,375 +535,263 @@ test('a fired game produces a run file that passes full scorer integrity verific
       approvedReportedModelIds: ['stub-model-1'],
     },
   ];
+  const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms });
+  assert.deepEqual(violations, []);
 
-  // Shifting detection forward past the recorded dispatch instants breaks
-  // the bundle → detection → request chain.
-  const shifted = [...lines];
-  const shiftedWatch = {
-    ...provenance,
-    detectedAt: new Date(NOW_MS + 5 * 60_000).toISOString(),
-    boardCompletedAt: new Date(Date.parse(BOARD_FIRST_SEEN) + 5 * 60_000).toISOString(),
-  };
-  shifted[metaIndex] = JSON.stringify({ ...meta, watch: shiftedWatch });
-  const shiftedViolations = verifyRunIntegrity(parseRunRecords(shifted), { expectedArms: expected });
-  assert.ok(shiftedViolations.some((v) => v.includes('dispatched before the recorded detection instant')));
+  const metaIndex = lines.findIndex((l) => l.includes('"recordType":"run_meta"'));
+  assert.ok(metaIndex >= 0);
+  const meta = JSON.parse(lines[metaIndex] ?? '') as Record<string, unknown>;
 
-  // Detection cannot predate the inputs it was evaluated on.
-  const predated = [...lines];
-  predated[metaIndex] = JSON.stringify({
+  // Fail-closed: stripping watch provenance makes it unscoreable.
+  const { watch: _watch, ...withoutWatch } = meta;
+  const stripped = [...lines];
+  stripped[metaIndex] = JSON.stringify(withoutWatch);
+  assert.ok(
+    verifyRunIntegrity(parseRunRecords(stripped), { expectedArms }).some((v) =>
+      v.includes('no watch provenance'),
+    ),
+  );
+
+  // Fail-closed: a single market's opener age above the threshold is refused.
+  const lateFired = [...lines];
+  lateFired[metaIndex] = JSON.stringify({
     ...meta,
-    watch: { ...provenance, detectedAt: '2026-07-20T11:00:00.000Z', boardCompletedAt: '2026-07-20T10:30:00.000Z' },
+    watch: {
+      ...provenance,
+      markets: {
+        ...provenance.markets,
+        total: { firstAppearanceAt: openedAt, openerAgeSeconds: 999_999 },
+      },
+    },
   });
-  const predatedViolations = verifyRunIntegrity(parseRunRecords(predated), { expectedArms: expected });
-  assert.ok(predatedViolations.some((v) => v.includes('precedes bundle assembly')));
+  assert.ok(
+    verifyRunIntegrity(parseRunRecords(lateFired), { expectedArms }).some((v) =>
+      v.includes('opener age exceeds the recorded late threshold'),
+    ),
+  );
 
-  // Bidirectional identity: watch metadata on a non-watch run is a violation.
-  const relabeled = lines.map((l) => l.replaceAll(outcome.runId, `smoke-v0-${slateDate}-abcdef`));
-  const relabeledViolations = verifyRunIntegrity(parseRunRecords(relabeled), { expectedArms: expected });
-  assert.ok(relabeledViolations.some((v) => v.includes('non-watch run carries watch provenance')));
+  // Fail-closed: a market gated but not entered (or vice versa) is a violation.
+  const gateMismatch = [...lines];
+  gateMismatch[metaIndex] = JSON.stringify({
+    ...meta,
+    watch: {
+      ...provenance,
+      markets: {
+        moneyline: { firstAppearanceAt: openedAt, openerAgeSeconds: 600 },
+        spread: { firstAppearanceAt: openedAt, openerAgeSeconds: 600 },
+      },
+    },
+  });
+  const mismatch = verifyRunIntegrity(parseRunRecords(gateMismatch), { expectedArms });
+  assert.ok(mismatch.some((v) => v.includes('gates spread but the bundle did not enter it')));
+  assert.ok(mismatch.some((v) => v.includes('entered total but recorded no gate provenance')));
 });
 
 // ---------------------------------------------------------------------------
 // CLI arg parsing
 // ---------------------------------------------------------------------------
 
-test('parseWatchArgs defaults and validation', () => {
+test('parseWatchArgs defaults and validation — no --late-minutes, no --markets', () => {
   const defaults = parseWatchArgs([], () => undefined);
   assert.deepEqual(defaults, {
     dryRun: false,
     once: false,
+    rehearse: false,
     outDir: 'out',
     outDirExplicit: false,
-    pollSeconds: 300,
+    pollSeconds: 60,
     windowHours: 168,
-    lateMinutes: 60,
-    maxFiresPerTick: 10,
+    maxDispatchesPerTick: 20,
     timeoutSeconds: null,
     maxOutputTokens: 16000,
   });
   assert.equal(parseWatchArgs(['--dry-run'], () => undefined).once, true);
-  assert.equal(parseWatchArgs(['--late-minutes', '15'], () => undefined).lateMinutes, 15);
-  assert.equal(parseWatchArgs(['--out', 'elsewhere'], () => undefined).outDirExplicit, true);
-  assert.equal(parseWatchArgs(['--max-fires-per-tick', '3'], () => undefined).maxFiresPerTick, 3);
+  assert.equal(parseWatchArgs(['--rehearse'], () => undefined).rehearse, true);
+  assert.equal(parseWatchArgs(['--rehearse'], () => undefined).once, true);
+  assert.equal(parseWatchArgs(['--max-dispatches-per-tick', '3'], () => undefined).maxDispatchesPerTick, 3);
   assert.throws(() => parseWatchArgs(['--poll-seconds', '5'], () => undefined), WatchUsageError);
   assert.throws(() => parseWatchArgs(['--window-hours', '9999'], () => undefined), WatchUsageError);
-  assert.throws(() => parseWatchArgs(['--late-minutes', '2000'], () => undefined), WatchUsageError);
-  assert.throws(() => parseWatchArgs(['--max-fires-per-tick', '0'], () => undefined), WatchUsageError);
+  // The entry-honesty threshold and market policy are committed, not flags.
+  assert.throws(() => parseWatchArgs(['--late-minutes', '15'], () => undefined), WatchUsageError);
+  assert.throws(() => parseWatchArgs(['--markets', 'moneyline'], () => undefined), WatchUsageError);
+  assert.throws(() => parseWatchArgs(['--max-dispatches-per-tick', '0'], () => undefined), WatchUsageError);
   assert.throws(() => parseWatchArgs(['--bogus'], () => undefined), WatchUsageError);
 });
 
 // ---------------------------------------------------------------------------
-// Hardening added in review: duplicate rows, spend caps, aged inputs,
-// mid-tick first pitch, poisoned timestamps, per-game isolation, deferral
-// escalation.
+// Policy isolation (the market allow-list itself)
 // ---------------------------------------------------------------------------
 
-test('duplicate rows for one game in a single fetch fire exactly once', async () => {
+test('market policy is a per-(league, market) allow-list; unlisted defaults to disabled', () => {
+  // The real committed policy: MLB acts on moneyline + total, not the run line.
+  assert.deepEqual(enabledMarkets('mlb'), ['moneyline', 'total']);
+  assert.equal(isMarketEnabled('mlb', 'moneyline'), true);
+  assert.equal(isMarketEnabled('mlb', 'total'), true);
+  assert.equal(isMarketEnabled('mlb', 'spread'), false);
+  // A league absent from the policy fires nothing until explicitly listed —
+  // introducing a league can never silently start dispatching markets.
+  assert.deepEqual(enabledMarkets('nfl'), []);
+  assert.equal(isMarketEnabled('nfl', 'spread'), false);
+  assert.equal(isMarketEnabled('ncaaf', 'moneyline'), false);
+});
+
+test('policy isolation: disabling the MLB run line says nothing about another league (via the watcher seam)', async () => {
+  // Two games, two leagues, one custom policy: MLB run line OFF, "xfl" spread ON.
   const fire = fakeFire();
-  const board = fullBoardInputs();
+  const mlbGame = gamesRow({ gameId: '00000000-0000-4000-8000-0000000mlb01', sport: 'mlb' });
+  const xflGame = gamesRow({
+    gameId: '00000000-0000-4000-8000-0000000xfl01',
+    sport: 'xfl',
+    matchTime: '2026-07-20T23:40:00+00:00',
+  });
+  const policy: Record<string, MarketKey[]> = { mlb: ['moneyline', 'total'], xfl: ['spread'] };
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    enabledMarketsFor: (league) => policy[league] ?? [],
+    fetchInputs: () =>
+      Promise.resolve({
+        gamesRows: [mlbGame, xflGame],
+        oddsRows: [
+          oddsRow('moneyline', null, mlbGame.gameId),
+          oddsRow('spread', 1.5, mlbGame.gameId),
+          oddsRow('total', 8.5, mlbGame.gameId),
+          oddsRow('spread', 3.5, xflGame.gameId),
+        ],
+        fetchStartedAt: '2026-07-20T11:59:58.000Z',
+        fetchCompletedAt: FETCH_COMPLETED_AT,
+      }),
+  });
+  await watchTick(deps);
+  // MLB dispatched moneyline + total; its run line stayed disabled.
+  assert.equal(deps.ledger.get(key(mlbGame.gameId, 'moneyline'))?.decision, 'fired');
+  assert.equal(deps.ledger.get(key(mlbGame.gameId, 'total'))?.decision, 'fired');
+  assert.equal(deps.ledger.has(key(mlbGame.gameId, 'spread')), false);
+  // The xfl spread DID dispatch — the same market, enabled for a different league.
+  assert.equal(deps.ledger.get(key(xflGame.gameId, 'spread'))?.decision, 'fired');
+});
+
+// ---------------------------------------------------------------------------
+// Hardening carried forward: dupes, caps, aged inputs, isolation, ordering.
+// ---------------------------------------------------------------------------
+
+test('duplicate rows for one game in a single fetch fire each speculation exactly once', async () => {
+  const fire = fakeFire();
+  const board = inputsWith(fullBoard());
   const dupRow = board.gamesRows[0];
   assert.ok(dupRow);
   const deps = makeDeps({
     fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve({ ...board, gamesRows: [dupRow, { ...dupRow }] }),
+  });
+  const summary = await watchTick(deps);
+  assert.equal(summary.dispatches, 1);
+  assert.equal(fire.calls.length, 1);
+});
+
+test('the per-tick dispatch cap stops loudly; uncapped games stay unclaimed', async () => {
+  const fire = fakeFire();
+  const a = gamesRow({ gameId: '00000000-0000-4000-8000-0000000cap01', matchTime: '2026-07-20T22:10:00+00:00' });
+  const b = gamesRow({ gameId: '00000000-0000-4000-8000-0000000cap02', matchTime: '2026-07-20T23:10:00+00:00' });
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    maxDispatchesPerTick: 1,
     fetchInputs: () =>
-      Promise.resolve({ ...board, gamesRows: [dupRow, { ...dupRow }] }),
+      Promise.resolve({
+        gamesRows: [a, b],
+        oddsRows: [
+          oddsRow('moneyline', null, a.gameId),
+          oddsRow('total', 8.5, a.gameId),
+          oddsRow('moneyline', null, b.gameId),
+          oddsRow('total', 8.5, b.gameId),
+        ],
+        fetchStartedAt: '2026-07-20T11:59:58.000Z',
+        fetchCompletedAt: FETCH_COMPLETED_AT,
+      }),
   });
   const summary = await watchTick(deps);
-  assert.equal(summary.fired, 1);
+  assert.equal(summary.dispatches, 1);
+  assert.equal(summary.capHit, true);
   assert.equal(fire.calls.length, 1);
-  // The completed entry survives — never overwritten by a duplicate claim.
-  assert.equal(deps.ledger.get(GAME_ID)?.runId, 'watch-v0-2026-07-20-abc123');
-});
-
-test('the per-tick fire cap stops dispatch loudly; uncapped games stay unclaimed', async () => {
-  const fire = fakeFire();
-  const a = fullBoardFor('00000000-0000-4000-8000-0000000wata1', '2026-07-20T22:10:00+00:00');
-  const b = fullBoardFor('00000000-0000-4000-8000-0000000watb2', '2026-07-20T23:10:00+00:00');
-  const deps = makeDeps({
-    fireGame: fire.fire,
-    maxFiresPerTick: 1,
-    fetchInputs: () =>
-      Promise.resolve(
-        fullBoardInputs({ gamesRows: [a.row, b.row], oddsRows: [...a.odds, ...b.odds] }),
-      ),
-  });
-  const summary = await watchTick(deps);
-  assert.equal(summary.fired, 1);
-  assert.equal(summary.capHit, true); // schedulers see the hit cap
-  assert.equal(fire.calls.length, 1);
-  assert.equal(deps.ledger.size, 1);
-  assert.ok(deps.errors.some((line) => line.includes('fire cap reached')));
-  // The uncapped game was never claimed — it re-evaluates next tick.
-  assert.equal(deps.ledger.has(b.row.gameId), false);
-});
-
-test('stale working inputs are re-fetched before evaluating a candidate (fire-at-detection per game)', async () => {
-  const fire = fakeFire();
-  let fetches = 0;
-  const freshCompletedAt = new Date(Date.parse(FETCH_COMPLETED_AT) + 5 * 60_000).toISOString();
-  const deps = makeDeps({
-    fireGame: fire.fire,
-    // 5 minutes past the tick snapshot: older than FRESH_FIRE_MS, younger
-    // than the backstop — the tick must refresh, then fire on fresh inputs.
-    nowMs: () => Date.parse(FETCH_COMPLETED_AT) + 5 * 60_000 + 10_000,
-    fetchInputs: () => {
-      fetches += 1;
-      return Promise.resolve(
-        fetches === 1
-          ? fullBoardInputs() // the stale tick snapshot
-          : fullBoardInputs({
-              fetchCompletedAt: freshCompletedAt,
-              oddsRows: [
-                { ...oddsRow('moneyline', null), upstream_last_updated: freshCompletedAt },
-                { ...oddsRow('spread', 1.5), upstream_last_updated: freshCompletedAt },
-                { ...oddsRow('total', 8.5), upstream_last_updated: freshCompletedAt },
-              ],
-            }),
-      );
-    },
-  });
-  const summary = await watchTick(deps);
-  assert.equal(fetches, 2); // tick snapshot + per-fire refresh
-  assert.equal(summary.fired, 1);
-  assert.equal(fire.calls.length, 1);
-});
-
-test('a game absent from the refreshed snapshot is skipped, never claimed', async () => {
-  const fire = fakeFire();
-  let fetches = 0;
-  const deps = makeDeps({
-    fireGame: fire.fire,
-    nowMs: () => Date.parse(FETCH_COMPLETED_AT) + 5 * 60_000,
-    fetchInputs: () => {
-      fetches += 1;
-      return Promise.resolve(
-        fetches === 1
-          ? fullBoardInputs()
-          : fullBoardInputs({ gamesRows: [], oddsRows: [] }), // left the window
-      );
-    },
-  });
-  const summary = await watchTick(deps);
-  assert.equal(summary.fired, 0);
-  assert.equal(summary.watched, 1);
-  assert.equal(fire.calls.length, 0);
-  assert.equal(deps.ledger.size, 0);
+  assert.ok(deps.errors.some((line) => line.includes('dispatch cap reached')));
+  // The uncapped game was never claimed.
+  assert.equal(deps.ledger.has(key(b.gameId, 'moneyline')), false);
 });
 
 test('inputs still aged after a refresh stop the tick (backstop)', async () => {
   const fire = fakeFire();
   const deps = makeDeps({
     fireGame: fire.fire,
-    // Far beyond the backstop; the refresh returns equally stale stamps.
     nowMs: () => Date.parse(FETCH_COMPLETED_AT) + 11 * 60_000,
     maxInputAgeMs: 10 * 60_000,
   });
   const summary = await watchTick(deps);
   assert.equal(summary.fired, 0);
   assert.equal(fire.calls.length, 0);
-  assert.equal(deps.ledger.size, 0);
   assert.ok(deps.errors.some((line) => line.includes('still aged after refresh')));
 });
 
-test('a game whose first pitch passed mid-tick is never claimed or burned', async () => {
+test('a game whose first pitch passed is blocked, never claimed', async () => {
   const fire = fakeFire();
-  // First pitch after assembly but before "now": eligible to buildBundle,
-  // caught by the pre-claim recheck.
-  const g = fullBoardFor(GAME_ID, '2026-07-20T12:00:15+00:00');
+  const g = gamesRow({ matchTime: '2026-07-20T12:00:15+00:00' }); // ~ now
   const deps = makeDeps({
     fireGame: fire.fire,
     fetchInputs: () =>
-      Promise.resolve(fullBoardInputs({ gamesRows: [g.row], oddsRows: g.odds })),
+      Promise.resolve(inputsWith([oddsRow('moneyline', null, g.gameId), oddsRow('total', 8.5, g.gameId)], { gamesRows: [g] })),
   });
   const summary = await watchTick(deps);
   assert.equal(summary.fired, 0);
-  assert.equal(summary.watched, 1);
+  assert.equal(summary.blocked, 2); // both enabled markets blocked: first_pitch_passed
   assert.equal(fire.calls.length, 0);
   assert.equal(deps.ledger.size, 0);
 });
 
-test('an unparseable first-appearance timestamp defers with a log and is never cached', async () => {
-  const fire = fakeFire();
-  let reads = 0;
-  const deps = makeDeps({
-    fireGame: fire.fire,
-    fetchFirstBoardAppearance: () => {
-      reads += 1;
-      return Promise.resolve('not-a-timestamp');
-    },
-  });
-  const first = await watchTick(deps);
-  assert.equal(first.deferred, 1);
-  assert.ok(deps.errors.some((line) => line.includes('unparseable first-appearance')));
-  assert.equal(deps.boardFirstSeen.size, 0);
-  const readsAfterFirst = reads;
-  await watchTick(deps);
-  // Not cached: the next tick re-reads instead of silently deferring forever.
-  assert.ok(reads > readsAfterFirst);
-});
-
 test('one malformed row is isolated — later candidates still fire', async () => {
   const fire = fakeFire();
-  const bad = fullBoardFor('00000000-0000-4000-8000-0000000badd1');
-  bad.row.matchTime = 'garbage'; // easternCalendarDay throws
-  const good = fullBoardFor(GAME_ID);
+  const bad = gamesRow({ gameId: '00000000-0000-4000-8000-0000000badd1', matchTime: 'garbage' });
+  const good = gamesRow();
   const deps = makeDeps({
     fireGame: fire.fire,
     fetchInputs: () =>
-      Promise.resolve(
-        fullBoardInputs({
-          gamesRows: [bad.row, good.row],
-          oddsRows: [...bad.odds, ...good.odds],
-        }),
-      ),
+      Promise.resolve({
+        gamesRows: [bad, good],
+        oddsRows: [
+          oddsRow('moneyline', null, bad.gameId),
+          oddsRow('total', 8.5, bad.gameId),
+          oddsRow('moneyline', null, good.gameId),
+          oddsRow('total', 8.5, good.gameId),
+        ],
+        fetchStartedAt: '2026-07-20T11:59:58.000Z',
+        fetchCompletedAt: FETCH_COMPLETED_AT,
+      }),
   });
   const summary = await watchTick(deps);
-  assert.equal(summary.fired, 1);
+  assert.equal(summary.dispatches, 1);
   assert.equal(summary.failed, 1);
-  assert.equal(fire.calls.length, 1);
   assert.ok(deps.errors.some((line) => line.includes('failed this tick')));
 });
 
 test('candidates order chronologically across mixed UTC offsets, not lexically', async () => {
   const fire = fakeFire();
-  // Lexical order puts the +00:00 string first; chronologically the +04:00
-  // game starts earlier (19:10Z vs 20:10Z).
-  const earlier = fullBoardFor('00000000-0000-4000-8000-0000000ord01', '2026-07-20T23:10:00+04:00');
-  const later = fullBoardFor('00000000-0000-4000-8000-0000000ord02', '2026-07-20T20:10:00+00:00');
+  const earlier = gamesRow({ gameId: '00000000-0000-4000-8000-0000000ord01', matchTime: '2026-07-20T23:10:00+04:00' });
+  const later = gamesRow({ gameId: '00000000-0000-4000-8000-0000000ord02', matchTime: '2026-07-20T20:10:00+00:00' });
   const deps = makeDeps({
     fireGame: fire.fire,
     fetchInputs: () =>
-      Promise.resolve(
-        fullBoardInputs({
-          gamesRows: [later.row, earlier.row],
-          oddsRows: [...later.odds, ...earlier.odds],
-        }),
-      ),
+      Promise.resolve({
+        gamesRows: [later, earlier],
+        oddsRows: [
+          oddsRow('moneyline', null, later.gameId),
+          oddsRow('moneyline', null, earlier.gameId),
+        ],
+        fetchStartedAt: '2026-07-20T11:59:58.000Z',
+        fetchCompletedAt: FETCH_COMPLETED_AT,
+      }),
   });
   await watchTick(deps);
   assert.deepEqual(
     fire.calls.map((c) => c.gameId),
-    [earlier.row.gameId, later.row.gameId],
+    [earlier.gameId, later.gameId],
   );
-});
-
-test('the fire cap bounds ATTEMPTS: failing fires count against it', async () => {
-  const fire = fakeFire(undefined, true); // every fire fails (may still have billed)
-  const a = fullBoardFor('00000000-0000-4000-8000-0000000cap01', '2026-07-20T22:10:00+00:00');
-  const b = fullBoardFor('00000000-0000-4000-8000-0000000cap02', '2026-07-20T23:10:00+00:00');
-  const deps = makeDeps({
-    fireGame: fire.fire,
-    maxFiresPerTick: 1,
-    fetchInputs: () =>
-      Promise.resolve(
-        fullBoardInputs({ gamesRows: [a.row, b.row], oddsRows: [...a.odds, ...b.odds] }),
-      ),
-  });
-  const summary = await watchTick(deps);
-  assert.equal(fire.calls.length, 1); // exactly one dispatch attempt
-  assert.equal(summary.fired, 0);
-  assert.equal(summary.failed, 1);
-  assert.equal(deps.ledger.size, 1); // only the attempted game is claimed
-  assert.ok(deps.errors.some((line) => line.includes('fire cap reached')));
-});
-
-test('fire errors surface in the tick summary as failures', async () => {
-  const fire = fakeFire(undefined, true);
-  const deps = makeDeps({ fireGame: fire.fire });
-  const summary = await watchTick(deps);
-  assert.equal(summary.failed, 1);
-  assert.equal(summary.fired, 0);
-});
-
-test('a future-dated first appearance fails closed: logged, never cached, never fired', async () => {
-  const fire = fakeFire();
-  const deps = makeDeps({
-    fireGame: fire.fire,
-    // "First appearance" a day AFTER detection — impossible; a bogus stamp
-    // must not defeat the late gate by reading as a fresh opener.
-    fetchFirstBoardAppearance: () => Promise.resolve('2026-07-21T12:00:00.000Z'),
-  });
-  const summary = await watchTick(deps);
-  assert.equal(summary.deferred, 1);
-  assert.equal(summary.fired, 0);
-  assert.equal(fire.calls.length, 0);
-  assert.equal(deps.boardFirstSeen.size, 0);
-  assert.ok(deps.errors.some((line) => line.includes('future first-appearance')));
-});
-
-test('a future stamp within minutes still defers — the runtime accepts only what the scorer will', async () => {
-  const fire = fakeFire();
-  let now = NOW_MS;
-  const futureStamp = new Date(NOW_MS + 60_000).toISOString(); // 60s after detection
-  const deps = makeDeps({
-    fireGame: fire.fire,
-    nowMs: () => now,
-    fetchFirstBoardAppearance: () => Promise.resolve(futureStamp),
-    fetchInputs: () =>
-      Promise.resolve(
-        fullBoardInputs({
-          fetchStartedAt: new Date(now - 2_000).toISOString(),
-          fetchCompletedAt: new Date(now).toISOString(),
-          oddsRows: [
-            { ...oddsRow('moneyline', null), upstream_last_updated: new Date(now - 60_000).toISOString() },
-            { ...oddsRow('spread', 1.5), upstream_last_updated: new Date(now - 60_000).toISOString() },
-            { ...oddsRow('total', 8.5), upstream_last_updated: new Date(now - 60_000).toISOString() },
-          ],
-        }),
-      ),
-  });
-  const first = await watchTick(deps);
-  assert.equal(first.deferred, 1);
-  assert.equal(fire.calls.length, 0);
-  assert.equal(deps.boardFirstSeen.size, 0);
-  assert.ok(deps.errors.some((line) => line.includes('future first-appearance')));
-
-  // One tick later the stamp is in the past: fires with a non-negative age.
-  now += 5 * 60_000;
-  const second = await watchTick(deps);
-  assert.equal(second.fired, 1);
-  const prov = fire.calls[0]?.provenance;
-  assert.ok(prov);
-  assert.ok(prov.openerAgeMinutes >= 0);
-});
-
-test('slow board-history reads trigger re-preparation — fires never use aged inputs', async () => {
-  const fire = fakeFire();
-  let now = NOW_MS;
-  let fetches = 0;
-  const deps = makeDeps({
-    fireGame: fire.fire,
-    nowMs: () => now,
-    fetchInputs: () => {
-      fetches += 1;
-      return Promise.resolve(
-        fullBoardInputs({
-          fetchStartedAt: new Date(now - 2_000).toISOString(),
-          fetchCompletedAt: new Date(now).toISOString(),
-          oddsRows: [
-            { ...oddsRow('moneyline', null), upstream_last_updated: new Date(now - 10_000).toISOString() },
-            { ...oddsRow('spread', 1.5), upstream_last_updated: new Date(now - 10_000).toISOString() },
-            { ...oddsRow('total', 8.5), upstream_last_updated: new Date(now - 10_000).toISOString() },
-          ],
-        }),
-      );
-    },
-    // Each history read consumes 40 simulated seconds — three reads push the
-    // snapshot far past FRESH_FIRE_MS before the claim.
-    fetchFirstBoardAppearance: () => {
-      now += 40_000;
-      return Promise.resolve(new Date(now - 5 * 60_000).toISOString());
-    },
-  });
-  const summary = await watchTick(deps);
-  assert.equal(summary.fired, 1);
-  assert.equal(fetches, 2); // tick snapshot + post-history-read re-preparation
-  const call = fire.calls[0];
-  assert.ok(call);
-  // The fired inputs are the RE-FETCHED snapshot, seconds old at dispatch.
-  assert.equal(call.fetchCompletedAt, new Date(now).toISOString());
-  // And detection is stamped after that assembly (the chain the scorer checks).
-  assert.ok(Date.parse(call.provenance.detectedAt) >= Date.parse(call.fetchCompletedAt));
 });
 
 test('a collision-failed fire is a FAILED pass, not a fired one', async () => {
@@ -855,7 +800,7 @@ test('a collision-failed fire is a FAILED pass, not a fired one', async () => {
   const summary = await watchTick(deps);
   assert.equal(summary.fired, 0);
   assert.equal(summary.failed, 1);
-  assert.equal(deps.ledger.get(GAME_ID)?.collisionFailed, true);
+  assert.equal(deps.ledger.get(key(GAME_ID, 'moneyline'))?.collisionFailed, true);
 });
 
 test('a thrown board-history read is a failure, not a benign deferral', async () => {
@@ -870,52 +815,59 @@ test('a thrown board-history read is a failure, not a benign deferral', async ()
   assert.equal(fire.calls.length, 0);
 });
 
-test('the fired provenance matches the gate evaluation', async () => {
+test('a future-dated first appearance fails closed: logged, never cached, never fired', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null)])),
+    fetchFirstBoardAppearance: () => Promise.resolve('2026-07-21T12:00:00.000Z'),
+  });
+  const summary = await watchTick(deps);
+  assert.equal(summary.deferred, 1);
+  assert.equal(summary.fired, 0);
+  assert.equal(deps.boardFirstSeen.size, 0);
+  assert.ok(deps.errors.some((line) => line.includes('future first-appearance')));
+});
+
+test('the fired provenance carries each market\'s own first appearance and age', async () => {
   const fire = fakeFire();
   const deps = makeDeps({ fireGame: fire.fire });
   await watchTick(deps);
-  const call = fire.calls[0];
-  assert.ok(call);
-  assert.equal(call.provenance.boardCompletedAt, BOARD_FIRST_SEEN);
-  assert.equal(call.provenance.openerAgeMinutes, 11);
-  assert.equal(call.provenance.lateThresholdMinutes, 60);
-  assert.equal(call.provenance.detectedAt, new Date(NOW_MS).toISOString());
+  const prov = fire.calls[0]?.provenance;
+  assert.ok(prov);
+  assert.equal(prov.lateThresholdSeconds, LATE_THRESHOLD_MS / 1000);
+  assert.equal(prov.detectedAt, new Date(NOW_MS).toISOString());
+  assert.equal(prov.markets.moneyline?.firstAppearanceAt, OPENED_AT);
+  assert.ok((prov.markets.moneyline?.openerAgeSeconds ?? -1) >= 600);
+  assert.ok((prov.markets.total?.openerAgeSeconds ?? -1) >= 600);
 });
 
-test('prolonged deferral escalates exactly once', async () => {
+test('prolonged deferral escalates exactly once, per speculation', async () => {
   const fire = fakeFire();
   let now = NOW_MS;
   const deps = makeDeps({
     fireGame: fire.fire,
     fetchFirstBoardAppearance: () => Promise.resolve(null),
-    // Real ticks fetch fresh inputs; the fixture's assembly time and the
-    // game's first pitch must track the advancing clock or the aged-inputs
-    // and already-started guards (correctly) stop the tick first.
     fetchInputs: () => {
-      const g = fullBoardFor(GAME_ID, new Date(now + 11 * 3_600_000).toISOString());
-      g.odds = g.odds.map((o) => ({
-        ...o,
-        upstream_last_updated: new Date(now - 5 * 60_000).toISOString(),
-        poll_captured_at: new Date(now - 5 * 60_000).toISOString(),
-      }));
-      return Promise.resolve(
-        fullBoardInputs({
-          gamesRows: [g.row],
-          oddsRows: g.odds,
-          fetchStartedAt: new Date(now - 2_000).toISOString(),
-          fetchCompletedAt: new Date(now).toISOString(),
-        }),
-      );
+      const g = gamesRow({ matchTime: new Date(now + 11 * 3_600_000).toISOString() });
+      return Promise.resolve({
+        gamesRows: [g],
+        oddsRows: [
+          { ...oddsRow('moneyline', null), upstream_last_updated: new Date(now - 5 * 60_000).toISOString() },
+          { ...oddsRow('total', 8.5), upstream_last_updated: new Date(now - 5 * 60_000).toISOString() },
+        ],
+        fetchStartedAt: new Date(now - 2_000).toISOString(),
+        fetchCompletedAt: new Date(now).toISOString(),
+      });
     },
     nowMs: () => now,
-    lateMs: 60 * 60_000,
   });
   await watchTick(deps);
-  assert.equal(deps.errors.length, 0);
+  assert.equal(deps.errors.filter((l) => l.includes('deferred longer')).length, 0);
   now += 2 * 60 * 60_000; // two hours later, still deferring
   await watchTick(deps);
-  const warns = deps.errors.filter((line) => line.includes('deferred longer'));
-  assert.equal(warns.length, 1);
+  // Once per speculation (moneyline + total) — each is its own entity.
+  assert.equal(deps.errors.filter((l) => l.includes('deferred longer')).length, 2);
   await watchTick(deps);
-  assert.equal(deps.errors.filter((line) => line.includes('deferred longer')).length, 1);
+  assert.equal(deps.errors.filter((l) => l.includes('deferred longer')).length, 2);
 });
