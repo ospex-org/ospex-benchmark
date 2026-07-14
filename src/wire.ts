@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type {
   ClosingLineRow,
+  ClosingLineRowWithId,
   CurrentOddsRow,
   GamesEndpointRow,
   GamesTableRow,
@@ -103,6 +104,15 @@ export const closingLineRowSchema = z
 
 export function parseClosingLineRows(body: unknown): ClosingLineRow[] {
   return z.array(closingLineRowSchema).parse(body) as ClosingLineRow[];
+}
+
+/** A closing-line row carrying its identity PK — the keyset-pagination key. */
+export const closingLineRowWithIdSchema = closingLineRowSchema.extend({
+  id: z.number().int().positive(),
+});
+
+export function parseClosingLineRowsWithId(body: unknown): ClosingLineRowWithId[] {
+  return z.array(closingLineRowWithIdSchema).parse(body) as ClosingLineRowWithId[];
 }
 
 export const gamesTableRowSchema = z

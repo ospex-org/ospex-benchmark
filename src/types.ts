@@ -171,6 +171,11 @@ export interface ClosingLineRow {
   source: string;
 }
 
+/** A closing-line row carrying its identity PK (the keyset-pagination key). */
+export interface ClosingLineRowWithId extends ClosingLineRow {
+  id: number;
+}
+
 /**
  * A `games` TABLE row over PostgREST (distinct from GamesEndpointRow, the
  * core-api games ENDPOINT shape) — the score/finality columns the totals-pair

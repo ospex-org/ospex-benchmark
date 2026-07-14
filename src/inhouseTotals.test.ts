@@ -99,7 +99,8 @@ function meta(overrides: Partial<InhouseTotalsMetaRecord> = {}): InhouseTotalsMe
     recordType: 'inhouse_totals_meta',
     network: 'polygon',
     sport: 'mlb',
-    mlbGames: 2,
+    totalsClosesSeen: 2,
+    droppedNonMlb: 0,
     records: 2,
     pairs: 1,
     droppedNullLine: 0,
@@ -134,6 +135,16 @@ test('parseInhouseTotalsDataset: pair-count mismatch is refused', () => {
     record(null),
   ]);
   assert.throws(() => parseInhouseTotalsDataset(text), /truncated or edited/);
+});
+
+test('parseInhouseTotalsDataset: coverage arithmetic that does not add up is refused', () => {
+  // Meta claims 5 closes seen but only 2 records + 0 dropped are accounted
+  // for — the completeness story must be arithmetic, not prose.
+  const text = datasetText(meta({ totalsClosesSeen: 5 }), [
+    record({ awayScore: 3, homeScore: 4, total: 7, finalType: 'Finished' }),
+    record(null),
+  ]);
+  assert.throws(() => parseInhouseTotalsDataset(text), /coverage arithmetic/);
 });
 
 test('parseInhouseTotalsDataset: an edited confidence histogram is refused', () => {

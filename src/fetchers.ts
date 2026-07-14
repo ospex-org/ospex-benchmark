@@ -1,6 +1,7 @@
 import { redactAndTruncate } from './config.js';
 import {
   parseClosingLineRows,
+  parseClosingLineRowsWithId,
   parseCurrentOddsRows,
   parseGamesBody,
   parseGamesTableRows,
@@ -8,6 +9,7 @@ import {
 } from './wire.js';
 import type {
   ClosingLineRow,
+  ClosingLineRowWithId,
   CurrentOddsRow,
   GamesEndpointRow,
   GamesTableRow,
@@ -116,77 +118,101 @@ export async function fetchClosingLines(
 }
 
 /**
- * Server-side exact row count for a PostgREST filter — the completeness
- * cross-check for offset pagination. A HEAD request with `count=exact`
- * answers from Content-Range without transferring rows.
+ * Keyset pagination over a monotone-identity key: each page asks for rows
+ * with id strictly greater than the last id seen, so — unlike offset
+ * pagination — a concurrent insert can never shift page boundaries and
+ * duplicate one row while dropping another. The identity walk asserts
+ * strictly increasing ids across the whole result (uniqueness + order), and
+ * refuses anything else. Correctness assumes the key is append-only
+ * monotone (a GENERATED IDENTITY column), which closing_lines.id is.
  */
-async function fetchExactCount(url: string, anonKey: string): Promise<number> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, {
-      method: 'HEAD',
-      headers: {
-        apikey: anonKey,
-        Authorization: `Bearer ${anonKey}`,
-        Prefer: 'count=exact',
-      },
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      throw new Error(`HEAD ${url} failed with HTTP ${response.status}`);
+export async function keysetWalk<T>(options: {
+  fetchPage: (afterId: number) => Promise<T[]>;
+  idOf: (row: T) => number;
+  pageSize: number;
+  maxRows?: number;
+}): Promise<T[]> {
+  const { fetchPage, idOf, pageSize } = options;
+  const maxRows = options.maxRows ?? 1_000_000;
+  const rows: T[] = [];
+  let afterId = 0;
+  for (;;) {
+    const page = await fetchPage(afterId);
+    let previous = afterId;
+    for (const row of page) {
+      const id = idOf(row);
+      if (!Number.isSafeInteger(id) || id <= previous) {
+        throw new Error(
+          `keyset pagination returned a non-increasing id (${id} after ${previous}) — ` +
+            'refusing an inconsistent snapshot',
+        );
+      }
+      previous = id;
+      rows.push(row);
     }
-    const contentRange = response.headers.get('content-range');
-    const total = contentRange?.split('/')[1];
-    if (total === undefined || !/^\d+$/.test(total)) {
-      throw new Error(`HEAD ${url}: no exact count in Content-Range ("${contentRange ?? ''}")`);
+    if (page.length < pageSize) return rows;
+    afterId = previous;
+    if (rows.length > maxRows) {
+      throw new Error('keyset pagination did not terminate — aborting rather than looping');
     }
-    return Number(total);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
 /**
- * Every `games` TABLE row for one (network, sport) over the same public
- * anon read path — the completion/score side of the totals-pair extraction.
- * Paginated and ordered by the stable key, then verified against the
- * server's exact count: if the server ever clamps pages below our limit,
- * pagination would otherwise terminate early and truncate SILENTLY (the
- * output stays self-consistent), so completeness is asserted, not assumed.
+ * EVERY totals closing line on a network, enumerated directly from the
+ * source table the snapshot claims to cover (not via a pre-enumerated game
+ * list, which would silently hide closes whose games row is missing or
+ * unexpected). Keyset-paginated on the identity PK.
  */
-export async function fetchGamesTableRows(
+export async function fetchTotalsClosingLines(
   supabaseUrl: string,
   anonKey: string,
   network: string,
-  sport: string,
+): Promise<ClosingLineRowWithId[]> {
+  const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
+  const select =
+    'id,network,jsonodds_id,market,line,away_odds_decimal,home_odds_decimal,' +
+    'away_p_novig,home_p_novig,value_captured_at,last_polled_at,lock_time,' +
+    'poll_gap_seconds,confidence,source';
+  const pageSize = 1000;
+  return keysetWalk({
+    fetchPage: async (afterId) => {
+      const url =
+        `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
+        `&network=eq.${network}&market=eq.total&id=gt.${afterId}` +
+        `&order=id.asc&limit=${pageSize}`;
+      return parseClosingLineRowsWithId(await getJson(url, headers));
+    },
+    idOf: (row) => row.id,
+    pageSize,
+  });
+}
+
+/**
+ * `games` TABLE rows for a pinned set of game ids — batched `in.()` lookups
+ * keyed by identity, so there is no pagination and nothing for a concurrent
+ * write to shift. Duplicate rows for one key are refused.
+ */
+export async function fetchGamesRowsByIds(
+  supabaseUrl: string,
+  anonKey: string,
+  network: string,
+  gameIds: string[],
 ): Promise<GamesTableRow[]> {
   const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
   const select =
     'network,jsonodds_id,sport,match_time,status,home_score,away_score,final_type,score_captured';
-  const filters = `network=eq.${network}&sport=eq.${sport}`;
   const rows: GamesTableRow[] = [];
-  const limit = 1000;
-  for (let offset = 0; ; offset += limit) {
+  const batchSize = 40;
+  for (let i = 0; i < gameIds.length; i += batchSize) {
+    const batch = gameIds.slice(i, i + batchSize);
     const url =
-      `${supabaseUrl}/rest/v1/games?select=${select}&${filters}` +
-      `&order=jsonodds_id.asc&limit=${limit}&offset=${offset}`;
-    const batch = parseGamesTableRows(await getJson(url, headers));
-    rows.push(...batch);
-    if (batch.length < limit) break;
-    if (offset > 100_000) {
-      throw new Error('games table pagination did not terminate — aborting rather than looping');
-    }
+      `${supabaseUrl}/rest/v1/games?select=${select}` +
+      `&network=eq.${network}&jsonodds_id=in.(${batch.join(',')})`;
+    rows.push(...parseGamesTableRows(await getJson(url, headers)));
   }
-  const expected = await fetchExactCount(
-    `${supabaseUrl}/rest/v1/games?select=jsonodds_id&${filters}`,
-    anonKey,
-  );
-  if (rows.length !== expected) {
-    throw new Error(
-      `games pagination returned ${rows.length} rows but the server counts ${expected} — ` +
-        'refusing a silently truncated snapshot',
-    );
+  if (new Set(rows.map((row) => row.jsonodds_id)).size !== rows.length) {
+    throw new Error('games lookup returned duplicate rows for one game id — refusing');
   }
   return rows;
 }

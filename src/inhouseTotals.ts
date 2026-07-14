@@ -29,7 +29,6 @@ export const closingTotalRecordSchema = z
     homePNovig: z.union([z.number(), z.null()]),
     lockTime: z.string().min(1),
     confidence: z.enum(['fresh', 'stale', 'missing']),
-    source: z.string().min(1),
     final: z.union([
       z
         .object({
@@ -49,7 +48,10 @@ export const inhouseTotalsMetaRecordSchema = z
     recordType: z.literal('inhouse_totals_meta'),
     network: z.string().min(1),
     sport: z.string().min(1),
-    mlbGames: z.number().int().nonnegative(),
+    /** Every totals closing line seen on the network, any sport. */
+    totalsClosesSeen: z.number().int().nonnegative(),
+    /** Closes whose game is not the snapshot's sport (visible, not hidden). */
+    droppedNonMlb: z.number().int().nonnegative(),
     records: z.number().int().nonnegative(),
     pairs: z.number().int().nonnegative(),
     droppedNullLine: z.number().int().nonnegative(),
@@ -87,7 +89,6 @@ export function closingTotalRecord(
     homePNovig: close.home_p_novig,
     lockTime: close.lock_time,
     confidence: close.confidence,
-    source: close.source,
     final:
       finished && game.home_score !== null && game.away_score !== null
         ? {
@@ -126,6 +127,15 @@ export function parseInhouseTotalsDataset(text: string): InhouseTotalsDataset {
   if (pairs !== meta.pairs) {
     throw new InhouseTotalsError(
       `meta says ${meta.pairs} pairs but the dataset holds ${pairs} — truncated or edited?`,
+    );
+  }
+  // Every totals close seen must be accounted for: written, dropped as
+  // another sport, or dropped for a null line. The meta cannot claim a
+  // coverage arithmetic the records do not support.
+  if (meta.totalsClosesSeen !== meta.records + meta.droppedNonMlb + meta.droppedNullLine) {
+    throw new InhouseTotalsError(
+      `meta coverage arithmetic fails: ${meta.totalsClosesSeen} closes seen != ` +
+        `${meta.records} records + ${meta.droppedNonMlb} non-mlb + ${meta.droppedNullLine} null-line`,
     );
   }
   const confidence = rederivedConfidence(records);

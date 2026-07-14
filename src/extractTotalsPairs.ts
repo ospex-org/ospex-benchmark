@@ -1,7 +1,7 @@
 import { describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
-import { fetchClosingLines, fetchGamesTableRows } from './fetchers.js';
+import { fetchGamesRowsByIds, fetchTotalsClosingLines } from './fetchers.js';
 import {
   closingTotalRecord,
   rederivedConfidence,
@@ -16,6 +16,14 @@ import type { ClosingTotalRecord, InhouseTotalsMetaRecord } from './inhouseTotal
  * in-house dataset the dispersion fit reads (docs/TOTALS_DISPERSION.md).
  * Read-only over the public anon key: closing_lines + games via PostgREST,
  * the same rows any outside reproducer can fetch.
+ *
+ * Completeness posture: the CLAIMED source table (closing_lines totals) is
+ * enumerated directly with keyset pagination on its identity key — never via
+ * a pre-enumerated game list, which would silently hide closes whose games
+ * row is missing or unexpected. Games are then looked up by pinned ids.
+ * Every close seen is accounted for in the meta (written / non-MLB /
+ * null-line), a close without a games row refuses the whole snapshot, and
+ * the dataset reader re-checks that arithmetic on every load.
  */
 
 class UsageError extends Error {}
@@ -77,28 +85,38 @@ async function main(): Promise<number> {
     );
   }
 
-  const games = await fetchGamesTableRows(supabaseUrl, supabaseAnonKey, NETWORK, SPORT);
-  printLine(`games table: ${games.length} ${SPORT} rows`);
-  const gameById = new Map(games.map((game) => [game.jsonodds_id, game]));
+  const closes = await fetchTotalsClosingLines(supabaseUrl, supabaseAnonKey, NETWORK);
+  printLine(`closing lines: ${closes.length} totals rows (all sports, keyset-complete)`);
+  const gameIds = [...new Set(closes.map((close) => close.jsonodds_id))];
+  if (gameIds.length !== closes.length) {
+    // One materialized totals row per (network, game) is the upstream
+    // invariant; a duplicate means the source is not what we think it is.
+    throw new Error('duplicate totals closing-line rows for one game — refusing the snapshot');
+  }
 
-  const closes = await fetchClosingLines(
-    supabaseUrl,
-    supabaseAnonKey,
-    NETWORK,
-    games.map((game) => game.jsonodds_id),
-  );
-  const totalCloses = closes.filter((close) => close.market === 'total');
-  printLine(`closing lines: ${closes.length} rows, ${totalCloses.length} totals`);
+  const games = await fetchGamesRowsByIds(supabaseUrl, supabaseAnonKey, NETWORK, gameIds);
+  const gameById = new Map(games.map((game) => [game.jsonodds_id, game]));
+  const orphans = closes.filter((close) => !gameById.has(close.jsonodds_id));
+  if (orphans.length > 0) {
+    // A close we cannot classify by sport would make every count below a
+    // guess; refuse the whole snapshot rather than publish one.
+    throw new Error(
+      `${orphans.length} totals closing line(s) have no games row ` +
+        `(first: ${orphans[0]?.jsonodds_id ?? ''}) — refusing an unclassifiable snapshot`,
+    );
+  }
+  printLine(`games rows joined: ${games.length}`);
 
   const records: ClosingTotalRecord[] = [];
+  let droppedNonMlb = 0;
   let droppedNullLine = 0;
   let finalsWithheldNotFinished = 0;
-  for (const close of totalCloses) {
+  for (const close of closes) {
     const game = gameById.get(close.jsonodds_id);
-    if (game === undefined) {
-      // Impossible by construction (closes were fetched by these game ids);
-      // refuse loudly if it ever happens rather than emit an unjoined row.
-      throw new Error(`closing line for unknown game ${close.jsonodds_id}`);
+    if (game === undefined) throw new Error('unreachable: orphan closes were refused above');
+    if (game.sport !== SPORT) {
+      droppedNonMlb += 1;
+      continue;
     }
     const record = closingTotalRecord(close, game);
     if (record === null) {
@@ -129,7 +147,8 @@ async function main(): Promise<number> {
     recordType: 'inhouse_totals_meta',
     network: NETWORK,
     sport: SPORT,
-    mlbGames: games.length,
+    totalsClosesSeen: closes.length,
+    droppedNonMlb,
     records: records.length,
     pairs,
     droppedNullLine,
@@ -146,8 +165,8 @@ async function main(): Promise<number> {
 
   printLine('');
   printLine(
-    `records: ${records.length} closing totals (${pairs} with finals; ` +
-      `dropped ${droppedNullLine} null-line` +
+    `records: ${records.length} ${SPORT} closing totals of ${closes.length} seen ` +
+      `(${pairs} with finals; dropped ${droppedNonMlb} non-${SPORT}, ${droppedNullLine} null-line` +
       `${finalsWithheldNotFinished > 0 ? `; ${finalsWithheldNotFinished} scored-but-not-Finished kept without final` : ''})`,
   );
   printLine(`dataset: ${outPath}`);
