@@ -57,6 +57,20 @@ test('margin-adjusted CLV moves with the de-vigged entry, not the vig-in entry',
   assert.equal(result.entryPNovigSelected, 0.4872);
 });
 
+test('a close whose stored probabilities disagree with its raw quotes is refused outright', () => {
+  // The review repro: raw 2.0/2.0 (a coin flip) with stored 0.9/0.1. Scoring
+  // from the stored side would report economic +80 while shin (from raw)
+  // reads 0 — an −80 "method delta" that is really data corruption. The row
+  // must be refused for EVERY metric instead.
+  const corrupt = close({ awayPNovig: 0.9, homePNovig: 0.1 });
+  const result = scoreDecision('moneyline', 'away', 'away', 2.0, 1.9, null, corrupt);
+  assert.equal(result.unscoredReason, 'close_inconsistent');
+  assert.equal(result.primaryClvPct, null);
+  assert.equal(result.marginAdjustedClvPct, null);
+  assert.equal(result.conditionalClvPct, null);
+  assert.equal(result.sensitivity, null);
+});
+
 test('missing/uncaptured/stale closes are unscored with distinct reasons; entry de-vig still recorded', () => {
   const missing = scoreDecision('moneyline', 'away', 'away', 2.0, 1.9, null, null);
   assert.equal(missing.unscoredReason, 'close_missing');
@@ -87,7 +101,7 @@ test('half-run line at the unchanged line scores both metrics as binary', () => 
     2.0,
     1.9,
     -1.5,
-    close({ line: -1.5, homePNovig: 0.55, awayPNovig: 0.45 }),
+    close({ line: -1.5, awayDecimal: 2.2, homeDecimal: 1.8, homePNovig: 0.55, awayPNovig: 0.45 }),
   );
   assert.equal(result.primaryClvPct, 10.0);
   // q_entry(home) = (1/2)/(1/2 + 1/1.9) = 0.4872 → 100*(0.55/0.4872 - 1).
@@ -157,7 +171,14 @@ test('shin-v1 sensitivity: recomputed from raw quotes, labeled, and distinct fro
   // toward the favorite relative to proportional, so the two methods must
   // disagree here — a sensitivity block that silently fell back to
   // proportional would match primaryClvPct and fail these assertions.
-  const skewed = close({ awayDecimal: 2.6, homeDecimal: 1.55, awayPNovig: 0.373494, homePNovig: 0.626506 });
+  // Stored probabilities at full float precision — the scorer validates them
+  // against the raw quotes and refuses the row on any disagreement.
+  const skewed = close({
+    awayDecimal: 2.6,
+    homeDecimal: 1.55,
+    awayPNovig: 0.3734939759036145,
+    homePNovig: 0.6265060240963857,
+  });
   const result = scoreDecision('moneyline', 'home', 'home', 1.6, 2.5, null, skewed);
   assert.ok(result.sensitivity);
   assert.equal(result.sensitivity.devigMethod, 'shin-v1');
@@ -187,15 +208,28 @@ test('devig methods: proportional and shin two-way properties', () => {
   assert.equal(Math.round(shin.pSelected * 1e6) / 1e6, 0.630273);
   assert.ok(shin.pSelected > prop.pSelected, 'shin must move probability toward the favorite');
   assert.ok(shin.pOpposite < prop.pOpposite, 'shin must take probability from the longshot');
-  // Symmetric quotes: both methods agree at one half (shin numerically).
+  // Symmetric quotes: both methods agree at one half (closed form exact).
   const even = shinTwoWay(1.9, 1.9);
   assert.ok(even);
   assert.ok(Math.abs(even.pSelected - 0.5) < 1e-12);
-  // No overround: shin reduces to proportional (z = 0, exact — the
-  // booksum <= 1 branch normalizes directly without the bisection).
+  // A fair quote (booksum = 1) is in-domain with z = 0 exactly: Shin
+  // coincides with proportional.
   const fair = shinTwoWay(2.0, 2.0);
   assert.ok(fair);
   assert.equal(fair.pSelected, 0.5);
+  // DOMAIN: an underround has no insider fraction — shin-v1 refuses rather
+  // than mislabeling another method (1/1.9 + 1/2.2 ≈ 0.981 < 1).
+  assert.equal(shinTwoWay(1.9, 2.2), null);
+  // Extreme boundary (near-degenerate overround, z → 1): the closed form
+  // stays exact — outputs finite, in [0,1], summing to 1.
+  const extreme = shinTwoWay(1.0001, 1.0001);
+  assert.ok(extreme);
+  assert.ok(Math.abs(extreme.pSelected - 0.5) < 1e-9);
+  assert.ok(Math.abs(extreme.pSelected + extreme.pOpposite - 1) < 1e-9);
+  const extremeAsym = shinTwoWay(1.0001, 50);
+  assert.ok(extremeAsym);
+  assert.ok(Math.abs(extremeAsym.pSelected + extremeAsym.pOpposite - 1) < 1e-9);
+  assert.ok(extremeAsym.pSelected > 0.9 && extremeAsym.pOpposite < 0.1);
   // Invalid quotes are refused, not guessed.
   assert.equal(shinTwoWay(1.0, 2.0), null);
   assert.equal(shinTwoWay(null, 2.0), null);

@@ -1,6 +1,6 @@
 # Ospex Agent Benchmark — Canonical MVE Design
 
-- Last updated UTC: `2026-07-14T07:40:00Z`
+- Last updated UTC: `2026-07-14T18:20:00Z`
 - Status: accepted application-layer direction; methodology and harness gates remain in progress
 - Scope: MLB-first, one fixed canonical cohort plus separately labeled open/community cohorts
 - Prompt/schema working draft: [BENCHMARK_PROMPT_V0.md](BENCHMARK_PROMPT_V0.md)
@@ -209,6 +209,8 @@ margin_adjusted_clv_pct = 100 * (q_s / q_e - 1)
 Zero means the forecast exactly matched the market. The margin-adjusted metric answers "was the forecast better than the market's?"; the economic metric answers "would this ticket have made money at the posted price?".
 
 The de-vig method is part of the metric, so it is named and versioned on every scored record: `proportional-v1` is primary at both ends (the identical formula behind the production closing-line capture), and a `shin-v1` sensitivity recompute of both metrics from the raw two-sided quotes is reported separately labeled — proportional-vs-Shin is a known methodological argument, and the choice is published, never hidden and never silently pooled.
+
+The sensitivity readout is evidence-safe by construction: the stored proportional close probabilities are validated against the raw closing quotes (a disagreement refuses the decision outright as `close_inconsistent` — a corrupt close is not evidence for any metric); the comparison is PAIRED, with both methods aggregated over the identical decision set and unpaired counts disclosed, so a delta can only reflect the method, never coverage; and `shin-v1` is defined only on overround quotes — an underround yields no shin value rather than a mislabeled fallback.
 
 Also preserve and report the raw entry/closing odds, simple/log decimal-price ratio, and the auxiliary probability-scale movement `100 * (q_s - 1 / D_e)`. These are diagnostics; the two named CLV metrics and their labeled sensitivity variants are the only preregistered formulas.
 

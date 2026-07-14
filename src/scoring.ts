@@ -1388,16 +1388,20 @@ export interface ParticipantStats {
   gameLevelMarginAdjusted: ClvSummary;
   perPickMarginAdjusted: ClvSummary;
   /**
-   * shin-v1 sensitivity: pooled game-level summaries of both metrics under
-   * the Shin de-vig — a within-participant method-sensitivity readout, not
-   * a comparison surface (per-row values live on scored_decision records).
-   * shinGamesScoreable can trail gamesScoreable when a close row carries
-   * p_novig without raw decimals (shin needs the raw quotes); the scorecard
-   * discloses both counts so the deltas are never read across different
-   * game sets unknowingly.
+   * shin-v1 sensitivity — a PAIRED within-participant method readout, not a
+   * comparison surface. A pick enters only when BOTH methods produced a
+   * value (shin needs usable raw quotes at entry and close), and the
+   * proportional side is re-aggregated over that identical paired set, so
+   * the shin-vs-proportional deltas are method-only by construction — never
+   * coverage artifacts. Unpaired picks are disclosed via the paired counts.
    */
-  gameLevelShin: { economic: ClvSummary; marginAdjusted: ClvSummary };
-  shinGamesScoreable: number;
+  sensitivity: {
+    devigMethod: typeof SHIN_DEVIG_METHOD;
+    pairedPicksEconomic: number;
+    pairedPicksMarginAdjusted: number;
+    economic: { proportional: ClvSummary; shin: ClvSummary };
+    marginAdjusted: { proportional: ClvSummary; shin: ClvSummary };
+  };
   conditionalOnly: number;
   unscoredByReason: Record<string, number>;
   byMarket: Record<string, MarketStats>;
@@ -1507,9 +1511,25 @@ export function aggregateByParticipant(
     // — identically for every metric.
     const economic = clusterByGame(picks, (p) => p.result.primaryClvPct);
     const marginAdjusted = clusterByGame(picks, (p) => p.result.marginAdjustedClvPct);
-    const shinEconomic = clusterByGame(picks, (p) => p.result.sensitivity?.economicClvPct ?? null);
-    const shinMarginAdjusted = clusterByGame(
-      picks,
+
+    // The sensitivity comparison is PAIRED: restrict to picks where the
+    // shin value exists, then aggregate BOTH methods over exactly that
+    // subset — a delta can only ever reflect the method, never coverage.
+    const pairedEconomic = picks.filter((p) => p.result.sensitivity?.economicClvPct != null);
+    const pairedMarginAdjusted = picks.filter(
+      (p) => p.result.sensitivity?.marginAdjustedClvPct != null,
+    );
+    const pairedEconProportional = clusterByGame(pairedEconomic, (p) => p.result.primaryClvPct);
+    const pairedEconShin = clusterByGame(
+      pairedEconomic,
+      (p) => p.result.sensitivity?.economicClvPct ?? null,
+    );
+    const pairedMaProportional = clusterByGame(
+      pairedMarginAdjusted,
+      (p) => p.result.marginAdjustedClvPct,
+    );
+    const pairedMaShin = clusterByGame(
+      pairedMarginAdjusted,
       (p) => p.result.sensitivity?.marginAdjustedClvPct ?? null,
     );
 
@@ -1561,11 +1581,19 @@ export function aggregateByParticipant(
       perPick: summary(economic.values),
       gameLevelMarginAdjusted: summary(marginAdjusted.gameMeans),
       perPickMarginAdjusted: summary(marginAdjusted.values),
-      gameLevelShin: {
-        economic: summary(shinEconomic.gameMeans),
-        marginAdjusted: summary(shinMarginAdjusted.gameMeans),
+      sensitivity: {
+        devigMethod: SHIN_DEVIG_METHOD,
+        pairedPicksEconomic: pairedEconomic.length,
+        pairedPicksMarginAdjusted: pairedMarginAdjusted.length,
+        economic: {
+          proportional: summary(pairedEconProportional.gameMeans),
+          shin: summary(pairedEconShin.gameMeans),
+        },
+        marginAdjusted: {
+          proportional: summary(pairedMaProportional.gameMeans),
+          shin: summary(pairedMaShin.gameMeans),
+        },
       },
-      shinGamesScoreable: shinEconomic.gameMeans.length,
       conditionalOnly: picks.filter((p) => p.result.conditionalClvPct !== null).length,
       unscoredByReason,
       byMarket,
@@ -1687,6 +1715,10 @@ export function scoredRecords(
       runId: run.runId,
       scoredAt,
       scoringPolicyVersion: SCORING_POLICY_VERSION,
+      devigMethods: {
+        primary: PROPORTIONAL_DEVIG_METHOD,
+        sensitivity: [SHIN_DEVIG_METHOD],
+      },
       ...stat,
     });
   }

@@ -50,6 +50,7 @@ export type UnscoredReason =
   | 'close_missing'
   | 'close_not_captured'
   | 'close_stale'
+  | 'close_inconsistent'
   | 'line_moved'
   | 'push_capable_line';
 
@@ -224,6 +225,22 @@ export function scoreDecision(
 
   const selected = selectedValues(close, side);
   if (selected === null) return unscored('close_not_captured', entryExtras);
+
+  // The stored proportional close probabilities and the raw closing quotes
+  // are two representations of the SAME close: when both are present they
+  // must agree, or the row is refused outright. Scoring a disagreeing row
+  // would let the proportional metrics (stored) and the shin sensitivity
+  // (raw) answer for different closes — data corruption masquerading as
+  // method sensitivity.
+  if (close.awayDecimal !== null && close.homeDecimal !== null) {
+    const recomputed =
+      side === 'away'
+        ? proportionalTwoWay(close.awayDecimal, close.homeDecimal)
+        : proportionalTwoWay(close.homeDecimal, close.awayDecimal);
+    if (recomputed === null || Math.abs(recomputed.pSelected - selected.pNovig) > 1e-9) {
+      return unscored('close_inconsistent', entryExtras);
+    }
+  }
 
   const closeShin =
     side === 'away'

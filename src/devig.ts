@@ -13,9 +13,22 @@
  *   longshot, so Shin removes MORE vig from the longshot side than
  *   proportional does. Published as a separately-labeled sensitivity variant
  *   so the proportional-vs-Shin methodology debate is inspectable in the
- *   output, never a hidden choice. Two-outcome inverse solved by bisection
- *   on the insider fraction `z` (Σp(z) = 1; Σp(0) = √booksum > 1 and Σp is
- *   decreasing in z, so the root is bracketed).
+ *   output, never a hidden choice.
+ *
+ *   shin-v1 uses the exact two-outcome closed form for the insider fraction
+ *   (Jullien–Salanié): with `s = (π₁² + π₂²)/B` and `d = π₁ − π₂`,
+ *   `z = 1 + 2(s − 1)/(1 − d²)`, then
+ *   `pᵢ = (√(z² + 4(1−z)πᵢ²/B) − z) / (2(1−z))`. Both `1 − d² > 0` and
+ *   `z ∈ [0, 1)` hold for every overround pair of decimal quotes (> 1),
+ *   because `s < max(πᵢ) < 1`.
+ *
+ *   DOMAIN — fail closed, never mislabel: shin-v1 is defined only for
+ *   quotes with `booksum ≥ 1`. An underround (booksum < 1) has no insider
+ *   fraction to attribute margin to, so shinTwoWay returns null rather than
+ *   silently substituting another method under the shin-v1 label. A fair
+ *   quote (booksum = 1) is in-domain with z = 0, where Shin coincides with
+ *   proportional exactly. Outputs are validated (finite, within [0, 1],
+ *   summing to 1 within 1e-9) and the pair is refused otherwise.
  *
  * Whether closing-line value should account for the bookmaker's margin at
  * all is a live, documented debate among bettors — the scorer publishes the
@@ -45,7 +58,7 @@ export function proportionalTwoWay(
   return { pSelected: piSelected / booksum, pOpposite: piOpposite / booksum };
 }
 
-/** Shin two-way de-vig; null on invalid quotes. */
+/** Shin two-way de-vig; null on invalid quotes or out-of-domain booksums. */
 export function shinTwoWay(
   selectedDecimal: number | null,
   oppositeDecimal: number | null,
@@ -55,25 +68,26 @@ export function shinTwoWay(
   const piSelected = 1 / selectedDecimal;
   const piOpposite = 1 / oppositeDecimal;
   const booksum = piSelected + piOpposite;
-  // Without an overround there is no margin to attribute to insiders: z = 0
-  // and Shin reduces to proportional normalization.
-  if (!(booksum > 1)) {
-    return { pSelected: piSelected / booksum, pOpposite: piOpposite / booksum };
-  }
-  const shinP = (pi: number, z: number): number =>
-    (Math.sqrt(z * z + 4 * (1 - z) * ((pi * pi) / booksum)) - z) / (2 * (1 - z));
-  const sum = (z: number): number => shinP(piSelected, z) + shinP(piOpposite, z);
-  let lo = 0;
-  let hi = 0.5;
-  while (sum(hi) > 1 && hi < 0.999) hi = (1 + hi) / 2;
-  for (let i = 0; i < 100; i += 1) {
-    const mid = (lo + hi) / 2;
-    if (sum(mid) > 1) {
-      lo = mid;
-    } else {
-      hi = mid;
-    }
-  }
-  const z = (lo + hi) / 2;
-  return { pSelected: shinP(piSelected, z), pOpposite: shinP(piOpposite, z) };
+  // Underround: Shin's insider model is undefined (no margin to attribute).
+  // Refuse rather than mislabel another method as shin-v1.
+  if (booksum < 1) return null;
+  const s = (piSelected * piSelected + piOpposite * piOpposite) / booksum;
+  const d = piSelected - piOpposite;
+  const z = Math.max(0, 1 + (2 * (s - 1)) / (1 - d * d));
+  const shinP = (pi: number): number =>
+    z >= 1
+      ? Number.NaN
+      : (Math.sqrt(z * z + 4 * (1 - z) * ((pi * pi) / booksum)) - z) / (2 * (1 - z));
+  const pSelected = shinP(piSelected);
+  const pOpposite = shinP(piOpposite);
+  const valid =
+    Number.isFinite(pSelected) &&
+    Number.isFinite(pOpposite) &&
+    pSelected >= 0 &&
+    pSelected <= 1 &&
+    pOpposite >= 0 &&
+    pOpposite <= 1 &&
+    Math.abs(pSelected + pOpposite - 1) <= 1e-9;
+  if (!valid) return null;
+  return { pSelected, pOpposite };
 }
