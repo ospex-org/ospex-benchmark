@@ -128,6 +128,45 @@ function selectedValues(
   return { pNovig, decimal };
 }
 
+/**
+ * Whole-close consistency validation — SELECTION-INDEPENDENT by design: the
+ * same corrupt close must be refused for every participant and side, or
+ * coverage itself becomes selection-dependent. Checks, in order:
+ *
+ * - the stored no-vig pair is complete (one side without the other is
+ *   corruption; both absent falls through to close_not_captured);
+ * - both probabilities are finite, within [0, 1], and sum to 1 within 1e-9
+ *   (a p-only row with no raw quotes gets exactly this validation — a
+ *   malformed stored pair must never enter any metric);
+ * - raw closing quotes are present as a pair or not at all;
+ * - when the raw pair exists, the canonical away/home proportional
+ *   recompute must match BOTH stored probabilities within 1e-9 — the two
+ *   representations describe the same close or the row is refused.
+ */
+function closeQuoteInconsistent(close: CloseQuote): boolean {
+  const { awayPNovig: away, homePNovig: home, awayDecimal, homeDecimal } = close;
+  if (away === null || home === null) {
+    // One stored probability without the other is corruption; both absent
+    // falls through to close_not_captured.
+    return away !== home;
+  }
+  if (!Number.isFinite(away) || !Number.isFinite(home)) return true;
+  if (away < 0 || away > 1 || home < 0 || home > 1) return true;
+  if (Math.abs(away + home - 1) > 1e-9) return true;
+  if ((awayDecimal === null) !== (homeDecimal === null)) return true;
+  if (awayDecimal !== null && homeDecimal !== null) {
+    const recomputed = proportionalTwoWay(awayDecimal, homeDecimal);
+    if (recomputed === null) return true;
+    if (
+      Math.abs(recomputed.pSelected - away) > 1e-9 ||
+      Math.abs(recomputed.pOpposite - home) > 1e-9
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function auxDiagnostics(
   entryDecimal: number,
   pNovig: number,
@@ -223,24 +262,15 @@ export function scoreDecision(
   if (close.confidence === 'missing') return unscored('close_not_captured', entryExtras);
   if (close.confidence === 'stale') return unscored('close_stale', entryExtras);
 
+  // Whole-close validation runs BEFORE side selection: a corrupt close is
+  // not evidence for any metric, for any participant, on either side.
+  // Scoring a disagreeing or malformed row would let the proportional
+  // metrics (stored) and the shin sensitivity (raw) answer for different
+  // closes — data corruption masquerading as scores.
+  if (closeQuoteInconsistent(close)) return unscored('close_inconsistent', entryExtras);
+
   const selected = selectedValues(close, side);
   if (selected === null) return unscored('close_not_captured', entryExtras);
-
-  // The stored proportional close probabilities and the raw closing quotes
-  // are two representations of the SAME close: when both are present they
-  // must agree, or the row is refused outright. Scoring a disagreeing row
-  // would let the proportional metrics (stored) and the shin sensitivity
-  // (raw) answer for different closes — data corruption masquerading as
-  // method sensitivity.
-  if (close.awayDecimal !== null && close.homeDecimal !== null) {
-    const recomputed =
-      side === 'away'
-        ? proportionalTwoWay(close.awayDecimal, close.homeDecimal)
-        : proportionalTwoWay(close.homeDecimal, close.awayDecimal);
-    if (recomputed === null || Math.abs(recomputed.pSelected - selected.pNovig) > 1e-9) {
-      return unscored('close_inconsistent', entryExtras);
-    }
-  }
 
   const closeShin =
     side === 'away'

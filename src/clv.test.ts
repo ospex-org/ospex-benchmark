@@ -57,18 +57,52 @@ test('margin-adjusted CLV moves with the de-vigged entry, not the vig-in entry',
   assert.equal(result.entryPNovigSelected, 0.4872);
 });
 
-test('a close whose stored probabilities disagree with its raw quotes is refused outright', () => {
-  // The review repro: raw 2.0/2.0 (a coin flip) with stored 0.9/0.1. Scoring
-  // from the stored side would report economic +80 while shin (from raw)
-  // reads 0 — an −80 "method delta" that is really data corruption. The row
-  // must be refused for EVERY metric instead.
-  const corrupt = close({ awayPNovig: 0.9, homePNovig: 0.1 });
-  const result = scoreDecision('moneyline', 'away', 'away', 2.0, 1.9, null, corrupt);
-  assert.equal(result.unscoredReason, 'close_inconsistent');
-  assert.equal(result.primaryClvPct, null);
-  assert.equal(result.marginAdjustedClvPct, null);
-  assert.equal(result.conditionalClvPct, null);
-  assert.equal(result.sensitivity, null);
+test('a corrupt close is refused for EVERY participant and side — validation is selection-independent', () => {
+  const refusedBothSides = (corrupt: ReturnType<typeof close>, label: string): void => {
+    for (const side of ['away', 'home'] as const) {
+      const result = scoreDecision('moneyline', side, side, 2.0, 1.9, null, corrupt);
+      assert.equal(result.unscoredReason, 'close_inconsistent', `${label} (${side})`);
+      assert.equal(result.primaryClvPct, null, `${label} (${side})`);
+      assert.equal(result.marginAdjustedClvPct, null, `${label} (${side})`);
+      assert.equal(result.conditionalClvPct, null, `${label} (${side})`);
+      assert.equal(result.sensitivity, null, `${label} (${side})`);
+    }
+  };
+  // The review repro: raw 2.0/2.0 with stored away 0.5 / home 0.9 — the
+  // AWAY-side stored value matches the raw recompute, so a selected-side-
+  // only check would score away picks (at 0) while refusing home picks.
+  // The whole close is corrupt; both selections must be refused.
+  refusedBothSides(close({ awayPNovig: 0.5, homePNovig: 0.9 }), 'unselected-side corruption');
+  // Sums to 1 and in range, but BOTH sides disagree with the raw recompute
+  // (2.0/2.0 → 0.5/0.5) — only the raw comparison catches this class.
+  refusedBothSides(close({ awayPNovig: 0.6, homePNovig: 0.4 }), 'raw-vs-stored mismatch');
+  // p-only rows (no raw quotes) get the full stored-pair validation: a
+  // malformed pair must never enter any metric (this row previously scored
+  // economic AND margin-adjusted at +80).
+  refusedBothSides(
+    close({ awayDecimal: null, homeDecimal: null, awayPNovig: 0.9, homePNovig: 0.9 }),
+    'p-only pair does not sum to 1',
+  );
+  refusedBothSides(
+    close({ awayDecimal: null, homeDecimal: null, awayPNovig: 1.2, homePNovig: -0.2 }),
+    'p-only pair out of range',
+  );
+  // One stored probability without the other is corruption too.
+  refusedBothSides(close({ awayPNovig: 0.5, homePNovig: null }), 'half-missing stored pair');
+  // A VALID p-only pair still scores economically (legacy/degraded rows) —
+  // it simply cannot pair for the shin sensitivity.
+  const pOnly = scoreDecision(
+    'moneyline',
+    'away',
+    'away',
+    2.0,
+    1.9,
+    null,
+    close({ awayDecimal: null, homeDecimal: null, awayPNovig: 0.4, homePNovig: 0.6 }),
+  );
+  assert.equal(pOnly.primaryClvPct, -20);
+  assert.ok(pOnly.marginAdjustedClvPct !== null);
+  assert.equal(pOnly.sensitivity?.economicClvPct ?? null, null);
 });
 
 test('missing/uncaptured/stale closes are unscored with distinct reasons; entry de-vig still recorded', () => {
