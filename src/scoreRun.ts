@@ -141,7 +141,7 @@ async function main(): Promise<number> {
   printLine(`closes: ${closes.length} market rows found`);
 
   const scored = scoreRun(run, closes, ladderParams);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, ladderParams);
   const scoredAt = new Date().toISOString();
 
   const outDir = options.outDir ?? dirname(options.runPath);

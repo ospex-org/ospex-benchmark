@@ -1451,6 +1451,8 @@ export interface ParticipantStats {
    */
   totalsLadder: {
     ladderVersion: typeof LADDER_VERSION;
+    /** The published dispersion-parameter version the ladder ran on. */
+    parameterVersion: string;
     totalsPicks: number;
     ladderScoreable: number;
     gameLevel: ClvSummary;
@@ -1523,6 +1525,7 @@ function clusterByGame(
 export function aggregateByParticipant(
   scored: ScoredPick[],
   run: SourceRun,
+  ladderParams: LadderParams,
 ): ParticipantStats[] {
   const picksByParticipant = new Map<string, ScoredPick[]>();
   for (const pick of scored) {
@@ -1656,6 +1659,7 @@ export function aggregateByParticipant(
         ? null
         : {
             ladderVersion: LADDER_VERSION,
+            parameterVersion: ladderParams.parameterVersion,
             totalsPicks: totalsPicks.length,
             ladderScoreable: ladderEconomic.values.length,
             gameLevel: summary(ladderEconomic.gameMeans),
@@ -1694,9 +1698,10 @@ export function aggregateByParticipant(
         },
       },
       // Conditional-ONLY means exactly that: a conditional value with NO
-      // primary. An integer same-line total upgraded to primary via the
-      // ladder q_P keeps its separately labeled conditional column but is no
-      // longer conditional-only.
+      // primary. Under the current candidate-status policy every integer
+      // same-line pick satisfies this (its primary is never filled); the
+      // two-sided predicate is kept so the count stays honest if a validated
+      // method ever fills a conditional pick's primary.
       conditionalOnly: picks.filter(
         (p) => p.result.conditionalClvPct !== null && p.result.primaryClvPct === null,
       ).length,

@@ -912,7 +912,7 @@ test('equal-weight game-level primary differs from per-pick pooling and is the p
     closeRow(GAME_B, 'moneyline', { ...NOVIG_ONLY, away_p_novig: 0.4, home_p_novig: 0.6 }),
   ];
   const scored = scoreRun(run, closes, TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const model = stats.find((s) => s.participantId === 'model-arm');
   assert.ok(model);
   assert.equal(model.primaryScoreable, 4);
@@ -928,7 +928,7 @@ test('arms with zero valid decisions stay in the denominators (no survivor bias)
   const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
   const run = parseRunRecords(lines);
   assert.deepEqual(verifyRunIntegrity(run, { expectedArms: FIXTURE_ARMS_WITH_TIMEOUT }), []);
-  const stats = aggregateByParticipant(scoreRun(run, [], TEST_LADDER), run);
+  const stats = aggregateByParticipant(scoreRun(run, [], TEST_LADDER), run, TEST_LADDER);
   const timeoutArm = stats.find((s) => s.participantId === 'timeout-arm');
   assert.ok(timeoutArm);
   assert.equal(timeoutArm.kind, 'model');
@@ -952,7 +952,7 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
   const { lines, slateSha256 } = fixtureRun();
   const run = parseRunRecords(lines);
   const scored = scoreRun(run, [closeRow(GAME_A, 'moneyline')], TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   const decisions = records.filter((r) => r['recordType'] === 'scored_decision');
   // 6 model decisions + 16 deterministic baseline decisions (8 × 2 games).
@@ -980,7 +980,7 @@ test('every scored record type is stamped with the scoring policy version', () =
   const { lines } = fixtureRun();
   const run = parseRunRecords(lines);
   const scored = scoreRun(run, [closeRow(GAME_A, 'moneyline')], TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   assert.ok(records.length > 0);
   assert.ok(records.every((r) => r['scoringPolicyVersion'] === SCORING_POLICY_VERSION));
@@ -999,7 +999,7 @@ test('margin-adjusted CLV rides every scored surface: rows, aggregates, run meta
     closeRow(GAME_B, 'moneyline', { ...NOVIG_ONLY, away_p_novig: 0.4, home_p_novig: 0.6 }),
   ];
   const scored = scoreRun(run, closes, TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
 
   // The wiring: the opposite side comes from the same bundle, so the model's
   // home-ML margin-adjusted CLV must equal 100*(q_close/q_entry - 1) with
@@ -1080,7 +1080,7 @@ test('byMarket reports game-clustered stats and per-market unscored reasons, nev
     closeRow(GAME_B, 'moneyline', { ...NOVIG_ONLY, away_p_novig: 0.4, home_p_novig: 0.6 }),
   ];
   const scored = scoreRun(run, closes, TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
 
   const model = stats.find((s) => s.participantId === 'model-arm');
   assert.ok(model);
@@ -1171,7 +1171,7 @@ test('per-market aggregation clusters within a game first (future multi-pick run
     syntheticScored(GAME_A, 0),
     syntheticScored(GAME_B, 3),
   ];
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const policy = stats.find((s) => s.participantId === 'synthetic-policy');
   assert.ok(policy);
   const total = policy.byMarket['total'];
@@ -1195,7 +1195,7 @@ test('the scorecard renders per-market game-level tables for every participant a
     closeRow(GAME_B, 'moneyline', { ...NOVIG_ONLY, away_p_novig: 0.4, home_p_novig: 0.6 }),
   ];
   const scored = scoreRun(run, closes, TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
 
   assert.ok(markdown.includes(`- Scoring policy: \`${SCORING_POLICY_VERSION}\``));
@@ -1251,7 +1251,7 @@ test('per-market tables rank by the market’s own mean even when the pooled ord
     closeRow(GAME_A, 'total', { ...NOVIG_ONLY, away_p_novig: 0.1, home_p_novig: 0.9 }),
   ];
   const scored = scoreRun(run, closes, TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const arm1 = stats.find((s) => s.participantId === 'model-arm');
   const arm2 = stats.find((s) => s.participantId === 'model-arm-2');
   assert.ok(arm1 && arm2);
@@ -1296,7 +1296,7 @@ test('a fully-failed arm keeps 0/N rows in every rendered per-market table', () 
   const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
   const run = parseRunRecords(lines);
   const scored = scoreRun(run, [], TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   const byMarketAt = markdown.indexOf('## By market');
   assert.ok(byMarketAt > 0);
@@ -1354,7 +1354,7 @@ test('integer same-line totals stay conditional-only; the ladder value is sensit
   assert.equal(over.ladder.marginAdjustedClvPct, 0);
   // Coverage semantics: nothing enters the primary aggregates, and the pick
   // counts as conditional-only.
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const model = stats.find((s) => s.participantId === 'model-arm');
   assert.ok(model);
   assert.equal(model.byMarket['total']?.scoreable, 0);
@@ -1394,7 +1394,7 @@ test('run_meta and participant_scorecard carry the ladder stamps and aggregates'
   const { lines } = fixtureRun();
   const run = parseRunRecords(lines);
   const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   const meta = records.find((r) => r['recordType'] === 'scored_run_meta');
   assert.ok(meta);
@@ -1416,6 +1416,7 @@ test('run_meta and participant_scorecard carry the ladder stamps and aggregates'
   assert.ok(card);
   const ladderStats = card['totalsLadder'] as Record<string, unknown>;
   assert.equal(ladderStats['ladderVersion'], 'TOTALS_V1');
+  assert.equal(ladderStats['parameterVersion'], 'TOTALS_V1_PROVISIONAL');
   assert.equal(ladderStats['ladderScoreable'], 1);
   // The single-market moneyline baselines have no totals exposure.
   const mlCard = records.find(
@@ -1429,7 +1430,7 @@ test('the scorecard renders the ladder table, policy bullet, and moved-line ladd
   const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
   const run = parseRunRecords(lines);
   const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   assert.ok(
     markdown.includes('## Totals ladder (`TOTALS_V1` candidate — sensitivity output pending validation)'),
@@ -1529,7 +1530,7 @@ test('a gate-passing pick the ladder cannot solve is typed and DISCLOSED in the 
   assert.ok(over.result.primaryClvPct !== null, 'primary is a number');
   assert.equal(over.ladder?.unscoredReason, 'ladder_unsolvable');
   assert.equal(over.ladder?.economicClvPct, null);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   assert.match(markdown, /\| model-arm \| 2 \| 0 \| — \| — \| — \| — \| .* \| — \| ladder_unsolvable 1, close_missing 1 \|/);
 });
@@ -1538,7 +1539,7 @@ test('ladder participant aggregates are value-pinned: MA summaries, movement, un
   const { lines } = fixtureRun();
   const run = parseRunRecords(lines);
   const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const model = stats.find((s) => s.participantId === 'model-arm');
   assert.ok(model && model.totalsLadder !== null, 'model ladder block');
   // One ladder-scored pick (GAME_A over, moved +0.5): econ 3.9993, MA
@@ -1570,13 +1571,17 @@ test('ladder participant aggregates are value-pinned: MA summaries, movement, un
 test('a fully-failed model arm keeps a non-null totalsLadder block (survivor-bias rule)', () => {
   const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
   const run = parseRunRecords(lines);
-  const stats = aggregateByParticipant(scoreRun(run, [], TEST_LADDER), run);
+  const stats = aggregateByParticipant(scoreRun(run, [], TEST_LADDER), run, TEST_LADDER);
   const timeoutArm = stats.find((s) => s.participantId === 'timeout-arm');
   assert.ok(timeoutArm);
   assert.ok(timeoutArm.totalsLadder !== null, 'failed arm stays visible on the ladder surface');
   assert.equal(timeoutArm.totalsLadder.totalsPicks, 0);
   assert.equal(timeoutArm.totalsLadder.ladderScoreable, 0);
   assert.equal(timeoutArm.totalsLadder.gameLevel.meanClvPct, null);
+  // Both stamps ride along even on a zero-decision row: the block still
+  // states which method and parameter WOULD have priced its picks.
+  assert.equal(timeoutArm.totalsLadder.ladderVersion, 'TOTALS_V1');
+  assert.equal(timeoutArm.totalsLadder.parameterVersion, 'TOTALS_V1_PROVISIONAL');
 });
 
 test('ladder aggregation clusters within a game first and never swaps econ with margin-adjusted', () => {
@@ -1603,7 +1608,7 @@ test('ladder aggregation clusters within a game first and never swaps econ with 
     ladderScoredPick(GAME_A, 20, 10),
     ladderScoredPick(GAME_B, 30, 15),
   ];
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const policy = stats.find((s) => s.participantId === 'synthetic-policy');
   assert.ok(policy && policy.totalsLadder !== null, 'synthetic policy has a ladder block');
   assert.equal(policy.totalsLadder.ladderScoreable, 3, 'scoreable counts VALUES, not games');
@@ -1620,13 +1625,14 @@ test('conditional-only counts exactly the picks with a conditional and NO primar
     ...syntheticScored(GAME_A, null),
     result: { ...syntheticScored(GAME_A, null).result, conditionalClvPct: -5 },
   };
-  // An upgraded pick keeps its conditional column AND has a primary — it is
-  // no longer conditional-ONLY and must not be double-counted.
-  const upgradedPick: ScoredPick = {
+  // A pick carrying BOTH a conditional value and a primary (possible only
+  // under a future validated method) is not conditional-ONLY and must not
+  // be double-counted.
+  const conditionalWithPrimaryPick: ScoredPick = {
     ...syntheticScored(GAME_B, -4.1386),
     result: { ...syntheticScored(GAME_B, -4.1386).result, conditionalClvPct: -4.5455 },
   };
-  const stats = aggregateByParticipant([conditionalOnlyPick, upgradedPick], run);
+  const stats = aggregateByParticipant([conditionalOnlyPick, conditionalWithPrimaryPick], run, TEST_LADDER);
   const policy = stats.find((s) => s.participantId === 'synthetic-policy');
   assert.ok(policy);
   assert.equal(policy.conditionalOnly, 1);
