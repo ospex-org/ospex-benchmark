@@ -1439,9 +1439,10 @@ export interface ParticipantStats {
   byMarket: Record<string, MarketStats>;
   /**
    * TOTALS_V1 ladder aggregates over this participant's totals picks — the
-   * "every pick is priced" column set (moved lines included), reported
-   * ALONGSIDE the conservative exact-line totals numbers in byMarket.total,
-   * never replacing them. Null for participants with no totals exposure.
+   * moved-lines-included column set (line movement never disqualifies a
+   * pick; the shared close-quality gates still apply), reported ALONGSIDE
+   * the same-line totals numbers in byMarket.total — moved-line values
+   * never enter those. Null for participants with no totals exposure.
    */
   totalsLadder: {
     ladderVersion: typeof LADDER_VERSION;
@@ -1687,7 +1688,13 @@ export function aggregateByParticipant(
           shin: summary(pairedMaShin.gameMeans),
         },
       },
-      conditionalOnly: picks.filter((p) => p.result.conditionalClvPct !== null).length,
+      // Conditional-ONLY means exactly that: a conditional value with NO
+      // primary. An integer same-line total upgraded to primary via the
+      // ladder q_P keeps its separately labeled conditional column but is no
+      // longer conditional-only.
+      conditionalOnly: picks.filter(
+        (p) => p.result.conditionalClvPct !== null && p.result.primaryClvPct === null,
+      ).length,
       unscoredByReason,
       byMarket,
       totalsLadder,
@@ -1734,7 +1741,7 @@ export function scoredRecords(
       marginAdjusted:
         'de-vigged entry vs no-vig close, 100*(q_close/q_entry - 1) on push-free contracts — 0 means the forecast exactly matched the market (always reported alongside, never a replacement)',
       totalsLadder:
-        'generalized push-aware CLV at the ENTRY line, 100*(q_W*D_e + q_P - 1) economic and 100*(q_W/q_entry + q_P - 1) margin-adjusted, with q_W/q_P from the TOTALS_V1 negative-binomial ladder solved at the close — every totals pick is priced, moved lines included; separately labeled, never replacing the exact-line columns',
+        'generalized push-aware CLV at the ENTRY line, 100*(q_W*D_e + q_P - 1) economic and 100*(q_W/q_entry + q_P - 1) margin-adjusted, with q_W/q_P from the TOTALS_V1 negative-binomial ladder solved at the close — line movement never disqualifies a totals pick: every totals pick whose close passes the shared quality gates is priced at its entry line, and gate-refused picks carry the same typed reasons as the exact-line metrics; separately labeled, and moved-line values never enter the same-line columns',
     },
     devigMethods: {
       primary: PROPORTIONAL_DEVIG_METHOD,
@@ -1750,7 +1757,7 @@ export function scoredRecords(
       confidenceRequired: 'fresh',
       lineMatchRequired: true,
       integerLinePrimary:
-        'computed via the TOTALS_V1 ladder q_P at the unchanged line (generalized push-aware formula); push-excluded conditional CLV still separately labeled, both metrics',
+        'totals: computed via the TOTALS_V1 ladder q_P at the unchanged line (generalized push-aware formula), push-excluded conditional CLV still separately labeled, both metrics; other markets: unavailable (conditional CLV separately labeled, both metrics)',
     },
     picks: scored.length,
     primaryScoreable: scored.filter((p) => p.result.primaryClvPct !== null).length,

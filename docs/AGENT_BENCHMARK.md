@@ -240,7 +240,7 @@ Preferred order:
    - spread: `entry_handicap - closing_handicap` from the selected team's perspective;
    - over: `closing_total - entry_total`;
    - under: `entry_total - closing_total`;
-4. price the pick with an approved, versioned line-value method, reported as its own separately labeled column set alongside (1)–(3), never pooled into the exact-line primary. **`TOTALS_V1` is that approved method for MLB totals**: every totals pick — moved lines included — receives a ladder CLV at its ENTRY line (economic and margin-adjusted, per the generalized push-aware formula in "Push-capable lines"), so no totals pick is ever discarded. Totals reporting is three-column: the conservative exact-line CLV where the line matched, the ladder CLV for every pick, and raw signed movement (which needs no model).
+4. price the pick with an approved, versioned line-value method, reported as its own separately labeled column set alongside (1)–(3), never pooled into the exact-line primary. **`TOTALS_V1` is that approved method for MLB totals**: every totals pick whose close passes the shared quality gates — moved lines included — receives a ladder CLV at its ENTRY line (economic and margin-adjusted, per the generalized push-aware formula in "Push-capable lines"), so line movement never discards a totals pick; gate-refused picks carry the same typed reason codes as the exact-line metrics. Totals reporting is three-column: the conservative exact-line CLV where the line matched, the ladder CLV for every pick, and raw signed movement (which needs no model).
 
 Do not attach the new main-line odds to the old contract or invent an ad-hoc conversion between runs and price outside the versioned method.
 

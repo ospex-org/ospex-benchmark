@@ -1350,6 +1350,14 @@ test('integer same-line totals upgrade to primary via the ladder q_P (E2E)', () 
   // and close both split 0.5/0.5, so q_W/q_e + q_P = (1-q_P) + q_P = 1.
   assert.equal(over.ladder.marginAdjustedClvPct, 0);
   assert.equal(over.result.marginAdjustedClvPct, 0);
+  // Coverage semantics of the upgrade: the pick enters the same-line primary
+  // aggregates and is no longer conditional-ONLY (it kept its conditional
+  // column but has a primary).
+  const stats = aggregateByParticipant(scored, run);
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model);
+  assert.equal(model.byMarket['total']?.scoreable, 1);
+  assert.equal(model.conditionalOnly, 0);
 });
 
 test('moved totals lines are priced by the ladder while exact-line stays unavailable (E2E)', () => {
@@ -1417,13 +1425,13 @@ test('run_meta and participant_scorecard carry the ladder stamps and aggregates'
 });
 
 test('the scorecard renders the ladder table, policy bullet, and moved-line ladder columns', () => {
-  const { lines } = fixtureRun();
+  const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
   const run = parseRunRecords(lines);
   const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
   const stats = aggregateByParticipant(scored, run);
   const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   assert.ok(
-    markdown.includes('## Totals ladder (`TOTALS_V1` — every totals pick priced at its entry line)'),
+    markdown.includes('## Totals ladder (`TOTALS_V1` — line movement never disqualifies a totals pick)'),
     'ladder section present',
   );
   assert.ok(
@@ -1435,8 +1443,45 @@ test('the scorecard renders the ladder table, policy bullet, and moved-line ladd
     markdown.includes('| Ladder econ mean | Ladder econ median | Ladder margin-adj mean |'),
     'ladder table header',
   );
-  // model-arm: 1 ladder-scored totals pick at 3.9993 (moved line, over).
-  assert.match(markdown, /\| model-arm \| 2 \| 1 \| 3\.9993 \| 3\.9993 \|/);
+  // model-arm, FULL row: 2 totals picks, 1 ladder-scored (GAME_A moved over:
+  // econ 3.9993, MA 100*(0.544758625663/0.5 - 1) = 8.9517), same-line column
+  // empty (nothing scored at an unchanged line), movement +0.5 over the one
+  // ladder-scored pick, GAME_B's totals close missing.
+  assert.ok(
+    markdown.includes(
+      '| model-arm | 2 | 1 | 3.9993 | 3.9993 | 8.9517 | 8.9517 | — (0) | 0.5 | close_missing 1 |',
+    ),
+    'model-arm full ladder row',
+  );
+  // baseline-under-total: under side of the same moved line (econ -13.0903,
+  // MA -8.9517, movement -0.5).
+  assert.ok(
+    markdown.includes(
+      '| baseline-under-total | 2 | 1 | -13.0903 | -13.0903 | -8.9517 | -8.9517 | — (0) | -0.5 | close_missing 1 |',
+    ),
+    'baseline-under-total full ladder row',
+  );
+  // Survivor-bias rule: a fully-failed model arm keeps a zero row in the
+  // ladder table — it must never vanish from the new surface.
+  assert.ok(
+    markdown.includes('| timeout-arm | 0 | 0 | — | — | — | — | — (0) | — | — |'),
+    'failed arm keeps a zero ladder row',
+  );
+  // Own-column ranking, nulls last: the over side (+3.9993) above the under
+  // baseline (-13.0903), and the null-mean failed arm dead last.
+  const idx = (needle: string): number => {
+    const at = markdown.indexOf(needle);
+    assert.ok(at >= 0, `row present: ${needle}`);
+    return at;
+  };
+  assert.ok(
+    idx('| model-arm | 2 | 1 | 3.9993') < idx('| baseline-under-total | 2 | 1 | -13.0903'),
+    'ranked by own ladder mean',
+  );
+  assert.ok(
+    idx('| baseline-under-total | 2 | 1 | -13.0903') < idx('| timeout-arm | 0 | 0 |'),
+    'null means rank last',
+  );
   // The moved-lines table now carries the ladder values alongside movement.
   assert.ok(
     markdown.includes(
@@ -1444,4 +1489,102 @@ test('the scorecard renders the ladder table, policy bullet, and moved-line ladd
     ),
     'moved-lines table has ladder columns',
   );
+});
+
+test('ladder participant aggregates are value-pinned: MA summaries, movement, unscored reasons', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run);
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model && model.totalsLadder !== null, 'model ladder block');
+  // One ladder-scored pick (GAME_A over, moved +0.5): econ 3.9993, MA
+  // 100*(0.544758625663/0.5 - 1) = 8.9517; GAME_B's close is missing.
+  assert.deepEqual(model.totalsLadder.gameLevel, {
+    meanClvPct: 3.9993,
+    medianClvPct: 3.9993,
+    beatClosePct: 100,
+  });
+  assert.deepEqual(model.totalsLadder.gameLevelMarginAdjusted, {
+    meanClvPct: 8.9517,
+    medianClvPct: 8.9517,
+    beatClosePct: 100,
+  });
+  assert.equal(model.totalsLadder.meanSignedMovement, 0.5);
+  assert.deepEqual(model.totalsLadder.unscoredByReason, { close_missing: 1 });
+  const under = stats.find((s) => s.participantId === 'baseline-under-total');
+  assert.ok(under && under.totalsLadder !== null, 'under-total ladder block');
+  // Under direction: the movement sign flips with the selection, and the MA
+  // mirror is the negative of the over side at an even entry quote.
+  assert.equal(under.totalsLadder.meanSignedMovement, -0.5);
+  assert.deepEqual(under.totalsLadder.gameLevelMarginAdjusted, {
+    meanClvPct: -8.9517,
+    medianClvPct: -8.9517,
+    beatClosePct: 0,
+  });
+});
+
+test('a fully-failed model arm keeps a non-null totalsLadder block (survivor-bias rule)', () => {
+  const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
+  const run = parseRunRecords(lines);
+  const stats = aggregateByParticipant(scoreRun(run, [], TEST_LADDER), run);
+  const timeoutArm = stats.find((s) => s.participantId === 'timeout-arm');
+  assert.ok(timeoutArm);
+  assert.ok(timeoutArm.totalsLadder !== null, 'failed arm stays visible on the ladder surface');
+  assert.equal(timeoutArm.totalsLadder.totalsPicks, 0);
+  assert.equal(timeoutArm.totalsLadder.ladderScoreable, 0);
+  assert.equal(timeoutArm.totalsLadder.gameLevel.meanClvPct, null);
+});
+
+test('ladder aggregation clusters within a game first and never swaps econ with margin-adjusted', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const ladderScoredPick = (gameId: string, econ: number, ma: number): ScoredPick => ({
+    ...syntheticScored(gameId, null),
+    ladder: {
+      ladderVersion: 'TOTALS_V1',
+      parameterVersion: 'TOTALS_V1_PROVISIONAL',
+      unscoredReason: null,
+      closeImpliedMean: 9,
+      qWinEntry: 0.5,
+      qPushEntry: 0,
+      economicClvPct: econ,
+      marginAdjustedClvPct: ma,
+    },
+  });
+  // Two picks in GAME_A, one in GAME_B: game-level and per-pick MUST differ
+  // (per-pick 20 vs game-level mean(15, 30) = 22.5), and the MA values are
+  // deliberately half the econ values so a copy-paste swap cannot hide.
+  const scored = [
+    ladderScoredPick(GAME_A, 10, 5),
+    ladderScoredPick(GAME_A, 20, 10),
+    ladderScoredPick(GAME_B, 30, 15),
+  ];
+  const stats = aggregateByParticipant(scored, run);
+  const policy = stats.find((s) => s.participantId === 'synthetic-policy');
+  assert.ok(policy && policy.totalsLadder !== null, 'synthetic policy has a ladder block');
+  assert.equal(policy.totalsLadder.ladderScoreable, 3, 'scoreable counts VALUES, not games');
+  assert.equal(policy.totalsLadder.perPick.meanClvPct, 20);
+  assert.equal(policy.totalsLadder.gameLevel.meanClvPct, 22.5);
+  assert.equal(policy.totalsLadder.perPickMarginAdjusted.meanClvPct, 10);
+  assert.equal(policy.totalsLadder.gameLevelMarginAdjusted.meanClvPct, 11.25);
+});
+
+test('conditional-only counts exactly the picks with a conditional and NO primary', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const conditionalOnlyPick: ScoredPick = {
+    ...syntheticScored(GAME_A, null),
+    result: { ...syntheticScored(GAME_A, null).result, conditionalClvPct: -5 },
+  };
+  // An upgraded pick keeps its conditional column AND has a primary — it is
+  // no longer conditional-ONLY and must not be double-counted.
+  const upgradedPick: ScoredPick = {
+    ...syntheticScored(GAME_B, -4.1386),
+    result: { ...syntheticScored(GAME_B, -4.1386).result, conditionalClvPct: -4.5455 },
+  };
+  const stats = aggregateByParticipant([conditionalOnlyPick, upgradedPick], run);
+  const policy = stats.find((s) => s.participantId === 'synthetic-policy');
+  assert.ok(policy);
+  assert.equal(policy.conditionalOnly, 1);
 });

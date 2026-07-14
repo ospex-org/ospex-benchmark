@@ -9,9 +9,12 @@ import type { ClvResult } from './clv.js';
  * TOTALS_V1 totals ladder — pure math, no I/O except the artifact loader.
  *
  * The ladder prices win/push probabilities for ANY totals line from one
- * closing quote, so no totals pick is ever discarded: a pick whose line
- * moved gets a ladder CLV instead of silence, and an integer same-line pick
- * gets the push probability that two-sided prices alone cannot identify.
+ * closing quote, so line movement never disqualifies a totals pick: a pick
+ * whose line moved gets a ladder CLV instead of silence, and an integer
+ * same-line pick gets the push probability that two-sided prices alone
+ * cannot identify. The close-quality gates still apply — SHARED with the
+ * exact-line metrics — so a missing/stale/inconsistent close refuses the
+ * ladder with the same typed reason it refuses everything else with.
  *
  * Model: the final combined total T is negative binomial with dispersion k
  * (the published, versioned parameter — docs/TOTALS_DISPERSION.md) and a

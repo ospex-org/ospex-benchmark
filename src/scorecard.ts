@@ -135,7 +135,7 @@ export function buildScorecardMarkdown(
     '- Policy: `fresh`-confidence closes only; a close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (`close_inconsistent`); exact-line price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable totals score as primary via the ladder q_P below, with the push-excluded conditional variants of BOTH metrics still separately labeled.',
   );
   lines.push(
-    `- Totals ladder: \`${LADDER_VERSION}\` (dispersion parameter \`${ladderParams.parameterVersion}\`, k = ${ladderParams.k}) prices EVERY totals pick at its entry line from the close — moved lines included, nothing discarded. Ladder columns are separately labeled and never replace the exact-line columns. Known approximation: the smooth model's push probability runs roughly 1-2 percentage points HIGH at even integer lines and LOW at odd ones (parity oscillation; see docs/TOTALS_DISPERSION.md).`,
+    `- Totals ladder: \`${LADDER_VERSION}\` (dispersion parameter \`${ladderParams.parameterVersion}\`, k = ${ladderParams.k}) prices every totals pick whose close passes the shared quality gates at its ENTRY line — line movement never disqualifies a pick, and gate-refused picks carry the same typed reasons as the exact-line metrics. Ladder columns are separately labeled; moved-line values never enter the same-line columns. Known approximation: the smooth model's push probability runs roughly 1-2 percentage points HIGH at even integer lines and LOW at odd ones (parity oscillation; see docs/TOTALS_DISPERSION.md).`,
   );
   lines.push('');
 
@@ -212,14 +212,14 @@ export function buildScorecardMarkdown(
       if (bMean === null) return -1;
       return bMean - aMean;
     });
-    lines.push(`## Totals ladder (\`${LADDER_VERSION}\` — every totals pick priced at its entry line)`);
+    lines.push(`## Totals ladder (\`${LADDER_VERSION}\` — line movement never disqualifies a totals pick)`);
     lines.push('');
     lines.push(
-      `Generalized push-aware CLV \`100·(q_W·D_e + q_P − 1)\` (economic) and \`100·(q_W/q_entry + q_P − 1)\` (margin-adjusted), with q_W/q_P from the \`${LADDER_VERSION}\` negative-binomial ladder — mean solved from the close (push-conditioned at integer lines), evaluated at the ENTRY line, so moved lines are priced instead of discarded. At an unchanged half-line the ladder value equals the exact-line value; at an unchanged integer line it equals the conditional CLV shrunk by the push mass. The exact-line column repeats the conservative same-line-only reading from the per-market table above; signed movement needs no model (0 = unmoved).`,
+      `Generalized push-aware CLV \`100·(q_W·D_e + q_P − 1)\` (economic) and \`100·(q_W/q_entry + q_P − 1)\` (margin-adjusted), with q_W/q_P from the \`${LADDER_VERSION}\` negative-binomial ladder — mean solved from the close (push-conditioned at integer lines), evaluated at the ENTRY line, so moved lines are priced instead of discarded (close-quality gates still apply, shared with the exact-line metrics). At an unchanged half-line the ladder value equals the exact-line value; at an unchanged integer line it equals the conditional CLV shrunk by the push mass. The same-line column repeats the same-line-only reading from the per-market table above (integer same-line picks use the ladder q_P per the push-capable policy; moved lines never enter it); signed movement needs no model (0 = unmoved) and is averaged over the ladder-scored picks.`,
     );
     lines.push('');
     lines.push(
-      '| Participant | Totals picks | Ladder-scored | Ladder econ mean | Ladder econ median | Ladder margin-adj mean | Ladder margin-adj median | Exact-line econ mean (n) | Mean signed movement | Unscored (reason) |',
+      '| Participant | Totals picks | Ladder-scored | Ladder econ mean | Ladder econ median | Ladder margin-adj mean | Ladder margin-adj median | Same-line econ mean (n) | Mean signed movement | Unscored (reason) |',
     );
     lines.push('|---|---|---|---|---|---|---|---|---|---|');
     for (const stat of withLadder) lines.push(ladderRow(stat));
