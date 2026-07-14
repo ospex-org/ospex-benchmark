@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
+import { buildScorecardMarkdown } from './scorecard.js';
 import {
   aggregateByParticipant,
   parseRunRecords,
+  SCORING_POLICY_VERSION,
   scoredRecords,
   scoreRun,
   sideForSelection,
@@ -12,6 +14,7 @@ import {
 } from './scoring.js';
 import { makeRequest } from './testFactories.js';
 import type { GameRequest } from './bundle.js';
+import type { MarketStats, ScoredPick } from './scoring.js';
 import type { ClosingLineRow, SlateBundle } from './types.js';
 
 const GAME_A = '00000000-0000-4000-8000-0000000000a1';
@@ -727,6 +730,15 @@ test('arms with zero valid decisions stay in the denominators (no survivor bias)
   assert.equal(timeoutArm.validDecisions, 0);
   assert.equal(timeoutArm.primaryScoreable, 0);
   assert.deepEqual(timeoutArm.armOutcomes, { timeout: 2 });
+  // The failed arm stays on the per-market comparison surface too: a 0/N
+  // entry in every market it was dispatched on, never a vanished row.
+  for (const market of ['moneyline', 'spread', 'total']) {
+    const entry: MarketStats | undefined = timeoutArm.byMarket[market];
+    assert.ok(entry, `${market} entry missing for the failed arm`);
+    assert.equal(entry.eligible, 2);
+    assert.equal(entry.picks, 0);
+    assert.equal(entry.gameLevel.meanClvPct, null);
+  }
 });
 
 test('scoredRecords carry provenance (reported model, response id, hashes) and the label', () => {
@@ -749,4 +761,183 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
   const meta = records.find((r) => r['recordType'] === 'scored_run_meta');
   assert.ok(meta);
   assert.equal(meta['integrityVerified'], true);
+});
+
+test('the scoring policy version is pinned to its literal value', () => {
+  // A bump must be a conscious edit HERE too. 'scoring-v0.1.0' is reserved
+  // for pre-stamp output by definition and must never be emitted.
+  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.2.0');
+});
+
+test('every scored record type is stamped with the scoring policy version', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [closeRow(GAME_A, 'moneyline')]);
+  const stats = aggregateByParticipant(scored, run);
+  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  assert.ok(records.length > 0);
+  assert.ok(records.every((r) => r['scoringPolicyVersion'] === SCORING_POLICY_VERSION));
+  const byType = new Set(records.map((r) => r['recordType']));
+  assert.deepEqual(
+    [...byType].sort(),
+    ['participant_scorecard', 'scored_decision', 'scored_run_meta'],
+  );
+});
+
+test('byMarket reports game-clustered stats and per-market unscored reasons, never pooled across markets', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  // Game A: ML scored (+8.5 for home 2.17 @ 0.5), spread line MOVED (1.5 →
+  // 2.5), total scored at the unchanged half line (1.90909 @ 0.5 → −4.5455).
+  // Game B: only ML scored (2.17 @ 0.6 → +30.2); spread/total close_missing.
+  const closes: ClosingLineRow[] = [
+    closeRow(GAME_A, 'moneyline'),
+    closeRow(GAME_A, 'spread', { line: 2.5 }),
+    closeRow(GAME_A, 'total'),
+    closeRow(GAME_B, 'moneyline', { away_p_novig: 0.4, home_p_novig: 0.6 }),
+  ];
+  const scored = scoreRun(run, closes);
+  const stats = aggregateByParticipant(scored, run);
+
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model);
+  const ml = model.byMarket['moneyline'];
+  assert.ok(ml);
+  assert.deepEqual(
+    { eligible: ml.eligible, picks: ml.picks, scoreable: ml.scoreable, gamesScoreable: ml.gamesScoreable },
+    { eligible: 2, picks: 2, scoreable: 2, gamesScoreable: 2 },
+  );
+  assert.equal(ml.gameLevel.meanClvPct, 19.35);
+  assert.equal(ml.gameLevel.beatClosePct, 100);
+  assert.deepEqual(ml.unscoredByReason, {});
+
+  const spread = model.byMarket['spread'];
+  assert.ok(spread);
+  assert.equal(spread.picks, 2);
+  assert.equal(spread.scoreable, 0);
+  assert.equal(spread.gamesScoreable, 0);
+  assert.equal(spread.gameLevel.meanClvPct, null);
+  assert.deepEqual(spread.unscoredByReason, { line_moved: 1, close_missing: 1 });
+
+  const total = model.byMarket['total'];
+  assert.ok(total);
+  assert.equal(total.scoreable, 1);
+  assert.equal(total.gameLevel.meanClvPct, -4.5455);
+  assert.deepEqual(total.unscoredByReason, { close_missing: 1 });
+
+  // Baselines carry the same per-market shape — they are the per-market
+  // comparison partners, not a models-only extra.
+  const homeMl = stats.find((s) => s.participantId === 'baseline-home-ml');
+  assert.ok(homeMl);
+  assert.equal(homeMl.byMarket['moneyline']?.gameLevel.meanClvPct, 19.35);
+
+  // The per-market mean is NOT the pooled mean: pooling would mix the
+  // moneyline's +19.35 with the total's −4.5455.
+  assert.notEqual(model.gameLevel.meanClvPct, ml.gameLevel.meanClvPct);
+});
+
+function syntheticScored(gameId: string, primaryClvPct: number | null): ScoredPick {
+  return {
+    kind: 'baseline',
+    participantId: 'synthetic-policy',
+    gameId,
+    market: 'total',
+    selection: 'over',
+    line: 8.5,
+    entryDecimal: 2,
+    probabilities: null,
+    confidenceValue: null,
+    policyVersion: 'synthetic-v0',
+    modelWinProbability: null,
+    wouldAbstain: null,
+    selectedForExecution: null,
+    provider: null,
+    requestedModelId: null,
+    reportedModelId: null,
+    providerResponseId: null,
+    attemptUsed: null,
+    echoedRequestSha256: null,
+    echoedGameSha256: null,
+    echoedSlateSha256: null,
+    side: 'away',
+    result: {
+      primaryClvPct,
+      unscoredReason: primaryClvPct === null ? 'close_missing' : null,
+      conditionalClvPct: null,
+      lineMovementFavorable: null,
+      closingPNovigSelected: null,
+      aux: null,
+    },
+    close: null,
+  };
+}
+
+test('per-market aggregation clusters within a game first (future multi-pick runs)', () => {
+  // One pick per game/market is the shape today; the clustering must hold if
+  // a run ever carries several picks in the same game and market.
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored: ScoredPick[] = [
+    syntheticScored(GAME_A, 2),
+    syntheticScored(GAME_A, 0),
+    syntheticScored(GAME_B, 3),
+  ];
+  const stats = aggregateByParticipant(scored, run);
+  const policy = stats.find((s) => s.participantId === 'synthetic-policy');
+  assert.ok(policy);
+  const total = policy.byMarket['total'];
+  assert.ok(total);
+  assert.equal(total.picks, 3);
+  assert.equal(total.gamesScoreable, 2);
+  // Game level: mean(mean(2, 0), 3) = mean(1, 3) = 2 — not the per-pick 5/3.
+  assert.equal(total.gameLevel.meanClvPct, 2);
+  assert.equal(total.perPick.meanClvPct, 1.6667);
+  assert.equal(total.gameLevel.beatClosePct, 100);
+  assert.equal(total.perPick.beatClosePct, 66.6667);
+});
+
+test('the scorecard renders per-market game-level tables for every participant and states the never-pool rule', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const closes: ClosingLineRow[] = [
+    closeRow(GAME_A, 'moneyline'),
+    closeRow(GAME_A, 'spread', { line: 2.5 }),
+    closeRow(GAME_A, 'total'),
+    closeRow(GAME_B, 'moneyline', { away_p_novig: 0.4, home_p_novig: 0.6 }),
+  ];
+  const scored = scoreRun(run, closes);
+  const stats = aggregateByParticipant(scored, run);
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z');
+
+  assert.ok(markdown.includes(`- Scoring policy: \`${SCORING_POLICY_VERSION}\``));
+  assert.ok(markdown.includes('never pool CLV across markets'));
+  assert.ok(markdown.includes('pooled across each participant’s markets — context only'));
+  const byMarketAt = markdown.indexOf('## By market');
+  assert.ok(byMarketAt > 0);
+  for (const heading of ['### Moneyline', '### Spread (run line)', '### Total']) {
+    assert.ok(markdown.indexOf(heading) > byMarketAt, `${heading} missing from the by-market section`);
+  }
+  // Baselines appear in the per-market tables (moneyline shown with the
+  // same game-level numbers as the models' moneyline picks).
+  assert.ok(markdown.indexOf('| baseline-home-ml | 2 | 2/2 | 2 | 19.35 |') > byMarketAt);
+  // Per-market unscored reasons are visible where the quarantine happens.
+  assert.ok(markdown.includes('line_moved 1, close_missing 1'));
+  // Per-market rows rank by THIS market's game-level mean, not the pooled
+  // aggregate: away-ml (-21.4182) sorts below home-ml (19.35) on moneyline.
+  const homeRowAt = markdown.indexOf('| baseline-home-ml | 2 | 2/2 |');
+  const awayRowAt = markdown.indexOf('| baseline-away-ml | 2 | 2/2 |');
+  assert.ok(homeRowAt > byMarketAt && awayRowAt > homeRowAt);
+});
+
+test('a fully-failed arm keeps 0/N rows in every rendered per-market table', () => {
+  const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, []);
+  const stats = aggregateByParticipant(scored, run);
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  const byMarketAt = markdown.indexOf('## By market');
+  assert.ok(byMarketAt > 0);
+  const failedRows = [...markdown.matchAll(/\| timeout-arm \| 0 \| 0\/2 \| 0 \| — \| — \| — \| — \|/g)];
+  assert.equal(failedRows.length, 3, 'the failed arm must appear in all three per-market tables');
+  assert.ok(failedRows.every((m) => (m.index ?? -1) > byMarketAt));
 });

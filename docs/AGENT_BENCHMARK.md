@@ -1,6 +1,6 @@
 # Ospex Agent Benchmark — Canonical MVE Design
 
-- Last updated UTC: `2026-07-11T15:01:40Z`
+- Last updated UTC: `2026-07-14T02:26:51Z`
 - Status: accepted application-layer direction; methodology and harness gates remain in progress
 - Scope: MLB-first, one fixed canonical cohort plus separately labeled open/community cohorts
 - Prompt/schema working draft: [BENCHMARK_PROMPT_V0.md](BENCHMARK_PROMPT_V0.md)
@@ -227,6 +227,8 @@ Primary benchmark outputs:
 - auxiliary raw/log price ratio and probability-scale movement;
 - CLV-measurable `n`, total eligible `n`, and exclusion counts;
 - equal-weight game-level aggregate as the primary summary, with market-stratified results also reported;
+- per-market game-level results as the cross-participant comparison surface: never pool CLV across markets when comparing participants with different market exposure; a pooled figure appears only alongside its per-market breakdown;
+- a scoring-policy version stamped on every scored record, so artifacts from different scoring-engine behaviors are never silently compared (unstamped scored output predates versioning and is v0.1.0 by definition);
 - results by moneyline, spread, total, model, day, and cohort;
 - uncertainty intervals clustered by game/day rather than treating every model row as independent;
 - paired differences against every model and preregistered non-LLM baseline, with a preregistered multiple-comparison correction.

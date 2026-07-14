@@ -27,6 +27,18 @@ import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } fr
  * the close fetch.
  */
 
+/**
+ * Scoring-policy version, stamped on every scored record (scored_run_meta,
+ * scored_decision, participant_scorecard). Bump on ANY change to scoring
+ * math, aggregation, or the scored-record/scorecard shape, so two scored
+ * artifacts are never silently compared across engine behaviors. Scored
+ * output produced before stamping existed is `scoring-v0.1.0` by definition.
+ */
+export const SCORING_POLICY_VERSION = 'scoring-v0.2.0';
+
+/** The scored markets, anchored to MarketKey so drift is a compile error. */
+export const MARKETS: ReadonlyArray<MarketKey> = ['moneyline', 'spread', 'total'];
+
 // ---------------------------------------------------------------------------
 // Source-run parsing (the harness's own NDJSON records)
 // ---------------------------------------------------------------------------
@@ -1258,6 +1270,32 @@ export interface ClvSummary {
   beatClosePct: number | null;
 }
 
+/**
+ * Per-market aggregate for one participant. This is the cross-participant
+ * comparison surface: vig differs by market, so CLV is never pooled across
+ * markets when comparing participants with different market exposure.
+ */
+export interface MarketStats {
+  /**
+   * Decision opportunities in this market: dispatched games for a model arm
+   * (so an arm that failed every game still shows 0/N here — failures never
+   * leave the denominators), recorded picks for a baseline.
+   */
+  eligible: number;
+  picks: number;
+  scoreable: number;
+  /** Games with at least one primary-scoreable pick in this market. */
+  gamesScoreable: number;
+  /**
+   * Equal-weight game-level aggregate within this market. With one pick per
+   * participant/game/market this equals perPick; the within-game clustering
+   * is applied regardless so multi-pick runs aggregate correctly.
+   */
+  gameLevel: ClvSummary;
+  perPick: ClvSummary;
+  unscoredByReason: Record<string, number>;
+}
+
 export interface ParticipantStats {
   participantId: string;
   kind: 'model' | 'baseline';
@@ -1277,7 +1315,7 @@ export interface ParticipantStats {
   perPick: ClvSummary;
   conditionalOnly: number;
   unscoredByReason: Record<string, number>;
-  byMarket: Record<string, { picks: number; scoreable: number; meanClvPct: number | null }>;
+  byMarket: Record<string, MarketStats>;
 }
 
 function round4(value: number): number {
@@ -1369,17 +1407,43 @@ export function aggregateByParticipant(
       .map((values) => mean(values))
       .filter((v): v is number => v !== null);
 
+    // Per-market aggregates use the same game-first clustering as the
+    // pooled primary, scoped to one market — never pooled across markets.
+    // A model arm is eligible in every market of every dispatched game, so
+    // it keeps a (possibly 0/N) entry even when it produced no decisions.
     const byMarket: ParticipantStats['byMarket'] = {};
-    for (const market of ['moneyline', 'spread', 'total']) {
+    for (const market of MARKETS) {
       const marketPicks = picks.filter((p) => p.market === market);
-      if (marketPicks.length === 0) continue;
+      const eligible = kind === 'model' ? responses.length : marketPicks.length;
+      if (eligible === 0 && marketPicks.length === 0) continue;
       const scoreable = marketPicks
         .map((p) => p.result.primaryClvPct)
         .filter((v): v is number => v !== null);
+      const marketByGame = new Map<string, number[]>();
+      for (const pick of marketPicks) {
+        if (pick.result.primaryClvPct === null) continue;
+        const list = marketByGame.get(pick.gameId) ?? [];
+        list.push(pick.result.primaryClvPct);
+        marketByGame.set(pick.gameId, list);
+      }
+      const marketGameMeans = [...marketByGame.values()]
+        .map((values) => mean(values))
+        .filter((v): v is number => v !== null);
+      const marketUnscored: Record<string, number> = {};
+      for (const pick of marketPicks) {
+        if (pick.result.unscoredReason !== null) {
+          marketUnscored[pick.result.unscoredReason] =
+            (marketUnscored[pick.result.unscoredReason] ?? 0) + 1;
+        }
+      }
       byMarket[market] = {
+        eligible,
         picks: marketPicks.length,
         scoreable: scoreable.length,
-        meanClvPct: mean(scoreable),
+        gamesScoreable: marketGameMeans.length,
+        gameLevel: summary(marketGameMeans),
+        perPick: summary(scoreable),
+        unscoredByReason: marketUnscored,
       };
     }
 
@@ -1429,6 +1493,7 @@ export function scoredRecords(
     slateSha256: run.slateSha256,
     sourceMode: run.mode,
     scoredAt,
+    scoringPolicyVersion: SCORING_POLICY_VERSION,
     integrityVerified: true,
     metric: 'reference-closing CLV (single reference source, decision CLV only)',
     primaryAggregate: 'equal-weight game-level mean (per-pick reported as secondary)',
@@ -1448,6 +1513,7 @@ export function scoredRecords(
       label: SMOKE_LABEL,
       runId: run.runId,
       scoredAt,
+      scoringPolicyVersion: SCORING_POLICY_VERSION,
       kind: pick.kind,
       participantId: pick.participantId,
       provider: pick.provider,
@@ -1494,6 +1560,7 @@ export function scoredRecords(
       label: SMOKE_LABEL,
       runId: run.runId,
       scoredAt,
+      scoringPolicyVersion: SCORING_POLICY_VERSION,
       ...stat,
     });
   }
