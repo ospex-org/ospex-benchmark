@@ -3,10 +3,12 @@
 ## Why this exists
 
 CLV asks one question: did you get a better number than the closing line?
-Enter at (or near) the close and the answer is structurally ≈ −vig no matter
-how good the forecast is — the line has already absorbed everything, and the
-first live smoke proved it (every arm landed within a point of −vig, because
-the slate was bundled hours after the lines had matured). The methodology's
+Enter at (or near) the close and no forecast can look good — the line has
+already absorbed everything, so economic CLV is structurally ≈ −vig and
+margin-adjusted CLV ≈ 0 (the entry matches the market; the two metrics just
+state that on different scales). The first live smoke proved it: every arm
+landed within a point of −vig, because the slate was bundled hours after
+the lines had matured. The methodology's
 cutoff has always been *first eligible*; watch mode is the machinery that
 actually honors it.
 

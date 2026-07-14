@@ -1,6 +1,6 @@
 # Canonical MLB Benchmark Prompt Contract — v0 Draft
 
-- Last updated UTC: 2026-07-14T05:45:00Z
+- Last updated UTC: 2026-07-14T09:05:00Z
 - Status: draft for B0 shadow testing; not preregistered and not approved for a public cohort
 - Parent methodology: [AGENT_BENCHMARK.md](AGENT_BENCHMARK.md)
 
@@ -130,7 +130,7 @@ Generate two records without conflating them: a same-snapshot common-cutoff deci
 4. Provider-specific reasoning settings and output-schema mechanisms.
 5. Exact invalid-output/timeout/retry reason codes.
 6. Exact-line/alternate-line closing history, closing-source fallback/max-age rules, and moved-line reporting.
-7. No-vig reference-close formula, push probabilities for integer lines, and calibration treatment.
+7. Independent push probabilities for integer lines and calibration treatment. (The reference-close formulas are settled: economic + margin-adjusted CLV under `proportional-v1`, with a `shin-v1` sensitivity variant — see AGENT_BENCHMARK.md "CLV methodology"; they are stamped on every scored record.)
 8. Stake size and daily/global caps for B1/B2.
 9. Public prompt/rationale redaction policy, if any.
 10. Pilot-powered minimum unique-game sample, clustered inference, and multiple-comparison policy.
