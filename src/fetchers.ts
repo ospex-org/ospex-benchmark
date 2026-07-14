@@ -1,14 +1,18 @@
 import { redactAndTruncate } from './config.js';
 import {
   parseClosingLineRows,
+  parseClosingLineRowsWithId,
   parseCurrentOddsRows,
   parseGamesBody,
+  parseGamesTableRows,
   parseHistoryFirstRow,
 } from './wire.js';
 import type {
   ClosingLineRow,
+  ClosingLineRowWithId,
   CurrentOddsRow,
   GamesEndpointRow,
+  GamesTableRow,
   SlateInputs,
 } from './types.js';
 
@@ -109,6 +113,117 @@ export async function fetchClosingLines(
       `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
       `&network=eq.${network}&jsonodds_id=in.(${batch.join(',')})`;
     rows.push(...parseClosingLineRows(await getJson(url, headers)));
+  }
+  return rows;
+}
+
+/**
+ * Keyset pagination over a monotone-identity key: each page asks for rows
+ * with id strictly greater than the last id seen, so — unlike offset
+ * pagination — a concurrent insert can never shift page boundaries and
+ * duplicate one row while dropping another. The identity walk asserts
+ * strictly increasing ids across the whole result (uniqueness + order), and
+ * refuses anything else. Correctness assumes the key is append-only
+ * monotone (a GENERATED IDENTITY column), which closing_lines.id is.
+ *
+ * Termination is an EMPTY page only. A short page must not be trusted as
+ * end-of-data: a server-side row cap below the requested limit would make
+ * every page "short" and silently truncate the walk — the walker
+ * deliberately does not know or assume any page size. Every appended page
+ * passes the maxRows bound before the walk can return, so no result ever
+ * exceeds it. Termination is guaranteed: each page must strictly advance
+ * the id cursor (else the non-increasing refusal fires), and unbounded
+ * growth hits maxRows.
+ */
+export async function keysetWalk<T>(options: {
+  fetchPage: (afterId: number) => Promise<T[]>;
+  idOf: (row: T) => number;
+  maxRows?: number;
+}): Promise<T[]> {
+  const { fetchPage, idOf } = options;
+  const maxRows = options.maxRows ?? 1_000_000;
+  const rows: T[] = [];
+  let afterId = 0;
+  for (;;) {
+    const page = await fetchPage(afterId);
+    if (page.length === 0) return rows;
+    let previous = afterId;
+    for (const row of page) {
+      const id = idOf(row);
+      if (!Number.isSafeInteger(id) || id <= previous) {
+        throw new Error(
+          `keyset pagination returned a non-increasing id (${id} after ${previous}) — ` +
+            'refusing an inconsistent snapshot',
+        );
+      }
+      previous = id;
+      rows.push(row);
+    }
+    if (rows.length > maxRows) {
+      throw new Error(
+        `keyset pagination exceeded ${maxRows} rows — refusing an unbounded walk`,
+      );
+    }
+    afterId = previous;
+  }
+}
+
+/**
+ * EVERY totals closing line on a network, enumerated directly from the
+ * source table the snapshot claims to cover (not via a pre-enumerated game
+ * list, which would silently hide closes whose games row is missing or
+ * unexpected). Keyset-paginated on the identity PK.
+ */
+export async function fetchTotalsClosingLines(
+  supabaseUrl: string,
+  anonKey: string,
+  network: string,
+): Promise<ClosingLineRowWithId[]> {
+  const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
+  const select =
+    'id,network,jsonodds_id,market,line,away_odds_decimal,home_odds_decimal,' +
+    'away_p_novig,home_p_novig,value_captured_at,last_polled_at,lock_time,' +
+    'poll_gap_seconds,confidence,source';
+  // The requested page size is a hint to the server, not a contract the
+  // walker relies on — termination is the empty final page.
+  const pageSize = 1000;
+  return keysetWalk({
+    fetchPage: async (afterId) => {
+      const url =
+        `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
+        `&network=eq.${network}&market=eq.total&id=gt.${afterId}` +
+        `&order=id.asc&limit=${pageSize}`;
+      return parseClosingLineRowsWithId(await getJson(url, headers));
+    },
+    idOf: (row) => row.id,
+  });
+}
+
+/**
+ * `games` TABLE rows for a pinned set of game ids — batched `in.()` lookups
+ * keyed by identity, so there is no pagination and nothing for a concurrent
+ * write to shift. Duplicate rows for one key are refused.
+ */
+export async function fetchGamesRowsByIds(
+  supabaseUrl: string,
+  anonKey: string,
+  network: string,
+  gameIds: string[],
+): Promise<GamesTableRow[]> {
+  const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
+  const select =
+    'network,jsonodds_id,sport,match_time,status,home_score,away_score,final_type,score_captured';
+  const rows: GamesTableRow[] = [];
+  const batchSize = 40;
+  for (let i = 0; i < gameIds.length; i += batchSize) {
+    const batch = gameIds.slice(i, i + batchSize);
+    const url =
+      `${supabaseUrl}/rest/v1/games?select=${select}` +
+      `&network=eq.${network}&jsonodds_id=in.(${batch.join(',')})`;
+    rows.push(...parseGamesTableRows(await getJson(url, headers)));
+  }
+  if (new Set(rows.map((row) => row.jsonodds_id)).size !== rows.length) {
+    throw new Error('games lookup returned duplicate rows for one game id — refusing');
   }
   return rows;
 }
