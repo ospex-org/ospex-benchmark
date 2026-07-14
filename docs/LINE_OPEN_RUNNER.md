@@ -14,13 +14,13 @@ actually honors it.
 A harness that detects at time T and fires at T+Δ has watched the line move
 for Δ — a cherry-pick surface indistinguishable from tout math, no matter how
 honest the operator. Detection and firing are one event: the moment a game
-becomes eligible, the bundle is assembled, hashed, and dispatched to all ten
-participants in the same breath, and the game is never touched again.
+becomes eligible, the bundle is assembled, hashed, and dispatched to all
+twelve participants in the same breath, and the game is never touched again.
 
 Two mechanisms, two jobs — they are complements, not substitutes:
 
-- **The frozen bundle** is the *fairness* mechanism: all ten participants
-  (four model arms + six deterministic baselines) receive identical
+- **The frozen bundle** is the *fairness* mechanism: all twelve participants
+  (four model arms + eight deterministic baselines) receive identical
   information at the identical instant, entering at the same prices. Without
   it, a leaderboard measures fetch latency and plumbing differences, not
   forecasting.
@@ -78,7 +78,7 @@ For one game, once, at detection:
    dispatch, so neither a crash nor a restart can ever double-bill.
 4. Fire: dispatch all four model arms concurrently (existing per-game
    runner: injected clock, cutoff enforcement, repair rules, identity
-   checks) and run all six baselines against the same bundle.
+   checks) and run all eight baselines against the same bundle.
 5. Write one self-contained run file for the game (`out/`,
    `watch-v0-<slateDate>-<hex>.ndjson`) — run metadata **including the
    watch-gate provenance** (detection time, board-completion time, opener

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
+import { BASELINE_POLICY_VERSION, isBaselinePolicyVersion, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { scoreDecision } from './clv.js';
 import { checkProviderCollision } from './providers/family.js';
@@ -13,6 +13,7 @@ import {
   validateResponseText,
 } from './schema.js';
 import { SMOKE_LABEL } from './types.js';
+import type { BaselinePolicyVersion } from './baselines.js';
 import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
 import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } from './types.js';
 
@@ -66,6 +67,7 @@ const runMetaSchema = z
     eligibleGames: z.number().int().nonnegative(),
     armGameResults: z.number().int().nonnegative(),
     baselineDecisionCount: z.number().int().nonnegative(),
+    baselinePolicyVersion: z.string().min(1).optional(),
     watch: watchProvenanceSchema.optional(),
   })
   .passthrough();
@@ -280,6 +282,8 @@ export interface SourceRun {
   eligibleGames: number;
   armGameResults: number;
   baselineDecisionCount: number;
+  /** Baseline policy version stamped at write time; null on legacy archives. */
+  baselinePolicyVersion: string | null;
   /** Watch-mode gate provenance; required (and verified) for watch runs. */
   watch: WatchProvenanceMeta | null;
   games: Map<string, SourceGame>;
@@ -494,6 +498,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
     eligibleGames: meta.eligibleGames,
     armGameResults: meta.armGameResults,
     baselineDecisionCount: meta.baselineDecisionCount,
+    baselinePolicyVersion: meta.baselinePolicyVersion ?? null,
     watch: meta.watch ?? null,
     games,
     picks,
@@ -772,10 +777,14 @@ export function verifyRunIntegrity(
     }
   }
 
-  // Baselines are RE-DERIVED: the six deterministic policies are re-run on
-  // the hash-verified bundles and every recorded baseline decision must
-  // match its re-derivation exactly — a tampered comparator cannot hide
-  // behind bundle-valid sides and prices.
+  // Baselines are RE-DERIVED: the deterministic policies are re-run on the
+  // hash-verified bundles and every recorded baseline decision must match
+  // its re-derivation exactly — a tampered comparator cannot hide behind
+  // bundle-valid sides and prices. Re-derivation runs under the RECORDED
+  // policy version, so archived runs keep verifying byte-for-byte as newer
+  // policy versions ship; the recorded version must be single-valued and
+  // known. A run with no baselines at all falls back to the current
+  // version's expectations (and fails on the missing decisions below).
   const sortedGames = [...run.games.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([, game]) => game.rawBundle);
@@ -788,8 +797,42 @@ export function verifyRunIntegrity(
     cutoffAt: run.slateCutoffAt,
     games: sortedGames,
   } as unknown as SlateBundle;
+  const recordedBaselineVersions = [...new Set(baselinePicks.map((p) => p.policyVersion))];
+  let baselinePolicyVersion: BaselinePolicyVersion = BASELINE_POLICY_VERSION;
+  if (recordedBaselineVersions.length > 1) {
+    violations.push(
+      `baseline decisions carry mixed policy versions (${recordedBaselineVersions
+        .map((v) => v ?? 'null')
+        .sort()
+        .join(', ')})`,
+    );
+  } else if (recordedBaselineVersions.length === 1) {
+    const recorded = recordedBaselineVersions[0];
+    if (typeof recorded === 'string' && isBaselinePolicyVersion(recorded)) {
+      baselinePolicyVersion = recorded;
+    } else {
+      violations.push(`baseline decisions carry unknown policy version ${recorded ?? 'null'}`);
+    }
+  }
+  // Cross-check the run_meta stamp against the per-decision stamps: a
+  // version-downgrade edit (restamp rows + delete the newer policies' rows +
+  // fix the count) must also rewrite run_meta coherently to pass. Absent
+  // stamp = legacy pre-stamp archive; per-decision dispatch alone applies.
+  if (run.baselinePolicyVersion !== null) {
+    const consistent =
+      recordedBaselineVersions.length === 1 &&
+      recordedBaselineVersions[0] === run.baselinePolicyVersion;
+    if (!consistent) {
+      violations.push(
+        `run_meta baselinePolicyVersion ${run.baselinePolicyVersion} does not match the recorded baseline decisions`,
+      );
+    }
+  }
   const expectedBaselines = new Map(
-    runBaselines(reconstructedSlate).map((d) => [`${d.participantId}:${d.gameId}`, d]),
+    runBaselines(reconstructedSlate, baselinePolicyVersion).map((d) => [
+      `${d.participantId}:${d.gameId}`,
+      d,
+    ]),
   );
   const seenBaselineKeys = new Set<string>();
   for (const pick of baselinePicks) {
@@ -804,7 +847,7 @@ export function verifyRunIntegrity(
       violations.push(`baseline decision ${key} is not produced by the deterministic policies`);
       continue;
     }
-    if (pick.policyVersion !== BASELINE_POLICY_VERSION) {
+    if (pick.policyVersion !== baselinePolicyVersion) {
       violations.push(`baseline decision ${key}: unexpected policyVersion ${pick.policyVersion ?? 'null'}`);
     }
     if (

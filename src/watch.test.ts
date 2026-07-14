@@ -131,7 +131,7 @@ function fakeFire(outcome?: Partial<FireOutcome>, fail = false): FakeFire {
         runId: 'watch-v0-2026-07-20-abc123',
         runFile: 'out/watch-v0-2026-07-20-abc123.ndjson',
         armOutcomes: { [TEST_ARM.participantId]: 'valid' },
-        baselineDecisions: 6,
+        baselineDecisions: 8,
         collisionFailed: false,
         ...outcome,
       });
@@ -407,7 +407,7 @@ test('a fired game produces a run file that passes full scorer integrity verific
 
   assert.equal(outcome.collisionFailed, false);
   assert.equal(outcome.armOutcomes[TEST_ARM.participantId], 'valid');
-  assert.equal(outcome.baselineDecisions, 6);
+  assert.equal(outcome.baselineDecisions, 8);
   assert.match(outcome.runId, /^watch-v0-2026-07-20-[0-9a-f]{6}$/);
 
   const lines = readFileSync(outcome.runFile, 'utf8').split(/\r?\n/);

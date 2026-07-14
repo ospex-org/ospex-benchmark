@@ -26,7 +26,7 @@ The authoritative methodology lives in this repo:
 
 ## Shadow smoke test (v0)
 
-`src/shadowSmoke.ts` is the B0 shadow harness: it fetches an MLB slate with reference odds from the existing public read path, freezes a content-hashed single-game bundle per game, dispatches the four frontier-model arms **per game** (games sequential, the four arms concurrent within each game, outputs sealed per game so no arm can be conditioned on another's answer), validates every response against the strict schema with a real validator, runs the six deterministic baselines, records everything with full provenance as NDJSON plus a human-readable summary — and stops. No scoring, no wallets, no chain access, no SSE.
+`src/shadowSmoke.ts` is the B0 shadow harness: it fetches an MLB slate with reference odds from the existing public read path, freezes a content-hashed single-game bundle per game, dispatches the four frontier-model arms **per game** (games sequential, the four arms concurrent within each game, outputs sealed per game so no arm can be conditioned on another's answer), validates every response against the strict schema with a real validator, runs the eight deterministic baselines, records everything with full provenance as NDJSON plus a human-readable summary — and stops. No scoring, no wallets, no chain access, no SSE.
 
 Per-game dispatch means one game's failure affects only that game, and each game carries its own decision cutoff (its scheduled first pitch) — a slate cannot be batched when each game's deadline is independent.
 
@@ -105,7 +105,7 @@ matured, where closing-line value is structurally ≈ −vig. Watch mode is the
 methodology's *first eligible* cutoff made real: it polls the same public
 read path and, the moment a game becomes eligible (the bundle builder yields
 a request — full board, two-sided, fresh quotes), it assembles, hashes, and
-fires that one game to all ten participants **in the same instant**, then
+fires that one game to all twelve participants **in the same instant**, then
 records it in a per-game ledger (`out/watch-ledger/`) and never touches it
 again. One self-contained run file per fired game (`out/watch-v0-*.ndjson`)
 — scored with the same `yarn score` command, verified by the same integrity
@@ -140,7 +140,7 @@ Joins a run's frozen decisions (and the deterministic baselines) to the producti
 - every game, request, and slate hash recomputed from the embedded bundles;
 - the **full harness validator** re-run on every archived accepted response against its hash-verified request bundle (a recorded `valid` that would not validate, or a valid response demoted to `invalid_schema`, is a violation), including the repair-acceptance rules (initial must fail with a complete fingerprint the accepted repair preserves);
 - every decision re-derived from the accepted response — content and provenance — and backed by exactly one `valid` arm response per game;
-- the six deterministic baselines re-derived via `runBaselines` and compared exactly;
+- the deterministic baselines re-derived via `runBaselines` under the run's RECORDED policy version (v0.1.0 six policies, v0.2.0 adds the mirrored run-line pair) and compared exactly — archived runs keep verifying as newer baseline versions ship, and the per-decision version stamps are cross-checked against run_meta's `baselinePolicyVersion` (absent on pre-stamp archives); like every non-hashed manifest field, the stamps defend against incoherent edits, not a forger rewriting the whole file consistently — see the trust boundary below;
 - the **identity/collision gate recomputed** from the archived reported model IDs and the approved-ID registry — the recomputed failure set must be empty regardless of whether `run_failure` records survive, and any surviving `run_failure` must correspond to a recomputed failure;
 - the frozen arm manifest, manifest counts, uniqueness, cross-products, and per-record run/label/cohort identity all enforced.
 

@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { buildScorecardMarkdown } from './scorecard.js';
+import type { BaselinePolicyVersion } from './baselines.js';
 import {
   aggregateByParticipant,
   parseRunRecords,
@@ -54,6 +55,8 @@ function fixtureRun(options?: {
   extraArm?: { participantId: string; outcome: string };
   /** Adds a second VALID model arm that takes the OPPOSITE side of every market. */
   secondModelArm?: boolean;
+  /** Baseline policy version to derive and stamp (default: current). */
+  baselinePolicyVersion?: BaselinePolicyVersion;
 }): {
   lines: string[];
   requests: GameRequest[];
@@ -223,7 +226,8 @@ function fixtureRun(options?: {
     }
   }
 
-  // The six deterministic baselines, re-derivable from the bundles.
+  // The deterministic baselines, re-derivable from the bundles (current
+  // policy version unless a test pins an earlier one).
   const slateForBaselines: SlateBundle = {
     schemaVersion: 1,
     label: 'SMOKE_V0_NOT_A_COHORT',
@@ -233,14 +237,15 @@ function fixtureRun(options?: {
     cutoffAt: '2026-07-12T16:15:00+00:00',
     games: requests.map((r) => r.game),
   };
-  for (const decision of runBaselines(slateForBaselines)) {
+  const baselineVersion = options?.baselinePolicyVersion ?? BASELINE_POLICY_VERSION;
+  for (const decision of runBaselines(slateForBaselines, baselineVersion)) {
     const shas = shaByGame.get(decision.gameId);
     records.push({
       recordType: 'baseline_decision',
       ...identity,
       cohortId: 'test-cohort',
       participantId: decision.participantId,
-      policyVersion: BASELINE_POLICY_VERSION,
+      policyVersion: decision.policyVersion,
       gameId: decision.gameId,
       market: decision.market,
       selection: decision.selection,
@@ -266,6 +271,9 @@ function fixtureRun(options?: {
     eligibleGames: requests.length,
     armGameResults: armResponseCount,
     baselineDecisionCount: baselineCount,
+    // Real v0.1.0 archives predate the run_meta version stamp — emulate that
+    // so the compat test exercises the legacy absent-stamp path.
+    ...(baselineVersion !== 'baselines-v0.1.0' ? { baselinePolicyVersion: baselineVersion } : {}),
   });
 
   return { lines: records.map((l) => JSON.stringify(l)), requests, slateSha256 };
@@ -451,6 +459,138 @@ test('a partially deleted baseline breaks the baseline×game cross-product', () 
   });
   const violations = verifyRunIntegrity(parseRunRecords(partial), { expectedArms: FIXTURE_ARMS });
   assert.ok(violations.some((v) => v.includes('is missing')));
+});
+
+test('an archived baselines-v0.1.0 run still verifies clean under the current scorer', () => {
+  // The compat contract: re-derivation runs under the RECORDED policy
+  // version, so a pre-run-line archive (six baselines per game, no
+  // run-line pair expected) verifies with zero violations. Forcing the
+  // current version's expectations onto this run would fail it with
+  // missing baseline-favorite-rl / baseline-underdog-rl decisions.
+  const { lines } = fixtureRun({ baselinePolicyVersion: 'baselines-v0.1.0' });
+  const run = parseRunRecords(lines);
+  const baselinePicks = run.picks.filter((p) => p.kind === 'baseline');
+  assert.equal(baselinePicks.length, 12);
+  assert.ok(baselinePicks.every((p) => p.policyVersion === 'baselines-v0.1.0'));
+  assert.ok(!baselinePicks.some((p) => p.participantId.endsWith('-rl')));
+  assert.deepEqual(verifyRunIntegrity(run, { expectedArms: FIXTURE_ARMS }), []);
+});
+
+test('a current-version run carries the mirrored run-line pair and verifies clean', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const rlPicks = run.picks.filter(
+    (p) => p.kind === 'baseline' && p.participantId.endsWith('-rl'),
+  );
+  // Fixture run line is the HOME handicap +1.5, so AWAY lays the runs:
+  // favorite-rl = away team at the away price, underdog-rl = home team.
+  assert.equal(rlPicks.length, 4);
+  assert.ok(rlPicks.every((p) => p.market === 'spread' && p.line === 1.5));
+  const favorite = rlPicks.find(
+    (p) => p.participantId === 'baseline-favorite-rl' && p.gameId === GAME_A,
+  );
+  assert.ok(favorite);
+  assert.equal(favorite.selection, 'Milwaukee Brewers');
+  assert.equal(favorite.entryDecimal, 2.3);
+  assert.deepEqual(verifyRunIntegrity(run, { expectedArms: FIXTURE_ARMS }), []);
+});
+
+test('mixed and unknown baseline policy versions are violations', () => {
+  const { lines } = fixtureRun();
+  const mixed = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (
+      record['recordType'] === 'baseline_decision' &&
+      record['participantId'] === 'baseline-home-ml' &&
+      record['gameId'] === GAME_A
+    ) {
+      record['policyVersion'] = 'baselines-v0.1.0';
+    }
+    return JSON.stringify(record);
+  });
+  const mixedViolations = verifyRunIntegrity(parseRunRecords(mixed), { expectedArms: FIXTURE_ARMS });
+  assert.ok(mixedViolations.some((v) => v.includes('mixed policy versions')));
+
+  const unknown = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (record['recordType'] === 'baseline_decision') {
+      record['policyVersion'] = 'baselines-v9.9.9';
+    }
+    return JSON.stringify(record);
+  });
+  const unknownViolations = verifyRunIntegrity(parseRunRecords(unknown), { expectedArms: FIXTURE_ARMS });
+  assert.ok(unknownViolations.some((v) => v.includes('unknown policy version baselines-v9.9.9')));
+});
+
+test('deleting the run-line pair from a current-version run is caught', () => {
+  const { lines } = fixtureRun();
+  const withoutRl = lines.filter((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    return !(
+      record['recordType'] === 'baseline_decision' &&
+      typeof record['participantId'] === 'string' &&
+      record['participantId'].endsWith('-rl')
+    );
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(withoutRl), { expectedArms: FIXTURE_ARMS });
+  assert.ok(
+    violations.some((v) => v.includes('baseline-favorite-rl') && v.includes('is missing')),
+    'deleting the run-line pair must surface as missing deterministic baselines',
+  );
+});
+
+test('a coherent version-downgrade edit is caught by the run_meta policy-version stamp', () => {
+  // The review probe: restamp every baseline row to v0.1.0, delete the
+  // run-line pair, and fix run_meta.baselineDecisionCount — three coherent
+  // edits that would otherwise present as a legitimate v0.1.0 archive. The
+  // run_meta baselinePolicyVersion stamp forces a fourth edit; a forger who
+  // rewrites that too is outside the documented trust boundary (run files
+  // are unsigned; the root of trust is the archived/published artifact).
+  const { lines } = fixtureRun();
+  const downgraded = lines
+    .filter((line) => {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      return !(
+        record['recordType'] === 'baseline_decision' &&
+        typeof record['participantId'] === 'string' &&
+        record['participantId'].endsWith('-rl')
+      );
+    })
+    .map((line) => {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      if (record['recordType'] === 'baseline_decision') {
+        record['policyVersion'] = 'baselines-v0.1.0';
+      }
+      if (record['recordType'] === 'run_meta') {
+        record['baselineDecisionCount'] = 12;
+      }
+      return JSON.stringify(record);
+    });
+  const violations = verifyRunIntegrity(parseRunRecords(downgraded), { expectedArms: FIXTURE_ARMS });
+  assert.ok(
+    violations.some((v) => v.includes('run_meta baselinePolicyVersion')),
+    'the run_meta stamp must contradict the downgraded per-decision stamps',
+  );
+});
+
+test('a tampered run-line baseline at a bundle-valid price fails re-derivation', () => {
+  const { lines } = fixtureRun();
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    if (
+      record['recordType'] === 'baseline_decision' &&
+      record['participantId'] === 'baseline-favorite-rl' &&
+      record['gameId'] === GAME_A
+    ) {
+      // The OTHER side at its valid frozen price — bundle-valid, policy-false
+      // (the away side lays on a +1.5 home handicap, not the home side).
+      record['selection'] = 'Pittsburgh Pirates';
+      record['observedDecimal'] = 1.66667;
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+  assert.ok(violations.some((v) => v.includes('does not match its deterministic re-derivation')));
 });
 
 test('the round-3 probe: a tampered baseline at a bundle-valid price fails re-derivation', () => {
@@ -788,8 +928,8 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
   const stats = aggregateByParticipant(scored, run);
   const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z');
   const decisions = records.filter((r) => r['recordType'] === 'scored_decision');
-  // 6 model decisions + 12 deterministic baseline decisions (6 × 2 games).
-  assert.equal(decisions.length, 18);
+  // 6 model decisions + 16 deterministic baseline decisions (8 × 2 games).
+  assert.equal(decisions.length, 22);
   const modelDecision = decisions.find((r) => r['kind'] === 'model');
   assert.ok(modelDecision);
   assert.equal(modelDecision['reportedModelId'], 'stub-model-1');
@@ -962,6 +1102,10 @@ test('the scorecard renders per-market game-level tables for every participant a
   assert.ok(markdown.indexOf('| baseline-home-ml | 2 | 2/2 | 2 | 19.35 |') > byMarketAt);
   // Per-market unscored reasons are visible where the quarantine happens.
   assert.ok(markdown.includes('line_moved 1, close_missing 1'));
+  // The run-line baseline pair renders in the spread table alongside models.
+  const spreadHeadingAt = markdown.indexOf('### Spread (run line)');
+  assert.ok(markdown.indexOf('| baseline-favorite-rl |', spreadHeadingAt) > spreadHeadingAt);
+  assert.ok(markdown.indexOf('| baseline-underdog-rl |', spreadHeadingAt) > spreadHeadingAt);
   // The ordering CONTRACT (market's own mean, never the pooled aggregate) is
   // pinned by the dedicated opposing-order test below — single-market
   // baselines cannot distinguish the two comparators.
