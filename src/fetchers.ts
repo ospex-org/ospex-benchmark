@@ -116,9 +116,44 @@ export async function fetchClosingLines(
 }
 
 /**
+ * Server-side exact row count for a PostgREST filter — the completeness
+ * cross-check for offset pagination. A HEAD request with `count=exact`
+ * answers from Content-Range without transferring rows.
+ */
+async function fetchExactCount(url: string, anonKey: string): Promise<number> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: 'HEAD',
+      headers: {
+        apikey: anonKey,
+        Authorization: `Bearer ${anonKey}`,
+        Prefer: 'count=exact',
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HEAD ${url} failed with HTTP ${response.status}`);
+    }
+    const contentRange = response.headers.get('content-range');
+    const total = contentRange?.split('/')[1];
+    if (total === undefined || !/^\d+$/.test(total)) {
+      throw new Error(`HEAD ${url}: no exact count in Content-Range ("${contentRange ?? ''}")`);
+    }
+    return Number(total);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Every `games` TABLE row for one (network, sport) over the same public
  * anon read path — the completion/score side of the totals-pair extraction.
- * Paginated, ordered by the stable key, with a runaway guard.
+ * Paginated and ordered by the stable key, then verified against the
+ * server's exact count: if the server ever clamps pages below our limit,
+ * pagination would otherwise terminate early and truncate SILENTLY (the
+ * output stays self-consistent), so completeness is asserted, not assumed.
  */
 export async function fetchGamesTableRows(
   supabaseUrl: string,
@@ -127,14 +162,14 @@ export async function fetchGamesTableRows(
   sport: string,
 ): Promise<GamesTableRow[]> {
   const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
+  const select =
+    'network,jsonodds_id,sport,match_time,status,home_score,away_score,final_type,score_captured';
+  const filters = `network=eq.${network}&sport=eq.${sport}`;
   const rows: GamesTableRow[] = [];
   const limit = 1000;
   for (let offset = 0; ; offset += limit) {
-    const select =
-      'network,jsonodds_id,sport,match_time,status,home_score,away_score,final_type,score_captured';
     const url =
-      `${supabaseUrl}/rest/v1/games?select=${select}` +
-      `&network=eq.${network}&sport=eq.${sport}` +
+      `${supabaseUrl}/rest/v1/games?select=${select}&${filters}` +
       `&order=jsonodds_id.asc&limit=${limit}&offset=${offset}`;
     const batch = parseGamesTableRows(await getJson(url, headers));
     rows.push(...batch);
@@ -142,6 +177,16 @@ export async function fetchGamesTableRows(
     if (offset > 100_000) {
       throw new Error('games table pagination did not terminate — aborting rather than looping');
     }
+  }
+  const expected = await fetchExactCount(
+    `${supabaseUrl}/rest/v1/games?select=jsonodds_id&${filters}`,
+    anonKey,
+  );
+  if (rows.length !== expected) {
+    throw new Error(
+      `games pagination returned ${rows.length} rows but the server counts ${expected} — ` +
+        'refusing a silently truncated snapshot',
+    );
   }
   return rows;
 }
