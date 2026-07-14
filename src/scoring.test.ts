@@ -13,10 +13,14 @@ import {
   sideForSelection,
   verifyRunIntegrity,
 } from './scoring.js';
-import { makeRequest } from './testFactories.js';
+import { makeGameBundle, makeRequest } from './testFactories.js';
 import type { GameRequest } from './bundle.js';
 import type { MarketStats, ScoredPick } from './scoring.js';
 import type { ClosingLineRow, SlateBundle } from './types.js';
+
+// Fixture ladder parameter: the real committed k so ladder goldens are
+// stable, threaded explicitly like the CLI threads the loaded artifact.
+const TEST_LADDER = { k: 8.101061957791782, parameterVersion: 'TOTALS_V1_PROVISIONAL' };
 
 const GAME_A = '00000000-0000-4000-8000-0000000000a1';
 const GAME_B = '00000000-0000-4000-8000-0000000000b2';
@@ -57,13 +61,26 @@ function fixtureRun(options?: {
   secondModelArm?: boolean;
   /** Baseline policy version to derive and stamp (default: current). */
   baselinePolicyVersion?: BaselinePolicyVersion;
+  /** Overrides GAME_A's bundle total line (e.g. 9 for a push-capable line). */
+  totalLineGameA?: number;
 }): {
   lines: string[];
   requests: GameRequest[];
   slateSha256: string;
 } {
+  const gameABase = makeGameBundle({ gameId: GAME_A });
   const requests = [
-    makeRequest('2026-07-12T16:15:00+00:00', { gameId: GAME_A }),
+    makeRequest('2026-07-12T16:15:00+00:00', {
+      gameId: GAME_A,
+      ...(options?.totalLineGameA !== undefined
+        ? {
+            markets: {
+              ...gameABase.markets,
+              total: { ...gameABase.markets.total, line: options.totalLineGameA },
+            },
+          }
+        : {}),
+    }),
     makeRequest('2026-07-12T20:10:00+00:00', { gameId: GAME_B }),
   ];
 
@@ -874,7 +891,7 @@ test('sideForSelection maps team names and over/under; rejects unknown labels', 
 test('missing close rows are unscored close_missing (pre-lock behavior)', () => {
   const { lines } = fixtureRun();
   const run = parseRunRecords(lines);
-  const scored = scoreRun(run, []);
+  const scored = scoreRun(run, [], TEST_LADDER);
   assert.ok(scored.every((p) => p.result.unscoredReason === 'close_missing'));
   assert.ok(scored.every((p) => p.result.primaryClvPct === null));
 });
@@ -894,8 +911,8 @@ test('equal-weight game-level primary differs from per-pick pooling and is the p
     closeRow(GAME_A, 'total'),
     closeRow(GAME_B, 'moneyline', { ...NOVIG_ONLY, away_p_novig: 0.4, home_p_novig: 0.6 }),
   ];
-  const scored = scoreRun(run, closes);
-  const stats = aggregateByParticipant(scored, run);
+  const scored = scoreRun(run, closes, TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const model = stats.find((s) => s.participantId === 'model-arm');
   assert.ok(model);
   assert.equal(model.primaryScoreable, 4);
@@ -911,7 +928,7 @@ test('arms with zero valid decisions stay in the denominators (no survivor bias)
   const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
   const run = parseRunRecords(lines);
   assert.deepEqual(verifyRunIntegrity(run, { expectedArms: FIXTURE_ARMS_WITH_TIMEOUT }), []);
-  const stats = aggregateByParticipant(scoreRun(run, []), run);
+  const stats = aggregateByParticipant(scoreRun(run, [], TEST_LADDER), run, TEST_LADDER);
   const timeoutArm = stats.find((s) => s.participantId === 'timeout-arm');
   assert.ok(timeoutArm);
   assert.equal(timeoutArm.kind, 'model');
@@ -934,9 +951,9 @@ test('arms with zero valid decisions stay in the denominators (no survivor bias)
 test('scoredRecords carry provenance (reported model, response id, hashes) and the label', () => {
   const { lines, slateSha256 } = fixtureRun();
   const run = parseRunRecords(lines);
-  const scored = scoreRun(run, [closeRow(GAME_A, 'moneyline')]);
-  const stats = aggregateByParticipant(scored, run);
-  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  const scored = scoreRun(run, [closeRow(GAME_A, 'moneyline')], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   const decisions = records.filter((r) => r['recordType'] === 'scored_decision');
   // 6 model decisions + 16 deterministic baseline decisions (8 × 2 games).
   assert.equal(decisions.length, 22);
@@ -956,15 +973,15 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
 test('the scoring policy version is pinned to its literal value', () => {
   // A bump must be a conscious edit HERE too. 'scoring-v0.1.0' is reserved
   // for pre-stamp output by definition and must never be emitted.
-  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.3.0');
+  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.4.0');
 });
 
 test('every scored record type is stamped with the scoring policy version', () => {
   const { lines } = fixtureRun();
   const run = parseRunRecords(lines);
-  const scored = scoreRun(run, [closeRow(GAME_A, 'moneyline')]);
-  const stats = aggregateByParticipant(scored, run);
-  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  const scored = scoreRun(run, [closeRow(GAME_A, 'moneyline')], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   assert.ok(records.length > 0);
   assert.ok(records.every((r) => r['scoringPolicyVersion'] === SCORING_POLICY_VERSION));
   const byType = new Set(records.map((r) => r['recordType']));
@@ -981,8 +998,8 @@ test('margin-adjusted CLV rides every scored surface: rows, aggregates, run meta
     closeRow(GAME_A, 'moneyline'),
     closeRow(GAME_B, 'moneyline', { ...NOVIG_ONLY, away_p_novig: 0.4, home_p_novig: 0.6 }),
   ];
-  const scored = scoreRun(run, closes);
-  const stats = aggregateByParticipant(scored, run);
+  const scored = scoreRun(run, closes, TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
 
   // The wiring: the opposite side comes from the same bundle, so the model's
   // home-ML margin-adjusted CLV must equal 100*(q_close/q_entry - 1) with
@@ -1022,7 +1039,7 @@ test('margin-adjusted CLV rides every scored surface: rows, aggregates, run meta
 
   // Scored records are self-contained: both entry sides, both metrics, the
   // named de-vig method, and the shin sensitivity block on scored rows.
-  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   const meta = records.find((r) => r['recordType'] === 'scored_run_meta');
   assert.ok(meta);
   assert.ok(meta['metrics']);
@@ -1062,8 +1079,8 @@ test('byMarket reports game-clustered stats and per-market unscored reasons, nev
     closeRow(GAME_A, 'total'),
     closeRow(GAME_B, 'moneyline', { ...NOVIG_ONLY, away_p_novig: 0.4, home_p_novig: 0.6 }),
   ];
-  const scored = scoreRun(run, closes);
-  const stats = aggregateByParticipant(scored, run);
+  const scored = scoreRun(run, closes, TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
 
   const model = stats.find((s) => s.participantId === 'model-arm');
   assert.ok(model);
@@ -1127,6 +1144,7 @@ function syntheticScored(gameId: string, primaryClvPct: number | null): ScoredPi
     echoedSlateSha256: null,
     side: 'away',
     entryOppositeDecimal: 2,
+    ladder: null,
     result: {
       primaryClvPct,
       unscoredReason: primaryClvPct === null ? 'close_missing' : null,
@@ -1153,7 +1171,7 @@ test('per-market aggregation clusters within a game first (future multi-pick run
     syntheticScored(GAME_A, 0),
     syntheticScored(GAME_B, 3),
   ];
-  const stats = aggregateByParticipant(scored, run);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const policy = stats.find((s) => s.participantId === 'synthetic-policy');
   assert.ok(policy);
   const total = policy.byMarket['total'];
@@ -1176,9 +1194,9 @@ test('the scorecard renders per-market game-level tables for every participant a
     closeRow(GAME_A, 'total'),
     closeRow(GAME_B, 'moneyline', { ...NOVIG_ONLY, away_p_novig: 0.4, home_p_novig: 0.6 }),
   ];
-  const scored = scoreRun(run, closes);
-  const stats = aggregateByParticipant(scored, run);
-  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  const scored = scoreRun(run, closes, TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
 
   assert.ok(markdown.includes(`- Scoring policy: \`${SCORING_POLICY_VERSION}\``));
   assert.ok(markdown.includes('never pool CLV across markets'));
@@ -1232,8 +1250,8 @@ test('per-market tables rank by the market’s own mean even when the pooled ord
     closeRow(GAME_A, 'spread', { ...NOVIG_ONLY, away_p_novig: 0.1, home_p_novig: 0.9 }),
     closeRow(GAME_A, 'total', { ...NOVIG_ONLY, away_p_novig: 0.1, home_p_novig: 0.9 }),
   ];
-  const scored = scoreRun(run, closes);
-  const stats = aggregateByParticipant(scored, run);
+  const scored = scoreRun(run, closes, TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const arm1 = stats.find((s) => s.participantId === 'model-arm');
   const arm2 = stats.find((s) => s.participantId === 'model-arm-2');
   assert.ok(arm1 && arm2);
@@ -1247,7 +1265,7 @@ test('per-market tables rank by the market’s own mean even when the pooled ord
   assert.ok(pooled2 > pooled1, 'fixture premise: model-arm-2 must win the pooled aggregate');
   assert.ok(ml1 > ml2, 'fixture premise: model-arm must win the moneyline market');
 
-  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   const mlAt = markdown.indexOf('### Moneyline');
   const spreadAt = markdown.indexOf('### Spread (run line)');
   const totalAt = markdown.indexOf('### Total');
@@ -1277,12 +1295,345 @@ test('per-market tables rank by the market’s own mean even when the pooled ord
 test('a fully-failed arm keeps 0/N rows in every rendered per-market table', () => {
   const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
   const run = parseRunRecords(lines);
-  const scored = scoreRun(run, []);
-  const stats = aggregateByParticipant(scored, run);
-  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z');
+  const scored = scoreRun(run, [], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   const byMarketAt = markdown.indexOf('## By market');
   assert.ok(byMarketAt > 0);
   const failedRows = [...markdown.matchAll(/\| timeout-arm \| 0 \| 0\/2 \| 0 \| — \| — \| — \| — \| — \| — \| — \|/g)];
   assert.equal(failedRows.length, 3, 'the failed arm must appear in all three per-market tables');
   assert.ok(failedRows.every((m) => (m.index ?? -1) > byMarketAt));
+});
+
+// ---------------------------------------------------------------------------
+// TOTALS_V1 ladder integration (scoring-v0.4.0)
+// ---------------------------------------------------------------------------
+
+test('every totals pick carries a ladder block; other markets carry none', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [], TEST_LADDER);
+  for (const pick of scored) {
+    if (pick.market === 'total') {
+      assert.ok(pick.ladder !== null, 'totals pick has a ladder block');
+      assert.equal(pick.ladder.ladderVersion, 'TOTALS_V1');
+      assert.equal(pick.ladder.parameterVersion, 'TOTALS_V1_PROVISIONAL');
+      // No closes fetched: the shared availability gate is honored verbatim.
+      assert.equal(pick.ladder.unscoredReason, 'close_missing');
+    } else {
+      assert.equal(pick.ladder, null);
+    }
+  }
+});
+
+test('integer same-line totals stay conditional-only; the ladder value is sensitivity output (E2E)', () => {
+  // GAME_A bundle total moved to the push-capable line 9; the close is at
+  // the same line with an even conditional split (2.0/2.0 -> 0.5/0.5).
+  const { lines } = fixtureRun({ totalLineGameA: 9 });
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
+  const over = scored.find(
+    (p) => p.participantId === 'model-arm' && p.market === 'total' && p.gameId === GAME_A,
+  );
+  assert.ok(over && over.selection === 'over' && over.line === 9, 'fixture premise');
+  // The primary columns are untouched while the candidate method's
+  // validation is pending: conditional-only, exactly as before the ladder.
+  assert.equal(over.result.conditionalClvPct, -4.5455);
+  assert.equal(over.result.primaryClvPct, null);
+  assert.equal(over.result.unscoredReason, 'push_capable_line');
+  assert.equal(over.result.marginAdjustedConditionalClvPct, 0);
+  // The ladder block carries the generalized value as separately labeled
+  // sensitivity output: conditional shrunk by the push mass q_P =
+  // 0.089517251326 (the independent golden at mu solved from (9, 0.5)).
+  assert.ok(over.ladder !== null, 'ladder block present');
+  assert.equal(over.ladder.unscoredReason, null);
+  assert.equal(over.ladder.economicClvPct, -4.1386);
+  assert.equal(over.ladder.qPushEntry, 0.0895);
+  // Margin-adjusted zero-point survives the generalization EXACTLY: entry
+  // and close both split 0.5/0.5, so q_W/q_e + q_P = (1-q_P) + q_P = 1.
+  assert.equal(over.ladder.marginAdjustedClvPct, 0);
+  // Coverage semantics: nothing enters the primary aggregates, and the pick
+  // counts as conditional-only.
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model);
+  assert.equal(model.byMarket['total']?.scoreable, 0);
+  assert.equal(model.conditionalOnly, 1);
+});
+
+test('moved totals lines are priced by the ladder while exact-line stays unavailable (E2E)', () => {
+  // Entry total 8.5 (fixture default), close at 9 with an even conditional
+  // split: mu = 9.551675689313 (independent golden), above(8.5) =
+  // 0.544758625663, below(8.5) = 0.455241374337.
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
+  const over = scored.find(
+    (p) => p.participantId === 'model-arm' && p.market === 'total' && p.gameId === GAME_A,
+  );
+  assert.ok(over && over.selection === 'over', 'fixture premise');
+  assert.equal(over.result.unscoredReason, 'line_moved');
+  assert.equal(over.result.primaryClvPct, null);
+  assert.equal(over.result.lineMovementFavorable, 0.5);
+  assert.ok(over.ladder !== null, 'ladder block present');
+  assert.equal(over.ladder.unscoredReason, null);
+  // econ = 100*(0.544758625663*1.90909 - 1) = 3.9993; half-line: no push.
+  assert.equal(over.ladder.economicClvPct, 3.9993);
+  assert.equal(over.ladder.qPushEntry, 0);
+  const under = scored.find(
+    (p) => p.participantId === 'baseline-under-total' && p.gameId === GAME_A,
+  );
+  assert.ok(under && under.line === 8.5, 'fixture premise');
+  assert.equal(under.result.unscoredReason, 'line_moved');
+  assert.equal(under.result.lineMovementFavorable, -0.5);
+  // econ = 100*(0.455241374337*1.90909 - 1) = -13.0903.
+  assert.equal(under.ladder?.economicClvPct, -13.0903);
+});
+
+test('run_meta and participant_scorecard carry the ladder stamps and aggregates', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
+  const meta = records.find((r) => r['recordType'] === 'scored_run_meta');
+  assert.ok(meta);
+  assert.deepEqual(meta['ladder'], {
+    version: 'TOTALS_V1',
+    parameterVersion: 'TOTALS_V1_PROVISIONAL',
+    k: TEST_LADDER.k,
+  });
+  // GAME_A's over + under totals picks are ladder-scored (model + baselines);
+  // GAME_B has no close. Cross-check the count against the picks themselves.
+  const expected = scored.filter((p) => p.ladder?.economicClvPct != null).length;
+  assert.ok(expected > 0, 'fixture premise: some picks are ladder-scored');
+  assert.equal(meta['totalsLadderScoreable'], expected);
+  const policy = meta['closePolicy'] as Record<string, unknown>;
+  assert.ok(String(policy['integerLinePrimary']).includes('TOTALS_V1'), 'policy names the ladder');
+  const card = records.find(
+    (r) => r['recordType'] === 'participant_scorecard' && r['participantId'] === 'model-arm',
+  );
+  assert.ok(card);
+  const ladderStats = card['totalsLadder'] as Record<string, unknown>;
+  assert.equal(ladderStats['ladderVersion'], 'TOTALS_V1');
+  assert.equal(ladderStats['parameterVersion'], 'TOTALS_V1_PROVISIONAL');
+  assert.equal(ladderStats['ladderScoreable'], 1);
+  // The single-market moneyline baselines have no totals exposure.
+  const mlCard = records.find(
+    (r) => r['recordType'] === 'participant_scorecard' && r['participantId'] === 'baseline-home-ml',
+  );
+  assert.ok(mlCard);
+  assert.equal(mlCard['totalsLadder'], null);
+});
+
+test('the scorecard renders the ladder table, policy bullet, and moved-line ladder columns', () => {
+  const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
+  assert.ok(
+    markdown.includes('## Totals ladder (`TOTALS_V1` candidate — sensitivity output pending validation)'),
+    'ladder section present',
+  );
+  assert.ok(
+    markdown.includes('preregistered CANDIDATE line-value method'),
+    'candidate status disclosed in the policy bullet',
+  );
+  assert.ok(
+    markdown.includes('Line movement alone never disqualifies a totals pick'),
+    'the precise coverage claim, not an unconditional one',
+  );
+  assert.ok(
+    markdown.includes(`dispersion parameter \`TOTALS_V1_PROVISIONAL\`, k = ${TEST_LADDER.k}`),
+    'parameter provenance in the header bullet',
+  );
+  assert.ok(markdown.includes('parity oscillation'), 'known approximation disclosed');
+  assert.ok(
+    markdown.includes('| Ladder econ mean | Ladder econ median | Ladder margin-adj mean |'),
+    'ladder table header',
+  );
+  // model-arm, FULL row: 2 totals picks, 1 ladder-scored (GAME_A moved over:
+  // econ 3.9993, MA 100*(0.544758625663/0.5 - 1) = 8.9517), same-line column
+  // empty (nothing scored at an unchanged line), movement +0.5 over the one
+  // ladder-scored pick, GAME_B's totals close missing.
+  assert.ok(
+    markdown.includes(
+      '| model-arm | 2 | 1 | 3.9993 | 3.9993 | 8.9517 | 8.9517 | — (0) | 0.5 | close_missing 1 |',
+    ),
+    'model-arm full ladder row',
+  );
+  // baseline-under-total: under side of the same moved line (econ -13.0903,
+  // MA -8.9517, movement -0.5).
+  assert.ok(
+    markdown.includes(
+      '| baseline-under-total | 2 | 1 | -13.0903 | -13.0903 | -8.9517 | -8.9517 | — (0) | -0.5 | close_missing 1 |',
+    ),
+    'baseline-under-total full ladder row',
+  );
+  // Survivor-bias rule: a fully-failed model arm keeps a zero row in the
+  // ladder table — it must never vanish from the new surface.
+  assert.ok(
+    markdown.includes('| timeout-arm | 0 | 0 | — | — | — | — | — (0) | — | — |'),
+    'failed arm keeps a zero ladder row',
+  );
+  // Own-column ranking, nulls last: the over side (+3.9993) above the under
+  // baseline (-13.0903), and the null-mean failed arm dead last.
+  const idx = (needle: string): number => {
+    const at = markdown.indexOf(needle);
+    assert.ok(at >= 0, `row present: ${needle}`);
+    return at;
+  };
+  assert.ok(
+    idx('| model-arm | 2 | 1 | 3.9993') < idx('| baseline-under-total | 2 | 1 | -13.0903'),
+    'ranked by own ladder mean',
+  );
+  assert.ok(
+    idx('| baseline-under-total | 2 | 1 | -13.0903') < idx('| timeout-arm | 0 | 0 |'),
+    'null means rank last',
+  );
+  // The moved-lines table now carries the ladder values alongside movement.
+  assert.ok(
+    markdown.includes(
+      '| Participant | Game | Market | Selection | Entry line | Closing line | Favorable movement | Ladder econ | Ladder margin-adj |',
+    ),
+    'moved-lines table has ladder columns',
+  );
+});
+
+test('a gate-passing pick the ladder cannot solve is typed and DISCLOSED in the rendered scorecard', () => {
+  // Same-line close at 6.5 with an extreme de-vigged over probability: the
+  // exact-line metrics score it (fresh, consistent close), but the implied
+  // mean falls below the solver bound — the ladder must refuse with a typed
+  // reason that surfaces in the rendered table, never a silent hole. This is
+  // exactly why every public surface says line movement ALONE never
+  // disqualifies a pick, not that every gate-passing pick is priced.
+  const { lines } = fixtureRun({ totalLineGameA: 6.5 });
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(
+    run,
+    [
+      closeRow(GAME_A, 'total', {
+        line: 6.5,
+        ...NOVIG_ONLY,
+        away_p_novig: 1e-7,
+        home_p_novig: 1 - 1e-7,
+      }),
+    ],
+    TEST_LADDER,
+  );
+  const over = scored.find(
+    (p) => p.participantId === 'model-arm' && p.market === 'total' && p.gameId === GAME_A,
+  );
+  assert.ok(over && over.selection === 'over' && over.line === 6.5, 'fixture premise');
+  assert.equal(over.result.unscoredReason, null, 'exact-line metrics scored this pick');
+  assert.ok(over.result.primaryClvPct !== null, 'primary is a number');
+  assert.equal(over.ladder?.unscoredReason, 'ladder_unsolvable');
+  assert.equal(over.ladder?.economicClvPct, null);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
+  assert.match(markdown, /\| model-arm \| 2 \| 0 \| — \| — \| — \| — \| .* \| — \| ladder_unsolvable 1, close_missing 1 \|/);
+});
+
+test('ladder participant aggregates are value-pinned: MA summaries, movement, unscored reasons', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [closeRow(GAME_A, 'total', { line: 9 })], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model && model.totalsLadder !== null, 'model ladder block');
+  // One ladder-scored pick (GAME_A over, moved +0.5): econ 3.9993, MA
+  // 100*(0.544758625663/0.5 - 1) = 8.9517; GAME_B's close is missing.
+  assert.deepEqual(model.totalsLadder.gameLevel, {
+    meanClvPct: 3.9993,
+    medianClvPct: 3.9993,
+    beatClosePct: 100,
+  });
+  assert.deepEqual(model.totalsLadder.gameLevelMarginAdjusted, {
+    meanClvPct: 8.9517,
+    medianClvPct: 8.9517,
+    beatClosePct: 100,
+  });
+  assert.equal(model.totalsLadder.meanSignedMovement, 0.5);
+  assert.deepEqual(model.totalsLadder.unscoredByReason, { close_missing: 1 });
+  const under = stats.find((s) => s.participantId === 'baseline-under-total');
+  assert.ok(under && under.totalsLadder !== null, 'under-total ladder block');
+  // Under direction: the movement sign flips with the selection, and the MA
+  // mirror is the negative of the over side at an even entry quote.
+  assert.equal(under.totalsLadder.meanSignedMovement, -0.5);
+  assert.deepEqual(under.totalsLadder.gameLevelMarginAdjusted, {
+    meanClvPct: -8.9517,
+    medianClvPct: -8.9517,
+    beatClosePct: 0,
+  });
+});
+
+test('a fully-failed model arm keeps a non-null totalsLadder block (survivor-bias rule)', () => {
+  const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'timeout' } });
+  const run = parseRunRecords(lines);
+  const stats = aggregateByParticipant(scoreRun(run, [], TEST_LADDER), run, TEST_LADDER);
+  const timeoutArm = stats.find((s) => s.participantId === 'timeout-arm');
+  assert.ok(timeoutArm);
+  assert.ok(timeoutArm.totalsLadder !== null, 'failed arm stays visible on the ladder surface');
+  assert.equal(timeoutArm.totalsLadder.totalsPicks, 0);
+  assert.equal(timeoutArm.totalsLadder.ladderScoreable, 0);
+  assert.equal(timeoutArm.totalsLadder.gameLevel.meanClvPct, null);
+  // Both stamps ride along even on a zero-decision row: the block still
+  // states which method and parameter WOULD have priced its picks.
+  assert.equal(timeoutArm.totalsLadder.ladderVersion, 'TOTALS_V1');
+  assert.equal(timeoutArm.totalsLadder.parameterVersion, 'TOTALS_V1_PROVISIONAL');
+});
+
+test('ladder aggregation clusters within a game first and never swaps econ with margin-adjusted', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const ladderScoredPick = (gameId: string, econ: number, ma: number): ScoredPick => ({
+    ...syntheticScored(gameId, null),
+    ladder: {
+      ladderVersion: 'TOTALS_V1',
+      parameterVersion: 'TOTALS_V1_PROVISIONAL',
+      unscoredReason: null,
+      closeImpliedMean: 9,
+      qWinEntry: 0.5,
+      qPushEntry: 0,
+      economicClvPct: econ,
+      marginAdjustedClvPct: ma,
+    },
+  });
+  // Two picks in GAME_A, one in GAME_B: game-level and per-pick MUST differ
+  // (per-pick 20 vs game-level mean(15, 30) = 22.5), and the MA values are
+  // deliberately half the econ values so a copy-paste swap cannot hide.
+  const scored = [
+    ladderScoredPick(GAME_A, 10, 5),
+    ladderScoredPick(GAME_A, 20, 10),
+    ladderScoredPick(GAME_B, 30, 15),
+  ];
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const policy = stats.find((s) => s.participantId === 'synthetic-policy');
+  assert.ok(policy && policy.totalsLadder !== null, 'synthetic policy has a ladder block');
+  assert.equal(policy.totalsLadder.ladderScoreable, 3, 'scoreable counts VALUES, not games');
+  assert.equal(policy.totalsLadder.perPick.meanClvPct, 20);
+  assert.equal(policy.totalsLadder.gameLevel.meanClvPct, 22.5);
+  assert.equal(policy.totalsLadder.perPickMarginAdjusted.meanClvPct, 10);
+  assert.equal(policy.totalsLadder.gameLevelMarginAdjusted.meanClvPct, 11.25);
+});
+
+test('conditional-only counts exactly the picks with a conditional and NO primary', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const conditionalOnlyPick: ScoredPick = {
+    ...syntheticScored(GAME_A, null),
+    result: { ...syntheticScored(GAME_A, null).result, conditionalClvPct: -5 },
+  };
+  // A pick carrying BOTH a conditional value and a primary (possible only
+  // under a future validated method) is not conditional-ONLY and must not
+  // be double-counted.
+  const conditionalWithPrimaryPick: ScoredPick = {
+    ...syntheticScored(GAME_B, -4.1386),
+    result: { ...syntheticScored(GAME_B, -4.1386).result, conditionalClvPct: -4.5455 },
+  };
+  const stats = aggregateByParticipant([conditionalOnlyPick, conditionalWithPrimaryPick], run, TEST_LADDER);
+  const policy = stats.find((s) => s.participantId === 'synthetic-policy');
+  assert.ok(policy);
+  assert.equal(policy.conditionalOnly, 1);
 });

@@ -3,7 +3,7 @@
 *Last updated: 2026-07-14T16:10:16Z*
 
 The published negative-binomial dispersion parameter for MLB game totals: the
-single fitted scalar the totals ladder (`TOTALS_V1`) will consume to price
+single fitted scalar the totals ladder (`TOTALS_V1`) consumes to price
 win/push probabilities at any line from a closing quote. This document is the
 methodology record for how it was fit, what it was fit on, the checks it must
 pass before it is published, and the approximations knowingly accepted in the
@@ -160,7 +160,9 @@ and low at odd lines** by roughly one to two percentage points. This is
 published rather than
 smoothed over; whether TOTALS_V1 adds a parity adjustment is a refit-time
 decision, to be judged against the accrued in-house pairs and the
-alternate-line ladder validation planned for the ladder PR.
+alternate-line ladder validation (pending a one-time manual capture of a
+real sportsbook alternate-totals ladder; until that artifact is published
+the ladder remains the preregistered candidate method, sensitivity-only).
 
 ## Known approximations (accepted for the provisional fit)
 
