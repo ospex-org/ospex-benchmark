@@ -1,5 +1,7 @@
 import { PROPORTIONAL_DEVIG_METHOD, SHIN_DEVIG_METHOD } from './clv.js';
+import { LADDER_VERSION } from './ladder.js';
 import { MARKETS, SCORING_POLICY_VERSION } from './scoring.js';
+import type { LadderParams } from './ladder.js';
 import type { MarketStats, ParticipantStats, ScoredPick, SourceRun } from './scoring.js';
 import type { MarketKey } from './types.js';
 
@@ -65,6 +67,19 @@ function marketRow(stat: ParticipantStats, market: MarketStats): string {
   );
 }
 
+function ladderRow(stat: ParticipantStats): string {
+  const ladder = stat.totalsLadder;
+  if (ladder === null) return '';
+  const exact = stat.byMarket['total'];
+  return (
+    `| ${stat.participantId} | ${ladder.totalsPicks} | ${ladder.ladderScoreable} | ` +
+    `${fmt(ladder.gameLevel.meanClvPct)} | ${fmt(ladder.gameLevel.medianClvPct)} | ` +
+    `${fmt(ladder.gameLevelMarginAdjusted.meanClvPct)} | ${fmt(ladder.gameLevelMarginAdjusted.medianClvPct)} | ` +
+    `${exact === undefined ? '—' : `${fmt(exact.gameLevel.meanClvPct)} (${exact.scoreable})`} | ` +
+    `${fmt(ladder.meanSignedMovement)} | ${reasons(ladder.unscoredByReason)} |`
+  );
+}
+
 function sensitivityRow(stat: ParticipantStats): string {
   const delta = (a: number | null, b: number | null): string =>
     a === null || b === null ? '—' : `${Math.round((b - a) * 1e4) / 1e4}`;
@@ -83,6 +98,7 @@ export function buildScorecardMarkdown(
   scored: ScoredPick[],
   stats: ParticipantStats[],
   scoredAt: string,
+  ladderParams: LadderParams,
 ): string {
   const lines: string[] = [];
   const models = stats.filter((s) => s.kind === 'model');
@@ -116,7 +132,10 @@ export function buildScorecardMarkdown(
     '- Comparison rule: **never pool CLV across markets when comparing participants with different market exposure** — vig differs by market (a moneyline-only baseline and a three-market model are not on the same footing). Pooled tables are context; cross-participant comparison belongs in the per-market section.',
   );
   lines.push(
-    '- Policy: `fresh`-confidence closes only; a close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (`close_inconsistent`); price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable lines report separately-labeled conditional variants of BOTH metrics, never pooled into primary.',
+    '- Policy: `fresh`-confidence closes only; a close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (`close_inconsistent`); exact-line price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable totals score as primary via the ladder q_P below, with the push-excluded conditional variants of BOTH metrics still separately labeled.',
+  );
+  lines.push(
+    `- Totals ladder: \`${LADDER_VERSION}\` (dispersion parameter \`${ladderParams.parameterVersion}\`, k = ${ladderParams.k}) prices EVERY totals pick at its entry line from the close — moved lines included, nothing discarded. Ladder columns are separately labeled and never replace the exact-line columns. Known approximation: the smooth model's push probability runs roughly 1-2 percentage points HIGH at even integer lines and LOW at odd ones (parity oscillation; see docs/TOTALS_DISPERSION.md).`,
   );
   lines.push('');
 
@@ -181,6 +200,32 @@ export function buildScorecardMarkdown(
     lines.push('');
   }
 
+  const withLadder = stats.filter((stat) => stat.totalsLadder !== null);
+  if (withLadder.length > 0) {
+    // Ranked by the ladder's own game-level mean, nulls last — same
+    // own-column ranking rule as the per-market tables.
+    withLadder.sort((a, b) => {
+      const aMean = a.totalsLadder?.gameLevel.meanClvPct ?? null;
+      const bMean = b.totalsLadder?.gameLevel.meanClvPct ?? null;
+      if (aMean === null && bMean === null) return 0;
+      if (aMean === null) return 1;
+      if (bMean === null) return -1;
+      return bMean - aMean;
+    });
+    lines.push(`## Totals ladder (\`${LADDER_VERSION}\` — every totals pick priced at its entry line)`);
+    lines.push('');
+    lines.push(
+      `Generalized push-aware CLV \`100·(q_W·D_e + q_P − 1)\` (economic) and \`100·(q_W/q_entry + q_P − 1)\` (margin-adjusted), with q_W/q_P from the \`${LADDER_VERSION}\` negative-binomial ladder — mean solved from the close (push-conditioned at integer lines), evaluated at the ENTRY line, so moved lines are priced instead of discarded. At an unchanged half-line the ladder value equals the exact-line value; at an unchanged integer line it equals the conditional CLV shrunk by the push mass. The exact-line column repeats the conservative same-line-only reading from the per-market table above; signed movement needs no model (0 = unmoved).`,
+    );
+    lines.push('');
+    lines.push(
+      '| Participant | Totals picks | Ladder-scored | Ladder econ mean | Ladder econ median | Ladder margin-adj mean | Ladder margin-adj median | Exact-line econ mean (n) | Mean signed movement | Unscored (reason) |',
+    );
+    lines.push('|---|---|---|---|---|---|---|---|---|---|');
+    for (const stat of withLadder) lines.push(ladderRow(stat));
+    lines.push('');
+  }
+
   lines.push(`## De-vig sensitivity (\`${SHIN_DEVIG_METHOD}\` vs \`${PROPORTIONAL_DEVIG_METHOD}\`)`);
   lines.push('');
   lines.push(
@@ -197,13 +242,15 @@ export function buildScorecardMarkdown(
 
   const moved = scored.filter((p) => p.result.unscoredReason === 'line_moved');
   if (moved.length > 0) {
-    lines.push('## Moved lines (primary CLV unavailable; favorable movement reported)');
+    lines.push('## Moved lines (exact-line CLV unavailable; ladder CLV + favorable movement reported)');
     lines.push('');
-    lines.push('| Participant | Game | Market | Selection | Entry line | Closing line | Favorable movement |');
-    lines.push('|---|---|---|---|---|---|---|');
+    lines.push(
+      '| Participant | Game | Market | Selection | Entry line | Closing line | Favorable movement | Ladder econ | Ladder margin-adj |',
+    );
+    lines.push('|---|---|---|---|---|---|---|---|---|');
     for (const pick of moved) {
       lines.push(
-        `| ${pick.participantId} | \`${pick.gameId}\` | ${pick.market} | ${pick.selection} | ${pick.line ?? '—'} | ${pick.close?.line ?? '—'} | ${fmt(pick.result.lineMovementFavorable)} |`,
+        `| ${pick.participantId} | \`${pick.gameId}\` | ${pick.market} | ${pick.selection} | ${pick.line ?? '—'} | ${pick.close?.line ?? '—'} | ${fmt(pick.result.lineMovementFavorable)} | ${fmt(pick.ladder?.economicClvPct ?? null)} | ${fmt(pick.ladder?.marginAdjustedClvPct ?? null)} |`,
       );
     }
     lines.push('');

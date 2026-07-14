@@ -1,6 +1,6 @@
 # Ospex Agent Benchmark — Canonical MVE Design
 
-- Last updated UTC: `2026-07-14T15:09:07Z`
+- Last updated UTC: `2026-07-14T19:15:51Z`
 - Status: accepted application-layer direction; methodology and harness gates remain in progress
 - Scope: MLB-first, one fixed canonical cohort plus separately labeled open/community cohorts
 - Prompt/schema working draft: [BENCHMARK_PROMPT_V0.md](BENCHMARK_PROMPT_V0.md)
@@ -212,7 +212,7 @@ The de-vig method is part of the metric, so it is named and versioned on every s
 
 The sensitivity readout is evidence-safe by construction: the whole close is validated before side selection — the stored proportional pair must be complete, finite, within [0, 1], sum to 1, and match the canonical recompute from the raw closing quotes on BOTH sides whenever those are present; any failure refuses the close outright as `close_inconsistent` for every participant and side (a corrupt close is not evidence for any metric); the comparison is PAIRED, with both methods aggregated over the identical decision set and unpaired counts disclosed, so a delta can only reflect the method, never coverage; and `shin-v1` is defined only on non-underround quotes (booksum >= 1) — an underround yields no shin value rather than a mislabeled fallback.
 
-Also preserve and report the raw entry/closing odds, simple/log decimal-price ratio, and the auxiliary probability-scale movement `100 * (q_s - 1 / D_e)`. These are diagnostics; the two named CLV metrics and their labeled sensitivity variants are the only preregistered formulas.
+Also preserve and report the raw entry/closing odds, simple/log decimal-price ratio, and the auxiliary probability-scale movement `100 * (q_s - 1 / D_e)`. These are diagnostics; the two named CLV metrics, their labeled sensitivity variants, and the `TOTALS_V1` ladder columns are the only preregistered formulas.
 
 If the close comes from one designated reference path rather than a fixed multi-book consensus, call the metric **reference-closing CLV** rather than implying a universal market close.
 
@@ -224,7 +224,9 @@ For v1, half-run spreads/totals have the cleanest binary CLV. For integer lines,
 reference_clv_pct = 100 * (q_W * D_e + q_P - 1)
 ```
 
-Ordinary two-sided prices generally do not identify push probability. Without a preregistered independent `q_P`, mark integer-line primary CLV unavailable or separately label it conditional CLV; do not pool it silently with directly observed binary CLV. The margin-adjusted metric mirrors this exactly: integer-line primary is unavailable, and a separately labeled push-excluded conditional variant (`100 * (q_cond_close / q_cond_entry - 1)`) is reported, never pooled.
+Ordinary two-sided prices generally do not identify push probability. Without a preregistered independent `q_P`, mark integer-line primary CLV unavailable or separately label it conditional CLV; do not pool it silently with directly observed binary CLV.
+
+**`TOTALS_V1` is that preregistered independent `q_P` source for MLB totals.** It is a versioned negative-binomial ladder (dispersion parameter published with method, gates, and known approximations in `docs/TOTALS_DISPERSION.md`): the per-game mean is solved from the de-vigged close — push-conditioned when the closing line is an integer, since push-refund quotes de-vig to conditional probabilities — and the model then supplies `q_W`/`q_P` at any line. Integer same-line totals therefore score as PRIMARY via the generalized formula above, which at the unchanged line equals the push-excluded conditional CLV shrunk by the push mass: `clv_cond * (1 - q_P)`. The margin-adjusted metric uses the same generalized form at the fair entry price `D_fair = 1/q_cond_entry`: `100 * (q_W / q_cond_entry + q_P - 1)`. The push-excluded conditional variants of both metrics (`100 * (q_cond_close / q_cond_entry - 1)` for margin-adjusted) remain separately labeled alongside, never silently replaced. Known, published approximation: the smooth model's `q_P` runs roughly 1–2 percentage points high at even integer lines and low at odd ones (parity oscillation — see the dispersion artifact's `marginalPmfCheck`). The ladder applies to MLB totals only; integer spread lines (none on the current MLB run line) have no approved `q_P` source and stay conditional-only.
 
 ### Spread and total line movement
 
@@ -238,11 +240,11 @@ Preferred order:
    - spread: `entry_handicap - closing_handicap` from the selected team's perspective;
    - over: `closing_total - entry_total`;
    - under: `entry_total - closing_total`;
-4. keep any frozen run-distribution conversion as separately labeled sensitivity analysis, not pooled primary CLV.
+4. price the pick with an approved, versioned line-value method, reported as its own separately labeled column set alongside (1)–(3), never pooled into the exact-line primary. **`TOTALS_V1` is that approved method for MLB totals**: every totals pick — moved lines included — receives a ladder CLV at its ENTRY line (economic and margin-adjusted, per the generalized push-aware formula in "Push-capable lines"), so no totals pick is ever discarded. Totals reporting is three-column: the conservative exact-line CLV where the line matched, the ladder CLV for every pick, and raw signed movement (which needs no model).
 
-Do not attach the new main-line odds to the old contract or invent a conversion between runs and price.
+Do not attach the new main-line odds to the old contract or invent an ad-hoc conversion between runs and price outside the versioned method.
 
-The current Ospex closing-line path has already produced a line-mismatch/null-CLV case. Exact-line closing history or an approved line-value method is a launch gate for credible all-market benchmark claims.
+The current Ospex closing-line path has already produced a line-mismatch/null-CLV case. Exact-line closing history or an approved line-value method is a launch gate for credible all-market benchmark claims; `TOTALS_V1` closes that gate for MLB totals (its `ladder_version` and dispersion-parameter version are stamped on every ladder-scored row, and a refit recomputes history rather than invalidating it), while spreads have neither exact-line history nor an approved method yet — the gate stays open there.
 
 ## Scorecard
 
@@ -251,6 +253,7 @@ Primary benchmark outputs:
 - mean and median reference-closing CLV in expected-ROI percentage points, economic and margin-adjusted side by side;
 - percentage beating the no-vig reference close, under both metrics;
 - a de-vig-method sensitivity readout (`shin-v1` vs `proportional-v1`) of both metrics;
+- the `TOTALS_V1` ladder table: every totals pick priced at its entry line (economic and margin-adjusted means/medians, ladder-scored counts, mean signed movement), separately labeled next to the conservative exact-line totals column, with the ladder version and dispersion-parameter version stamped on every ladder-scored row;
 - auxiliary raw/log price ratio and probability-scale movement;
 - CLV-measurable `n`, total eligible `n`, and exclusion counts;
 - equal-weight game-level aggregate as the primary summary, with market-stratified results also reported;

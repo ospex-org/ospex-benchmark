@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { BASELINE_POLICY_VERSION, isBaselinePolicyVersion, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { PROPORTIONAL_DEVIG_METHOD, scoreDecision, SHIN_DEVIG_METHOD } from './clv.js';
+import { favorableLineMovement } from './clv.js';
+import { applyLadderUpgrade, LADDER_VERSION, scoreTotalsLadder } from './ladder.js';
 import { checkProviderCollision } from './providers/family.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
@@ -15,6 +17,7 @@ import {
 import { SMOKE_LABEL } from './types.js';
 import type { BaselinePolicyVersion } from './baselines.js';
 import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
+import type { LadderParams, TotalsLadderResult } from './ladder.js';
 import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } from './types.js';
 
 /**
@@ -36,8 +39,12 @@ import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } fr
  * output produced before stamping existed is `scoring-v0.1.0` by definition.
  * v0.3.0 adds margin-adjusted CLV (+ conditional mirror) and the shin-v1
  * de-vig sensitivity block alongside the unchanged economic primary.
+ * v0.4.0 adds the TOTALS_V1 ladder: every totals pick carries a ladder
+ * block (generalized push-aware CLV at the entry line, moved lines
+ * included), and integer SAME-line totals upgrade from conditional-only to
+ * primary via the ladder's q_P. All previously scored values are unchanged.
  */
-export const SCORING_POLICY_VERSION = 'scoring-v0.3.0';
+export const SCORING_POLICY_VERSION = 'scoring-v0.4.0';
 
 /** The scored markets, anchored to MarketKey so drift is a compile error. */
 export const MARKETS: ReadonlyArray<MarketKey> = ['moneyline', 'spread', 'total'];
@@ -1264,6 +1271,8 @@ export interface ScoredPick extends SourcePick {
   /** The opposite side's frozen bundle price — the margin-adjusted entry de-vig input. */
   entryOppositeDecimal: number;
   result: ClvResult;
+  /** TOTALS_V1 ladder block — non-null on every totals pick, null elsewhere. */
+  ladder: TotalsLadderResult | null;
   close: ClosingLineRow | null;
 }
 
@@ -1289,7 +1298,11 @@ export function sideForSelection(
   );
 }
 
-export function scoreRun(run: SourceRun, closeRows: ClosingLineRow[]): ScoredPick[] {
+export function scoreRun(
+  run: SourceRun,
+  closeRows: ClosingLineRow[],
+  ladderParams: LadderParams,
+): ScoredPick[] {
   const closes = closesByKey(closeRows);
   return run.picks.map((pick) => {
     const game = run.games.get(pick.gameId);
@@ -1308,16 +1321,35 @@ export function scoreRun(run: SourceRun, closeRows: ClosingLineRow[]): ScoredPic
       side === 'away' ? 'home' : 'away',
     ).price;
     const close = closes.get(`${pick.gameId}:${pick.market}`) ?? null;
-    const result = scoreDecision(
+    const closeQuote = close === null ? null : closeQuoteFromRow(close);
+    const exactLine = scoreDecision(
       pick.market,
       side,
       movementSelection,
       pick.entryDecimal,
       entryOppositeDecimal,
       pick.line,
-      close === null ? null : closeQuoteFromRow(close),
+      closeQuote,
     );
-    return { ...pick, side, entryOppositeDecimal, result, close };
+    // Every totals pick additionally gets the TOTALS_V1 ladder block. The
+    // close-quality gates are SHARED (taken from the exact-line verdict,
+    // never re-derived), and an integer same-line pick promotes the
+    // ladder's generalized value into primary per the methodology.
+    let ladder: TotalsLadderResult | null = null;
+    let result = exactLine;
+    if (pick.market === 'total' && pick.line !== null) {
+      ladder = scoreTotalsLadder({
+        selection: pick.selection as 'over' | 'under',
+        entryDecimal: pick.entryDecimal,
+        entryOppositeDecimal,
+        entryLine: pick.line,
+        close: closeQuote,
+        gateReason: exactLine.unscoredReason,
+        params: ladderParams,
+      });
+      result = applyLadderUpgrade(exactLine, ladder);
+    }
+    return { ...pick, side, entryOppositeDecimal, result, ladder, close };
   });
 }
 
@@ -1405,6 +1437,24 @@ export interface ParticipantStats {
   conditionalOnly: number;
   unscoredByReason: Record<string, number>;
   byMarket: Record<string, MarketStats>;
+  /**
+   * TOTALS_V1 ladder aggregates over this participant's totals picks — the
+   * "every pick is priced" column set (moved lines included), reported
+   * ALONGSIDE the conservative exact-line totals numbers in byMarket.total,
+   * never replacing them. Null for participants with no totals exposure.
+   */
+  totalsLadder: {
+    ladderVersion: typeof LADDER_VERSION;
+    totalsPicks: number;
+    ladderScoreable: number;
+    gameLevel: ClvSummary;
+    perPick: ClvSummary;
+    gameLevelMarginAdjusted: ClvSummary;
+    perPickMarginAdjusted: ClvSummary;
+    /** Mean favorable signed line movement over ladder-scored picks (0 = unmoved). */
+    meanSignedMovement: number | null;
+    unscoredByReason: Record<string, number>;
+  } | null;
 }
 
 function round4(value: number): number {
@@ -1567,6 +1617,49 @@ export function aggregateByParticipant(
       };
     }
 
+    // Ladder aggregates over totals picks only. Same game-first clustering
+    // as every other metric; with one totals pick per participant/game the
+    // game-level and per-pick views coincide, and both are reported.
+    const totalsPicks = picks.filter((p) => p.market === 'total');
+    const ladderEconomic = clusterByGame(totalsPicks, (p) => p.ladder?.economicClvPct ?? null);
+    const ladderMarginAdjusted = clusterByGame(
+      totalsPicks,
+      (p) => p.ladder?.marginAdjustedClvPct ?? null,
+    );
+    const ladderUnscored: Record<string, number> = {};
+    const movements: number[] = [];
+    for (const pick of totalsPicks) {
+      if (pick.ladder === null) continue;
+      if (pick.ladder.unscoredReason !== null) {
+        ladderUnscored[pick.ladder.unscoredReason] =
+          (ladderUnscored[pick.ladder.unscoredReason] ?? 0) + 1;
+      } else if (pick.line !== null && pick.close !== null && pick.close.line !== null) {
+        movements.push(
+          favorableLineMovement(
+            'total',
+            pick.selection as 'over' | 'under',
+            pick.line,
+            pick.close.line,
+          ),
+        );
+      }
+    }
+    const totalsEligible = kind === 'model' ? responses.length : totalsPicks.length;
+    const totalsLadder: ParticipantStats['totalsLadder'] =
+      totalsEligible === 0 && totalsPicks.length === 0
+        ? null
+        : {
+            ladderVersion: LADDER_VERSION,
+            totalsPicks: totalsPicks.length,
+            ladderScoreable: ladderEconomic.values.length,
+            gameLevel: summary(ladderEconomic.gameMeans),
+            perPick: summary(ladderEconomic.values),
+            gameLevelMarginAdjusted: summary(ladderMarginAdjusted.gameMeans),
+            perPickMarginAdjusted: summary(ladderMarginAdjusted.values),
+            meanSignedMovement: mean(movements),
+            unscoredByReason: ladderUnscored,
+          };
+
     stats.push({
       participantId,
       kind,
@@ -1597,6 +1690,7 @@ export function aggregateByParticipant(
       conditionalOnly: picks.filter((p) => p.result.conditionalClvPct !== null).length,
       unscoredByReason,
       byMarket,
+      totalsLadder,
     });
   }
 
@@ -1618,6 +1712,7 @@ export function scoredRecords(
   scored: ScoredPick[],
   stats: ParticipantStats[],
   scoredAt: string,
+  ladderParams: LadderParams,
 ): Array<Record<string, unknown>> {
   const records: Array<Record<string, unknown>> = [];
   records.push({
@@ -1638,20 +1733,29 @@ export function scoredRecords(
         'vig-in entry vs no-vig close, 100*(D_e*q_close - 1) — the industry-standard reading; a flat market reads at about minus the vig (PRIMARY)',
       marginAdjusted:
         'de-vigged entry vs no-vig close, 100*(q_close/q_entry - 1) on push-free contracts — 0 means the forecast exactly matched the market (always reported alongside, never a replacement)',
+      totalsLadder:
+        'generalized push-aware CLV at the ENTRY line, 100*(q_W*D_e + q_P - 1) economic and 100*(q_W/q_entry + q_P - 1) margin-adjusted, with q_W/q_P from the TOTALS_V1 negative-binomial ladder solved at the close — every totals pick is priced, moved lines included; separately labeled, never replacing the exact-line columns',
     },
     devigMethods: {
       primary: PROPORTIONAL_DEVIG_METHOD,
       sensitivity: [SHIN_DEVIG_METHOD],
     },
+    ladder: {
+      version: LADDER_VERSION,
+      parameterVersion: ladderParams.parameterVersion,
+      k: ladderParams.k,
+    },
     primaryAggregate: 'equal-weight game-level mean (per-pick reported as secondary)',
     closePolicy: {
       confidenceRequired: 'fresh',
       lineMatchRequired: true,
-      integerLinePrimary: 'unavailable (conditional CLV separately labeled, both metrics)',
+      integerLinePrimary:
+        'computed via the TOTALS_V1 ladder q_P at the unchanged line (generalized push-aware formula); push-excluded conditional CLV still separately labeled, both metrics',
     },
     picks: scored.length,
     primaryScoreable: scored.filter((p) => p.result.primaryClvPct !== null).length,
     marginAdjustedScoreable: scored.filter((p) => p.result.marginAdjustedClvPct !== null).length,
+    totalsLadderScoreable: scored.filter((p) => p.ladder?.economicClvPct != null).length,
     armGameResponses: run.armResponses.length,
   });
   for (const pick of scored) {
@@ -1705,6 +1809,7 @@ export function scoredRecords(
       closingPNovigSelected: pick.result.closingPNovigSelected,
       entryPNovigSelected: pick.result.entryPNovigSelected,
       sensitivity: pick.result.sensitivity,
+      ladder: pick.ladder,
       aux: pick.result.aux,
     });
   }

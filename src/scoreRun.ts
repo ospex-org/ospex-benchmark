@@ -5,6 +5,7 @@ import { describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
 import { fetchClosingLines } from './fetchers.js';
+import { LADDER_VERSION, loadLadderParams } from './ladder.js';
 import { writeNdjson, writeText } from './records.js';
 import { buildScorecardMarkdown } from './scorecard.js';
 import {
@@ -126,12 +127,20 @@ async function main(): Promise<number> {
   }
   printLine('integrity: hashes, decision echoes, and response linkage verified');
 
+  // The published dispersion parameter the totals ladder runs on — loaded
+  // from the committed artifact and stamped on every scored record.
+  const ladderParams = loadLadderParams();
+  printLine(
+    `totals ladder: ${LADDER_VERSION} (parameter ${ladderParams.parameterVersion}, ` +
+      `k = ${ladderParams.k})`,
+  );
+
   const gameIds = [...run.games.keys()];
   printLine(`fetching captured closes for ${gameIds.length} games ...`);
   const closes = await fetchClosingLines(supabaseUrl, supabaseAnonKey, 'polygon', gameIds);
   printLine(`closes: ${closes.length} market rows found`);
 
-  const scored = scoreRun(run, closes);
+  const scored = scoreRun(run, closes, ladderParams);
   const stats = aggregateByParticipant(scored, run);
   const scoredAt = new Date().toISOString();
 
@@ -139,8 +148,8 @@ async function main(): Promise<number> {
   const base = basename(options.runPath).replace(/\.ndjson$/, '');
   const ndjsonPath = join(outDir, `${base}-scored.ndjson`);
   const scorecardPath = join(outDir, `${base}-scorecard.md`);
-  writeNdjson(ndjsonPath, scoredRecords(run, scored, stats, scoredAt));
-  writeText(scorecardPath, buildScorecardMarkdown(run, scored, stats, scoredAt));
+  writeNdjson(ndjsonPath, scoredRecords(run, scored, stats, scoredAt, ladderParams));
+  writeText(scorecardPath, buildScorecardMarkdown(run, scored, stats, scoredAt, ladderParams));
 
   printLine('');
   printLine(
