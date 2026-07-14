@@ -1,0 +1,153 @@
+{
+  "parameterVersion": "TOTALS_V1_PROVISIONAL",
+  "sport": "mlb",
+  "market": "total",
+  "distribution": "negative-binomial",
+  "parameterization": "negative binomial with mean mu and dispersion k: Var(T | mu) = mu + mu^2 / k",
+  "k": 8.101061957791782,
+  "primaryFit": {
+    "basis": "settlement: all completed finals including extra innings; forfeits and rain-shortened (under 51 outs) games excluded",
+    "method": "moment decomposition with the Jensen term retained: k = (mean^2 + Var(lines)) / (Var(T) - Var(lines) - mean), with Var(T) and mean from Retrosheet finals and Var(lines) from our captured closing totals",
+    "retrosheet": {
+      "dataset": "data/retrosheet-mlb-totals-2023-2025.ndjson",
+      "seasons": [
+        2023,
+        2024,
+        2025
+      ],
+      "window": "MLB regular seasons 2023-2025",
+      "nGames": 7277,
+      "nForfeitsExcluded": 0,
+      "nShortenedExcluded": 12,
+      "nExtraInnings": 626,
+      "nCompletedLater": 13,
+      "marginalMean": 8.974852274288855,
+      "marginalVariance": 20.270258104204043
+    },
+    "closeSpread": {
+      "dataset": "data/inhouse-totals-2026-07-14.ndjson",
+      "source": "production closing_lines capture (MLB totals, polygon network) over the public anon read path",
+      "n": 927,
+      "confidence": {
+        "fresh": 925,
+        "stale": 2
+      },
+      "lockTimeRange": [
+        "2026-05-05T23:40:00+00:00",
+        "2026-07-12T20:10:00+00:00"
+      ],
+      "lineMean": 8.548543689320388,
+      "lineVariance": 1.2039044643418821
+    },
+    "conditionalVariance": 19.06635363986216
+  },
+  "sensitivity": {
+    "regulationOnly": {
+      "nGames": 6651,
+      "marginalMean": 8.92873252142535,
+      "marginalVariance": 20.27101040829395,
+      "conditionalVariance": 19.06710594395207,
+      "k": 7.982164942128545
+    }
+  },
+  "anchors": {
+    "pushProbabilityAtLineEqualMean": [
+      {
+        "line": 7,
+        "pushProbability": 0.10861571052475079
+      },
+      {
+        "line": 8,
+        "pushProbability": 0.09850754425297889
+      },
+      {
+        "line": 9,
+        "pushProbability": 0.09019438857397878
+      },
+      {
+        "line": 10,
+        "pushProbability": 0.08322332939015029
+      }
+    ],
+    "acceptanceBand": [
+      0.06,
+      0.12
+    ],
+    "marginalPmfCheck": {
+      "recenteredBy": 0.42630858496846713,
+      "rows": [
+        {
+          "t": 4,
+          "empirical": 0.04699738903394256,
+          "model": 0.06465742041074517
+        },
+        {
+          "t": 5,
+          "empirical": 0.0990792909165865,
+          "model": 0.08083850385612634
+        },
+        {
+          "t": 6,
+          "empirical": 0.0724199532774495,
+          "model": 0.09141359453861389
+        },
+        {
+          "t": 7,
+          "empirical": 0.11185928267143054,
+          "model": 0.09561216493841757
+        },
+        {
+          "t": 8,
+          "empirical": 0.07255737254363062,
+          "model": 0.09395329939728826
+        },
+        {
+          "t": 9,
+          "empirical": 0.10004122577985433,
+          "model": 0.08773258576548654
+        },
+        {
+          "t": 10,
+          "empirical": 0.06637350556548029,
+          "model": 0.07852366019390157
+        },
+        {
+          "t": 11,
+          "empirical": 0.07393156520544181,
+          "model": 0.06781626822479943
+        },
+        {
+          "t": 12,
+          "empirical": 0.05084512848701388,
+          "model": 0.05681530331734769
+        },
+        {
+          "t": 13,
+          "empirical": 0.058265768860794286,
+          "model": 0.04637236560892439
+        },
+        {
+          "t": 14,
+          "empirical": 0.033942558746736295,
+          "model": 0.03700404790832515
+        }
+      ]
+    },
+    "inHousePairsObserved": {
+      "n": 45,
+      "integerLinePairs": 21,
+      "pushes": 1
+    }
+  },
+  "knownApproximations": [
+    "closing line used as the market mean; price-implied skew ignored",
+    "close-spread window (May-Jul 2026) vs fit window (2023-2025 full seasons): era and seasonal-coverage mismatch",
+    "closing-line sample variance includes market noise and 0.5-run quantization, over-subtracting Var(mu)",
+    "a smooth NB cannot reproduce the odd/even parity oscillation of MLB totals (see marginalPmfCheck)",
+    "dispersion k assumed constant across means",
+    "walk-off truncation is absorbed into the marginal, not modeled"
+  ],
+  "refitPlan": "TOTALS_V1: maximum-likelihood refit on in-house (closing total, prices, final) pairs conditional on the close-implied mean, same reference feed, once pairs reach a workable n (~300, expected mid-August 2026); ladder_version distinguishes the two and history recomputes",
+  "attribution": "The information used here was obtained free of charge from and is copyrighted by Retrosheet. Interested parties may contact Retrosheet at \"www.retrosheet.org\".",
+  "generatedAt": "2026-07-14T16:13:20.689Z"
+}

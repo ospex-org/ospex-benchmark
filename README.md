@@ -23,6 +23,7 @@ The authoritative methodology lives in this repo:
 
 - [`docs/AGENT_BENCHMARK.md`](docs/AGENT_BENCHMARK.md) — canonical benchmark design: layer boundaries, frozen-input and anti-leakage controls, deterministic baselines, CLV formulas, publication and claims policy.
 - [`docs/BENCHMARK_PROMPT_V0.md`](docs/BENCHMARK_PROMPT_V0.md) — the v0 prompt and output-schema contract.
+- [`docs/TOTALS_DISPERSION.md`](docs/TOTALS_DISPERSION.md) — the published MLB totals dispersion parameter (`TOTALS_V1_PROVISIONAL`): fit method, data, gates, and known approximations, feeding the totals ladder.
 
 ## Shadow smoke test (v0)
 
@@ -153,6 +154,18 @@ What this cannot detect, by design: a forger who consistently rewrites the archi
 Output: `<runId>-scored.ndjson` (per-pick `scored_decision` records with full provenance — reported model IDs, response IDs, all three hashes — plus per-participant scorecards) and `<runId>-scorecard.md`, both in the run's directory (gitignored). Every scored record is stamped with a `scoringPolicyVersion`, so artifacts produced by different engine behaviors are never silently compared; rescoring a run with a newer engine recomputes history rather than invalidating it. Records without the stamp predate versioning and are `scoring-v0.1.0` by definition; the version bumps on any change to scoring math, aggregation, or the scored-record/scorecard shape. Run it any time after the slate locks — before lock, every pick reports `close_missing` and the scorer says so. Decision CLV only: nothing here measures execution. This is a single reference source, so the metric is always labeled reference-closing CLV, not a market consensus.
 
 Requires only `SUPABASE_URL` + `SUPABASE_ANON_KEY` (the same public read-only anon key).
+
+## Published parameters (totals dispersion)
+
+`data/` holds the committed inputs and output of the MLB totals dispersion fit — the parameter the totals ladder will consume ([`docs/TOTALS_DISPERSION.md`](docs/TOTALS_DISPERSION.md) is the methodology record):
+
+```bash
+yarn ingest:retrosheet --download   # historical finals -> data/retrosheet-mlb-totals-2023-2025.ndjson
+yarn extract:totals                 # captured closing totals + finals -> data/inhouse-totals-<date>.ndjson
+yarn fit:totals --inhouse data/inhouse-totals-<date>.ndjson   # -> data/totals-dispersion-TOTALS_V1_PROVISIONAL.json
+```
+
+The fit is deterministic given its committed inputs, refuses to publish on any gate failure, and the test suite recomputes the committed artifact from the committed datasets and requires exact equality. The historical finals derive from Retrosheet game logs — the information used here was obtained free of charge from and is copyrighted by Retrosheet; interested parties may contact Retrosheet at "www.retrosheet.org".
 
 ## Secrets discipline
 

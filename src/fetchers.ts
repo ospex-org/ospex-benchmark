@@ -3,12 +3,14 @@ import {
   parseClosingLineRows,
   parseCurrentOddsRows,
   parseGamesBody,
+  parseGamesTableRows,
   parseHistoryFirstRow,
 } from './wire.js';
 import type {
   ClosingLineRow,
   CurrentOddsRow,
   GamesEndpointRow,
+  GamesTableRow,
   SlateInputs,
 } from './types.js';
 
@@ -109,6 +111,37 @@ export async function fetchClosingLines(
       `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
       `&network=eq.${network}&jsonodds_id=in.(${batch.join(',')})`;
     rows.push(...parseClosingLineRows(await getJson(url, headers)));
+  }
+  return rows;
+}
+
+/**
+ * Every `games` TABLE row for one (network, sport) over the same public
+ * anon read path — the completion/score side of the totals-pair extraction.
+ * Paginated, ordered by the stable key, with a runaway guard.
+ */
+export async function fetchGamesTableRows(
+  supabaseUrl: string,
+  anonKey: string,
+  network: string,
+  sport: string,
+): Promise<GamesTableRow[]> {
+  const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
+  const rows: GamesTableRow[] = [];
+  const limit = 1000;
+  for (let offset = 0; ; offset += limit) {
+    const select =
+      'network,jsonodds_id,sport,match_time,status,home_score,away_score,final_type,score_captured';
+    const url =
+      `${supabaseUrl}/rest/v1/games?select=${select}` +
+      `&network=eq.${network}&sport=eq.${sport}` +
+      `&order=jsonodds_id.asc&limit=${limit}&offset=${offset}`;
+    const batch = parseGamesTableRows(await getJson(url, headers));
+    rows.push(...batch);
+    if (batch.length < limit) break;
+    if (offset > 100_000) {
+      throw new Error('games table pagination did not terminate — aborting rather than looping');
+    }
   }
   return rows;
 }

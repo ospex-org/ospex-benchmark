@@ -171,6 +171,25 @@ export interface ClosingLineRow {
   source: string;
 }
 
+/**
+ * A `games` TABLE row over PostgREST (distinct from GamesEndpointRow, the
+ * core-api games ENDPOINT shape) — the score/finality columns the totals-pair
+ * extraction joins closing lines against. Note: scores latch with
+ * final_type = 'Finished' while status can remain 'upcoming', so completion
+ * is judged from scores + final_type, never from status.
+ */
+export interface GamesTableRow {
+  network: string;
+  jsonodds_id: string;
+  sport: string;
+  match_time: string;
+  status: string;
+  home_score: number | null;
+  away_score: number | null;
+  final_type: string | null;
+  score_captured: boolean;
+}
+
 export interface SlateInputs {
   gamesRows: GamesEndpointRow[];
   oddsRows: CurrentOddsRow[];
