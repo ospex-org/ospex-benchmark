@@ -270,8 +270,10 @@ told apart from a silently-empty read path.
 Chain today: book hangs the line → writer polls the feed (~30s) → snapshot
 write → our poll (**300s default**). The poll dominates.
 
-- **Cheapest real win: drop the default poll to 30–60s.** The floor is already
-  30s.
+- **Poll cadence is a committed constant (superseded).** The "30–60s recommendation"
+  is superseded by the normative **`pollIntervalMs = 30_000`** pinned in the manifest
+  (evidence-model §6, §5): a cohort constant that **must be < `W` = 120_000 ms**, not a
+  per-invocation `--poll-seconds` lever. The floor is already 30s.
 - **Dead end — core-api SSE (`/v1/stream/odds`):** keyed on an on-chain
   `contestId`. These games have no contest. Unusable here.
 - **Dead end — tailing `odds_history`:** it takes a row on every *price

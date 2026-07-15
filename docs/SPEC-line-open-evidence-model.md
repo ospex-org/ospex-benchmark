@@ -93,6 +93,24 @@ code.
 > `id.desc`, the serializer is `canonicalize` (not `canonicalJSON`), and the anchor
 > inventory rejects bad paths + enforces required-set equality (§9.3).
 >
+> **Final amendment contract (this revision — the reviewer's exact directive).**
+> Capacity attribution is made **single-valued** by a decision table over
+> `firstObservedAt` vs the independent `firstTwoSided + W` (not "a prior deferral"):
+> capacity-in-`W` miss → `capacity_deferred` (salvage); observed-late (`firstObservedAt
+> > firstTwoSided + W`) → new **`missed_clean_open`** (C); pre-window opener →
+> `delayed`/`late` (H). Four normative timestamps (`firstObservedAt`,
+> `capacityDeferredAt`, `firstEligibleDetectedAt`, fire `detectedAt`) with an exact
+> **`TransitionRecordV1`** schema (§3.2); capacity can no longer "cross V-lag." The
+> schedule gate is **reachable** (`ready → schedule_changed`/`read_failed`;
+> `ready → deferred` removed) with a 9-step latest-safe-point ordering, and **every
+> never-fired `schedule_changed` is UNKNOWN** (no schedule history). The observed
+> universe is replaced by three explicitly-scoped source sets **`H_census` /
+> `H_external_window` / `G_final`** with persisted, hashed snapshot files in the
+> post-cohort required set; a live-in-window non-census game with no market becomes a
+> game-level **`census_anomaly`** (UNKNOWN). **`pollIntervalMs = 30_000`** (< W),
+> `providerCallTimeoutMs`, `maxOutputTokens` are pinned and canonical-mode-locked; new
+> **`opened_after_window`** (H) closes the post-window/pre-finalization boundary.
+>
 > **Source-fact reconciliation (verified against live code, this pass):**
 > - The live `games` table **does** carry advisory `home_score`/`away_score`/
 >   `final_type`/`score_captured` (added in the odds-payload-persistence work);
@@ -139,7 +157,8 @@ still pending, firing the former violates the total order and waiting for the
 latter violates no-wait). Resolve this by separating **admission** (deterministic,
 before any async read) from **gating** (independent, no-wait):
 
-1. At tick start, **freeze** the tick's candidate identities and **one** `detectedAt`.
+1. At tick start, **freeze** the tick's candidate identities (the sort is over
+   identities, not gate results; a fire's `detectedAt` is stamped per §1 timestamps).
 2. **Sort** the frozen candidates by the deterministic total order — market-enum
    order, then `gameId` lexical (a genuine total order: network is pinned, so
    `gameId` = `jsonodds_id` is unique and `(market, gameId)` is unique across the
@@ -155,26 +174,43 @@ before any async read) from **gating** (independent, no-wait):
    refilled from a non-admitted candidate during that tick (backfill would
    reintroduce completion-order dependence).
 
-A non-admitted candidate is recorded **`capacity_deferred`** (§7) and preserves a
-`firstObservedAt` (when first seen) plus `capacityDeferredAt` for evidence. **Two
-distinct timestamps, deliberately** (this is what makes a deferred re-fire compatible
-with the 10-s V-lag under a 30-s poll): each *fire* carries its own `detectedAt` — the
-detection instant of the dispatch that actually fired, at which a **fresh** bundle is
-built (base §3.3) — and **V-lag, V1, and V1b run from that fire's `detectedAt`**, so a
-re-fire is not failed by the poll gap since it was first observed. The independent
-anchors still bound it: **V2 and V8 measure opener age and clean-window eligibility
-against the `odds_history`-derived first two-sided appearance**, so a deferral that
-pushes the fire past `firstTwoSided + W` is caught as `delayed_open` (never disguised
-as fresh) and one past `lateThresholdMs` as `late` — the deferral cannot buy a clean
-score. Per-tick deferral is **transient** — a candidate re-detected and cleanly fired
-on a later tick stays `entered` in the canonical cohort. **Only a *terminal* capacity
-deferral taints the corpus:** a market a cap kept from **ever**
-firing within the cohort (a `deferred`-survivor — never fired before it fell outside
-W/V-lag or before finalization) is capacity-shaped sample selection, so it is routed
-to a separately labeled **salvage cohort** and its presence makes the **canonical
-cohort incomplete/unranked** (§7), never scored as ordinary canonical coverage. A
-per-tick `maxDispatchesPerTick` deferral that re-fires next tick does **not** un-rank
-the cohort.
+A non-admitted candidate is recorded **`capacity_deferred`** (§7). **Four normative
+timestamps** govern capacity (the transition-record schema §3.2 pins them; §7/§8 use
+them):
+- **`firstObservedAt`** — the first tick instant this runner observed the identity
+  `(cohortId, gameId, market)`; **immutable** once written.
+- **`capacityDeferredAt`** — each non-admission writes a **separate** transition
+  stamped with that tick's instant (there may be several).
+- **`firstEligibleDetectedAt`** — the first *admitted* evaluation instant at which the
+  independent history gate could classify the market.
+- **`detectedAt`** (in a fire artifact) — **only** the detection instant of the
+  admitted dispatch that actually fired; it may be later than `firstObservedAt` and
+  **never overwrites** it. **V-lag, V1, V1b run from this fire's `detectedAt`**; **V2,
+  V8 use the independently-derived `firstTwoSided`** plus the frozen window.
+
+**Capacity cannot "cross V-lag" before a fire exists** — V-lag starts from each fire's
+own `detectedAt`, so an unadmitted candidate cannot age out of any fire's V-lag.
+Capacity can push a candidate past **`W`**, past first pitch, past `windowEnd`, or to
+finalization **without a fire**.
+
+**Single-valued cause (the decision table).** For a policy-enabled census
+`(game, market)`, cause is derived from `firstObservedAt` versus the independent
+`firstTwoSided + W` — **not** from "a prior deferral exists" (admission precedes the
+async gate, so a pre-gate deferral does **not** prove the candidate was ready or
+in-`W`):
+
+| Condition | Canonical action / reason |
+|---|---|
+| A later admitted fire has `detectedAt ≤ firstTwoSided + W` and is before the frozen cutoff | **It may fire** — V-lag runs from that fire's `detectedAt`; all earlier capacity records preserved. |
+| `firstObservedAt ≤ firstTwoSided + W`, but capacity prevents admission until **after** `firstTwoSided + W` | **Do not dispatch.** `capacity_deferred` — **salvage / canonical-unranked**; it is **not** `delayed_open`/`late_detection`. |
+| `firstObservedAt > firstTwoSided + W` and `firstTwoSided` occurred in the active window | Capacity did **not** cause the miss (a pre-gate record does not prove readiness). **`missed_clean_open`** — class **C**, canonical-unranked. |
+| `firstTwoSided < windowStart` | The existing delayed/late diagnostic by opener age, classified as a **source-derived pre-window exclusion** (**H**) — not a capacity failure. |
+| No clean fire by finalization after ≥ 1 capacity deferral | `capacity_deferred` — salvage / canonical-unranked. |
+
+So: a capacity deferral that re-fires cleanly within `W` stays `entered` (canonical); a
+capacity deferral that prevents a clean fire from an in-`W` `firstObservedAt` is
+`capacity_deferred` (salvage, unranked); a market first *observed* already past `W` is
+`missed_clean_open` (**C**). Capacity is never conflated with a benign late-open.
 
 **I2 — A game produces multiple artifacts; each is bound *as of its own fire*.**
 Separate dispatches across ticks → separate run files. Every coverage check
@@ -442,6 +478,45 @@ Two things, deliberately separated:
   substantiate is **UNKNOWN/unscoreable** — the ledger alone proves nothing about a
   dropped market.
 
+**Transition-record contract (normative — field names and nullability are part of
+the contract).** Each ledger record is a `TransitionRecordV1`:
+
+```ts
+type TransitionRecordV1 = {
+  schemaVersion: "line-open-transition-v1";
+  recordType: "transition";
+  cohortId: string;
+  cohortManifestSha256: string;
+  gameId: string;
+  market: "moneyline" | "spread" | "total";
+  sequence: number;
+  state: TransitionState;
+  reason: DispositionReason | null;
+  snapshotAt: string;
+  firstObservedAt: string;
+  capacityDeferredAt: string | null;
+  firstEligibleDetectedAt: string | null;
+  fireDetectedAt: string | null;
+  fireId: string | null;
+  runId: string | null;
+};
+```
+
+Validation (V6 structural):
+- Records are grouped by `(cohortId, gameId, market)`.
+- `sequence` starts at zero and increases by exactly one.
+- `snapshotAt` is nondecreasing; equal timestamps are ordered by `sequence`.
+- `firstObservedAt` is **byte-identical** across every record for the group.
+- A `deferred` record has `capacityDeferredAt = snapshotAt`; other records have it null.
+- `firstEligibleDetectedAt`, once non-null, is immutable.
+- `fireDetectedAt` is present only for the handoff to a claimed fire and equals the
+  run's `run_meta.detectedAt`.
+- `fireId`/`runId` are both present only where the state/reason contract requires them;
+  linkage remains one-to-one.
+- A missing, contradictory, decreasing, duplicated, or rewritten record is a **V6
+  structural violation**.
+- The complete raw transition ledger is included in the **post-cohort root** (§9.3).
+
 ### 3.3 The frozen census + slate-pass hygiene
 
 The `gameIdCensus` is **frozen in the manifest at cohort start** (§3.0); live
@@ -453,44 +528,82 @@ reconstruct a historical cutoff** (it is mutable and cannot say what it was at
 detection, and there is no append-only schedule history — §2). Instead:
 - **`first_pitch_passed`** is computed against the frozen `scheduledAtAtFreeze`
   (deterministic, precommitted), **not** the live value.
-- **`schedule_changed` is a runtime pre-dispatch gate, not a finalization afterthought
-  (§9.2).** The runner compares live `match_time` against `scheduledAtAtFreeze` at
-  candidate evaluation **and** immediately before claim/dispatch; a material divergence
-  (≥ `scheduleChangeToleranceMs`, default the writer's 60 s) ⇒ **do not dispatch**, and
-  the census game is recorded as a typed, non-fired **`schedule_changed`** terminal —
-  it **stays in the denominator**, keeps its original `scheduledAtAtFreeze`, and is
-  never paid-fired outside its frozen window (a finalization-only check cannot achieve
-  this). A completed `fired` is **immutable** (a post-fire reschedule never rewrites
-  it). At finalization the slate only **reconciles**: a never-fired divergence
-  **observed in-window and still holding** substantiates `schedule_changed` (**H**); a
-  divergence that has **reverted**, or is seen only at finalization, is not provable
-  without schedule history → **UNKNOWN / cohort-unranked**, never a clean H. This one
-  reason covers reschedule-out and in-window reschedule; it does not prove direction.
-- A game absent from the frozen census that appears in `odds_history` within the
-  window gets an **`out_of_cohort_observed`** coverage record (V6) — renamed from
-  "rescheduled_in" because a non-census game with history does **not** prove a
-  reschedule-in (it may be newly discovered/added); the archive only proves it was
-  *observed*. It still cannot vanish silently.
+- **`schedule_changed` is a reachable runtime no-dispatch safety gate (§9.2), classed
+  conservatively.** The runner gates on live `match_time` vs `scheduledAtAtFreeze` at
+  evaluation, before `ready`, and at the latest safe point after the claim (§9.2 steps
+  1–8). A completed `fired` is **immutable**. **Every never-fired `schedule_changed` is
+  UNKNOWN / canonical-unranked** under the current mutable source (no append-only
+  schedule history), whether the final row still differs or has reverted.
+- A game absent from the frozen census is handled by the observed-universe / anomaly
+  sets below (**`out_of_cohort_observed`** for an observed non-census market;
+  **`census_anomaly`** for a live-in-window game with no observed market) — the archive
+  cannot prove a reschedule-in versus a newly-discovered game, so both claim only
+  *observation* (§4).
 
-The slate pass runs only at the **finalization point** (`windowEnd +
-ingestionGraceMs`, §6), pins `network`, and **fails closed on any truncated/partial
-read** (base §3.7 read-path canary, at slate scope). Its two source walks use
-**different immutable cursors** under §3.0's empty-page-termination contract — the
-`games` cursor does **not** transfer to history:
-- **`games`** → cursor the immutable `jsonodds_id` (unique per network), one snapshot.
-- **`odds_history`** → cursor its **surrogate `id`** (`jsonodds_id` is **not** unique
-  here — many rows per game). After the ingestion grace, freeze an **`id` upper
-  watermark**, scan `id ≤ watermark` (empty-page-terminated), and record the
-  `odds_history` source-snapshot **hash + row count + watermark**, all **persisted
-  under the post-cohort root** (§9.3) so the exact scanned set is fixed and verifiable.
+**Slate source sets (§4).** The slate pass runs only at the **finalization point**
+(`windowEnd + ingestionGraceMs`, §6), pins `network`/`sport` from the manifest, and
+**fails closed on any truncated/partial read**. At finalization it freezes **one
+`odds_history.id` upper watermark** and **one MVCC `games`-in-window snapshot**, then
+derives exactly three explicitly-scoped source sets — **`H_census`**,
+**`H_external_window`**, **`G_final`** (§4). Each uses its own immutable
+surrogate cursor under §3.0's empty-page-termination contract (`games` → `jsonodds_id`;
+`odds_history` → its surrogate `id`; the `games` cursor does **not** transfer to
+history), and each is persisted as a hashed source-snapshot file in the post-cohort
+root (§4.4, §9.3). **The unbounded "every game with any row under the watermark" rule
+is forbidden** — it would sweep in every historical game ever written. The market-level
+`out_of_cohort_observed` set and the game-level `census_anomaly` set are defined below.
 
-**Observed universe (`out_of_cohort_observed`).** V6's observed universe is the
-**union** of (a) every game with a `source=jsonodds` row in the frozen `id ≤
-watermark` scan, **and** (b) the **live `games`-in-window at finalization minus the
-frozen census**. Clause (b) is required because a non-census game whose first
-two-sided row predates `windowStart` and stays flat has **no** in-window history row,
-so (a) alone would miss it. Every game in the union that is absent from the frozen
-census gets `out_of_cohort_observed` — never silently dropped.
+**The three source sets (normative).**
+
+**`H_census`** — all `source=jsonodds` history rows with `id ≤ oddsHistoryWatermark`,
+`captured_at ≤ finalization`, `jsonodds_id` in the frozen census, and a
+manifest-declared market. **May include rows before `windowStart`.** Supports
+first-appearance / V1 / V2 / V3 / V8 / `market_never_two_sided` for census games.
+
+**`H_external_window`** — all `source=jsonodds` history rows with `id ≤
+oddsHistoryWatermark`, `windowStart ≤ captured_at < windowEnd`, game **absent** from
+the frozen census, network+sport in the manifest's frozen scope, and a
+manifest-declared market. The market-level observed universe outside the census is the
+**distinct `(gameId, market)` from `H_external_window`**; emit **one** market-level
+**`out_of_cohort_observed`** per pair. Do **not** synthesize market records for markets
+that were not independently observed.
+
+**`G_final`** — **one** coherent finalization-time MVCC snapshot of live `games` with
+manifest network+sport scope and `windowStart ≤ match_time < windowEnd`. Compute
+`G_final gameIds − frozen census gameIds` — a **game-level** anomaly set that
+**cannot** be a market-level `Disposition` (no market was observed). Each such game
+emits a `CensusAnomalyRecordV1`:
+
+```ts
+type CensusAnomalyRecordV1 = {
+  schemaVersion: "line-open-census-anomaly-v1";
+  recordType: "census_anomaly";
+  cohortId: string;
+  cohortManifestSha256: string;
+  gameId: string;
+  sport: string;
+  network: string;
+  scheduledAtAtFinalization: string;
+  reason: "live_game_not_in_frozen_census";
+  snapshotAt: string;
+  finalGamesSnapshotSha256: string;
+};
+```
+
+A `census_anomaly` is **UNKNOWN / canonical-unranked** (the current sources cannot
+distinguish a legitimate reschedule-in from an incomplete frozen census) — **not H**.
+
+**Persist the actual source snapshots** (canonical NDJSON row ordering, sorted by the
+immutable surrogate `id`; duplicate or non-increasing IDs fail closed):
+`source/census-source-snapshot.ndjson`, `source/census-source-snapshot-meta.json`,
+`source/odds-history-census.ndjson`, `source/odds-history-external-window.ndjson`,
+`source/odds-history-snapshot-meta.json`, `source/games-final-snapshot.ndjson`,
+`source/games-final-snapshot-meta.json`, `census-anomalies.ndjson`. Each `-meta.json`
+carries the exact query/scope version, row count, SHA-256 of the raw snapshot file,
+snapshot/finalization time, and watermark where applicable. The post-cohort inventory's
+**required-set equality** includes the **actual snapshot files and their metadata**
+(not detached digests) — omitting any listed file, any run, any fire snapshot, or the
+transition ledger **rejects the root** (§9.3).
 
 ### 3.4 Crash / persistence ordering (the failure contract)
 
@@ -592,10 +705,13 @@ committed cross-host allowance is `maxClockSkewMs` (§6), **not** the repo's leg
 - **V6 — Slate completeness + fire↔run linkage + ledger & anchor reconciliation.**
   A **distinct slate pass** (`yarn score --slate <cohort>`), over the frozen census
   (§3.3) + `odds_history` + all fire snapshots/run files + the transition ledger:
-  - every policy-enabled `(census game, market)` **or** `(game, market)` with a
-    `source=jsonodds` appearance in the window **must** have a coverage disposition —
-    else violation (a non-census observed game needs `out_of_cohort_observed`;
-    no first two-sided row to finalization is `market_never_two_sided`);
+  - **coverage completeness (per the §4 source sets — the unbounded
+    "any appearance under the watermark" rule is deleted):** every policy-enabled
+    census `(game, market)` **must** have a coverage disposition derived from
+    `H_census` (else violation; no first two-sided row to finalization →
+    `market_never_two_sided`); every distinct `(gameId, market)` in
+    `H_external_window` gets **one** market-level `out_of_cohort_observed`; every game
+    in `G_final − census` gets a **game-level** `census_anomaly` (§4);
   - **every `entered` disposition — across *all* run denominators and fire
     snapshots, not only each fire's own firing market — resolves to exactly one
     verifier-green run artifact, and back** (`enteredFireId`/`enteredRunId` resolve;
@@ -735,14 +851,26 @@ hashed. Values:
 | `anchorWallet` / `anchorTarget` | pin at implementation | Dedicated evidence-anchor EOA (same wallet for both roots) + tx `to` (default self-send). |
 | `anchorVersion` | `v1` | Calldata domain version (§9.3). |
 | `postRootMaxDelayMs` | `900_000` | **NEW** (15 min). Bounds the post-cohort anchor: `finalization ≤ anchorBlockTime ≤ finalization + postRootMaxDelayMs` (§9.3). |
+| `pollIntervalMs` | `30_000` | **NEW.** Cohort constant; **must be < `W` = 120_000** (else a market cannot be seen inside `W`). Replaces the base spec's "30–60 s" recommendation; the current default is **300 s**. Canonical mode rejects any `--poll-seconds` override ≠ this (§5). |
+| `providerCallTimeoutMs` | `300_000` | **NEW.** Per-arm provider-HTTP timeout; covered by `toolInferenceConfigSha256`. Canonical mode rejects `--timeout-seconds` override ≠ this. |
+| `maxOutputTokens` | `16_000` | **NEW.** Per-arm max output; covered by `toolInferenceConfigSha256`. Canonical mode rejects `--max-output-tokens` override ≠ this. |
 | `marketPolicyVersion` / `marketPolicyDigest` | from `marketPolicy.ts` | `market-policy-v1` + digest. |
-| `promptScaffoldSha256` / `toolInferenceConfigSha256` / `baselinePolicyVersion` / `repairPolicyVersion` / `runnerCommitSha` | per cohort | Precommit the exact model-facing scaffold, inference config, baselines, repair policy, and code commit. |
+| `promptScaffoldSha256` / `toolInferenceConfigSha256` / `baselinePolicyVersion` / `repairPolicyVersion` / `runnerCommitSha` | per cohort | Precommit the exact model-facing scaffold, inference config, baselines, repair policy, and code commit. **`toolInferenceConfigSha256` covers, per arm:** requested model ID, tool permissions, temperature/sampling fields, repair policy, `providerCallTimeoutMs`, and `maxOutputTokens`. |
 
 **The one that bites:** W and `maxClockSkewMs` are different constants with
 different jobs. W is the size of the clean window (120 s total). `maxClockSkewMs`
 (5 s) is only the tolerance for comparing a writer-host `captured_at` against a
 benchmark-host `detectedAt`; it never enlarges W. The implementation must not reuse
 the 120_000-ms legacy skew for any line-open as-of comparison.
+
+**Canonical-mode config lock.** For a canonical cohort every eligibility-changing value
+comes **only** from the hashed manifest. `windowStart`/`windowEnd` (not
+`--window-hours`) define the cohort; `maxDispatchesPerTick` and the cohort call/spend
+caps come only from the manifest. The flags `--poll-seconds`, `--timeout-seconds`,
+`--max-output-tokens`, `--window-hours`, `--late-minutes`, and `--max-fires-per-tick`
+may remain for **dry-run/rehearsal** only; supplying any of them in canonical mode is a
+**boot failure** unless the value is byte-for-byte equal to the manifest (redundant
+confirmation, never an override). They are deleted when the implementation lands.
 
 ## 7. State & reason matrix
 
@@ -767,15 +895,30 @@ canonical cohort incomplete/unranked).
 | `not_yet_two_sided` (`not_entered`) | No `source=jsonodds` two-sided row **as of `detectedAt`** (may open later) | V3 per-fire (as-of) | **H** |
 | `market_never_two_sided` (`not_entered`) | No first two-sided `source=jsonodds` row **at or before finalization** (an opener may predate `windowStart` — §2) | V3 slate (whole history to finalization) | **H** |
 | `policy_disabled` (`not_entered`) | Detected but not policy-enabled for this league | market policy version/digest (manifest) | **H** |
-| `late_detection` (`not_entered`) | `openerAge > lateThresholdMs`, decided at the **first eligible** evaluation and **pinned** (§8), with **no prior capacity deferral** | V2 vs `odds_history` first two-sided appearance, at the pinned first-eligible `detectedAt` | **H** |
-| `delayed_open` (`not_entered`) | Two-sided but `detectedAt > firstTwoSided + W` (≤ late) at **first eligibility**, pinned, **not** upgraded to `late` — a genuinely late *opener*, **no prior capacity deferral** (a capacity-caused W-cross is `capacity_deferred`/salvage, §8) | V8 vs independently-derived `firstTwoSided`, at the pinned first-eligible `detectedAt` | **H** |
-| `stale_quote` (`not_entered`) | Runtime decline: the `current_odds` snapshot was older than `maxQuoteAgeMs` | **NOT scorer-verifiable** — change-based `odds_history` is *price age*, not observation freshness (§2); the freshness signal lives in `current_odds`, which the scorer cannot read | **UNKNOWN** |
-| `first_pitch_passed` (`not_entered`) | `detectedAt` after the **frozen** scheduled start | vs `scheduledAtAtFreeze` (manifest census); live `match_time` cannot reconstruct the detection-time cutoff (§9.2) | **H** |
-| `capacity_deferred` (`not_entered`) | A cap blocked **admission** (§1) and the market never cleanly fired — **including a ready-within-W market that crossed `W`/V-lag *because* it kept being deferred** (capacity is the higher-precedence cause over `delayed_open`) | the cap (manifest) + the admission total-order (§1) | **salvage** |
-| `history_unavailable` (`not_entered`) | An as-of / slate read could not be completed (bounded read failed) | read-path canary (fail-closed, not zero) | **C** |
-| `fire_interrupted` (`not_entered`) | A fire was claimed but run+snapshot never finalized (§3.4) — the `entered` claim is retracted | V7 health + V6 linkage (unresolved) | **C** |
-| `schedule_changed` (`not_entered`) | **Runtime** pre-dispatch gate (§9.2): live `match_time` diverges ≥ `scheduleChangeToleranceMs` from `scheduledAtAtFreeze` → not dispatched. A completed `fired` is immutable (never rewritten). | runtime live-`match_time` check; slate substantiates only if the divergence was observed in-window **and** still holds — a reverted/unobserved divergence → **UNKNOWN** (§9.2) | **H** / **UNKNOWN** |
-| `out_of_cohort_observed` (`not_entered`) | Non-census game observed in `odds_history` in the window — the archive cannot prove reschedule-in vs newly-discovered (§9.2) | V6 observed-universe reconciliation | **H** |
+| `late_detection` (`not_entered`) | **Pre-window** opener (`firstTwoSided < windowStart`), `openerAge > lateThresholdMs` — a source-derived pre-window exclusion (§1) | V2 vs `H_census` first two-sided appearance | **H** |
+| `delayed_open` (`not_entered`) | **Pre-window** opener (`firstTwoSided < windowStart`), past `firstTwoSided + W` (≤ late) — a source-derived pre-window exclusion, never pooled with clean-open scoring (§1) | V8 vs `H_census` `firstTwoSided` | **H** |
+| `capacity_deferred` (`not_entered`) | **In-window** opener, `firstObservedAt ≤ firstTwoSided + W`, but capacity prevented a clean fire (no dispatch) — cause is **derived** (`firstObservedAt` vs `firstTwoSided + W`), not "a prior deferral" (§1) | `firstObservedAt` vs independent `firstTwoSided + W` (§1) + the cap (manifest) | **salvage** |
+| `missed_clean_open` (`not_entered`) **(NEW)** | **In-window** opener, `firstObservedAt > firstTwoSided + W` (observed late), with no independently-substantiated excuse (§5.2) | `firstObservedAt` vs `H_census` `firstTwoSided` | **C** |
+| `opened_after_window` (`not_entered`) **(NEW)** | `firstTwoSided ∈ [windowEnd, finalization)` — opened after the active window but before finalization (finalization-only) | `H_census` first appearance (§5.2) | **H** |
+| `stale_quote` (`not_entered`) | Runtime decline: the `current_odds` snapshot older than `maxQuoteAgeMs` | **NOT scorer-verifiable** — change-based `odds_history` is *price age*, not observation freshness (§2) | **UNKNOWN** |
+| `first_pitch_passed` (`not_entered`) | `detectedAt` after the **frozen** scheduled start | vs `scheduledAtAtFreeze`; live `match_time` cannot reconstruct the detection-time cutoff (§9.2) | **H** |
+| `history_unavailable` (`not_entered`) | A bounded as-of / slate read could not be completed (fail-closed) | read-path canary (fail-closed, not zero) | **C** |
+| `fire_interrupted` (`not_entered`) | A fire was claimed but run+snapshot never finalized (§3.4) — the `entered` claim is retracted | V7 health + V6 linkage | **C** |
+| `schedule_changed` (`not_entered`) | **Runtime** no-dispatch safety gate (§9.2): live `match_time` diverges ≥ `scheduleChangeToleranceMs` from `scheduledAtAtFreeze` → not dispatched. A completed `fired` is immutable. | runtime live-`match_time` check; **without append-only schedule history, every never-fired divergence is UNKNOWN** (§9.2) | **UNKNOWN** |
+| `out_of_cohort_observed` (`not_entered`) | A non-census `(gameId, market)` independently observed in `H_external_window` (§4) — the archive proves only *observation*, not reschedule-in | V6 / `H_external_window` | **H** |
+| `census_anomaly` (game-level) **(NEW)** | A live `games`-in-window game (`G_final`) absent from the frozen census with **no** observed market — a **game-level** record, not a `Disposition` (§4) | V6 / `G_final − census`; cannot distinguish reschedule-in from an incomplete census | **UNKNOWN** |
+
+**Clean-window miss priority (in-window opener, no clean fire).** When a policy-enabled
+census market's independent `firstTwoSided ∈ [windowStart, windowEnd)` but no clean fire
+exists by `firstTwoSided + W`, classify by this **priority** — it **cannot** become
+benign **H** merely because the runner reports a later `detectedAt`:
+1. capacity caused the miss from an in-`W` `firstObservedAt` → `capacity_deferred` (**salvage**);
+2. history/read failure → `history_unavailable` (**C**);
+3. unverifiable current-quote freshness → `stale_quote` (**UNKNOWN**);
+4. no independently-substantiated reason → `missed_clean_open` (**C**).
+Boundaries: opener before `windowStart` → pre-window `delayed`/`late` (**H**); opener in
+`[windowEnd, finalization)` → `opened_after_window` (**H**); no opener by finalization →
+`market_never_two_sided` (**H**).
 
 **7b. Scoring outcomes of an `entered` (`fired`) fire** — V4 over the run's arms:
 
@@ -814,73 +957,58 @@ G/H/C is unambiguous directly from the pinned reason). The `state↔decision` ma
 state ⇔ `not_entered` with the record's `reason`) is used **only** for the V6 ledger
 reconciliation.
 
-**States.** A market's terminal disposition is taken at the **first eligible
-evaluation** where it can be *known*, and then **pinned** — the ledger records the
-**first-eligible `detectedAt`** the decision was made from, and the decision is never
-re-converted (no `delayed→late` because time later passed). Only `absent` (never
-opened) is genuinely unknowable until finalization; making `late`/`delayed`
-finalization-only was an over-correction (they *are* known at first eligibility —
-base spec per-speculation late gate).
+**States.** A market's terminal disposition is derived from `firstObservedAt` versus
+the independent `firstTwoSided` (from `H_census`, §4), **not** from "was it deferred"
+— admission precedes the async gate, so a pre-gate deferral proves nothing about
+readiness. Each decision is **pinned** in its `TransitionRecordV1` (§3.2) with the
+timestamp it was derived from, and never re-converted.
 - *Transient:* `detected`, `evaluating`, `ready`, `pending_open`, `deferred`.
-- *Terminal — decided at first eligibility (immediate; pinned with its first-eligible
-  `detectedAt`):* `disabled` (→ `policy_disabled`); `first_pitch_passed` (→
-  `first_pitch_passed`; vs the frozen cutoff, monotone); `schedule_changed` (→
-  `schedule_changed`; runtime — live `match_time` diverges ≥ tolerance from frozen,
-  §9.2); `late` (→ `late_detection`; `openerAge = detectedAt − firstTwoSided >
-  lateThresholdMs` at first eligibility, **with no prior capacity deferral**);
-  `delayed` (→ `delayed_open`; two-sided but `detectedAt > firstTwoSided + W`, ≤ late,
-  at first eligibility, **with no prior capacity deferral**); `read_failed` (→
-  `history_unavailable`, **C**; fail-closed); `interrupted` (→ `fire_interrupted`, **C**).
-- *Terminal — capacity (salvage):* `capacity_deferred` — reached from `deferred` when
-  a **ready-within-W** market crosses `W`/V-lag because it was **not admitted**, or as
-  a `deferred` finalization survivor. **Capacity is the higher-precedence cause:** a
-  W-cross caused by non-admission is `capacity_deferred` (salvage), **not**
-  `delayed`/`late` (which are **H** and require *no* prior deferral) — otherwise
-  capacity-shaped selection would hide as benign H (§1, §7a).
-- *Terminal — finalization-only:* `absent` (→ `market_never_two_sided`; a
-  `pending_open` with no first two-sided row by finalization). `out_of_cohort_observed`
-  is V6/slate-produced.
+- *Terminal states → reasons:*
+  - `disabled` (→ `policy_disabled`, **H**) — not policy-enabled.
+  - `first_pitch_passed` (→ `first_pitch_passed`, **H**) — `detectedAt` past the frozen cutoff.
+  - `schedule_changed` (→ `schedule_changed`, **UNKNOWN**, §9.2) — runtime no-dispatch gate; every never-fired divergence is canonical-unranked.
+  - `read_failed` (→ `history_unavailable`, **C**) — a bounded read failed (fail-closed).
+  - `interrupted` (→ `fire_interrupted`, **C**) — claimed but not finalized (§3.4).
+  - `late` (→ `late_detection`, **H**) / `delayed` (→ `delayed_open`, **H**) — **pre-window** openers (`firstTwoSided < windowStart`) by opener age; a source-derived pre-window exclusion, never pooled with clean-open scoring.
+  - `capacity_deferred` (→ `capacity_deferred`, **salvage**) — in-window opener, `firstObservedAt ≤ firstTwoSided + W`, but capacity prevented a clean fire (§1).
+  - `missed_clean_open` (→ `missed_clean_open`, **C**) — in-window opener, `firstObservedAt > firstTwoSided + W` (observed late), no independently-substantiated excuse.
+  - `opened_after_window` (→ `opened_after_window`, **H**; finalization-only) — `firstTwoSided ∈ [windowEnd, finalization)` (§5.2).
+  - `absent` (→ `market_never_two_sided`, **H**; finalization-only) — no first two-sided row by finalization.
+  - (`stale_quote`, **UNKNOWN**, is a runtime decline the scorer cannot verify — §2/§7; `out_of_cohort_observed`/`census_anomaly` are V6/slate-produced, §4.)
 - *Handoff:* `fired` — exits the ledger; authoritative evidence is the run + snapshot.
-There is **no** `stale` state: `stale_quote` is a runtime decline the scorer cannot
-verify (UNKNOWN — §2/§7).
 
 **Legal transitions.**
 - `detected → { disabled | schedule_changed | evaluating | deferred }` (`deferred` =
   not admitted this tick, §1)
-- `evaluating → { ready | pending_open | first_pitch_passed | schedule_changed | late | delayed | read_failed }`
-  — `late`/`delayed` are decided **here** at first eligibility and pinned; the **only**
-  window-lifetime verdict withheld is `absent`.
-- `pending_open → { pending_open | ready | late | delayed | first_pitch_passed | schedule_changed | deferred }`
-  — re-evaluated until the opener appears; the tick it appears is the first-eligible
-  evaluation (→ `ready`/`late`/`delayed`).
-- `deferred → { evaluating | ready | pending_open | deferred | capacity_deferred | first_pitch_passed | schedule_changed }`
-  — re-detected (may be admitted, open, defer again, or hit a schedule/first-pitch
-  terminal). **No `late`/`delayed` edge from `deferred`:** a market that was
-  ready-within-W and crosses `W`/V-lag *because* it kept being deferred is
-  `capacity_deferred` (salvage), not `delayed`/`late` (capacity is the
-  higher-precedence cause — §7a).
-- `ready → { fired | interrupted | deferred }` — fires, crashes, or is not admitted on
-  a later tick (capacity).
+- `evaluating → { ready | pending_open | first_pitch_passed | schedule_changed | late | delayed | missed_clean_open | read_failed }`
+- `pending_open → { pending_open | ready | late | delayed | missed_clean_open | first_pitch_passed | schedule_changed | deferred }`
+  — re-evaluated until the opener appears.
+- `deferred → { evaluating | ready | pending_open | deferred | capacity_deferred | late | delayed | missed_clean_open | first_pitch_passed | schedule_changed }`
+  — once admitted, independent history reveals what was already true at `firstObservedAt`;
+  cause is **derived** (§1), never attributed to "it was deferred."
+- `ready → { fired | schedule_changed | read_failed | interrupted }` — the latest-safe
+  schedule/read gate (§9.2 steps 6–8) resolves here. **`ready → deferred` is removed:**
+  admission was decided before the gate, so a `ready` market fires immediately and does
+  **not** return to the capacity queue or wait for a sibling.
 Any edge not in this graph (e.g. `detected→ready` without a gate result,
-`evaluating→absent` mid-window, or `fired→ready`) is illegal.
+`ready→deferred`, `evaluating→absent` mid-window, or `fired→ready`) is illegal.
 
 **Rules.**
 - **Legal transitions only** — the graph above.
-- **Stable record order** — appended in nondecreasing `snapshotAt`; the scorer reads
-  in that order; ties broken by a per-record monotonic sequence.
-- **Finalization** — at `windowEnd + ingestionGraceMs`, a market already in a
-  **pinned terminal** (`disabled`/`first_pitch_passed`/`schedule_changed`/`late`/
-  `delayed`/`read_failed`/`interrupted`/`fired`) keeps it — finalization does **not**
-  re-evaluate or convert it. Finalization only resolves the two withheld outcomes: a
-  `pending_open` with no first two-sided row by finalization → `absent`
-  (`market_never_two_sided`); a `deferred` survivor → `capacity_deferred` (salvage). A
-  market left `evaluating`/`ready` (a claimed fire that neither finalized nor crashed,
-  or a clean-window two-sided opener it never fired) is a **coverage hole** →
-  cohort-failing (V6 — a runner bug, not a benign state).
+- **Stable record order** — `TransitionRecordV1` `sequence`/`snapshotAt` (§3.2): the
+  scorer reads in that order; equal timestamps ordered by `sequence`.
+- **Finalization** — at `windowEnd + ingestionGraceMs`, a market already in a **pinned
+  terminal** keeps it (finalization does **not** re-evaluate or convert it).
+  Finalization resolves only what needs the full `H_census` (§4): `firstTwoSided ∈
+  [windowEnd, finalization)` → `opened_after_window` (**H**); no first two-sided row →
+  `absent`/`market_never_two_sided` (**H**); an in-window opener with no clean fire and
+  no pinned terminal is classified by the **§5.2 priority** (`capacity_deferred` /
+  `history_unavailable` / `stale_quote` / `missed_clean_open`). A market left
+  `evaluating`/`ready` (a claimed fire that neither finalized nor crashed) is a
+  **coverage hole** → cohort-failing (V6 — a runner bug, not a benign state).
 - **No terminal-state regression** — once a market reaches a terminal state, a later
-  record moving it backward is a **violation**, not an overwrite. In particular a
-  `delayed` decision is **not** later upgraded to `late`, and a completed `fired` is
-  **never** rewritten to `schedule_changed` by a post-fire reschedule (§9.2).
+  record moving it backward is a **violation**. A completed `fired` is **never**
+  rewritten to `schedule_changed` by a post-fire reschedule (§9.2).
 
 ## 9. Confirmed decisions
 
@@ -893,29 +1021,48 @@ negative, so a *partial* fire still scores its sent arms; only an all-arms-late 
 is `fire_interrupted`. Preserve the cohort evidence and return nonzero runtime health
 (a custody/health signal, like V7).
 
-**9.2 Reschedule policy — a runtime gate on the frozen cutoff.** Membership is frozen
-at cohort start; census rows keep their original `scheduledAtAtFreeze`, the
-**canonical cutoff** for every schedule-derived gate (`first_pitch_passed` and the
-schedule-change check). Live `match_time` is **not** used to reconstruct a
-*historical* cutoff (mutable, no schedule history), but the runner **can** read it
-live — so `schedule_changed` is a **runtime gate, not a finalization afterthought**:
-- The runner compares live `match_time` against `scheduledAtAtFreeze` **at candidate
-  evaluation AND again immediately before claim/dispatch**. A material divergence
-  (≥ `scheduleChangeToleranceMs`) ⇒ **do not dispatch**; record `schedule_changed`
-  (terminal, non-fired). This prevents a paid fire on a game whose schedule moved
-  before detection (a finalization-only check cannot).
-- **A completed fire is immutable.** A reschedule observed *after* a market fired
-  (`entered`/`fired`) does **not** rewrite it to `not_entered`/`schedule_changed` — a
-  disposition cannot be both. Precedence: `fired` wins; `schedule_changed` applies
-  only to a market that did **not** fire.
-- **At finalization** the slate reconciles: a never-fired market whose divergence was
-  observed **during the window** and whose live `match_time` **still** diverges →
-  `schedule_changed` substantiated; a divergence that has since **reverted**, or is
-  seen only at finalization and never during the window, is **not** provable without
-  schedule history → **UNKNOWN / cohort-unranked**, never a clean H.
+**9.2 Reschedule policy — a reachable runtime safety gate, conservatively classed.**
+Membership is frozen at cohort start; census rows keep `scheduledAtAtFreeze`, the
+**canonical cutoff** for every schedule-derived gate. Live `match_time` is **not**
+used to reconstruct a *historical* cutoff (mutable, no schedule history), but the
+runner reads it live as a **no-dispatch safety gate**.
+
+**Exact execution ordering** for every admitted candidate (the finite race policy):
+1. Compare live `match_time` with frozen `scheduledAtAtFreeze` during candidate
+   evaluation.
+2. Complete bounded asynchronous history/preparation work.
+3. **Re-read** live `match_time` before entering `ready`. A material divergence
+   transitions `evaluating → schedule_changed`; do not claim or dispatch.
+4. Enter `ready` only after that re-check passes.
+5. Acquire the atomic at-most-once claim.
+6. Immediately after the claim, perform **one final** live schedule read at the
+   **latest safe point** before any provider HTTP request. **No unrelated awaited work
+   may occur between that read and initiating the arm requests.**
+7. If the final read diverges: `ready → schedule_changed`, consume the claim, **zero**
+   provider requests, never retry that market.
+8. If the final read fails: `ready → read_failed`, consume the claim, **zero** provider
+   requests, class **C**.
+9. If the process crashes after claim and before terminal persistence:
+   `interrupted`/`fire_interrupted` under the V7 failure contract.
+
+This is the latest safe pre-request gate — it does **not** promise a mutable source can
+never change after the latest completed read.
+
+**Evidence class (conservative under the current source model).** There is no
+append-only schedule history, so a local claim that a divergence was "observed
+in-window" is **not** independently time-verifiable merely because the final mutable
+row still differs (the ledger is self-reported and anchored only afterward):
+- `schedule_changed` is a **mandatory runtime no-dispatch safety gate**.
+- A completed `fired` record is **immutable** and is never rewritten by a later
+  reschedule.
+- For this version, **every never-fired `schedule_changed` disposition is UNKNOWN /
+  canonical-unranked** — whether the final mutable row still differs or has reverted.
+- The final games snapshot (§3.3) may **corroborate** the current divergence but
+  cannot upgrade it to **H**.
+- Only a future independently-queryable append-only schedule-history source may upgrade
+  this reason to **H**; that source does not exist in this version.
 A game absent from the frozen census that appears in the observed universe gets
-**`out_of_cohort_observed`** (V6, §3.3) — the archive cannot prove a reschedule-in
-versus a newly-discovered game, so the reason claims only *observation*.
+**`out_of_cohort_observed`** (V6, §3.3, §4).
 
 **9.3 Published root = on-chain Polygon anchor (exact contract).** Git commit/tag
 dates are locally selectable and do not prove an object existed before the window;
@@ -935,13 +1082,18 @@ use; there is no `canonicalJSON`).
   duplicate `path`, an absolute path, a `..` segment, a backslash, or any
   non-normalized/`./`-prefixed path — an invalid path set ⇒ no valid root.
 - The **manifest root** covers exactly `cohort-manifest.json`.
-- The **post-cohort root** covers a **required set defined by exact equality**, not a
-  vague "relevant" list: the manifest; **every** run artifact; **every** fire
-  snapshot; the transition ledger; the census source-snapshot digest (§3.0); and the
-  slate `odds_history` source-snapshot digest + its `id`-watermark/row-count (§3.3).
-  The verifier recomputes this required set from the cohort and requires the inventory
-  to **equal it exactly** — a missing required file (or an extra unexpected one) ⇒ the
-  root is rejected, so omitting a source snapshot cannot yield a verifier-green root.
+- The **post-cohort root** covers a **required set defined by exact equality** — the
+  **actual snapshot files and their metadata**, not detached digest strings: the
+  manifest; **every** run artifact; **every** fire snapshot; the complete raw
+  transition ledger; and the §4 source snapshots —
+  `source/census-source-snapshot.ndjson` + `-meta.json`,
+  `source/odds-history-census.ndjson`, `source/odds-history-external-window.ndjson`,
+  `source/odds-history-snapshot-meta.json`, `source/games-final-snapshot.ndjson` +
+  `-meta.json`, and `census-anomalies.ndjson`. The verifier recomputes this required
+  set from the cohort and requires the inventory to **equal it exactly** — a missing
+  required file (or an extra unexpected one) ⇒ the root is rejected, so omitting any
+  source snapshot (including the final games snapshot) cannot yield a verifier-green
+  root.
 
 **Calldata.** A zero-value transaction (no contract, no approvals) whose calldata is
 the UTF-8 bytes of `ospex-anchor/v1/<manifest|postcohort>/<cohortId>/<rootHexLower>`
@@ -988,115 +1140,86 @@ cohort until PR-3 merges.
 
 ## 11. Test matrix
 
+**Retained structural / verifier tests.**
 - **Multi-fire both-score:** moneyline tick 1, total tick 2 → two run files, each
   binds to its own `fire_coverage_snapshot`, both pass V1–V5; each scored once.
-- **No sibling stall:** A ready, **N>1** siblings' reads held open → A fires
-  (latency assertion).
-- **No-wait batching:** a ready market never delayed by a coalescing window or a
-  sibling's not-yet-ready state.
-- **Capacity overload:** more ready markets than the cap → deterministic admission
-  over frozen identities (§1); deferred markets carry typed `capacity_deferred`.
-- **Deferral vs V-lag (HB2):** a candidate first observed tick 1, capacity-deferred,
-  re-fired tick 2 (~30 s later at min poll) → V-lag **passes** (measured from the
-  tick-2 `detectedAt`, request within 10 s of it), `firstObservedAt`/`capacityDeferredAt`
-  preserved; if the re-fire is past `firstTwoSided + W`, V8 independently marks it
-  `delayed_open` (never disguised as fresh).
+- **No sibling stall / no-wait batching:** a ready market never waits on a sibling's
+  read or a coalescing window (latency assertion, N>1 siblings held open).
 - **Stale price / stale gap:** reprice between snapshot and `detectedAt` → V1;
   `bundleSnapshotTs > freshFireMs` before `detectedAt` on a flat market → V1b.
-- **Dispatch lag:** an arm whose HTTP request starts `> maxDispatchLagMs` after
-  `detectedAt` → V-lag `dispatch_lag_exceeded` (not sent); a *partial* fire still
-  scores its sent arms; **all** arms late → `fire_interrupted`.
-- **Shopping window:** `detectedAt > firstTwoSided + W` → V8 `delayed_open` (not
-  pooled); a boundary within `maxClockSkewMs` → UNKNOWN, not clean.
+- **Dispatch lag:** an arm whose HTTP request starts `> maxDispatchLagMs` after the
+  fire's `detectedAt` → V-lag `dispatch_lag_exceeded` (not sent); a *partial* fire
+  still scores its sent arms; **all** arms late → `fire_interrupted`.
 - **Skew does not widen W:** an entry that is clean only if the legacy 120 s skew is
-  added is classified `delayed_open`, not clean.
-- **V4 policy:** one arm `timeout`, others valid → scores the valid arms, failed arm
-  retained (NOT an event failure); zero valid → `zero_valid_arms` failed-event
-  artifact; stripped `FIRE_FAILED` **and** stripped credential-missing arm → still
-  refused (roster recompute); missing expected-arm record → integrity violation.
-- **Crash ordering:** crash after each of §3.4 steps 1–4, including a
-  coverage-append failure after a billed provider request → unhealthy/nonzero,
-  at-most-once, V6 rejects the cohort, never rendered clean-entered.
-- **Coherent drop:** a market dropped from both run file and ledger → V6 (frozen
-  census / `source=jsonodds` appearance).
+  added is **not** clean; a boundary within `maxClockSkewMs` → UNKNOWN.
+- **V4 policy:** one arm `timeout`, others valid → scores the valid arms; zero valid →
+  `zero_valid_arms`; a required `credential_missing` → C; a missing expected-arm record
+  → integrity violation (no absence marker); `cutoff_missed` distinguishes
+  never-sent from sent-late.
+- **Crash ordering:** crash after each of §3.4 steps 1–4, including a coverage-append
+  failure after a billed provider request → unhealthy/nonzero, at-most-once, V6
+  rejects the cohort, never rendered clean-entered.
 - **Exactly once:** duplicate fire of one speculation, or a fired transition with no
   green run artifact → V6 linkage violation.
 - **Forged detection:** disposition claims appearance, no `source=jsonodds` row ≤
-  `detectedAt` → V3.
-- **Reschedule runtime gate (HB1):** a game rescheduled **before** detection → the
-  runtime pre-dispatch check (live `match_time` vs frozen) **blocks the paid fire** →
-  `schedule_changed`; a game rescheduled **after** it fired → the completed `fired` is
-  immutable (never rewritten); an in-window reschedule → `schedule_changed`; a
-  divergence that **reverts** (or is seen only at finalization, never in-window) →
-  **UNKNOWN**/cohort-unranked, not clean. `first_pitch_passed` is computed vs the
-  **frozen** cutoff. A non-census observed game → `out_of_cohort_observed` (V6).
+  `detectedAt` in `H_census` → V3.
 - **Manifest binding:** a run/coverage record referencing a different
   `cohortManifestSha256`, or a denominator whose hash ≠ the envelope's
   `denominatorSha256` → violation.
-- **Census builder (B1):** a server that caps every page below the requested limit →
-  the walk still returns ALL rows (empty-page termination, never short-page); a
+- **Census builder:** a server that caps every page below the requested limit → the
+  walk still returns ALL rows (empty-page termination, never short-page); a
   `match_time` mutation mid-walk drops/duplicates nothing (immutable `jsonodds_id`
-  cursor + one MVCC snapshot); a truncated/partial response → build failure
-  (fail-closed); a non-advancing cursor → error, not silent truncation.
-- **Source-snapshot completeness (HB5):** a canonical cohort requires the single
-  server-side snapshot — the two-reads-agree HTTP fallback is accepted **only** for
-  rehearsal/salvage; the slate `odds_history` scan uses its **surrogate `id`** cursor +
-  a frozen `id ≤ watermark` (not `jsonodds_id`); a non-census game whose only two-sided
-  row predates `windowStart` and stays flat is still surfaced via
-  **live-games-in-window − frozen-census** → `out_of_cohort_observed`; the census +
-  `odds_history` snapshot hashes/counts are in the post-cohort root.
-- **Terminal regression:** a ledger record moving a market backward out of a
-  terminal state → violation.
-- **As-of vs whole-window detection:** moneyline fires tick 1 while `total` is not
+  cursor + one MVCC snapshot); a two-reads-agree HTTP fallback is rehearsal/salvage
+  only, never canonical.
+- **As-of vs whole-history detection:** moneyline fires tick 1 while `total` is not
   yet two-sided → run1's denominator marks `total` `not_yet_two_sided` (V3 as-of),
-  **not** `market_never_two_sided`; `total` opens tick 2, so the slate V3
-  (whole-history to finalization) does not flag `market_never_two_sided`.
-- **Admission determinism (B4):** more ready candidates than the cap, with gate
-  reads finishing out of priority order → admission is decided over **frozen candidate
-  identities before any read** (a slower higher-priority `(market, gameId)` is admitted
-  over a faster lower-priority one); a failed admitted slot is **not** backfilled that
-  tick; a per-tick-deferred market that **re-fires** next tick stays `entered` and
-  keeps the cohort rankable; a `deferred`-survivor that **never** fires → salvage, and
-  its presence makes the canonical cohort **incomplete/unranked**. `detectedAt`
-  unchanged.
-- **Anchor contract (B7):** a manifest anchor at/after `windowStart` → rejected; a
-  post-cohort root before `finalization` **or** after `finalization + postRootMaxDelayMs`
-  (e.g. +20 min) → rejected; a wrong `from`/`anchorChainId`/`anchorTarget`, an
-  unfinalized block, or `receipt.status != 1` → rejected; calldata whose recomputed
-  inventory root ≠ the published root → rejected.
-- **Transient at finalization:** a market left in `evaluating`/`ready` at
-  finalization → cohort-failing; a `pending_open` that never opened → `absent`/
-  `market_never_two_sided`; a `deferred` that never fired → `capacity_deferred` (salvage).
-- **No premature terminal (B5):** a tick-1 `evaluating→absent` is rejected as illegal;
-  a market not-yet-open at tick 1 that opens at tick 2 is never frozen `absent`.
-- **First-eligible timing terminal (HB3):** a market whose opener is already past W at
-  first eligibility with **no prior deferral** → `delayed_open` **pinned at that
-  first-eligible `detectedAt`**; more time passing does **not** upgrade it to `late`;
-  only `absent` waits for finalization (`late`/`delayed` are immediate).
-- **Capacity-caused W-cross (HB3/HB2 attribution):** a market ready-**within**-W that
-  capacity kept deferring until it crossed `W`/V-lag → `capacity_deferred` (**salvage**,
-  canonical unranked), **not** `delayed_open` (H) — capacity is the higher-precedence
-  cause, so capacity-shaped selection cannot hide as a benign late-open.
-- **Per-bundle decision cardinality (HB4):** a moneyline-only fire → **one** decision
-  per valid arm; a co-arriving moneyline+total fire → **two**; no path asserts a fixed
-  3 (schema/prompt/fingerprint/baseline cardinality derive from the scoped bundle's
-  market set).
-- **Anchor inventory (HB6):** the V1 as-of query carries `order=captured_at.desc,id.desc`;
-  an inventory with a duplicate / absolute / `..` / backslash / `./`-prefixed path → no
-  valid root; a post-cohort inventory missing a required source snapshot (or carrying an
-  extra file) → root rejected (required-set equality).
-- **Opener predates window (B2):** a market whose first two-sided row precedes
-  `windowStart` and stays flat (no in-window change row) → `delayed_open`/`late_detection`,
-  **never** `market_never_two_sided`.
-- **Stale not scorer-verified (B2):** a runtime `stale_quote` decline where
-  `odds_history` shows a fresh change row → UNKNOWN, not clean H; if it masks a clean
-  two-sided market → V6 coverage hole.
-- **Arm-outcome enum (B6):** `cutoff_missed` distinguishes never-sent (cutoff passed
-  at dispatch) from sent-late; a required `credential_missing` → C; a missing
-  expected-roster record → integrity violation (no absence marker); ≥1 `valid` scores,
-  all-non-`valid` → `zero_valid_arms`.
-- **Unsubstantiated ledger reason:** a ledger `absent`/`schedule_changed` record whose
-  `reason` cannot be reconciled against `source=jsonodds` `odds_history` / live
-  `match_time` → UNKNOWN (not a pass).
-- **Backward compatibility:** archived smoke-corpus replay still passes (bundle
-  shape unchanged).
+  **not** `market_never_two_sided`; `total` opens tick 2, so the slate does not flag it.
+- **Anchor tx fields:** a manifest anchor at/after `windowStart`, a post-cohort root
+  outside `[finalization, finalization + postRootMaxDelayMs]` (e.g. +20 min), a wrong
+  `from`/`anchorChainId`/`anchorTarget`, an unfinalized block, or `receipt.status != 1`
+  → cohort rejected; calldata whose recomputed inventory root ≠ published root → rejected.
+- **`evaluating→absent` illegal / no premature terminal:** rejected as illegal; a
+  market not-yet-open at tick 1 that opens at tick 2 is never frozen `absent`.
+- **Backward compatibility:** archived smoke-corpus replay still passes (bundle shape
+  unchanged).
+
+**Named acceptance cases (amendments §7).**
+1. **Capacity within W, later fire within W:** first tick deferred; later admitted
+   before `firstTwoSided + W`; fresh fire `detectedAt`; V-lag passes; earlier timestamps
+   preserved.
+2. **Capacity causes W-cross:** first observed inside W; repeated non-admission; next
+   opportunity after W; **zero provider requests**; `capacity_deferred`; canonical unranked.
+3. **Already missed before pre-gate deferral:** first observed after W; a pre-gate
+   capacity record exists; the verifier uses first observation versus first appearance
+   and produces `missed_clean_open`, **not** capacity.
+4. **Deferred timestamp integrity:** editing/deleting `firstObservedAt`, a capacity
+   deferral, or `sequence` breaks V6/root verification.
+5. **Schedule changes during awaited history:** first schedule check passes, history
+   awaits, second check fails; zero claim and zero provider requests.
+6. **Schedule changes after claim:** post-claim latest-safe-point check fails; claim is
+   consumed, zero provider requests, `ready → schedule_changed`, UNKNOWN/unranked.
+7. **Schedule read fails after claim:** zero provider requests; `ready → read_failed`; C.
+8. **Schedule changes after completed fire:** the completed fire remains entered and is
+   never rewritten.
+9. **Schedule divergence persists/reverts:** both remain UNKNOWN without append-only
+   schedule history.
+10. **Old unrelated history row:** a prior-season game under the ID watermark is
+    excluded from `H_external_window` and creates no anomaly.
+11. **Non-census in-window market row:** exactly one market-level `out_of_cohort_observed`
+    for the observed pair.
+12. **Final live game with no market row:** one game-level `census_anomaly`; no
+    fabricated market disposition.
+13. **Pre-window flat non-census game now in window:** caught by `G_final − census` even
+    without an in-window history change.
+14. **Source snapshot omission:** deleting any raw source snapshot or metadata file
+    fails required-set equality and the root.
+15. **Canonical poll override:** default/current `300s` or any value other than
+    `30_000 ms` fails canonical boot **before** provider calls.
+16. **In-window clean opener missed beyond W:** `missed_clean_open`, C, canonical unranked.
+17. **Pre-window opener:** source-derived delayed/late exclusion, H, never pooled with
+    clean-open scoring.
+18. **Post-window pre-finalization opener:** `opened_after_window`, H.
+19. **Scoped response cardinality regression:** a valid response emits exactly one
+    decision for every scoped bundle market, for one-, two-, and three-market bundles.
+20. **Dynamic schedule terminal edge:** the state-machine validator accepts
+    `ready → schedule_changed` and rejects `ready → deferred`.
