@@ -21,11 +21,12 @@ spec.** Target repo: `ospex-benchmark`.
 >   `one_sided` is **removed** (the writer discards one-sided tuples, so the archive
 >   cannot prove it).
 > - **§4's PR labels and per-tick cap are repointed.** Rehearsal mode ships in
->   **PR 1** (evidence-model §10), not "PR A". The per-tick claim cap is the hashed
->   manifest **`maxDispatchesPerTick` (20)** — the free `--max-fires-per-tick`
->   operator flag is **deleted** (a per-invocation lever is the cherry-pick surface
->   this benchmark forbids, exactly as §3.2 deleted `--late-minutes`). The base-spec
->   figure "default 10" is stale; the manifest value governs (evidence-model §6).
+>   **PR 1** (evidence-model §10), not "PR A". The per-tick claim cap becomes the
+>   hashed manifest **`maxDispatchesPerTick`** (value pinned in the manifest) — the
+>   free `--max-fires-per-tick` flag (`DEFAULT_MAX_FIRES_PER_TICK`, default 10) is
+>   **deleted** (a per-invocation lever is the cherry-pick surface this benchmark
+>   forbids, exactly as §3.2 deleted `--late-minutes`). §4's note that the cap
+>   "needs retuning" is honored by pinning it in the manifest (evidence-model §6).
 > Everything not called out above still stands; this file is the immutable,
 > reviewable base the evidence-model spec builds on.
 
