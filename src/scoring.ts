@@ -4,7 +4,12 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { PROPORTIONAL_DEVIG_METHOD, scoreDecision, SHIN_DEVIG_METHOD } from './clv.js';
 import { favorableLineMovement } from './clv.js';
 import { LADDER_VERSION, scoreTotalsLadder } from './ladder.js';
-import { enabledMarkets, LATE_THRESHOLD_MS } from './marketPolicy.js';
+import {
+  enabledMarkets,
+  LATE_THRESHOLD_MS,
+  MARKET_POLICY_DIGEST,
+  MARKET_POLICY_VERSION,
+} from './marketPolicy.js';
 import { checkProviderCollision } from './providers/family.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
@@ -87,6 +92,8 @@ const runMetaSchema = z
     armGameResults: z.number().int().nonnegative(),
     baselineDecisionCount: z.number().int().nonnegative(),
     baselinePolicyVersion: z.string().min(1).optional(),
+    marketPolicyVersion: z.string().min(1).optional(),
+    marketPolicyDigest: z.string().min(1).optional(),
     watch: watchProvenanceSchema.optional(),
   })
   .passthrough();
@@ -338,6 +345,9 @@ export interface SourceRun {
   baselineDecisionCount: number;
   /** Baseline policy version stamped at write time; null on legacy archives. */
   baselinePolicyVersion: string | null;
+  /** Market policy version + digest stamped at write time (null on legacy). */
+  marketPolicyVersion: string | null;
+  marketPolicyDigest: string | null;
   /** Watch-mode gate provenance; required (and verified) for watch runs. */
   watch: WatchProvenanceMeta | null;
   games: Map<string, SourceGame>;
@@ -595,6 +605,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
     armGameResults: meta.armGameResults,
     baselineDecisionCount: meta.baselineDecisionCount,
     baselinePolicyVersion: meta.baselinePolicyVersion ?? null,
+    marketPolicyVersion: meta.marketPolicyVersion ?? null,
+    marketPolicyDigest: meta.marketPolicyDigest ?? null,
     watch: meta.watch ?? null,
     games,
     picks,
@@ -679,6 +691,19 @@ export function verifyRunIntegrity(
   options?: { expectedArms?: ExpectedArm[] },
 ): string[] {
   const violations: string[] = [];
+
+  // Pin the market policy to the committed one: run_meta is not hash-covered, so
+  // a run that recorded a market policy must declare the COMMITTED version AND
+  // digest — a tampered version string or a tampered allow-list is refused. A
+  // legacy archive with no stamp (null) is exempt (it predates the policy).
+  if (run.marketPolicyVersion !== null && run.marketPolicyVersion !== MARKET_POLICY_VERSION) {
+    violations.push(
+      `run_meta marketPolicyVersion ${run.marketPolicyVersion} is not the committed ${MARKET_POLICY_VERSION}`,
+    );
+  }
+  if (run.marketPolicyDigest !== null && run.marketPolicyDigest !== MARKET_POLICY_DIGEST) {
+    violations.push('run_meta marketPolicyDigest does not match the committed market policy');
+  }
 
   // Watch runs must prove their entry-timing claim from the artifact itself:
   // a watch-v0 run without recorded, internally consistent gate provenance is

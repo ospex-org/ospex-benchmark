@@ -1,3 +1,4 @@
+import { canonicalize, sha256Hex } from './canonical.js';
 import type { MarketKey } from './types.js';
 
 /**
@@ -47,6 +48,14 @@ export const MARKET_POLICY: Readonly<Record<string, readonly MarketKey[]>> = {
   mlb: ['moneyline', 'total'],
   // nfl: ['moneyline', 'spread', 'total'],   // example — not enabled
 };
+
+/**
+ * A content digest of the committed allow-list. Stamped into every run record
+ * and verified by the scorer, so a run cannot claim the committed policy while
+ * actually having run under a tampered allow-list (the version STRING alone
+ * could be forged to match; the digest cannot without changing the map).
+ */
+export const MARKET_POLICY_DIGEST = sha256Hex(canonicalize(MARKET_POLICY));
 
 /** The markets a league dispatches, in the canonical market order. */
 export function enabledMarkets(league: string): MarketKey[] {

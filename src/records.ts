@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { redactSecrets } from './config.js';
 import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
-import { MARKET_POLICY_VERSION } from './marketPolicy.js';
+import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import { bundleMarketKeys } from './markets.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { SMOKE_LABEL } from './types.js';
@@ -181,9 +181,11 @@ export function buildRecords(
     createdAt: ctx.createdAt,
     executionPolicy: ctx.executionPolicy,
     dispatch: 'per-speculation-at-detection',
-    // The preregistered market allow-list this run dispatched under. Hashed
-    // into the record so a run always declares the policy it actually ran.
+    // The preregistered market allow-list this run dispatched under: version +
+    // content digest, so the scorer can pin the run to the committed policy and
+    // refuse a tampered version string or a tampered allow-list.
     marketPolicyVersion: MARKET_POLICY_VERSION,
+    marketPolicyDigest: MARKET_POLICY_DIGEST,
     slateSha256,
     fetchStartedAt: ctx.fetchStartedAt,
     fetchCompletedAt: ctx.fetchCompletedAt,
@@ -364,6 +366,24 @@ export function writeNdjson(filePath: string, records: JsonRecord[]): void {
 export function writeText(filePath: string, content: string): void {
   mkdirSync(dirname(filePath), { recursive: true });
   writeFileSync(filePath, redactSecrets(content), 'utf8');
+}
+
+/**
+ * Exclusive-create write (O_EXCL): returns false if the file already exists,
+ * true if this call created it. This is the at-most-once primitive the
+ * line-open ledger claim uses — on a shared filesystem, two watcher instances
+ * cannot both create the same speculation's claim file, so they cannot both
+ * dispatch (and double-bill) it. Redaction still precedes the write.
+ */
+export function writeTextExclusive(filePath: string, content: string): boolean {
+  mkdirSync(dirname(filePath), { recursive: true });
+  try {
+    writeFileSync(filePath, redactSecrets(content), { encoding: 'utf8', flag: 'wx' });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
 }
 
 /**

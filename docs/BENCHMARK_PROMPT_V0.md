@@ -97,7 +97,7 @@ The eight baseline participants (`baselines-v0.2.0`; v0.1.0 was the same set wit
 - `baseline-favorite-rl`: the designated run line's laying side (negative handicap; price-independent; zero handicap → home);
 - `baseline-underdog-rl`: the other side of the same run line.
 
-Each returns the same participant/cohort/game/market/side/line/observed-price identity fields and policy/input hashes, but no rationale or model metadata. Fixtures must prove mirrored choices, tie behavior, no randomness, and byte-stable output for identical input; missing/stale-market exclusion is enforced upstream at the bundle layer — a game without fresh two-sided odds in every designated market never reaches the baselines.
+Each returns the same participant/cohort/game/market/side/line/observed-price identity fields and policy/input hashes, but no rationale or model metadata. Fixtures must prove mirrored choices, tie behavior, no randomness, and byte-stable output for identical input. A baseline is emitted only for a market the bundle actually carries — a scoped line-open fire (moneyline + total) produces the moneyline and total baselines but not the run-line pair, and a market with no fresh two-sided odds is simply absent from the bundle and therefore from the baselines.
 
 Generate two records without conflating them: a same-snapshot common-cutoff decision used in primary model comparison and an optional first-eligible execution record used only in the early-entry strategy track.
 

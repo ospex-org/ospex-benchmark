@@ -81,8 +81,11 @@ For one game's ready speculations, once, at detection:
    bundle's future-quote tolerance).
 3. Claim each ready speculation in the ledger — memory first, then disk —
    BEFORE any dispatch, so neither a crash nor a restart can double-bill.
-4. Fire: dispatch all four model arms concurrently and run all eight baselines
-   against the same bundle. The prompt, required forecasts, baselines, and the
+4. Fire: dispatch all four model arms concurrently and run the deterministic
+   baselines for the markets the bundle carries (the four moneyline baselines
+   and the two total baselines for a moneyline+total fire; the run-line pair
+   only when a run line is present) against the same bundle. The prompt,
+   required forecasts, baselines, and the
    scorer's denominator all derive from the bundle's own market set — every
    hard-coded "3" is gone.
 5. Write one self-contained run file (`out/`, `watch-v0-<slateDate>-<hex>.ndjson`)

@@ -7,8 +7,11 @@ import { buildBundle } from './bundle.js';
 import { enabledMarkets, isMarketEnabled } from './marketPolicy.js';
 import { parseRunRecords, verifyRunIntegrity, verifyWatchEntryTiming } from './scoring.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
+import { loadLadderParams } from './ladder.js';
+import { aggregateByParticipant, scoreRun } from './scoring.js';
 import {
   fireEligibleGame,
+  FRESH_FIRE_MS,
   LATE_THRESHOLD_MS,
   loadLedger,
   parseWatchArgs,
@@ -1019,6 +1022,150 @@ test('PR B: verifyWatchEntryTiming reconciles the opener against odds_history �
   const nonWatch = { ...run, watch: null };
   const none = await verifyWatchEntryTiming(nonWatch, () => Promise.resolve(openedAt));
   assert.deepEqual(none.violations, []);
+});
+
+// ---------------------------------------------------------------------------
+// Round-2 review fixes: negative tests for the exposed invariants.
+// ---------------------------------------------------------------------------
+
+test('R2: fire-at-detection under slow board reads — the fire re-prepares on a fresh snapshot', async () => {
+  const fire = fakeFire();
+  let now = NOW_MS;
+  let fetches = 0;
+  const opened = new Date(NOW_MS - 5 * 60_000).toISOString();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    nowMs: () => now,
+    fetchInputs: () => {
+      fetches += 1;
+      return Promise.resolve(
+        inputsWith(
+          [
+            { ...oddsRow('moneyline', null), upstream_last_updated: new Date(now - 10_000).toISOString() },
+            { ...oddsRow('total', 8.5), upstream_last_updated: new Date(now - 10_000).toISOString() },
+          ],
+          {
+            fetchStartedAt: new Date(now - 2_000).toISOString(),
+            fetchCompletedAt: new Date(now).toISOString(),
+          },
+        ),
+      );
+    },
+    // Each board read consumes 40 simulated seconds — the two reads push the
+    // snapshot far past FRESH_FIRE_MS before the claim.
+    fetchFirstBoardAppearance: () => {
+      now += 40_000;
+      return Promise.resolve(opened);
+    },
+  });
+  await watchTick(deps);
+  assert.equal(fire.calls.length, 1);
+  assert.ok(fetches >= 2, 'snapshot was re-fetched after the slow reads aged it');
+  const call = fire.calls[0];
+  assert.ok(call);
+  // The fired bundle was built on the RE-FETCHED snapshot, seconds old — not
+  // the 80s-stale one the reads started on.
+  assert.ok(now - Date.parse(call.fetchCompletedAt) < FRESH_FIRE_MS + 5_000);
+});
+
+test('R2: a first appearance seconds in the FUTURE defers — runtime accepts only what the scorer will', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null)])),
+    // +60s ahead of detection: within any plausible cross-clock skew, but the
+    // scorer rejects any first appearance after detection — so the runtime must
+    // NOT fire it (age 0). It defers one tick instead.
+    fetchFirstBoardAppearance: () => Promise.resolve(new Date(NOW_MS + 60_000).toISOString()),
+  });
+  const summary = await watchTick(deps);
+  assert.equal(summary.deferred, 1);
+  assert.equal(summary.fired, 0);
+  assert.equal(fire.calls.length, 0);
+  assert.equal(deps.boardFirstSeen.size, 0);
+});
+
+test('R2: cross-process claim — a speculation already claimed on disk is not re-dispatched', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null), oddsRow('total', 8.5)])),
+  });
+  // Another instance already claimed the moneyline (an exclusive file on disk),
+  // but this process's in-memory ledger doesn't know yet.
+  persistLedgerEntry(deps.ledgerDir, {
+    gameId: GAME_ID,
+    slug: 'mil-pit-2026-07-20',
+    market: 'moneyline',
+    decision: 'fired',
+    decidedAt: new Date(NOW_MS).toISOString(),
+    slateDate: '2026-07-20',
+    scheduledStartUtc: MATCH_TIME,
+    firstAppearanceAt: OPENED_AT,
+    openerAgeSeconds: 600,
+    gameSha256: 'x',
+    requestSha256: 'y',
+    runId: 'watch-v0-other-instance',
+  });
+  const summary = await watchTick(deps);
+  // Only the total fires; the moneyline claim is lost and skipped — no double dispatch.
+  assert.equal(summary.fired, 1);
+  assert.deepEqual(fire.calls[0]?.markets, ['total']);
+  assert.ok(deps.errors.some((e) => e.includes('lost to another instance')));
+});
+
+test('R2: the status snapshot records a dispatched market as fired, not a stale ready', async () => {
+  const fire = fakeFire();
+  const captured: SpecStatus[] = [];
+  const deps = makeDeps({ fireGame: fire.fire, onStatuses: (s) => captured.push(...s) });
+  await watchTick(deps);
+  const ml = captured.find((s) => s.market === 'moneyline');
+  assert.equal(ml?.state, 'fired');
+  assert.equal(ml?.reason, 'entered');
+  assert.ok(!captured.some((s) => s.state === 'ready'), 'no stale ready survives the fire');
+});
+
+test('R2: universal detection — a policy-disabled market present in the snapshot is recorded as appeared', async () => {
+  const fire = fakeFire();
+  const captured: SpecStatus[] = [];
+  const deps = makeDeps({ fireGame: fire.fire, onStatuses: (s) => captured.push(...s) });
+  const summary = await watchTick(deps);
+  assert.equal(summary.disabled, 1);
+  const spread = captured.find((s) => s.market === 'spread');
+  assert.equal(spread?.state, 'disabled');
+  assert.equal(spread?.reason, 'policy_disabled');
+  // The run line APPEARED (it is in the snapshot) — distinguishable from a
+  // market that never appeared, substantiating the universal-detection claim.
+  assert.ok(spread?.snapshotObservedAt, 'a disabled market that appeared records its snapshot time');
+});
+
+test('R2: scoped-run aggregation is derived from the bundle — no phantom spread row, eligibleMarkets = 2', async () => {
+  const { lines } = await fireScopedRun([
+    { gameId: 'ignored', slug: 'x', league: 'mlb', market: 'moneyline', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: '2026-07-20T11:50:00.000Z', openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+    { gameId: 'ignored', slug: 'x', league: 'mlb', market: 'total', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: '2026-07-20T11:50:00.000Z', openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+  ]);
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [], loadLadderParams()); // no closes → all unscored
+  const stats = aggregateByParticipant(scored, run, loadLadderParams());
+  const model = stats.find((s) => s.kind === 'model');
+  assert.ok(model);
+  assert.equal(model.eligibleMarkets, 2); // moneyline + total, never a hardcoded 3
+  assert.equal(model.byMarket['spread'], undefined); // no phantom "Spread 0/N"
+  assert.ok(model.byMarket['moneyline']);
+  assert.ok(model.byMarket['total']);
+});
+
+test('R2: the scorer refuses a tampered marketPolicyVersion', async () => {
+  const { lines } = await fireScopedRun([
+    { gameId: 'ignored', slug: 'x', league: 'mlb', market: 'moneyline', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: '2026-07-20T11:50:00.000Z', openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+    { gameId: 'ignored', slug: 'x', league: 'mlb', market: 'total', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: '2026-07-20T11:50:00.000Z', openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+  ]);
+  const metaIndex = lines.findIndex((l) => l.includes('"recordType":"run_meta"'));
+  const meta = JSON.parse(lines[metaIndex] ?? '') as Record<string, unknown>;
+  const tampered = [...lines];
+  tampered[metaIndex] = JSON.stringify({ ...meta, marketPolicyVersion: 'tampered-policy-version' });
+  const violations = verifyRunIntegrity(parseRunRecords(tampered), { expectedArms: EXPECTED_ARMS });
+  assert.ok(violations.some((v) => v.includes('is not the committed')));
 });
 
 test('prolonged deferral escalates exactly once, per speculation', async () => {

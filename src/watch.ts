@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { runBaselines } from './baselines.js';
-import { buildScopedResult, evaluateGameMarkets, FUTURE_QUOTE_SKEW_MS } from './bundle.js';
+import { buildScopedResult, evaluateGameMarkets } from './bundle.js';
 import { describeError } from './config.js';
 import { LATE_THRESHOLD_MS } from './marketPolicy.js';
 import { MARKET_KEYS } from './markets.js';
@@ -14,6 +14,7 @@ import {
   unidentifiedResponsesByArm,
   writeNdjson,
   writeText,
+  writeTextExclusive,
 } from './records.js';
 import { runSlate } from './runner.js';
 import { easternCalendarDay } from './slateDate.js';
@@ -253,8 +254,15 @@ export interface SpecStatus {
   /** Machine-readable reason (policy_disabled, market_never_opened, one_sided,
    *  stale_quote, deferred, first_pitch_passed, late_detection, entered, …). */
   reason: string;
+  /** First BOARD appearance from odds_history (read only for enabled markets we
+   *  act on). Null for markets we never gate (disabled / not-yet-built). */
   firstAppearanceAt: string | null;
   openerAgeSeconds: number | null;
+  /** Whether the market was PRESENT in this tick's current-odds snapshot, and
+   *  its quote timestamp if so — universal-detection evidence for markets we do
+   *  NOT read history for (a policy-disabled run line that appeared is
+   *  distinguishable from one that never did). Null = absent from the snapshot. */
+  snapshotObservedAt: string | null;
   scheduledStartUtc: string;
 }
 
@@ -270,6 +278,20 @@ export function persistLedgerEntry(ledgerDir: string, entry: SpecLedgerEntry): v
   // writeText is the redaction chokepoint — every serialized byte passes
   // redactSecrets before touching disk, same as run records.
   writeText(
+    ledgerPath(ledgerDir, entry.gameId, entry.market),
+    `${JSON.stringify(entry, null, 2)}\n`,
+  );
+}
+
+/**
+ * Exclusive-create claim: writes the initial claim file only if it does not yet
+ * exist, returning true iff THIS call won the claim. On a shared filesystem two
+ * watcher instances cannot both win, so they cannot both dispatch (double-bill)
+ * the speculation — the "one instance" rule becomes a billing-safety guarantee,
+ * not just an operator convention. Later writes (completion, failure) overwrite.
+ */
+export function claimLedgerEntryExclusive(ledgerDir: string, entry: SpecLedgerEntry): boolean {
+  return writeTextExclusive(
     ledgerPath(ledgerDir, entry.gameId, entry.market),
     `${JSON.stringify(entry, null, 2)}\n`,
   );
@@ -457,11 +479,14 @@ async function firstAppearance(
     );
     return null;
   }
-  if (Date.parse(first) > deps.nowMs() + FUTURE_QUOTE_SKEW_MS) {
-    // A first appearance meaningfully after detection is rejected — fail
-    // closed, never cached, never fired (a legitimately skewed stamp becomes
-    // past within one tick). The small skew allowance mirrors the bundle's
-    // future-quote tolerance so a cross-host clock jitter is not a stall.
+  if (Date.parse(first) > deps.nowMs()) {
+    // ANY first appearance after the current instant is rejected — never
+    // cached, never fired. This is STRICT (no future-skew grace) so the runtime
+    // accepts only what the scorer will: the scorer refuses a firstAppearance
+    // after detection outright, and detection is sampled no earlier than this
+    // read, so a stamp we fire on is always ≤ detectedAt. A legitimately
+    // cross-clock-skewed stamp simply becomes past within one poll and fires
+    // then — deferring it one tick is safe; firing it stale is not.
     deps.logError(
       `future first-appearance timestamp for ${gameId} ${market}: ${first} — deferring, not caching`,
     );
@@ -523,7 +548,10 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
   let currentInputs = inputs;
 
   // Ensure the working snapshot is fresh, then evaluate one game's markets and
-  // classify every speculation. Returns null when the game has left the window.
+  // classify every speculation. PURE with respect to the tick summary — it has
+  // NO summary side effects (so it can be safely re-run to re-prepare on a
+  // fresh snapshot); the caller tallies from the returned statuses. Returns
+  // null when the game has left the window.
   const planGame = async (gameId: string): Promise<GamePlan | 'stop' | null> => {
     if (deps.nowMs() - Date.parse(currentInputs.fetchCompletedAt) > FRESH_FIRE_MS) {
       currentInputs = await deps.fetchInputs();
@@ -552,6 +580,10 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
     const statuses: SpecStatus[] = [];
 
     for (const market of MARKET_KEYS) {
+      // Universal-detection evidence, read for FREE from the snapshot: whether
+      // this market appeared at all, and its quote time if so. Recorded for
+      // every market — including ones we never read history for (a disabled run
+      // line that appeared is now distinguishable from one that never did).
       const base = {
         gameId: row.gameId,
         slug: row.slug,
@@ -560,6 +592,7 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         scheduledStartUtc: row.matchTime,
         firstAppearanceAt: null as string | null,
         openerAgeSeconds: null as number | null,
+        snapshotObservedAt: oddsMap.get(market)?.upstream_last_updated ?? null,
       };
 
       // Handled forever: report the ledger's terminal decision, never re-fire.
@@ -611,7 +644,6 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
       try {
         first = await firstAppearance(deps, row.gameId, market);
       } catch (error) {
-        summary.failed += 1;
         deps.logError(
           `board-appearance read failed for ${row.gameId} ${market} (${describeError(error)}) — market excluded this tick`,
         );
@@ -619,7 +651,6 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         continue;
       }
       if (first === null) {
-        summary.deferred += 1;
         const since = deps.deferredSince.get(deferKey) ?? deps.nowMs();
         deps.deferredSince.set(deferKey, since);
         if (deps.nowMs() - since > deps.lateMs && !deps.deferralWarned.has(deferKey)) {
@@ -667,30 +698,53 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
     };
   };
 
+  /** Tally every non-fire counter from a plan's statuses (fire counters are
+   *  handled at the fire site). Runs on the FINAL plan only, so a re-prepare
+   *  never double-counts. */
+  const tally = (plan: GamePlan): void => {
+    for (const status of plan.statuses) {
+      // Already-handled speculations are census-only; count them separately.
+      if (
+        (status.reason === 'entered' || status.reason === 'late_detection') &&
+        deps.ledger.has(specKey(status.gameId, status.market))
+      ) {
+        summary.handled += 1;
+        continue;
+      }
+      summary.speculations += 1;
+      if (status.state === 'disabled') summary.disabled += 1;
+      else if (status.state === 'deferred') summary.deferred += 1;
+      else if (status.state === 'blocked' && status.reason === 'board_read_failed') {
+        summary.failed += 1;
+      } else if (status.state === 'blocked') summary.blocked += 1;
+      // 'ready' → fire site; 'late' → the late loop below.
+    }
+  };
+
   for (const candidate of candidates) {
     try {
-      const plan = await planGame(candidate.gameId);
+      let plan = await planGame(candidate.gameId);
       if (plan === 'stop') break;
       if (plan === null) continue;
 
-      // Tally the non-ready speculations from the plan's statuses.
-      for (const status of plan.statuses) {
-        // Already-handled speculations are census-only; count them separately.
-        if (status.reason === 'entered' || status.reason === 'late_detection') {
-          if (deps.ledger.has(specKey(status.gameId, status.market))) {
-            summary.handled += 1;
-            continue;
-          }
-        }
-        summary.speculations += 1;
-        if (status.state === 'disabled') summary.disabled += 1;
-        // A board_read_failed market is already tallied in `failed` (planGame)
-        // — count it as a speculation but not also as a benign block.
-        else if (status.state === 'blocked' && status.reason !== 'board_read_failed') {
-          summary.blocked += 1;
-        }
-        // 'deferred' already counted in planGame; 'ready'/'late' handled below.
+      // Fire-at-detection per game: the board-history reads above are network
+      // calls and can be slow; if they aged the snapshot past FRESH_FIRE_MS and
+      // this game has ready work, RE-PREPARE on a fresh snapshot so the fire
+      // enters on current prices, not the stale snapshot the reads started on.
+      // Board data is cached, so the re-prep costs no history reads. The tally
+      // then runs on this fresh plan only.
+      if (
+        !deps.rehearse &&
+        plan.ready.length > 0 &&
+        deps.nowMs() - Date.parse(plan.fetchCompletedAt) > FRESH_FIRE_MS
+      ) {
+        const replanned = await planGame(candidate.gameId);
+        if (replanned === 'stop') break;
+        if (replanned === null) continue; // left the window during re-prepare
+        plan = replanned;
       }
+
+      tally(plan);
 
       // Late exclusions discovered this tick (fresh, not already handled): make
       // them terminal now so a stale opener is never entered on a later tick.
@@ -725,9 +779,10 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         );
       }
 
-      allStatuses.push(...plan.statuses);
-
-      if (plan.ready.length === 0) continue;
+      if (plan.ready.length === 0) {
+        allStatuses.push(...plan.statuses);
+        continue;
+      }
 
       if (deps.rehearse) {
         const list = plan.ready
@@ -736,6 +791,7 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         deps.log(`[rehearsal] would fire ${plan.row.slug}: ${list}`);
         summary.fired += plan.ready.length;
         summary.dispatches += 1;
+        allStatuses.push(...plan.statuses);
         continue;
       }
 
@@ -744,11 +800,23 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         deps.logError(
           `dispatch cap reached (${deps.maxDispatchesPerTick}) — stopping this tick; remaining speculations re-detected next tick`,
         );
+        allStatuses.push(...plan.statuses);
         break;
       }
 
-      await fireReadySpeculations(deps, plan, summary);
+      const fired = await fireReadySpeculations(deps, plan, summary);
       summary.dispatches += 1;
+      // Reflect the actual outcome in the status snapshot: a dispatched market
+      // is `fired`, not `ready` (the snapshot is written from these statuses,
+      // and under --once no later tick would ever correct a stale `ready`).
+      const firedSet = new Set(fired);
+      for (const status of plan.statuses) {
+        if (firedSet.has(status.market)) {
+          status.state = 'fired';
+          status.reason = 'entered';
+        }
+      }
+      allStatuses.push(...plan.statuses);
     } catch (error) {
       summary.failed += 1;
       deps.logError(
@@ -762,73 +830,41 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
 }
 
 /**
- * Fire one game's ready speculations as a single dispatch. Each speculation is
- * claimed in the ledger — memory first, then disk — BEFORE any dispatch, so
- * neither a crash nor a restart can double-bill. The bundle carries exactly the
- * ready markets; the run file records each market's own gate provenance.
+ * Fire one game's ready speculations as a single dispatch, returning the
+ * markets actually dispatched. Each speculation is claimed via EXCLUSIVE-CREATE
+ * before any dispatch, so neither a crash, a restart, nor a second concurrent
+ * watcher can double-bill it. The bundle carries exactly the won markets; the
+ * run file records each market's own gate provenance.
  */
 async function fireReadySpeculations(
   deps: WatchDeps,
   plan: GamePlan,
   summary: TickSummary,
-): Promise<void> {
+): Promise<MarketKey[]> {
   // ONE detection instant for the whole fire, and every market's opener age is
   // recomputed against it — so the recorded provenance is internally
   // consistent (the scorer recomputes openerAge = detectedAt − firstAppearance
   // and rejects a mismatch). A ready market that aged past the gate during the
   // (network) board reads is DROPPED and re-detected next tick — never fired
-  // stale. If none survive, nothing is claimed or dispatched.
+  // stale.
   const detectedAtMs = deps.nowMs();
   const detectedAt = new Date(detectedAtMs).toISOString();
   const gated = plan.ready
-    .map((r) => ({
-      market: r.market,
-      firstAppearanceAt: r.firstAppearanceAt,
-      ageMs: detectedAtMs - Date.parse(r.firstAppearanceAt),
-    }))
+    .map((r) => ({ market: r.market, firstAppearanceAt: r.firstAppearanceAt, ageMs: detectedAtMs - Date.parse(r.firstAppearanceAt) }))
     .filter((r) => r.ageMs <= deps.lateMs)
-    .map((r) => ({
-      market: r.market,
-      firstAppearanceAt: r.firstAppearanceAt,
-      openerAgeSeconds: Math.max(0, Math.round(r.ageMs / 1000)),
-    }));
-  if (gated.length === 0) return;
-  const readyMarkets = gated.map((r) => r.market);
-  const gatedSet = new Set(readyMarkets);
+    .map((r) => ({ market: r.market, firstAppearanceAt: r.firstAppearanceAt, openerAgeSeconds: Math.max(0, Math.round(r.ageMs / 1000)) }));
+  if (gated.length === 0) return [];
 
-  // The bundle is assembled from the snapshot the plan was built on — its
-  // fetch-completion instant is the bundle timestamp, so detection (now, ≥ that
-  // instant) never predates its inputs (the scorer verifies exactly that).
-  const build = buildScopedResult({
-    gameRow: plan.row,
-    blocks: plan.evaluation.blocks,
-    markets: readyMarkets,
-    slug: plan.row.slug,
-    slateDate: plan.slateDate,
-    bundleTimestamp: plan.fetchCompletedAt,
-    oddsRows: plan.oddsRows,
-  });
-  const request = build.requests[0];
-  if (request === undefined) return; // unreachable: gated is non-empty
-
-  const provenance: WatchGateProvenance = {
-    detectedAt,
-    lateThresholdSeconds: Math.round(deps.lateMs / 1000),
-    markets: Object.fromEntries(
-      gated.map((r) => [
-        r.market,
-        { firstAppearanceAt: r.firstAppearanceAt, openerAgeSeconds: r.openerAgeSeconds },
-      ]),
-    ),
-  };
-
-  // Claim every gated speculation before dispatch (memory, then disk),
-  // ATOMICALLY: if any disk write throws, roll the whole batch back (delete the
-  // written claim files and drop the in-memory entries) so no phantom `fired`
-  // speculation is stranded, and dispatch nothing.
-  const claimed: SpecLedgerEntry[] = [];
+  // Claim each gated speculation with an EXCLUSIVE create BEFORE dispatch. A
+  // claim that loses to an existing file (this process already handled it, or a
+  // second watcher instance won it) is dropped from the batch — never
+  // dispatched, never double-billed. Hashes are filled in at completion; the
+  // claim file just has to exist first.
+  const claimed: Array<{ market: MarketKey; firstAppearanceAt: string; openerAgeSeconds: number; entry: SpecLedgerEntry }> = [];
   try {
     for (const r of gated) {
+      const key = specKey(plan.row.gameId, r.market);
+      if (deps.ledger.has(key)) continue; // already handled in-process
       const entry: SpecLedgerEntry = {
         gameId: plan.row.gameId,
         slug: plan.row.slug,
@@ -839,32 +875,83 @@ async function fireReadySpeculations(
         scheduledStartUtc: plan.row.matchTime,
         firstAppearanceAt: r.firstAppearanceAt,
         openerAgeSeconds: r.openerAgeSeconds,
-        gameSha256: build.gameHashes[plan.row.gameId] ?? 'unknown',
-        requestSha256: request.requestSha256,
+        gameSha256: 'pending',
+        requestSha256: 'pending',
       };
-      deps.ledger.set(specKey(plan.row.gameId, r.market), entry);
-      persistLedgerEntry(deps.ledgerDir, entry);
-      claimed.push(entry);
+      if (!claimLedgerEntryExclusive(deps.ledgerDir, entry)) {
+        // Another instance owns this claim — adopt its terminal record so we
+        // never retry, and skip it.
+        try {
+          deps.ledger.set(
+            key,
+            JSON.parse(readFileSync(ledgerPath(deps.ledgerDir, entry.gameId, entry.market), 'utf8')) as SpecLedgerEntry,
+          );
+        } catch {
+          deps.ledger.set(key, { ...entry, fireError: 'claimed by another instance' });
+        }
+        deps.logError(`claim for ${plan.row.slug} ${r.market} lost to another instance — skipped`);
+        continue;
+      }
+      deps.ledger.set(key, entry);
+      claimed.push({ market: r.market, firstAppearanceAt: r.firstAppearanceAt, openerAgeSeconds: r.openerAgeSeconds, entry });
     }
   } catch (error) {
-    for (const entry of claimed) {
-      deps.ledger.delete(specKey(entry.gameId, entry.market));
+    // A genuine write error (not a lost EEXIST claim) — roll the batch back so
+    // no phantom `fired` is stranded, and dispatch nothing.
+    for (const c of claimed) {
+      deps.ledger.delete(specKey(c.entry.gameId, c.entry.market));
       try {
-        rmSync(ledgerPath(deps.ledgerDir, entry.gameId, entry.market), { force: true });
+        rmSync(ledgerPath(deps.ledgerDir, c.entry.gameId, c.entry.market), { force: true });
       } catch {
         // best-effort rollback; the surfaced failure is the signal
       }
     }
     summary.failed += 1;
-    deps.logError(
-      `claim failed for ${plan.row.slug} (${plan.row.gameId}) — rolled back, nothing dispatched: ${describeError(error)}`,
-    );
-    return;
+    deps.logError(`claim failed for ${plan.row.slug} (${plan.row.gameId}) — rolled back, nothing dispatched: ${describeError(error)}`);
+    return [];
+  }
+  if (claimed.length === 0) return []; // every claim lost to another instance
+
+  const wonMarkets = claimed.map((c) => c.market);
+  const wonSet = new Set(wonMarkets);
+
+  // The bundle is assembled from the snapshot the plan was built on — its
+  // fetch-completion instant is the bundle timestamp, so detection (now, ≥ that
+  // instant) never predates its inputs (the scorer verifies exactly that). Only
+  // the WON markets are carried.
+  const build = buildScopedResult({
+    gameRow: plan.row,
+    blocks: plan.evaluation.blocks,
+    markets: wonMarkets,
+    slug: plan.row.slug,
+    slateDate: plan.slateDate,
+    bundleTimestamp: plan.fetchCompletedAt,
+    oddsRows: plan.oddsRows,
+  });
+  const request = build.requests[0];
+  if (request === undefined) return [];
+
+  // Backfill the real hashes onto the claim files now that the bundle exists.
+  const gameSha = build.gameHashes[plan.row.gameId] ?? 'unknown';
+  for (const c of claimed) {
+    c.entry.gameSha256 = gameSha;
+    c.entry.requestSha256 = request.requestSha256;
+    try {
+      persistLedgerEntry(deps.ledgerDir, c.entry);
+    } catch {
+      // the exclusive claim file already exists; hashes are informational
+    }
   }
 
-  deps.log(
-    `firing ${plan.row.slug} [${readyMarkets.join(', ')}]: request sha256 ${request.requestSha256.slice(0, 16)}…`,
-  );
+  const provenance: WatchGateProvenance = {
+    detectedAt,
+    lateThresholdSeconds: Math.round(deps.lateMs / 1000),
+    markets: Object.fromEntries(
+      claimed.map((c) => [c.market, { firstAppearanceAt: c.firstAppearanceAt, openerAgeSeconds: c.openerAgeSeconds }]),
+    ),
+  };
+
+  deps.log(`firing ${plan.row.slug} [${wonMarkets.join(', ')}]: request sha256 ${request.requestSha256.slice(0, 16)}…`);
 
   const fireInputs: SlateInputs = {
     gamesRows: [plan.row],
@@ -872,12 +959,11 @@ async function fireReadySpeculations(
     fetchStartedAt: plan.fetchStartedAt,
     fetchCompletedAt: plan.fetchCompletedAt,
   };
-  // The published denominator for this game: every market's disposition. The
-  // ENTERED set is exactly the gated (dispatched) markets — a ready market
-  // dropped by the age-recompute above is recorded not_entered / late_detection,
-  // so the denominator and the bundle stay consistent.
+  // The published denominator: entered = exactly the won markets; a gated market
+  // that lost its claim, or a ready market dropped by the age-recompute, is
+  // recorded not_entered so the denominator and bundle stay consistent.
   const dispositions: SpeculationDisposition[] = plan.statuses.map((status) => {
-    const entered = gatedSet.has(status.market);
+    const entered = wonSet.has(status.market);
     return {
       gameId: status.gameId,
       slug: status.slug,
@@ -895,38 +981,38 @@ async function fireReadySpeculations(
   try {
     outcome = await deps.fireGame(build, fireInputs, plan.slateDate, provenance, dispositions);
   } catch (error) {
-    for (const entry of claimed) {
-      const failed: SpecLedgerEntry = { ...entry, fireError: describeError(error) };
-      deps.ledger.set(specKey(entry.gameId, entry.market), failed);
+    for (const c of claimed) {
+      const failed: SpecLedgerEntry = { ...c.entry, fireError: describeError(error) };
+      deps.ledger.set(specKey(c.entry.gameId, c.entry.market), failed);
       try {
         persistLedgerEntry(deps.ledgerDir, failed);
       } catch {
-        // the in-memory claim already prevents a re-fire this process
+        // the claim already prevents a re-fire this process
       }
     }
     summary.failed += 1;
     deps.logError(`fire failed for ${plan.row.slug} (${plan.row.gameId}): ${describeError(error)}`);
-    return;
+    return [];
   }
 
   // The fire SUCCEEDED — providers were billed. A completion-write failure must
   // NOT downgrade it to failed (that would mislabel a real, scored fire): log
   // it and keep counting the fire.
-  for (const entry of claimed) {
+  for (const c of claimed) {
     const completed: SpecLedgerEntry = {
-      ...entry,
+      ...c.entry,
       runId: outcome.runId,
       runFile: outcome.runFile,
       armOutcomes: outcome.armOutcomes,
       baselineDecisions: outcome.baselineDecisions,
       collisionFailed: outcome.collisionFailed,
     };
-    deps.ledger.set(specKey(entry.gameId, entry.market), completed);
+    deps.ledger.set(specKey(c.entry.gameId, c.entry.market), completed);
     try {
       persistLedgerEntry(deps.ledgerDir, completed);
     } catch (error) {
       deps.logError(
-        `completion-write failed for ${plan.row.slug} ${entry.market} (fire succeeded, run ${outcome.runFile}) — ledger link may be stale: ${describeError(error)}`,
+        `completion-write failed for ${plan.row.slug} ${c.market} (fire succeeded, run ${outcome.runFile}) — ledger link may be stale: ${describeError(error)}`,
       );
     }
   }
@@ -934,8 +1020,11 @@ async function fireReadySpeculations(
     // A hard identity/collision failure: the file exists but is unscoreable.
     summary.failed += 1;
   } else {
-    summary.fired += gated.length;
+    summary.fired += wonMarkets.length;
   }
+  // The dispatched markets — for status-snapshot reconciliation. Reported even
+  // on collision-failure (a dispatch DID happen, and it is terminal).
+  return wonMarkets;
 }
 
 // ---------------------------------------------------------------------------
