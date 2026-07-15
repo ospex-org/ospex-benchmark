@@ -192,7 +192,14 @@ than inferred from the counters — the exclusion reason a naive counter hides.
 
 ## Operations
 
-- `yarn watch` — long-running loop; `--poll-seconds` (default 60, min 30),
+- A mode is REQUIRED and the live path is fail-closed. Plain `yarn watch`
+  refuses; `--live` explicitly acknowledges the destructive path (real fires,
+  real spend, irreversible claims) and, before any ledger claim, validates every
+  model-provider credential — a missing credential refuses the boot rather than
+  burning openers with a non-participating arm. A fire in which a required arm
+  is credential-missing, or no arm produces a valid response, is a FAILED fire
+  (durable `fire_failed`, nonzero `--once` exit), never a clean entry.
+- `yarn watch --live` — long-running loop; `--poll-seconds` (default 60, min 30),
   `--window-hours` (default 168), `--max-dispatches-per-tick` (default 20 — a
   circuit breaker on per-tick spend; once hit, the tick stops loudly and
   unclaimed speculations re-evaluate next tick), `--out` (default `out`),

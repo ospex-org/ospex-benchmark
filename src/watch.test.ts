@@ -650,6 +650,7 @@ test('parseWatchArgs defaults and validation — no --late-minutes, no --markets
     dryRun: false,
     once: false,
     rehearse: false,
+    live: false,
     outDir: 'out',
     outDirExplicit: false,
     pollSeconds: 60,
@@ -658,6 +659,7 @@ test('parseWatchArgs defaults and validation — no --late-minutes, no --markets
     timeoutSeconds: null,
     maxOutputTokens: 16000,
   });
+  assert.equal(parseWatchArgs(['--live'], () => undefined).live, true);
   assert.equal(parseWatchArgs(['--dry-run'], () => undefined).once, true);
   assert.equal(parseWatchArgs(['--rehearse'], () => undefined).rehearse, true);
   assert.equal(parseWatchArgs(['--rehearse'], () => undefined).once, true);
@@ -1328,6 +1330,63 @@ test('R3: verifyWatchEntryTiming refutes a not_entered:market_never_opened the l
     Promise.resolve(market === 'total' ? openedTotal : '2026-07-20T11:50:00.000Z'),
   );
   assert.ok(result.violations.some((v) => v.includes('market_never_opened but odds_history shows it appeared')));
+});
+
+// ---------------------------------------------------------------------------
+// Round-4 review fix: live boot is fail-closed (Hermes).
+// ---------------------------------------------------------------------------
+
+test('R4: a credential-missing / unscoreable fire is FAILED, never a clean entry', async () => {
+  const fire = fakeFire({ fireFailed: true, failureReason: 'credential_missing: some-arm' });
+  const captured: SpecStatus[] = [];
+  const deps = makeDeps({ fireGame: fire.fire, onStatuses: (s) => captured.push(...s) });
+  const s1 = await watchTick(deps);
+  assert.equal(s1.fired, 0);
+  assert.equal(s1.failed, 1);
+  assert.equal(captured.find((s) => s.market === 'moneyline')?.state, 'failed');
+  assert.match(deps.ledger.get(key(GAME_ID, 'moneyline'))?.fireError ?? '', /credential_missing/);
+  // Next tick: still `failed` / `fire_failed`, never laundered into `entered`.
+  captured.length = 0;
+  const s2 = await watchTick(deps);
+  assert.equal(s2.fired, 0);
+  const ml2 = captured.find((s) => s.market === 'moneyline');
+  assert.equal(ml2?.state, 'failed');
+  assert.equal(ml2?.reason, 'fire_failed');
+});
+
+test('R4: fireEligibleGame flags a credential-missing arm as a failed fire, not a collision', async () => {
+  const inputs = inputsWith([oddsRow('moneyline', null)]);
+  const build = buildBundle(inputs, '2026-07-20', { requireFuture: false });
+  const request = build.requests[0];
+  assert.ok(request);
+  const noCredAdapter: ProviderAdapter = {
+    provider: TEST_ARM.provider,
+    requestedModelId: TEST_ARM.requestedModelId,
+    credentialEnvVar: TEST_ARM.credentialEnvVar,
+    hasCredential: () => false,
+    chat: () => Promise.reject(new Error('should not be called without a credential')),
+  };
+  const provenance: WatchGateProvenance = {
+    detectedAt: new Date(NOW_MS).toISOString(),
+    lateThresholdSeconds: LATE_THRESHOLD_MS / 1000,
+    markets: { moneyline: { firstAppearanceAt: OPENED_AT, openerAgeSeconds: 600 } },
+  };
+  const outcome = await fireEligibleGame(build, inputs, '2026-07-20', provenance, {
+    arms: [TEST_ARM],
+    adapters: new Map([[TEST_ARM.participantId, noCredAdapter]]),
+    approvedReportedModelIds: () => ['stub-model-1'],
+    outDir: tempDir('watch-nocred-'),
+    timeoutMs: 1000,
+    maxOutputTokens: 16000,
+    mode: 'live',
+    clockMode: 'wall',
+    nowMs: () => NOW_MS,
+    log: () => undefined,
+    logError: () => undefined,
+  }, []);
+  assert.equal(outcome.fireFailed, true);
+  assert.equal(outcome.collisionFailed, false); // it's a structural failure, not a collision
+  assert.match(outcome.failureReason ?? '', /credential_missing/);
 });
 
 test('prolonged deferral escalates exactly once, per speculation', async () => {

@@ -55,8 +55,19 @@ async function main(): Promise<number> {
     printLine(WATCH_USAGE);
     process.exit(0);
   });
+  // Fail-closed: the destructive live-write path (not dry-run, not rehearse)
+  // requires an EXPLICIT --live acknowledgement. Plain `yarn watch` refuses, so
+  // a bare invocation can never silently fire real money and burn openers.
+  const isLiveWrite = !options.dryRun && !options.rehearse;
+  if (isLiveWrite && !options.live) {
+    throw new WatchUsageError(
+      'live mode fires real model calls, bills real money, and makes irreversible ledger claims — ' +
+        'pass --live to acknowledge, or use --rehearse (report-only) / --dry-run (fixtures). ' +
+        'Run --rehearse and review its output before the first --live boot.',
+    );
+  }
   const mode = options.dryRun ? 'dry-run' : 'live';
-  const modeLabel = options.rehearse ? `${mode} — REHEARSAL (report-only)` : mode;
+  const modeLabel = options.rehearse ? `${mode} — REHEARSAL (report-only)` : options.live ? `${mode} — LIVE (destructive)` : mode;
   printLine(
     `ospex-benchmark line-open watch — ${modeLabel} — the speculation is the unit — label SMOKE_V0_NOT_A_COHORT`,
   );
@@ -72,6 +83,23 @@ async function main(): Promise<number> {
   const adapters = options.dryRun
     ? createMockAdapters({ simulateCollision: false })
     : createRealAdapters();
+
+  // Credential preflight — BEFORE any tick, any claim, any spend. A live write
+  // run with a missing model-provider credential would otherwise dispatch a
+  // credential-missing arm, count the fire as clean, and permanently burn the
+  // opener with no real decisions. Refuse to boot if any required arm lacks its
+  // credential. (Rehearsal dispatches nothing, so it does not need this.)
+  if (isLiveWrite) {
+    const missingArms = ARMS.filter((arm) => adapters.get(arm.participantId)?.hasCredential() !== true);
+    if (missingArms.length > 0) {
+      throw new WatchUsageError(
+        'live boot refused — missing model-provider credential(s) for: ' +
+          missingArms.map((a) => `${a.participantId} (${a.credentialEnvVar})`).join(', ') +
+          '. Every arm must be credentialed before any ledger claim; fix the env and re-run.',
+      );
+    }
+    printLine(`credential preflight: all ${ARMS.length} model arms credentialed`);
+  }
 
   // Dry runs are repeatable demos: unless --out was passed explicitly, they
   // write into an ephemeral directory so synthetic fixture entries never

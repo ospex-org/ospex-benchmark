@@ -87,6 +87,10 @@ export interface WatchCliOptions {
   /** Report-only: evaluate and print what WOULD fire, write no ledger, no
    *  run files, dispatch nothing. Mandatory before the first live boot. */
   rehearse: boolean;
+  /** Explicit acknowledgement of the DESTRUCTIVE live path (real fires, real
+   *  spend, irreversible ledger claims). Required to fire; plain `yarn watch`
+   *  is fail-closed and refuses without it. */
+  live: boolean;
   outDir: string;
   /** True when --out was passed explicitly (dry runs default elsewhere). */
   outDirExplicit: boolean;
@@ -97,14 +101,23 @@ export interface WatchCliOptions {
   maxOutputTokens: number;
 }
 
-export const WATCH_USAGE = `Usage: yarn watch [options]
+export const WATCH_USAGE = `Usage: yarn watch (--live | --rehearse | --dry-run) [options]
 
-Options:
+A mode is REQUIRED — plain \`yarn watch\` is fail-closed and refuses, because the
+live path fires real model calls, bills real money, and makes irreversible
+ledger claims. Run --rehearse first and review its output before --live.
+
+Modes:
+  --live                 DESTRUCTIVE: real fires against live data. Validates
+                         every model-provider credential before any claim and
+                         refuses to boot if one is missing.
   --dry-run              One pass against the fixture slate and mock providers
                          (no credentials, no network, implies --once).
   --rehearse             Report-only: evaluate every speculation and print what
                          WOULD fire, writing no ledger and dispatching nothing.
                          Mandatory before a first live boot (implies --once).
+
+Options:
   --once                 Run a single watch pass and exit (external schedulers, tests).
   --out DIR              Output directory (run files + line-open-ledger/). Default: out/
   --poll-seconds N       Poll interval between passes. Default: 60, min 30.
@@ -126,6 +139,7 @@ export function parseWatchArgs(argv: string[], onHelp: () => void): WatchCliOpti
     dryRun: false,
     once: false,
     rehearse: false,
+    live: false,
     outDir: 'out',
     outDirExplicit: false,
     pollSeconds: 60,
@@ -150,6 +164,9 @@ export function parseWatchArgs(argv: string[], onHelp: () => void): WatchCliOpti
       case '--rehearse':
         options.rehearse = true;
         options.once = true;
+        break;
+      case '--live':
+        options.live = true;
         break;
       case '--once':
         options.once = true;
@@ -374,6 +391,13 @@ export interface FireOutcome {
   armOutcomes: Record<string, ArmOutcome>;
   baselineDecisions: number;
   collisionFailed: boolean;
+  /** True when the fire did not produce a scoreable cohort — a required arm was
+   *  credential-missing (a structural config error, not a transient miss) or no
+   *  arm produced a valid response at all. Such a fire is durably FAILED, never
+   *  a clean entry, and it exits `--once` nonzero. Optional so synthetic test
+   *  outcomes may omit it (treated as false). */
+  fireFailed?: boolean | undefined;
+  failureReason?: string | undefined;
 }
 
 export interface WatchDeps {
@@ -601,7 +625,9 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
       // re-appear as `entered` in the durable coverage.
       const handled = deps.ledger.get(specKey(row.gameId, market));
       if (handled !== undefined) {
-        const failedFire = handled.decision === 'fired' && handled.fireError !== undefined;
+        const failedFire =
+          handled.decision === 'fired' &&
+          (handled.fireError !== undefined || handled.collisionFailed === true);
         statuses.push({
           ...base,
           state: handled.decision === 'late_detection' ? 'late' : failedFire ? 'failed' : 'fired',
@@ -1029,8 +1055,14 @@ async function dispatchFire(
     return { fired: [], failed: wonMarkets };
   }
 
-  // The fire SUCCEEDED — providers were billed. A completion-write failure must
-  // NOT downgrade it to failed (that would mislabel a real, scored fire).
+  // The dispatch completed — providers were billed. But it is a clean ENTRY
+  // only if the cohort is scoreable: a provider collision, a credential-missing
+  // arm, or a total dud is a FAILED fire, recorded with durable failure evidence
+  // (`fireError`) so it renders `fire_failed`, never a clean `entered`, on any
+  // later tick. A completion-write failure alone does NOT downgrade a real fire.
+  const unscoreable = outcome.collisionFailed || outcome.fireFailed;
+  const failureReason =
+    outcome.failureReason ?? (outcome.collisionFailed ? 'provider collision (unscoreable)' : undefined);
   for (const c of claimed) {
     const completed: SpecLedgerEntry = {
       ...c.entry,
@@ -1039,23 +1071,22 @@ async function dispatchFire(
       armOutcomes: outcome.armOutcomes,
       baselineDecisions: outcome.baselineDecisions,
       collisionFailed: outcome.collisionFailed,
+      ...(unscoreable ? { fireError: failureReason } : {}),
     };
     deps.ledger.set(specKey(c.entry.gameId, c.entry.market), completed);
     try {
       persistLedgerEntry(deps.ledgerDir, completed);
     } catch (error) {
       deps.logError(
-        `completion-write failed for ${plan.row.slug} ${c.market} (fire succeeded, run ${outcome.runFile}) — ledger link may be stale: ${describeError(error)}`,
+        `completion-write failed for ${plan.row.slug} ${c.market} (run ${outcome.runFile}) — ledger link may be stale: ${describeError(error)}`,
       );
     }
   }
-  if (outcome.collisionFailed) {
+  if (unscoreable) {
     summary.failed += 1;
-  } else {
-    summary.fired += wonMarkets.length;
+    return { fired: [], failed: wonMarkets };
   }
-  // A dispatch DID happen (terminal) — the markets render `fired` in the status
-  // snapshot even on collision-failure.
+  summary.fired += wonMarkets.length;
   return { fired: wonMarkets, failed: [] };
 }
 
@@ -1144,11 +1175,34 @@ export async function fireEligibleGame(
     cfg.logError(`!!! ${ctx.runId} FAILED — ${codes.join(' + ')} (file kept, permanently unscoreable) !!!`);
     for (const failure of collision.failures) cfg.logError(`  ${failure}`);
   }
+
+  // A fire is a clean entry only if it produced a scoreable cohort. A
+  // credential-missing arm is a STRUCTURAL failure (that arm never participated
+  // — a misconfiguration, not a transient miss), and a fire in which NO arm
+  // produced a valid response is a total dud. Either is a FAILED fire, never a
+  // clean entry — the board must not be laundered into `fired` without the
+  // intended model decisions. A single transient miss while other arms succeed
+  // is a normal partial fire and still counts.
+  const credentialMissing = armGameResults.filter((r) => r.outcome === 'credential_missing');
+  const anyValid = armGameResults.some((r) => r.outcome === 'valid');
+  const fireFailed = credentialMissing.length > 0 || !anyValid;
+  const failureReason =
+    credentialMissing.length > 0
+      ? `credential_missing: ${credentialMissing.map((r) => r.arm.participantId).join(', ')}`
+      : !anyValid
+        ? 'no arm produced a valid response'
+        : undefined;
+  if (fireFailed) {
+    cfg.logError(`!!! ${ctx.runId} FIRE FAILED — ${failureReason} (board claimed, no scoreable cohort) !!!`);
+  }
+
   return {
     runId: ctx.runId,
     runFile,
     armOutcomes,
     baselineDecisions: baselineDecisions.length,
     collisionFailed: collision.failures.length > 0,
+    fireFailed,
+    failureReason,
   };
 }

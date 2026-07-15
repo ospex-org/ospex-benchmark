@@ -96,11 +96,17 @@ Artifact safety: every byte serialized to NDJSON or the summary passes through c
 ## Line-open watch mode (the speculation is the unit)
 
 ```bash
-yarn watch                 # long-running; polls every 60 seconds
-yarn watch --once          # single pass (external schedulers)
-yarn watch --rehearse      # report-only: what it WOULD fire, no writes
+yarn watch --rehearse      # report-only: what it WOULD fire, no writes (do this first)
+yarn watch --live          # DESTRUCTIVE: real fires, real spend, long-running
+yarn watch --live --once   # single live pass (external schedulers)
 yarn watch --dry-run       # fixture slate + mock providers, no credentials
+# plain `yarn watch` is fail-closed and refuses — a mode is required.
 ```
+
+The live path is fail-closed: a mode is mandatory (plain `yarn watch` refuses),
+`--live` explicitly acknowledges real spend and irreversible claims, and the
+boot validates every model-provider credential BEFORE any ledger claim so a
+misconfigured key can never silently burn an opener with no real decisions.
 
 The smoke enters a slate whenever it is run — often hours after lines
 matured, where economic closing-line value is structurally ≈ −vig and
