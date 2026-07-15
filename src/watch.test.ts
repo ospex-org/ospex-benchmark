@@ -16,7 +16,7 @@ import {
   watchTick,
   WatchUsageError,
 } from './watch.js';
-import type { FireOutcome, SpecLedgerEntry, WatchDeps, WatchGateProvenance } from './watch.js';
+import type { FireOutcome, SpecLedgerEntry, SpecStatus, WatchDeps, WatchGateProvenance } from './watch.js';
 import type { BuildResult } from './bundle.js';
 import type {
   CurrentOddsRow,
@@ -596,9 +596,29 @@ test('a scoped watch fire (moneyline + total) produces a run file that passes fu
   });
   assert.ok(
     verifyRunIntegrity(parseRunRecords(lateFired), { expectedArms }).some((v) =>
-      v.includes('opener age exceeds the recorded late threshold'),
+      v.includes('opener age exceeds the committed late threshold'),
     ),
   );
+
+  // Forgery the scorer must catch: inflate the recorded threshold to match a
+  // stale opener (both consistent with each other). Pinning to the committed
+  // constant refuses it — the artifact cannot raise its own bar.
+  const forgedThreshold = [...lines];
+  const staleOpen = new Date(NOW_MS - 100 * 3_600_000).toISOString();
+  forgedThreshold[metaIndex] = JSON.stringify({
+    ...meta,
+    watch: {
+      detectedAt,
+      lateThresholdSeconds: 400_000,
+      markets: {
+        moneyline: { firstAppearanceAt: staleOpen, openerAgeSeconds: 360_000 },
+        total: { firstAppearanceAt: staleOpen, openerAgeSeconds: 360_000 },
+      },
+    },
+  });
+  const forgedViolations = verifyRunIntegrity(parseRunRecords(forgedThreshold), { expectedArms });
+  assert.ok(forgedViolations.some((v) => v.includes('is not the committed')));
+  assert.ok(forgedViolations.some((v) => v.includes('exceeds the committed late threshold')));
 
   // Fail-closed: a market gated but not entered (or vice versa) is a violation.
   const gateMismatch = [...lines];
@@ -833,16 +853,37 @@ test('a collision-failed fire is a FAILED pass, not a fired one', async () => {
   assert.equal(deps.ledger.get(key(GAME_ID, 'moneyline'))?.collisionFailed, true);
 });
 
-test('a thrown board-history read is a failure, not a benign deferral', async () => {
+test('a thrown board-history read is a failure per market, fault-isolated, not a benign deferral', async () => {
   const fire = fakeFire();
   const deps = makeDeps({
     fireGame: fire.fire,
+    // Both enabled markets' reads throw → two isolated failures, no deferral,
+    // no dispatch — and the game still yields a status snapshot (not dropped).
     fetchFirstBoardAppearance: () => Promise.reject(new Error('read denied')),
   });
+  const captured: SpecStatus[] = [];
+  deps.onStatuses = (s) => captured.push(...s);
   const summary = await watchTick(deps);
-  assert.equal(summary.failed, 1);
+  assert.equal(summary.failed, 2); // moneyline + total
   assert.equal(summary.deferred, 0);
   assert.equal(fire.calls.length, 0);
+  // The game is NOT lost from coverage — every market has a status.
+  assert.equal(captured.length, 3);
+  assert.ok(captured.some((s) => s.reason === 'board_read_failed'));
+});
+
+test('one market\'s broken read does not blind its sibling — the readable market still fires', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null), oddsRow('total', 8.5)])),
+    fetchFirstBoardAppearance: (_g, market) =>
+      market === 'total' ? Promise.reject(new Error('read denied')) : Promise.resolve(OPENED_AT),
+  });
+  const summary = await watchTick(deps);
+  assert.equal(summary.failed, 1); // total's read
+  assert.equal(summary.fired, 1); // moneyline still fires
+  assert.deepEqual(fire.calls[0]?.markets, ['moneyline']);
 });
 
 test('a future-dated first appearance fails closed: logged, never cached, never fired', async () => {

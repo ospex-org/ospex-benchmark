@@ -4,6 +4,7 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { PROPORTIONAL_DEVIG_METHOD, scoreDecision, SHIN_DEVIG_METHOD } from './clv.js';
 import { favorableLineMovement } from './clv.js';
 import { LADDER_VERSION, scoreTotalsLadder } from './ladder.js';
+import { enabledMarkets, LATE_THRESHOLD_MS } from './marketPolicy.js';
 import { checkProviderCollision } from './providers/family.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
@@ -132,7 +133,14 @@ const bundleGameSchema = z
               .passthrough()
               .optional(),
           })
-          .passthrough(),
+          .passthrough()
+          // The harness never emits a zero-market bundle (buildBundle excludes
+          // a game with no buildable market); refuse one at parse time so a
+          // doctored empty-markets bundle cannot inflate a denominator.
+          .refine(
+            (m) => m.moneyline !== undefined || m.runLine !== undefined || m.total !== undefined,
+            'bundle carries no market blocks',
+          ),
       })
       .passthrough(),
   })
@@ -684,6 +692,16 @@ export function verifyRunIntegrity(
       if (!Number.isFinite(detectedMs)) {
         violations.push('watch provenance detectedAt is unparseable');
       }
+      // The recorded late threshold must be the COMMITTED constant — run_meta
+      // is not hash-covered, so a doctored artifact could otherwise inflate its
+      // own threshold and certify a stale opener as fresh. The gate below is
+      // pinned to the committed value, not the artifact's copy.
+      const committedThresholdSeconds = LATE_THRESHOLD_MS / 1000;
+      if (run.watch.lateThresholdSeconds !== committedThresholdSeconds) {
+        violations.push(
+          `watch provenance late threshold ${run.watch.lateThresholdSeconds}s is not the committed ${committedThresholdSeconds}s`,
+        );
+      }
       const gateMarkets = Object.entries(run.watch.markets);
       if (gateMarkets.length === 0) {
         violations.push('watch provenance carries no per-market gate — nothing was entered');
@@ -704,9 +722,10 @@ export function verifyRunIntegrity(
         if (gate.openerAgeSeconds < 0) {
           violations.push(`watch provenance ${market} openerAgeSeconds is negative — impossible gate result`);
         }
-        if (gate.openerAgeSeconds > run.watch.lateThresholdSeconds) {
+        // Pinned to the COMMITTED constant, not run.watch.lateThresholdSeconds.
+        if (gate.openerAgeSeconds > committedThresholdSeconds) {
           violations.push(
-            `watch provenance ${market} opener age exceeds the recorded late threshold — this market should never have fired`,
+            `watch provenance ${market} opener age exceeds the committed late threshold — this market should never have fired`,
           );
         }
         if (Number.isFinite(detectedMs)) {
@@ -726,6 +745,9 @@ export function verifyRunIntegrity(
       const singleGameId = [...run.games.keys()][0];
       if (singleGame !== undefined) {
         const bundleMarkets = bundleMarketKeysFromPrices(singleGame);
+        if (bundleMarkets.length === 0) {
+          violations.push('watch run bundle carries no markets — nothing could have been entered');
+        }
         for (const market of bundleMarkets) {
           if (!gatedSet.has(market)) {
             violations.push(`watch run entered ${market} but recorded no gate provenance for it`);
@@ -770,6 +792,21 @@ export function verifyRunIntegrity(
         for (const d of forGame) {
           if (d.decision === 'entered' && d.firstAppearanceAt === null) {
             violations.push(`denominator marks ${d.market} entered but records no first-appearance evidence`);
+          }
+        }
+        // Anchor the denominator to the FROZEN market policy, not just the
+        // (attacker-controllable) bundle: every market the committed allow-list
+        // enables for this league must appear in the denominator (entered or
+        // not_entered). Otherwise the bundle, the gate set, and the denominator
+        // could all be shrunk in lockstep to hide a market that should have
+        // been entered. The run line (policy_disabled) is legitimately absent
+        // from the enabled set, so this does not demand it.
+        const covered = new Set([...enteredSet, ...notEnteredSet]);
+        for (const market of enabledMarkets(singleGame.league)) {
+          if (!covered.has(market)) {
+            violations.push(
+              `watch run denominator omits policy-enabled market ${market} — coverage cannot be shrunk below the committed policy`,
+            );
           }
         }
       }
@@ -1805,6 +1842,15 @@ export function aggregateByParticipant(
     list.push(response);
     responsesByParticipant.set(response.participantId, list);
   }
+  // A model arm is eligible in market M for a game iff that game's bundle
+  // carries M — a scoped fire (moneyline + total) makes the arm eligible in
+  // two markets, not three. Derive the per-game market set once.
+  const marketsByGame = new Map<string, Set<MarketKey>>();
+  for (const [gameId, game] of run.games) {
+    marketsByGame.set(gameId, new Set(bundleMarketKeysFromPrices(game)));
+  }
+  const eligibleInMarket = (responses: ArmResponseRef[], market: MarketKey): number =>
+    responses.filter((r) => marketsByGame.get(r.gameId)?.has(market) ?? false).length;
 
   // Every arm that was dispatched appears, even with zero valid decisions —
   // failures must never vanish from the denominators.
@@ -1865,7 +1911,10 @@ export function aggregateByParticipant(
     const byMarket: ParticipantStats['byMarket'] = {};
     for (const market of MARKETS) {
       const marketPicks = picks.filter((p) => p.market === market);
-      const eligible = kind === 'model' ? responses.length : marketPicks.length;
+      // Model arms are eligible only in the markets their dispatched games
+      // actually carried — not blindly in all three (that produced a phantom
+      // "Spread 0/N" row and understated coverage on every scoped run).
+      const eligible = kind === 'model' ? eligibleInMarket(responses, market) : marketPicks.length;
       if (eligible === 0 && marketPicks.length === 0) continue;
       const marketEconomic = clusterByGame(marketPicks, (p) => p.result.primaryClvPct);
       const marketMarginAdjusted = clusterByGame(
@@ -1940,7 +1989,13 @@ export function aggregateByParticipant(
       participantId,
       kind,
       games: kind === 'model' ? responses.length : new Set(picks.map((p) => p.gameId)).size,
-      eligibleMarkets: kind === 'model' ? responses.length * 3 : picks.length,
+      // A model arm's eligible-market count is the sum of its games' bundle
+      // market counts (2 for a scoped moneyline+total fire, 3 for a full board)
+      // — never a hardcoded ×3.
+      eligibleMarkets:
+        kind === 'model'
+          ? responses.reduce((sum, r) => sum + (marketsByGame.get(r.gameId)?.size ?? 0), 0)
+          : picks.length,
       validDecisions: picks.length,
       armOutcomes,
       primaryScoreable: economic.values.length,

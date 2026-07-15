@@ -4,7 +4,7 @@ import { ZodError } from 'zod';
 import { describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
-import { fetchClosingLines } from './fetchers.js';
+import { fetchClosingLines, fetchFirstBoardAppearance } from './fetchers.js';
 import { LADDER_VERSION, loadLadderParams } from './ladder.js';
 import { writeNdjson, writeText } from './records.js';
 import { buildScorecardMarkdown } from './scorecard.js';
@@ -15,6 +15,7 @@ import {
   scoredRecords,
   scoreRun,
   verifyRunIntegrity,
+  verifyWatchEntryTiming,
 } from './scoring.js';
 
 /**
@@ -126,6 +127,33 @@ async function main(): Promise<number> {
     return 1;
   }
   printLine('integrity: hashes, decision echoes, and response linkage verified');
+
+  // Independent entry-timing verification: for a watch run, re-derive each
+  // entered market's first board appearance from the append-only odds_history
+  // and reconcile the self-reported opener age against it. This is what turns
+  // the fire-at-detection claim from self-attested into independently checked;
+  // a claimed opener the source log refutes refuses the score.
+  if (run.runId.startsWith('watch-v0-')) {
+    const timing = await verifyWatchEntryTiming(run, (gameId, market) =>
+      fetchFirstBoardAppearance(supabaseUrl, supabaseAnonKey, gameId, market),
+    );
+    if (timing.violations.length > 0) {
+      printError('');
+      printError('!!! ENTRY-TIMING VERIFICATION FAILURE — refusing to score !!!');
+      for (const violation of timing.violations) printError(`  ${violation}`);
+      return 1;
+    }
+    if (timing.unknown.length > 0) {
+      // A market whose opener could not be re-derived is a typed UNKNOWN, never
+      // a silent pass: the entry-honesty claim for it is unverifiable, so the
+      // run is not scoreable until odds_history is readable for it.
+      printError('');
+      printError('!!! ENTRY-TIMING UNVERIFIABLE — odds_history did not resolve every entered market !!!');
+      for (const u of timing.unknown) printError(`  ${u.market}: ${u.detail}`);
+      return 1;
+    }
+    printLine('entry timing: each entered market\'s opener reconciled against odds_history');
+  }
 
   // The published dispersion parameter the totals ladder runs on — loaded
   // from the committed artifact and stamped on every scored record.

@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
@@ -142,7 +142,28 @@ async function main(): Promise<number> {
   // their full denominator in the run file; this log covers games that never
   // fire any market (no run file), so their negative space is not invisible.
   const coverageFile = join(outDir, 'line-open-coverage.ndjson');
+  // Seed the state-change dedup from the existing coverage log so a restart
+  // does not re-append an unchanged disposition for every already-logged
+  // speculation (the log is append-only and survives restarts, like the ledger).
   const lastDisposition = new Map<string, string>();
+  if (!options.rehearse && existsSync(coverageFile)) {
+    for (const line of readFileSync(coverageFile, 'utf8').split(/\r?\n/)) {
+      if (line.trim() === '') continue;
+      try {
+        const rec = JSON.parse(line) as {
+          gameId?: string;
+          market?: string;
+          state?: string;
+          reason?: string;
+        };
+        if (rec.gameId && rec.market && rec.state && rec.reason) {
+          lastDisposition.set(`${rec.gameId}:${rec.market}`, `${rec.state}:${rec.reason}`);
+        }
+      } catch {
+        // a corrupt line just means that key re-emits once — harmless
+      }
+    }
+  }
   const onStatuses = options.rehearse
     ? undefined
     : (statuses: SpecStatus[]): void => {

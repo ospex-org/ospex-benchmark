@@ -21,6 +21,17 @@ import type { MarketKey } from './types.js';
 export const MARKET_POLICY_VERSION = 'market-policy-v1';
 
 /**
+ * The committed entry-honesty threshold: a market fires only if its own first
+ * board appearance is within this window of detection. Preregistration, not a
+ * runtime lever — it is stamped into every run record AND the scorer pins its
+ * checks to THIS constant rather than the run's self-reported copy, so a
+ * doctored artifact cannot certify a stale opener as fresh by inflating its
+ * own threshold. Lives here, beside the market allow-list, because both are
+ * the frozen preregistration the runner and the scorer must agree on.
+ */
+export const LATE_THRESHOLD_MS = 30 * 60_000;
+
+/**
  * The allow-list. A market dispatches only if its league is listed here AND
  * the market appears in that league's array. MLB scores the moneyline and the
  * total; the run line is supported everywhere (types, prompt, schema,

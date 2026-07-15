@@ -1,9 +1,10 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { runBaselines } from './baselines.js';
 import { buildScopedResult, evaluateGameMarkets, FUTURE_QUOTE_SKEW_MS } from './bundle.js';
 import { describeError } from './config.js';
+import { LATE_THRESHOLD_MS } from './marketPolicy.js';
 import { MARKET_KEYS } from './markets.js';
 import { checkProviderCollision } from './providers/family.js';
 import {
@@ -52,14 +53,10 @@ import type {
  * same per-speculation records. Nothing ever waits for another market.
  */
 
-/**
- * The entry-honesty threshold: a market fires only if its OWN first board
- * appearance was within this window of detection. Committed constant, NOT a
- * CLI flag — a per-invocation lever over which openers are admitted would be a
- * cherry-pick surface. It is stamped into every run record and the scorer
- * checks each market's age against it.
- */
-export const LATE_THRESHOLD_MS = 30 * 60_000;
+/** The committed entry-honesty threshold lives in marketPolicy (the frozen-
+ *  preregistration home) so the watcher AND the scorer pin to ONE constant.
+ *  Re-exported here for the watcher's existing consumers. NOT a CLI flag. */
+export { LATE_THRESHOLD_MS };
 
 /**
  * Per-tick dispatch circuit breaker (billing events, not speculations — a
@@ -301,7 +298,14 @@ export function loadLedger(
     for (const name of files) {
       if (!name.endsWith('.json')) continue;
       const market = name.slice(0, -'.json'.length) as MarketKey;
-      if (!MARKET_KEYS.includes(market)) continue;
+      if (!MARKET_KEYS.includes(market)) {
+        // A ledger file with an unrecognized market stem is a migration or
+        // corruption signal — surface it rather than silently ignoring it.
+        logError(
+          `ledger entry ${gameId}/${name} has an unrecognized market name — skipped (migration or corruption?)`,
+        );
+        continue;
+      }
       const key = specKey(gameId, market);
       try {
         const parsed = JSON.parse(readFileSync(join(gameDir, name), 'utf8')) as SpecLedgerEntry;
@@ -582,19 +586,38 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         continue;
       }
 
-      // Not buildable at this snapshot (never opened / one-sided / stale / …).
+      // Not buildable at this snapshot. A game-level exclusion (a non-upcoming
+      // status) is the true reason and takes precedence over the per-market
+      // fallback, so the denominator records `status:postponed` rather than a
+      // misleading `market_never_opened`.
       if (!evaluation.built.includes(market)) {
         statuses.push({
           ...base,
           state: 'blocked',
-          reason: evaluation.reasons[market] ?? 'market_never_opened',
+          reason:
+            evaluation.gameExcludedReason ??
+            evaluation.reasons[market] ??
+            'market_never_opened',
         });
         continue;
       }
 
-      // Buildable → the per-market late gate needs the first appearance.
-      const first = await firstAppearance(deps, row.gameId, market);
+      // Buildable → the per-market late gate needs the first appearance. A
+      // THROWN read (network/permission) is fault-isolated to THIS market: it
+      // is a failure, but the game's other markets still evaluate and the
+      // game still yields a plan (so its denominator/coverage is never lost).
       const deferKey = specKey(row.gameId, market);
+      let first: string | null;
+      try {
+        first = await firstAppearance(deps, row.gameId, market);
+      } catch (error) {
+        summary.failed += 1;
+        deps.logError(
+          `board-appearance read failed for ${row.gameId} ${market} (${describeError(error)}) — market excluded this tick`,
+        );
+        statuses.push({ ...base, state: 'blocked', reason: 'board_read_failed' });
+        continue;
+      }
       if (first === null) {
         summary.deferred += 1;
         const since = deps.deferredSince.get(deferKey) ?? deps.nowMs();
@@ -661,7 +684,11 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         }
         summary.speculations += 1;
         if (status.state === 'disabled') summary.disabled += 1;
-        else if (status.state === 'blocked') summary.blocked += 1;
+        // A board_read_failed market is already tallied in `failed` (planGame)
+        // — count it as a speculation but not also as a benign block.
+        else if (status.state === 'blocked' && status.reason !== 'board_read_failed') {
+          summary.blocked += 1;
+        }
         // 'deferred' already counted in planGame; 'ready'/'late' handled below.
       }
 
@@ -745,8 +772,30 @@ async function fireReadySpeculations(
   plan: GamePlan,
   summary: TickSummary,
 ): Promise<void> {
+  // ONE detection instant for the whole fire, and every market's opener age is
+  // recomputed against it — so the recorded provenance is internally
+  // consistent (the scorer recomputes openerAge = detectedAt − firstAppearance
+  // and rejects a mismatch). A ready market that aged past the gate during the
+  // (network) board reads is DROPPED and re-detected next tick — never fired
+  // stale. If none survive, nothing is claimed or dispatched.
   const detectedAtMs = deps.nowMs();
-  const readyMarkets = plan.ready.map((r) => r.market);
+  const detectedAt = new Date(detectedAtMs).toISOString();
+  const gated = plan.ready
+    .map((r) => ({
+      market: r.market,
+      firstAppearanceAt: r.firstAppearanceAt,
+      ageMs: detectedAtMs - Date.parse(r.firstAppearanceAt),
+    }))
+    .filter((r) => r.ageMs <= deps.lateMs)
+    .map((r) => ({
+      market: r.market,
+      firstAppearanceAt: r.firstAppearanceAt,
+      openerAgeSeconds: Math.max(0, Math.round(r.ageMs / 1000)),
+    }));
+  if (gated.length === 0) return;
+  const readyMarkets = gated.map((r) => r.market);
+  const gatedSet = new Set(readyMarkets);
+
   // The bundle is assembled from the snapshot the plan was built on — its
   // fetch-completion instant is the bundle timestamp, so detection (now, ≥ that
   // instant) never predates its inputs (the scorer verifies exactly that).
@@ -760,38 +809,57 @@ async function fireReadySpeculations(
     oddsRows: plan.oddsRows,
   });
   const request = build.requests[0];
-  if (request === undefined) return; // unreachable: ready is non-empty
+  if (request === undefined) return; // unreachable: gated is non-empty
 
   const provenance: WatchGateProvenance = {
-    detectedAt: new Date(detectedAtMs).toISOString(),
+    detectedAt,
     lateThresholdSeconds: Math.round(deps.lateMs / 1000),
     markets: Object.fromEntries(
-      plan.ready.map((r) => [
+      gated.map((r) => [
         r.market,
         { firstAppearanceAt: r.firstAppearanceAt, openerAgeSeconds: r.openerAgeSeconds },
       ]),
     ),
   };
 
-  // Claim every ready speculation before dispatch (memory, then disk).
+  // Claim every gated speculation before dispatch (memory, then disk),
+  // ATOMICALLY: if any disk write throws, roll the whole batch back (delete the
+  // written claim files and drop the in-memory entries) so no phantom `fired`
+  // speculation is stranded, and dispatch nothing.
   const claimed: SpecLedgerEntry[] = [];
-  for (const r of plan.ready) {
-    const entry: SpecLedgerEntry = {
-      gameId: plan.row.gameId,
-      slug: plan.row.slug,
-      market: r.market,
-      decision: 'fired',
-      decidedAt: provenance.detectedAt,
-      slateDate: plan.slateDate,
-      scheduledStartUtc: plan.row.matchTime,
-      firstAppearanceAt: r.firstAppearanceAt,
-      openerAgeSeconds: r.openerAgeSeconds,
-      gameSha256: build.gameHashes[plan.row.gameId] ?? 'unknown',
-      requestSha256: request.requestSha256,
-    };
-    deps.ledger.set(specKey(plan.row.gameId, r.market), entry);
-    persistLedgerEntry(deps.ledgerDir, entry);
-    claimed.push(entry);
+  try {
+    for (const r of gated) {
+      const entry: SpecLedgerEntry = {
+        gameId: plan.row.gameId,
+        slug: plan.row.slug,
+        market: r.market,
+        decision: 'fired',
+        decidedAt: detectedAt,
+        slateDate: plan.slateDate,
+        scheduledStartUtc: plan.row.matchTime,
+        firstAppearanceAt: r.firstAppearanceAt,
+        openerAgeSeconds: r.openerAgeSeconds,
+        gameSha256: build.gameHashes[plan.row.gameId] ?? 'unknown',
+        requestSha256: request.requestSha256,
+      };
+      deps.ledger.set(specKey(plan.row.gameId, r.market), entry);
+      persistLedgerEntry(deps.ledgerDir, entry);
+      claimed.push(entry);
+    }
+  } catch (error) {
+    for (const entry of claimed) {
+      deps.ledger.delete(specKey(entry.gameId, entry.market));
+      try {
+        rmSync(ledgerPath(deps.ledgerDir, entry.gameId, entry.market), { force: true });
+      } catch {
+        // best-effort rollback; the surfaced failure is the signal
+      }
+    }
+    summary.failed += 1;
+    deps.logError(
+      `claim failed for ${plan.row.slug} (${plan.row.gameId}) — rolled back, nothing dispatched: ${describeError(error)}`,
+    );
+    return;
   }
 
   deps.log(
@@ -804,48 +872,69 @@ async function fireReadySpeculations(
     fetchStartedAt: plan.fetchStartedAt,
     fetchCompletedAt: plan.fetchCompletedAt,
   };
-  // The published denominator for this game: every market's disposition, so a
-  // market that did NOT enter (disabled, never opened, late) is a recorded fact
-  // in the run file next to the entered ones — never an invisible gap.
-  const dispositions: SpeculationDisposition[] = plan.statuses.map((status) => ({
-    gameId: status.gameId,
-    slug: status.slug,
-    league: status.league,
-    market: status.market,
-    decision: status.state === 'ready' ? 'entered' : 'not_entered',
-    reason: status.state === 'ready' ? 'entered' : status.reason,
-    firstAppearanceAt: status.firstAppearanceAt,
-    openerAgeSeconds: status.openerAgeSeconds,
-    scheduledStartUtc: status.scheduledStartUtc,
-  }));
+  // The published denominator for this game: every market's disposition. The
+  // ENTERED set is exactly the gated (dispatched) markets — a ready market
+  // dropped by the age-recompute above is recorded not_entered / late_detection,
+  // so the denominator and the bundle stay consistent.
+  const dispositions: SpeculationDisposition[] = plan.statuses.map((status) => {
+    const entered = gatedSet.has(status.market);
+    return {
+      gameId: status.gameId,
+      slug: status.slug,
+      league: status.league,
+      market: status.market,
+      decision: entered ? 'entered' : 'not_entered',
+      reason: entered ? 'entered' : status.state === 'ready' ? 'late_detection' : status.reason,
+      firstAppearanceAt: status.firstAppearanceAt,
+      openerAgeSeconds: status.openerAgeSeconds,
+      scheduledStartUtc: status.scheduledStartUtc,
+    };
+  });
+
+  let outcome: FireOutcome;
   try {
-    const outcome = await deps.fireGame(build, fireInputs, plan.slateDate, provenance, dispositions);
-    for (const entry of claimed) {
-      const completed: SpecLedgerEntry = {
-        ...entry,
-        runId: outcome.runId,
-        runFile: outcome.runFile,
-        armOutcomes: outcome.armOutcomes,
-        baselineDecisions: outcome.baselineDecisions,
-        collisionFailed: outcome.collisionFailed,
-      };
-      deps.ledger.set(specKey(entry.gameId, entry.market), completed);
-      persistLedgerEntry(deps.ledgerDir, completed);
-    }
-    if (outcome.collisionFailed) {
-      // A hard identity/collision failure: the file exists but is unscoreable.
-      summary.failed += 1;
-    } else {
-      summary.fired += plan.ready.length;
-    }
+    outcome = await deps.fireGame(build, fireInputs, plan.slateDate, provenance, dispositions);
   } catch (error) {
     for (const entry of claimed) {
       const failed: SpecLedgerEntry = { ...entry, fireError: describeError(error) };
       deps.ledger.set(specKey(entry.gameId, entry.market), failed);
-      persistLedgerEntry(deps.ledgerDir, failed);
+      try {
+        persistLedgerEntry(deps.ledgerDir, failed);
+      } catch {
+        // the in-memory claim already prevents a re-fire this process
+      }
     }
     summary.failed += 1;
     deps.logError(`fire failed for ${plan.row.slug} (${plan.row.gameId}): ${describeError(error)}`);
+    return;
+  }
+
+  // The fire SUCCEEDED — providers were billed. A completion-write failure must
+  // NOT downgrade it to failed (that would mislabel a real, scored fire): log
+  // it and keep counting the fire.
+  for (const entry of claimed) {
+    const completed: SpecLedgerEntry = {
+      ...entry,
+      runId: outcome.runId,
+      runFile: outcome.runFile,
+      armOutcomes: outcome.armOutcomes,
+      baselineDecisions: outcome.baselineDecisions,
+      collisionFailed: outcome.collisionFailed,
+    };
+    deps.ledger.set(specKey(entry.gameId, entry.market), completed);
+    try {
+      persistLedgerEntry(deps.ledgerDir, completed);
+    } catch (error) {
+      deps.logError(
+        `completion-write failed for ${plan.row.slug} ${entry.market} (fire succeeded, run ${outcome.runFile}) — ledger link may be stale: ${describeError(error)}`,
+      );
+    }
+  }
+  if (outcome.collisionFailed) {
+    // A hard identity/collision failure: the file exists but is unscoreable.
+    summary.failed += 1;
+  } else {
+    summary.fired += gated.length;
   }
 }
 
