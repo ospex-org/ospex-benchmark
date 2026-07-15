@@ -76,11 +76,14 @@ For one game's ready speculations, once, at detection:
    gate's board-history reads. Build and hash the bundle carrying exactly the
    ready markets; detection is stamped after assembly, so
    bundle-assembly ≤ detection ≤ dispatch holds by construction.
-2. Apply the per-market late gate (a first appearance after detection fails
-   closed — never cached, never fired; a small skew allowance mirrors the
-   bundle's future-quote tolerance).
-3. Claim each ready speculation in the ledger — memory first, then disk —
-   BEFORE any dispatch, so neither a crash nor a restart can double-bill.
+2. Apply the per-market late gate (ANY first appearance after the current
+   instant fails closed — never cached, never fired; strict, with no future
+   grace, so the runtime accepts only what the scorer will).
+3. Claim each ready speculation with an EXCLUSIVE-create ledger file (then set
+   the in-memory entry) BEFORE any dispatch, so neither a crash, a restart, nor
+   a second concurrent watcher can double-bill. A market whose gate age was
+   recomputed past the threshold, or whose claim loses to another instance, is
+   dropped from the dispatch and re-detected next tick.
 4. Fire: dispatch all four model arms concurrently and run the deterministic
    baselines for the markets the bundle carries (the four moneyline baselines
    and the two total baselines for a moneyline+total fire; the run-line pair
@@ -162,8 +165,10 @@ games, except `games` and `dispatches`:
 - **specs** — (game, market) pairs evaluated this tick, excluding ones already
   terminal in the ledger.
 - **fired** — speculations newly dispatched this tick.
-- **dispatches** — billing events (a batched co-arrival is one dispatch of four
-  model calls, however many markets it carries).
+- **dispatches** — billing events, counted only when a dispatch actually
+  happens (a claim lost to another instance does not count). A batched
+  co-arrival is one dispatch to the four model arms — plus a format-repair call
+  per arm that needs one — however many markets it carries.
 - **late** — speculations newly excluded `late_detection` (their opener was
   older than the 30-minute threshold). Terminal.
 - **deferred** — buildable speculations whose first-appearance history row is
@@ -196,9 +201,12 @@ than inferred from the counters — the exclusion reason a naive counter hides.
   mock adapters + synthetic clock; ephemeral out dir unless `--out` given;
   implies `--once`). The late-detection threshold and the market policy are
   committed constants, not flags.
-- One instance per `--out` directory (model calls cost real money; the ledger
-  makes double-fire impossible across restarts but not across two concurrent
-  processes).
+- One instance per `--out` directory is still the operating recommendation,
+  but the exclusive-create ledger claim now makes it a billing-safety guarantee
+  too: two watchers sharing a ledger directory cannot both win a speculation's
+  claim, so they cannot both dispatch it. Within a tick the games' dispatches
+  run concurrently, so a slow provider call on one game never delays another's
+  fire past its opener.
 - `yarn preflight` before a live session remains the ritual — a fire with dead
   credentials still counts as fired, and the ledger is one-shot.
 - Scoring is unchanged: after closes land, `yarn score --run out/<runId>.ndjson`

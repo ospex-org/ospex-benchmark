@@ -155,9 +155,11 @@ async function main(): Promise<number> {
           market?: string;
           state?: string;
           reason?: string;
+          snapshotObservedAt?: string | null;
         };
         if (rec.gameId && rec.market && rec.state && rec.reason) {
-          lastDisposition.set(`${rec.gameId}:${rec.market}`, `${rec.state}:${rec.reason}`);
+          const presence = rec.snapshotObservedAt == null ? 'absent' : 'present';
+          lastDisposition.set(`${rec.gameId}:${rec.market}`, `${rec.state}:${rec.reason}:${presence}`);
         }
       } catch {
         // a corrupt line just means that key re-emits once — harmless
@@ -169,28 +171,39 @@ async function main(): Promise<number> {
     : (statuses: SpecStatus[]): void => {
         const snapshotAt = new Date(nowMs()).toISOString();
         writeText(statusFile, `${JSON.stringify({ snapshotAt, statuses }, null, 2)}\n`);
-        const changed = statuses.filter((s) => {
-          const stateKey = `${s.state}:${s.reason}`;
-          if (lastDisposition.get(`${s.gameId}:${s.market}`) === stateKey) return false;
-          lastDisposition.set(`${s.gameId}:${s.market}`, stateKey);
-          return true;
-        });
-        appendNdjson(
-          coverageFile,
-          changed.map((s) => ({
-            recordType: 'coverage_status',
-            snapshotAt,
-            gameId: s.gameId,
-            slug: s.slug,
-            league: s.league,
-            market: s.market,
-            state: s.state,
-            reason: s.reason,
-            firstAppearanceAt: s.firstAppearanceAt,
-            openerAgeSeconds: s.openerAgeSeconds,
-            scheduledStartUtc: s.scheduledStartUtc,
-          })),
+        // A disposition changed if its state/reason OR its snapshot-presence
+        // changed — so a market that moves from absent→present while staying
+        // policy_disabled still produces a durable coverage record.
+        const dispKey = (s: SpecStatus): string =>
+          `${s.state}:${s.reason}:${s.snapshotObservedAt === null ? 'absent' : 'present'}`;
+        const changed = statuses.filter(
+          (s) => lastDisposition.get(`${s.gameId}:${s.market}`) !== dispKey(s),
         );
+        try {
+          appendNdjson(
+            coverageFile,
+            changed.map((s) => ({
+              recordType: 'coverage_status',
+              snapshotAt,
+              gameId: s.gameId,
+              slug: s.slug,
+              league: s.league,
+              market: s.market,
+              state: s.state,
+              reason: s.reason,
+              firstAppearanceAt: s.firstAppearanceAt,
+              openerAgeSeconds: s.openerAgeSeconds,
+              // Durable universal-detection evidence in the append-only log.
+              snapshotObservedAt: s.snapshotObservedAt,
+              scheduledStartUtc: s.scheduledStartUtc,
+            })),
+          );
+          // Only advance the dedup map AFTER a successful append — a transient
+          // append failure must not suppress the retry on the next tick.
+          for (const s of changed) lastDisposition.set(`${s.gameId}:${s.market}`, dispKey(s));
+        } catch (error) {
+          printError(`coverage-log append failed (will retry next tick): ${describeErrorWithStack(error)}`);
+        }
       };
 
   const deps: WatchDeps = {

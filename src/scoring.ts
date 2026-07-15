@@ -710,6 +710,17 @@ export function verifyRunIntegrity(
   // unscoreable. Fail-closed — the fire-at-detection property is the whole
   // point of watch mode, so it is verified, never assumed from the prefix.
   if (run.runId.startsWith('watch-v0-')) {
+    // A watch run must POSITIVELY declare the committed policy — not merely
+    // "not disagree". A stripped version/digest is as suspect as a tampered one
+    // (the whole point of watch mode is a preregistered, verifiable policy).
+    if (run.marketPolicyVersion !== MARKET_POLICY_VERSION) {
+      violations.push(
+        `watch run must declare marketPolicyVersion ${MARKET_POLICY_VERSION} (found ${run.marketPolicyVersion ?? 'none'})`,
+      );
+    }
+    if (run.marketPolicyDigest !== MARKET_POLICY_DIGEST) {
+      violations.push('watch run must declare the committed marketPolicyDigest (found none or a mismatch)');
+    }
     if (run.watch === null) {
       violations.push('watch run has no watch provenance in run_meta — entry timing unverifiable');
     } else {
@@ -795,6 +806,23 @@ export function verifyRunIntegrity(
         const forGame = run.dispositions.filter((d) => d.gameId === singleGameId);
         if (forGame.length === 0) {
           violations.push('watch run carries no speculation_status denominator — coverage is unverifiable');
+        }
+        // Exactly ONE disposition per market — a duplicate could split a market
+        // across a truthful and a forged reason and let the forgery hide.
+        const perMarketCount = new Map<string, number>();
+        for (const d of forGame) perMarketCount.set(d.market, (perMarketCount.get(d.market) ?? 0) + 1);
+        for (const [market, n] of perMarketCount) {
+          if (n !== 1) violations.push(`watch run denominator has ${n} dispositions for ${market} — expected exactly one`);
+        }
+        const enabledForGame = new Set(enabledMarkets(singleGame.league));
+        // A policy-ENABLED market can never legitimately be `policy_disabled`.
+        // Rejecting this closes the "label a dropped enabled total policy_disabled
+        // and pass" hole. (Independent reconciliation of the OTHER not_entered
+        // reasons against odds_history happens in verifyWatchEntryTiming.)
+        for (const d of forGame) {
+          if (d.reason === 'policy_disabled' && enabledForGame.has(d.market as MarketKey)) {
+            violations.push(`denominator marks policy-enabled market ${d.market} as policy_disabled — impossible`);
+          }
         }
         const enteredSet = new Set(forGame.filter((d) => d.decision === 'entered').map((d) => d.market));
         const notEnteredSet = new Set(forGame.filter((d) => d.decision === 'not_entered').map((d) => d.market));
@@ -1573,6 +1601,56 @@ export async function verifyWatchEntryTiming(
       }
     }
   }
+
+  // The negative space is verified too, not just the entered markets: a
+  // policy-ENABLED market marked not_entered must have a reason the append-only
+  // log actually supports. Otherwise a dropped total could be labeled
+  // "market_never_opened" (or "late_detection") and pass — the exact
+  // selective-retention surface this exists to close. Only the two
+  // appearance-refutable reasons are reconciled; quote-quality reasons
+  // (one_sided / stale_quote) and non-appearance reasons are left to the pure
+  // integrity checks.
+  const game = run.games.get(gameId);
+  const thresholdMs = LATE_THRESHOLD_MS;
+  if (game !== undefined && Number.isFinite(detectedMs)) {
+    const enabledForGame = new Set(enabledMarkets(game.league));
+    for (const d of run.dispositions) {
+      if (d.gameId !== gameId || d.decision !== 'not_entered') continue;
+      const market = d.market;
+      if (!enabledForGame.has(market)) continue;
+      if (d.reason !== 'market_never_opened' && d.reason !== 'late_detection') continue;
+      let observed: string | null;
+      try {
+        observed = await oracle(gameId, market);
+      } catch (error) {
+        unknown.push({ market, detail: `not_entered:${d.reason} oracle read failed: ${error instanceof Error ? error.message : String(error)}` });
+        continue;
+      }
+      if (observed === null) {
+        // Never appeared in the source log — market_never_opened is consistent;
+        // late_detection is not (nothing to be late about) but conservative.
+        continue;
+      }
+      const observedMs = Date.parse(observed);
+      if (!Number.isFinite(observedMs)) {
+        unknown.push({ market, detail: `not_entered:${d.reason} odds_history first appearance unparseable: ${observed}` });
+        continue;
+      }
+      const ageMs = detectedMs - observedMs;
+      if (d.reason === 'market_never_opened' && ageMs > -FIRST_APPEARANCE_SKEW_MS) {
+        // It DID appear at/before detection — "never opened" is false.
+        violations.push(
+          `${market}: denominator says market_never_opened but odds_history shows it appeared at ${observed} (before detection ${run.watch.detectedAt})`,
+        );
+      }
+      if (d.reason === 'late_detection' && ageMs <= thresholdMs + FIRST_APPEARANCE_SKEW_MS) {
+        // Its opener was within the gate — it was NOT late, it should have fired.
+        violations.push(
+          `${market}: denominator says late_detection but odds_history shows an opener age of ${Math.round(ageMs / 1000)}s ≤ the ${thresholdMs / 1000}s gate`,
+        );
+      }
+    }
+  }
   return { violations, unknown };
 }
 
@@ -1993,7 +2071,10 @@ export function aggregateByParticipant(
         );
       }
     }
-    const totalsEligible = kind === 'model' ? responses.length : totalsPicks.length;
+    // Derived from the bundle's markets, not a blanket per-response count — a
+    // moneyline-only fire has ZERO totals-eligible responses (no phantom ladder
+    // block on a game that never carried a total).
+    const totalsEligible = kind === 'model' ? eligibleInMarket(responses, 'total') : totalsPicks.length;
     const totalsLadder: ParticipantStats['totalsLadder'] =
       totalsEligible === 0 && totalsPicks.length === 0
         ? null

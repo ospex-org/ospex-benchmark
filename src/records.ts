@@ -52,6 +52,11 @@ export interface SpeculationDisposition {
   reason: string;
   firstAppearanceAt: string | null;
   openerAgeSeconds: number | null;
+  /** Whether the market appeared in the fire's snapshot (durable
+   *  universal-detection evidence: a policy-disabled market that appeared is
+   *  distinguishable from one that never did, in the hashed run record). Always
+   *  set by the runner; optional only so synthetic test dispositions can omit it. */
+  snapshotObservedAt?: string | null;
   scheduledStartUtc: string;
 }
 

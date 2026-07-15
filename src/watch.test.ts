@@ -962,6 +962,42 @@ async function fireScopedRun(dispositions: Parameters<typeof fireEligibleGame>[5
   return { lines, openedAt, gameId: request.gameId };
 }
 
+/** A moneyline-ONLY scoped fire (the total is absent from the bundle). */
+async function fireScopedRunMoneylineOnly(): Promise<{ lines: string[]; gameId: string }> {
+  const inputs = inputsWith([oddsRow('moneyline', null)]);
+  const slateDate = '2026-07-20';
+  const build = buildBundle(inputs, slateDate, { requireFuture: false });
+  const request = build.requests[0];
+  assert.ok(request);
+  const cohortId = `watch-v0-${slateDate}`;
+  const adapter = stubAdapter(() => JSON.stringify(makeValidResponse(request, TEST_ARM, cohortId)));
+  let t = NOW_MS;
+  const nowMs = (): number => (t += 5);
+  const openedAt = new Date(NOW_MS - 10 * 60_000).toISOString();
+  const provenance: WatchGateProvenance = {
+    detectedAt: new Date(NOW_MS).toISOString(),
+    lateThresholdSeconds: LATE_THRESHOLD_MS / 1000,
+    markets: { moneyline: { firstAppearanceAt: openedAt, openerAgeSeconds: 600 } },
+  };
+  const outcome = await fireEligibleGame(build, inputs, slateDate, provenance, {
+    arms: [TEST_ARM],
+    adapters: new Map([[TEST_ARM.participantId, adapter]]),
+    approvedReportedModelIds: () => ['stub-model-1'],
+    outDir: tempDir('watch-mlonly-'),
+    timeoutMs: 60_000,
+    maxOutputTokens: 16000,
+    mode: 'live',
+    clockMode: 'wall',
+    nowMs,
+    log: () => undefined,
+    logError: () => undefined,
+  }, [
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'moneyline', decision: 'entered', reason: 'entered', firstAppearanceAt: openedAt, openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+  ]);
+  const lines = readFileSync(outcome.runFile, 'utf8').split(/\r?\n/).filter((l) => l.trim() !== '');
+  return { lines, gameId: request.gameId };
+}
+
 const EXPECTED_ARMS = [
   { participantId: TEST_ARM.participantId, provider: TEST_ARM.provider, requestedModelId: TEST_ARM.requestedModelId, approvedReportedModelIds: ['stub-model-1'] },
 ];
@@ -1166,6 +1202,132 @@ test('R2: the scorer refuses a tampered marketPolicyVersion', async () => {
   tampered[metaIndex] = JSON.stringify({ ...meta, marketPolicyVersion: 'tampered-policy-version' });
   const violations = verifyRunIntegrity(parseRunRecords(tampered), { expectedArms: EXPECTED_ARMS });
   assert.ok(violations.some((v) => v.includes('is not the committed')));
+});
+
+// ---------------------------------------------------------------------------
+// Round-3 review fixes (Hermes, combined head 48e6e62).
+// ---------------------------------------------------------------------------
+
+test('R3: a failed fire renders as failed next tick — never a clean entry', async () => {
+  const fire = fakeFire(undefined, true); // every fire throws
+  const deps = makeDeps({ fireGame: fire.fire });
+  const s1 = await watchTick(deps);
+  assert.equal(s1.failed, 1);
+  assert.equal(s1.fired, 0);
+  assert.match(deps.ledger.get(key(GAME_ID, 'moneyline'))?.fireError ?? '', /synthetic/);
+  // Next tick: the terminal failed fire is `failed` / `fire_failed`, NOT
+  // fired / entered — the durable coverage never launders a failure into a win.
+  const captured: SpecStatus[] = [];
+  deps.onStatuses = (st) => captured.push(...st);
+  const s2 = await watchTick(deps);
+  assert.equal(s2.fired, 0);
+  const ml = captured.find((s) => s.market === 'moneyline');
+  assert.equal(ml?.state, 'failed');
+  assert.equal(ml?.reason, 'fire_failed');
+});
+
+test('R3: a lost claim does not increment the dispatch counter', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null), oddsRow('total', 8.5)])),
+  });
+  // Both markets already claimed on disk by another instance.
+  for (const m of ['moneyline', 'total'] as MarketKey[]) {
+    persistLedgerEntry(deps.ledgerDir, {
+      gameId: GAME_ID, slug: 'x', market: m, decision: 'fired', decidedAt: new Date(NOW_MS).toISOString(),
+      slateDate: '2026-07-20', scheduledStartUtc: MATCH_TIME, firstAppearanceAt: OPENED_AT, openerAgeSeconds: 600,
+      gameSha256: 'x', requestSha256: 'y', runId: 'watch-v0-other',
+    });
+  }
+  const summary = await watchTick(deps);
+  assert.equal(summary.dispatches, 0); // both claims lost → nothing dispatched
+  assert.equal(fire.calls.length, 0);
+});
+
+test('R3: games dispatch CONCURRENTLY — a slow provider on one does not delay another', async () => {
+  const order: string[] = [];
+  let releaseFirst: () => void = () => {};
+  const firstHeld = new Promise<void>((r) => (releaseFirst = r));
+  const a = gamesRow({ gameId: '00000000-0000-4000-8000-0000000con01', matchTime: '2026-07-20T22:10:00+00:00' });
+  const b = gamesRow({ gameId: '00000000-0000-4000-8000-0000000con02', matchTime: '2026-07-20T23:10:00+00:00' });
+  const fireGame: WatchDeps['fireGame'] = async (build): Promise<FireOutcome> => {
+    const gid = build.requests[0]?.gameId ?? '';
+    order.push(`start:${gid}`);
+    if (gid === a.gameId) await firstHeld; // a's dispatch hangs until released
+    order.push(`done:${gid}`);
+    return { runId: 'r', runFile: 'f', armOutcomes: {}, baselineDecisions: 0, collisionFailed: false };
+  };
+  const deps = makeDeps({
+    fireGame,
+    fetchInputs: () =>
+      Promise.resolve({
+        gamesRows: [a, b],
+        oddsRows: [oddsRow('moneyline', null, a.gameId), oddsRow('moneyline', null, b.gameId)],
+        fetchStartedAt: '2026-07-20T11:59:58.000Z',
+        fetchCompletedAt: FETCH_COMPLETED_AT,
+      }),
+  });
+  const tickP = watchTick(deps);
+  await new Promise((r) => setTimeout(r, 25)); // let the concurrent phase launch
+  // Both dispatches STARTED even though a is still hanging — serial dispatch
+  // would have started b only after a completed.
+  assert.ok(order.includes(`start:${a.gameId}`));
+  assert.ok(order.includes(`start:${b.gameId}`));
+  assert.ok(!order.includes(`done:${a.gameId}`));
+  releaseFirst();
+  await tickP;
+});
+
+test('R3: the scorer rejects a denominator marking a policy-ENABLED market policy_disabled', async () => {
+  const { lines, gameId } = await fireScopedRun([]);
+  const runId = (JSON.parse(lines[0] ?? '{}') as { runId: string }).runId;
+  const mk = (market: string, decision: string, reason: string): string =>
+    JSON.stringify({
+      recordType: 'speculation_status', label: 'SMOKE_V0_NOT_A_COHORT', runId, gameId, slug: 'x', league: 'mlb',
+      market, decision, reason, firstAppearanceAt: decision === 'entered' ? '2026-07-20T11:50:00.000Z' : null,
+      openerAgeSeconds: decision === 'entered' ? 600 : null, scheduledStartUtc: MATCH_TIME,
+    });
+  const doctored = [...lines, mk('moneyline', 'entered', 'entered'), mk('total', 'not_entered', 'policy_disabled')];
+  const violations = verifyRunIntegrity(parseRunRecords(doctored), { expectedArms: EXPECTED_ARMS });
+  assert.ok(violations.some((v) => v.includes('policy-enabled market total as policy_disabled')));
+});
+
+test('R3: a watch run that omits the market policy version/digest is refused', async () => {
+  const { lines } = await fireScopedRun([
+    { gameId: 'ignored', slug: 'x', league: 'mlb', market: 'moneyline', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: '2026-07-20T11:50:00.000Z', openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+    { gameId: 'ignored', slug: 'x', league: 'mlb', market: 'total', decision: 'entered' as const, reason: 'entered', firstAppearanceAt: '2026-07-20T11:50:00.000Z', openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+  ]);
+  const metaIndex = lines.findIndex((l) => l.includes('"recordType":"run_meta"'));
+  const meta = JSON.parse(lines[metaIndex] ?? '') as Record<string, unknown>;
+  const { marketPolicyVersion: _v, marketPolicyDigest: _d, ...stripped } = meta;
+  const doctored = [...lines];
+  doctored[metaIndex] = JSON.stringify(stripped);
+  const violations = verifyRunIntegrity(parseRunRecords(doctored), { expectedArms: EXPECTED_ARMS });
+  assert.ok(violations.some((v) => v.includes('must declare marketPolicyVersion')));
+  assert.ok(violations.some((v) => v.includes('must declare the committed marketPolicyDigest')));
+});
+
+test('R3: verifyWatchEntryTiming refutes a not_entered:market_never_opened the log shows DID open', async () => {
+  // A moneyline-only fire whose denominator claims the enabled total never
+  // opened — but odds_history shows it opened well before detection.
+  const { lines, gameId } = await fireScopedRunMoneylineOnly();
+  const runId = (JSON.parse(lines[0] ?? '{}') as { runId: string }).runId;
+  const withTotalNeverOpened = [
+    ...lines,
+    JSON.stringify({
+      recordType: 'speculation_status', label: 'SMOKE_V0_NOT_A_COHORT', runId, gameId, slug: 'x', league: 'mlb',
+      market: 'total', decision: 'not_entered', reason: 'market_never_opened', firstAppearanceAt: null,
+      openerAgeSeconds: null, scheduledStartUtc: MATCH_TIME,
+    }),
+  ];
+  const run = parseRunRecords(withTotalNeverOpened);
+  // Oracle: the total actually appeared 10 minutes before detection.
+  const openedTotal = new Date(NOW_MS - 10 * 60_000).toISOString();
+  const result = await verifyWatchEntryTiming(run, (_g, market) =>
+    Promise.resolve(market === 'total' ? openedTotal : '2026-07-20T11:50:00.000Z'),
+  );
+  assert.ok(result.violations.some((v) => v.includes('market_never_opened but odds_history shows it appeared')));
 });
 
 test('prolonged deferral escalates exactly once, per speculation', async () => {
