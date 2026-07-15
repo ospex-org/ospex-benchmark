@@ -1,34 +1,34 @@
 # SPEC — line-open runner: the speculation is the unit
 
-Status: **base spec — architecture approved; read alongside the evidence-model
-spec.** Target repo: `ospex-benchmark`.
+Status: **base spec — the unit + firing model; read alongside the Tier-0
+evidence-model spec.** Target repo: `ospex-benchmark`.
 
 > **Supersession banner (read first).** This base spec nailed the *unit* and the
-> *firing model*; the *evidence & verification model* is specified — and in places
-> corrects this document — in the companion `SPEC-line-open-evidence-model.md`,
-> committed beside this file. Where they differ, the evidence-model spec wins:
-> - **§5 sequencing (PR A / PR B) is superseded** by the evidence-model spec's
->   re-cut (PR 0 → 3, `--live` enabled only in PR 3). The original A+B stack (PRs
->   #10/#11) was closed unmerged and rebuilt.
-> - **§3.5 (publish the denominator) and §3.6 (independent entry timing) are
->   superseded** by the evidence-model spec (the canonical `Disposition` type, the
->   atomic per-fire coverage snapshot, and V1–V8/V-lag).
-> - **§3.3 (independent-by-default firing) is hardened** there (no-wait batching
->   bounded by precommitted capacity; `capacity_deferred`).
-> - The reason enum sketched in §3.5 is superseded by the evidence-model spec's
->   **state/reason matrix (§7)**: `market_never_opened` → the pair
->   `not_yet_two_sided` (as-of) / `market_never_two_sided` (whole-window), and
->   `one_sided` is **removed** (the writer discards one-sided tuples, so the archive
->   cannot prove it).
-> - **§4's PR labels and per-tick cap are repointed.** Rehearsal mode ships in
->   **PR 1** (evidence-model §10), not "PR A". The per-tick claim cap becomes the
->   hashed manifest **`maxDispatchesPerTick`** (value pinned in the manifest) — the
->   free `--max-fires-per-tick` flag (`DEFAULT_MAX_FIRES_PER_TICK`, default 10) is
->   **deleted** (a per-invocation lever is the cherry-pick surface this benchmark
->   forbids, exactly as §3.2 deleted `--late-minutes`). §4's note that the cap
->   "needs retuning" is honored by pinning it in the manifest (evidence-model §6).
-> Everything not called out above still stands; this file is the immutable,
-> reviewable base the evidence-model spec builds on.
+> *firing model*; the **Tier-0 evidence & measurement model** is specified in the
+> companion `SPEC-line-open-evidence-model.md`, committed beside this file. Tier 0 is a
+> **statistical instrument with transparent coverage**, not an adversarial protocol.
+> Where they differ, the Tier-0 spec wins:
+> - **§3.6 (independent entry timing from `odds_history`) stands and is central** — it
+>   is a retained Tier-0 protection (independent first-appearance + as-of quote
+>   verification).
+> - **§3.5's *intent* stands — coverage is a *published number*** — but Tier-0 derives
+>   it **globally at scoring time** from the independent `odds_history` universe
+>   (`U − F`), **not** from a per-fire denominator embedded in each artifact. An
+>   operational miss is *reported*, not cohort-poisoning. The per-fire
+>   `speculation_status` mechanism and machine-reason enum sketched in §3.5 do **not**
+>   carry into Tier 0 — markets that never fired are the global `U − F` miss set with
+>   **advisory** reasons (Tier-0 spec §6).
+> - **§3.3 (per-market, no-wait firing) stands** (independent claims; a ready market
+>   never waits for a sibling). Capacity/spend caps come from the manifest, and a
+>   capacity miss is *reported* in coverage.
+> - **§5 sequencing (PR A / PR B) is superseded** by the Tier-0 re-cut (PR 0 → 3,
+>   `--live` only in PR 3). The A+B stack (PRs #10/#11) was closed unmerged.
+> - **§4's rehearsal + per-tick cap:** rehearsal ships in **PR 1**; the per-tick and
+>   cohort caps come from the manifest (the `--max-fires-per-tick` / `--late-minutes`
+>   levers are canonical-mode-locked to the manifest). The base-spec figure "default
+>   10" is stale.
+> Everything not called out above still stands; this file is the immutable, reviewable
+> base the Tier-0 spec builds on.
 
 ## 1. Why (and the part that is worse than a feature gap)
 
@@ -272,7 +272,7 @@ write → our poll (**300s default**). The poll dominates.
 
 - **Poll cadence is a committed constant (superseded).** The "30–60s recommendation"
   is superseded by the normative **`pollIntervalMs = 30_000`** pinned in the manifest
-  (evidence-model §6, §5): a cohort constant that **must be < `W` = 120_000 ms**, not a
+  (Tier-0 spec §2): a cohort constant that **must be < `W` = 120_000 ms**, not a
   per-invocation `--poll-seconds` lever. The floor is already 30s.
 - **Dead end — core-api SSE (`/v1/stream/odds`):** keyed on an on-chain
   `contestId`. These games have no contest. Unusable here.
