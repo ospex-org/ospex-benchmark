@@ -205,6 +205,31 @@ const speculationStatusSchema = z
     reason: z.string().min(1),
     firstAppearanceAt: z.string().nullable(),
     openerAgeSeconds: z.number().nullable(),
+    // Universal-detection evidence (whether the market appeared in the fire's
+    // snapshot, and its quote time if so). PARSED — not merely tolerated through
+    // .passthrough() — and captured, so verifyRunIntegrity can require it for a
+    // watch run: a stripped snapshotObservedAt is a detectable omission, not a
+    // silently-dropped field. Nullable value (market absent from the snapshot);
+    // optional key only so this schema also parses a legacy/doctored record,
+    // whose missing key verifyRunIntegrity then flags.
+    snapshotObservedAt: z.string().nullable().optional(),
+    // The scheduled first pitch, for independent reconciliation of a
+    // first_pitch_passed non-entry reason against detection time.
+    scheduledStartUtc: z.string().min(1).optional(),
+  })
+  .passthrough();
+
+/** A line-open coverage-log record: the slate-wide published denominator for
+ *  every (game, market) the runner saw, including games that fired nothing (and
+ *  so wrote no run file). The scorer binds a watch run to this log. */
+const coverageStatusSchema = z
+  .object({
+    recordType: z.literal('coverage_status'),
+    snapshotAt: z.string().min(1),
+    gameId: z.string().min(1),
+    market: z.enum(['moneyline', 'spread', 'total']),
+    state: z.string().min(1),
+    reason: z.string().min(1),
   })
   .passthrough();
 
@@ -363,6 +388,10 @@ export interface SourceRun {
     reason: string;
     firstAppearanceAt: string | null;
     openerAgeSeconds: number | null;
+    /** Universal-detection evidence; `undefined` = the record omitted the key
+     *  (a violation for a watch run — the field must be present, may be null). */
+    snapshotObservedAt: string | null | undefined;
+    scheduledStartUtc: string | undefined;
   }>;
   /** Identity stamps of every parsed record, for run/cohort/label checks. */
   identities: Array<{ ref: string; runId: string; label: string; cohortId: string | null }>;
@@ -512,6 +541,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
           reason: status.reason,
           firstAppearanceAt: status.firstAppearanceAt,
           openerAgeSeconds: status.openerAgeSeconds,
+          snapshotObservedAt: status.snapshotObservedAt,
+          scheduledStartUtc: status.scheduledStartUtc,
         });
         break;
       }
@@ -847,18 +878,32 @@ export function verifyRunIntegrity(
             violations.push(`denominator marks ${d.market} entered but records no first-appearance evidence`);
           }
         }
-        // Anchor the denominator to the FROZEN market policy, not just the
-        // (attacker-controllable) bundle: every market the committed allow-list
-        // enables for this league must appear in the denominator (entered or
-        // not_entered). Otherwise the bundle, the gate set, and the denominator
-        // could all be shrunk in lockstep to hide a market that should have
-        // been entered. The run line (policy_disabled) is legitimately absent
-        // from the enabled set, so this does not demand it.
+        // The denominator must carry EVERY market the runner universally
+        // detects — moneyline, run line, total — each exactly once, INCLUDING
+        // the policy-disabled run line. Detection is universal, so the disabled
+        // run line's disposition is what distinguishes "seen and withheld by
+        // policy" from "silently gone"; omitting it drops negative space.
+        // Anchoring to the frozen declared-market set (MARKETS) — not the
+        // attacker-controllable bundle, nor only the enabled subset — means the
+        // bundle, gate set, and denominator cannot be shrunk in lockstep to hide
+        // a market. (Combined with the exactly-one-per-market count above, this
+        // is exactly one disposition per declared market.)
         const covered = new Set([...enteredSet, ...notEnteredSet]);
-        for (const market of enabledMarkets(singleGame.league)) {
+        for (const market of MARKETS) {
           if (!covered.has(market)) {
             violations.push(
-              `watch run denominator omits policy-enabled market ${market} — coverage cannot be shrunk below the committed policy`,
+              `watch run denominator omits declared market ${market} — every detected market (incl. the disabled run line) must carry exactly one disposition`,
+            );
+          }
+        }
+        // Every disposition must carry its universal-detection evidence: the
+        // snapshotObservedAt KEY must be present (its value may be null when the
+        // market was absent from the snapshot). A stripped field is a detectable
+        // omission, refused here rather than tolerated through .passthrough().
+        for (const d of forGame) {
+          if (d.snapshotObservedAt === undefined) {
+            violations.push(
+              `watch run denominator disposition for ${d.market} is missing snapshotObservedAt (universal-detection evidence)`,
             );
           }
         }
@@ -1456,8 +1501,18 @@ export function verifyRunIntegrity(
   for (const failure of recomputedIdentity.failures) {
     violations.push(`recomputed identity gate: ${failure}`);
   }
-  const recordedFailureTexts = new Set(run.runFailures.flatMap((f) => f.failures));
-  for (const recorded of recordedFailureTexts) {
+  // Only identity/collision run_failures are recomputable from the arm
+  // responses. A FIRE_FAILED (terminal-dud) run_failure is a legitimate artifact
+  // record with no collision-recomputation counterpart, so it is NOT
+  // cross-checked here — it still makes the run unscoreable via the
+  // run.runFailures refusal above. Scoping the cross-check keeps a genuine
+  // terminal failure from being mislabeled "does not correspond".
+  const collisionFailureTexts = new Set(
+    run.runFailures
+      .filter((f) => f.code === 'MODEL_IDENTITY' || f.code === 'PROVIDER_COLLISION')
+      .flatMap((f) => f.failures),
+  );
+  for (const recorded of collisionFailureTexts) {
     if (!recomputedIdentity.failures.includes(recorded)) {
       violations.push(`recorded run_failure does not correspond to any recomputed failure: ${recorded}`);
     }
@@ -1602,14 +1657,12 @@ export async function verifyWatchEntryTiming(
     }
   }
 
-  // The negative space is verified too, not just the entered markets: a
+  // The negative space is verified too, not just the entered markets: EVERY
   // policy-ENABLED market marked not_entered must have a reason the append-only
-  // log actually supports. Otherwise a dropped total could be labeled
-  // "market_never_opened" (or "late_detection") and pass — the exact
-  // selective-retention surface this exists to close. Only the two
-  // appearance-refutable reasons are reconciled; quote-quality reasons
-  // (one_sided / stale_quote) and non-appearance reasons are left to the pure
-  // integrity checks.
+  // log independently supports — otherwise a dropped total could be relabeled to
+  // slip out of the cohort, the exact selective-retention surface this exists to
+  // close. A reason the first-appearance oracle CANNOT substantiate becomes a
+  // typed UNKNOWN (the run is unscoreable), never an accepted self-attestation.
   const game = run.games.get(gameId);
   const thresholdMs = LATE_THRESHOLD_MS;
   if (game !== undefined && Number.isFinite(detectedMs)) {
@@ -1617,41 +1670,205 @@ export async function verifyWatchEntryTiming(
     for (const d of run.dispositions) {
       if (d.gameId !== gameId || d.decision !== 'not_entered') continue;
       const market = d.market;
+      // Only policy-ENABLED markets carry an entry-timing claim to reconcile — a
+      // disabled market (the run line) is legitimately withheld by policy.
       if (!enabledForGame.has(market)) continue;
-      if (d.reason !== 'market_never_opened' && d.reason !== 'late_detection') continue;
-      let observed: string | null;
-      try {
-        observed = await oracle(gameId, market);
-      } catch (error) {
-        unknown.push({ market, detail: `not_entered:${d.reason} oracle read failed: ${error instanceof Error ? error.message : String(error)}` });
+
+      // The two appearance-refutable reasons are reconciled against the log.
+      if (d.reason === 'market_never_opened' || d.reason === 'late_detection') {
+        let observed: string | null;
+        try {
+          observed = await oracle(gameId, market);
+        } catch (error) {
+          unknown.push({ market, detail: `not_entered:${d.reason} oracle read failed: ${error instanceof Error ? error.message : String(error)}` });
+          continue;
+        }
+        if (observed === null) {
+          if (d.reason === 'late_detection') {
+            // No first-appearance row → the opener the "late" claim references
+            // does not exist in the log. UNKNOWN, never a silent pass.
+            unknown.push({
+              market,
+              detail: 'not_entered:late_detection but odds_history has no first-appearance row to confirm the opener existed',
+            });
+          }
+          // market_never_opened + no row → consistent (it also never appeared).
+          continue;
+        }
+        const observedMs = Date.parse(observed);
+        if (!Number.isFinite(observedMs)) {
+          unknown.push({ market, detail: `not_entered:${d.reason} odds_history first appearance unparseable: ${observed}` });
+          continue;
+        }
+        const ageMs = detectedMs - observedMs;
+        if (d.reason === 'market_never_opened') {
+          if (ageMs > -FIRST_APPEARANCE_SKEW_MS) {
+            // It DID appear at/before detection — "never opened" is false.
+            violations.push(
+              `${market}: denominator says market_never_opened but odds_history shows it appeared at ${observed} (at/before detection ${run.watch.detectedAt})`,
+            );
+          }
+          // else it appeared only after detection → consistent.
+        } else {
+          // late_detection: the opener must be GENUINELY older than the gate.
+          if (ageMs < -FIRST_APPEARANCE_SKEW_MS) {
+            violations.push(
+              `${market}: denominator says late_detection but odds_history shows the opener ${observed} is AFTER detection ${run.watch.detectedAt} — it never opened, not "late"`,
+            );
+          } else if (ageMs <= thresholdMs + FIRST_APPEARANCE_SKEW_MS) {
+            violations.push(
+              `${market}: denominator says late_detection but odds_history shows an opener age of ${Math.round(ageMs / 1000)}s ≤ the ${thresholdMs / 1000}s gate — it should have fired`,
+            );
+          }
+          // else genuinely late → consistent.
+        }
         continue;
       }
-      if (observed === null) {
-        // Never appeared in the source log — market_never_opened is consistent;
-        // late_detection is not (nothing to be late about) but conservative.
+
+      // first_pitch_passed is a GAME-level exclusion: if the first pitch had
+      // passed, NO market would be fireable, so a FIRED run (this run entered at
+      // least one market) cannot honestly carry a first_pitch_passed disposition
+      // on ANY market. Reconcile against the HASH-VERIFIED bundle start
+      // (game.startUtc), NEVER the disposition's own scheduledStartUtc — that
+      // field is not hash-covered, so an operator could set it freely to launder
+      // a dropped enabled market behind a fake "first pitch passed". For a fired
+      // game the bundle start is necessarily after detection, so the claim is
+      // refuted; if the bundle start is unparseable, it is UNKNOWN, never a pass.
+      if (d.reason === 'first_pitch_passed') {
+        // A FIRED run entered at least one market, so first pitch had NOT passed
+        // for the game — first_pitch_passed on ANY enabled market is therefore
+        // refuted, in BOTH start-time cases. Reconcile against the HASH-VERIFIED
+        // bundle start (game.startUtc), never the disposition's own un-hash-
+        // covered scheduledStartUtc.
+        const startMs = Date.parse(game.startUtc);
+        if (!Number.isFinite(startMs)) {
+          unknown.push({ market, detail: `not_entered:first_pitch_passed but the hash-verified bundle start ${game.startUtc} is unparseable` });
+        } else if (startMs > detectedMs) {
+          violations.push(
+            `${market}: denominator says first_pitch_passed but the hash-verified bundle start ${game.startUtc} is AFTER detection ${run.watch.detectedAt} — the game fired, so first pitch had not passed`,
+          );
+        } else {
+          // Bundle start at/before detection in a run that nonetheless FIRED is
+          // itself contradictory (a fire requires an unstarted game), so it can
+          // never legitimately arise — flag it rather than leave a silent-pass
+          // window (even though game.startUtc is hash-covered and detection is
+          // pinned to the odds_history opener, so this is not manufacturable).
+          violations.push(
+            `${market}: denominator says first_pitch_passed and the hash-verified bundle start ${game.startUtc} is at/before detection ${run.watch.detectedAt}, yet the run fired — a fired run cannot have first pitch already passed`,
+          );
+        }
         continue;
       }
-      const observedMs = Date.parse(observed);
-      if (!Number.isFinite(observedMs)) {
-        unknown.push({ market, detail: `not_entered:${d.reason} odds_history first appearance unparseable: ${observed}` });
-        continue;
-      }
-      const ageMs = detectedMs - observedMs;
-      if (d.reason === 'market_never_opened' && ageMs > -FIRST_APPEARANCE_SKEW_MS) {
-        // It DID appear at/before detection — "never opened" is false.
-        violations.push(
-          `${market}: denominator says market_never_opened but odds_history shows it appeared at ${observed} (before detection ${run.watch.detectedAt})`,
-        );
-      }
-      if (d.reason === 'late_detection' && ageMs <= thresholdMs + FIRST_APPEARANCE_SKEW_MS) {
-        // Its opener was within the gate — it was NOT late, it should have fired.
-        violations.push(
-          `${market}: denominator says late_detection but odds_history shows an opener age of ${Math.round(ageMs / 1000)}s ≤ the ${thresholdMs / 1000}s gate`,
-        );
-      }
+
+      // one_sided / stale_quote / board_read_failed / deferred / anything else:
+      // a quote-state or transient reason the first-appearance oracle cannot
+      // substantiate. Classify UNKNOWN (unscoreable) rather than accept the
+      // operator's self-attestation — a dropped enabled market must not slip
+      // through behind an unverifiable reason.
+      unknown.push({
+        market,
+        detail: `not_entered:${d.reason} cannot be substantiated from odds_history first-appearance data — unscoreable`,
+      });
     }
   }
   return { violations, unknown };
+}
+
+// ---------------------------------------------------------------------------
+// Coverage binding (§3.7) — the published denominator is bound at scoring time
+// ---------------------------------------------------------------------------
+
+/** The latest disposition per (game, market), replayed from the append-only
+ *  coverage log. */
+export type CoverageIndex = Map<string, { state: string; reason: string; snapshotAt: string }>;
+
+/**
+ * Replay the append-only line-open coverage log into the latest disposition per
+ * (game, market). The log is the slate-wide published denominator — every game
+ * the runner saw, INCLUDING games that fired nothing (and so wrote no run
+ * file). Non-coverage / malformed lines are ignored (the log only ever holds
+ * coverage_status records, but be forgiving of a partial final line).
+ */
+export function parseCoverageLog(lines: string[]): CoverageIndex {
+  const latest: CoverageIndex = new Map();
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    let rec: unknown;
+    try {
+      rec = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const parsed = coverageStatusSchema.safeParse(rec);
+    if (!parsed.success) continue;
+    const key = `${parsed.data.gameId}:${parsed.data.market}`;
+    const prev = latest.get(key);
+    if (prev === undefined || Date.parse(parsed.data.snapshotAt) >= Date.parse(prev.snapshotAt)) {
+      latest.set(key, { state: parsed.data.state, reason: parsed.data.reason, snapshotAt: parsed.data.snapshotAt });
+    }
+  }
+  return latest;
+}
+
+/**
+ * Bind a scored watch run to the published coverage denominator. Per-market
+ * firing creates a selective-retention surface: a game that should have fired
+ * but was silently dropped produces no run file — so its absence is only visible
+ * against the slate-wide coverage log. Binding requires that the scored game
+ * appears in the log, covers every declared market, and that the log's fired set
+ * agrees with the run file's own denominator. A dropped market would then have
+ * to be dropped from BOTH published denominators coherently, not just quietly
+ * omitted from the one file being scored.
+ *
+ * NOTE (documented limitation): binding proves per-market completeness for the
+ * games IN the log; a game omitted from BOTH the run corpus AND the coverage log
+ * is still only detectable against the upstream schedule census, which is not an
+ * input here. Returns violations (empty = bound).
+ */
+export function verifyCoverageBinding(run: SourceRun, coverage: CoverageIndex): string[] {
+  const violations: string[] = [];
+  if (!run.runId.startsWith('watch-v0-')) return violations; // only watch runs bind coverage
+  const gameId = [...run.games.keys()][0];
+  if (gameId === undefined) return violations;
+
+  const coveredMarkets = MARKETS.filter((m) => coverage.has(`${gameId}:${m}`));
+  if (coveredMarkets.length === 0) {
+    violations.push(
+      `scored game ${gameId} has no entry in the coverage log — the published denominator does not cover it`,
+    );
+    return violations;
+  }
+  for (const m of MARKETS) {
+    if (!coverage.has(`${gameId}:${m}`)) {
+      violations.push(
+        `coverage log omits declared market ${m} for scored game ${gameId} — incomplete published denominator`,
+      );
+    }
+  }
+  // The coverage log's fired set for this game must equal the run file's entered
+  // set — the two published denominators cannot disagree about what was entered.
+  const coverageEntered = new Set(
+    MARKETS.filter((m) => coverage.get(`${gameId}:${m}`)?.state === 'fired'),
+  );
+  const runEntered = new Set(
+    run.dispositions.filter((d) => d.gameId === gameId && d.decision === 'entered').map((d) => d.market),
+  );
+  for (const m of runEntered) {
+    if (!coverageEntered.has(m)) {
+      violations.push(
+        `run file entered ${m} for ${gameId} but the coverage log does not record it fired — published denominators disagree`,
+      );
+    }
+  }
+  for (const m of coverageEntered) {
+    if (!runEntered.has(m)) {
+      violations.push(
+        `coverage log records ${m} fired for ${gameId} but the run file's denominator does not mark it entered — published denominators disagree`,
+      );
+    }
+  }
+  return violations;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { ZodError } from 'zod';
 import { describeErrorWithStack, envValue } from './config.js';
@@ -10,13 +10,18 @@ import { writeNdjson, writeText } from './records.js';
 import { buildScorecardMarkdown } from './scorecard.js';
 import {
   aggregateByParticipant,
+  parseCoverageLog,
   parseRunRecords,
   SCORING_POLICY_VERSION,
   scoredRecords,
   scoreRun,
+  verifyCoverageBinding,
   verifyRunIntegrity,
   verifyWatchEntryTiming,
 } from './scoring.js';
+
+/** The slate-wide published coverage denominator lives beside the run files. */
+const COVERAGE_LOG_BASENAME = 'line-open-coverage.ndjson';
 
 /**
  * ospex-benchmark scorer — joins a shadow run's frozen decisions to the
@@ -31,9 +36,12 @@ class UsageError extends Error {}
 const USAGE = `Usage: yarn score --run <path-to-run.ndjson> [options]
 
 Options:
-  --run PATH   The harness run file to score (required).
-  --out DIR    Output directory. Default: the run file's directory.
-  -h, --help   Show this help.
+  --run PATH       The harness run file to score (required).
+  --out DIR        Output directory. Default: the run file's directory.
+  --coverage PATH  Line-open coverage log to bind a watch run against. Default:
+                   ${COVERAGE_LOG_BASENAME} beside the run file. Required for a
+                   watch run — the published denominator is bound at scoring.
+  -h, --help       Show this help.
 
 Requires SUPABASE_URL and SUPABASE_ANON_KEY (public read-only anon key);
 a local gitignored .env is loaded automatically.`;
@@ -41,11 +49,13 @@ a local gitignored .env is loaded automatically.`;
 interface CliOptions {
   runPath: string;
   outDir: string | null;
+  coveragePath: string | null;
 }
 
 function parseArgs(argv: string[]): CliOptions {
   let runPath: string | null = null;
   let outDir: string | null = null;
+  let coveragePath: string | null = null;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = (): string => {
@@ -61,6 +71,9 @@ function parseArgs(argv: string[]): CliOptions {
       case '--out':
         outDir = next();
         break;
+      case '--coverage':
+        coveragePath = next();
+        break;
       case '-h':
       case '--help':
         printLine(USAGE);
@@ -71,7 +84,7 @@ function parseArgs(argv: string[]): CliOptions {
     }
   }
   if (runPath === null) throw new UsageError('--run is required');
-  return { runPath, outDir };
+  return { runPath, outDir, coveragePath };
 }
 
 async function main(): Promise<number> {
@@ -153,6 +166,31 @@ async function main(): Promise<number> {
       return 1;
     }
     printLine('entry timing: each entered market\'s opener reconciled against odds_history');
+
+    // Bind the run to the slate-wide published coverage denominator. A silently
+    // dropped market produces no run file, so its absence is only detectable
+    // against the coverage log — which the scorer must therefore INGEST, not
+    // ignore. The log is required for a watch run (it is written beside the run
+    // files); a missing log means the denominator was never published.
+    const coveragePath = options.coveragePath ?? join(dirname(options.runPath), COVERAGE_LOG_BASENAME);
+    if (!existsSync(coveragePath)) {
+      printError('');
+      printError('!!! COVERAGE DENOMINATOR MISSING — refusing to score !!!');
+      printError(
+        `  no coverage log at ${coveragePath} — a watch run must be scored alongside its published ` +
+          `denominator (${COVERAGE_LOG_BASENAME}); pass --coverage to point at it`,
+      );
+      return 1;
+    }
+    const coverage = parseCoverageLog(readFileSync(coveragePath, 'utf8').split(/\r?\n/));
+    const coverageViolations = verifyCoverageBinding(run, coverage);
+    if (coverageViolations.length > 0) {
+      printError('');
+      printError('!!! COVERAGE BINDING FAILURE — refusing to score !!!');
+      for (const violation of coverageViolations) printError(`  ${violation}`);
+      return 1;
+    }
+    printLine('coverage: scored game bound to the published denominator (fired set consistent)');
   }
 
   // The published dispersion parameter the totals ladder runs on — loaded

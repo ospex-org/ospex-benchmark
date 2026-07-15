@@ -5,7 +5,13 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { buildBundle } from './bundle.js';
 import { enabledMarkets, isMarketEnabled } from './marketPolicy.js';
-import { parseRunRecords, verifyRunIntegrity, verifyWatchEntryTiming } from './scoring.js';
+import {
+  parseCoverageLog,
+  parseRunRecords,
+  verifyCoverageBinding,
+  verifyRunIntegrity,
+  verifyWatchEntryTiming,
+} from './scoring.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
 import { loadLadderParams } from './ladder.js';
 import { aggregateByParticipant, scoreRun } from './scoring.js';
@@ -1417,4 +1423,462 @@ test('prolonged deferral escalates exactly once, per speculation', async () => {
   assert.equal(deps.errors.filter((l) => l.includes('deferred longer')).length, 2);
   await watchTick(deps);
   assert.equal(deps.errors.filter((l) => l.includes('deferred longer')).length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// Round-5 review fixes (Hermes, combined head f5dc940).
+// ---------------------------------------------------------------------------
+
+// Blocker 1 — fire-at-detection + crash evidence.
+
+test('R5: a SLOW later game board read never delays an earlier ready game\'s dispatch (fire-at-detection across games)', async () => {
+  // Game A (earlier) has a fast board read; game B (later) hangs its board read
+  // for the whole test. A must dispatch immediately — its fire cannot wait on
+  // B's read, and it must enter on a FRESH snapshot, not one B's read aged.
+  let releaseB: () => void = () => {};
+  const bHeld = new Promise<void>((r) => (releaseB = r));
+  const a = gamesRow({ gameId: '00000000-0000-4000-8000-0000000r5a01', matchTime: '2026-07-20T22:10:00+00:00' });
+  const b = gamesRow({ gameId: '00000000-0000-4000-8000-0000000r5b02', matchTime: '2026-07-20T23:10:00+00:00' });
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () =>
+      Promise.resolve({
+        gamesRows: [a, b],
+        oddsRows: [oddsRow('moneyline', null, a.gameId), oddsRow('moneyline', null, b.gameId)],
+        fetchStartedAt: '2026-07-20T11:59:58.000Z',
+        fetchCompletedAt: FETCH_COMPLETED_AT,
+      }),
+    fetchFirstBoardAppearance: (gameId) =>
+      gameId === b.gameId ? bHeld.then(() => OPENED_AT) : Promise.resolve(OPENED_AT),
+  });
+  const tickP = watchTick(deps);
+  await new Promise((r) => setTimeout(r, 25)); // let A plan+claim+dispatch while B's read hangs
+  // A fired even though B's board read is still blocked — a serial-prepare
+  // design would have A wait for B's read before dispatching.
+  assert.equal(fire.calls.length, 1);
+  assert.equal(fire.calls[0]?.gameId, a.gameId);
+  // And A entered on a fresh snapshot (not one B's read staled).
+  assert.ok(NOW_MS - Date.parse(fire.calls[0]?.fetchCompletedAt ?? '') <= FRESH_FIRE_MS);
+  releaseB();
+  await tickP;
+  assert.equal(fire.calls.length, 2); // B fires once its read completes
+});
+
+test('R5: a stranded `pending` claim restarts as fire_interrupted — never a clean entry, never re-fired', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null)])),
+  });
+  // A crash between claim and dispatch: a `pending` claim on disk with no runId
+  // (the provider call never completed).
+  persistLedgerEntry(deps.ledgerDir, {
+    gameId: GAME_ID,
+    slug: 'x',
+    market: 'moneyline',
+    decision: 'fired',
+    decidedAt: new Date(NOW_MS).toISOString(),
+    slateDate: '2026-07-20',
+    scheduledStartUtc: MATCH_TIME,
+    firstAppearanceAt: OPENED_AT,
+    openerAgeSeconds: 600,
+    gameSha256: 'x',
+    requestSha256: 'y',
+    dispatchStatus: 'pending',
+  });
+  deps.ledger = loadLedger(deps.ledgerDir, () => undefined);
+  const captured: SpecStatus[] = [];
+  deps.onStatuses = (s) => captured.push(...s);
+  const summary = await watchTick(deps);
+  assert.equal(fire.calls.length, 0); // terminal — never re-fired (providers may already have billed)
+  assert.equal(summary.fired, 0);
+  const ml = captured.find((s) => s.market === 'moneyline');
+  assert.equal(ml?.state, 'failed');
+  assert.equal(ml?.reason, 'fire_interrupted'); // NOT 'entered'
+});
+
+test('R5: the claim is durably `pending` before the provider call and `completed` after', async () => {
+  let statusAtDispatch: string | undefined;
+  const deps = makeDeps({
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null)])),
+  });
+  deps.fireGame = (): Promise<FireOutcome> => {
+    const onDisk = JSON.parse(
+      readFileSync(join(deps.ledgerDir, GAME_ID, 'moneyline.json'), 'utf8'),
+    ) as SpecLedgerEntry;
+    statusAtDispatch = onDisk.dispatchStatus;
+    return Promise.resolve({
+      runId: 'watch-v0-2026-07-20-abc123',
+      runFile: 'f',
+      armOutcomes: { [TEST_ARM.participantId]: 'valid' },
+      baselineDecisions: 6,
+      collisionFailed: false,
+    });
+  };
+  await watchTick(deps);
+  assert.equal(statusAtDispatch, 'pending'); // written to disk BEFORE the provider call
+  const after = JSON.parse(
+    readFileSync(join(deps.ledgerDir, GAME_ID, 'moneyline.json'), 'utf8'),
+  ) as SpecLedgerEntry;
+  assert.equal(after.dispatchStatus, 'completed');
+});
+
+// Blocker 2 — the negative-space guarantee is not bypassable.
+
+/** Fire a scoped moneyline+total run with NO denominator, returning the runId
+ *  and gameId so a test can append hand-built speculation_status records. */
+async function scopedRunForDenominator(): Promise<{ lines: string[]; runId: string; gameId: string }> {
+  const { lines, gameId } = await fireScopedRun([]);
+  const runId = (JSON.parse(lines[0] ?? '{}') as { runId: string }).runId;
+  return { lines, runId, gameId };
+}
+
+function statusRecord(
+  runId: string,
+  gameId: string,
+  market: string,
+  decision: string,
+  reason: string,
+  opts: { snapshotObservedAt?: string | null; omitSnapshot?: boolean } = {},
+): string {
+  const rec: Record<string, unknown> = {
+    recordType: 'speculation_status',
+    label: 'SMOKE_V0_NOT_A_COHORT',
+    runId,
+    gameId,
+    slug: 'x',
+    league: 'mlb',
+    market,
+    decision,
+    reason,
+    firstAppearanceAt: decision === 'entered' ? '2026-07-20T11:50:00.000Z' : null,
+    openerAgeSeconds: decision === 'entered' ? 600 : null,
+    scheduledStartUtc: MATCH_TIME,
+  };
+  if (!opts.omitSnapshot) rec['snapshotObservedAt'] = opts.snapshotObservedAt ?? null;
+  return JSON.stringify(rec);
+}
+
+test('R5: dropping the policy-disabled run-line disposition is a denominator violation (all declared markets required)', async () => {
+  const { lines, runId, gameId } = await scopedRunForDenominator();
+  // moneyline + total entered, but the run line's disposition is omitted.
+  const doctored = [
+    ...lines,
+    statusRecord(runId, gameId, 'moneyline', 'entered', 'entered'),
+    statusRecord(runId, gameId, 'total', 'entered', 'entered'),
+  ];
+  const violations = verifyRunIntegrity(parseRunRecords(doctored), { expectedArms: EXPECTED_ARMS });
+  assert.ok(violations.some((v) => v.includes('omits declared market spread')));
+});
+
+test('R5: stripping snapshotObservedAt from a disposition is a denominator violation (parsed, not tolerated)', async () => {
+  const { lines, runId, gameId } = await scopedRunForDenominator();
+  const doctored = [
+    ...lines,
+    statusRecord(runId, gameId, 'moneyline', 'entered', 'entered'),
+    statusRecord(runId, gameId, 'total', 'entered', 'entered', { omitSnapshot: true }), // <- stripped
+    statusRecord(runId, gameId, 'spread', 'not_entered', 'policy_disabled'),
+  ];
+  const violations = verifyRunIntegrity(parseRunRecords(doctored), { expectedArms: EXPECTED_ARMS });
+  assert.ok(violations.some((v) => v.includes('missing snapshotObservedAt')));
+});
+
+test('R5: an enabled market not_entered for an unverifiable reason (one_sided) is UNKNOWN, never a silent pass', async () => {
+  const { lines, gameId } = await fireScopedRunMoneylineOnly();
+  const runId = (JSON.parse(lines[0] ?? '{}') as { runId: string }).runId;
+  const withTotalOneSided = [...lines, statusRecord(runId, gameId, 'total', 'not_entered', 'one_sided')];
+  const run = parseRunRecords(withTotalOneSided);
+  const mlOpened = new Date(NOW_MS - 10 * 60_000).toISOString();
+  // Even when the oracle shows the total opened FRESH before detection, the
+  // first-appearance log cannot confirm one-sidedness either way → UNKNOWN.
+  const result = await verifyWatchEntryTiming(run, () => Promise.resolve(mlOpened));
+  assert.deepEqual(result.violations, []);
+  assert.ok(result.unknown.some((u) => u.market === 'total' && u.detail.includes('one_sided')));
+});
+
+test('R5: a not_entered:late_detection with NO odds_history first-appearance row is UNKNOWN, not a pass', async () => {
+  const { lines, gameId } = await fireScopedRunMoneylineOnly();
+  const runId = (JSON.parse(lines[0] ?? '{}') as { runId: string }).runId;
+  const withTotalLate = [
+    ...lines,
+    JSON.stringify({
+      recordType: 'speculation_status',
+      label: 'SMOKE_V0_NOT_A_COHORT',
+      runId,
+      gameId,
+      slug: 'x',
+      league: 'mlb',
+      market: 'total',
+      decision: 'not_entered',
+      reason: 'late_detection',
+      firstAppearanceAt: '2026-07-20T08:00:00.000Z',
+      openerAgeSeconds: 14_400,
+      snapshotObservedAt: null,
+      scheduledStartUtc: MATCH_TIME,
+    }),
+  ];
+  const run = parseRunRecords(withTotalLate);
+  const mlOpened = new Date(NOW_MS - 10 * 60_000).toISOString();
+  const result = await verifyWatchEntryTiming(run, (_g, market) =>
+    Promise.resolve(market === 'total' ? null : mlOpened),
+  );
+  assert.deepEqual(result.violations, []);
+  assert.ok(result.unknown.some((u) => u.market === 'total' && u.detail.includes('late_detection')));
+});
+
+// Blocker 3 — coverage persistence + scoring binding.
+
+test('R5: a coverage/status sink failure marks the tick failed (nonzero --once)', async () => {
+  const fire = fakeFire();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    fetchInputs: () => Promise.resolve(inputsWith([oddsRow('moneyline', null)])),
+    onStatuses: () => {
+      throw new Error('coverage-log append failed (EISDIR)');
+    },
+  });
+  const summary = await watchTick(deps);
+  assert.ok(summary.failed >= 1); // the tick is observably failed — not silently 0
+  assert.ok(deps.errors.some((e) => e.includes('status/coverage sink failed')));
+});
+
+test('R5: the scorer binds a watch run to the published coverage denominator — pass, absent, and disagree', async () => {
+  const { lines, runId, gameId } = await scopedRunForDenominator();
+  const full = [
+    ...lines,
+    statusRecord(runId, gameId, 'moneyline', 'entered', 'entered'),
+    statusRecord(runId, gameId, 'total', 'entered', 'entered'),
+    statusRecord(runId, gameId, 'spread', 'not_entered', 'policy_disabled'),
+  ];
+  const run = parseRunRecords(full);
+  const cov = (
+    entries: Array<{ market: string; state: string; reason: string }>,
+  ): ReturnType<typeof parseCoverageLog> =>
+    parseCoverageLog(
+      entries.map((e) =>
+        JSON.stringify({
+          recordType: 'coverage_status',
+          snapshotAt: '2026-07-20T12:00:30.000Z',
+          gameId,
+          slug: 'x',
+          league: 'mlb',
+          ...e,
+        }),
+      ),
+    );
+
+  // Consistent: the log records moneyline+total fired, the run line disabled.
+  const consistent = cov([
+    { market: 'moneyline', state: 'fired', reason: 'entered' },
+    { market: 'total', state: 'fired', reason: 'entered' },
+    { market: 'spread', state: 'disabled', reason: 'policy_disabled' },
+  ]);
+  assert.deepEqual(verifyCoverageBinding(run, consistent), []);
+
+  // Absent: the scored game is missing from the coverage log entirely.
+  assert.ok(verifyCoverageBinding(run, cov([])).some((v) => v.includes('no entry in the coverage log')));
+
+  // Disagree: the run entered the total, but the coverage log shows it not fired
+  // (the exact silently-dropped-market contradiction the binding exists to catch).
+  const disagree = cov([
+    { market: 'moneyline', state: 'fired', reason: 'entered' },
+    { market: 'total', state: 'blocked', reason: 'market_never_opened' },
+    { market: 'spread', state: 'disabled', reason: 'policy_disabled' },
+  ]);
+  assert.ok(verifyCoverageBinding(run, disagree).some((v) => v.includes('does not record it fired')));
+});
+
+// Blocker 4 — a terminally-failed fire is refused on the artifact alone.
+
+test('R5: a terminal fire (all arms respond, none valid) writes a FIRE_FAILED run_failure and the scorer refuses it', async () => {
+  const inputs = inputsWith([oddsRow('moneyline', null)]);
+  const build = buildBundle(inputs, '2026-07-20', { requireFuture: false });
+  const request = build.requests[0];
+  assert.ok(request);
+  // A credentialed arm that RESPONDS but never produces valid content → all arms
+  // respond, none valid: a terminal dud, distinct from a collision.
+  const dudAdapter = stubAdapter(() => 'not valid json at all');
+  const provenance: WatchGateProvenance = {
+    detectedAt: new Date(NOW_MS).toISOString(),
+    lateThresholdSeconds: LATE_THRESHOLD_MS / 1000,
+    markets: { moneyline: { firstAppearanceAt: OPENED_AT, openerAgeSeconds: 600 } },
+  };
+  const outcome = await fireEligibleGame(build, inputs, '2026-07-20', provenance, {
+    arms: [TEST_ARM],
+    adapters: new Map([[TEST_ARM.participantId, dudAdapter]]),
+    approvedReportedModelIds: () => ['stub-model-1'],
+    outDir: tempDir('watch-dud-'),
+    timeoutMs: 1000,
+    maxOutputTokens: 16000,
+    mode: 'live',
+    clockMode: 'wall',
+    nowMs: () => NOW_MS,
+    log: () => undefined,
+    logError: () => undefined,
+  }, [
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'moneyline', decision: 'entered', reason: 'entered', firstAppearanceAt: OPENED_AT, openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'total', decision: 'not_entered', reason: 'market_never_opened', firstAppearanceAt: null, openerAgeSeconds: null, scheduledStartUtc: MATCH_TIME },
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'spread', decision: 'not_entered', reason: 'policy_disabled', firstAppearanceAt: null, openerAgeSeconds: null, scheduledStartUtc: MATCH_TIME },
+  ]);
+  assert.equal(outcome.fireFailed, true);
+  assert.equal(outcome.collisionFailed, false); // structural dud, not a collision
+  const lines = readFileSync(outcome.runFile, 'utf8').split(/\r?\n/).filter((l) => l.trim() !== '');
+  // The artifact ITSELF carries the terminal failure (not only the ledger).
+  assert.ok(
+    lines.some((l) => l.includes('"recordType":"run_failure"') && l.includes('FIRE_FAILED')),
+    'a FIRE_FAILED run_failure is in the artifact',
+  );
+  // And the scorer refuses it on the artifact alone.
+  const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms: EXPECTED_ARMS });
+  assert.ok(violations.some((v) => v.includes('not scoreable')));
+});
+
+// ---------------------------------------------------------------------------
+// Round-5b: adversarial-verification findings (defeated freshness gate;
+// first_pitch_passed bypass; credential-missing-with-valid-arms).
+// ---------------------------------------------------------------------------
+
+test('R5b: a slow DEFERRED sibling market does not stale the fire — the ready market enters on a re-fetched fresh snapshot', async () => {
+  // The exact class the freshness gate must catch: moneyline is ready (fast,
+  // cached read); the same game's total has a SLOW board read that advances the
+  // clock 40s past FRESH_FIRE_MS and returns null (deferred, never cached, so a
+  // re-plan through planGame would re-hang and re-stale the snapshot). The fire
+  // must still enter on a FRESH snapshot, not the 40s-staled one.
+  const fire = fakeFire();
+  let now = NOW_MS;
+  let fetches = 0;
+  const mlOpened = new Date(NOW_MS - 5 * 60_000).toISOString();
+  const deps = makeDeps({
+    fireGame: fire.fire,
+    nowMs: () => now,
+    // Live-like feed: each fetch stamps fetchCompletedAt at the current instant.
+    fetchInputs: () => {
+      fetches += 1;
+      return Promise.resolve(
+        inputsWith(
+          [
+            { ...oddsRow('moneyline', null), upstream_last_updated: new Date(now - 10_000).toISOString() },
+            { ...oddsRow('total', 8.5), upstream_last_updated: new Date(now - 10_000).toISOString() },
+          ],
+          { fetchStartedAt: new Date(now - 2_000).toISOString(), fetchCompletedAt: new Date(now).toISOString() },
+        ),
+      );
+    },
+    fetchFirstBoardAppearance: (_g, market) => {
+      if (market === 'total') {
+        now += 40_000; // the slow read advances the clock past FRESH_FIRE_MS
+        return Promise.resolve(null); // and returns null → deferred, uncached
+      }
+      return Promise.resolve(mlOpened);
+    },
+  });
+  await watchTick(deps);
+  assert.equal(fire.calls.length, 1);
+  assert.deepEqual(fire.calls[0]?.markets, ['moneyline']); // total deferred, fired alone
+  const call = fire.calls[0];
+  assert.ok(call);
+  // The fire entered on a FRESH snapshot — its recorded fetchCompletedAt is
+  // within FRESH_FIRE_MS of the fire instant, NOT the 40s-staled one the total's
+  // read produced. (This assertion FAILS on the defeated claim→dispatch gap
+  // check, which never measured snapshot age.)
+  assert.ok(
+    now - Date.parse(call.fetchCompletedAt) <= FRESH_FIRE_MS,
+    `fired on a fresh snapshot (age ${now - Date.parse(call.fetchCompletedAt)}ms)`,
+  );
+  assert.ok(fetches >= 2, 'the price snapshot was re-fetched for the fire');
+  // A clean entry, not a stale-abort.
+  assert.equal(deps.ledger.get(key(GAME_ID, 'moneyline'))?.dispatchStatus, 'completed');
+});
+
+test('R5b: first_pitch_passed on an ENABLED market of a FIRED run is refuted against the hash-verified bundle start', async () => {
+  const { lines, gameId } = await fireScopedRunMoneylineOnly();
+  const runId = (JSON.parse(lines[0] ?? '{}') as { runId: string }).runId;
+  // Drop the enabled total and launder it behind a fake first_pitch_passed with
+  // a doctored (past) scheduledStartUtc. The scorer must IGNORE that un-hash-
+  // covered field and refute it against the bundle's real (future) start.
+  const withTotalFpp = [
+    ...lines,
+    JSON.stringify({
+      recordType: 'speculation_status',
+      label: 'SMOKE_V0_NOT_A_COHORT',
+      runId,
+      gameId,
+      slug: 'x',
+      league: 'mlb',
+      market: 'total',
+      decision: 'not_entered',
+      reason: 'first_pitch_passed',
+      firstAppearanceAt: null,
+      openerAgeSeconds: null,
+      snapshotObservedAt: null,
+      scheduledStartUtc: new Date(NOW_MS - 60_000).toISOString(), // doctored: 1 min before detection
+    }),
+  ];
+  const run = parseRunRecords(withTotalFpp);
+  const mlOpened = new Date(NOW_MS - 10 * 60_000).toISOString();
+  const result = await verifyWatchEntryTiming(run, () => Promise.resolve(mlOpened));
+  assert.ok(
+    result.violations.some((v) => v.includes('first_pitch_passed but the hash-verified bundle start')),
+    'the doctored scheduledStartUtc is ignored; the reason is refuted against game.startUtc',
+  );
+});
+
+test('R5b: a fire with SOME valid arms but a credential-missing arm is still FAILED (FIRE_FAILED in the artifact, refused)', async () => {
+  const inputs = inputsWith([oddsRow('moneyline', null)]);
+  const build = buildBundle(inputs, '2026-07-20', { requireFuture: false });
+  const request = build.requests[0];
+  assert.ok(request);
+  const cohortId = 'watch-v0-2026-07-20';
+  const arm2 = {
+    participantId: 'stub-anthropic',
+    provider: 'anthropic' as const,
+    requestedModelId: 'stub-model-2',
+    credentialEnvVar: 'STUB_PROVIDER_KEY_2',
+  };
+  const validAdapter = stubAdapter(() => JSON.stringify(makeValidResponse(request, TEST_ARM, cohortId)));
+  const noCredAdapter: ProviderAdapter = {
+    provider: arm2.provider,
+    requestedModelId: arm2.requestedModelId,
+    credentialEnvVar: arm2.credentialEnvVar,
+    hasCredential: () => false,
+    chat: () => Promise.reject(new Error('no credential')),
+  };
+  const provenance: WatchGateProvenance = {
+    detectedAt: new Date(NOW_MS).toISOString(),
+    lateThresholdSeconds: LATE_THRESHOLD_MS / 1000,
+    markets: { moneyline: { firstAppearanceAt: OPENED_AT, openerAgeSeconds: 600 } },
+  };
+  const outcome = await fireEligibleGame(build, inputs, '2026-07-20', provenance, {
+    arms: [TEST_ARM, arm2],
+    adapters: new Map([
+      [TEST_ARM.participantId, validAdapter],
+      [arm2.participantId, noCredAdapter],
+    ]),
+    approvedReportedModelIds: (pid) => (pid === TEST_ARM.participantId ? ['stub-model-1'] : ['stub-model-2']),
+    outDir: tempDir('watch-partcred-'),
+    timeoutMs: 1000,
+    maxOutputTokens: 16000,
+    mode: 'live',
+    clockMode: 'wall',
+    nowMs: () => NOW_MS,
+    log: () => undefined,
+    logError: () => undefined,
+  }, [
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'moneyline', decision: 'entered', reason: 'entered', firstAppearanceAt: OPENED_AT, openerAgeSeconds: 600, scheduledStartUtc: MATCH_TIME },
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'total', decision: 'not_entered', reason: 'market_never_opened', firstAppearanceAt: null, openerAgeSeconds: null, scheduledStartUtc: MATCH_TIME },
+    { gameId: request.gameId, slug: 'x', league: 'mlb', market: 'spread', decision: 'not_entered', reason: 'policy_disabled', firstAppearanceAt: null, openerAgeSeconds: null, scheduledStartUtc: MATCH_TIME },
+  ]);
+  assert.equal(outcome.fireFailed, true); // credential-missing arm → failed even though one arm was valid
+  const lines = readFileSync(outcome.runFile, 'utf8').split(/\r?\n/).filter((l) => l.trim() !== '');
+  // The artifact carries decisions (one arm was valid) AND a FIRE_FAILED failure.
+  assert.ok(lines.some((l) => l.includes('"recordType":"decision"')), 'the valid arm produced decisions');
+  assert.ok(lines.some((l) => l.includes('"recordType":"run_failure"') && l.includes('FIRE_FAILED')));
+  const violations = verifyRunIntegrity(parseRunRecords(lines), {
+    expectedArms: [
+      { participantId: TEST_ARM.participantId, provider: TEST_ARM.provider, requestedModelId: TEST_ARM.requestedModelId, approvedReportedModelIds: ['stub-model-1'] },
+      { participantId: arm2.participantId, provider: arm2.provider, requestedModelId: arm2.requestedModelId, approvedReportedModelIds: ['stub-model-2'] },
+    ],
+  });
+  assert.ok(violations.some((v) => v.includes('not scoreable')));
 });

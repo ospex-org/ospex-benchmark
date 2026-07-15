@@ -170,6 +170,12 @@ export function buildRecords(
   /** Per-market dispositions for the fired game(s) — the published denominator
    *  (watch runs only; empty for the smoke). */
   dispositions: SpeculationDisposition[] = [],
+  /** Terminal fire failures computed BEFORE record assembly (watch runs only):
+   *  a fire that billed providers but produced no scoreable cohort (a
+   *  credential-missing arm or no valid response at all) is durably recorded as
+   *  a `run_failure` in the artifact itself — so the scorer refuses it even once
+   *  the artifact is separated from the ledger. Distinct from a collision. */
+  terminalFailures: Array<{ code: string; failures: string[] }> = [],
 ): JsonRecord[] {
   const records: JsonRecord[] = [];
   const { slateBundle, slateSha256, requests, gameHashes, excluded, provenance } = build;
@@ -251,12 +257,17 @@ export function buildRecords(
   }
 
   // The published denominator: every market of the fired game, entered or not.
+  // snapshotObservedAt is normalized to null (never dropped) so the KEY is
+  // always present in the artifact — the scorer requires it, so a post-hoc
+  // strip of the universal-detection evidence is a detectable omission, not a
+  // silently tolerated passthrough field.
   for (const disposition of dispositions) {
     records.push({
       recordType: 'speculation_status',
       label: SMOKE_LABEL,
       runId: ctx.runId,
       ...disposition,
+      snapshotObservedAt: disposition.snapshotObservedAt ?? null,
     });
   }
 
@@ -351,6 +362,19 @@ export function buildRecords(
       runId: ctx.runId,
       code,
       failures,
+    });
+  }
+
+  // Terminal fire failures (credential-missing arm / no valid response) are
+  // recorded with their own code(s), so a dud fire that still wrote an artifact
+  // is refused by the scorer on the artifact alone, not only via the ledger.
+  for (const terminal of terminalFailures) {
+    records.push({
+      recordType: 'run_failure',
+      label: SMOKE_LABEL,
+      runId: ctx.runId,
+      code: terminal.code,
+      failures: terminal.failures,
     });
   }
 

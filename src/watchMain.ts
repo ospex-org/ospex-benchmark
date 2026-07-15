@@ -207,31 +207,33 @@ async function main(): Promise<number> {
         const changed = statuses.filter(
           (s) => lastDisposition.get(`${s.gameId}:${s.market}`) !== dispKey(s),
         );
-        try {
-          appendNdjson(
-            coverageFile,
-            changed.map((s) => ({
-              recordType: 'coverage_status',
-              snapshotAt,
-              gameId: s.gameId,
-              slug: s.slug,
-              league: s.league,
-              market: s.market,
-              state: s.state,
-              reason: s.reason,
-              firstAppearanceAt: s.firstAppearanceAt,
-              openerAgeSeconds: s.openerAgeSeconds,
-              // Durable universal-detection evidence in the append-only log.
-              snapshotObservedAt: s.snapshotObservedAt,
-              scheduledStartUtc: s.scheduledStartUtc,
-            })),
-          );
-          // Only advance the dedup map AFTER a successful append — a transient
-          // append failure must not suppress the retry on the next tick.
-          for (const s of changed) lastDisposition.set(`${s.gameId}:${s.market}`, dispKey(s));
-        } catch (error) {
-          printError(`coverage-log append failed (will retry next tick): ${describeErrorWithStack(error)}`);
-        }
+        // NOT swallowed: a coverage-append failure THROWS out of this sink, so
+        // watchTick marks the tick failed — `--once` exits nonzero and the
+        // long-running loop reports the failure and retries next tick. The
+        // published denominator can never silently go missing while the pass
+        // still reports success. (There is no next tick under `--once`, so a
+        // fail-loud nonzero exit is exactly the required behavior.)
+        appendNdjson(
+          coverageFile,
+          changed.map((s) => ({
+            recordType: 'coverage_status',
+            snapshotAt,
+            gameId: s.gameId,
+            slug: s.slug,
+            league: s.league,
+            market: s.market,
+            state: s.state,
+            reason: s.reason,
+            firstAppearanceAt: s.firstAppearanceAt,
+            openerAgeSeconds: s.openerAgeSeconds,
+            // Durable universal-detection evidence in the append-only log.
+            snapshotObservedAt: s.snapshotObservedAt,
+            scheduledStartUtc: s.scheduledStartUtc,
+          })),
+        );
+        // Advance the dedup map only AFTER a successful append — a failed append
+        // (which throws above) never suppresses the retry on the next tick.
+        for (const s of changed) lastDisposition.set(`${s.gameId}:${s.market}`, dispKey(s));
       };
 
   const deps: WatchDeps = {

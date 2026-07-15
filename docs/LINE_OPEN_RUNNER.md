@@ -46,9 +46,11 @@ dispatched in the same breath.
 
 Batching is a transport detail, not a coupling. When two enabled markets are
 ready in the same tick (MLB's moneyline and total open in the same feed cycle),
-they share ONE dispatch to all twelve participants — but each is claimed,
-gated, and recorded independently. A batched dispatch and N separate
-dispatches produce the same per-speculation records.
+they share ONE dispatch — the four model arms plus the deterministic baselines
+for exactly the markets that bundle carries (a scoped moneyline+total fire runs
+the four moneyline baselines and the two total baselines, never the full set) —
+but each market is claimed, gated, and recorded independently. A batched
+dispatch and N separate dispatches produce the same per-speculation records.
 
 ## The per-market late gate (entry honesty)
 
@@ -105,8 +107,14 @@ speculation. Existence means handled forever; the set is re-derived from disk
 on restart, so a speculation fires at most once, ever, across restarts. Each
 entry records the decision (`fired` | `late_detection`), the market's first
 appearance and opener age, the bundle and request hashes, the run file, and the
-outcome. A corrupt file is treated as handled (never risk a double-fire). Ledger
-writes pass the same redaction chokepoint as every other artifact.
+outcome. A `fired` claim is written `pending` the instant it is claimed —
+BEFORE any provider call — and advanced to `completed` (a clean entry) or
+`failed` when the dispatch resolves. A claim stranded `pending` by a crash in
+the (synchronous, single-step) claim→dispatch gap restarts as
+`fire_interrupted`: terminal and unscoreable, never re-fired (a provider may
+already have billed) and never a clean `entered`. A corrupt file is likewise
+treated as handled (never risk a double-fire). Ledger writes pass the same
+redaction chokepoint as every other artifact.
 
 ## The published denominator (what makes per-market firing safe)
 
@@ -125,10 +133,20 @@ the corpus must carry the **negative space**, not just what fired:
   log (`out/line-open-coverage.ndjson`, emitted on state change) carries those
   dispositions too.
 - The scorer **enforces** consistency: for a watch run, the `entered` set must
-  equal the bundle's market set and the gated set — a market marked `not_entered`
-  that actually fired, or an entry with no denominator, is a hard violation.
-  Coverage becomes a published number, and a silently-dropped market becomes a
-  detectable contradiction rather than an invisible gap.
+  equal the bundle's market set and the gated set; the denominator must carry
+  exactly one disposition for **every declared market — including the disabled
+  run line** — each with its universal-detection evidence (`snapshotObservedAt`,
+  which the scorer PARSES and requires, not merely tolerates); and the run is
+  **bound to the append-only coverage log** — the scored game must appear there
+  with a fired set that matches the run file. A market marked `not_entered` that
+  actually fired, an entry with no denominator, a dropped declared market, a
+  stripped detection field, or a coverage log that disagrees with the run file is
+  a hard violation. Coverage becomes a published number, and a silently-dropped
+  market becomes a detectable contradiction rather than an invisible gap.
+  (A game omitted from BOTH the run corpus and the coverage log is only
+  detectable against the upstream schedule census, which is not yet a scoring
+  input — the one residual gap, called out honestly here rather than papered
+  over.)
 
 ## Independently verified entry timing
 
@@ -136,10 +154,17 @@ The recorded opener age is not taken on faith. `verifyWatchEntryTiming`
 re-derives each entered market's first board appearance from the append-only
 `odds_history` and reconciles the run's self-reported timing against it, within
 a bounded cross-clock skew (the runner and the writer stamp on different hosts).
-A claimed opener the log refutes is a violation; a market the log cannot resolve
-is a typed UNKNOWN (surfaced, never a silent pass and never a permanent
-fail-closed — that would strand the fresh-open path). This converts the
-fire-at-detection claim from self-attested to independently checked.
+It reconciles the **negative space** too: EVERY policy-enabled market marked
+`not_entered` must carry a reason the log actually supports — a
+`market_never_opened` the log shows DID open, or a `late_detection` whose opener
+was in fact within the gate, is a violation. A reason the first-appearance log
+cannot substantiate (`one_sided`, `stale_quote`, `board_read_failed`, or a
+`late_detection` with no first-appearance row at all) is a typed UNKNOWN —
+unscoreable, never accepted as operator self-attestation. A claimed opener the
+log refutes is a violation; a market the log cannot resolve is a typed UNKNOWN
+(surfaced, never a silent pass and never a permanent fail-closed — that would
+strand the fresh-open path). This converts the fire-at-detection claim from
+self-attested to independently checked.
 
 ## Rehearsal mode (mandatory before a first live boot)
 
@@ -179,8 +204,11 @@ games, except `games` and `dispatches`:
 - **disabled** — speculations withheld by policy (the MLB run line).
 - **handled** — speculations already terminal in the ledger (census-only).
 - **failed** — per-speculation failures (a thrown history read, a fire error, a
-  collision-failed fire, a malformed row). Any `failed` makes the pass
-  non-healthy and `--once` exits nonzero.
+  collision-failed or credential-missing fire, a `fire_interrupted` claim
+  stranded by a crash, a snapshot that staled before dispatch, a malformed row)
+  — plus a failure to persist the coverage denominator this tick (that append is
+  fail-loud, not swallowed). Any `failed` makes the pass non-healthy and
+  `--once` exits nonzero.
 - **CAP HIT** / **REHEARSAL** — suffixes for a hit dispatch cap or report-only
   mode.
 
@@ -211,13 +239,24 @@ than inferred from the counters — the exclusion reason a naive counter hides.
 - One instance per `--out` directory is still the operating recommendation,
   but the exclusive-create ledger claim now makes it a billing-safety guarantee
   too: two watchers sharing a ledger directory cannot both win a speculation's
-  claim, so they cannot both dispatch it. Within a tick the games' dispatches
-  run concurrently, so a slow provider call on one game never delays another's
-  fire past its opener.
-- `yarn preflight` before a live session remains the ritual — a fire with dead
-  credentials still counts as fired, and the ledger is one-shot.
-- Scoring is unchanged: after closes land, `yarn score --run out/<runId>.ndjson`
-  per fired game.
+  claim, so they cannot both dispatch it. Within a tick each game's dispatch is
+  launched the instant that game is claimed and runs concurrently with the rest
+  of the pass, so neither a slow provider call NOR a slow first-appearance read
+  on another game can delay a ready game's fire past its opener. A final
+  freshness check immediately before each provider call refuses to enter on a
+  snapshot that has staled.
+- `yarn preflight` before a live session remains a useful ritual, but the live
+  boot is now fail-closed on its own: `--live` validates EVERY model-provider
+  credential BEFORE any claim and refuses to boot if one is missing, and a fire
+  in which a required arm is credential-missing (or no arm returns a valid
+  response) is a FAILED fire — durable `fire_failed`, nonzero `--once`, and
+  refused by the scorer (a `FIRE_FAILED` `run_failure` is written into the
+  artifact itself). A dead-credential fire is never laundered into a clean
+  `fired`. The ledger is one-shot.
+- Scoring: after closes land, `yarn score --run out/<runId>.ndjson` per fired
+  game. For a watch run the scorer also binds the run to the coverage log beside
+  it (`line-open-coverage.ndjson`, or `--coverage PATH`) — a missing or
+  disagreeing coverage denominator refuses the score.
 
 ## Labels and cohorts
 

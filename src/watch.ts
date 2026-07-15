@@ -255,6 +255,50 @@ export interface SpecLedgerEntry {
   collisionFailed?: boolean | undefined;
   /** Present when the fire errored after the ledger claim. */
   fireError?: string | undefined;
+  /** The dispatch lifecycle of a `fired` claim, so a crash in the tiny
+   *  claim→dispatch gap is DURABLE and detectable on restart:
+   *   - `'pending'`   claimed, provider dispatch not yet completed (written at
+   *                   claim time). A claim stranded in this state is a crash
+   *                   between claim and dispatch — terminal, but `fire_interrupted`,
+   *                   NEVER a clean `entered`.
+   *   - `'completed'` the dispatch produced a scoreable cohort — a clean entry.
+   *   - `'failed'`    the dispatch billed but produced no scoreable cohort
+   *                   (collision / credential-missing / dud / thrown / stale) —
+   *                   terminal `fire_failed`.
+   *  Absent on `late_detection` entries (they never dispatch). */
+  dispatchStatus?: 'pending' | 'completed' | 'failed' | undefined;
+}
+
+/**
+ * A `fired` ledger entry is a CLEAN entry (renders `entered`) only if its
+ * dispatch durably COMPLETED without a failure signal. Completion evidence is
+ * `dispatchStatus === 'completed'` (or, for an entry adopted from another
+ * instance / a legacy file, a recorded `runId`). Anything else — a `pending`
+ * claim (crash in the claim→dispatch gap), an explicit `'failed'`, a
+ * `fireError`, or a collision — is terminal but is NOT a clean entry.
+ */
+export function firedEntryIsCleanEntry(entry: SpecLedgerEntry): boolean {
+  if (entry.decision !== 'fired') return false;
+  if (entry.fireError !== undefined) return false;
+  if (entry.collisionFailed === true) return false;
+  if (entry.dispatchStatus === 'pending' || entry.dispatchStatus === 'failed') return false;
+  return entry.dispatchStatus === 'completed' || entry.runId !== undefined;
+}
+
+/**
+ * A `fired` claim whose dispatch never completed and carries no explicit
+ * failure signal — a crash between the (durable) claim and the dispatch. It is
+ * terminal (never re-fired: providers may already have been billed) but renders
+ * `fire_interrupted`, distinct from a `fire_failed` dispatch that ran and failed.
+ */
+export function firedEntryInterrupted(entry: SpecLedgerEntry): boolean {
+  return (
+    entry.decision === 'fired' &&
+    !firedEntryIsCleanEntry(entry) &&
+    entry.fireError === undefined &&
+    entry.collisionFailed !== true &&
+    entry.dispatchStatus !== 'failed'
+  );
 }
 
 /** The live state of one speculation this tick — the observability + (in
@@ -620,23 +664,26 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
       };
 
       // Handled forever: report the ledger's terminal decision, never re-fire.
-      // A `fired` claim whose dispatch ultimately FAILED (fireError set) is
-      // terminal but is NOT a clean entry — it must render as `failed`, never
-      // re-appear as `entered` in the durable coverage.
+      // A `fired` claim is a clean `entered` only if its dispatch durably
+      // COMPLETED. A stranded `pending` claim (a crash in the claim→dispatch
+      // gap) renders `fire_interrupted`; a dispatch that ran and failed renders
+      // `fire_failed`. Neither ever re-appears as `entered` in the durable
+      // coverage, and neither is ever re-fired.
       const handled = deps.ledger.get(specKey(row.gameId, market));
       if (handled !== undefined) {
-        const failedFire =
-          handled.decision === 'fired' &&
-          (handled.fireError !== undefined || handled.collisionFailed === true);
+        const clean = firedEntryIsCleanEntry(handled);
+        const interrupted = firedEntryInterrupted(handled);
+        const isLate = handled.decision === 'late_detection';
         statuses.push({
           ...base,
-          state: handled.decision === 'late_detection' ? 'late' : failedFire ? 'failed' : 'fired',
-          reason:
-            handled.decision === 'late_detection'
-              ? 'late_detection'
-              : failedFire
-                ? 'fire_failed'
-                : 'entered',
+          state: isLate ? 'late' : clean ? 'fired' : 'failed',
+          reason: isLate
+            ? 'late_detection'
+            : clean
+              ? 'entered'
+              : interrupted
+                ? 'fire_interrupted'
+                : 'fire_failed',
           firstAppearanceAt: handled.firstAppearanceAt,
           openerAgeSeconds: handled.openerAgeSeconds,
         });
@@ -733,6 +780,67 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
     };
   };
 
+  // Re-fetch ONLY the price snapshot — never the board — so a fire enters on the
+  // freshest prices the feed can provide, even when THIS game's board reads were
+  // slow enough to age the snapshot it was planned on. First appearances are
+  // cached and immutable, so this does NO history read: a slow or deferred
+  // sibling market (an uncached null/failed read) can never re-stale the
+  // refreshed snapshot (the bug a re-plan through planGame reintroduced —
+  // planGame re-reads every market, re-hanging on the uncached one). Returns the
+  // plan UNCHANGED when the feed cannot produce anything newer (a fixed dry-run
+  // fixture / stuck feed — its capturedAt does not advance, so there is nothing
+  // fresher to fire on); 'stop' when even the refreshed snapshot is beyond
+  // maxInputAge; or null if the game left the window during the refresh.
+  const refreshPricesForFire = async (plan: GamePlan): Promise<GamePlan | 'stop' | null> => {
+    const fresh = await deps.fetchInputs();
+    const freshMs = Date.parse(fresh.fetchCompletedAt);
+    if (!(Number.isFinite(freshMs) && freshMs > Date.parse(plan.fetchCompletedAt))) {
+      return plan; // feed can't get fresher — fire on the freshest snapshot it has
+    }
+    currentInputs = fresh;
+    if (deps.nowMs() - freshMs > deps.maxInputAgeMs) {
+      deps.logError('inputs still aged after refresh — stopping this tick');
+      return 'stop';
+    }
+    const row = fresh.gamesRows.find((g) => g.gameId === plan.row.gameId);
+    if (row === undefined) return null; // left the window during the refresh
+    const oddsRows = fresh.oddsRows.filter((o) => o.jsonodds_id === row.gameId);
+    const oddsMap = new Map(oddsRows.map((o) => [o.market, o]));
+    const evaluation = evaluateGameMarkets(row, oddsMap, freshMs, {
+      requireFuture: true,
+      enabled: deps.enabledMarketsFor(row.sport),
+    });
+    // Fire only markets STILL buildable on the fresh prices; a ready market whose
+    // fresh quote vanished or went stale is dropped (never fired on a stale
+    // price) and its status re-flagged from the fresh evaluation. The gate
+    // (opener age, from the immutable first appearance) is recomputed at
+    // detection in prepareFire, so it is unaffected by the price refresh.
+    const built = new Set(evaluation.built);
+    const ready = plan.ready.filter((r) => built.has(r.market));
+    const statuses: SpecStatus[] = plan.statuses.map((s) => {
+      const snapshotObservedAt = oddsMap.get(s.market)?.upstream_last_updated ?? null;
+      if (s.state === 'ready' && !built.has(s.market)) {
+        return {
+          ...s,
+          state: 'blocked',
+          reason: evaluation.gameExcludedReason ?? evaluation.reasons[s.market] ?? 'market_never_opened',
+          snapshotObservedAt,
+        };
+      }
+      return { ...s, snapshotObservedAt };
+    });
+    return {
+      ...plan,
+      row,
+      oddsRows,
+      evaluation,
+      ready,
+      statuses,
+      fetchStartedAt: fresh.fetchStartedAt,
+      fetchCompletedAt: fresh.fetchCompletedAt,
+    };
+  };
+
   /** Tally every non-fire counter from a plan's statuses. Any status derived
    *  from a ledger entry is already handled (census-only). Fire counters are
    *  set at the dispatch site. */
@@ -752,9 +860,13 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
     }
   };
 
-  // SERIAL prepare phase: plan, gate, and CLAIM each game's ready markets. Fast
-  // (cached board data, local-disk claims), so every game is claimed promptly.
-  const fires: FireContext[] = [];
+  // Serial plan+claim, but each game's dispatch is LAUNCHED immediately (never
+  // deferred to a second phase) and collected — so a later game's slow board
+  // read can never delay an earlier, already-claimed game's in-flight fire, and
+  // the claim→dispatch gap for any game is a single synchronous step with no
+  // await, minimizing the window in which a crash could strand a `pending` claim
+  // (which, if it happens anyway, restarts as `fire_interrupted`, never entered).
+  const dispatchPromises: Array<Promise<void>> = [];
   for (const candidate of candidates) {
     try {
       let plan = await planGame(candidate.gameId);
@@ -762,18 +874,19 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
       if (plan === null) continue;
 
       // Fire-at-detection: the board reads can be slow; if they aged the
-      // snapshot and this game has ready work, RE-PREPARE on a fresh snapshot so
-      // the fire enters on current prices. Board data is cached, so this costs
-      // no history reads. The tally runs on the final plan only.
+      // snapshot and this game has ready work, refresh the PRICES on a fresh
+      // snapshot so the fire enters on current prices — WITHOUT re-reading the
+      // board (which would re-hang on an uncached deferred market and re-stale
+      // the snapshot). The tally runs on the final (refreshed) plan only.
       if (
         !deps.rehearse &&
         plan.ready.length > 0 &&
         deps.nowMs() - Date.parse(plan.fetchCompletedAt) > FRESH_FIRE_MS
       ) {
-        const replanned = await planGame(candidate.gameId);
-        if (replanned === 'stop') break;
-        if (replanned === null) continue; // left the window during re-prepare
-        plan = replanned;
+        const refreshed = await refreshPricesForFire(plan);
+        if (refreshed === 'stop') break;
+        if (refreshed === null) continue; // left the window during the refresh
+        plan = refreshed;
       }
 
       tally(plan);
@@ -841,40 +954,56 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
         allStatuses.push(...plan.statuses);
         continue;
       }
-      summary.dispatches += 1; // a real dispatch will happen in the concurrent phase
-      fires.push(ctx);
+      summary.dispatches += 1; // a real dispatch happens as soon as it's launched below
+
+      // Launch the dispatch NOW — concurrently with the rest of the loop,
+      // including the next game's board read. Its statuses are pushed AFTER the
+      // dispatch reconciles fired/failed, so the snapshot never shows a stale
+      // `ready` for a market that has already fired.
+      dispatchPromises.push(
+        (async (fireCtx: FireContext): Promise<void> => {
+          try {
+            const { fired, failed } = await dispatchFire(deps, fireCtx, summary);
+            const firedSet = new Set(fired);
+            const failedSet = new Set(failed);
+            for (const status of fireCtx.plan.statuses) {
+              if (firedSet.has(status.market)) {
+                status.state = 'fired';
+                status.reason = 'entered';
+              } else if (failedSet.has(status.market)) {
+                status.state = 'failed';
+                status.reason = 'fire_failed';
+              }
+            }
+          } catch (error) {
+            summary.failed += 1;
+            deps.logError(`dispatch failed for ${fireCtx.plan.row.slug} (${describeError(error)})`);
+          }
+          allStatuses.push(...fireCtx.plan.statuses);
+        })(ctx),
+      );
     } catch (error) {
       summary.failed += 1;
       deps.logError(`game ${candidate.gameId} failed this tick (${describeError(error)}) — continuing`);
     }
   }
 
-  // CONCURRENT dispatch phase: no game waits on another's provider round-trip.
-  await Promise.all(
-    fires.map(async (ctx) => {
-      try {
-        const { fired, failed } = await dispatchFire(deps, ctx, summary);
-        const firedSet = new Set(fired);
-        const failedSet = new Set(failed);
-        for (const status of ctx.plan.statuses) {
-          if (firedSet.has(status.market)) {
-            status.state = 'fired';
-            status.reason = 'entered';
-          } else if (failedSet.has(status.market)) {
-            status.state = 'failed';
-            status.reason = 'fire_failed';
-          }
-        }
-      } catch (error) {
-        summary.failed += 1;
-        deps.logError(`dispatch failed for ${ctx.plan.row.slug} (${describeError(error)})`);
-      }
-    }),
-  );
-  // The fired games' statuses are pushed AFTER dispatch, with fired/failed states.
-  for (const ctx of fires) allStatuses.push(...ctx.plan.statuses);
+  // Await every launched dispatch before publishing the status snapshot.
+  await Promise.all(dispatchPromises);
 
-  if (deps.onStatuses !== undefined) deps.onStatuses(allStatuses);
+  // Publish the per-speculation status snapshot / coverage denominator. A
+  // failure in this sink (e.g. a coverage-log append that cannot be persisted)
+  // is NOT swallowed: it fails the tick — nonzero `--once`, observably failed in
+  // the long-running loop — so the published denominator can never silently go
+  // missing while the pass still reports success.
+  if (deps.onStatuses !== undefined) {
+    try {
+      deps.onStatuses(allStatuses);
+    } catch (error) {
+      summary.failed += 1;
+      deps.logError(`status/coverage sink failed this tick (${describeError(error)}) — tick marked failed`);
+    }
+  }
   return summary;
 }
 
@@ -927,6 +1056,10 @@ function prepareFire(deps: WatchDeps, plan: GamePlan, summary: TickSummary): Fir
         openerAgeSeconds: r.openerAgeSeconds,
         gameSha256: 'pending',
         requestSha256: 'pending',
+        // Written to disk NOW, before any provider call: a crash before dispatch
+        // completes leaves this `pending` claim, which restarts as
+        // `fire_interrupted`, never a clean `entered`.
+        dispatchStatus: 'pending',
       };
       if (!claimLedgerEntryExclusive(deps.ledgerDir, entry)) {
         // Another instance owns this claim — adopt its record, never retry.
@@ -1035,14 +1168,39 @@ async function dispatchFire(
     fetchCompletedAt: plan.fetchCompletedAt,
   };
 
+  // Secondary guard on the CLAIM→DISPATCH gap, immediately before the provider
+  // call. Price freshness itself is guaranteed upstream by refreshPricesForFire
+  // (the fire enters on the freshest snapshot the feed can provide); this only
+  // backstops the gap between the claim's detection instant and the dispatch.
+  // Dispatch is launched synchronously right after the claim, so the gap is ~0 —
+  // but if a future change ever reintroduced an await there, a snapshot could
+  // stale in the gap, and that must NEVER be entered. If the gap exceeds
+  // FRESH_FIRE_MS the claim is a durable FAILED fire (no provider call, no
+  // billing) — recorded honestly, not entered on stale prices.
+  if (deps.nowMs() - Date.parse(provenance.detectedAt) > FRESH_FIRE_MS) {
+    const reason = 'dispatch lagged the claim by more than FRESH_FIRE_MS — the snapshot may have staled; not entered';
+    for (const c of claimed) {
+      const staled: SpecLedgerEntry = { ...c.entry, dispatchStatus: 'failed', fireError: reason };
+      deps.ledger.set(specKey(c.entry.gameId, c.entry.market), staled);
+      try {
+        persistLedgerEntry(deps.ledgerDir, staled);
+      } catch {
+        // the claim already prevents a re-fire this process
+      }
+    }
+    summary.failed += 1;
+    deps.logError(`fire aborted for ${plan.row.slug} (${plan.row.gameId}): ${reason}`);
+    return { fired: [], failed: wonMarkets };
+  }
+
   let outcome: FireOutcome;
   try {
     outcome = await deps.fireGame(build, fireInputs, plan.slateDate, provenance, dispositions);
   } catch (error) {
-    // A terminal fire FAILURE gets its own durable reason — it must never later
-    // render as a clean `entered` in the durable coverage.
+    // A terminal fire FAILURE gets its own durable reason AND a `failed`
+    // dispatch status — it must never later render as a clean `entered`.
     for (const c of claimed) {
-      const failed: SpecLedgerEntry = { ...c.entry, fireError: describeError(error) };
+      const failed: SpecLedgerEntry = { ...c.entry, dispatchStatus: 'failed', fireError: describeError(error) };
       deps.ledger.set(specKey(c.entry.gameId, c.entry.market), failed);
       try {
         persistLedgerEntry(deps.ledgerDir, failed);
@@ -1071,6 +1229,10 @@ async function dispatchFire(
       armOutcomes: outcome.armOutcomes,
       baselineDecisions: outcome.baselineDecisions,
       collisionFailed: outcome.collisionFailed,
+      // The dispatch ran: `completed` (clean, scoreable) or `failed` (billed but
+      // unscoreable). Either way the claim leaves `pending`, so a crash can no
+      // longer be mistaken for a clean entry.
+      dispatchStatus: unscoreable ? 'failed' : 'completed',
       ...(unscoreable ? { fireError: failureReason } : {}),
     };
     deps.ledger.set(specKey(c.entry.gameId, c.entry.market), completed);
@@ -1158,7 +1320,37 @@ export async function fireEligibleGame(
     })),
   );
 
-  const records = buildRecords(ctx, build, armGameResults, baselineDecisions, collision, dispositions);
+  // Terminal fire validity, computed BEFORE the records are written. A fire is
+  // a clean entry only if it produced a scoreable cohort: a credential-missing
+  // arm is a STRUCTURAL failure (that arm never participated — a misconfig, not
+  // a transient miss), and a fire in which NO arm produced a valid response is a
+  // total dud. Either is a FAILED fire, never a clean entry. A single transient
+  // miss while other arms succeed is a normal partial fire and still counts.
+  const credentialMissing = armGameResults.filter((r) => r.outcome === 'credential_missing');
+  const anyValid = armGameResults.some((r) => r.outcome === 'valid');
+  const fireFailed = credentialMissing.length > 0 || !anyValid;
+  const failureReason =
+    credentialMissing.length > 0
+      ? `credential_missing: ${credentialMissing.map((r) => r.arm.participantId).join(', ')}`
+      : !anyValid
+        ? 'no arm produced a valid response'
+        : undefined;
+  // Record the terminal failure IN THE ARTIFACT (a FIRE_FAILED run_failure) so
+  // the scorer refuses it on the file alone — the ledger is a separate,
+  // runner-local audit trail that a published/archived run file does not carry.
+  const terminalFailures = fireFailed
+    ? [{ code: 'FIRE_FAILED', failures: [failureReason ?? 'fire produced no scoreable cohort'] }]
+    : [];
+
+  const records = buildRecords(
+    ctx,
+    build,
+    armGameResults,
+    baselineDecisions,
+    collision,
+    dispositions,
+    terminalFailures,
+  );
   const runFile = join(cfg.outDir, `${ctx.runId}.ndjson`);
   writeNdjson(runFile, records);
   writeText(
@@ -1175,23 +1367,6 @@ export async function fireEligibleGame(
     cfg.logError(`!!! ${ctx.runId} FAILED — ${codes.join(' + ')} (file kept, permanently unscoreable) !!!`);
     for (const failure of collision.failures) cfg.logError(`  ${failure}`);
   }
-
-  // A fire is a clean entry only if it produced a scoreable cohort. A
-  // credential-missing arm is a STRUCTURAL failure (that arm never participated
-  // — a misconfiguration, not a transient miss), and a fire in which NO arm
-  // produced a valid response is a total dud. Either is a FAILED fire, never a
-  // clean entry — the board must not be laundered into `fired` without the
-  // intended model decisions. A single transient miss while other arms succeed
-  // is a normal partial fire and still counts.
-  const credentialMissing = armGameResults.filter((r) => r.outcome === 'credential_missing');
-  const anyValid = armGameResults.some((r) => r.outcome === 'valid');
-  const fireFailed = credentialMissing.length > 0 || !anyValid;
-  const failureReason =
-    credentialMissing.length > 0
-      ? `credential_missing: ${credentialMissing.map((r) => r.arm.participantId).join(', ')}`
-      : !anyValid
-        ? 'no arm produced a valid response'
-        : undefined;
   if (fireFailed) {
     cfg.logError(`!!! ${ctx.runId} FIRE FAILED — ${failureReason} (board claimed, no scoreable cohort) !!!`);
   }
