@@ -353,7 +353,7 @@ the PR that changes the behaviour.
 
 ## 7. Verification
 
-**The authoritative acceptance matrix is the Tier-0 spec §10** (cases 1–44). The
+**The authoritative acceptance matrix is the Tier-0 spec §10** (cases 1–48). The
 still-current unit/firing checks below are a subset of it; the per-market
 `policy_disabled` / `late_detection` **status-record** assertions from the
 earlier draft are superseded by global coverage reconciliation (Tier-0 spec §6)

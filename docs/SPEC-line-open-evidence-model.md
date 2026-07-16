@@ -259,15 +259,23 @@ No canonical provider request may begin unless **all** hold (times in ms):
 ```
 windowStart ≤ firstTwoSided.captured_at < windowEnd
 windowStart ≤ detectedAt                < windowEnd
-requestStartedAt                        < windowEnd
+initialRequestStartedAt                 < windowEnd                     // window boundary: INITIAL request only
 0 ≤ detectedAt − firstTwoSided.captured_at ≤ cleanEntryWindowMs        // = W
-0 ≤ requestStartedAt − detectedAt          ≤ maxDispatchLagMs           // V-lag, two-sided
-requestStartedAt < scheduledAtAtFire                                    // hard first-pitch gate
+0 ≤ initialRequestStartedAt − detectedAt   ≤ maxDispatchLagMs           // V-lag: INITIAL request only, two-sided
+requestStartedAt < scheduledAtAtFire                                    // hard first-pitch gate — EVERY request (incl repair)
 ```
 
-**V-lag is two-sided:** a backdated `requestStartedAt` (before `detectedAt`) must **not**
-pass. Per-attempt timestamp monotonicity is also required (§5):
-`requestReceivedAt ≥ requestStartedAt` and `acceptedAt ≥ requestStartedAt`.
+**V-lag applies to each arm's INITIAL request only** — it proves prompt dispatch after
+detection, and is two-sided (a backdated `initialRequestStartedAt`, before `detectedAt`,
+must **not** pass). A repair is causally downstream of the initial response and is **not**
+compared to `detectedAt` under V-lag (§5, repair timeline). The observation-window boundary
+`initialRequestStartedAt < windowEnd` likewise binds admission and the initial request: a
+fire admitted before `windowEnd` may receive its initial response and perform one
+fingerprint-preserving repair **after** `windowEnd`, provided the repair starts and is
+accepted **before** `scheduledAtAtFire` and within all timeout/cap/fingerprint rules —
+otherwise a fire admitted 1 ms before `windowEnd` would have systematically lower completion
+probability. The first-pitch gate `requestStartedAt < scheduledAtAtFire` binds **every**
+request, initial and repair. Full per-attempt timestamp ordering is required in §5.
 
 The bare age gate `detectedAt − firstTwoSided ≤ W` alone is **insufficient**: it admits a
 paid request for a market that can never be in the universe `U` (§6) — an opener just
@@ -325,8 +333,8 @@ prepared snapshot, not the final bundle):
    - atomically persist claims and reservations.
 5. If no key remains, create **no** claim/reservation/artifact and send **no** request.
 6. Persist `bundleBuiltAt` separately; it may be **after** `detectedAt`, but bundle
-   construction is synchronous and every request still satisfies V-lag / freshness /
-   window / cutoff.
+   construction is synchronous, and every **initial** request still satisfies V-lag /
+   freshness / `windowEnd`, and **every** request (initial or repair) the first-pitch cutoff.
 7. Start the full-roster initial request batch.
 
 ### Co-arrival partial-claim
@@ -349,10 +357,13 @@ Manifest arm order must **not** decide which model gets a request before V-lag/c
 3. Launch all initial arm requests as **one concurrent roster batch**. No arm may become
    `dispatch_lag_exceeded` merely because another arm occupied the only internal scheduler
    slot first.
-4. Repairs use the same bounded scheduler and remain subject to V-lag / cutoff / attempt
-   caps.
-5. Cross-process concurrency reservations live in the **same** durable atomic store as
-   claims and call/spend reservations.
+4. A repair uses the same bounded scheduler but is **not** subject to initial V-lag (it is
+   causally downstream of the initial response); it remains bounded by
+   `maxRepairAttemptsPerArm`, a freshly-acquired concurrency lease (§4), the remaining
+   `providerCallTimeoutMs` / attempt-timeout contract, the first-pitch cutoff
+   `scheduledAtAtFire`, the call/spend caps, and decision-fingerprint preservation (§5).
+5. Cross-process concurrency reservations are expiring, releasable **leases** (§4), held in
+   the **same** durable atomic store as the claim and call/spend reservations.
 
 If full-roster capacity cannot be obtained while the market is still clean, **defer before
 claim**; an eventual miss is disclosed in `M` (§6).
@@ -374,7 +385,8 @@ Each completed fire artifact retains:
 - `cohortId`, the manifest hash, and the public-manifest publication descriptor + observed
   committer timestamp (§2);
 - `fireId`, `runId`, `gameId`, `games.sport`, the **scoped market set**;
-- `preparedSnapshotTs`, `detectedAt`, `bundleBuiltAt`, per-arm provider `requestStartedAt`;
+- `preparedSnapshotTs`, `detectedAt`, `bundleBuiltAt`, and per arm `initialRequestStartedAt`
+  plus each attempt's `requestStartedAt` / `requestReceivedAt` / `acceptedAt` (§5);
 - `scheduledAtAtFire` (the scheduled start used for the first-pitch gate);
 - the `source=jsonodds` `odds_history` opener/as-of **row identity** and the exact opening
   quote **for each scoped market**;
@@ -395,8 +407,9 @@ snapshot — coverage is derived globally (§6).
 
 A small append-only ledger records claim → completion for **at-most-once billing and
 crash recovery only**. It is operational state, **not** the source of the coverage
-denominator. Persistence order: (1) atomic claim + budget/concurrency reservation (below);
-(2) start provider requests within V-lag; (3) persist arm outcomes + run artifact; (4) mark
+denominator. Persistence order: (1) atomic claim + budget reservation + concurrency-lease
+acquisition (below); (2) start the initial provider requests within V-lag; (3) persist arm
+outcomes + run artifact; (4) mark
 the claim completed. A crash between steps leaves an interrupted claim — at-most-once holds
 (no re-fire), and the pair surfaces as a miss/incomplete fire in §6, never as a clean entry.
 
@@ -431,9 +444,51 @@ input-token count, `maxOutputTokens`, the tool policy, and the repair reservatio
 pricing **fails boot**. It is **not** exact external billing; the hard guarantees are call
 count, token/output bounds, and this conservative estimate.
 
-A crash **after** reservation leaves claims and reservations **consumed** (conservative; no
-duplicate retry). A completed dispatch may settle actual attempt counts only through the
-same atomic store, and can **never** reduce below calls already made.
+**Two distinct state classes.** *Consumed cohort accounting* — the claim, the call
+reservation, and the spend reservation — stays consumed per the conservative rules above; a
+crash **after** reservation leaves it consumed (no duplicate retry, no fire retry), and a
+completed dispatch may settle actual attempt counts only through the same atomic store,
+never reducing below calls already made. *Transient concurrency capacity* is **not** a
+permanently-consumed cohort budget: it is held as expiring, releasable attempt leases.
+
+### Concurrency leases (releasable, crash-expiring)
+
+`maxConcurrentProviderRequests` is enforced through **leases**, not consumed budget —
+otherwise the first full-roster dispatch (e.g. `maxConcurrentProviderRequests = 4`,
+`expectedArmRoster.length = 4`) could hold every slot forever, even after all four HTTP
+attempts complete. Each lease is at least:
+
+```
+ConcurrencyLeaseV1 {
+  leaseId,
+  cohortId,
+  fireId,
+  ownerId,
+  attemptKind,        // initial | repair
+  slotCount,
+  acquiredAt,
+  expiresAt
+}
+```
+
+Canonical behavior:
+1. Initial admission atomically acquires `expectedArmRoster.length` slots **together with**
+   the claim / call / spend reservation.
+2. The initial lease's `expiresAt` is **no earlier than**
+   `acquiredAt + maxDispatchLagMs + providerCallTimeoutMs + maxClockSkewMs`.
+3. Launch the roster batch; **release each slot in a `finally` path** the moment that HTTP
+   attempt reaches response, timeout, abort, or transport failure.
+4. A repair acquires **one** fresh slot lease immediately before its repair HTTP attempt,
+   from the same atomic global capacity counter; its `expiresAt` is no earlier than
+   `acquiredAt + providerCallTimeoutMs + maxClockSkewMs`.
+5. A stale lease may be reclaimed **only at/after `expiresAt`**, never earlier.
+6. Reclaiming concurrency changes **only** current in-flight capacity — it does **not**
+   refund a claim / call / spend reservation and **never** permits a fire retry.
+7. A cleanly completed fire has **no** active leases; a crash may leave a lease until
+   `expiresAt`, after which later unrelated fires may use the capacity while the crashed
+   fire stays claimed/incomplete.
+8. At every instant, the sum of active, unexpired lease slots across all workers is
+   `≤ maxConcurrentProviderRequests`.
 
 ## 5. Per-fire entry verification and arm provenance
 
@@ -446,8 +501,9 @@ For each fire key `(gameId, market)`:
   `detectedAt` — `(captured_at DESC, id DESC) limit 1`, `id ≤ oddsHistoryWatermark` — on
   `line` + both American odds (home-side spread convention) (**V1**); the freshness gap
   `0 ≤ detectedAt − preparedSnapshotTs ≤ freshFireMs` holds (**V1b**);
-- the dispatch lag `0 ≤ requestStartedAt − detectedAt ≤ maxDispatchLagMs` holds (**V-lag**,
-  two-sided, measured at the provider HTTP boundary; both operands benchmark-host, no skew);
+- the **initial** dispatch lag `0 ≤ initialRequestStartedAt − detectedAt ≤ maxDispatchLagMs`
+  holds (**V-lag**, two-sided, **initial request only** — a repair is not tested against it;
+  measured at the provider HTTP boundary; both operands benchmark-host, no skew);
 - the scoped bundle carries the same quote + market identity;
 - no hard-coded three-market assumption; and
 - **all** expected arms and their outcomes are present.
@@ -468,8 +524,8 @@ violation (there is no free absence marker):
 | `timeout` | sent | valid negative |
 | `rate_limited` | sent (429) | valid negative — a throttle must never read as a model failure |
 | `provider_error` | sent | valid negative — provider/transport refusal with **no body** |
-| `cutoff_missed` | an arm in an already-claimed fire whose initial/repair request would **start** at/after `scheduledAtAtFire` (or `windowEnd`), **or** whose response/repair crosses that cutoff → no request sent / no decision accepted for that arm | valid negative; **no** decision records |
-| `dispatch_lag_exceeded` | **not sent** — the first request would start `> maxDispatchLagMs` after `detectedAt` (**V-lag**, measured at the provider HTTP boundary; both operands benchmark-host, no skew) | valid negative |
+| `cutoff_missed` | an arm in an already-claimed fire where the **initial** request is unsent at/after `windowEnd` or `scheduledAtAtFire`, **or** a **repair** request/response crosses `scheduledAtAtFire` (first pitch), or any response is accepted at/after first pitch → no request sent / no decision accepted. Crossing `windowEnd` **after** a timely initial request is **not** by itself `cutoff_missed`. | valid negative; **no** decision records |
+| `dispatch_lag_exceeded` | **not sent** — the **initial** request would start `> maxDispatchLagMs` after `detectedAt` (**V-lag**, initial-only, measured at the provider HTTP boundary; both operands benchmark-host, no skew) | valid negative |
 | `credential_missing` | not sent (should be blocked at boot) | structural — a required arm makes the fire fail integrity |
 
 "Failures never leave the denominator" — a *partial* fire still scores its sent arms;
@@ -481,10 +537,14 @@ For every expected arm, persist **exactly one** terminal outcome and **all attem
 to substantiate it. Each attempt records:
 - `participantId`, provider, requested model ID;
 - the provider-reported model ID when a response identifies one;
-- initial vs repair attempt number (**monotone and unique**);
-- provider HTTP `requestStartedAt`, `requestReceivedAt`, and (when accepted) `acceptedAt`
-  timestamps (**monotone**: `requestReceivedAt ≥ requestStartedAt`, `acceptedAt ≥
-  requestStartedAt`);
+- initial vs repair attempt number (**unique and strictly increasing**);
+- the fire's `initialRequestStartedAt` (the arm's initial-request start — the **sole**
+  operand of V-lag) recorded **distinctly** from each attempt's own `requestStartedAt`, so
+  the scorer can never apply initial V-lag to a repair;
+- per attempt, provider HTTP `requestStartedAt`, `requestReceivedAt`, and (when accepted)
+  `acceptedAt`, in **full causal order** —
+  `requestStartedAt ≤ requestReceivedAt ≤ acceptedAt` (the `acceptedAt` bound when present) —
+  and across attempts `repair.requestStartedAt ≥ initial.requestReceivedAt`;
 - `requestSha256`, the exact persisted response body, `responseSha256`;
 - transport status, usage/token metadata, and repair linkage.
 
@@ -504,7 +564,7 @@ unpersisted raw-provider digest kept for diagnostics is **not** an integrity pro
 armDigest = sha256Hex(canonicalize({
   cohortId, fireId, runId, participantId, requestSha256,
   expectedArmIdentity,
-  orderedAttempts,                  // attempt numbers + timestamps monotone & unique
+  orderedAttempts,                  // attempt numbers unique & strictly increasing; timestamps fully causally ordered
   terminalOutcome,
   acceptedResponseDigestOrNull,     // = responseSha256 of the accepted attempt, or null
   acceptedDecisionFingerprintOrNull
@@ -512,7 +572,10 @@ armDigest = sha256Hex(canonicalize({
 ```
 
 The scorer **recomputes** `armDigest`. Mutating the persisted response bytes, the enclosing
-fire/run identity, an attempt's order, or an attempt timestamp must **fail** integrity.
+fire/run identity, an attempt's order, or an attempt timestamp must **fail** integrity. The
+scorer also recomputes the per-attempt ordering `requestStartedAt ≤ requestReceivedAt ≤
+acceptedAt`, the cross-attempt ordering `repair.requestStartedAt ≥ initial.requestReceivedAt`,
+and unique strictly-increasing attempt numbers; any violation fails arm/fire integrity.
 
 ### Retained benchmark protections
 
@@ -535,15 +598,20 @@ an undocumented outcome.
 
 ### Cutoff race
 
-The hard first-pitch rule governs `cutoff_missed`, in two separate cases:
-- if the first-pitch/window cutoff is already passed **before claim**, create **no** claim
-  and **no** fire artifact — it becomes a coverage **miss** (`M`, §6), not a `cutoff_missed`
-  outcome;
-- if the cutoff passes **after an atomic claim** but before a particular initial/repair
-  request starts, send **no** request for that arm and record `cutoff_missed` in the
-  already-claimed fire;
+First pitch (`scheduledAtAtFire`) is the hard cutoff for **every** request; `windowEnd`
+bounds only admission and the **initial** request:
+- if first pitch is already passed **before claim**, create **no** claim and **no** fire
+  artifact — it becomes a coverage **miss** (`M`, §6), not a `cutoff_missed` outcome;
+- an **initial** request unsent at/after `windowEnd` **or** `scheduledAtAtFire` (in an
+  already-claimed fire) → `cutoff_missed` for that arm;
+- a **repair** request or response that crosses `scheduledAtAtFire` (first pitch) →
+  `cutoff_missed`;
+- **crossing `windowEnd` after a timely initial request is NOT by itself `cutoff_missed`** —
+  a fire admitted before `windowEnd` may complete one fingerprint-preserving repair after
+  `windowEnd`, so long as that repair starts and is accepted before first pitch and within
+  all timeout/cap/fingerprint rules (§3);
 - no response may be **accepted** at/after `scheduledAtAtFire`;
-- `dispatch_lag_exceeded` means the request is **not sent**.
+- `dispatch_lag_exceeded` means the **initial** request is **not sent**.
 
 **No request ever starts late.** Persist enough timestamps for the scorer to recompute each
 classification.
@@ -834,3 +902,15 @@ evidence" does **not** mean casual paid dispatch.
 43. Independent bootstrap implementations using the pinned seed/PRNG/quantile rules produce
     **byte-identical** intervals.
 44. A non-`jsonodds` `closing_lines.source` is CLV-unavailable under Tier-0 v1.
+45. One full-roster dispatch completes and **releases** all concurrency leases; a second
+    dispatch acquires those slots, and active unexpired slots never exceed
+    `maxConcurrentProviderRequests`.
+46. A worker crashes after claim/lease acquisition → the lease cannot be reclaimed **before**
+    `expiresAt`, can be reclaimed **after**, and claim/call/spend stay consumed with **no**
+    redispatch of the crashed fire.
+47. An initial request starts before `windowEnd`, returns **after** `windowEnd`, and needs a
+    fingerprint-preserving repair before first pitch → the repair is allowed and is **not**
+    tested against initial V-lag; the same repair at/after first pitch → `cutoff_missed`.
+48. `acceptedAt < requestReceivedAt`, a repair starting before the initial response
+    (`repair.requestStartedAt < initial.requestReceivedAt`), or non-increasing/duplicate
+    attempt numbers → fails arm/fire integrity.
