@@ -20,7 +20,7 @@ import type { MarketKey } from './types.js';
  * enter. See SPEC-line-open-speculation-runner.md §3.1 and
  * SPEC-line-open-evidence-model.md §2/§3.
  */
-export const MARKET_POLICY_VERSIONS = ['market-policy-v1'] as const;
+export const MARKET_POLICY_VERSIONS = Object.freeze(['market-policy-v1'] as const);
 export type MarketPolicyVersion = (typeof MARKET_POLICY_VERSIONS)[number];
 
 /** The policy version the harness stamps on NEW runs. */
@@ -33,15 +33,37 @@ export function isMarketPolicyVersion(value: string): value is MarketPolicyVersi
 /** One policy: for each `games.sport` slug, the markets that are enabled. */
 type MarketPolicy = Readonly<Record<string, readonly MarketKey[]>>;
 
+/**
+ * Recursively freeze an object graph so the compile-time `readonly` cannot be
+ * bypassed at runtime — e.g. `(marketPolicyForVersion(...) as any).mlb.push(...)`.
+ * Without this, the allow-list could change eligibility after a digest check
+ * without a version bump, splitting `market-policy-v1` from its pinned digest.
+ */
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object') {
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      deepFreeze((value as Record<string, unknown>)[key]);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
 const MARKET_POLICY_V1: MarketPolicy = {
   // MLB: moneyline + total. Run line (the 'spread' MarketKey) deliberately OFF.
   mlb: ['moneyline', 'total'],
   // nfl: ['moneyline', 'spread', 'total'],  // example — when NFL is enabled
 };
 
-const POLICIES: Readonly<Record<MarketPolicyVersion, MarketPolicy>> = {
+/**
+ * The version→policy registry, **deep-frozen** so neither the registry, the
+ * policy objects, nor their market arrays can be mutated at runtime.
+ * `market-policy-v1` therefore denotes exactly one immutable allow-list, and its
+ * digest can never go stale relative to what the runner/scorer actually read.
+ */
+const POLICIES: Readonly<Record<MarketPolicyVersion, MarketPolicy>> = deepFreeze({
   'market-policy-v1': MARKET_POLICY_V1,
-};
+});
 
 /** The policy object for a KNOWN version; throws on an unknown version. */
 export function marketPolicyForVersion(version: string): MarketPolicy {
