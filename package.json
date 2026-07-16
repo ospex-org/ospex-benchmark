@@ -17,7 +17,7 @@
     "ingest:retrosheet": "tsx src/ingestRetrosheet.ts",
     "extract:totals": "tsx src/extractTotalsPairs.ts",
     "fit:totals": "tsx src/fitTotalsDispersion.ts",
-    "test": "tsx --test src/slateDate.test.ts src/bundle.test.ts src/schema.test.ts src/prompt.test.ts src/runner.test.ts src/family.test.ts src/records.test.ts src/console.test.ts src/redaction.test.ts src/cli.integration.test.ts src/clv.test.ts src/baselines.test.ts src/scoring.test.ts src/watch.test.ts src/zip.test.ts src/retrosheet.test.ts src/inhouseTotals.test.ts src/dispersion.test.ts src/dispersion.artifact.test.ts src/fetchers.test.ts src/ladder.test.ts src/marketPolicy.test.ts src/manifest.test.ts src/manifestValidate.test.ts src/cohortBoot.test.ts",
+    "test": "tsx --test src/slateDate.test.ts src/bundle.test.ts src/schema.test.ts src/prompt.test.ts src/runner.test.ts src/family.test.ts src/records.test.ts src/console.test.ts src/redaction.test.ts src/cli.integration.test.ts src/clv.test.ts src/baselines.test.ts src/scoring.test.ts src/watch.test.ts src/zip.test.ts src/retrosheet.test.ts src/inhouseTotals.test.ts src/dispersion.test.ts src/dispersion.artifact.test.ts src/fetchers.test.ts src/ladder.test.ts src/marketPolicy.test.ts src/manifest.test.ts src/manifestValidate.test.ts src/cohortBoot.test.ts src/manifestPublication.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
