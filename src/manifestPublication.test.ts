@@ -14,10 +14,13 @@ import type {
 
 /**
  * Public-Git precommitment verification (§2, case 17). Fixtures are structurally
- * valid manifests (this check parses + derives cohortId/windowStart; it does not
- * re-run the code-consistency checks). Each case isolates one refusal — mismatched
- * bytes, a different published cohort, or a committer timestamp not strictly before
- * windowStart — plus the resolver-failure and frozen-record guarantees.
+ * valid manifests carried as raw bytes (this check compares raw bytes, decodes
+ * fail-closed, and derives cohortId/windowStart; it does not re-run the
+ * code-consistency checks). Each case isolates one refusal — mismatched raw bytes,
+ * a different published cohort, an offset-less/late committer timestamp — plus the
+ * two binding guarantees §2 requires: the descriptor (and the local bytes) are
+ * snapshotted before any resolver call, and equality is a RAW-BYTE compare (not a
+ * decoded string).
  */
 
 const WINDOW_START = '2026-07-16T00:00:00.000Z';
@@ -77,7 +80,10 @@ function validRaw(overrides: Record<string, unknown> = {}): Record<string, unkno
   };
 }
 
-const LOCAL_BYTES = JSON.stringify(validRaw());
+const bytesOf = (raw: Record<string, unknown>, pretty = false): Buffer =>
+  Buffer.from(JSON.stringify(raw, null, pretty ? 2 : undefined), 'utf-8');
+
+const LOCAL_BYTES = bytesOf(validRaw());
 
 function resolved(over: Partial<ResolvedPublication> = {}): ResolvedPublication {
   return { blobBytes: LOCAL_BYTES, committerTimestamp: BEFORE, ...over };
@@ -96,7 +102,7 @@ test('parseManifestPublication accepts a valid descriptor and rejects malformed 
   assert.throws(() => parseManifestPublication({ ...PUB, path: '' }), /path/);
 });
 
-// --- checkPublication ---
+// --- checkPublication: raw-byte equality + cohortId + timestamp ---
 
 test('a matching, timely precommitment verifies and returns a frozen record', () => {
   const verified = checkPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolved: resolved() });
@@ -106,22 +112,42 @@ test('a matching, timely precommitment verifies and returns a frozen record', ()
     (verified as unknown as { committerTimestamp: string }).committerTimestamp = 'x';
   });
   assert.throws(() => {
-    (verified.publication as unknown as { commitSha: string }).commitSha = 'f'.repeat(40).replace('f', 'e');
+    (verified.publication as unknown as { commitSha: string }).commitSha = 'e'.repeat(40);
   });
 });
 
-test('byte equality is stricter than cohortId — same manifest, different bytes still refuses', () => {
+test('byte equality is stricter than cohortId — pretty vs compact refuses on bytes alone', () => {
   // Pretty-printed blob: byte-different from the compact local bytes, but the same
   // semantic manifest, so ONLY the raw-byte check fails (cohortId still matches).
-  const pretty = JSON.stringify(validRaw(), null, 2);
   const err = assertThrowsPublication(() =>
-    checkPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolved: resolved({ blobBytes: pretty }) }),
+    checkPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolved: resolved({ blobBytes: bytesOf(validRaw(), true) }) }),
   );
   assert.deepEqual(err.violations, ['published blob bytes differ from the local manifest bytes']);
 });
 
+test('CRLF vs LF byte differences fail even when cohort identity matches', () => {
+  const lf = bytesOf(validRaw(), true);
+  const crlf = Buffer.from(lf.toString('utf-8').replace(/\n/g, '\r\n'), 'utf-8');
+  const err = assertThrowsPublication(() =>
+    checkPublication({ localManifestBytes: lf, publication: PUB, resolved: { blobBytes: crlf, committerTimestamp: BEFORE } }),
+  );
+  assert.deepEqual(err.violations, ['published blob bytes differ from the local manifest bytes']);
+});
+
+test('raw byte comparison, not decoded-string — the U+FFFD collision is refused', () => {
+  // ef bf bd (valid UTF-8 for U+FFFD) vs ff (invalid UTF-8): different raw bytes a
+  // lossy decoder would collapse to the same "�" string. The raw-byte compare
+  // rejects the difference, and fail-closed decoding rejects the invalid-UTF-8 blob.
+  const local = Buffer.from([0xef, 0xbf, 0xbd]);
+  const blob = Buffer.from([0xff]);
+  const err = assertThrowsPublication(() =>
+    checkPublication({ localManifestBytes: local, publication: PUB, resolved: { blobBytes: blob, committerTimestamp: BEFORE } }),
+  );
+  assert.ok(err.violations.some((v) => /blob bytes differ/.test(v)), err.violations.join('; '));
+});
+
 test('a published blob that is a different cohort fails both byte and cohortId checks', () => {
-  const other = JSON.stringify(validRaw({ windowEnd: '2026-07-16T03:00:00.000Z' }));
+  const other = bytesOf(validRaw({ windowEnd: '2026-07-16T03:00:00.000Z' }));
   const err = assertThrowsPublication(() =>
     checkPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolved: resolved({ blobBytes: other }) }),
   );
@@ -131,7 +157,7 @@ test('a published blob that is a different cohort fails both byte and cohortId c
 
 test('a published blob that is not a valid manifest is flagged', () => {
   const err = assertThrowsPublication(() =>
-    checkPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolved: resolved({ blobBytes: '{ not json' }) }),
+    checkPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolved: resolved({ blobBytes: Buffer.from('{ not json', 'utf-8') }) }),
   );
   assert.ok(err.violations.some((v) => /published blob is not a valid manifest/.test(v)), err.violations.join('; '));
 });
@@ -146,9 +172,6 @@ test('a committer timestamp equal to or after windowStart is not strictly before
 });
 
 test('a garbage or offset-less committer timestamp is refused (no host-local interpretation)', () => {
-  // A naive (offset-less) ISO string would be read by Date.parse in the runner's
-  // local zone and compared against a UTC windowStart — a host-dependent verdict.
-  // Both a garbage value and a valid-but-offset-less one must fail closed.
   for (const ts of ['not-a-date', '2026-07-16T09:00:00', '2026-07-15T23:00:00']) {
     const err = assertThrowsPublication(() =>
       checkPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolved: resolved({ committerTimestamp: ts }) }),
@@ -158,9 +181,7 @@ test('a garbage or offset-less committer timestamp is refused (no host-local int
 });
 
 test('an explicit non-Z offset is compared by true instant, not host zone', () => {
-  // windowStart is 2026-07-16T00:00:00Z. Both fixtures use a +05:00 offset so the
-  // true instant — not the wall-clock digits — decides, independent of host zone.
-  // 04:00+05:00 == 2026-07-15T23:00:00Z (before -> verifies).
+  // windowStart is 2026-07-16T00:00:00Z. 04:00+05:00 == 2026-07-15T23:00:00Z (before -> verifies).
   const verified = checkPublication({
     localManifestBytes: LOCAL_BYTES,
     publication: PUB,
@@ -178,10 +199,23 @@ test('an explicit non-Z offset is compared by true instant, not host zone', () =
   assert.ok(err.violations.some((v) => /not strictly before/.test(v)), err.violations.join('; '));
 });
 
+test('an invalid local manifest is flagged (self-contained parse)', () => {
+  const err = assertThrowsPublication(() =>
+    checkPublication({ localManifestBytes: Buffer.from('{ not json', 'utf-8'), publication: PUB, resolved: resolved({ blobBytes: Buffer.from('{ not json', 'utf-8') }) }),
+  );
+  assert.ok(err.violations.some((v) => /local manifest is not a valid manifest/.test(v)), err.violations.join('; '));
+});
+
+test('violations accumulate into one refusal', () => {
+  const other = bytesOf(validRaw({ windowEnd: '2026-07-16T03:00:00.000Z' }));
+  const err = assertThrowsPublication(() =>
+    checkPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolved: { blobBytes: other, committerTimestamp: AFTER } }),
+  );
+  assert.ok(err.violations.some((v) => /blob bytes differ/.test(v)), err.violations.join('; '));
+  assert.ok(err.violations.some((v) => /not strictly before/.test(v)), err.violations.join('; '));
+});
+
 test('a descriptor that bypassed strict parsing (branch-name commitSha) is refused', () => {
-  // commitSha is not used in the pass/refuse logic, but it is persisted into the
-  // step-6 evidence, so a non-canonical descriptor smuggled past parseManifestPublication
-  // must still be rejected rather than frozen into the record.
   const branchRef = { ...PUB, commitSha: 'main' } as ManifestPublicationV1;
   const err = assertThrowsPublication(() =>
     checkPublication({ localManifestBytes: LOCAL_BYTES, publication: branchRef, resolved: resolved() }),
@@ -189,27 +223,7 @@ test('a descriptor that bypassed strict parsing (branch-name commitSha) is refus
   assert.ok(err.violations.some((v) => /publication descriptor is invalid/.test(v)), err.violations.join('; '));
 });
 
-test('an invalid local manifest is flagged (self-contained parse)', () => {
-  const err = assertThrowsPublication(() =>
-    checkPublication({ localManifestBytes: '{ not json', publication: PUB, resolved: resolved({ blobBytes: '{ not json' }) }),
-  );
-  assert.ok(err.violations.some((v) => /local manifest is not a valid manifest/.test(v)), err.violations.join('; '));
-});
-
-test('violations accumulate into one refusal', () => {
-  const other = JSON.stringify(validRaw({ windowEnd: '2026-07-16T03:00:00.000Z' }));
-  const err = assertThrowsPublication(() =>
-    checkPublication({
-      localManifestBytes: LOCAL_BYTES,
-      publication: PUB,
-      resolved: { blobBytes: other, committerTimestamp: AFTER },
-    }),
-  );
-  assert.ok(err.violations.some((v) => /blob bytes differ/.test(v)), err.violations.join('; '));
-  assert.ok(err.violations.some((v) => /not strictly before/.test(v)), err.violations.join('; '));
-});
-
-// --- verifyPublication (async, injected resolver) ---
+// --- verifyPublication: resolver + descriptor snapshot binding ---
 
 test('verifyPublication resolves via the injected resolver and returns the verified record', async () => {
   const resolver: PublicationResolver = { resolve: () => Promise.resolve(resolved()) };
@@ -232,6 +246,68 @@ test('verifyPublication still enforces the checks after a successful resolve', a
     verifyPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolver }),
   );
   assert.ok(err.violations.some((v) => /not strictly before/.test(v)), err.violations.join('; '));
+});
+
+test('an invalid descriptor is rejected before the resolver/network is touched', async () => {
+  let resolverCalls = 0;
+  const resolver: PublicationResolver = {
+    resolve: () => {
+      resolverCalls += 1;
+      return Promise.resolve(resolved());
+    },
+  };
+  const branchRef = { ...PUB, commitSha: 'main' } as ManifestPublicationV1;
+  const err = await assertRejectsPublication(
+    verifyPublication({ localManifestBytes: LOCAL_BYTES, publication: branchRef, resolver }),
+  );
+  assert.equal(resolverCalls, 0);
+  assert.ok(err.violations.some((v) => /invalid descriptor/.test(v)), err.violations.join('; '));
+});
+
+test('the descriptor is snapshotted+frozen before resolve — a cross-await mutation cannot rebind the record', async () => {
+  const original: ManifestPublicationV1 = {
+    repositoryOwner: 'owner-a',
+    repositoryName: 'repo-a',
+    path: 'path-a.json',
+    commitSha: 'a'.repeat(40),
+  };
+  const snapshotBound = { ...original };
+  let seen: ManifestPublicationV1 | undefined;
+  const resolver: PublicationResolver = {
+    resolve: (p) => {
+      seen = { ...p };
+      // (a) the received descriptor is the frozen snapshot — a resolver-side mutation throws.
+      assert.throws(() => {
+        (p as unknown as { commitSha: string }).commitSha = 'b'.repeat(40);
+      });
+      // (b) mutate the caller's ORIGINAL descriptor across the await, on EVERY field.
+      original.repositoryOwner = 'owner-b';
+      original.repositoryName = 'repo-b';
+      original.path = 'path-b.json';
+      original.commitSha = 'b'.repeat(40);
+      return Promise.resolve(resolved());
+    },
+  };
+  const verified = await verifyPublication({ localManifestBytes: LOCAL_BYTES, publication: original, resolver });
+  // The resolver saw the original values, and the persisted record is bound to them —
+  // owner/repo/path/commitSha all covered, not only the SHA.
+  assert.deepEqual(seen, snapshotBound);
+  assert.deepEqual(verified.publication, snapshotBound);
+});
+
+test('local bytes are detached before resolve — a cross-await buffer mutation cannot flip the verdict', async () => {
+  const local = Buffer.from(LOCAL_BYTES); // caller-owned buffer, mutated mid-resolve
+  const blob = Buffer.from(LOCAL_BYTES); // the resolver returns the published bytes
+  const resolver: PublicationResolver = {
+    resolve: () => {
+      local.fill(0); // caller mutates the shared buffer while resolve() is pending
+      return Promise.resolve({ blobBytes: blob, committerTimestamp: BEFORE });
+    },
+  };
+  // verifyPublication copied the bytes before the await, so the check still sees the
+  // published content and verifies (without the copy it would spuriously refuse).
+  const verified = await verifyPublication({ localManifestBytes: local, publication: PUB, resolver });
+  assert.equal(verified.committerTimestamp, BEFORE);
 });
 
 function assertThrowsPublication(fn: () => unknown): PublicationError {

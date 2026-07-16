@@ -1,6 +1,8 @@
 import { z } from 'zod';
+import { TextDecoder } from 'node:util';
 import { deepFreeze } from './freeze.js';
 import { cohortId, parseManifest } from './manifest.js';
+import type { CohortManifestV1 } from './manifest.js';
 
 /**
  * Public-Git precommitment verification (SPEC-line-open-evidence-model.md §2,
@@ -9,10 +11,12 @@ import { cohortId, parseManifest } from './manifest.js';
  * commit the manifest was published at; before any provider request the runner
  * resolves that commit and refuses to run unless:
  *
- *   - the resolved blob bytes EQUAL the local manifest file bytes (raw bytes,
- *     not just the same canonical form);
+ *   - the resolved blob bytes EQUAL the local manifest file bytes, compared as
+ *     RAW BYTES (not as decoded strings — different byte sequences can collapse
+ *     to the same string under lossy UTF-8 decoding);
  *   - the manifest parsed from the blob recomputes the SAME `cohortId` as the
- *     local manifest; and
+ *     local manifest, each decoded FAIL-CLOSED (invalid UTF-8 is rejected, not
+ *     silently replaced); and
  *   - the commit's committer timestamp is STRICTLY BEFORE `windowStart`.
  *
  * The limitation is stated precisely: a Git committer timestamp is
@@ -66,13 +70,13 @@ export function parseManifestPublication(raw: unknown): ManifestPublicationV1 {
 
 /**
  * What the injected resolver returns: the exact blob bytes at `(commitSha, path)`
- * and the resolved commit's committer timestamp. The timestamp MUST be an ISO-8601
- * instant with an explicit offset (`Z` or `+/-hh:mm`) — an offset-less value is
- * rejected, because it would otherwise be read in the runner's local zone. Git
- * commit timestamps are second-granularity.
+ * as RAW BYTES, and the resolved commit's committer timestamp. The timestamp MUST
+ * be an ISO-8601 instant with an explicit offset (`Z` or `+/-hh:mm`) — an
+ * offset-less value is rejected, because it would otherwise be read in the
+ * runner's local zone. Git commit timestamps are second-granularity.
  */
 export interface ResolvedPublication {
-  blobBytes: string;
+  blobBytes: Uint8Array;
   committerTimestamp: string;
 }
 
@@ -111,9 +115,29 @@ function reasonOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// Fail-closed UTF-8: invalid byte sequences THROW rather than silently collapsing
+// to U+FFFD, which would let genuinely different raw bytes decode to one string.
+const utf8Strict = new TextDecoder('utf-8', { fatal: true });
+
+/** Byte-wise equality of two raw byte arrays. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/** Fail-closed decode + strict parse + cohortId of a manifest carried as raw
+ *  bytes. Throws on invalid UTF-8, non-JSON, or an invalid manifest. */
+function parseManifestFromBytes(bytes: Uint8Array): { manifest: CohortManifestV1; cohortId: string } {
+  const manifest = parseManifest(JSON.parse(utf8Strict.decode(bytes)));
+  return { manifest, cohortId: cohortId(manifest) };
+}
+
 export interface CheckPublicationInput {
-  /** The exact bytes of the local manifest file the cohort is running from. */
-  localManifestBytes: string;
+  /** The exact raw bytes of the local manifest file the cohort is running from. */
+  localManifestBytes: Uint8Array;
   publication: ManifestPublicationV1;
   /** The already-resolved public blob + committer timestamp (from the resolver). */
   resolved: ResolvedPublication;
@@ -145,27 +169,25 @@ export function checkPublication(input: CheckPublicationInput): PublicationVerif
   let localWindowStart: string | undefined;
   let localCohortId: string | undefined;
   try {
-    const local = parseManifest(JSON.parse(localManifestBytes));
-    localWindowStart = local.windowStart;
-    localCohortId = cohortId(local);
+    const local = parseManifestFromBytes(localManifestBytes);
+    localWindowStart = local.manifest.windowStart;
+    localCohortId = local.cohortId;
   } catch (error) {
     violations.push(`local manifest is not a valid manifest: ${reasonOf(error)}`);
   }
 
-  // (3) Raw byte equality — stricter than cohortId: the committed file must be
-  //     byte-identical to the file being run, not merely canonically equivalent.
-  //     Both sides are the file's UTF-8 text; the resolver must decode the blob
-  //     with the same encoding used to read the local file.
-  if (resolved.blobBytes !== localManifestBytes) {
+  // (3) RAW byte equality — stricter than cohortId AND than a decoded-string
+  //     compare: the committed file must be byte-identical to the file being run.
+  if (!bytesEqual(resolved.blobBytes, localManifestBytes)) {
     violations.push('published blob bytes differ from the local manifest bytes');
   }
 
-  // (4) Recomputed cohortId match — parse the blob independently; a blob that is
-  //     a valid manifest but a DIFFERENT cohort is caught here even if step 3
-  //     were ever relaxed.
+  // (4) Recomputed cohortId match — decode+parse the blob independently and
+  //     fail-closed; a blob that is a valid manifest but a DIFFERENT cohort is
+  //     caught here even if step 3 were ever relaxed.
   let blobCohortId: string | undefined;
   try {
-    blobCohortId = cohortId(parseManifest(JSON.parse(resolved.blobBytes)));
+    blobCohortId = parseManifestFromBytes(resolved.blobBytes).cohortId;
   } catch (error) {
     violations.push(`published blob is not a valid manifest: ${reasonOf(error)}`);
   }
@@ -206,18 +228,42 @@ export function checkPublication(input: CheckPublicationInput): PublicationVerif
 }
 
 export interface VerifyPublicationInput {
-  localManifestBytes: string;
+  localManifestBytes: Uint8Array;
   publication: ManifestPublicationV1;
   resolver: PublicationResolver;
 }
 
 /**
  * Resolve the public commit (§2 steps 1-2) via the injected resolver, then run
- * the pure `checkPublication` (steps 3-6). A resolver rejection is itself a
+ * the pure `checkPublication` (steps 3-6).
+ *
+ * The descriptor is strictly parsed, copied, and DEEP-FROZEN into a snapshot
+ * BEFORE the resolver is invoked, and that one snapshot is handed to both the
+ * resolver and the final check. So (a) an invalid descriptor — a branch-name
+ * commitSha, an extra field — is rejected before any network call, and (b) a
+ * caller cannot mutate the descriptor across the `await` to make the persisted
+ * evidence identify a different commit than the one actually fetched. The local
+ * bytes are likewise detached up front, so a caller mutating a shared buffer
+ * across the await cannot flip the check. A resolver rejection is itself a
  * refusal — an unresolvable precommitment must never run.
  */
 export async function verifyPublication(input: VerifyPublicationInput): Promise<PublicationVerified> {
-  const { localManifestBytes, publication, resolver } = input;
+  const { resolver } = input;
+
+  // Detach a copy of the local bytes up front, mirroring the descriptor snapshot
+  // below, so a caller mutating a shared buffer across the await cannot affect the
+  // check. `new Uint8Array(src)` copies the elements — a plain `.slice()` on a Node
+  // Buffer can return a shared view.
+  const localManifestBytes = new Uint8Array(input.localManifestBytes);
+
+  let publication: ManifestPublicationV1;
+  try {
+    publication = deepFreeze(parseManifestPublication(input.publication));
+  } catch (error) {
+    const reason = reasonOf(error);
+    throw new PublicationError(`invalid publication descriptor: ${reason}`, [`invalid descriptor: ${reason}`]);
+  }
+
   let resolved: ResolvedPublication;
   try {
     resolved = await resolver.resolve(publication);
