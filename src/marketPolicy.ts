@@ -1,4 +1,5 @@
 import { canonicalize, sha256Hex } from './canonical.js';
+import { deepFreeze } from './freeze.js';
 import type { MarketKey } from './types.js';
 
 /**
@@ -32,22 +33,6 @@ export function isMarketPolicyVersion(value: string): value is MarketPolicyVersi
 
 /** One policy: for each `games.sport` slug, the markets that are enabled. */
 type MarketPolicy = Readonly<Record<string, readonly MarketKey[]>>;
-
-/**
- * Recursively freeze an object graph so the compile-time `readonly` cannot be
- * bypassed at runtime — e.g. `(marketPolicyForVersion(...) as any).mlb.push(...)`.
- * Without this, the allow-list could change eligibility after a digest check
- * without a version bump, splitting `market-policy-v1` from its pinned digest.
- */
-function deepFreeze<T>(value: T): T {
-  if (value !== null && typeof value === 'object') {
-    for (const key of Object.keys(value as Record<string, unknown>)) {
-      deepFreeze((value as Record<string, unknown>)[key]);
-    }
-    Object.freeze(value);
-  }
-  return value;
-}
 
 const MARKET_POLICY_V1: MarketPolicy = {
   // MLB: moneyline + total. Run line (the 'spread' MarketKey) deliberately OFF.

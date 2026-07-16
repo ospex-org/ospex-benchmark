@@ -18,7 +18,7 @@ import type { BaselineDecision, SlateBundle } from './types.js';
  * The scorer re-derives baselines under the RECORDED policy version, so
  * archived runs keep verifying byte-for-byte as newer versions ship.
  */
-export const BASELINE_POLICY_VERSIONS = ['baselines-v0.1.0', 'baselines-v0.2.0'] as const;
+export const BASELINE_POLICY_VERSIONS = Object.freeze(['baselines-v0.1.0', 'baselines-v0.2.0'] as const);
 export type BaselinePolicyVersion = (typeof BASELINE_POLICY_VERSIONS)[number];
 
 /** The policy version the harness stamps on NEW runs. */

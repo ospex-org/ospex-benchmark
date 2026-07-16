@@ -49,6 +49,9 @@ export const SCORING_POLICY_VERSION = 'scoring-v0.4.0';
 
 /** The scored markets, anchored to MarketKey so drift is a compile error. */
 export const MARKETS: ReadonlyArray<MarketKey> = ['moneyline', 'spread', 'total'];
+// Frozen: SCORING_POLICY_VERSION is validated at preflight, but MARKETS drives
+// scoring under that version — it must not drift after a clean validation.
+Object.freeze(MARKETS);
 
 // ---------------------------------------------------------------------------
 // Source-run parsing (the harness's own NDJSON records)
@@ -577,7 +580,9 @@ export function defaultExpectedArms(): ExpectedArm[] {
     participantId: arm.participantId,
     provider: arm.provider,
     requestedModelId: arm.requestedModelId,
-    approvedReportedModelIds: approvedReportedModelIds(arm.participantId),
+    // Defensive copy so a caller mutating the returned roster cannot reach the
+    // canonical (frozen) approved-model registry.
+    approvedReportedModelIds: [...approvedReportedModelIds(arm.participantId)],
   }));
 }
 
