@@ -43,7 +43,12 @@ function safeMs(label: string, iso: string, violations: string[]): number | unde
 /**
  * Verify per-attempt and cross-attempt ordering integrity (§5, case 48). Returns a
  * violations array (empty = clean):
- * - exactly one `initial` attempt;
+ * - every `kind` is exactly `initial` or `repair` (not trusted from the TS union —
+ *   the persisted sequence is re-validated at runtime);
+ * - the FIRST (lowest-ordered) attempt is the sole `initial`; every later attempt is
+ *   a repair;
+ * - at most `maxRepairAttemptsPerArm` repairs (Tier-0 pins 1) — an explicit,
+ *   validated cap the scorer sources from the frozen manifest so it cannot drift;
  * - attempt numbers are safe positive integers, unique and strictly increasing;
  * - per attempt `requestStartedAt <= requestReceivedAt <= acceptedAt` (the
  *   `acceptedAt` bound only when present);
@@ -54,16 +59,42 @@ function safeMs(label: string, iso: string, violations: string[]): number | unde
 export function verifyAttemptOrdering(
   attempts: readonly AttemptTiming[],
   initialRequestStartedAt: string,
+  maxRepairAttemptsPerArm: number,
 ): string[] {
+  if (!Number.isSafeInteger(maxRepairAttemptsPerArm) || maxRepairAttemptsPerArm < 0) {
+    throw new Error(`maxRepairAttemptsPerArm must be a safe nonnegative integer, got ${String(maxRepairAttemptsPerArm)}`);
+  }
   const violations: string[] = [];
   if (attempts.length === 0) {
     violations.push('no attempts recorded for the arm');
     return violations;
   }
 
+  // Every kind must be a known value (do not trust the TS union at runtime).
+  for (const attempt of attempts) {
+    if (attempt.kind !== 'initial' && attempt.kind !== 'repair') {
+      violations.push(`attempt ${String(attempt.attemptNumber)}: unknown kind ${JSON.stringify(attempt.kind)}`);
+    }
+  }
+
   const initials = attempts.filter((a) => a.kind === 'initial');
   if (initials.length !== 1) {
     violations.push(`expected exactly one initial attempt, found ${initials.length}`);
+  }
+  // The first (lowest-ordered) attempt must be the sole initial; every later attempt
+  // a repair — a repair listed/numbered before the initial is not a valid history.
+  const firstAttempt = attempts[0];
+  if (firstAttempt !== undefined && firstAttempt.kind !== 'initial') {
+    violations.push('the first attempt must be the initial');
+  }
+  for (const attempt of attempts.slice(1)) {
+    if (attempt.kind === 'initial') {
+      violations.push(`attempt ${String(attempt.attemptNumber)}: a second initial after the first attempt`);
+    }
+  }
+  const repairCount = attempts.filter((a) => a.kind === 'repair').length;
+  if (repairCount > maxRepairAttemptsPerArm) {
+    violations.push(`too many repair attempts: ${repairCount} > maxRepairAttemptsPerArm ${maxRepairAttemptsPerArm}`);
   }
 
   // Parse every timestamp ONCE (a malformed field yields exactly one violation),
@@ -149,7 +180,11 @@ export function dispatchLagVerdict(input: {
  *   windowEnd; only first pitch bounds a repair, so windowEnd is not checked against
  *   repairs);
  * - NO request — initial or repair — may start at/after first pitch
- *   (`scheduledAtAtFire`), and NO response may be accepted at/after first pitch.
+ *   (`scheduledAtAtFire`), NO response may be RECEIVED at/after first pitch, and NO
+ *   response may be ACCEPTED at/after first pitch. First pitch (not windowEnd) is the
+ *   hard cutoff for a response's receipt: a repair received after windowEnd but
+ *   before first pitch is fine, but a receipt at/after first pitch is a crossing even
+ *   when `acceptedAt` is null (the runtime correctly refused to accept it).
  *
  * `initialRequestStartedAt` is null when the initial was never sent (its lateness is
  * a `dispatch_lag_exceeded`, handled by `dispatchLagVerdict`, not here).
@@ -176,6 +211,10 @@ export function cutoffViolations(input: {
     const startedMs = safeMs(`attempt ${attempt.attemptNumber} requestStartedAt`, attempt.requestStartedAt, violations);
     if (startedMs !== undefined && firstPitchMs !== undefined && startedMs >= firstPitchMs) {
       violations.push(`${attempt.kind} request (attempt ${attempt.attemptNumber}) started at/after first pitch`);
+    }
+    const receivedMs = safeMs(`attempt ${attempt.attemptNumber} requestReceivedAt`, attempt.requestReceivedAt, violations);
+    if (receivedMs !== undefined && firstPitchMs !== undefined && receivedMs >= firstPitchMs) {
+      violations.push(`${attempt.kind} response (attempt ${attempt.attemptNumber}) received at/after first pitch`);
     }
     if (attempt.acceptedAt !== null) {
       const acceptedMs = safeMs(`attempt ${attempt.attemptNumber} acceptedAt`, attempt.acceptedAt, violations);

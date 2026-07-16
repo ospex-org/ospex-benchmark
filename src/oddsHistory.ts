@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { instantMs, parseableOffsetInstant } from './time.js';
+import { instantMs, isParseableInstant } from './time.js';
 import type { MarketKey } from './types.js';
 
 // Re-exported so existing consumers/tests that import `instantMs` from this module
@@ -58,7 +58,12 @@ const validTwoSidedHistoryRowSchema = z
     away_odds_decimal: decimalOddsSchema,
     home_odds_american: americanOddsSchema,
     home_odds_decimal: decimalOddsSchema,
-    captured_at: parseableOffsetInstant,
+    // The offset-required parseable-instant rule, applied via the shared function
+    // (not a shared mutable schema): captured_at must be an offset-qualified,
+    // genuinely-parseable ISO-8601 instant.
+    captured_at: z.string().refine(isParseableInstant, {
+      message: 'captured_at must be a parseable ISO-8601 instant with an explicit offset',
+    }),
   })
   .passthrough() // tolerate extra columns (sportspage_id, created_at, ...)
   .refine((r) => (r.market === 'moneyline' ? r.line === null : typeof r.line === 'number'), {

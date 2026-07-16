@@ -38,35 +38,39 @@ function repair(over: Partial<AttemptTiming> = {}): AttemptTiming {
   };
 }
 
+// The scorer sources maxRepairAttemptsPerArm from the frozen manifest (Tier-0 = 1).
+const order = (attempts: readonly AttemptTiming[], init: string, cap = 1): string[] =>
+  verifyAttemptOrdering(attempts, init, cap);
+
 // --- verifyAttemptOrdering (case 48) ---
 
 test('a clean initial+repair sequence has no ordering violations', () => {
-  assert.deepEqual(verifyAttemptOrdering([initial(), repair()], INITIAL_START), []);
+  assert.deepEqual(order([initial(), repair()], INITIAL_START), []);
 });
 
 test('a clean single initial (not accepted) has no ordering violations', () => {
-  assert.deepEqual(verifyAttemptOrdering([initial({ acceptedAt: null })], INITIAL_START), []);
+  assert.deepEqual(order([initial({ acceptedAt: null })], INITIAL_START), []);
 });
 
 test('empty attempts is flagged', () => {
-  assert.ok(verifyAttemptOrdering([], INITIAL_START).some((v) => /no attempts/.test(v)));
+  assert.ok(order([], INITIAL_START).some((v) => /no attempts/.test(v)));
 });
 
 test('zero or two initial attempts is flagged', () => {
-  assert.ok(verifyAttemptOrdering([repair()], INITIAL_START).some((v) => /exactly one initial/.test(v)));
+  assert.ok(order([repair()], INITIAL_START).some((v) => /exactly one initial/.test(v)));
   assert.ok(
-    verifyAttemptOrdering([initial(), initial({ attemptNumber: 2 })], INITIAL_START).some((v) => /exactly one initial/.test(v)),
+    order([initial(), initial({ attemptNumber: 2 })], INITIAL_START).some((v) => /exactly one initial/.test(v)),
   );
 });
 
 test('non-increasing or duplicate attempt numbers are flagged (case 48)', () => {
   assert.ok(
-    verifyAttemptOrdering([initial({ attemptNumber: 2 }), repair({ attemptNumber: 2 })], INITIAL_START).some((v) =>
+    order([initial({ attemptNumber: 2 }), repair({ attemptNumber: 2 })], INITIAL_START).some((v) =>
       /strictly increasing/.test(v),
     ),
   );
   assert.ok(
-    verifyAttemptOrdering([initial({ attemptNumber: 5 }), repair({ attemptNumber: 3 })], INITIAL_START).some((v) =>
+    order([initial({ attemptNumber: 5 }), repair({ attemptNumber: 3 })], INITIAL_START).some((v) =>
       /strictly increasing/.test(v),
     ),
   );
@@ -75,7 +79,7 @@ test('non-increasing or duplicate attempt numbers are flagged (case 48)', () => 
 test('an unsafe or non-positive attempt number is flagged', () => {
   for (const n of [0, -1, 1.5, NaN, 9007199254740992]) {
     assert.ok(
-      verifyAttemptOrdering([initial({ attemptNumber: n })], INITIAL_START).some((v) => /safe positive integer/.test(v)),
+      order([initial({ attemptNumber: n })], INITIAL_START).some((v) => /safe positive integer/.test(v)),
       String(n),
     );
   }
@@ -83,13 +87,13 @@ test('an unsafe or non-positive attempt number is flagged', () => {
 
 test('per-attempt causal-order violations are flagged (case 48)', () => {
   // requestStartedAt after requestReceivedAt
-  const started = verifyAttemptOrdering(
+  const started = order(
     [initial({ requestStartedAt: '2026-07-16T00:00:06.000Z', requestReceivedAt: '2026-07-16T00:00:05.000Z' })],
     '2026-07-16T00:00:06.000Z',
   );
   assert.ok(started.some((v) => /requestStartedAt is after requestReceivedAt/.test(v)), started.join('; '));
   // acceptedAt before requestReceivedAt
-  const accepted = verifyAttemptOrdering(
+  const accepted = order(
     [initial({ requestReceivedAt: '2026-07-16T00:00:06.000Z', acceptedAt: '2026-07-16T00:00:05.000Z' })],
     INITIAL_START,
   );
@@ -98,38 +102,63 @@ test('per-attempt causal-order violations are flagged (case 48)', () => {
 
 test('the fire initialRequestStartedAt must equal the initial attempt start', () => {
   assert.ok(
-    verifyAttemptOrdering([initial()], '2026-07-16T00:00:09.000Z').some((v) => /initialRequestStartedAt must equal/.test(v)),
+    order([initial()], '2026-07-16T00:00:09.000Z').some((v) => /initialRequestStartedAt must equal/.test(v)),
   );
 });
 
 test('a repair starting before the initial response was received is flagged (case 48)', () => {
   const r = repair({ requestStartedAt: '2026-07-16T00:00:05.500Z' }); // before the initial's received (06)
   assert.ok(
-    verifyAttemptOrdering([initial(), r], INITIAL_START).some((v) => /before the initial's requestReceivedAt/.test(v)),
+    order([initial(), r], INITIAL_START).some((v) => /before the initial's requestReceivedAt/.test(v)),
   );
 });
 
 test('a malformed attempt timestamp is flagged', () => {
-  const v = verifyAttemptOrdering([initial({ requestStartedAt: '2026-07-16T00:00:05' })], '2026-07-16T00:00:05');
+  const v = order([initial({ requestStartedAt: '2026-07-16T00:00:05' })], '2026-07-16T00:00:05');
   assert.ok(v.some((x) => /not a valid offset-qualified instant/.test(x)), v.join('; '));
 });
 
 test('causal + cross-attempt EQUALITY is allowed (started==received==accepted, repair.start==initial.received)', () => {
   const t = '2026-07-16T00:00:05.000Z';
   // started == received == accepted -> clean (the <= bounds are inclusive).
-  assert.deepEqual(verifyAttemptOrdering([initial({ requestStartedAt: t, requestReceivedAt: t, acceptedAt: t })], t), []);
+  assert.deepEqual(order([initial({ requestStartedAt: t, requestReceivedAt: t, acceptedAt: t })], t), []);
   // repair.requestStartedAt == the initial's requestReceivedAt (06) -> clean (>= is inclusive).
-  assert.deepEqual(verifyAttemptOrdering([initial(), repair({ requestStartedAt: '2026-07-16T00:00:06.000Z' })], INITIAL_START), []);
+  assert.deepEqual(order([initial(), repair({ requestStartedAt: '2026-07-16T00:00:06.000Z' })], INITIAL_START), []);
 });
 
-test('multiple repairs: a clean 3-attempt chain passes; a LATER repair before the initial response is flagged', () => {
+test('two repairs exceed the Tier-0 cap (maxRepairAttemptsPerArm = 1) and are flagged', () => {
   const r2 = repair({ attemptNumber: 2, requestStartedAt: '2026-07-16T00:00:10.000Z', requestReceivedAt: '2026-07-16T00:00:11.000Z', acceptedAt: '2026-07-16T00:00:12.000Z' });
   const r3 = repair({ attemptNumber: 3, requestStartedAt: '2026-07-16T00:00:15.000Z', requestReceivedAt: '2026-07-16T00:00:16.000Z', acceptedAt: '2026-07-16T00:00:17.000Z' });
-  assert.deepEqual(verifyAttemptOrdering([initial(), r2, r3], INITIAL_START), []);
-  // The THIRD attempt starts before the initial's requestReceivedAt (06) — the per-repair loop must catch it, not just the first repair.
+  const v = order([initial(), r2, r3], INITIAL_START); // cap defaults to 1 in the wrapper
+  assert.ok(v.some((x) => /too many repair attempts: 2 > maxRepairAttemptsPerArm 1/.test(x)), v.join('; '));
+});
+
+test('the per-repair loop checks EVERY repair against the initial response (not just the first)', () => {
+  // Under a relaxed cap of 2, a valid 3-attempt chain is clean; the SECOND repair
+  // starting before the initial response is still flagged (naming repair 3).
+  const r2 = repair({ attemptNumber: 2, requestStartedAt: '2026-07-16T00:00:10.000Z', requestReceivedAt: '2026-07-16T00:00:11.000Z', acceptedAt: '2026-07-16T00:00:12.000Z' });
+  const r3 = repair({ attemptNumber: 3, requestStartedAt: '2026-07-16T00:00:15.000Z', requestReceivedAt: '2026-07-16T00:00:16.000Z', acceptedAt: '2026-07-16T00:00:17.000Z' });
+  assert.deepEqual(order([initial(), r2, r3], INITIAL_START, 2), []);
   const r3bad = repair({ attemptNumber: 3, requestStartedAt: '2026-07-16T00:00:05.500Z', requestReceivedAt: '2026-07-16T00:00:16.000Z', acceptedAt: '2026-07-16T00:00:17.000Z' });
-  const v = verifyAttemptOrdering([initial(), r2, r3bad], INITIAL_START);
+  const v = order([initial(), r2, r3bad], INITIAL_START, 2);
   assert.ok(v.some((x) => /repair 3: requestStartedAt is before the initial's requestReceivedAt/.test(x)), v.join('; '));
+});
+
+test('an unknown attempt kind, or a repair listed before the initial, is flagged (case 48 taxonomy)', () => {
+  // Unknown kind is rejected at runtime (not trusted from the TS union).
+  const other = { attemptNumber: 2, kind: 'other' as unknown as AttemptTiming['kind'], requestStartedAt: '2026-07-16T00:00:10.000Z', requestReceivedAt: '2026-07-16T00:00:11.000Z', acceptedAt: null };
+  assert.ok(order([initial(), other], INITIAL_START).some((x) => /unknown kind/.test(x)));
+  // A repair listed/numbered before the sole initial is not a valid history.
+  const r1 = repair({ attemptNumber: 1, requestStartedAt: '2026-07-16T00:00:10.000Z' });
+  const i2 = initial({ attemptNumber: 2, requestStartedAt: '2026-07-16T00:00:05.000Z' });
+  const v = order([r1, i2], '2026-07-16T00:00:05.000Z');
+  assert.ok(v.some((x) => /the first attempt must be the initial/.test(x)), v.join('; '));
+});
+
+test('verifyAttemptOrdering throws on a malformed maxRepairAttemptsPerArm cap', () => {
+  for (const bad of [NaN, Infinity, -1, 1.5, 9007199254740992]) {
+    assert.throws(() => verifyAttemptOrdering([initial()], INITIAL_START, bad as number), String(bad));
+  }
 });
 
 // --- dispatchLagVerdict (V-lag -> dispatch_lag_exceeded) ---
@@ -228,6 +257,34 @@ test('a null initial (never sent) skips the windowEnd check', () => {
 test('cutoffViolations flags a malformed timestamp', () => {
   const v = cutoffViolations({ windowEnd: '2026-07-16T00:02:00', scheduledAtAtFire: FIRST_PITCH, initialRequestStartedAt: INITIAL_START, attempts: [initial()] });
   assert.ok(v.some((x) => /not a valid offset-qualified instant/.test(x)), v.join('; '));
+});
+
+test('a response RECEIVED at/after first pitch is a cutoff violation even when acceptedAt is null (case 26)', () => {
+  const inWindowStart = '2026-07-16T00:01:00.000Z'; // < windowEnd, < first pitch
+  // received 1ms before first pitch, not accepted -> clean.
+  const before = initial({ requestStartedAt: inWindowStart, requestReceivedAt: '2026-07-16T00:59:59.999Z', acceptedAt: null });
+  assert.deepEqual(
+    cutoffViolations({ windowEnd: WINDOW_END, scheduledAtAtFire: FIRST_PITCH, initialRequestStartedAt: inWindowStart, attempts: [before] }),
+    [],
+  );
+  // initial received exactly at, and after, first pitch with acceptedAt null -> violation.
+  for (const rcv of [FIRST_PITCH, '2026-07-16T01:00:05.000Z']) {
+    const late = initial({ requestStartedAt: inWindowStart, requestReceivedAt: rcv, acceptedAt: null });
+    const v = cutoffViolations({ windowEnd: WINDOW_END, scheduledAtAtFire: FIRST_PITCH, initialRequestStartedAt: inWindowStart, attempts: [late] });
+    assert.ok(v.some((x) => /initial response \(attempt 1\) received at\/after first pitch/.test(x)), `${rcv}: ${v.join('; ')}`);
+  }
+  // repair received exactly at, and after, first pitch with acceptedAt null -> violation.
+  for (const rcv of [FIRST_PITCH, '2026-07-16T01:00:05.000Z']) {
+    const lateRepair = repair({ requestStartedAt: '2026-07-16T00:59:00.000Z', requestReceivedAt: rcv, acceptedAt: null });
+    const v = cutoffViolations({ windowEnd: WINDOW_END, scheduledAtAtFire: FIRST_PITCH, initialRequestStartedAt: INITIAL_START, attempts: [initial(), lateRepair] });
+    assert.ok(v.some((x) => /repair response \(attempt 2\) received at\/after first pitch/.test(x)), `${rcv}: ${v.join('; ')}`);
+  }
+  // repair received after windowEnd but before first pitch -> clean (first pitch, not windowEnd, bounds a receipt).
+  const repairAfterWindow = repair({ requestStartedAt: '2026-07-16T00:03:00.000Z', requestReceivedAt: '2026-07-16T00:03:30.000Z', acceptedAt: '2026-07-16T00:03:31.000Z' });
+  assert.deepEqual(
+    cutoffViolations({ windowEnd: WINDOW_END, scheduledAtAtFire: FIRST_PITCH, initialRequestStartedAt: INITIAL_START, attempts: [initial(), repairAfterWindow] }),
+    [],
+  );
 });
 
 test('cutoff bounds are inclusive at the EXACT instant (>=)', () => {
