@@ -76,9 +76,11 @@ column is µs-capable but never exercised sub-ms). The committed cross-host allo
 `maxClockSkewMs`; a boundary genuinely ambiguous under it is UNKNOWN, never silently
 reclassified.
 
-`odds_history` has **neither a `league` nor a `network` column** — it cannot, alone,
-decide which league a pair belongs to. League classification comes from a `games`
-identity join at finalization (§6), never from a scheduled-game census.
+`odds_history` has **neither a `sport`/`league` nor a `network` column** — it cannot,
+alone, decide which sport a pair belongs to. **Sport classification comes from a `games`
+identity join at finalization** (`games.sport`, §6), never from a scheduled-game census.
+(`games.league` is a nullable column the writer persists as `null`; it is **not** a Tier-0
+policy dimension — `games.sport` is the stable `NOT NULL` slug, e.g. `"mlb"`.)
 
 ## 2. The precommitted manifest (no census)
 
@@ -95,11 +97,11 @@ CohortManifestV1 {
 
   // Source / statistical scope
   network,                         // e.g. "polygon"; needed for the games/closing_lines joins
-  leagueAllowList,                 // e.g. ["mlb"]
+  sportAllowList,                  // e.g. ["mlb"]; matches games.sport slugs (NOT games.league)
   windowStart, windowEnd,          // the precommitted opener-observation window [start, end)
   source: "jsonodds",
   sourceQueryVersion,              // versions validTwoSidedHistoryRowV1 (§6) + the as-of query
-  marketPolicyVersion, marketPolicyDigest,   // enabled (league, market) allow-list
+  marketPolicyVersion, marketPolicyDigest,   // enabled (sport, market) allow-list
 
   // Model-facing configuration
   promptScaffoldSha256,
@@ -117,6 +119,7 @@ CohortManifestV1 {
   constants: {
     pollIntervalMs:            30_000,   // must be < cleanEntryWindowMs
     cleanEntryWindowMs:        120_000,  // = W
+    gameDiscoveryWindowHours:  168,      // GET /v1/games discovery horizon; does NOT define U
     maxClockSkewMs:            5_000,
     freshFireMs:               30_000,
     maxDispatchLagMs:          10_000,
@@ -126,7 +129,7 @@ CohortManifestV1 {
     maxRepairAttemptsPerArm:   1,
     ingestionGraceMs:          900_000,
     scheduleChangeToleranceMs: 60_000,
-    maxConcurrentProviderRequests,       // required positive integer
+    maxConcurrentProviderRequests,       // required positive integer; must be >= expectedArmRoster.length (§3)
     maxDispatchesPerTick                 // required positive integer
   },
 
@@ -193,29 +196,60 @@ finality checks, reorg handling, or post-cohort on-chain roots in Tier 0.
 ### Canonical-mode config lock
 
 Every eligibility-changing value comes only from the manifest. `windowStart`/`windowEnd`
-(not `--window-hours`) define the cohort; poll cadence, caps, timeouts, and output limits
-come only from `CohortManifestV1.constants`. `--poll-seconds`, `--timeout-seconds`,
-`--max-output-tokens`, `--window-hours`, `--late-minutes`, `--max-fires-per-tick` may
-remain for **dry-run/rehearsal only** (output labeled non-cohort); supplying any in
-canonical mode is a **boot failure** unless byte-equal to the manifest value.
+(not `--window-hours`) define the cohort; poll cadence, the discovery horizon, caps,
+timeouts, and output limits come only from `CohortManifestV1.constants`. `--poll-seconds`,
+`--timeout-seconds`, `--max-output-tokens`, `--window-hours`, `--late-minutes`,
+`--max-fires-per-tick` may remain for **dry-run/rehearsal only** (output labeled
+non-cohort); supplying any in canonical mode is a **boot failure** unless byte-equal to the
+manifest value.
 
-## 3. Detection and firing
+## 3. Candidate discovery, detection, and firing
 
-Detection is per-market and no-wait: a policy-enabled market fires on its own the moment
-it is cleanly detected, never waiting on a sibling market. Fire-at-detection is preserved
-verbatim — the bundle is built from the **same** `current_odds` snapshot detection reads;
-there is **no** capture/dispatch split. For each currently-valid, two-sided,
-policy-enabled candidate, per tick:
+### Candidate discovery (runtime)
+
+Candidates are discovered from the core API's games endpoint. In canonical mode the runner
+queries `GET /v1/games` **once per `sportAllowList` member** with:
+
+```
+windowHours  = gameDiscoveryWindowHours     // from the manifest; core-api default 168, range 1..720
+availableOnly = false
+```
+
+and **paginates every page** (deterministic pagination, no silent truncation). A different
+discovery horizon — or `availableOnly=true` — is an eligibility-changing override and
+**fails canonical boot**. This horizon is an operational reach only; it does **not** define
+`U`. A qualifying history opener whose game falls outside the discovery horizon still
+appears as a disclosed miss in `M` (§6), never a silent exclusion.
+
+### Effective eligibility (runtime and finalization, identical)
+
+```
+effectiveEnabled(sport, market)
+  = sport ∈ sportAllowList
+    AND marketPolicy(sport, market) = enabled
+```
+
+`sport` is `games.sport` (the stable `NOT NULL` slug). This one predicate governs both
+runtime dispatch and finalization membership — they must never diverge.
+
+### Detection and firing
+
+Detection is per-market and no-wait: an `effectiveEnabled` market fires on its own the
+moment it is cleanly detected, never waiting on a sibling market. Fire-at-detection is
+preserved verbatim — the prepared snapshot is built from the **same** `current_odds`
+snapshot detection reads; there is **no** capture/dispatch split. Per tick, for each
+currently-valid, two-sided, `effectiveEnabled` candidate:
 
 1. Derive/fetch its independent `firstTwoSided` from `source=jsonodds` `odds_history` (§1).
-2. Prepare a **fresh** scoped bundle and stamp `detectedAt` (ordering below), binding each
-   firing market to its actual opening/as-of quote and its `odds_history` row identity.
+2. Produce a fresh immutable **prepared snapshot** and stamp `detectedAt` (ordering below),
+   binding each candidate market to its actual opening/as-of quote and its `odds_history`
+   row identity.
 3. Evaluate the **canonical window gates** (below). If any fails, do **not** claim or
    dispatch.
-4. Acquire the atomic **at-most-once claim** (per `(cohortId, gameId, market)`) **plus the
-   per-dispatch worst-case budget reservation** (§4) — the reservation is per dispatch, not
-   per market.
-5. Dispatch **all** expected model arms without waiting on unrelated markets.
+4. Under the durable atomic lock, deterministically select the retained scope and acquire
+   the **at-most-once claim + full-roster budget/concurrency reservation** (§4).
+5. Launch **all** expected model arms as one concurrent roster batch, without waiting on
+   unrelated markets.
 6. Persist **one** terminal arm outcome for **every** expected arm.
 
 ### Canonical window gates
@@ -227,17 +261,21 @@ windowStart ≤ firstTwoSided.captured_at < windowEnd
 windowStart ≤ detectedAt                < windowEnd
 requestStartedAt                        < windowEnd
 0 ≤ detectedAt − firstTwoSided.captured_at ≤ cleanEntryWindowMs        // = W
-requestStartedAt − detectedAt              ≤ maxDispatchLagMs           // V-lag
+0 ≤ requestStartedAt − detectedAt          ≤ maxDispatchLagMs           // V-lag, two-sided
 requestStartedAt < scheduledAtAtFire                                    // hard first-pitch gate
 ```
+
+**V-lag is two-sided:** a backdated `requestStartedAt` (before `detectedAt`) must **not**
+pass. Per-attempt timestamp monotonicity is also required (§5):
+`requestReceivedAt ≥ requestStartedAt` and `acceptedAt ≥ requestStartedAt`.
 
 The bare age gate `detectedAt − firstTwoSided ≤ W` alone is **insufficient**: it admits a
 paid request for a market that can never be in the universe `U` (§6) — an opener just
 **before** `windowStart` but within `W`, or an opener just **after** `windowEnd` detected
 immediately. Both are guaranteed `X = F − U` extra fires. **The window gates above forbid
 those calls before any provider spend.** `first_pitch_passed` is a hard no-dispatch
-condition: no provider request may start at/after `scheduledAtAtFire` (the scheduled start
-carried by that fire's bundle).
+condition (see the cutoff race in §5): no provider request may start at/after
+`scheduledAtAtFire` (the scheduled start carried by that fire's bundle).
 
 **The clean window is never widened by clock skew.** If `firstTwoSided.captured_at >
 detectedAt`:
@@ -245,45 +283,87 @@ detectedAt`:
   fresh `detectedAt`;
 - beyond `maxClockSkewMs`: treat as a source/clock failure — do **not** claim or dispatch.
 
-The scorer requires a **non-negative** age; no negative-age fire is clean.
+The scorer requires a **non-negative** age; no negative-age fire is clean. All scorer-side
+`firstTwoSided` and as-of queries bound on `id ≤ oddsHistoryWatermark` (§6), so repeated
+scoring cannot change as later rows arrive.
+
+### Deterministic candidate ordering
+
+Input / API / DB iteration order must **not** change the admitted set. Before
+grouping/admission, sort clean candidate keys by:
+
+```
+(firstTwoSided.captured_at ASC, firstTwoSided.id ASC, gameId ASC, marketOrdinal ASC)
+marketOrdinal: moneyline = 0, spread = 1, total = 2
+```
+
+For co-arrival grouping, sort the scoped market keys by `marketOrdinal`; order dispatch
+groups by the minimum member key above, then `gameId`. This exact order governs
+`maxDispatchesPerTick`, concurrency admission, and the final call/spend slots — so which
+opportunities and which arms are sent is never decided by nondeterministic iteration order.
 
 ### Preparation / claim / request ordering
 
-For each independent candidate path:
+One coherent sequence (resolves the `detectedAt` vs partial-claim contradiction — the
+final bundle is **projected synchronously after claim**, so `detectedAt` anchors the
+prepared snapshot, not the final bundle):
 
-1. Fetch/refresh the current game + odds inputs; record
-   `bundleSnapshotTs = fetchCompletedAt`.
-2. Obtain the **bounded** first-appearance / as-of history result (`historyReadTimeoutMs`).
-3. If step 2 (or any preparation) made the current inputs too old, **refresh them again
-   before claim** — no stale fallback snapshot may be used after a failed refresh.
-4. Build the final scoped bundle from that final snapshot.
-5. Stamp `detectedAt` immediately after final bundle completion and **before** claim.
-6. Require `0 ≤ detectedAt − bundleSnapshotTs ≤ freshFireMs` (V1b), exact quote / as-of
-   equality (V1), the canonical window gates, and the first-pitch gate.
-7. Perform the atomic claim + budget reservation (§4).
-8. Start each provider request within `maxDispatchLagMs` of `detectedAt` and before both
-   `windowEnd` and `scheduledAtAtFire`.
+1. Complete all asynchronous reads/refreshes and produce one immutable **prepared
+   snapshot** containing candidate market blocks and their history evidence; record
+   `preparedSnapshotTs = fetchCompletedAt`.
+2. If the snapshot is stale or the quote/as-of checks fail, repeat the preparation loop —
+   **no stale fallback** snapshot may be used after a failed refresh.
+3. Stamp `detectedAt` once the prepared snapshot is clean and all asynchronous eligibility
+   work is finished, **before** atomic scope selection/claim. Require
+   `0 ≤ detectedAt − preparedSnapshotTs ≤ freshFireMs` (V1b).
+4. Under the durable atomic lock:
+   - recheck which candidate keys are still unclaimed;
+   - deterministically select the retained scope (candidate ordering above);
+   - **synchronously project** the final bundle/request bytes from the prepared snapshot
+     for exactly that scope;
+   - compute exact input tokens and the worst-case call/spend/**concurrency** reservation;
+   - atomically persist claims and reservations.
+5. If no key remains, create **no** claim/reservation/artifact and send **no** request.
+6. Persist `bundleBuiltAt` separately; it may be **after** `detectedAt`, but bundle
+   construction is synchronous and every request still satisfies V-lag / freshness /
+   window / cutoff.
+7. Start the full-roster initial request batch.
 
-No claim occurs before all asynchronous eligibility / preparation work finishes.
+### Co-arrival partial-claim
 
-### Co-arrival partial-claim rule
+A dispatched bundle contains **only** the keys this dispatch successfully claimed. If two
+markets co-arrive and one is already claimed by another worker, step 4's deterministic
+scope selection retains only the newly-claimed key(s); the synchronous projection builds
+the bundle for that scope, recomputes the bundle/request hashes and scoped decision
+cardinality, and dispatches only if ≥ 1 key remains. The already-claimed key receives **no**
+second provider forecast. No "rebuild after claim" outside this synchronous projection.
 
-A dispatched bundle may contain **only** the keys this dispatch successfully claimed. If
-two markets co-arrive and one is already claimed by another worker:
-- the already-claimed key receives **no** second provider forecast;
-- project/rebuild the final bundle **synchronously from the same frozen snapshot** using
-  only the newly-claimed key(s);
-- recompute the bundle/request hashes and the scoped decision cardinality; and
-- dispatch only if at least one key remains.
+### Full-roster fairness
+
+Manifest arm order must **not** decide which model gets a request before V-lag/cutoff:
+
+1. Require `maxConcurrentProviderRequests ≥ expectedArmRoster.length`; otherwise canonical
+   boot **fails**.
+2. Admit/claim a dispatch **only** when the scheduler can reserve initial-request capacity
+   for the **entire** expected arm roster.
+3. Launch all initial arm requests as **one concurrent roster batch**. No arm may become
+   `dispatch_lag_exceeded` merely because another arm occupied the only internal scheduler
+   slot first.
+4. Repairs use the same bounded scheduler and remain subject to V-lag / cutoff / attempt
+   caps.
+5. Cross-process concurrency reservations live in the **same** durable atomic store as
+   claims and call/spend reservations.
+
+If full-roster capacity cannot be obtained while the market is still clean, **defer before
+claim**; an eventual miss is disclosed in `M` (§6).
 
 **Capacity is bounded, not poisoning.** Deterministic caps apply, all from the manifest:
-`maxDispatchesPerTick` bounds new dispatches admitted per tick;
-`maxConcurrentProviderRequests` bounds simultaneously in-flight provider HTTP requests
-across all arms and markets; and `cohortCallCap`/`cohortSpendCapUsdMicros` bound the cohort
-total (§4). A candidate not admitted is deferred to a later tick; a market that never
-cleanly fires within the cohort is a **reported coverage miss** (§6), never a
-cohort-poisoning event.
-The runner reads `games`/current inputs to build the prompt, identify teams, and enforce
+`maxDispatchesPerTick` bounds new dispatches admitted per tick; `maxConcurrentProviderRequests`
+bounds simultaneously in-flight provider HTTP requests across all arms and markets; and
+`cohortCallCap`/`cohortSpendCapUsdMicros` bound the cohort total (§4). A candidate not
+admitted is deferred to a later tick; a market that never cleanly fires within the cohort
+is a **reported coverage miss** (§6), never a cohort-poisoning event. The runner reads
+`games`/current inputs to build the prompt, identify teams, classify `sport`, and enforce
 `first_pitch_passed` — these are **fire inputs**, not cohort-membership evidence.
 
 ## 4. The fire artifact and atomic reservation
@@ -293,8 +373,8 @@ The runner reads `games`/current inputs to build the prompt, identify teams, and
 Each completed fire artifact retains:
 - `cohortId`, the manifest hash, and the public-manifest publication descriptor + observed
   committer timestamp (§2);
-- `fireId`, `runId`, `gameId`, the **scoped market set**;
-- `detectedAt`, `bundleSnapshotTs`, per-arm provider `requestStartedAt`;
+- `fireId`, `runId`, `gameId`, `games.sport`, the **scoped market set**;
+- `preparedSnapshotTs`, `detectedAt`, `bundleBuiltAt`, per-arm provider `requestStartedAt`;
 - `scheduledAtAtFire` (the scheduled start used for the first-pitch gate);
 - the `source=jsonodds` `odds_history` opener/as-of **row identity** and the exact opening
   quote **for each scoped market**;
@@ -315,23 +395,23 @@ snapshot — coverage is derived globally (§6).
 
 A small append-only ledger records claim → completion for **at-most-once billing and
 crash recovery only**. It is operational state, **not** the source of the coverage
-denominator. Persistence order: (1) atomic claim + budget reservation (below); (2) start
-provider requests within V-lag; (3) persist arm outcomes + run artifact; (4) mark the
-claim completed. A crash between steps leaves an interrupted claim — at-most-once holds
-(no re-fire), and the pair surfaces as a miss/incomplete fire in §6, never as a clean
-entry.
+denominator. Persistence order: (1) atomic claim + budget/concurrency reservation (below);
+(2) start provider requests within V-lag; (3) persist arm outcomes + run artifact; (4) mark
+the claim completed. A crash between steps leaves an interrupted claim — at-most-once holds
+(no re-fire), and the pair surfaces as a miss/incomplete fire in §6, never as a clean entry.
 
-### Atomic at-most-once + budget reservation
+### Atomic at-most-once + budget/concurrency reservation
 
-Per-key `O_EXCL` claims alone do **not** enforce a global call/spend cap across concurrent
-workers. Under **one durable cross-process lock/transaction**:
+Per-key `O_EXCL` claims alone do **not** enforce a global call/spend/concurrency cap across
+concurrent workers. Under **one durable cross-process lock/transaction**:
 
 1. Recheck which candidate keys are still unclaimed.
 2. Determine the final proposed dispatch scope (the keys to fire in this bundle).
-3. Compute the worst-case provider-attempt reservation for that dispatch.
-4. Check the cohort call cap and the conservative spend cap.
-5. If sufficient: persist pending claims for **every** retained key and reserve the budget,
-   **all atomically**.
+3. Compute the worst-case provider-attempt reservation for that dispatch **and** the
+   full-roster initial-request concurrency reservation.
+4. Check the cohort call cap, the conservative spend cap, and the concurrency budget.
+5. If sufficient: persist pending claims for **every** retained key and reserve the
+   budget + concurrency, **all atomically**.
 6. If insufficient: create **no** claim and send **no** request; the candidate may retry
    while still clean, and an eventual miss is disclosed in `M` (§6).
 
@@ -363,11 +443,11 @@ For each fire key `(gameId, market)`:
 - **exactly one** completed artifact exists;
 - fire timing is inside `W` of the independent `firstTwoSided` (**V2**, within skew);
 - the fire's opening quote **equals** the correct `source=jsonodds` as-of quote for its
-  `detectedAt` — `(captured_at DESC, id DESC) limit 1` — on `line` + both American odds
-  (home-side spread convention) (**V1**); the freshness gap `0 ≤ detectedAt −
-  bundleSnapshotTs ≤ freshFireMs` holds (**V1b**);
-- the dispatch lag `requestStartedAt − detectedAt ≤ maxDispatchLagMs` holds (**V-lag**,
-  measured at the provider HTTP boundary; both operands benchmark-host, no skew);
+  `detectedAt` — `(captured_at DESC, id DESC) limit 1`, `id ≤ oddsHistoryWatermark` — on
+  `line` + both American odds (home-side spread convention) (**V1**); the freshness gap
+  `0 ≤ detectedAt − preparedSnapshotTs ≤ freshFireMs` holds (**V1b**);
+- the dispatch lag `0 ≤ requestStartedAt − detectedAt ≤ maxDispatchLagMs` holds (**V-lag**,
+  two-sided, measured at the provider HTTP boundary; both operands benchmark-host, no skew);
 - the scoped bundle carries the same quote + market identity;
 - no hard-coded three-market assumption; and
 - **all** expected arms and their outcomes are present.
@@ -388,7 +468,7 @@ violation (there is no free absence marker):
 | `timeout` | sent | valid negative |
 | `rate_limited` | sent (429) | valid negative — a throttle must never read as a model failure |
 | `provider_error` | sent | valid negative — provider/transport refusal with **no body** |
-| `cutoff_missed` | request started before `scheduledAtAtFire` but its response/repair crossed it, **or** cutoff already passed at dispatch (zero requests sent) | valid negative; **no** decision records |
+| `cutoff_missed` | an arm in an already-claimed fire whose initial/repair request would **start** at/after `scheduledAtAtFire` (or `windowEnd`), **or** whose response/repair crosses that cutoff → no request sent / no decision accepted for that arm | valid negative; **no** decision records |
 | `dispatch_lag_exceeded` | **not sent** — the first request would start `> maxDispatchLagMs` after `detectedAt` (**V-lag**, measured at the provider HTTP boundary; both operands benchmark-host, no skew) | valid negative |
 | `credential_missing` | not sent (should be blocked at boot) | structural — a required arm makes the fire fail integrity |
 
@@ -401,23 +481,38 @@ For every expected arm, persist **exactly one** terminal outcome and **all attem
 to substantiate it. Each attempt records:
 - `participantId`, provider, requested model ID;
 - the provider-reported model ID when a response identifies one;
-- initial vs repair attempt number;
-- provider HTTP request-start and response-received timestamps;
-- request hash, redacted response bytes or canonical retained body, and response digest;
+- initial vs repair attempt number (**monotone and unique**);
+- provider HTTP `requestStartedAt`, `requestReceivedAt`, and (when accepted) `acceptedAt`
+  timestamps (**monotone**: `requestReceivedAt ≥ requestStartedAt`, `acceptedAt ≥
+  requestStartedAt`);
+- `requestSha256`, the exact persisted response body, `responseSha256`;
 - transport status, usage/token metadata, and repair linkage.
+
+**Persisted response bytes (one exact rule).**
+
+```
+persistedResponseBytes = UTF8(the exact post-redaction retained response body)
+responseSha256         = sha256Hex(persistedResponseBytes)
+```
+
+The scorer recomputes `responseSha256` from those **exact persisted bytes**. Any
+unpersisted raw-provider digest kept for diagnostics is **not** an integrity proof.
+
+**Arm digest (domain-bound to its enclosing identity).**
 
 ```
 armDigest = sha256Hex(canonicalize({
+  cohortId, fireId, runId, participantId, requestSha256,
   expectedArmIdentity,
-  orderedAttempts,
+  orderedAttempts,                  // attempt numbers + timestamps monotone & unique
   terminalOutcome,
-  acceptedResponseDigestOrNull,
+  acceptedResponseDigestOrNull,     // = responseSha256 of the accepted attempt, or null
   acceptedDecisionFingerprintOrNull
 }))
 ```
 
-The scorer **recomputes** `armDigest`. Deleting or reordering an attempt, or changing an
-outcome, must **fail** integrity.
+The scorer **recomputes** `armDigest`. Mutating the persisted response bytes, the enclosing
+fire/run identity, an attempt's order, or an attempt timestamp must **fail** integrity.
 
 ### Retained benchmark protections
 
@@ -438,33 +533,34 @@ outcome, must **fail** integrity.
 — unless a separately versioned explicit enum value is deliberately added. Do not invent
 an undocumented outcome.
 
-### Cutoff semantics
+### Cutoff race
 
-The hard first-pitch rule governs `cutoff_missed` (the earlier "sent-late" wording is
-replaced):
-- no initial or repair request may **start** at/after `scheduledAtAtFire`;
+The hard first-pitch rule governs `cutoff_missed`, in two separate cases:
+- if the first-pitch/window cutoff is already passed **before claim**, create **no** claim
+  and **no** fire artifact — it becomes a coverage **miss** (`M`, §6), not a `cutoff_missed`
+  outcome;
+- if the cutoff passes **after an atomic claim** but before a particular initial/repair
+  request starts, send **no** request for that arm and record `cutoff_missed` in the
+  already-claimed fire;
 - no response may be **accepted** at/after `scheduledAtAtFire`;
-- a request started before cutoff whose response/repair misses cutoff → `cutoff_missed`,
-  with **no** decision records;
-- if cutoff is already passed at dispatch, send **zero** requests and record
-  `cutoff_missed`;
 - `dispatch_lag_exceeded` means the request is **not sent**.
 
-Persist enough timestamps for the scorer to recompute each classification.
+**No request ever starts late.** Persist enough timestamps for the scorer to recompute each
+classification.
 
 ## 6. Finalization: the universe + global coverage reconciliation
 
 History — not a scheduled-game census — is the source of opportunity membership. `games`
-is used **only** as an identity-classification join (to obtain `league`/`network` and
-stable prompt-identity fields), **never** as a scheduled-game census: a `games` row cannot
-create membership without a qualifying first history appearance, and mutable schedule
-fields never decide membership.
+is used **only** as an identity-classification join (to obtain `games.sport` and stable
+prompt-identity fields), **never** as a scheduled-game census: a `games` row cannot create
+membership without a qualifying first history appearance, and mutable schedule fields never
+decide membership.
 
 ### The valid-history predicate
 
-`odds_history` alone cannot decide league (it has neither a `league` nor a `network`
-column). The finalizer parses each source row **fail-closed** against
-`validTwoSidedHistoryRowV1` (versioned by `sourceQueryVersion`), which requires at least:
+`odds_history` alone cannot decide sport (it has no `sport`/`network` column). The finalizer
+parses each source row **fail-closed** against `validTwoSidedHistoryRowV1` (versioned by
+`sourceQueryVersion`), which requires at least:
 - `source === "jsonodds"`;
 - a known market enum;
 - a parseable `captured_at` and a safe, strictly-ordered identity (`id`);
@@ -489,17 +585,18 @@ At the **first** finalization attempt after `windowEnd + ingestionGraceMs`:
      `captured_at ∈ [windowStart, windowEnd)` to collect candidate `(jsonodds_id, market)`
      pairs;
    - **pass 2** — for every candidate pair, query its **earliest** valid row under the
-     same watermark by `(captured_at ASC, id ASC)` with **no lower time bound**; include
-     the pair only when that true first row is in `[windowStart, windowEnd)` **and** policy
-     is enabled.
+     same watermark by `(captured_at ASC, id ASC)` with **no lower time bound**; keep the
+     pair as an in-window opener only when that true first row is in `[windowStart,
+     windowEnd)`. **Policy is applied only after step 5 produces the policy key** — do not
+     filter on policy before the `games.sport` join exists.
 5. **Identity-classification join.** Join each candidate `jsonodds_id` to **exactly one**
-   `games` row for the manifest `network` to obtain `league` (and stable prompt-identity
-   fields). Apply the committed `(league, market)` policy. A **missing, duplicate,
-   null-league, or ambiguous** metadata join is `universe_metadata_unresolved`:
-   finalization **exits nonzero** and publishes **no** denominator or CLV report — it never
-   silently excludes such a pair.
-6. Persist each included first row, its metadata join, the query version, the watermark,
-   the row count, and a SHA-256 in `universe.ndjson` plus metadata.
+   `games` row for the manifest `network` to obtain `games.sport` (and stable
+   prompt-identity fields). Then apply `effectiveEnabled(sport, market)` (§3, identical to
+   runtime). A **missing, duplicate, null/blank, or unknown `sport`** join is
+   `universe_metadata_unresolved`: finalization **exits nonzero** and publishes **no**
+   denominator or CLV report — it never silently excludes such a pair.
+6. Persist each included first row, its `games.sport`/metadata join, the query version, the
+   watermark, the row count, and a SHA-256 in `universe.ndjson` plus metadata.
 7. Any source-read, pagination, metadata-join, parse, or required-output-write failure
    **exits nonzero** and publishes no scorecard. Retrying with the **same** watermark is
    allowed.
@@ -509,7 +606,7 @@ At the **first** finalization attempt after `windowEnd + ingestionGraceMs`:
 ```
 U = distinct (gameId, market)
     where windowStart ≤ firstTwoSided.captured_at < windowEnd
-      and marketPolicy(league, market) = enabled           // league from the games join
+      and effectiveEnabled(games.sport, market)          // sport from the games join
 ```
 
 A reprice inside the window does **not** make a market whose true first appearance
@@ -555,7 +652,13 @@ entry.
 
 Use the production `closing_lines` source on the manifest `network`, keyed uniquely by
 `(network, jsonodds_id, market)`:
-- require `source = jsonodds` (or the exact committed close-source value);
+
+```
+closing_lines.source === "jsonodds"
+```
+
+(the single literal Tier-0 v1 close source — there is no committed alternative; a future
+close source needs a new manifest field + version bump before it is honored). Also:
 - retain the existing `confidence = fresh` and raw-price / no-vig consistency gates;
 - persist `lock_time`, `value_captured_at`, `last_polled_at`, `confidence`, the raw
   quotes, the no-vig values, and `source`;
@@ -577,22 +680,33 @@ exist, compute CLV but tag the row `schedule_changed=true`, **exclude it from th
 same-schedule estimate**, and show it only in a separate reschedule-sensitivity stratum.
 `first_pitch_passed` stays a hard no-dispatch condition at fire time (§3).
 
-### Uncertainty
+### Uncertainty (byte-reproducible bootstrap)
 
 Pin one reproducible policy in `uncertaintyPolicyVersion`. Tier-0 v1:
 
 ```
-method:     95% percentile bootstrap
-cluster:    gameId
-replicates: 10_000
-sampling:   unique gameIds with replacement; include all rows belonging to each sampled game
-seed:       deterministic hash of cohortId + scoringPolicyVersion + result/comparison key
+canonicalResultKey = canonicalize({ market, metric, participantA, participantBOrNull })
+seedBytes          = SHA256(UTF8(cohortId + "\0" + scoringPolicyVersion + "\0" + canonicalResultKey))
+PRNG               = xoshiro256** seeded with the four big-endian uint64 words of seedBytes
+replicates         = 10_000
 ```
 
-Apply it to each model/market mean **and** each pairwise model difference on the **common
-scoreable** fires. For fewer than two game clusters, report the mean and N but interval
-`null` with `insufficient_n` — never a fabricated zero-width interval. **Never pool
-markets** for the primary comparison.
+- **Cluster unit is `gameId`.** Sort the unique `gameId` cluster keys **lexicographically**
+  before sampling.
+- Draw unbiased indices with **rejection sampling**, never modulo bias.
+- For each replicate, draw exactly `N` game clusters **with replacement** and include **all
+  rows** for every sampled cluster occurrence.
+- Sort the replicate statistics ascending.
+- Use **nearest-rank** percentile indexes `ceil(p × B) − 1` for `p = 0.025` and `0.975`
+  (`B = replicates`).
+- Numeric **rounding/serialization is defined once** in `uncertaintyPolicyVersion`.
+- `N < 2` game clusters → `interval: null, reason: insufficient_n` (never a fabricated
+  zero-width interval).
+
+Apply it to each single-model market mean **and** each pairwise model difference on the
+**common scoreable** fires, using the exact `canonicalResultKey` vocabulary (a single-model
+market mean sets `participantBOrNull = null`; a paired common-fire difference sets both).
+**Never pool markets** for the primary comparison.
 
 ### Published reporting
 
@@ -617,13 +731,13 @@ zero valid decisions.
 ## 8. Trust boundary (stated plainly)
 
 Tier-0 integrity rests on: (a) **internal consistency** — recomputable digests
-(`requestSha256`, bundle/artifact hashes, and the arm digest of §5); (b) **practical
-precommitment** — the manifest published to public Git before `windowStart`, verified
-byte-equal at runtime (§2); and (c) **independent honesty** — `odds_history` derives the
-universe, first appearance, and as-of quotes, so coverage and entry timing are not
-self-reported. There is **no** independently-irreversible external timestamp in Tier 0;
-that is the acknowledged limit, and it is sufficient for the non-adversarial question
-Tier 0 answers. Do not overstate it.
+(`requestSha256`, `responseSha256`, bundle/artifact hashes, and the domain-bound arm digest
+of §5); (b) **practical precommitment** — the manifest published to public Git before
+`windowStart`, verified byte-equal at runtime (§2); and (c) **independent honesty** —
+`odds_history` derives the universe, first appearance, and as-of quotes, so coverage and
+entry timing are not self-reported. There is **no** independently-irreversible external
+timestamp in Tier 0; that is the acknowledged limit, and it is sufficient for the
+non-adversarial question Tier 0 answers. Do not overstate it.
 
 ## 9. Sequencing
 
@@ -691,10 +805,32 @@ evidence" does **not** mean casual paid dispatch.
     `U`.
 29. Server page cap below the requested page size, plus a post-watermark insertion →
     complete, stable `U`.
-30. Same-window MLB and non-MLB history rows → only policy-enabled `(league, market)` pairs
+30. Same-window MLB and non-MLB history rows → only `effectiveEnabled(sport, market)` pairs
     enter `U`; unresolved metadata fails loudly (`universe_metadata_unresolved`).
 31. Empty `U` → counts plus `N/A` coverage; no ranking.
 32. Closing-row schedule drift at, below, and above `scheduleChangeToleranceMs` →
     deterministic primary / sensitivity classification.
 33. Bootstrap rerun with the same inputs → byte-identical intervals; `N < 2` → `null`
     interval with `insufficient_n`.
+34. A current writer-style `games` row with `sport="mlb", league=null` classifies
+    successfully by `sport`; a blank/unknown `sport` fails loudly
+    (`universe_metadata_unresolved`).
+35. `sportAllowList=["mlb"]` plus a policy version that also knows NFL still admits only
+    MLB; runtime and finalizer produce the **same** effective set.
+36. A non-default game-discovery horizon or `availableOnly=true` in canonical mode fails
+    boot; shuffled/paginated game input yields the same candidates.
+37. Reversed candidate input under a one-dispatch cap yields the **same** admitted dispatch
+    and misses.
+38. `maxConcurrentProviderRequests < expectedArmRoster.length` fails boot; a saturated
+    scheduler never privileges an earlier arm.
+39. Partial co-arrival claim produces a final projected bundle **without** violating the
+    prepared-snapshot / `detectedAt` / claim ordering.
+40. `requestStartedAt < detectedAt` fails V-lag; all V1/V2 scoring queries remain stable
+    under a post-watermark row.
+41. Cutoff before claim produces **no** claim; cutoff after claim but before an arm request
+    produces an unsent `cutoff_missed` for that arm.
+42. Mutating persisted response bytes, enclosing fire identity, attempt order, or attempt
+    timestamps → digest/integrity verification fails.
+43. Independent bootstrap implementations using the pinned seed/PRNG/quantile rules produce
+    **byte-identical** intervals.
+44. A non-`jsonodds` `closing_lines.source` is CLV-unavailable under Tier-0 v1.

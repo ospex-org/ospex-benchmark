@@ -92,8 +92,8 @@ other market on that game is doing.
 This separation is the core of the fix.
 
 1. **Detection is universal.** *Every* market that appears is detected,
-   timestamped, and recorded — moneyline, total, run line, spread, whatever a
-   league sends. No market is ever ignored at the detection layer.
+   timestamped, and recorded — moneyline, total, run line, spread, whatever the
+   feed sends. No market is ever ignored at the detection layer.
 
 2. **Policy decides what to *do* with a detected speculation.** MLB scores
    moneyline and total, not run lines. A run line may still be detected and
@@ -107,9 +107,11 @@ requirement. Policy-disabled markets may surface in **non-canonical
 diagnostics**, but Tier 0 requires **no** canonical detection or status artifact
 for them; the final universe is **policy-enabled only** (Tier-0 spec §6).
 
-### 3.1 Market policy: a per-`(league, market)` allow-list in code
+### 3.1 Market policy: a per-`(sport, market)` allow-list in code
 
-`src/marketPolicy.ts`, versioned, hashed into the run record:
+`src/marketPolicy.ts`, versioned, hashed into the run record. Keys are the
+`games.sport` slug (the stable `NOT NULL` column, e.g. `mlb`) — **not** the
+nullable `games.league` column, which the writer persists as `null`:
 
 ```
 MARKET_POLICY_V1 = {
@@ -118,14 +120,14 @@ MARKET_POLICY_V1 = {
 }
 ```
 
-- Keyed on **`(league, market)`**, and it is an **allow-list** — never
+- Keyed on **`(sport, market)`**, and it is an **allow-list** — never
   global-per-market, never a deny-list. Turning off the MLB run line says
   nothing about NFL spreads; enabling NFL spread later is one versioned entry,
   not a change to MLB.
-- **Default for any unlisted `(league, market)` is disabled.** A market
-  dispatches only if that league explicitly lists it. Adding a league
+- **Default for any unlisted `(sport, market)` is disabled.** A market
+  dispatches only if that sport explicitly lists it. Adding a sport
   therefore fires *nothing* until its markets are enumerated in a
-  policy-version bump — there is no path by which a new league silently starts
+  policy-version bump — there is no path by which a new sport silently starts
   firing markets nobody affirmatively chose. (Detection stays universal
   operationally: an unlisted market may still be detected and noted in
   non-canonical diagnostics; Tier 0 requires no canonical `policy_disabled`
@@ -336,16 +338,22 @@ the PR that changes the behaviour.
 ## 6. Explicitly out of scope
 
 - No host/deployment change. It runs where it runs today — the operator's call.
-- No spread ladder, no new leagues enabled, no Shin de-vig.
-- Do not touch closing-line capture, the scoring formulas, or the CLV engine
-  beyond what §3.5/§3.6 require.
+- Preserve the existing economic / margin-adjusted CLV formulas and existing
+  **labeled** sensitivity metrics (including the current `shin-v1` de-vig
+  sensitivity) unless the Tier-0 evidence spec explicitly says otherwise.
+- PR 2 **may** add the close metadata, close-quality gates, schedule strata,
+  global coverage joins, and uncertainty outputs required by the Tier-0 evidence
+  spec §§6–7.
+- **No new sport, spread ladder, or new *primary* de-vig methodology is enabled
+  by PR 0.** This does **not** delete the existing labeled Shin sensitivity — it
+  only bars promoting/adding a *new primary* de-vig policy.
 - **No backfill.** Openers already entered late are sunk and stay as-is; their
   *labels* become honest once §3.6 re-derivation lands, but they are not
   re-entered.
 
 ## 7. Verification
 
-**The authoritative acceptance matrix is the Tier-0 spec §10** (cases 1–33). The
+**The authoritative acceptance matrix is the Tier-0 spec §10** (cases 1–44). The
 still-current unit/firing checks below are a subset of it; the per-market
 `policy_disabled` / `late_detection` **status-record** assertions from the
 earlier draft are superseded by global coverage reconciliation (Tier-0 spec §6)
@@ -357,7 +365,7 @@ and are **not** Tier-0 acceptance criteria.
 - A simulated co-arrival of moneyline + total produces one dispatch but **two
   independently-claimed, independently-gated, independently-recorded**
   speculations (Tier-0 §10 cases 3, 24).
-- **Policy isolation:** a `(league, market)` absent from the committed market
+- **Policy isolation:** a `(sport, market)` absent from the committed market
   policy is never dispatched; enabling NFL spread later says nothing about MLB.
 - A stale moneyline (open 3h) and a fresh total (open 2m) on one game: the total
   fires and the moneyline is **not** entered — nothing lets the moneyline ride
