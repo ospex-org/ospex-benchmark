@@ -1,6 +1,7 @@
 import { createAnthropicAdapter } from './anthropic.js';
 import { createGoogleAdapter } from './google.js';
 import { createOpenAiCompatibleAdapter } from './openaiCompatible.js';
+import { deepFreeze } from '../freeze.js';
 import type { ArmSpec, ProviderAdapter } from '../types.js';
 
 /**
@@ -21,6 +22,9 @@ export const APPROVED_REPORTED_MODEL_IDS: Record<string, string[]> = {
   'google-gemini-3.1-pro-preview': ['gemini-3.1-pro-preview'],
   'xai-grok-4.5': ['grok-4.5'],
 };
+// Freeze the canonical registry + its nested arrays: a one-time manifest
+// preflight is only a lock if the checked runtime state cannot drift afterward.
+deepFreeze(APPROVED_REPORTED_MODEL_IDS);
 
 export function approvedReportedModelIds(participantId: string): string[] {
   return APPROVED_REPORTED_MODEL_IDS[participantId] ?? [];
@@ -52,6 +56,7 @@ export const ARMS: ArmSpec[] = [
     credentialEnvVar: 'XAI_API_KEY',
   },
 ];
+deepFreeze(ARMS); // canonical roster — frozen so a validated preflight stays valid
 
 export function createRealAdapters(): Map<string, ProviderAdapter> {
   const adapters = new Map<string, ProviderAdapter>();

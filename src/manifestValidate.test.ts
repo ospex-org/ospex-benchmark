@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { BASELINE_POLICY_VERSION } from './baselines.js';
+import { BASELINE_POLICY_VERSION, BASELINE_POLICY_VERSIONS, isBaselinePolicyVersion } from './baselines.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
-import { parseManifest } from './manifest.js';
+import { cohortId, parseManifest } from './manifest.js';
 import { validateManifestAgainstCode } from './manifestValidate.js';
+import { APPROVED_REPORTED_MODEL_IDS, ARMS, approvedReportedModelIds } from './providers/index.js';
 import { promptScaffoldSha256 } from './prompt.js';
-import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
+import { MARKETS, SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
+import type { MarketKey } from './types.js';
 
 /**
  * Semantic manifest↔code validation. The valid fixture is built FROM the running
@@ -143,4 +145,43 @@ test('insufficient concurrency for the full roster is flagged', () => {
   (raw.constants as Record<string, unknown>).maxConcurrentProviderRequests = roster.length - 1;
   const v = validateManifestAgainstCode(parse(raw));
   assert.ok(v.some((s) => /maxConcurrentProviderRequests .* < expectedArmRoster.length/.test(s)), v.join('; '));
+});
+
+test('canonical registries are frozen — no post-preflight mutation drifts behavior or cohortId', () => {
+  const m = parse(codeConsistentRaw());
+  assert.deepEqual(validateManifestAgainstCode(m), []); // clean preflight
+  const id0 = cohortId(m);
+  const firstId = ARMS[0]!.participantId;
+  const armModelBefore = ARMS[0]!.requestedModelId;
+  const approvedBefore = [...approvedReportedModelIds(firstId)];
+  const baselineKnownBefore = isBaselinePolicyVersion('baselines-v9.9.9'); // false
+  const marketsBefore = [...MARKETS];
+
+  // (a) replace an arm's requested model — frozen registry → throws.
+  assert.throws(() => {
+    (ARMS[0] as unknown as { requestedModelId: string }).requestedModelId = 'evil';
+  });
+  // (b) push an approved reported-model ID, via the accessor and directly → throws.
+  assert.throws(() => approvedReportedModelIds(firstId).push('evil-alias'));
+  assert.throws(() => (APPROVED_REPORTED_MODEL_IDS[firstId] as string[]).push('evil-alias'));
+  // (c) mutate the array returned by defaultExpectedArms() — a caller-owned copy,
+  //     so it affects ONLY the copy, never the canonical registry (no `any` cast).
+  const roster = defaultExpectedArms();
+  roster[0]!.approvedReportedModelIds.push('local-only');
+  assert.ok(!approvedReportedModelIds(firstId).includes('local-only'));
+  // (d) append a fake baseline version — frozen → throws; membership unchanged.
+  assert.throws(() => (BASELINE_POLICY_VERSIONS as unknown as string[]).push('baselines-v9.9.9'));
+  // (e) remove/replace scoring markets — frozen → throws.
+  assert.throws(() => (MARKETS as unknown as MarketKey[]).push('total'));
+  assert.throws(() => {
+    (MARKETS as unknown as { length: number }).length = 1;
+  });
+
+  // Nothing drifted: registries, known-version membership, cohortId, re-preflight.
+  assert.equal(ARMS[0]!.requestedModelId, armModelBefore);
+  assert.deepEqual(approvedReportedModelIds(firstId), approvedBefore);
+  assert.equal(isBaselinePolicyVersion('baselines-v9.9.9'), baselineKnownBefore);
+  assert.deepEqual([...MARKETS], marketsBefore);
+  assert.equal(cohortId(m), id0);
+  assert.deepEqual(validateManifestAgainstCode(m), []);
 });
