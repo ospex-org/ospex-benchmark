@@ -21,6 +21,14 @@ import { canonicalize, sha256Hex } from './canonical.js';
 // cohortId stay canonical; an uppercase-hex digest is non-canonical and rejected.
 const sha256HexSchema = z.string().regex(/^[0-9a-f]{64}$/);
 
+// Manifest integers must be JavaScript-SAFE: Zod v3 `.int()` alone accepts
+// magnitudes beyond Number.MAX_SAFE_INTEGER, where two distinct JSON literals
+// round to the same double — which would make cohortId ambiguous and the
+// call/spend/timing arithmetic inexact. `.safe()` bounds every count to the
+// exactly-representable range.
+const positiveSafeInteger = z.number().int().safe().positive();
+const nonnegativeSafeInteger = z.number().int().safe().nonnegative();
+
 const expectedArmSchema = z
   .object({
     participantId: z.string().min(1),
@@ -34,20 +42,20 @@ const expectedArmSchema = z
 
 const constantsSchema = z
   .object({
-    pollIntervalMs: z.number().int().positive(),
-    cleanEntryWindowMs: z.number().int().positive(),
-    gameDiscoveryWindowHours: z.number().int().min(1).max(720), // core-api /v1/games range
-    maxClockSkewMs: z.number().int().nonnegative(),
-    freshFireMs: z.number().int().positive(),
-    maxDispatchLagMs: z.number().int().positive(),
-    historyReadTimeoutMs: z.number().int().positive(),
-    providerCallTimeoutMs: z.number().int().positive(),
-    maxOutputTokens: z.number().int().positive(),
-    maxRepairAttemptsPerArm: z.number().int().nonnegative(),
-    ingestionGraceMs: z.number().int().nonnegative(),
-    scheduleChangeToleranceMs: z.number().int().nonnegative(),
-    maxConcurrentProviderRequests: z.number().int().positive(),
-    maxDispatchesPerTick: z.number().int().positive(),
+    pollIntervalMs: positiveSafeInteger,
+    cleanEntryWindowMs: positiveSafeInteger,
+    gameDiscoveryWindowHours: positiveSafeInteger.max(720), // core-api /v1/games range (1..720)
+    maxClockSkewMs: nonnegativeSafeInteger,
+    freshFireMs: positiveSafeInteger,
+    maxDispatchLagMs: positiveSafeInteger,
+    historyReadTimeoutMs: positiveSafeInteger,
+    providerCallTimeoutMs: positiveSafeInteger,
+    maxOutputTokens: positiveSafeInteger,
+    maxRepairAttemptsPerArm: nonnegativeSafeInteger,
+    ingestionGraceMs: nonnegativeSafeInteger,
+    scheduleChangeToleranceMs: nonnegativeSafeInteger,
+    maxConcurrentProviderRequests: positiveSafeInteger,
+    maxDispatchesPerTick: positiveSafeInteger,
   })
   .strict()
   // Poll cadence must be strictly under the clean-entry window (spec §2/§3).
@@ -83,8 +91,8 @@ export const cohortManifestV1Schema = z
 
     constants: constantsSchema,
 
-    cohortCallCap: z.number().int().nonnegative(),
-    cohortSpendCapUsdMicros: z.number().int().nonnegative(),
+    cohortCallCap: nonnegativeSafeInteger,
+    cohortSpendCapUsdMicros: nonnegativeSafeInteger,
   })
   .strict()
   // The observation window must be a real forward interval.

@@ -169,3 +169,36 @@ test('offset (non-Z) datetimes parse; cohortId rejects a smuggled extra field', 
     /invalid cohort manifest/,
   );
 });
+
+test('manifest integers must be JS-safe — unsafe magnitudes are rejected (closes the cohortId collision)', () => {
+  // (1) MAX_SAFE_INTEGER is accepted where the field's sign permits.
+  const atMax = { ...validManifest(), cohortCallCap: Number.MAX_SAFE_INTEGER };
+  assert.match(cohortId(parseManifest(atMax)), /^[0-9a-f]{64}$/);
+
+  // (2) MAX_SAFE_INTEGER + 1 rejected for a representative positive constant.
+  const bigConst = validManifest();
+  (bigConst.constants as Record<string, unknown>).maxDispatchesPerTick = Number.MAX_SAFE_INTEGER + 1;
+  assert.throws(() => parseManifest(bigConst), /invalid cohort manifest/);
+
+  // (3) MAX_SAFE_INTEGER + 1 rejected for both cohort caps.
+  assert.throws(
+    () => parseManifest({ ...validManifest(), cohortCallCap: Number.MAX_SAFE_INTEGER + 1 }),
+    /invalid cohort manifest/,
+  );
+  assert.throws(
+    () => parseManifest({ ...validManifest(), cohortSpendCapUsdMicros: Number.MAX_SAFE_INTEGER + 1 }),
+    /invalid cohort manifest/,
+  );
+
+  // (4) The two raw JSON literals round to the SAME double, so neither may parse
+  // into a valid manifest — they cannot collapse to one shared cohortId.
+  const lo = JSON.parse('{"v": 9007199254740992}') as { v: number };
+  const hi = JSON.parse('{"v": 9007199254740993}') as { v: number };
+  assert.equal(lo.v, hi.v); // same IEEE-754 double — the collision source
+  for (const cap of [lo.v, hi.v]) {
+    assert.throws(
+      () => parseManifest({ ...validManifest(), cohortCallCap: cap }),
+      /invalid cohort manifest/,
+    );
+  }
+});
