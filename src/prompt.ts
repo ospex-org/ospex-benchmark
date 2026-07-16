@@ -2,7 +2,7 @@ import { sha256Hex } from './canonical.js';
 import { benchmarkResponseSchema, renderResponseTemplate } from './schema.js';
 import type { SlateBundle } from './types.js';
 
-export const PROMPT_SCAFFOLD_VERSION = 'shadow-smoke-v0.2';
+export const PROMPT_SCAFFOLD_VERSION = 'shadow-smoke-v0.3';
 
 /**
  * System prompt, VERBATIM from docs/BENCHMARK_PROMPT_V0.md ("System prompt
@@ -12,12 +12,9 @@ export const SYSTEM_PROMPT = `You are one participant in a preregistered sports-
 
 Use only the supplied frozen information bundle and the tools explicitly declared in this request. Do not use memory of later events, external browsing, native provider search, or unstated information. Treat all reference odds as timestamped observations, not guarantees of current executable prices.
 
-For every eligible game, forecast all three supplied fixed markets:
-1. Select a moneyline side.
-2. Select a side on the designated spread/run line.
-3. Select over or under on the designated total.
+For every eligible game, forecast each market supplied in that game's frozen bundle entry (listed under "markets"), and only those markets: a moneyline side, a side on the designated spread/run line, and over or under on the designated total, for whichever of the three the bundle carries. Do not forecast a market the bundle does not carry.
 
-For each forecast, supply win/push/loss probabilities that sum to 1, a short grounded rationale, and whether you would ordinarily abstain. Follow the cohort's declared execution policy when marking exactly two forecasts for execution: either fixed moneyline+total or model-choice moneyline/spread+total.
+For each forecast, supply win/push/loss probabilities that sum to 1, a short grounded rationale, and whether you would ordinarily abstain. Follow the cohort's declared execution policy when marking forecasts for execution: under the fixed policy, mark the moneyline and the total (whichever are present) and never the spread/run line.
 
 Use the exact market, line, team/side labels, and observed decimal prices from the bundle. Do not size stakes. A fixed equal-risk policy is applied by the harness.
 
@@ -68,14 +65,14 @@ export const RESPONSE_TEMPLATE = renderResponseTemplate(
  * the declared policy), plus the schema-rendered response template. Identical
  * for every arm; part of the hashed scaffold.
  */
-export const CONTRACT_NOTES = `Declared execution policy: fixed-moneyline-total. In every game, set "selectedForExecution": true on the moneyline forecast and the total forecast, and false on the spread forecast.
+export const CONTRACT_NOTES = `Declared execution policy: fixed-moneyline-total. In every game, set "selectedForExecution": true on the moneyline and total forecasts that the bundle carries, and false on the spread forecast; a market absent from the bundle has no forecast.
 
 Response template — use EXACTLY this structure and these field names. Do not add, rename, or omit any field:
 ${RESPONSE_TEMPLATE}
 Each "games" entry carries ONLY "gameId" and "forecasts". "probabilities" is an object with exactly the keys "win", "push", "loss" — never an array. "confidence" is your overall confidence in the forecast, from 0 through 1. "wouldAbstain" is whether you would ordinarily abstain from this market — a non-executing signal.
 
 Output contract:
-- Return one "games" entry for every game in the bundle, each with exactly three forecasts: one "market": "moneyline", one "market": "spread" (the designated run line), and one "market": "total".
+- Return one "games" entry for every game in the bundle. For each game, return exactly one forecast per market listed under that game's "markets" — some dispatches carry all three ("moneyline", "spread" [the designated run line], "total"), others carry fewer. Do not add a forecast for a market the bundle does not carry, and do not omit one it does.
 - "selection" labels: for "moneyline" and "spread", exactly the game's "awayTeam" or "homeTeam" string from the bundle; for "total", exactly "over" or "under".
 - "line": null for moneyline. For "spread", copy the bundle's designated run-line "line" value verbatim (it is expressed as the home team's handicap; selecting the away team means taking the away side of that same designated line). For "total", copy the bundle's total "line" value verbatim.
 - "observedDecimal": copy exactly the bundle's decimal price for the side you selected ("awayDecimal"/"homeDecimal", or "overDecimal"/"underDecimal" for totals).

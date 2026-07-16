@@ -7,7 +7,9 @@ import {
   validateResponseText,
 } from './schema.js';
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
-import type { BenchmarkResponse } from './types.js';
+import type { BenchmarkResponse, MarketKey } from './types.js';
+
+const CUTOFF = '2026-07-12T16:15:00+00:00';
 
 function validate(response: BenchmarkResponse, request = makeRequest()) {
   return validateResponseText(
@@ -124,6 +126,82 @@ test('fingerprint extraction: unparseable, incomplete, and duplicated responses 
   );
 });
 
+// ---------------------------------------------------------------------------
+// Dynamic decision cardinality — one-, two-, and three-market scoped bundles
+// (§3.4). The required forecast set derives from the bundle, never a fixed 3.
+// ---------------------------------------------------------------------------
+
+test('a scoped one-market bundle validates a single matching forecast', () => {
+  for (const present of [['moneyline'], ['spread'], ['total']] as MarketKey[][]) {
+    const request = makeRequest(CUTOFF, {}, present);
+    const result = validate(makeValidResponse(request), request);
+    assert.deepEqual(result.errors, [], `present=${present.join(',')}`);
+    assert.ok(result.parsed);
+  }
+});
+
+test('a scoped two-market (moneyline+total) bundle validates exactly two forecasts', () => {
+  const request = makeRequest(CUTOFF, {}, ['moneyline', 'total']);
+  const result = validate(makeValidResponse(request), request);
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.parsed?.games[0]?.forecasts.length, 2);
+});
+
+test('a forecast for a market not in the scoped bundle is rejected', () => {
+  const request = makeRequest(CUTOFF, {}, ['total']); // total-only scope
+  const response = makeValidResponse(request);
+  const game = response.games[0];
+  const total = game?.forecasts[0];
+  assert.ok(game && total);
+  // Add a moneyline forecast the scoped bundle does not carry.
+  game.forecasts = [
+    ...game.forecasts,
+    { ...total, market: 'moneyline', selection: request.game.awayTeam, line: null },
+  ];
+  const result = validate(response, request);
+  assert.ok(result.errors.some((e) => e.includes('not in the scoped bundle')));
+});
+
+test('a missing required market is rejected with the present set named', () => {
+  const request = makeRequest(); // full three-market
+  const response = makeValidResponse(request);
+  const game = response.games[0];
+  assert.ok(game);
+  game.forecasts = game.forecasts.filter((f) => f.market !== 'total');
+  const result = validate(response, request);
+  assert.ok(result.errors.some((e) => e.includes('missing total forecast')));
+});
+
+test('execution policy intersects the scoped set: run-line-only executes nothing, total-only executes the total', () => {
+  // Run-line-only: the single spread forecast must NOT be marked for execution.
+  const rlRequest = makeRequest(CUTOFF, {}, ['spread']);
+  assert.deepEqual(validate(makeValidResponse(rlRequest), rlRequest).errors, []);
+  const rlBad = makeValidResponse(rlRequest);
+  rlBad.games[0]!.forecasts[0]!.selectedForExecution = true;
+  assert.ok(validate(rlBad, rlRequest).errors.some((e) => e.includes('spread must be false')));
+
+  // Total-only: the single total forecast MUST be marked for execution.
+  const totRequest = makeRequest(CUTOFF, {}, ['total']);
+  const totBad = makeValidResponse(totRequest);
+  totBad.games[0]!.forecasts[0]!.selectedForExecution = false;
+  assert.ok(validate(totBad, totRequest).errors.some((e) => e.includes('total must be true')));
+});
+
+test('fingerprint extraction on a scoped bundle: size matches the present set; an out-of-scope market yields null', () => {
+  const request = makeRequest(CUTOFF, {}, ['moneyline', 'total']);
+  const fp = extractDecisionFingerprint(
+    JSON.stringify(makeValidResponse(request)),
+    request.requestBundle,
+  );
+  assert.ok(fp);
+  assert.equal(fp.size, 2);
+
+  // A full three-market response against a two-market scope carries a forecast
+  // outside the present set — not a clean, preservation-provable fingerprint.
+  const full = makeValidResponse(makeRequest(CUTOFF));
+  assert.equal(extractDecisionFingerprint(JSON.stringify(full), request.requestBundle), null);
+});
+
 test('compareFingerprints: identical fingerprints produce no diffs', () => {
   const request = makeRequest();
   const a = fingerprintFromParsed(makeValidResponse(request));
@@ -146,7 +224,7 @@ test('compareFingerprints: changed probability, selection, and missing forecast 
   const swappedForecast = swapped.games[0]?.forecasts[0];
   assert.ok(swappedForecast);
   swappedForecast.selection = request.game.homeTeam;
-  swappedForecast.observedDecimal = request.game.markets.moneyline.homeDecimal;
+  swappedForecast.observedDecimal = request.game.markets.moneyline!.homeDecimal;
   const swapDiffs = compareFingerprints(before, fingerprintFromParsed(swapped));
   assert.ok(swapDiffs.some((d) => d.includes('selection changed')));
 

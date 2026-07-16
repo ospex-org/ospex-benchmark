@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { presentMarkets } from './scopedMarkets.js';
 import type {
   ArmSpec,
   BenchmarkResponse,
@@ -48,7 +49,11 @@ const forecastSchema = z
 const gameForecastsSchema = z
   .object({
     gameId: z.string().min(1),
-    forecasts: z.array(forecastSchema).length(3),
+    // Shape only: at least one forecast. The EXACT cardinality — one forecast
+    // per market present in the scoped bundle — is a bundle-aware semantic
+    // check in `checkGame`, since the required set is per-dispatch (§3.4) and
+    // a static `.length(3)` cannot see the bundle.
+    forecasts: z.array(forecastSchema).min(1),
   })
   .strict();
 
@@ -164,75 +169,93 @@ function checkGame(
   errors: string[],
 ): void {
   const id = game.gameId;
-  const byMarket = new Map(game.forecasts.map((f) => [f.market, f]));
-  if (byMarket.size !== 3) {
-    errors.push(`game ${id}: must contain exactly one moneyline, one spread, one total forecast`);
-    return;
+
+  // The scoped bundle's market set is the ONE source of the required forecast
+  // set (§3.4): exactly one forecast per present market, and none for a market
+  // absent from this dispatch. Duplicates, extras, and omissions are flagged
+  // individually rather than short-circuiting, so the model sees the full list.
+  const expected = new Set(presentMarkets(bundleGame));
+  const byMarket = new Map<MarketKey, ForecastOutput>();
+  for (const forecast of game.forecasts) {
+    if (byMarket.has(forecast.market)) {
+      errors.push(`game ${id} ${forecast.market}: duplicate forecast`);
+    }
+    byMarket.set(forecast.market, forecast);
+    if (!expected.has(forecast.market)) {
+      errors.push(
+        `game ${id} ${forecast.market}: forecast for a market not in the scoped bundle (carries ${[...expected].join(', ')})`,
+      );
+    }
+  }
+  for (const market of expected) {
+    if (!byMarket.has(market)) {
+      errors.push(
+        `game ${id}: missing ${market} forecast (scoped bundle carries ${[...expected].join(', ')})`,
+      );
+    }
   }
 
   const moneyline = byMarket.get('moneyline');
   const spread = byMarket.get('spread');
   const total = byMarket.get('total');
-  if (!moneyline || !spread || !total) {
-    errors.push(`game ${id}: must contain exactly one moneyline, one spread, one total forecast`);
-    return;
-  }
-
+  const mlBlock = bundleGame.markets.moneyline;
+  const rlBlock = bundleGame.markets.runLine;
+  const totalBlock = bundleGame.markets.total;
   const teams = [bundleGame.awayTeam, bundleGame.homeTeam];
 
-  // moneyline
-  if (moneyline.line !== null) errors.push(`game ${id} moneyline: "line" must be null`);
-  if (!teams.includes(moneyline.selection)) {
-    errors.push(`game ${id} moneyline: selection must be exactly "${bundleGame.awayTeam}" or "${bundleGame.homeTeam}"`);
-  } else {
-    const expected =
-      moneyline.selection === bundleGame.awayTeam
-        ? bundleGame.markets.moneyline.awayDecimal
-        : bundleGame.markets.moneyline.homeDecimal;
-    if (moneyline.observedDecimal !== expected) {
-      errors.push(`game ${id} moneyline: observedDecimal must equal the bundle price ${expected} for the selected side`);
+  // moneyline — checked only when the market is in BOTH the bundle and response.
+  if (moneyline && mlBlock) {
+    if (moneyline.line !== null) errors.push(`game ${id} moneyline: "line" must be null`);
+    if (!teams.includes(moneyline.selection)) {
+      errors.push(`game ${id} moneyline: selection must be exactly "${bundleGame.awayTeam}" or "${bundleGame.homeTeam}"`);
+    } else {
+      const expectedDecimal =
+        moneyline.selection === bundleGame.awayTeam ? mlBlock.awayDecimal : mlBlock.homeDecimal;
+      if (moneyline.observedDecimal !== expectedDecimal) {
+        errors.push(`game ${id} moneyline: observedDecimal must equal the bundle price ${expectedDecimal} for the selected side`);
+      }
     }
-  }
-  if (moneyline.probabilities.push !== 0) {
-    errors.push(`game ${id} moneyline: push probability must be 0`);
+    if (moneyline.probabilities.push !== 0) {
+      errors.push(`game ${id} moneyline: push probability must be 0`);
+    }
   }
 
   // spread (designated run line)
-  if (spread.line !== bundleGame.markets.runLine.line) {
-    errors.push(`game ${id} spread: line must echo the designated run line ${bundleGame.markets.runLine.line}`);
-  }
-  if (!teams.includes(spread.selection)) {
-    errors.push(`game ${id} spread: selection must be exactly "${bundleGame.awayTeam}" or "${bundleGame.homeTeam}"`);
-  } else {
-    const expected =
-      spread.selection === bundleGame.awayTeam
-        ? bundleGame.markets.runLine.awayDecimal
-        : bundleGame.markets.runLine.homeDecimal;
-    if (spread.observedDecimal !== expected) {
-      errors.push(`game ${id} spread: observedDecimal must equal the bundle price ${expected} for the selected side`);
+  if (spread && rlBlock) {
+    if (spread.line !== rlBlock.line) {
+      errors.push(`game ${id} spread: line must echo the designated run line ${rlBlock.line}`);
     }
-  }
-  if (isHalfLine(bundleGame.markets.runLine.line) && spread.probabilities.push !== 0) {
-    errors.push(`game ${id} spread: push probability must be 0 on a half-run line`);
+    if (!teams.includes(spread.selection)) {
+      errors.push(`game ${id} spread: selection must be exactly "${bundleGame.awayTeam}" or "${bundleGame.homeTeam}"`);
+    } else {
+      const expectedDecimal =
+        spread.selection === bundleGame.awayTeam ? rlBlock.awayDecimal : rlBlock.homeDecimal;
+      if (spread.observedDecimal !== expectedDecimal) {
+        errors.push(`game ${id} spread: observedDecimal must equal the bundle price ${expectedDecimal} for the selected side`);
+      }
+    }
+    if (isHalfLine(rlBlock.line) && spread.probabilities.push !== 0) {
+      errors.push(`game ${id} spread: push probability must be 0 on a half-run line`);
+    }
   }
 
   // total
-  if (total.line !== bundleGame.markets.total.line) {
-    errors.push(`game ${id} total: line must echo the designated total ${bundleGame.markets.total.line}`);
-  }
-  if (total.selection !== 'over' && total.selection !== 'under') {
-    errors.push(`game ${id} total: selection must be exactly "over" or "under"`);
-  } else {
-    const expected =
-      total.selection === 'over'
-        ? bundleGame.markets.total.overDecimal
-        : bundleGame.markets.total.underDecimal;
-    if (total.observedDecimal !== expected) {
-      errors.push(`game ${id} total: observedDecimal must equal the bundle price ${expected} for the selected side`);
+  if (total && totalBlock) {
+    if (total.line !== totalBlock.line) {
+      errors.push(`game ${id} total: line must echo the designated total ${totalBlock.line}`);
     }
-  }
-  if (isHalfLine(bundleGame.markets.total.line) && total.probabilities.push !== 0) {
-    errors.push(`game ${id} total: push probability must be 0 on a half-point total`);
+    if (total.selection !== 'over' && total.selection !== 'under') {
+      errors.push(`game ${id} total: selection must be exactly "over" or "under"`);
+    } else {
+      const expectedDecimal =
+        total.selection === 'over' ? totalBlock.overDecimal : totalBlock.underDecimal;
+      if (total.observedDecimal !== expectedDecimal) {
+        errors.push(`game ${id} total: observedDecimal must equal the bundle price ${expectedDecimal} for the selected side`);
+      }
+    }
+    if (isHalfLine(totalBlock.line) && total.probabilities.push !== 0) {
+      errors.push(`game ${id} total: push probability must be 0 on a half-point total`);
+    }
   }
 
   // shared per-forecast checks
@@ -249,10 +272,17 @@ function checkGame(
     }
   }
 
-  // execution policy: fixed moneyline+total
-  if (!moneyline.selectedForExecution || !total.selectedForExecution || spread.selectedForExecution) {
+  // Execution policy: fixed moneyline+total, intersected with the present set.
+  // Whichever of moneyline/total is present must be marked for execution; the
+  // run line, when present, must not be. A run-line-only fire executes nothing
+  // under this policy, which is correct — the run line is a shadow forecast.
+  const execMismatch: string[] = [];
+  if (moneyline && mlBlock && !moneyline.selectedForExecution) execMismatch.push('moneyline must be true');
+  if (total && totalBlock && !total.selectedForExecution) execMismatch.push('total must be true');
+  if (spread && rlBlock && spread.selectedForExecution) execMismatch.push('spread must be false');
+  if (execMismatch.length > 0) {
     errors.push(
-      `game ${id}: under fixed-moneyline-total, selectedForExecution must be true on moneyline and total and false on spread`,
+      `game ${id}: under fixed-moneyline-total, selectedForExecution ${execMismatch.join('; ')}`,
     );
   }
 }
@@ -381,13 +411,12 @@ function forecastFingerprint(forecast: ForecastOutput): ForecastFingerprint {
   };
 }
 
-const REQUIRED_MARKETS: MarketKey[] = ['moneyline', 'spread', 'total'];
-
 /**
  * A complete, unambiguous decision fingerprint of a raw response against the
  * request bundle: the response must be parseable, shape-valid, and contain
- * EXACTLY the bundle's games with exactly one forecast per market. Returns
- * null otherwise — in which case no repair can prove decision preservation.
+ * EXACTLY the bundle's games, each with exactly one forecast per market PRESENT
+ * in that game's scoped bundle (§3.4). Returns null otherwise — in which case
+ * no repair can prove decision preservation.
  */
 export function extractDecisionFingerprint(
   rawText: string,
@@ -398,21 +427,26 @@ export function extractDecisionFingerprint(
   const shape = benchmarkResponseSchema.safeParse(extracted);
   if (!shape.success) return null;
 
-  const bundleIds = new Set(bundle.games.map((g) => g.gameId));
+  const bundleGames = new Map(bundle.games.map((g) => [g.gameId, g]));
   const fingerprint: DecisionFingerprint = new Map();
   const seenGames = new Set<string>();
   for (const game of shape.data.games) {
-    if (!bundleIds.has(game.gameId) || seenGames.has(game.gameId)) return null;
+    const bundleGame = bundleGames.get(game.gameId);
+    if (bundleGame === undefined || seenGames.has(game.gameId)) return null;
     seenGames.add(game.gameId);
+    // Exactly the scoped bundle's present markets — one forecast each, no
+    // duplicate and none for an absent market. An incomplete or over-complete
+    // decision set cannot prove repair preservation.
+    const expected = new Set(presentMarkets(bundleGame));
     const markets = new Set<MarketKey>();
     for (const forecast of game.forecasts) {
-      if (markets.has(forecast.market)) return null;
+      if (markets.has(forecast.market) || !expected.has(forecast.market)) return null;
       markets.add(forecast.market);
       fingerprint.set(`${game.gameId}:${forecast.market}`, forecastFingerprint(forecast));
     }
-    if (REQUIRED_MARKETS.some((m) => !markets.has(m))) return null;
+    if (markets.size !== expected.size) return null;
   }
-  if (seenGames.size !== bundleIds.size) return null;
+  if (seenGames.size !== bundleGames.size) return null;
   return fingerprint;
 }
 

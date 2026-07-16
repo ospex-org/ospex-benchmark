@@ -21,6 +21,7 @@ function formatHandicap(value: number): string {
 
 function describeFavorite(game: GameBundle): string {
   const ml = game.markets.moneyline;
+  if (!ml) return '—';
   if (ml.awayDecimal === ml.homeDecimal) return 'pick-em';
   return ml.awayDecimal < ml.homeDecimal
     ? `${game.awayTeam} (away)`
@@ -32,11 +33,12 @@ function slateRow(game: GameBundle): string {
   const rl = game.markets.runLine;
   const total = game.markets.total;
   const matchup = `${game.awayTeam} at ${game.homeTeam}`;
-  const moneyline = `${ml.awayDecimal} / ${ml.homeDecimal}`;
-  const runLine =
-    `${game.awayTeam} ${formatHandicap(rl.awayHandicap)} @ ${rl.awayDecimal} · ` +
-    `${game.homeTeam} ${formatHandicap(rl.homeHandicap)} @ ${rl.homeDecimal}`;
-  const totals = `${total.line} (o ${total.overDecimal} / u ${total.underDecimal})`;
+  const moneyline = ml ? `${ml.awayDecimal} / ${ml.homeDecimal}` : '—';
+  const runLine = rl
+    ? `${game.awayTeam} ${formatHandicap(rl.awayHandicap)} @ ${rl.awayDecimal} · ` +
+      `${game.homeTeam} ${formatHandicap(rl.homeHandicap)} @ ${rl.homeDecimal}`
+    : '—';
+  const totals = total ? `${total.line} (o ${total.overDecimal} / u ${total.underDecimal})` : '—';
   const pitchers = game.probableStartingPitchers
     ? `${game.probableStartingPitchers.away ?? '—'} / ${game.probableStartingPitchers.home ?? '—'}`
     : '—';

@@ -4,7 +4,9 @@
  * The information bundle is deliberately thin (see docs/BENCHMARK_PROMPT_V0.md
  * and the v0 data policy): game identity, scheduled start, probable starting
  * pitchers when the read path exposes them, and timestamped reference prices
- * for the three fixed markets. Nothing else.
+ * for the markets scoped to that dispatch. The market set is per-dispatch
+ * (see GameBundle.markets and presentMarkets in scopedMarkets.ts); nothing
+ * else.
  */
 
 export type MarketKey = 'moneyline' | 'spread' | 'total';
@@ -93,10 +95,22 @@ export interface GameBundle {
    * absence is visible in the hashed bundle.
    */
   probableStartingPitchers: ProbablePitchers | null;
+  /**
+   * The markets scoped to this dispatch — per-market optional. A scoped bundle
+   * carries exactly the speculations firing in its dispatch (evidence spec
+   * §3.4): a co-arrival fire may carry all three, a split fire carries one.
+   * Every consumer — the prompt, the required forecast set, the baselines, and
+   * the records — derives cardinality from the present set (see
+   * `presentMarkets` in scopedMarkets.ts), never a hard-coded three. The
+   * `runLine` field name is retained (not renamed to `spread`) so
+   * `verifyRunIntegrity` replays the archived corpus. Under
+   * `exactOptionalPropertyTypes`, an absent market is OMITTED, never set to
+   * `undefined`.
+   */
   markets: {
-    moneyline: MoneylineBlock;
-    runLine: RunLineBlock;
-    total: TotalBlock;
+    moneyline?: MoneylineBlock;
+    runLine?: RunLineBlock;
+    total?: TotalBlock;
   };
   /** Every evidenceRef a rationale may cite for this game. */
   evidenceRefs: string[];

@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
+import { presentMarkets } from './scopedMarkets.js';
 import { currentOddsRowSchema, gamesEndpointRowSchema } from './wire.js';
 import type {
   BenchmarkResponse,
@@ -130,6 +131,7 @@ function buildForecast(
 
   if (market === 'moneyline') {
     const ml = game.markets.moneyline;
+    if (!ml) throw new Error('mock buildForecast: moneyline requested but the scoped bundle has none');
     const homeIsFavorite = ml.homeDecimal <= ml.awayDecimal;
     selection = homeIsFavorite ? game.homeTeam : game.awayTeam;
     observedDecimal = homeIsFavorite ? ml.homeDecimal : ml.awayDecimal;
@@ -138,9 +140,15 @@ function buildForecast(
     evidenceRef = ml.evidenceRef;
   } else if (market === 'spread') {
     const rl = game.markets.runLine;
+    if (!rl) throw new Error('mock buildForecast: spread requested but the scoped bundle has none');
     const ml = game.markets.moneyline;
-    // Deterministic contrast pick: take the run line on the moneyline underdog.
-    const takeAway = ml.awayDecimal >= ml.homeDecimal;
+    // Deterministic contrast pick: take the run line on the moneyline underdog
+    // when the moneyline is in scope; otherwise (a run-line-only split fire)
+    // fall back to the run line's own higher-decimal side, so the mock handles
+    // any cardinality without depending on a market outside the scope.
+    const takeAway = ml
+      ? ml.awayDecimal >= ml.homeDecimal
+      : rl.awayDecimal >= rl.homeDecimal;
     selection = takeAway ? game.awayTeam : game.homeTeam;
     observedDecimal = takeAway ? rl.awayDecimal : rl.homeDecimal;
     otherDecimal = takeAway ? rl.homeDecimal : rl.awayDecimal;
@@ -148,6 +156,7 @@ function buildForecast(
     evidenceRef = rl.evidenceRef;
   } else {
     const total = game.markets.total;
+    if (!total) throw new Error('mock buildForecast: total requested but the scoped bundle has none');
     selection = 'over';
     observedDecimal = total.overDecimal;
     otherDecimal = total.underDecimal;
@@ -187,11 +196,9 @@ function buildValidResponse(payload: RequestPayload): BenchmarkResponse {
     executionPolicy: payload.executionPolicy,
     games: payload.bundle.games.map((game) => ({
       gameId: game.gameId,
-      forecasts: [
-        buildForecast(game, 'moneyline'),
-        buildForecast(game, 'spread'),
-        buildForecast(game, 'total'),
-      ],
+      // One forecast per market present in the scoped bundle (§3.4) — three for
+      // a co-arrival board, fewer for a split fire — never a hard-coded three.
+      forecasts: presentMarkets(game).map((market) => buildForecast(game, market)),
     })),
   };
 }
@@ -200,7 +207,8 @@ function buildSchemaInvalidResponse(payload: RequestPayload): BenchmarkResponse 
   const invalid = structuredClone(buildValidResponse(payload));
   const game = invalid.games[0];
   if (game) {
-    // Drop the spread forecast: violates the exactly-three-forecasts contract.
+    // Drop the spread forecast: on the three-market fixture game this violates
+    // the required per-market forecast set (a missing scoped market).
     game.forecasts = game.forecasts.filter((f) => f.market !== 'spread');
     const forecast = game.forecasts[0];
     if (forecast) {

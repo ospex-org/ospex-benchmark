@@ -174,7 +174,7 @@ test('repair that changes a decision is rejected even when schema-valid', async 
   const forecast = mutated.games[0]?.forecasts[0];
   assert.ok(forecast);
   forecast.selection = request.game.homeTeam; // Milwaukee -> Pittsburgh
-  forecast.observedDecimal = request.game.markets.moneyline.homeDecimal;
+  forecast.observedDecimal = request.game.markets.moneyline!.homeDecimal;
   const adapter = stubAdapter([
     async () => stubResponse(wrongEcho(makeValidResponse(request))),
     async () => stubResponse(JSON.stringify(mutated)),

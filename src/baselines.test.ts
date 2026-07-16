@@ -5,9 +5,10 @@ import {
   BASELINE_POLICY_VERSIONS,
   isBaselinePolicyVersion,
   runBaselines,
+  type BaselinePolicyVersion,
 } from './baselines.js';
-import { makeRequest } from './testFactories.js';
-import type { GameBundle, SlateBundle } from './types.js';
+import { makeGameBundle, makeRequest } from './testFactories.js';
+import type { BaselineDecision, GameBundle, MarketKey, SlateBundle } from './types.js';
 
 /**
  * Deterministic-baseline policy tests. The run-line fixtures deliberately
@@ -41,6 +42,19 @@ function slateWithRunLine(overrides: {
   } as SlateBundle;
 }
 
+/** A one-game slate carrying exactly the given scoped markets (a split fire). */
+function slateOf(present: readonly MarketKey[]): SlateBundle {
+  return {
+    schemaVersion: 1,
+    label: 'SMOKE_V0_NOT_A_COHORT',
+    league: 'mlb',
+    slateDate: '2026-07-12',
+    bundleTimestamp: '2026-07-12T14:05:00+00:00',
+    cutoffAt: '2026-07-12T16:15:00+00:00',
+    games: [makeGameBundle({}, present)],
+  };
+}
+
 function rlPair(slate: SlateBundle): { favorite: { selection: string; observedDecimal: number; line: number | null }; underdog: { selection: string; observedDecimal: number; line: number | null } } {
   const decisions = runBaselines(slate);
   const favorite = decisions.find((d) => d.participantId === 'baseline-favorite-rl');
@@ -72,9 +86,9 @@ test('the current version appends the run-line pair and leaves the legacy six by
   const slate = slateWithRunLine({ line: -1.5, awayDecimal: 1.54054, homeDecimal: 2.64 });
   const v1 = runBaselines(slate, 'baselines-v0.1.0');
   const v2 = runBaselines(slate);
-  assert.equal(BASELINE_POLICY_VERSION, 'baselines-v0.2.0');
+  assert.equal(BASELINE_POLICY_VERSION, 'baselines-v0.3.0');
   assert.equal(v2.length, 8);
-  assert.ok(v2.every((d) => d.policyVersion === 'baselines-v0.2.0'));
+  assert.ok(v2.every((d) => d.policyVersion === 'baselines-v0.3.0'));
   // The six legacy decisions are unchanged apart from the version stamp.
   const stripVersion = (d: (typeof v1)[number]): Omit<(typeof v1)[number], 'policyVersion'> => {
     const { policyVersion: _policyVersion, ...rest } = d;
@@ -114,9 +128,65 @@ test('a zero handicap (pick’em) breaks to home as the laying side', () => {
 });
 
 test('version registry: known versions dispatch, unknown strings do not', () => {
-  assert.deepEqual([...BASELINE_POLICY_VERSIONS], ['baselines-v0.1.0', 'baselines-v0.2.0']);
+  assert.deepEqual(
+    [...BASELINE_POLICY_VERSIONS],
+    ['baselines-v0.1.0', 'baselines-v0.2.0', 'baselines-v0.3.0'],
+  );
   assert.ok(isBaselinePolicyVersion('baselines-v0.1.0'));
   assert.ok(isBaselinePolicyVersion('baselines-v0.2.0'));
+  assert.ok(isBaselinePolicyVersion('baselines-v0.3.0'));
   assert.ok(!isBaselinePolicyVersion('baselines-v9.9.9'));
   assert.ok(!isBaselinePolicyVersion(''));
+});
+
+test('v0.3.0 derives the baseline set from the scoped bundle present markets', () => {
+  const mlOnly = runBaselines(slateOf(['moneyline']));
+  assert.deepEqual(mlOnly.map((d) => d.participantId).sort(), [
+    'baseline-away-ml',
+    'baseline-favorite-ml',
+    'baseline-home-ml',
+    'baseline-underdog-ml',
+  ]);
+  assert.ok(mlOnly.every((d) => d.market === 'moneyline'));
+
+  const totalOnly = runBaselines(slateOf(['total']));
+  assert.deepEqual(totalOnly.map((d) => d.participantId).sort(), [
+    'baseline-over-total',
+    'baseline-under-total',
+  ]);
+  assert.ok(totalOnly.every((d) => d.market === 'total'));
+
+  // A run-line-only split fire yields only the mirrored run-line pair.
+  const runLineOnly = runBaselines(slateOf(['spread']));
+  assert.deepEqual(runLineOnly.map((d) => d.participantId).sort(), [
+    'baseline-favorite-rl',
+    'baseline-underdog-rl',
+  ]);
+  assert.ok(runLineOnly.every((d) => d.market === 'spread'));
+
+  // Moneyline + total (no run line) yields six, no run-line baseline.
+  const mlAndTotal = runBaselines(slateOf(['moneyline', 'total']));
+  assert.equal(mlAndTotal.length, 6);
+  assert.ok(mlAndTotal.every((d) => d.market !== 'spread'));
+});
+
+test('a three-market bundle re-derives the exact archived v0.2.0 baseline set (golden order), and v0.3.0 matches it', () => {
+  const slate = slateOf(['moneyline', 'spread', 'total']);
+  const gameId = slate.games[0]!.gameId;
+  // A FIXED golden of the v0.2.0 output for the standard fixture, in derivation
+  // order. This pins the archived-replay guarantee against ANY future reorder
+  // or field change in runBaselines — not merely v0.2.0 vs v0.3.0 of the same
+  // body (which share a code path and would drift together undetected).
+  const golden = (policyVersion: BaselinePolicyVersion): BaselineDecision[] => [
+    { participantId: 'baseline-favorite-ml', policyVersion, gameId, market: 'moneyline', selection: 'Milwaukee Brewers', line: null, observedDecimal: 1.74627, track: 'common-cutoff' },
+    { participantId: 'baseline-underdog-ml', policyVersion, gameId, market: 'moneyline', selection: 'Pittsburgh Pirates', line: null, observedDecimal: 2.17, track: 'common-cutoff' },
+    { participantId: 'baseline-home-ml', policyVersion, gameId, market: 'moneyline', selection: 'Pittsburgh Pirates', line: null, observedDecimal: 2.17, track: 'common-cutoff' },
+    { participantId: 'baseline-away-ml', policyVersion, gameId, market: 'moneyline', selection: 'Milwaukee Brewers', line: null, observedDecimal: 1.74627, track: 'common-cutoff' },
+    { participantId: 'baseline-over-total', policyVersion, gameId, market: 'total', selection: 'over', line: 8.5, observedDecimal: 1.90909, track: 'common-cutoff' },
+    { participantId: 'baseline-under-total', policyVersion, gameId, market: 'total', selection: 'under', line: 8.5, observedDecimal: 1.90909, track: 'common-cutoff' },
+    { participantId: 'baseline-favorite-rl', policyVersion, gameId, market: 'spread', selection: 'Milwaukee Brewers', line: 1.5, observedDecimal: 2.3, track: 'common-cutoff' },
+    { participantId: 'baseline-underdog-rl', policyVersion, gameId, market: 'spread', selection: 'Pittsburgh Pirates', line: 1.5, observedDecimal: 1.66667, track: 'common-cutoff' },
+  ];
+  assert.deepEqual(runBaselines(slate, 'baselines-v0.2.0'), golden('baselines-v0.2.0'));
+  assert.deepEqual(runBaselines(slate, 'baselines-v0.3.0'), golden('baselines-v0.3.0'));
 });
