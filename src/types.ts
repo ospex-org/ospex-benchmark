@@ -15,9 +15,12 @@ export type ProviderName = 'openai' | 'anthropic' | 'google' | 'xai';
  * Arm outcome codes, per (arm, game) request. The first four are the required
  * set; the rest are deliberate extensions recorded honestly rather than
  * shoehorned: `rate_limited` (HTTP 429 — a throttle must never read as a
- * model failure), `provider_error` (other transport/HTTP failures), and
+ * model failure), `provider_error` (other transport/HTTP failures),
  * `cutoff_missed` (the decision window closed before an acceptable response
- * existed — never emits decision records).
+ * existed — never emits decision records), and `dispatch_lag_exceeded` (the
+ * initial request would start more than `maxDispatchLagMs` after detection, so it
+ * is not sent — a valid negative, §5). None of the non-`valid` outcomes emit
+ * decision records.
  */
 export type ArmOutcome =
   | 'valid'
@@ -26,7 +29,8 @@ export type ArmOutcome =
   | 'credential_missing'
   | 'rate_limited'
   | 'provider_error'
-  | 'cutoff_missed';
+  | 'cutoff_missed'
+  | 'dispatch_lag_exceeded';
 
 /** Transport status of the repair attempt, recorded separately from outcome. */
 export type RepairTransport = 'ok' | 'timeout' | 'rate_limited' | 'provider_error' | null;

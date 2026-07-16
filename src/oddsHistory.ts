@@ -1,5 +1,10 @@
 import { z } from 'zod';
+import { instantMs, parseableOffsetInstant } from './time.js';
 import type { MarketKey } from './types.js';
+
+// Re-exported so existing consumers/tests that import `instantMs` from this module
+// keep working; the canonical home is now `src/time.ts`.
+export { instantMs } from './time.js';
 
 /**
  * The independent `odds_history` read model (SPEC-line-open-evidence-model.md §1
@@ -22,33 +27,6 @@ import type { MarketKey } from './types.js';
 /** The read-model version pinned in the manifest as `sourceQueryVersion` — it
  *  versions `validTwoSidedHistoryRowV1` (below) and the as-of query. */
 export const SOURCE_QUERY_VERSION = 'source-query-v1';
-
-// An ISO-8601 instant with an explicit offset (`Z` or `+/-hh:mm`). An offset-less
-// string would be read by Date.parse in the runner's LOCAL zone — the same
-// host-timezone hazard guarded elsewhere — so a naive value is rejected.
-const offsetInstant = z.string().datetime({ offset: true });
-
-// zod's datetime regex validates offset SYNTAX but not its RANGE — it accepts
-// e.g. `+99:99`, which Date.parse then turns into NaN. Require the instant to be
-// genuinely parseable so a NaN can never poison the ms sort key.
-const parseableOffsetInstant = offsetInstant.refine((s) => Number.isFinite(Date.parse(s)), {
-  message: 'must be a parseable ISO-8601 instant',
-});
-
-/** Parse an offset-qualified ISO-8601 instant to epoch ms, FAIL-CLOSED on a naive,
- *  out-of-range-offset, or otherwise unparseable value. The single instant→ms
- *  conversion used everywhere in this module, so every comparison shares one
- *  definition of "when". */
-export function instantMs(iso: string): number {
-  if (!offsetInstant.safeParse(iso).success) {
-    throw new Error(`timestamp "${iso}" must be an ISO-8601 instant with an explicit offset (Z or +/-hh:mm)`);
-  }
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) {
-    throw new Error(`timestamp "${iso}" is not a parseable instant`);
-  }
-  return ms;
-}
 
 // American odds: present, a safe non-zero integer (the DB column is an integer;
 // null/absent, zero, or a fractional value is not a valid two-sided price).

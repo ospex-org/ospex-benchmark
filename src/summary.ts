@@ -10,6 +10,7 @@ const OUTCOME_ORDER: ArmOutcome[] = [
   'timeout',
   'rate_limited',
   'cutoff_missed',
+  'dispatch_lag_exceeded',
   'credential_missing',
   'provider_error',
 ];
