@@ -96,12 +96,16 @@ This separation is the core of the fix.
    league sends. No market is ever ignored at the detection layer.
 
 2. **Policy decides what to *do* with a detected speculation.** MLB scores
-   moneyline and total, not run lines. A run line is still detected and still
-   recorded — with reason `policy_disabled` — it simply is not dispatched to
-   the participants.
+   moneyline and total, not run lines. A run line may still be detected and
+   noted — it simply is not dispatched to the participants.
 
-The run line is not "filtered out." It is seen, logged, and **deliberately not
-acted upon**. Detection is complete; action is policy.
+The run line is not "filtered out." It is seen and **deliberately not acted
+upon**. Detection is complete; action is policy.
+
+**Tier-0 note.** Universal detection is an operational convenience, not a Tier-0
+requirement. Policy-disabled markets may surface in **non-canonical
+diagnostics**, but Tier 0 requires **no** canonical detection or status artifact
+for them; the final universe is **policy-enabled only** (Tier-0 spec §6).
 
 ### 3.1 Market policy: a per-`(league, market)` allow-list in code
 
@@ -122,9 +126,10 @@ MARKET_POLICY_V1 = {
   dispatches only if that league explicitly lists it. Adding a league
   therefore fires *nothing* until its markets are enumerated in a
   policy-version bump — there is no path by which a new league silently starts
-  firing markets nobody affirmatively chose. (Detection stays universal: an
-  unlisted market is still detected and recorded `policy_disabled`; only
-  *action* is withheld.)
+  firing markets nobody affirmatively chose. (Detection stays universal
+  operationally: an unlisted market may still be detected and noted in
+  non-canonical diagnostics; Tier 0 requires no canonical `policy_disabled`
+  artifact — the final universe is policy-enabled only.)
 - **No `--markets` CLI flag.** A per-invocation lever over which markets are
   entered is exactly the cherry-pick surface this benchmark cannot have.
 
@@ -141,16 +146,19 @@ openerAge = detectedAt − firstAppearance(game, market)
 ```
 
 A speculation fires only if its **own** age is inside the threshold. A stale
-market can never ride in on a fresh one.
+market can never ride in on a fresh one. (`firstAppearance` here is the Tier-0
+`firstTwoSided` appearance — evidence spec §1; the two names denote one
+quantity.)
 
-**The threshold is a committed constant — 30 minutes — not a CLI flag.**
-`--late-minutes` is deleted. Today the scorer checks
-`openerAgeMinutes ≤ lateThresholdMinutes` where the threshold is copied from a
-flag accepting up to 1440 — so `--late-minutes 1440` enters 23-hour-old lines
-and the scorer certifies them honest. The threshold is an entry-honesty
-parameter and is preregistered exactly as the market policy is: stored and
-hashed into the run record, and filtered against each speculation's own
-recorded first appearance.
+**The threshold is a manifest constant — `cleanEntryWindowMs = 120_000` (= `W`)
+— not a CLI flag.** `--late-minutes` is not a canonical lever. Today the scorer
+checks `openerAgeMinutes ≤ lateThresholdMinutes` where the threshold is copied
+from a flag accepting up to 1440 — so `--late-minutes 1440` enters 23-hour-old
+lines and the scorer certifies them honest. The clean-entry window is an
+entry-honesty parameter, preregistered exactly as the market policy is: pinned
+in the manifest and hashed into `cohortId`, and filtered against each
+speculation's own independently-derived first appearance. Tier 0 additionally
+gates on the full **canonical window** (Tier-0 spec §3), not opener age alone.
 
 ### 3.3 Firing: independent by default, batched as a transport detail
 
@@ -165,7 +173,7 @@ At each detection, for each game:
   individually inside its own late gate**;
 - if `ready` is non-empty: build **one** bundle over exactly those markets,
   hash it, **claim each speculation independently**, and dispatch **one**
-  request to all twelve participants;
+  request to **every arm in `expectedArmRoster`** (Tier-0 spec §2);
 - markets not ready are not in that bundle. They are re-detected on later ticks
   and may fire in their own later dispatch. **Nothing ever waits for another
   market.**
@@ -215,22 +223,26 @@ difference is a gitignored local directory.
 
 That is a cherry-pick surface, and per-market firing creates it.
 
-**Requirement:** the corpus must contain the **negative space**. Every (game,
-market) the runner sees gets a typed, hashed `speculation_status` record —
-`entered` (with full provenance) or `not_entered` with a machine-readable
-reason (`market_never_opened`, `late_detection`, `stale_quote`, `one_sided`,
-`first_pitch_passed`, `policy_disabled`, …) carrying its first-appearance
-evidence. The scorer **reads and enforces** it (today it ignores
-`excluded_game` records entirely), so coverage is a published number and a
-dropped market is a detectable hole rather than an invisible one.
+**Requirement (Tier-0 form).** The cherry-pick surface is closed by **globally
+derived coverage**, not a per-fire self-reported denominator. Tier 0
+reconstructs the expected universe `U` from the independent `odds_history` first
+appearances at scoring time and reconciles it against the fired keys `F` into
+published `U/F/C/M/X/D` coverage (Tier-0 spec §6). A dropped market shows up as a
+miss in `M = U − F`; it cannot hide, because membership is derived from the
+independent feed, not attested per fire. The per-market `speculation_status`
+record and machine-reason enum sketched here do **not** carry into Tier 0 —
+runner miss reasons are **advisory diagnostics** attached to `M`, never the
+denominator.
 
-Per-market firing is only safe *with* this. It is not optional.
+Per-market firing is only safe *with* published coverage. It is not optional —
+but in Tier 0 that coverage is the global `odds_history` reconciliation, not an
+embedded per-fire denominator.
 
 ### 3.6 Independently verifiable entry timing
 
-`firstAppearanceAt` is currently whatever the runner writes, and the scorer
-validates it against itself. `odds_history` is append-only and the scorer can
-already reach it.
+`firstAppearanceAt` (the Tier-0 `firstTwoSided` appearance, evidence spec §1) is
+currently whatever the runner writes, and the scorer validates it against
+itself. `odds_history` is append-only and the scorer can already reach it.
 
 **The scorer re-derives each speculation's first appearance from
 `odds_history` at scoring time** and refuses a run whose claimed opener age
@@ -286,17 +298,21 @@ write → our poll (**300s default**). The poll dominates.
 ## 4. Two hazards to handle before the first live run
 
 **The first live boot burns the board.** Every enabled market already open in
-the window will be hours old, fail its late gate, and be ledgered
-`late_detection` — permanently, on the first tick. A single accidental live
-boot closes the slate.
+the window will be hours old, fall outside its clean-entry window, and become a
+coverage miss on the first tick. A single accidental live boot closes the slate.
+(Tier 0 records this as a global `M = U − F` miss, not a permanent per-market
+ledger stamp.)
 
-**Rehearsal mode is mandatory and ships in PR A.** It reports what it *would*
-do, per speculation, with reasons, and writes **no live ledger**. No live run
-is possible until rehearsal output has been reviewed.
+**Rehearsal mode is mandatory and ships in PR 1.** It reports what it *would*
+do, per speculation, with reasons, and writes **no live ledger**. No live run is
+possible until rehearsal output has been reviewed, and `--live` is hard-disabled
+until PR 3 (Tier-0 spec §9).
 
-**The spend cap needs retuning.** `--max-fires-per-tick` (default 10) now
-counts *speculation* claims; ~15 games × 2 markets = 30 claims on the first
-tick that finds them.
+**The caps come from the manifest.** `maxDispatchesPerTick` and the cohort
+call/spend caps (`cohortCallCap` / `cohortSpendCapUsdMicros`) are manifest
+constants, not CLI defaults; the stale "`--max-fires-per-tick` default 10"
+figure does not apply in canonical mode. On the first tick that finds them,
+~15 games × 2 markets ≈ 30 candidate claims, bounded by those manifest caps.
 
 ## 5. Sequencing
 
@@ -305,14 +321,14 @@ There is **no honest quick unblock.** Narrowing the watched markets to
 the newer of the two — the same class of bug, shipped onto the highest-value
 runs we will ever record. The gate and the market scope land together.
 
-| PR | Content |
-|---|---|
-| **A** | Market policy + universal detection + partial bundles + per-speculation late gate + per-speculation ledger + prompt/schema/baselines derived from the bundle's market set + scorer accepts scoped runs + **rehearsal mode** |
-| **B** | Publish the denominator (§3.5) + scorer enforces coverage + independent first-appearance verification (§3.6) |
-
-**A and B ship together, or back-to-back with nothing merged in between.** A
-creates the cherry-pick surface; B is what closes it. **Do not run any cohort
-in the gap.**
+**Sequencing is the Tier-0 PR 0 → 3 plan (Tier-0 spec §9), which supersedes the
+earlier PR A / PR B split** (the A+B stack, PRs #10/#11, was closed unmerged):
+PR 0 is this spec pair; PR 1 is per-market no-wait firing + fire artifacts +
+at-most-once + rehearsal; PR 2 is global coverage reconciliation + close capture
++ CLV + scorecard; PR 3 is the budget-bounded live canary. `--live` is
+**hard-disabled through PR 2**. The cherry-pick surface PR 1 creates is closed by
+PR 2's global `U/F/C` reconciliation — **do not run any paid cohort before
+PR 2's coverage lands.**
 
 Docs (`LINE_OPEN_RUNNER.md`, the methodology doc, the prompt doc) ship **with**
 the PR that changes the behaviour.
@@ -329,22 +345,26 @@ the PR that changes the behaviour.
 
 ## 7. Verification
 
+**The authoritative acceptance matrix is the Tier-0 spec §10** (cases 1–33). The
+still-current unit/firing checks below are a subset of it; the per-market
+`policy_disabled` / `late_detection` **status-record** assertions from the
+earlier draft are superseded by global coverage reconciliation (Tier-0 spec §6)
+and are **not** Tier-0 acceptance criteria.
+
 - A simulated three-market game with three distinct arrival times produces
   **three independent fires** at three honest opener ages — the primary test,
-  not an edge case.
+  not an edge case (Tier-0 §10 case 2).
 - A simulated co-arrival of moneyline + total produces one dispatch but **two
   independently-claimed, independently-gated, independently-recorded**
-  speculations.
-- A run line on an MLB game is detected and recorded `policy_disabled`, and
-  never dispatched.
-- **Policy isolation:** MLB run line disabled + NFL spread enabled produces
-  exactly that. A league absent from `MARKET_POLICY_V1` fires nothing (every
-  market `policy_disabled`) until explicitly listed.
-- A stale moneyline (open 3h) and a fresh total (open 2m) on one game: the
-  total fires, the moneyline is recorded `late_detection`, and nothing lets the
-  moneyline ride in on the total's freshness.
-- The scorer rejects a run whose claimed opener age doesn't reconcile with
-  `odds_history`.
+  speculations (Tier-0 §10 cases 3, 24).
+- **Policy isolation:** a `(league, market)` absent from the committed market
+  policy is never dispatched; enabling NFL spread later says nothing about MLB.
+- A stale moneyline (open 3h) and a fresh total (open 2m) on one game: the total
+  fires and the moneyline is **not** entered — nothing lets the moneyline ride
+  in on the total's freshness. Under Tier 0 the un-entered moneyline surfaces as
+  a global `M` miss, not a per-market status stamp.
+- The scorer re-derives each speculation's first appearance from `odds_history`
+  and refuses a run whose opener age doesn't reconcile (§3.6; Tier-0 V1/V2).
 - `verifyRunIntegrity` still replays the archived smoke corpus (game-scoped
   bundles carrying `runLine`) — backward compatibility by recorded policy
   version.
