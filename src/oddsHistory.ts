@@ -157,9 +157,29 @@ function compareOrder(a: TwoSidedHistoryRow, b: TwoSidedHistoryRow): number {
 }
 
 /** Whether a row is within the frozen scoring watermark (`id <= watermark`); an
- *  `undefined` watermark imposes no upper bound (live runtime detection). */
+ *  `undefined` watermark imposes no upper bound (live runtime detection). Assumes
+ *  the watermark was already validated by `requireValidWatermark`. */
 function withinWatermark(row: TwoSidedHistoryRow, watermark: number | undefined): boolean {
   return watermark === undefined || row.id <= watermark;
+}
+
+/**
+ * Validate a supplied scoring watermark BEFORE any row is evaluated. `undefined`
+ * is the intentional unbounded live-runtime mode; a supplied value must be a safe
+ * NONNEGATIVE integer — it is `MAX(odds_history.id)`, and ids start at 1, so a real
+ * frozen watermark is `>= 1` while `0` is the coherent empty bound. A malformed
+ * watermark FAILS CLOSED rather than flowing into `<=`: `NaN`/negative would
+ * silently exclude every row (shrinking the denominator), `Infinity` would admit
+ * post-watermark rows (defeating the case-40 frozen-watermark stability), and an
+ * untyped `null`/string/object would coerce. Shared by both derivations so their
+ * watermark semantics cannot drift. (Same fail-closed class as the `Date.parse`
+ * NaN guard above — a load-bearing numeric boundary must never reach a comparator.)
+ */
+function requireValidWatermark(watermark: number | undefined): void {
+  if (watermark === undefined) return;
+  if (!Number.isSafeInteger(watermark) || watermark < 0) {
+    throw new Error(`watermark must be undefined or a safe nonnegative integer, got ${String(watermark)}`);
+  }
 }
 
 /** Fail-closed: the derivations operate on ONE `(jsonodds_id, market)` pair's
@@ -183,6 +203,7 @@ export function firstTwoSided(
   rows: readonly TwoSidedHistoryRow[],
   watermark?: number,
 ): TwoSidedHistoryRow | undefined {
+  requireValidWatermark(watermark);
   assertSinglePair(rows);
   let best: TwoSidedHistoryRow | undefined;
   for (const row of rows) {
@@ -204,6 +225,7 @@ export function asOfQuote(
   t: string,
   watermark?: number,
 ): TwoSidedHistoryRow | undefined {
+  requireValidWatermark(watermark);
   assertSinglePair(rows);
   const tMs = instantMs(t);
   let best: TwoSidedHistoryRow | undefined;

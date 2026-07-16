@@ -216,3 +216,30 @@ test('the derivations refuse a mixed (jsonodds_id, market) input (fail-closed)',
   assert.throws(() => firstTwoSided([a, b]), /single \(jsonodds_id, market\) pair/);
   assert.throws(() => asOfQuote([a, b], '2026-07-16T00:05:00.000Z'), /single \(jsonodds_id, market\) pair/);
 });
+
+test('a malformed watermark is refused before any row is evaluated (fail-closed)', () => {
+  // Two post-watermark rows are present: a backdated one (would become the wrong
+  // "first" under Infinity) and a later one (would become the wrong "as-of").
+  // NaN/negative would instead silently drop everything. Every malformed value throws.
+  const inWindow = vrow({ id: 10, captured_at: '2026-07-16T00:02:00.000Z' });
+  const backdated = vrow({ id: 20, captured_at: '2026-07-15T23:00:00.000Z' }); // earlier time, post-watermark id
+  const laterPost = vrow({ id: 30, captured_at: '2026-07-16T00:04:00.000Z' }); // later time, post-watermark id
+  const rows = [inWindow, backdated, laterPost];
+  const asOf = '2026-07-16T00:05:00.000Z';
+  const malformed: unknown[] = [NaN, Infinity, -Infinity, -1, 10.5, 9007199254740992, null, '10', {}];
+  for (const w of malformed) {
+    assert.throws(() => firstTwoSided(rows, w as number), /watermark/, `firstTwoSided ${String(w)}`);
+    assert.throws(() => asOfQuote(rows, asOf, w as number), /watermark/, `asOfQuote ${String(w)}`);
+  }
+  // Under a valid frozen watermark the post-watermark rows are correctly excluded.
+  assert.equal(firstTwoSided(rows, 10)?.id, 10); // not the backdated id 20
+  assert.equal(asOfQuote(rows, asOf, 10)?.id, 10); // not the later id 30
+});
+
+test('a watermark of 0 is a valid empty bound (ids start at 1) — no rows, no throw', () => {
+  const rows = [vrow({ id: 1 })];
+  assert.equal(firstTwoSided(rows, 0), undefined);
+  assert.equal(asOfQuote(rows, '2026-07-16T00:05:00.000Z', 0), undefined);
+  // Number.MAX_SAFE_INTEGER is a valid (in-domain) watermark.
+  assert.equal(firstTwoSided(rows, Number.MAX_SAFE_INTEGER)?.id, 1);
+});
