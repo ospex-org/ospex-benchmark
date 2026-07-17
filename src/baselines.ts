@@ -1,4 +1,4 @@
-import type { BaselineDecision, SlateBundle } from './types.js';
+import type { BaselineDecision, GameBundle, SlateBundle } from './types.js';
 
 /**
  * The deterministic baseline participants (docs/AGENT_BENCHMARK.md,
@@ -15,6 +15,15 @@ import type { BaselineDecision, SlateBundle } from './types.js';
  *   part — and a zero handicap (pick'em; not seen on MLB run lines) breaks
  *   to home as the laying side.
  *
+ * Both current versions are full-board-era policies: they are defined over
+ * the fixed three-market board (moneyline + run line + total), so a scoped
+ * (1–2-market) input is not a valid input for either and fails closed rather
+ * than emitting a partial set (SPEC-prepared-request.md §3). Version dispatch
+ * is likewise fail-closed: an unrecognized version throws instead of falling
+ * through to a default policy. The forthcoming scoped `v0.3` (S3) is the only
+ * version that derives from a present-market subset; it relaxes the full-board
+ * requirement for that version alone.
+ *
  * The scorer re-derives baselines under the RECORDED policy version, so
  * archived runs keep verifying byte-for-byte as newer versions ship.
  */
@@ -28,10 +37,52 @@ export function isBaselinePolicyVersion(value: string): value is BaselinePolicyV
   return (BASELINE_POLICY_VERSIONS as readonly string[]).includes(value);
 }
 
+/** The market blocks a full-board policy (v0.1/v0.2) requires on every game. */
+const FULL_BOARD_MARKETS = ['moneyline', 'runLine', 'total'] as const;
+
+/**
+ * Fail closed on a scoped input (SPEC-prepared-request.md §3). v0.1/v0.2 are
+ * full-board policies and must never emit a partial baseline set for a game
+ * that is missing any of the three market blocks. The static type marks all
+ * three present; this enforces it at runtime against a scoped value that
+ * reached here through a cast (e.g. the scorer reconstructs slates with
+ * `as unknown as SlateBundle`). It throws before any decision is emitted.
+ *
+ * Scope: this detects an ABSENT (null/undefined) block — the scoped-input
+ * concern. Structural validity of a PRESENT block (that it is a well-formed
+ * object with valid prices/lines) is the prepared-request boundary's job
+ * (§2.2), through which every real input to runBaselines has already passed;
+ * it is not re-checked here.
+ */
+function assertFullBoard(bundle: SlateBundle, policyVersion: BaselinePolicyVersion): void {
+  for (const game of bundle.games) {
+    const markets = game.markets as Partial<GameBundle['markets']> | null | undefined;
+    const missing = FULL_BOARD_MARKETS.filter((key) => markets?.[key] == null);
+    if (missing.length > 0) {
+      throw new Error(
+        `baseline policy ${policyVersion} requires a full three-market board; ` +
+          `game ${game.gameId} is missing market block(s): ${missing.join(', ')}`,
+      );
+    }
+  }
+}
+
 export function runBaselines(
   bundle: SlateBundle,
   policyVersion: BaselinePolicyVersion = BASELINE_POLICY_VERSION,
 ): BaselineDecision[] {
+  // Version isolation (spec §3). The typed parameter guards compile-time
+  // callers, but the scorer re-derives baselines under a version string read
+  // from an archived artifact. An unknown version reaching here — through that
+  // path or any cast — must fail closed, never fall through to a default
+  // policy that would stamp foreign output with the unrecognized version.
+  if (!isBaselinePolicyVersion(policyVersion)) {
+    throw new Error(`unknown baseline policy version "${policyVersion}"`);
+  }
+  // Full-board input guard: reject a scoped input before emitting anything.
+  assertFullBoard(bundle, policyVersion);
+
+  const includeRunLine = policyVersion === 'baselines-v0.2.0';
   const decisions: BaselineDecision[] = [];
 
   for (const game of bundle.games) {
@@ -90,7 +141,7 @@ export function runBaselines(
       },
     );
 
-    if (policyVersion !== 'baselines-v0.1.0') {
+    if (includeRunLine) {
       const runLine = game.markets.runLine;
       // Run-line favorite = the side LAYING the runs. The line is stored as
       // the HOME handicap: home lays when the line is negative, away lays
