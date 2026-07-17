@@ -49,6 +49,29 @@ export class PreparedRequestError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime origin brand. A PreparedGameRequest's TypeScript type is erased at
+// runtime, so a direct caller could forge the shape (or cast a raw bundle) and
+// hand an unprepared request straight to the prompt/dispatch boundary. This
+// module-private WeakSet is populated ONLY by prepareGameRequest below, and
+// nothing outside this module can add to it, so membership is unforgeable
+// runtime PROOF that a value actually came through the boundary — the type
+// alone is not a guard.
+// ---------------------------------------------------------------------------
+const preparedRegistry = new WeakSet<PreparedGameRequest>();
+
+/**
+ * Throw unless `request` was produced by `prepareGameRequest`. The prompt
+ * builder and the per-arm dispatch call this before serializing or dispatching
+ * anything, so a forged or unprepared request never reaches a model — even
+ * though the TypeScript type would let one through at compile time.
+ */
+export function assertPrepared(request: PreparedGameRequest): void {
+  if (!preparedRegistry.has(request)) {
+    throw new PreparedRequestError(['request was not produced by prepareGameRequest']);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Strict schema — MODULE-PRIVATE. Parsing yields fresh plain data; `.strict()`
 // rejects unknown/extra fields; each numeric/instant field is validated here,
 // the cross-field invariants below.
@@ -252,8 +275,10 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
 
   if (violations.length > 0) throw new PreparedRequestError(violations);
 
-  // 9. Deep-freeze — immutable plain data; game === requestBundle.games[0].
-  return deepFreeze({
+  // 9. Deep-freeze — immutable plain data; game === requestBundle.games[0] —
+  //    then register it in the origin brand so the dispatch and prompt
+  //    boundaries can prove at runtime that this value came through here.
+  const prepared: PreparedGameRequest = deepFreeze({
     gameId: game.gameId,
     slug: env.slug,
     game,
@@ -262,4 +287,6 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
     gameSha256,
     cutoffAt: bundle.cutoffAt,
   });
+  preparedRegistry.add(prepared);
+  return prepared;
 }

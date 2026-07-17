@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
+import { prepareGameRequest } from './preparedRequest.js';
 import { runOneArmGame } from './runner.js';
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
 import type {
@@ -60,7 +61,7 @@ function baseOptions(nowMs: () => number) {
 }
 
 test('already past cutoff at dispatch: cutoff_missed, no provider call', async () => {
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   const adapter = stubAdapter([]);
   const result = await runOneArmGame(TEST_ARM, adapter, request, baseOptions(() => CUTOFF_MS + 1));
   assert.equal(result.outcome, 'cutoff_missed');
@@ -68,7 +69,7 @@ test('already past cutoff at dispatch: cutoff_missed, no provider call', async (
 });
 
 test('valid response crossing the cutoff: cutoff_missed, no decisions', async () => {
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   let now = CUTOFF_MS - 60_000;
   const adapter = stubAdapter([
     async () => {
@@ -83,7 +84,7 @@ test('valid response crossing the cutoff: cutoff_missed, no decisions', async ()
 });
 
 test('repair crossing the cutoff: cutoff_missed even though the repaired content is valid', async () => {
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   let now = CUTOFF_MS - 60_000;
   const adapter = stubAdapter([
     async () => stubResponse(wrongEcho(makeValidResponse(request))),
@@ -105,7 +106,7 @@ test('repair window closing after acceptance yields cutoff_missed, not invalid_s
   // response existed → cutoff_missed. The queue mirrors the runner's exact
   // nowMs read order: dispatch check, request start, response stamp,
   // acceptance check, repair-window check.
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   const reads = [
     CUTOFF_MS - 61_000, // dispatch check
     CUTOFF_MS - 60_000, // timedChat request start
@@ -131,7 +132,7 @@ test('repair window closing after acceptance yields cutoff_missed, not invalid_s
 });
 
 test('repair blocked by HTTP 429: transport recorded separately, never schema failure alone', async () => {
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   const adapter = stubAdapter([
     async () => stubResponse(wrongEcho(makeValidResponse(request))),
     async () => {
@@ -150,7 +151,7 @@ test('repair blocked by HTTP 429: transport recorded separately, never schema fa
 });
 
 test('unparseable initial response is unrepairable: no repair call, stays invalid', async () => {
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   const adapter = stubAdapter([
     async () => stubResponse('Milwaukee looks good tonight {{{ not json'),
   ]);
@@ -169,7 +170,7 @@ test('unparseable initial response is unrepairable: no repair call, stays invali
 });
 
 test('repair that changes a decision is rejected even when schema-valid', async () => {
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   const mutated = makeValidResponse(request);
   const forecast = mutated.games[0]?.forecasts[0];
   assert.ok(forecast);
@@ -190,7 +191,7 @@ test('repair that changes a decision is rejected even when schema-valid', async 
 });
 
 test('fingerprint-preserving repair is accepted as valid', async () => {
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   const adapter = stubAdapter([
     async () => stubResponse(wrongEcho(makeValidResponse(request))),
     async () => stubResponse(JSON.stringify(makeValidResponse(request))),
@@ -208,7 +209,7 @@ test('fingerprint-preserving repair is accepted as valid', async () => {
 });
 
 test('each call is bounded by the remaining time to cutoff', async () => {
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   const adapter = stubAdapter([
     async () => stubResponse(JSON.stringify(makeValidResponse(request))),
   ]);
@@ -224,7 +225,7 @@ test('each call is bounded by the remaining time to cutoff', async () => {
 });
 
 test('initial timeout classifies as timeout', async () => {
-  const request = makeRequest(CUTOFF);
+  const request = prepareGameRequest(makeRequest(CUTOFF));
   const adapter = stubAdapter([
     async (_turns, timeoutMs) => {
       throw new ProviderTimeoutError('stub', timeoutMs);

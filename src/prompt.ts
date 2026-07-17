@@ -1,6 +1,7 @@
 import { sha256Hex } from './canonical.js';
+import { assertPrepared } from './preparedRequest.js';
 import { benchmarkResponseSchema, renderResponseTemplate } from './schema.js';
-import type { SlateBundle } from './types.js';
+import type { PreparedGameRequest } from './preparedRequest.js';
 
 export const PROMPT_SCAFFOLD_VERSION = 'shadow-smoke-v0.2';
 
@@ -85,24 +86,38 @@ Output contract:
 - Echo "schemaVersion": 1 and the supplied "cohortId", "participantId", "requestedModelId", "bundleSha256", and "executionPolicy" values exactly.
 - Respond with ONLY the JSON object — no prose, no code fences.`;
 
+/**
+ * The user-message builder is guarded to a `PreparedGameRequest`: the only
+ * value it will serialize is the normalized, hash-verified, frozen request the
+ * prepared boundary produces (SPEC-prepared-request.md §2.3). A caller cannot
+ * hand it a raw bundle, so the bytes the model sees always canonicalize back to
+ * the exact bytes behind `requestSha256` — the hashed request IS the prompted
+ * request. Both `bundleSha256` and `decisionCutoffUtc` are taken from the
+ * prepared request's derived fields, never from a separately-supplied value.
+ */
 export interface PromptInputs {
   cohortId: string;
   participantId: string;
   requestedModelId: string;
   executionPolicy: 'fixed-moneyline-total';
-  bundleSha256: string;
-  bundle: SlateBundle;
+  request: PreparedGameRequest;
 }
 
 export function buildUserMessage(inputs: PromptInputs): string {
+  // Read the request EXACTLY ONCE, then guard THAT captured value. inputs.request
+  // could be a getter; re-reading it after the check would let a caller return a
+  // branded request to assertPrepared and a different (unprepared) one to the
+  // serializer — check one object, prompt another. The single read closes that.
+  const { request } = inputs;
+  assertPrepared(request);
   const payload = {
     cohortId: inputs.cohortId,
     participantId: inputs.participantId,
     requestedModelId: inputs.requestedModelId,
     executionPolicy: inputs.executionPolicy,
-    bundleSha256: inputs.bundleSha256,
-    decisionCutoffUtc: inputs.bundle.cutoffAt,
-    bundle: inputs.bundle,
+    bundleSha256: request.requestSha256,
+    decisionCutoffUtc: request.cutoffAt,
+    bundle: request.requestBundle,
   };
   return `${CONTRACT_NOTES}\n\nRequest:\n${JSON.stringify(payload, null, 2)}`;
 }
