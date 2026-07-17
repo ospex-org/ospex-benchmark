@@ -4,22 +4,24 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { deepFreeze } from './freeze.js';
 import { instantMs, isParseableInstant } from './time.js';
 import { SMOKE_LABEL } from './types.js';
-import type { GameRequest } from './bundle.js';
 import type { GameBundle, SlateBundle } from './types.js';
 
 /**
  * The prepared request boundary (SPEC-prepared-request.md §1–2), for the current
  * fixed three-market bundle (S1 — no cardinality change; S3 relaxes to 1–3).
  *
- * `prepareGameRequest` turns a caller-supplied `GameRequest` into ONE immutable,
- * normalized, plain-data value that every downstream surface derives from. It
- * strict-parses the request bundle into fresh plain data (the parser's `.data`,
- * never the original object — so any getter/Proxy is evaluated once and inherited
- * `toJSON`, symbols, non-data descriptors, and unknown fields cannot survive),
- * verifies the cross-field identity and timing invariants, DERIVES the hashes
- * (never trusting a supplied hash), and deep-freezes the result. A malformed or
- * inconsistent request throws `PreparedRequestError` — the dispatch path (S1b)
- * treats that as a harness/preparation failure and makes zero adapter calls.
+ * `prepareGameRequest` turns a caller-supplied request envelope (accepted as
+ * `unknown`) into ONE immutable, normalized, plain-data value that every
+ * downstream surface derives from. It `structuredClone`s the WHOLE envelope into
+ * fresh, recursively-plain data (copying own-enumerable values only — so
+ * inherited keys and custom prototypes are dropped, each accessor is evaluated
+ * once, `toJSON` is never invoked, and a function/unclonable value throws, which
+ * becomes a typed rejection), requires each market to be an OWN property,
+ * strict-parses the whole envelope, verifies the cross-field identity and timing
+ * invariants, DERIVES the hashes (never trusting a supplied hash), and
+ * deep-freezes the result. A malformed or inconsistent request throws
+ * `PreparedRequestError` — the dispatch path (S1b) treats that as a
+ * harness/preparation failure and makes zero adapter calls.
  */
 
 export interface PreparedGameRequest {
@@ -112,28 +114,81 @@ const requestBundleSchema = z
   })
   .strict();
 
-/** canonicalize, or null if the value is not canonically representable. */
-function canonicalOrNull(value: unknown): string | null {
-  try {
-    return canonicalize(value);
-  } catch {
-    return null;
-  }
+const MARKET_FIELDS = ['moneyline', 'runLine', 'total'] as const;
+
+// The whole request envelope — every field parsed to plain data, not just the
+// bundle. `.strict()` rejects extra envelope keys; `slug` must be a plain string.
+const envelopeSchema = z
+  .object({
+    gameId: nonEmpty,
+    slug: z.string(),
+    game: gameSchema,
+    requestBundle: requestBundleSchema,
+    requestSha256: z.string(),
+  })
+  .strict();
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
-export function prepareGameRequest(request: GameRequest): PreparedGameRequest {
-  // 1. Strict parse into fresh plain data. A parse failure is terminal — the
-  //    cross-field checks below need a validated `.data`.
-  const parsed = requestBundleSchema.safeParse(request.requestBundle);
-  if (!parsed.success) {
-    throw new PreparedRequestError(
-      parsed.error.issues.slice(0, 20).map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`),
-    );
-  }
-  const bundle: SlateBundle = parsed.data;
+function issueList(error: z.ZodError): string[] {
+  return error.issues.slice(0, 20).map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`);
+}
 
-  // 2. Exactly one game. For a per-game request this also subsumes the
-  //    duplicate-game-id case (there is only one game to key on).
+/**
+ * The clone's `requestBundle.games[0].markets` when the (already plain) clone has
+ * that shape, else null (a structural problem the schema parse reports). Because
+ * structuredClone keeps own-enumerable keys only, the returned object's own keys
+ * are exactly the RAW markets' own keys — so the own-property gate reads true
+ * ownership, not a value pulled through the prototype chain.
+ */
+function clonedMarkets(clone: unknown): Record<string, unknown> | null {
+  if (typeof clone !== 'object' || clone === null) return null;
+  const bundle = (clone as Record<string, unknown>)['requestBundle'];
+  if (typeof bundle !== 'object' || bundle === null) return null;
+  const games = (bundle as Record<string, unknown>)['games'];
+  if (!Array.isArray(games) || games.length !== 1) return null;
+  const game = games[0];
+  if (typeof game !== 'object' || game === null) return null;
+  const markets = (game as Record<string, unknown>)['markets'];
+  if (typeof markets !== 'object' || markets === null) return null;
+  return markets as Record<string, unknown>;
+}
+
+export function prepareGameRequest(input: unknown): PreparedGameRequest {
+  // 1. Normalize the ENTIRE envelope to fresh, recursively-plain data before
+  //    trusting anything. structuredClone copies own-enumerable values only
+  //    (dropping inherited keys and custom prototypes), evaluates each accessor
+  //    exactly once, never invokes toJSON, and throws on functions / unclonable
+  //    values — a clone failure is a typed rejection, not a raw error.
+  let clone: unknown;
+  try {
+    clone = structuredClone(input);
+  } catch (err) {
+    throw new PreparedRequestError([`request is not clonable plain data: ${errorMessage(err)}`]);
+  }
+
+  // 2. Each market must be an OWN property of the raw markets object. The clone
+  //    kept own-enumerable keys only, so an inherited market was dropped and is
+  //    rejected here with a clear message. (S3 relaxes this fixed three-key set
+  //    to the present-market subset; the ownership rule is what carries over.)
+  const markets = clonedMarkets(clone);
+  if (markets !== null) {
+    for (const key of MARKET_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(markets, key)) {
+        throw new PreparedRequestError([`markets must contain an own "${key}" property`]);
+      }
+    }
+  }
+
+  // 3. Strict-parse the whole envelope into validated plain data.
+  const parsed = envelopeSchema.safeParse(clone);
+  if (!parsed.success) throw new PreparedRequestError(issueList(parsed.error));
+  const env = parsed.data;
+  const bundle: SlateBundle = env.requestBundle;
+
+  // 4. Exactly one game (subsumes duplicate-game-id for a per-game request).
   if (bundle.games.length !== 1) {
     throw new PreparedRequestError([
       `a per-game request must carry exactly one game, found ${bundle.games.length}`,
@@ -143,14 +198,14 @@ export function prepareGameRequest(request: GameRequest): PreparedGameRequest {
 
   const violations: string[] = [];
 
-  // 3. The cutoff is bound to first pitch — it cannot be widened past it.
+  // 5. The cutoff is bound to first pitch — it cannot be widened past it.
   if (bundle.cutoffAt !== game.scheduledStartUtc) {
     violations.push(
       `cutoffAt "${bundle.cutoffAt}" must equal the game's scheduledStartUtc "${game.scheduledStartUtc}"`,
     );
   }
 
-  // 4. Market coherence. The instant fields are already schema-validated, so
+  // 6. Market coherence. The instant fields are already schema-validated, so
   //    instantMs cannot throw here.
   const bundleMs = instantMs(bundle.bundleTimestamp);
   const rl = game.markets.runLine;
@@ -178,32 +233,30 @@ export function prepareGameRequest(request: GameRequest): PreparedGameRequest {
     }
   }
 
-  // 5. Derive the hashes from the normalized snapshot.
+  // 7. Derive the hashes from the normalized snapshot.
   const requestSha256 = sha256Hex(canonicalize(bundle));
   const gameSha256 = sha256Hex(canonicalize(game));
 
-  // 6. Verify the caller's aliases against the derived canonical values — a
+  // 8. Verify the caller's aliases against the derived canonical values — a
   //    mismatch is a rejection, never a silent correction.
-  if (request.gameId !== game.gameId) {
-    violations.push(`request.gameId "${request.gameId}" does not match the bundle game "${game.gameId}"`);
+  if (env.gameId !== game.gameId) {
+    violations.push(`gameId "${env.gameId}" does not match the bundle game "${game.gameId}"`);
   }
-  const suppliedGame = canonicalOrNull(request.game);
-  if (suppliedGame === null || suppliedGame !== canonicalize(game)) {
-    violations.push('request.game is not the same canonical value as the request bundle game');
+  if (canonicalize(env.game) !== canonicalize(game)) {
+    violations.push('the supplied game is not the same canonical value as the request bundle game');
   }
-  if (request.requestSha256 !== requestSha256) {
+  if (env.requestSha256 !== requestSha256) {
     violations.push(
-      `supplied requestSha256 "${request.requestSha256}" does not match the recomputed hash`,
+      `supplied requestSha256 "${env.requestSha256}" does not match the recomputed hash`,
     );
   }
 
   if (violations.length > 0) throw new PreparedRequestError(violations);
 
-  // 7. Deep-freeze — the prepared request is immutable plain data, and `game`
-  //    is the same frozen object as `requestBundle.games[0]`.
+  // 9. Deep-freeze — immutable plain data; game === requestBundle.games[0].
   return deepFreeze({
     gameId: game.gameId,
-    slug: request.slug,
+    slug: env.slug,
     game,
     requestBundle: bundle,
     requestSha256,

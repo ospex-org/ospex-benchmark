@@ -172,15 +172,15 @@ test('a multi-game (or zero-game) request is rejected', () => {
 test('a gameId alias mismatch is rejected', () => {
   const request = base();
   request.gameId = 'a-different-game-id';
-  throwsWith(() => prepareGameRequest(request), /request\.gameId .* does not match/);
+  throwsWith(() => prepareGameRequest(request), /gameId .* does not match/);
 });
 
 test('a request.game that diverges from the bundle game is rejected', () => {
   const request = base();
-  // Same gameId, different content (records serialize request.game — it must not
-  // be allowed to differ from the game that is prompted and hashed).
+  // Same gameId, different content (records serialize the game — it must not be
+  // allowed to differ from the game that is prompted and hashed).
   request.game = { ...request.game, awayTeam: 'DIFFERENT AWAY' };
-  throwsWith(() => prepareGameRequest(request), /request\.game is not the same canonical value/);
+  throwsWith(() => prepareGameRequest(request), /supplied game is not the same canonical value/);
 });
 
 test('a forged (mismatched) supplied requestSha256 is rejected', () => {
@@ -223,10 +223,70 @@ test('an accessor does not survive preparation — the stored value is plain dat
   assert.equal(prepared.game.markets.moneyline.awayDecimal, fixed);
 });
 
-test('an enumerable inherited key (e.g. toJSON) is rejected by the strict parse', () => {
+test('an inherited (non-market) key such as toJSON is stripped, not carried', () => {
   const request = base();
   Object.setPrototypeOf(request.requestBundle.games[0]!, { toJSON: () => ({ hijacked: true }) });
-  assert.throws(() => prepareGameRequest(request), PreparedRequestError);
+  const prepared = prepareGameRequest(request);
+  // structuredClone copied only own-enumerable keys, so the inherited toJSON is
+  // gone — a later JSON.stringify (the prompt, S1b) has nothing to invoke.
+  assert.equal(Object.getPrototypeOf(prepared.game), Object.prototype);
+  assert.ok(!('toJSON' in prepared.game));
+});
+
+test('an inherited (non-own) market key is rejected', () => {
+  for (const key of ['moneyline', 'runLine', 'total'] as const) {
+    const request = base();
+    const rawMarkets = request.requestBundle.games[0]!.markets as unknown as Record<string, unknown>;
+    const block = rawMarkets[key];
+    // Present via the prototype but not as an own property.
+    delete rawMarkets[key];
+    Object.setPrototypeOf(rawMarkets, { [key]: block });
+    assert.throws(() => prepareGameRequest(request), PreparedRequestError);
+  }
+});
+
+test('a non-string slug (object or function) is rejected, not carried into the snapshot', () => {
+  const objectSlug = base();
+  (objectSlug as unknown as Record<string, unknown>).slug = { hijack: 'HIJACKED-SLUG' };
+  assert.throws(() => prepareGameRequest(objectSlug), PreparedRequestError);
+
+  const functionSlug = base();
+  (functionSlug as unknown as Record<string, unknown>).slug = () => 'HIJACKED-SLUG';
+  assert.throws(() => prepareGameRequest(functionSlug), PreparedRequestError);
+});
+
+test('a non-object input (null / undefined / primitive) is a typed rejection, not a raw error', () => {
+  for (const bad of [null, undefined, 42, 'x', true] as unknown[]) {
+    assert.throws(() => prepareGameRequest(bad), PreparedRequestError);
+  }
+});
+
+test('a throwing accessor anywhere in the envelope is a typed rejection', () => {
+  const outer = base();
+  Object.defineProperty(outer, 'gameId', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throw new Error('boom');
+    },
+  });
+  assert.throws(() => prepareGameRequest(outer), PreparedRequestError);
+
+  const nested = base();
+  Object.defineProperty(nested.requestBundle.games[0]!.markets.total, 'overDecimal', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throw new Error('boom');
+    },
+  });
+  assert.throws(() => prepareGameRequest(nested), PreparedRequestError);
+});
+
+test('the prepared slug is the normalized string', () => {
+  const prepared = prepareGameRequest(base());
+  assert.equal(typeof prepared.slug, 'string');
+  assert.equal(prepared.slug, 'mil-pit-2026-07-12');
 });
 
 test('the prepared snapshot is a plain-data object graph — no custom prototype survives', () => {
