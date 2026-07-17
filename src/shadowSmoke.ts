@@ -217,16 +217,18 @@ async function main(): Promise<number> {
     `dispatching per game in cutoff order: ${build.requests.length} games sequential, ` +
       `${ARMS.length} arms concurrent per game (sealed per game) ...`,
   );
-  const { results: armGameResults, snapshot } = await runSlate(ARMS, adapters, build.requests, {
+  const env = await runSlate(ARMS, adapters, build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
+    executionPolicy: ctx.executionPolicy,
     nowMs,
     onGameComplete: (line) => printLine(`  ${line}`),
   });
+  const armGameResults = env.results;
 
-  // The artifact (records, baselines, summary) is built entirely from the sealed
-  // dispatch snapshot inside buildRecords/buildSummaryMarkdown.
+  // The artifact (records, baselines, summary) is built entirely from the sealed,
+  // branded run envelope inside buildRecords/buildSummaryMarkdown.
   const reportedByArm = reportedModelIdsByArm(armGameResults);
   const unidentifiedByArm = unidentifiedResponsesByArm(armGameResults);
   const collision = checkProviderCollision(
@@ -240,13 +242,13 @@ async function main(): Promise<number> {
     })),
   );
 
-  const records = buildRecords(ctx, build, snapshot, armGameResults, collision);
+  const records = buildRecords(env, ctx, build, collision);
   const ndjsonPath = join(options.outDir, `${ctx.runId}.ndjson`);
   const summaryPath = join(options.outDir, `${ctx.runId}-summary.md`);
   writeNdjson(ndjsonPath, records);
   writeText(
     summaryPath,
-    buildSummaryMarkdown(ctx, build, snapshot, armGameResults, collision),
+    buildSummaryMarkdown(env, ctx, build, collision),
   );
 
   printLine('');

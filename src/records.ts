@@ -4,10 +4,10 @@ import { redactSecrets } from './config.js';
 import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
 import { runBaselines } from './baselines.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
-import { assertSealed } from './runner.js';
+import { authenticateRun } from './runner.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
-import type { DispatchSnapshot } from './runner.js';
+import type { RunEnvelope } from './runner.js';
 import type { CollisionCheckResult } from './providers/family.js';
 import type { ArmGameResult, AttemptRecord } from './types.js';
 
@@ -79,7 +79,7 @@ export function reportedModelId(result: ArmGameResult): string | null {
 }
 
 /** Distinct non-null reported model IDs per arm across all its games. */
-export function reportedModelIdsByArm(results: ArmGameResult[]): Map<string, string[]> {
+export function reportedModelIdsByArm(results: readonly ArmGameResult[]): Map<string, string[]> {
   const byArm = new Map<string, Set<string>>();
   for (const result of results) {
     const set = byArm.get(result.arm.participantId) ?? new Set<string>();
@@ -96,7 +96,7 @@ export function reportedModelIdsByArm(results: ArmGameResult[]): Map<string, str
  * reported model ID. Feeds the fail-closed identity check — transport
  * failures with no response body are exempt.
  */
-export function unidentifiedResponsesByArm(results: ArmGameResult[]): Map<string, number> {
+export function unidentifiedResponsesByArm(results: readonly ArmGameResult[]): Map<string, number> {
   const byArm = new Map<string, number>();
   for (const result of results) {
     let count = byArm.get(result.arm.participantId) ?? 0;
@@ -126,17 +126,18 @@ export function failuresByCode(failures: string[]): Map<string, string[]> {
 }
 
 export function buildRecords(
+  env: RunEnvelope,
   ctx: RunContext,
   build: BuildResult,
-  snapshot: DispatchSnapshot,
-  armGameResults: ArmGameResult[],
   collision: CollisionCheckResult,
 ): JsonRecord[] {
-  // Authenticate the whole snapshot WRAPPER (its slate + hash, not just the
-  // nested prepared objects) before emitting anything: only a snapshot produced
-  // by sealDispatch — genuine prepared, unique game IDs, uniform slate metadata,
-  // a slate re-derived from the prepared games — reaches the artifact (SPEC §2.4).
-  assertSealed(snapshot);
+  // A5: authenticate the branded run envelope (this subsumes assertSealed — the
+  // envelope brand transitively guarantees the nested sealed snapshot) and
+  // reconcile the five load-bearing context fields against it (A4) before
+  // emitting anything. A context that disagrees on any of the five has already
+  // failed closed; `bound` carries the authoritative values the records stamp.
+  const bound = authenticateRun(env, ctx);
+  const { snapshot, results } = env;
   const { prepared, slate, slateSha256 } = snapshot;
   const { excluded, provenance } = build;
 
@@ -148,68 +149,25 @@ export function buildRecords(
   const cutoffByGame = new Map(prepared.map((r) => [r.gameId, r.cutoffAt]));
   const gameShaByGame = new Map(prepared.map((r) => [r.gameId, r.gameSha256]));
 
-  // Couple every arm result to the sealed run before writing: no duplicate
-  // (arm, game) pair, and each result must reference a snapshot game at the
-  // dispatched request hash AND cutoff — an artifact never carries evidence for a
-  // game it did not dispatch, dispatched differently, or dispatched twice.
-  const armsByGame = new Map<string, Set<string>>();
-  for (const result of armGameResults) {
-    let arms = armsByGame.get(result.gameId);
-    if (arms === undefined) {
-      arms = new Set<string>();
-      armsByGame.set(result.gameId, arms);
-    }
-    if (arms.has(result.arm.participantId)) {
-      throw new Error(`duplicate arm result for ${result.arm.participantId} on ${result.gameId}`);
-    }
-    if (!requestShaByGame.has(result.gameId)) {
-      throw new Error(`arm result references a game not in the dispatch snapshot: ${result.gameId}`);
-    }
-    if (result.requestSha256 !== requestShaByGame.get(result.gameId)) {
-      throw new Error(
-        `arm result requestSha256 does not match the dispatched request for ${result.gameId}`,
-      );
-    }
-    if (result.cutoffAt !== cutoffByGame.get(result.gameId)) {
-      throw new Error(
-        `arm result cutoffAt does not match the dispatched request for ${result.gameId}`,
-      );
-    }
-    arms.add(result.arm.participantId);
-  }
-  // Completeness: every dispatched game must have results, and the (arm, game)
-  // grid must be complete for every arm that reported — a truncated result set
-  // (a game, or an arm on a game, silently dropped) is rejected before writing.
-  // Full completeness against the configured arm roster is additionally verified
-  // downstream by the scorer, which alone knows the expected roster.
-  const armsSeen = new Set(armGameResults.map((r) => r.arm.participantId));
-  for (const request of prepared) {
-    const arms = armsByGame.get(request.gameId);
-    if (arms === undefined) {
-      throw new Error(`no arm results for dispatched game ${request.gameId}`);
-    }
-    for (const armId of armsSeen) {
-      if (!arms.has(armId)) {
-        throw new Error(`missing arm result for ${armId} on game ${request.gameId}`);
-      }
-    }
-  }
-
-  // Every per-game record derives from the frozen, hash-verified snapshot that
-  // was actually dispatched — never from a separate build alias — so the
-  // recorded game, its hash, and its cutoff are provably the bytes the provider
-  // saw, and so are the baselines, the slate metadata, and the summary.
+  // `results` is the authenticated, complete-by-construction arm × game grid
+  // (A3): it lives INSIDE the branded, deep-frozen envelope — runSlate already
+  // rejected a foreign arm, a duplicate (arm, game), and a missing cell before
+  // sealing — so the producer trusts it rather than re-deriving completeness
+  // from a caller-supplied array. Every per-game record still derives from the
+  // frozen, hash-verified snapshot, so the recorded game, its hash, and its
+  // cutoff are provably the bytes the provider saw, and so are the baselines,
+  // the slate metadata, and the summary.
   const records: JsonRecord[] = [];
 
   records.push({
     recordType: 'run_meta',
     label: SMOKE_LABEL,
     runId: ctx.runId,
-    cohortId: ctx.cohortId,
+    cohortId: bound.cohortId,
     mode: ctx.mode,
-    slateDate: ctx.slateDate,
+    slateDate: bound.slateDate,
     createdAt: ctx.createdAt,
-    executionPolicy: ctx.executionPolicy,
+    executionPolicy: bound.executionPolicy,
     dispatch: 'per-game-by-cutoff',
     slateSha256,
     fetchStartedAt: ctx.fetchStartedAt,
@@ -218,8 +176,8 @@ export function buildRecords(
     slateCutoffAt: slate.cutoffAt,
     promptScaffoldVersion: PROMPT_SCAFFOLD_VERSION,
     promptScaffoldSha256: promptScaffoldSha256(),
-    timeoutMs: ctx.timeoutMs,
-    maxOutputTokens: ctx.maxOutputTokens,
+    timeoutMs: bound.timeoutMs,
+    maxOutputTokens: bound.maxOutputTokens,
     clockMode: ctx.clockMode,
     quoteFreshnessPolicy: {
       maxQuoteAgeMs: MAX_QUOTE_AGE_MS,
@@ -227,7 +185,7 @@ export function buildRecords(
     },
     eligibleGames: slate.games.length,
     excludedGames: excluded.length,
-    armGameResults: armGameResults.length,
+    armGameResults: results.length,
     baselineDecisionCount: baselineDecisions.length,
     // Redundant top-level stamp of the (single) baseline policy version,
     // mirroring baselineDecisionCount: the scorer cross-checks it against
@@ -273,7 +231,7 @@ export function buildRecords(
       recordType: 'baseline_decision',
       label: SMOKE_LABEL,
       runId: ctx.runId,
-      cohortId: ctx.cohortId,
+      cohortId: bound.cohortId,
       slateSha256,
       gameSha256: gameShaByGame.get(decision.gameId) ?? null,
       requestSha256: requestShaByGame.get(decision.gameId) ?? null,
@@ -282,12 +240,12 @@ export function buildRecords(
     });
   }
 
-  for (const result of armGameResults) {
+  for (const result of results) {
     records.push({
       recordType: 'arm_game_response',
       label: SMOKE_LABEL,
       runId: ctx.runId,
-      cohortId: ctx.cohortId,
+      cohortId: bound.cohortId,
       participantId: result.arm.participantId,
       provider: result.arm.provider,
       requestedModelId: result.arm.requestedModelId,
@@ -313,7 +271,7 @@ export function buildRecords(
           recordType: 'decision',
           label: SMOKE_LABEL,
           runId: ctx.runId,
-          cohortId: ctx.cohortId,
+          cohortId: bound.cohortId,
           participantId: result.arm.participantId,
           slateSha256,
           gameSha256: gameShaByGame.get(game.gameId) ?? null,

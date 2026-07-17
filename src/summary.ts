@@ -1,9 +1,9 @@
 import { runBaselines } from './baselines.js';
 import { failuresByCode, reportedModelIdsByArm } from './records.js';
-import { assertSealed } from './runner.js';
+import { authenticateRun } from './runner.js';
 import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
-import type { DispatchSnapshot } from './runner.js';
+import type { RunEnvelope } from './runner.js';
 import type { CollisionCheckResult } from './providers/family.js';
 import type { ArmGameResult, ArmOutcome, GameBundle } from './types.js';
 
@@ -47,21 +47,22 @@ function slateRow(game: GameBundle): string {
 }
 
 export function buildSummaryMarkdown(
+  env: RunEnvelope,
   ctx: RunContext,
   build: BuildResult,
-  snapshot: DispatchSnapshot,
-  armGameResults: ArmGameResult[],
   collision: CollisionCheckResult,
 ): string {
-  // Authenticate the sealed snapshot: the rendered game content comes from it,
-  // not the mutable build slate, so the summary can never disagree with the
-  // records or baselines (SPEC-prepared-request.md §2.4).
-  assertSealed(snapshot);
+  // A5: authenticate the branded run envelope (subsumes assertSealed) and gate
+  // the five load-bearing context fields against it (A4); the rendered content
+  // comes from the envelope, so the summary can never disagree with the records
+  // or baselines (SPEC-artifact-producer.md).
+  const bound = authenticateRun(env, ctx);
   const { excluded } = build;
-  const slateBundle = snapshot.slate;
-  const slateSha256 = snapshot.slateSha256;
+  const armGameResults = env.results;
+  const slateBundle = env.snapshot.slate;
+  const slateSha256 = env.snapshot.slateSha256;
   // Baselines are derived from the sealed snapshot, never accepted as an array.
-  const baselineDecisions = runBaselines(snapshot.slate);
+  const baselineDecisions = runBaselines(env.snapshot.slate);
   const lines: string[] = [];
   const arms = [...new Map(armGameResults.map((r) => [r.arm.participantId, r.arm])).values()];
   const byArm = (participantId: string): ArmGameResult[] =>
@@ -71,8 +72,8 @@ export function buildSummaryMarkdown(
   const watch = ctx.watch;
   lines.push(
     watch !== undefined
-      ? `# Ospex line-open watch run — ${ctx.slateDate}`
-      : `# Ospex shadow smoke run — ${ctx.slateDate}`,
+      ? `# Ospex line-open watch run — ${bound.slateDate}`
+      : `# Ospex shadow smoke run — ${bound.slateDate}`,
   );
   lines.push('');
   lines.push(`**Label: \`SMOKE_V0_NOT_A_COHORT\`** — pipeline shakedown, not a scored cohort.`);
@@ -92,7 +93,7 @@ export function buildSummaryMarkdown(
   lines.push(
     `- Dispatch: per game (sequential games, four arms concurrent per game; each game's cutoff is its own first pitch)`,
   );
-  lines.push(`- Execution policy (declared, not executed): \`${ctx.executionPolicy}\``);
+  lines.push(`- Execution policy (declared, not executed): \`${bound.executionPolicy}\``);
   lines.push('');
 
   if (collision.failures.length > 0) {

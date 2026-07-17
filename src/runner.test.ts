@@ -56,6 +56,7 @@ function baseOptions(nowMs: () => number) {
     cohortId: TEST_COHORT,
     timeoutMs: 600_000,
     maxOutputTokens: 16000,
+    executionPolicy: 'fixed-moneyline-total' as const,
     nowMs,
   };
 }
@@ -123,6 +124,7 @@ test('repair window closing after acceptance yields cutoff_missed, not invalid_s
     cohortId: TEST_COHORT,
     timeoutMs: 600_000,
     maxOutputTokens: 16000,
+    executionPolicy: 'fixed-moneyline-total',
     nowMs,
   });
   assert.equal(result.outcome, 'cutoff_missed');
