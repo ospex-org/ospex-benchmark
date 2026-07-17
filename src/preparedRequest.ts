@@ -128,10 +128,6 @@ const envelopeSchema = z
   })
   .strict();
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 function issueList(error: z.ZodError): string[] {
   return error.issues.slice(0, 20).map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`);
 }
@@ -165,8 +161,11 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
   let clone: unknown;
   try {
     clone = structuredClone(input);
-  } catch (err) {
-    throw new PreparedRequestError([`request is not clonable plain data: ${errorMessage(err)}`]);
+  } catch {
+    // Do NOT format the thrown value — a hostile getter can throw an object whose
+    // Symbol.toPrimitive (or an Error whose message accessor) throws again, which
+    // would escape as a raw error. A fixed message keeps preparation total.
+    throw new PreparedRequestError(['request is not clonable plain data']);
   }
 
   // 2. Each market must be an OWN property of the raw markets object. The clone

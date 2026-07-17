@@ -283,6 +283,42 @@ test('a throwing accessor anywhere in the envelope is a typed rejection', () => 
   assert.throws(() => prepareGameRequest(nested), PreparedRequestError);
 });
 
+test('a hostile value thrown during cloning is still a typed rejection (Symbol.toPrimitive throws)', () => {
+  const request = base();
+  const hostile = {
+    [Symbol.toPrimitive]() {
+      throw new Error('toPrimitive boom');
+    },
+  };
+  Object.defineProperty(request, 'gameId', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throw hostile; // structuredClone reads gameId, the getter throws this value
+    },
+  });
+  assert.throws(() => prepareGameRequest(request), PreparedRequestError);
+});
+
+test('a hostile Error thrown during cloning is still a typed rejection (message accessor throws)', () => {
+  const request = base();
+  const hostileError = new Error('placeholder');
+  Object.defineProperty(hostileError, 'message', {
+    configurable: true,
+    get() {
+      throw new Error('message boom');
+    },
+  });
+  Object.defineProperty(request.requestBundle.games[0]!.markets.total, 'overDecimal', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      throw hostileError;
+    },
+  });
+  assert.throws(() => prepareGameRequest(request), PreparedRequestError);
+});
+
 test('the prepared slug is the normalized string', () => {
   const prepared = prepareGameRequest(base());
   assert.equal(typeof prepared.slug, 'string');
