@@ -1,20 +1,19 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
-import { runBaselines } from './baselines.js';
 import { PreparedRequestError, prepareGameRequest } from './preparedRequest.js';
 import { buildUserMessage } from './prompt.js';
 import type { PromptInputs } from './prompt.js';
 import { buildRecords } from './records.js';
 import type { RunContext } from './records.js';
-import { runOneArmGame, runSlate } from './runner.js';
-import type { SlateRunOptions } from './runner.js';
+import { runOneArmGame, runSlate, sealDispatch } from './runner.js';
+import type { DispatchSnapshot, SlateRunOptions } from './runner.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
 import { buildSummaryMarkdown } from './summary.js';
 import { makeRequest, makeValidResponse } from './testFactories.js';
 import type { BuildResult, GameRequest } from './bundle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
-import type { ArmSpec, ProviderAdapter, ProviderResponse } from './types.js';
+import type { ArmGameResult, ArmSpec, ProviderAdapter, ProviderResponse } from './types.js';
 
 /**
  * Integration proof for the dispatch boundary (SPEC-prepared-request.md §2.3,
@@ -169,6 +168,17 @@ for (const { name, make } of malformed) {
     assert.equal(totalCalls(), 0);
   });
 }
+
+test('runSlate rejects a duplicate-game batch before any provider call', async () => {
+  // sealDispatch runs before dispatch, so a batch-level rejection makes zero calls.
+  const validRaw = makeRequest(CUTOFF);
+  const { adapters, totalCalls } = makeAdapters(false, validRaw);
+  await assert.rejects(
+    runSlate(ARMS, adapters, [validRaw, validRaw], options()),
+    /duplicate game ID/,
+  );
+  assert.equal(totalCalls(), 0);
+});
 
 test('the prompted bundle canonicalizes back to the exact bytes behind requestSha256', () => {
   const prepared = prepareGameRequest(makeRequest(CUTOFF));
@@ -347,11 +357,10 @@ test('a post-preparation mutation of the build slate cannot split the artifact',
   // ...but the frozen dispatch snapshot is untouched.
   assert.equal(snapshot.slate.games[0]?.markets.moneyline.awayDecimal, originalAway);
 
-  // Baselines, records, and summary ALL read the frozen snapshot.
-  const baselines = runBaselines(snapshot.slate);
+  // Baselines, records, and summary ALL derive from the frozen snapshot.
   const ctx = runContext();
-  const records = buildRecords(ctx, build, snapshot, results, baselines, NO_COLLISION);
-  const summary = buildSummaryMarkdown(ctx, build, snapshot, results, baselines, NO_COLLISION);
+  const records = buildRecords(ctx, build, snapshot, results, NO_COLLISION);
+  const summary = buildSummaryMarkdown(ctx, build, snapshot, results, NO_COLLISION);
 
   // The away-moneyline baseline and the bundle_game record carry the frozen
   // price, never the mutated 99.
@@ -378,4 +387,65 @@ test('a post-preparation mutation of the build slate cannot split the artifact',
   });
   assert.deepEqual(violations, []);
   assert.ok(summary.includes(String(originalAway)));
+});
+
+// The producer boundary rejects independently-substituted inputs before it
+// writes anything — an artifact can never contradict its own verifier.
+
+async function validRun(): Promise<{
+  build: BuildResult;
+  snapshot: DispatchSnapshot;
+  results: ArmGameResult[];
+}> {
+  const validRaw = makeRequest(CUTOFF);
+  const { adapters } = makeAdapters(true, validRaw);
+  const { results, snapshot } = await runSlate([ARM_A], adapters, [validRaw], options());
+  return { build: sharedBuild(validRaw), snapshot, results: [...results] };
+}
+
+test('buildRecords rejects a forged (unsealed) snapshot wrapper', async () => {
+  const { build } = await validRun();
+  // A hand-built snapshot: a genuine prepared request but a substituted slate.
+  const prepared = prepareGameRequest(makeRequest(CUTOFF));
+  const forged = {
+    prepared: [prepared],
+    slate: { ...prepared.requestBundle, games: [{ ...prepared.game, awayTeam: 'HIJACK' }] },
+    slateSha256: 'x'.repeat(64),
+  } as unknown as DispatchSnapshot;
+  assert.throws(
+    () => buildRecords(runContext(), build, forged, [], NO_COLLISION),
+    /not produced by sealDispatch/,
+  );
+});
+
+test('buildRecords rejects an arm result with a foreign cutoff', async () => {
+  const { build, snapshot, results } = await validRun();
+  const foreign = { ...results[0]!, cutoffAt: '2026-07-12T18:00:00+00:00' };
+  assert.throws(
+    () => buildRecords(runContext(), build, snapshot, [foreign], NO_COLLISION),
+    /cutoffAt does not match/,
+  );
+});
+
+test('buildRecords rejects a duplicate arm result', async () => {
+  const { build, snapshot, results } = await validRun();
+  assert.throws(
+    () => buildRecords(runContext(), build, snapshot, [results[0]!, results[0]!], NO_COLLISION),
+    /duplicate arm result/,
+  );
+});
+
+test('sealDispatch rejects a batch with duplicate game IDs', () => {
+  const prepared = prepareGameRequest(makeRequest(CUTOFF));
+  assert.throws(() => sealDispatch([prepared, prepared]), /duplicate game ID/);
+});
+
+test('sealDispatch rejects a batch that mixes slate metadata', () => {
+  const p1 = prepareGameRequest(makeRequest(CUTOFF));
+  // A second, individually-valid request carrying a different bundleTimestamp.
+  const raw2 = makeRequest(CUTOFF, { gameId: '00000000-0000-4000-8000-00000000t099' });
+  raw2.requestBundle.bundleTimestamp = '2026-07-12T14:06:00+00:00';
+  raw2.requestSha256 = sha256Hex(canonicalize(raw2.requestBundle));
+  const p2 = prepareGameRequest(raw2);
+  assert.throws(() => sealDispatch([p1, p2]), /mixes slate metadata/);
 });

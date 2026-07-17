@@ -2,13 +2,14 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { redactSecrets } from './config.js';
 import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
-import { assertPrepared } from './preparedRequest.js';
+import { runBaselines } from './baselines.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
+import { assertSealed } from './runner.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
 import type { DispatchSnapshot } from './runner.js';
 import type { CollisionCheckResult } from './providers/family.js';
-import type { ArmGameResult, AttemptRecord, BaselineDecision } from './types.js';
+import type { ArmGameResult, AttemptRecord } from './types.js';
 
 /**
  * Watch-mode gate provenance, recorded in run_meta so the entry-timing claim
@@ -129,34 +130,68 @@ export function buildRecords(
   build: BuildResult,
   snapshot: DispatchSnapshot,
   armGameResults: ArmGameResult[],
-  baselineDecisions: BaselineDecision[],
   collision: CollisionCheckResult,
 ): JsonRecord[] {
+  // Authenticate the whole snapshot WRAPPER (its slate + hash, not just the
+  // nested prepared objects) before emitting anything: only a snapshot produced
+  // by sealDispatch — genuine prepared, unique game IDs, uniform slate metadata,
+  // a slate re-derived from the prepared games — reaches the artifact (SPEC §2.4).
+  assertSealed(snapshot);
   const { prepared, slate, slateSha256 } = snapshot;
   const { excluded, provenance } = build;
 
-  // Seal the records boundary BEFORE writing (SPEC §2.3–2.4): the snapshot must
-  // be genuinely prepared (runtime origin, not just the erased type), free of
-  // duplicate game IDs, and every arm result must reference a request that is in
-  // the snapshot at the same hash — so an artifact can never carry contradictory
-  // evidence for a game it did not dispatch, or a game it dispatched differently.
-  const requestShaByGame = new Map<string, string>();
-  for (const request of prepared) {
-    assertPrepared(request);
-    if (requestShaByGame.has(request.gameId)) {
-      throw new Error(`duplicate game ID in the dispatch snapshot: ${request.gameId}`);
-    }
-    requestShaByGame.set(request.gameId, request.requestSha256);
-  }
+  // Baselines are DERIVED from the sealed snapshot, never accepted as a swappable
+  // array — so a missing/foreign/duplicate baseline row cannot be smuggled in.
+  const baselineDecisions = runBaselines(slate);
+
+  const requestShaByGame = new Map(prepared.map((r) => [r.gameId, r.requestSha256]));
+  const cutoffByGame = new Map(prepared.map((r) => [r.gameId, r.cutoffAt]));
+  const gameShaByGame = new Map(prepared.map((r) => [r.gameId, r.gameSha256]));
+
+  // Couple every arm result to the sealed run before writing: no duplicate
+  // (arm, game) pair, and each result must reference a snapshot game at the
+  // dispatched request hash AND cutoff — an artifact never carries evidence for a
+  // game it did not dispatch, dispatched differently, or dispatched twice.
+  const armsByGame = new Map<string, Set<string>>();
   for (const result of armGameResults) {
-    const expected = requestShaByGame.get(result.gameId);
-    if (expected === undefined) {
+    let arms = armsByGame.get(result.gameId);
+    if (arms === undefined) {
+      arms = new Set<string>();
+      armsByGame.set(result.gameId, arms);
+    }
+    if (arms.has(result.arm.participantId)) {
+      throw new Error(`duplicate arm result for ${result.arm.participantId} on ${result.gameId}`);
+    }
+    if (!requestShaByGame.has(result.gameId)) {
       throw new Error(`arm result references a game not in the dispatch snapshot: ${result.gameId}`);
     }
-    if (result.requestSha256 !== expected) {
+    if (result.requestSha256 !== requestShaByGame.get(result.gameId)) {
       throw new Error(
         `arm result requestSha256 does not match the dispatched request for ${result.gameId}`,
       );
+    }
+    if (result.cutoffAt !== cutoffByGame.get(result.gameId)) {
+      throw new Error(
+        `arm result cutoffAt does not match the dispatched request for ${result.gameId}`,
+      );
+    }
+    arms.add(result.arm.participantId);
+  }
+  // Completeness: every dispatched game must have results, and the (arm, game)
+  // grid must be complete for every arm that reported — a truncated result set
+  // (a game, or an arm on a game, silently dropped) is rejected before writing.
+  // Full completeness against the configured arm roster is additionally verified
+  // downstream by the scorer, which alone knows the expected roster.
+  const armsSeen = new Set(armGameResults.map((r) => r.arm.participantId));
+  for (const request of prepared) {
+    const arms = armsByGame.get(request.gameId);
+    if (arms === undefined) {
+      throw new Error(`no arm results for dispatched game ${request.gameId}`);
+    }
+    for (const armId of armsSeen) {
+      if (!arms.has(armId)) {
+        throw new Error(`missing arm result for ${armId} on game ${request.gameId}`);
+      }
     }
   }
 
@@ -165,8 +200,6 @@ export function buildRecords(
   // recorded game, its hash, and its cutoff are provably the bytes the provider
   // saw, and so are the baselines, the slate metadata, and the summary.
   const records: JsonRecord[] = [];
-  const cutoffByGame = new Map(prepared.map((r) => [r.gameId, r.cutoffAt]));
-  const gameShaByGame = new Map(prepared.map((r) => [r.gameId, r.gameSha256]));
 
   records.push({
     recordType: 'run_meta',

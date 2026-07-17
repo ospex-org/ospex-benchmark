@@ -681,7 +681,8 @@ export async function fireEligibleGame(
     onGameComplete: (line) => cfg.log(`  ${line}`),
   });
 
-  // Everything the artifact is built from reads the frozen dispatch snapshot.
+  // buildRecords/buildSummaryMarkdown derive baselines from the sealed snapshot;
+  // this copy is only for the fire-outcome count reported to schedulers.
   const baselineDecisions = runBaselines(snapshot.slate);
   const reportedByArm = reportedModelIdsByArm(armGameResults);
   const unidentifiedByArm = unidentifiedResponsesByArm(armGameResults);
@@ -696,12 +697,12 @@ export async function fireEligibleGame(
     })),
   );
 
-  const records = buildRecords(ctx, build, snapshot, armGameResults, baselineDecisions, collision);
+  const records = buildRecords(ctx, build, snapshot, armGameResults, collision);
   const runFile = join(cfg.outDir, `${ctx.runId}.ndjson`);
   writeNdjson(runFile, records);
   writeText(
     join(cfg.outDir, `${ctx.runId}-summary.md`),
-    buildSummaryMarkdown(ctx, build, snapshot, armGameResults, baselineDecisions, collision),
+    buildSummaryMarkdown(ctx, build, snapshot, armGameResults, collision),
   );
 
   const armOutcomes: Record<string, ArmOutcome> = {};

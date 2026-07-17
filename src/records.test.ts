@@ -14,7 +14,7 @@ import {
   writeText,
 } from './records.js';
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
-import type { BuildResult } from './bundle.js';
+import type { BuildResult, GameRequest } from './bundle.js';
 import type { RunContext } from './records.js';
 import type { ArmGameResult, AttemptRecord } from './types.js';
 
@@ -63,6 +63,24 @@ function attempt(overrides: Partial<AttemptRecord>): AttemptRecord {
   };
 }
 
+/** A minimal result matching a request — satisfies the (arm, game) completeness
+ *  gate for tests that focus on non-result records. */
+function minimalResult(request: GameRequest): ArmGameResult {
+  return {
+    arm: TEST_ARM,
+    gameId: request.gameId,
+    requestSha256: request.requestSha256,
+    cutoffAt: request.requestBundle.cutoffAt,
+    outcome: 'timeout',
+    attempt: attempt({ rawText: null }),
+    repair: null,
+    repairUsed: false,
+    repairTransport: null,
+    parsed: null,
+    validationErrors: [],
+  };
+}
+
 test('repaired decisions carry the ACCEPTED repair attempt provenance', () => {
   const build = makeBuild();
   const request = build.requests[0];
@@ -96,7 +114,7 @@ test('repaired decisions carry the ACCEPTED repair attempt provenance', () => {
     validationErrors: [],
   };
 
-  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [result], [], { failures: [], warnings: [] });
+  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [result], { failures: [], warnings: [] });
   const decisions = records.filter((r) => r['recordType'] === 'decision');
   assert.equal(decisions.length, 3);
   for (const decision of decisions) {
@@ -119,7 +137,7 @@ test('repaired decisions carry the ACCEPTED repair attempt provenance', () => {
 test('bundle_game serializes the exact prepared game, hash-consistent', () => {
   const build = makeBuild();
   const snapshot = sealDispatch(build.requests.map(prepareGameRequest));
-  const records = buildRecords(makeCtx(), build, snapshot, [], [], { failures: [], warnings: [] });
+  const records = buildRecords(makeCtx(), build, snapshot, [minimalResult(build.requests[0]!)], { failures: [], warnings: [] });
   const bundleGame = records.find((r) => r['recordType'] === 'bundle_game');
   assert.ok(bundleGame);
   const first = snapshot.prepared[0];
@@ -147,7 +165,7 @@ test('a mutation attempt after preparation does not change the recorded bundle',
   } catch {
     // strict-mode TypeError writing a frozen property — expected.
   }
-  const records = buildRecords(makeCtx(), build, snapshot, [], [], { failures: [], warnings: [] });
+  const records = buildRecords(makeCtx(), build, snapshot, [minimalResult(build.requests[0]!)], { failures: [], warnings: [] });
   const bundleGame = records.find((r) => r['recordType'] === 'bundle_game');
   assert.ok(bundleGame);
   assert.equal((bundleGame['bundle'] as { awayTeam: string }).awayTeam, 'Milwaukee Brewers');
@@ -172,13 +190,13 @@ test('cutoff_missed results never emit decision records', () => {
     parsed: makeValidResponse(request),
     validationErrors: ['response received after the decision cutoff'],
   };
-  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [result], [], { failures: [], warnings: [] });
+  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [result], { failures: [], warnings: [] });
   assert.equal(records.filter((r) => r['recordType'] === 'decision').length, 0);
 });
 
 test('identity-only failures get their own MODEL_IDENTITY run_failure record, never PROVIDER_COLLISION', () => {
   const build = makeBuild();
-  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [], [], {
+  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [minimalResult(build.requests[0]!)], {
     failures: [
       'MODEL_IDENTITY: some-arm returned 1 response(s) without a reported model ID — accepted decisions require verified identity',
       'PROVIDER_COLLISION: two arms resolve to the openai family',

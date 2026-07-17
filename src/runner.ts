@@ -45,12 +45,33 @@ export interface SlateRunResult {
   snapshot: DispatchSnapshot;
 }
 
+// Module-private registry of snapshots produced by sealDispatch. Nothing
+// outside this module can add to it, so membership is unforgeable proof that a
+// DispatchSnapshot WRAPPER (its slate + hash, not just its nested prepared
+// objects) actually came through sealDispatch — a consumer cannot be handed a
+// hand-built snapshot with genuine prepared requests but a substituted slate.
+const sealedSnapshots = new WeakSet<DispatchSnapshot>();
+
 /**
- * Seal the dispatched games into one frozen snapshot. The slate view is
- * re-derived from the frozen prepared games THEMSELVES (canonical gameId order;
- * slate-level fields taken from the per-game request bundles, which carry them
- * identically), so nothing downstream needs the mutable build slate. The whole
- * snapshot — the prepared array included — is deep-frozen.
+ * Throw unless `snapshot` was produced by `sealDispatch`. The record and summary
+ * builders call this before emitting anything, so a forged or substituted
+ * snapshot never reaches the artifact.
+ */
+export function assertSealed(snapshot: DispatchSnapshot): void {
+  if (!sealedSnapshots.has(snapshot)) {
+    throw new Error('dispatch snapshot was not produced by sealDispatch (forged or substituted)');
+  }
+}
+
+/**
+ * Validate and seal the dispatched games into one frozen, branded snapshot,
+ * BEFORE any provider call. Every request must be genuinely prepared, game IDs
+ * must be unique, and the shared slate metadata (schema/label/league/date/
+ * bundle-timestamp) must be identical across the batch — otherwise the batch is
+ * rejected without a single provider call. The slate view is re-derived from the
+ * frozen prepared games THEMSELVES (canonical gameId order), so nothing
+ * downstream needs the mutable build slate; the whole snapshot — the prepared
+ * array included — is deep-frozen and registered in the seal brand.
  */
 export function sealDispatch(prepared: readonly PreparedGameRequest[]): DispatchSnapshot {
   const first = prepared[0];
@@ -58,6 +79,26 @@ export function sealDispatch(prepared: readonly PreparedGameRequest[]): Dispatch
     throw new Error('cannot seal a dispatch snapshot from zero prepared requests');
   }
   const base = first.requestBundle;
+  const seenIds = new Set<string>();
+  for (const p of prepared) {
+    // Only genuinely-prepared requests may enter a sealed snapshot, so a sealed
+    // snapshot transitively guarantees its prepared are branded.
+    assertPrepared(p);
+    if (seenIds.has(p.gameId)) {
+      throw new Error(`duplicate game ID in the dispatch batch: ${p.gameId}`);
+    }
+    seenIds.add(p.gameId);
+    const b = p.requestBundle;
+    if (
+      b.schemaVersion !== base.schemaVersion ||
+      b.label !== base.label ||
+      b.league !== base.league ||
+      b.slateDate !== base.slateDate ||
+      b.bundleTimestamp !== base.bundleTimestamp
+    ) {
+      throw new Error(`dispatch batch mixes slate metadata (game ${p.gameId})`);
+    }
+  }
   const byGameId = [...prepared].sort((a, b) =>
     a.gameId < b.gameId ? -1 : a.gameId > b.gameId ? 1 : 0,
   );
@@ -73,7 +114,9 @@ export function sealDispatch(prepared: readonly PreparedGameRequest[]): Dispatch
     cutoffAt,
     games: byGameId.map((p) => p.game),
   };
-  return deepFreeze({ prepared, slate, slateSha256: sha256Hex(canonicalize(slate)) });
+  const snapshot = deepFreeze({ prepared, slate, slateSha256: sha256Hex(canonicalize(slate)) });
+  sealedSnapshots.add(snapshot);
+  return snapshot;
 }
 
 export interface SlateRunOptions {
@@ -390,10 +433,13 @@ export async function runSlate(
   requests: GameRequest[],
   options: SlateRunOptions,
 ): Promise<SlateRunResult> {
-  const prepared: PreparedGameRequest[] = requests.map(prepareGameRequest);
+  // Seal + validate the whole batch BEFORE any provider call (unique game IDs,
+  // identical shared slate metadata, genuine prepared origin). Dispatch then
+  // runs on the sealed snapshot, and the artifact is built from it.
+  const snapshot = sealDispatch(requests.map(prepareGameRequest));
   const all: ArmGameResult[] = [];
   let index = 0;
-  for (const request of prepared) {
+  for (const request of snapshot.prepared) {
     index += 1;
     const results = await Promise.all(
       arms.map((arm) => {
@@ -408,10 +454,11 @@ export async function runSlate(
         .map((r) => `${r.arm.provider} ${r.outcome}${r.repairUsed ? ' (repair)' : ''}`)
         .join(' · ');
       // The caller prints through the redacted console chokepoint.
-      options.onGameComplete(`game ${index}/${prepared.length} ${request.slug}: ${cells}`);
+      options.onGameComplete(`game ${index}/${snapshot.prepared.length} ${request.slug}: ${cells}`);
     }
   }
-  // Seal the dispatched snapshot (deep-frozen) and freeze the result envelope —
-  // nothing downstream may mutate what the artifact is built from.
-  return Object.freeze({ results: all, snapshot: sealDispatch(prepared) });
+  // Freeze the results collection and the result envelope — nothing downstream
+  // may mutate what the artifact is built from (the snapshot is already sealed).
+  Object.freeze(all);
+  return Object.freeze({ results: all, snapshot });
 }
