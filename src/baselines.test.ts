@@ -5,6 +5,7 @@ import {
   BASELINE_POLICY_VERSIONS,
   isBaselinePolicyVersion,
   runBaselines,
+  type BaselinePolicyVersion,
 } from './baselines.js';
 import { makeRequest } from './testFactories.js';
 import type { GameBundle, SlateBundle } from './types.js';
@@ -39,6 +40,24 @@ function slateWithRunLine(overrides: {
     cutoffAt: '2026-07-12T16:15:00+00:00',
     games: [game],
   } as SlateBundle;
+}
+
+type MarketBlockKey = 'moneyline' | 'runLine' | 'total';
+
+/**
+ * A slate whose single game carries only the named market blocks — the scoped
+ * (1–2-market) shape S3 will make reachable, built by keeping just the present
+ * blocks so the absent ones are omitted own properties (as a real scoped
+ * request would carry them). Used to prove the full-board policies fail closed.
+ */
+function scopedSlate(present: ReadonlyArray<MarketBlockKey>): SlateBundle {
+  const slate = slateWithRunLine({ line: -1.5, awayDecimal: 1.54054, homeDecimal: 2.64 });
+  const game = slate.games[0]!;
+  const fullBoard = game.markets;
+  const scoped: Record<string, unknown> = {};
+  for (const key of present) scoped[key] = fullBoard[key];
+  (game as { markets: unknown }).markets = scoped;
+  return slate;
 }
 
 function rlPair(slate: SlateBundle): { favorite: { selection: string; observedDecimal: number; line: number | null }; underdog: { selection: string; observedDecimal: number; line: number | null } } {
@@ -119,4 +138,41 @@ test('version registry: known versions dispatch, unknown strings do not', () => 
   assert.ok(isBaselinePolicyVersion('baselines-v0.2.0'));
   assert.ok(!isBaselinePolicyVersion('baselines-v9.9.9'));
   assert.ok(!isBaselinePolicyVersion(''));
+});
+
+// --- S2: baseline version isolation (SPEC-prepared-request.md §3, §5-S2) ---
+
+// Every 1- and 2-market scoping (plus the zero-market degenerate) — none is a
+// full board, so both full-board policies must fail closed on all of them.
+const SCOPED_INPUTS: ReadonlyArray<ReadonlyArray<MarketBlockKey>> = [
+  [],
+  ['moneyline'],
+  ['runLine'],
+  ['total'],
+  ['moneyline', 'runLine'],
+  ['moneyline', 'total'],
+  ['runLine', 'total'],
+];
+
+for (const present of SCOPED_INPUTS) {
+  for (const version of ['baselines-v0.1.0', 'baselines-v0.2.0'] as const) {
+    const label = present.length === 0 ? 'none' : present.join('+');
+    test(`${version} fails closed on a scoped board [${label}] — never a partial set`, () => {
+      assert.throws(
+        () => runBaselines(scopedSlate(present), version),
+        /requires a full three-market board/,
+      );
+    });
+  }
+}
+
+test('runBaselines rejects an unknown policy version — fail closed, not a silent default', () => {
+  const slate = slateWithRunLine({ line: -1.5, awayDecimal: 1.54054, homeDecimal: 2.64 });
+  const asVersion = (v: string): BaselinePolicyVersion => v as unknown as BaselinePolicyVersion;
+  assert.throws(() => runBaselines(slate, asVersion('baselines-v9.9.9')), /unknown baseline policy version/);
+  assert.throws(() => runBaselines(slate, asVersion('')), /unknown baseline policy version/);
+  // The registry-adjacent v0.3 string must NOT inherit v0.2 output through a
+  // fall-through: it is unregistered at S2, so it is rejected. (S3 registers
+  // v0.3 and gives it its own scoped branch; this row is re-homed there.)
+  assert.throws(() => runBaselines(slate, asVersion('baselines-v0.3.0')), /unknown baseline policy version/);
 });
