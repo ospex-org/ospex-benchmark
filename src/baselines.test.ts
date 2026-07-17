@@ -46,9 +46,10 @@ type MarketBlockKey = 'moneyline' | 'runLine' | 'total';
 
 /**
  * A slate whose single game carries only the named market blocks — the scoped
- * (1–2-market) shape S3 will make reachable, built by keeping just the present
+ * (1–3-market) shape S3 makes reachable, built by keeping just the present
  * blocks so the absent ones are omitted own properties (as a real scoped
- * request would carry them). Used to prove the full-board policies fail closed.
+ * request would carry them). Full-board policies (v0.1/v0.2) fail closed on it;
+ * v0.3 derives baselines from the present subset.
  */
 function scopedSlate(present: ReadonlyArray<MarketBlockKey>): SlateBundle {
   const slate = slateWithRunLine({ line: -1.5, awayDecimal: 1.54054, homeDecimal: 2.64 });
@@ -133,9 +134,13 @@ test('a zero handicap (pick’em) breaks to home as the laying side', () => {
 });
 
 test('version registry: known versions dispatch, unknown strings do not', () => {
-  assert.deepEqual([...BASELINE_POLICY_VERSIONS], ['baselines-v0.1.0', 'baselines-v0.2.0']);
+  assert.deepEqual(
+    [...BASELINE_POLICY_VERSIONS],
+    ['baselines-v0.1.0', 'baselines-v0.2.0', 'baselines-v0.3.0'],
+  );
   assert.ok(isBaselinePolicyVersion('baselines-v0.1.0'));
   assert.ok(isBaselinePolicyVersion('baselines-v0.2.0'));
+  assert.ok(isBaselinePolicyVersion('baselines-v0.3.0'));
   assert.ok(!isBaselinePolicyVersion('baselines-v9.9.9'));
   assert.ok(!isBaselinePolicyVersion(''));
 });
@@ -171,8 +176,54 @@ test('runBaselines rejects an unknown policy version — fail closed, not a sile
   const asVersion = (v: string): BaselinePolicyVersion => v as unknown as BaselinePolicyVersion;
   assert.throws(() => runBaselines(slate, asVersion('baselines-v9.9.9')), /unknown baseline policy version/);
   assert.throws(() => runBaselines(slate, asVersion('')), /unknown baseline policy version/);
-  // The registry-adjacent v0.3 string must NOT inherit v0.2 output through a
-  // fall-through: it is unregistered at S2, so it is rejected. (S3 registers
-  // v0.3 and gives it its own scoped branch; this row is re-homed there.)
-  assert.throws(() => runBaselines(slate, asVersion('baselines-v0.3.0')), /unknown baseline policy version/);
+  // (S2 asserted 'baselines-v0.3.0' was rejected as unregistered; S3 registers it
+  // as the scoped policy, so that row is re-homed to the S3 v0.3 tests below.)
 });
+
+// --- S3: v0.3 scoped baselines (SPEC-prepared-request.md §3, §4, §5-S3) ---
+
+/** The baseline participantIds v0.3 emits for each present market. */
+const V3_MARKET_BASELINES: Record<MarketBlockKey, readonly string[]> = {
+  moneyline: ['baseline-favorite-ml', 'baseline-underdog-ml', 'baseline-home-ml', 'baseline-away-ml'],
+  total: ['baseline-over-total', 'baseline-under-total'],
+  runLine: ['baseline-favorite-rl', 'baseline-underdog-rl'],
+};
+
+test('baselines-v0.3.0 on a full board equals v0.2 apart from the policyVersion stamp (§4)', () => {
+  const slate = slateWithRunLine({ line: -1.5, awayDecimal: 1.54054, homeDecimal: 2.64 });
+  const v2 = runBaselines(slate, 'baselines-v0.2.0');
+  const v3 = runBaselines(slate, 'baselines-v0.3.0');
+  assert.equal(v3.length, 8);
+  assert.ok(v3.every((d) => d.policyVersion === 'baselines-v0.3.0'));
+  const strip = (d: (typeof v2)[number]): Omit<(typeof v2)[number], 'policyVersion'> => {
+    const { policyVersion: _pv, ...rest } = d;
+    return rest;
+  };
+  // Identical set and per-row values — only the version stamp differs.
+  assert.deepEqual(v3.map(strip), v2.map(strip));
+});
+
+// All seven non-empty market combinations: v0.3 derives EXACTLY the present
+// markets' baselines — a scoped subset, never a full board it wasn't given.
+const V3_SCOPINGS: ReadonlyArray<ReadonlyArray<MarketBlockKey>> = [
+  ['moneyline'],
+  ['total'],
+  ['runLine'],
+  ['moneyline', 'total'],
+  ['moneyline', 'runLine'],
+  ['total', 'runLine'],
+  ['moneyline', 'runLine', 'total'],
+];
+
+for (const present of V3_SCOPINGS) {
+  const label = present.join('+');
+  test(`baselines-v0.3.0 derives exactly the present-market baselines for [${label}]`, () => {
+    const decisions = runBaselines(scopedSlate(present), 'baselines-v0.3.0');
+    const expected = [...present].flatMap((m) => V3_MARKET_BASELINES[m]).sort();
+    assert.deepEqual(
+      decisions.map((d) => d.participantId).sort(),
+      expected,
+    );
+    assert.ok(decisions.every((d) => d.policyVersion === 'baselines-v0.3.0'));
+  });
+}

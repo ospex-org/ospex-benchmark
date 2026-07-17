@@ -14,23 +14,35 @@ import type { BaselineDecision, GameBundle, SlateBundle } from './types.js';
  *   side. The side is determined by the line sign alone — price plays no
  *   part — and a zero handicap (pick'em; not seen on MLB run lines) breaks
  *   to home as the laying side.
+ * - `baselines-v0.3.0` — the SCOPED policy: it derives the same per-market
+ *   baselines but only for the markets PRESENT on each game (1–3 markets), so
+ *   a dynamic cohort with partial boards produces exactly the baselines its
+ *   games carry. On a full three-market board its output is identical to v0.2
+ *   apart from the required `policyVersion` stamp (§4).
  *
- * Both current versions are full-board-era policies: they are defined over
- * the fixed three-market board (moneyline + run line + total), so a scoped
- * (1–2-market) input is not a valid input for either and fails closed rather
- * than emitting a partial set (SPEC-prepared-request.md §3). Version dispatch
- * is likewise fail-closed: an unrecognized version throws instead of falling
- * through to a default policy. The forthcoming scoped `v0.3` (S3) is the only
- * version that derives from a present-market subset; it relaxes the full-board
- * requirement for that version alone.
+ * v0.1 and v0.2 are full-board-era policies: they are defined over the fixed
+ * three-market board (moneyline + run line + total), so a scoped (1–2-market)
+ * input is not a valid input for either and fails closed rather than emitting a
+ * partial set (SPEC-prepared-request.md §3). v0.3 is the only version that
+ * derives from a present-market subset. Version dispatch is likewise
+ * fail-closed: an unrecognized version throws instead of falling through to a
+ * default policy.
+ *
+ * The default stamped on NEW runs stays v0.2 (the current fixed three-market
+ * smoke/watch path); a dynamic cohort requires v0.3 — its boot/runtime gate is
+ * a separate S3 slice.
  *
  * The scorer re-derives baselines under the RECORDED policy version, so
  * archived runs keep verifying byte-for-byte as newer versions ship.
  */
-export const BASELINE_POLICY_VERSIONS = Object.freeze(['baselines-v0.1.0', 'baselines-v0.2.0'] as const);
+export const BASELINE_POLICY_VERSIONS = Object.freeze([
+  'baselines-v0.1.0',
+  'baselines-v0.2.0',
+  'baselines-v0.3.0',
+] as const);
 export type BaselinePolicyVersion = (typeof BASELINE_POLICY_VERSIONS)[number];
 
-/** The policy version the harness stamps on NEW runs. */
+/** The policy version the harness stamps on NEW runs (the fixed-board path). */
 export const BASELINE_POLICY_VERSION: BaselinePolicyVersion = 'baselines-v0.2.0';
 
 export function isBaselinePolicyVersion(value: string): value is BaselinePolicyVersion {
@@ -39,6 +51,34 @@ export function isBaselinePolicyVersion(value: string): value is BaselinePolicyV
 
 /** The market blocks a full-board policy (v0.1/v0.2) requires on every game. */
 const FULL_BOARD_MARKETS = ['moneyline', 'runLine', 'total'] as const;
+
+/** Policies defined over the fixed three-market board; they reject scoped input. */
+const FULL_BOARD_POLICIES = new Set<BaselinePolicyVersion>([
+  'baselines-v0.1.0',
+  'baselines-v0.2.0',
+]);
+
+/**
+ * Which markets a policy emits baselines for on a given game. v0.1 = moneyline
+ * + total (never the run line); v0.2 = all three; v0.3 = the PRESENT markets
+ * (1–3). Only WHICH markets are emitted differs across versions — the per-market
+ * derivation itself is shared, so v0.3 on a full board equals v0.2's set apart
+ * from the version stamp.
+ */
+function emittedMarkets(
+  policyVersion: BaselinePolicyVersion,
+  game: GameBundle,
+): { moneyline: boolean; total: boolean; runLine: boolean } {
+  if (policyVersion === 'baselines-v0.1.0') return { moneyline: true, total: true, runLine: false };
+  if (policyVersion === 'baselines-v0.2.0') return { moneyline: true, total: true, runLine: true };
+  // v0.3.0 (scoped): emit each market only where it is present on this game.
+  const markets = game.markets as Partial<GameBundle['markets']>;
+  return {
+    moneyline: markets.moneyline != null,
+    total: markets.total != null,
+    runLine: markets.runLine != null,
+  };
+}
 
 /**
  * Fail closed on a scoped input (SPEC-prepared-request.md §3). v0.1/v0.2 are
@@ -79,69 +119,79 @@ export function runBaselines(
   if (!isBaselinePolicyVersion(policyVersion)) {
     throw new Error(`unknown baseline policy version "${policyVersion}"`);
   }
-  // Full-board input guard: reject a scoped input before emitting anything.
-  assertFullBoard(bundle, policyVersion);
+  // Full-board input guard: a full-board policy (v0.1/v0.2) rejects a scoped
+  // input before emitting anything. v0.3 is scoped and skips this guard.
+  if (FULL_BOARD_POLICIES.has(policyVersion)) {
+    assertFullBoard(bundle, policyVersion);
+  }
 
-  const includeRunLine = policyVersion === 'baselines-v0.2.0';
   const decisions: BaselineDecision[] = [];
 
   for (const game of bundle.games) {
-    const ml = game.markets.moneyline;
-    const total = game.markets.total;
+    // Which markets this policy emits for this game (v0.1/v0.2 fixed by version
+    // over a guaranteed full board; v0.3 the present-market subset).
+    const emit = emittedMarkets(policyVersion, game);
 
-    // Favorite = lower decimal price; exact-price tie breaks to home.
-    const favoriteSelection =
-      ml.homeDecimal <= ml.awayDecimal ? game.homeTeam : game.awayTeam;
-    // Underdog = higher decimal price; exact-price tie breaks to away.
-    const underdogSelection =
-      ml.awayDecimal >= ml.homeDecimal ? game.awayTeam : game.homeTeam;
+    if (emit.moneyline) {
+      const ml = game.markets.moneyline;
 
-    const mlDecimal = (team: string): number =>
-      team === game.awayTeam ? ml.awayDecimal : ml.homeDecimal;
+      // Favorite = lower decimal price; exact-price tie breaks to home.
+      const favoriteSelection =
+        ml.homeDecimal <= ml.awayDecimal ? game.homeTeam : game.awayTeam;
+      // Underdog = higher decimal price; exact-price tie breaks to away.
+      const underdogSelection =
+        ml.awayDecimal >= ml.homeDecimal ? game.awayTeam : game.homeTeam;
 
-    const moneylineBaselines: Array<{ participantId: string; selection: string }> = [
-      { participantId: 'baseline-favorite-ml', selection: favoriteSelection },
-      { participantId: 'baseline-underdog-ml', selection: underdogSelection },
-      { participantId: 'baseline-home-ml', selection: game.homeTeam },
-      { participantId: 'baseline-away-ml', selection: game.awayTeam },
-    ];
-    for (const { participantId, selection } of moneylineBaselines) {
-      decisions.push({
-        participantId,
-        policyVersion,
-        gameId: game.gameId,
-        market: 'moneyline',
-        selection,
-        line: null,
-        observedDecimal: mlDecimal(selection),
-        track: 'common-cutoff',
-      });
+      const mlDecimal = (team: string): number =>
+        team === game.awayTeam ? ml.awayDecimal : ml.homeDecimal;
+
+      const moneylineBaselines: Array<{ participantId: string; selection: string }> = [
+        { participantId: 'baseline-favorite-ml', selection: favoriteSelection },
+        { participantId: 'baseline-underdog-ml', selection: underdogSelection },
+        { participantId: 'baseline-home-ml', selection: game.homeTeam },
+        { participantId: 'baseline-away-ml', selection: game.awayTeam },
+      ];
+      for (const { participantId, selection } of moneylineBaselines) {
+        decisions.push({
+          participantId,
+          policyVersion,
+          gameId: game.gameId,
+          market: 'moneyline',
+          selection,
+          line: null,
+          observedDecimal: mlDecimal(selection),
+          track: 'common-cutoff',
+        });
+      }
     }
 
-    decisions.push(
-      {
-        participantId: 'baseline-over-total',
-        policyVersion,
-        gameId: game.gameId,
-        market: 'total',
-        selection: 'over',
-        line: total.line,
-        observedDecimal: total.overDecimal,
-        track: 'common-cutoff',
-      },
-      {
-        participantId: 'baseline-under-total',
-        policyVersion,
-        gameId: game.gameId,
-        market: 'total',
-        selection: 'under',
-        line: total.line,
-        observedDecimal: total.underDecimal,
-        track: 'common-cutoff',
-      },
-    );
+    if (emit.total) {
+      const total = game.markets.total;
+      decisions.push(
+        {
+          participantId: 'baseline-over-total',
+          policyVersion,
+          gameId: game.gameId,
+          market: 'total',
+          selection: 'over',
+          line: total.line,
+          observedDecimal: total.overDecimal,
+          track: 'common-cutoff',
+        },
+        {
+          participantId: 'baseline-under-total',
+          policyVersion,
+          gameId: game.gameId,
+          market: 'total',
+          selection: 'under',
+          line: total.line,
+          observedDecimal: total.underDecimal,
+          track: 'common-cutoff',
+        },
+      );
+    }
 
-    if (includeRunLine) {
+    if (emit.runLine) {
       const runLine = game.markets.runLine;
       // Run-line favorite = the side LAYING the runs. The line is stored as
       // the HOME handicap: home lays when the line is negative, away lays
