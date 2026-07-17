@@ -12,6 +12,31 @@ is settled in the specs). Please don't grow this doc into another spec; sizes/de
 estimates re-confirmed at each sub-PR's start, and any **L** may split further at
 implementation if its diff runs large.
 
+## Re-sequencing (2026-07-16) — request integrity is the foundation, cardinality sits on it
+
+The first attempt at **1.4 (dynamic-cardinality bundle)** surfaced that the runner
+carries several independently-mutable aliases for what should be one request
+(gameId / game / bundle-game / cutoff / hash), and that the hashed identity can
+diverge from the bytes actually prompted, validated, and recorded. Those are
+**request-integrity** properties — most of them predate the cardinality change —
+so the dependency was backwards: request integrity is the **foundation**, dynamic
+cardinality is a **feature on top of it**.
+
+Re-sequenced accordingly (see `SPEC-prepared-request.md` for the contract):
+
+- **S1 — prepared request** (new foundation): one immutable, normalized,
+  plain-data `PreparedGameRequest` enforced at the pre-provider boundary. Built
+  for the current fixed three-market bundle; **no cardinality change**.
+- **S2 — baseline policy-version isolation**: v0.1/v0.2 full-board-only, only
+  v0.3 scoped.
+- **S3 — dynamic cardinality, re-homed**: the original 1.4 goal (per-market
+  optional, derive from the present set), rebuilt on top of S1's prepared
+  request. The validator/baseline/prompt derivations from the closed first
+  attempt are reused.
+
+S1→S2→S3 replace the single "1.4" row below; 1.5 (attempt provenance) already
+merged; 1.6–1.9 follow S3 and now build on a request they can trust.
+
 ## PR 1 scope (spec §9)
 
 - **In:** per-market no-wait firing; independent at-most-once claims + crash linkage; the
