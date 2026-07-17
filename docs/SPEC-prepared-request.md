@@ -73,7 +73,8 @@ Block coherence (applies from **S1**, to whatever markets the contract requires)
 - Prices (`awayDecimal`/`homeDecimal`/`overDecimal`/`underDecimal`) are finite
   decimal odds **> 1**; run-line/total `line` is finite.
 - `observedAt` is a canonical offset-qualified instant and must not postdate the
-  bundle timestamp.
+  bundle timestamp beyond the build-time clock-skew allowance
+  (`FUTURE_QUOTE_SKEW_MS`), matching the bundle quote-freshness policy.
 - Run-line redundancy is coherent: `homeHandicap === line` and
   `awayHandicap === -line`.
 - Every present block's `evidenceRef` is non-empty and appears in the game's
