@@ -140,11 +140,13 @@ const requestBundleSchema = z
 const MARKET_FIELDS = ['moneyline', 'runLine', 'total'] as const;
 
 // The whole request envelope — every field parsed to plain data, not just the
-// bundle. `.strict()` rejects extra envelope keys; `slug` must be a plain string.
+// bundle. `.strict()` rejects extra envelope keys; `slug` is display-only but
+// must be non-empty — the scorer requires a non-empty slug, so an empty one
+// would seal + dispatch here and then make the artifact unscoreable.
 const envelopeSchema = z
   .object({
     gameId: nonEmpty,
-    slug: z.string(),
+    slug: nonEmpty,
     game: gameSchema,
     requestBundle: requestBundleSchema,
     requestSha256: z.string(),

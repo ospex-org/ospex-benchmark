@@ -1,6 +1,5 @@
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import { runBaselines } from './baselines.js';
 import { buildBundle } from './bundle.js';
 import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
@@ -218,7 +217,7 @@ async function main(): Promise<number> {
     `dispatching per game in cutoff order: ${build.requests.length} games sequential, ` +
       `${ARMS.length} arms concurrent per game (sealed per game) ...`,
   );
-  const armGameResults = await runSlate(ARMS, adapters, build.requests, {
+  const { results: armGameResults, snapshot } = await runSlate(ARMS, adapters, build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
@@ -226,7 +225,8 @@ async function main(): Promise<number> {
     onGameComplete: (line) => printLine(`  ${line}`),
   });
 
-  const baselineDecisions = runBaselines(build.slateBundle);
+  // The artifact (records, baselines, summary) is built entirely from the sealed
+  // dispatch snapshot inside buildRecords/buildSummaryMarkdown.
   const reportedByArm = reportedModelIdsByArm(armGameResults);
   const unidentifiedByArm = unidentifiedResponsesByArm(armGameResults);
   const collision = checkProviderCollision(
@@ -240,13 +240,13 @@ async function main(): Promise<number> {
     })),
   );
 
-  const records = buildRecords(ctx, build, armGameResults, baselineDecisions, collision);
+  const records = buildRecords(ctx, build, snapshot, armGameResults, collision);
   const ndjsonPath = join(options.outDir, `${ctx.runId}.ndjson`);
   const summaryPath = join(options.outDir, `${ctx.runId}-summary.md`);
   writeNdjson(ndjsonPath, records);
   writeText(
     summaryPath,
-    buildSummaryMarkdown(ctx, build, armGameResults, baselineDecisions, collision),
+    buildSummaryMarkdown(ctx, build, snapshot, armGameResults, collision),
   );
 
   printLine('');

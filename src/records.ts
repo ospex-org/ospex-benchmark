@@ -2,11 +2,14 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { redactSecrets } from './config.js';
 import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
+import { runBaselines } from './baselines.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
+import { assertSealed } from './runner.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
+import type { DispatchSnapshot } from './runner.js';
 import type { CollisionCheckResult } from './providers/family.js';
-import type { ArmGameResult, AttemptRecord, BaselineDecision } from './types.js';
+import type { ArmGameResult, AttemptRecord } from './types.js';
 
 /**
  * Watch-mode gate provenance, recorded in run_meta so the entry-timing claim
@@ -125,14 +128,78 @@ export function failuresByCode(failures: string[]): Map<string, string[]> {
 export function buildRecords(
   ctx: RunContext,
   build: BuildResult,
+  snapshot: DispatchSnapshot,
   armGameResults: ArmGameResult[],
-  baselineDecisions: BaselineDecision[],
   collision: CollisionCheckResult,
 ): JsonRecord[] {
+  // Authenticate the whole snapshot WRAPPER (its slate + hash, not just the
+  // nested prepared objects) before emitting anything: only a snapshot produced
+  // by sealDispatch — genuine prepared, unique game IDs, uniform slate metadata,
+  // a slate re-derived from the prepared games — reaches the artifact (SPEC §2.4).
+  assertSealed(snapshot);
+  const { prepared, slate, slateSha256 } = snapshot;
+  const { excluded, provenance } = build;
+
+  // Baselines are DERIVED from the sealed snapshot, never accepted as a swappable
+  // array — so a missing/foreign/duplicate baseline row cannot be smuggled in.
+  const baselineDecisions = runBaselines(slate);
+
+  const requestShaByGame = new Map(prepared.map((r) => [r.gameId, r.requestSha256]));
+  const cutoffByGame = new Map(prepared.map((r) => [r.gameId, r.cutoffAt]));
+  const gameShaByGame = new Map(prepared.map((r) => [r.gameId, r.gameSha256]));
+
+  // Couple every arm result to the sealed run before writing: no duplicate
+  // (arm, game) pair, and each result must reference a snapshot game at the
+  // dispatched request hash AND cutoff — an artifact never carries evidence for a
+  // game it did not dispatch, dispatched differently, or dispatched twice.
+  const armsByGame = new Map<string, Set<string>>();
+  for (const result of armGameResults) {
+    let arms = armsByGame.get(result.gameId);
+    if (arms === undefined) {
+      arms = new Set<string>();
+      armsByGame.set(result.gameId, arms);
+    }
+    if (arms.has(result.arm.participantId)) {
+      throw new Error(`duplicate arm result for ${result.arm.participantId} on ${result.gameId}`);
+    }
+    if (!requestShaByGame.has(result.gameId)) {
+      throw new Error(`arm result references a game not in the dispatch snapshot: ${result.gameId}`);
+    }
+    if (result.requestSha256 !== requestShaByGame.get(result.gameId)) {
+      throw new Error(
+        `arm result requestSha256 does not match the dispatched request for ${result.gameId}`,
+      );
+    }
+    if (result.cutoffAt !== cutoffByGame.get(result.gameId)) {
+      throw new Error(
+        `arm result cutoffAt does not match the dispatched request for ${result.gameId}`,
+      );
+    }
+    arms.add(result.arm.participantId);
+  }
+  // Completeness: every dispatched game must have results, and the (arm, game)
+  // grid must be complete for every arm that reported — a truncated result set
+  // (a game, or an arm on a game, silently dropped) is rejected before writing.
+  // Full completeness against the configured arm roster is additionally verified
+  // downstream by the scorer, which alone knows the expected roster.
+  const armsSeen = new Set(armGameResults.map((r) => r.arm.participantId));
+  for (const request of prepared) {
+    const arms = armsByGame.get(request.gameId);
+    if (arms === undefined) {
+      throw new Error(`no arm results for dispatched game ${request.gameId}`);
+    }
+    for (const armId of armsSeen) {
+      if (!arms.has(armId)) {
+        throw new Error(`missing arm result for ${armId} on game ${request.gameId}`);
+      }
+    }
+  }
+
+  // Every per-game record derives from the frozen, hash-verified snapshot that
+  // was actually dispatched — never from a separate build alias — so the
+  // recorded game, its hash, and its cutoff are provably the bytes the provider
+  // saw, and so are the baselines, the slate metadata, and the summary.
   const records: JsonRecord[] = [];
-  const { slateBundle, slateSha256, requests, gameHashes, excluded, provenance } = build;
-  const requestShaByGame = new Map(requests.map((r) => [r.gameId, r.requestSha256]));
-  const cutoffByGame = new Map(requests.map((r) => [r.gameId, r.requestBundle.cutoffAt]));
 
   records.push({
     recordType: 'run_meta',
@@ -147,8 +214,8 @@ export function buildRecords(
     slateSha256,
     fetchStartedAt: ctx.fetchStartedAt,
     fetchCompletedAt: ctx.fetchCompletedAt,
-    bundleTimestamp: slateBundle.bundleTimestamp,
-    slateCutoffAt: slateBundle.cutoffAt,
+    bundleTimestamp: slate.bundleTimestamp,
+    slateCutoffAt: slate.cutoffAt,
     promptScaffoldVersion: PROMPT_SCAFFOLD_VERSION,
     promptScaffoldSha256: promptScaffoldSha256(),
     timeoutMs: ctx.timeoutMs,
@@ -158,7 +225,7 @@ export function buildRecords(
       maxQuoteAgeMs: MAX_QUOTE_AGE_MS,
       futureQuoteSkewMs: FUTURE_QUOTE_SKEW_MS,
     },
-    eligibleGames: slateBundle.games.length,
+    eligibleGames: slate.games.length,
     excludedGames: excluded.length,
     armGameResults: armGameResults.length,
     baselineDecisionCount: baselineDecisions.length,
@@ -173,15 +240,19 @@ export function buildRecords(
     ...(ctx.watch !== undefined ? { watch: ctx.watch } : {}),
   });
 
-  for (const request of requests) {
+  for (const request of prepared) {
+    // `bundle` is the frozen prepared game itself. Its serialized byte layout
+    // follows the prepared-request schema's key order, whereas `gameSha256` is
+    // order-independent (canonicalize sorts keys) — so a future field reorder
+    // would change these recorded bytes but never the hash, the joins, or scoring.
     records.push({
       recordType: 'bundle_game',
       label: SMOKE_LABEL,
       runId: ctx.runId,
       gameId: request.gameId,
-      gameSha256: gameHashes[request.gameId] ?? null,
+      gameSha256: request.gameSha256,
       requestSha256: request.requestSha256,
-      cutoffAt: request.requestBundle.cutoffAt,
+      cutoffAt: request.cutoffAt,
       slug: request.slug,
       bundle: request.game,
       sourceOddsRows: provenance[request.gameId]?.oddsRows ?? [],
@@ -204,7 +275,7 @@ export function buildRecords(
       runId: ctx.runId,
       cohortId: ctx.cohortId,
       slateSha256,
-      gameSha256: gameHashes[decision.gameId] ?? null,
+      gameSha256: gameShaByGame.get(decision.gameId) ?? null,
       requestSha256: requestShaByGame.get(decision.gameId) ?? null,
       cutoffAt: cutoffByGame.get(decision.gameId) ?? null,
       ...decision,
@@ -245,7 +316,7 @@ export function buildRecords(
           cohortId: ctx.cohortId,
           participantId: result.arm.participantId,
           slateSha256,
-          gameSha256: gameHashes[game.gameId] ?? null,
+          gameSha256: gameShaByGame.get(game.gameId) ?? null,
           bundleSha256: result.requestSha256,
           cutoffAt: result.cutoffAt,
           gameId: game.gameId,

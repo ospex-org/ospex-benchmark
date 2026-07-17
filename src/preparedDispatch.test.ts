@@ -4,12 +4,16 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { PreparedRequestError, prepareGameRequest } from './preparedRequest.js';
 import { buildUserMessage } from './prompt.js';
 import type { PromptInputs } from './prompt.js';
-import { runOneArmGame, runSlate } from './runner.js';
-import type { SlateRunOptions } from './runner.js';
+import { buildRecords } from './records.js';
+import type { RunContext } from './records.js';
+import { runOneArmGame, runSlate, sealDispatch } from './runner.js';
+import type { DispatchSnapshot, SlateRunOptions } from './runner.js';
+import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
+import { buildSummaryMarkdown } from './summary.js';
 import { makeRequest, makeValidResponse } from './testFactories.js';
-import type { GameRequest } from './bundle.js';
+import type { BuildResult, GameRequest } from './bundle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
-import type { ArmSpec, ProviderAdapter, ProviderResponse } from './types.js';
+import type { ArmGameResult, ArmSpec, ProviderAdapter, ProviderResponse } from './types.js';
 
 /**
  * Integration proof for the dispatch boundary (SPEC-prepared-request.md §2.3,
@@ -130,10 +134,15 @@ function twoGames(valid: GameRequest): GameRequest {
 test('the three-market request prepares and dispatches to every arm', async () => {
   const validRaw = makeRequest(CUTOFF);
   const { adapters, totalCalls } = makeAdapters(true, validRaw);
-  const results = await runSlate(ARMS, adapters, [validRaw], options());
+  const { results, snapshot } = await runSlate(ARMS, adapters, [validRaw], options());
   assert.equal(results.length, ARMS.length);
   for (const result of results) assert.equal(result.outcome, 'valid');
   assert.equal(totalCalls(), ARMS.length); // exactly one call per arm
+  // runSlate surfaces the frozen snapshot it dispatched (for records/baselines).
+  assert.equal(snapshot.prepared.length, 1);
+  assert.equal(snapshot.prepared[0]?.requestSha256, validRaw.requestSha256);
+  assert.equal(snapshot.slate.games.length, 1);
+  assert.ok(Object.isFrozen(snapshot.prepared)); // the array itself is sealed
 });
 
 // Each failure rejects at a DIFFERENT stage of preparation (alias check,
@@ -159,6 +168,17 @@ for (const { name, make } of malformed) {
     assert.equal(totalCalls(), 0);
   });
 }
+
+test('runSlate rejects a duplicate-game batch before any provider call', async () => {
+  // sealDispatch runs before dispatch, so a batch-level rejection makes zero calls.
+  const validRaw = makeRequest(CUTOFF);
+  const { adapters, totalCalls } = makeAdapters(false, validRaw);
+  await assert.rejects(
+    runSlate(ARMS, adapters, [validRaw, validRaw], options()),
+    /duplicate game ID/,
+  );
+  assert.equal(totalCalls(), 0);
+});
 
 test('the prompted bundle canonicalizes back to the exact bytes behind requestSha256', () => {
   const prepared = prepareGameRequest(makeRequest(CUTOFF));
@@ -268,4 +288,164 @@ test('buildUserMessage cannot be check/use-swapped by a request getter', () => {
   assert.equal(payload.bundleSha256, prepared.requestSha256);
   assert.equal(canonicalize(payload.bundle), canonicalize(prepared.requestBundle));
   assert.ok(!message.includes('hijacked'));
+});
+
+const NO_COLLISION = { failures: [], warnings: [] };
+
+function runContext(): RunContext {
+  return {
+    runId: 'smoke-v0-2026-07-12-abcdef',
+    cohortId: COHORT,
+    mode: 'dry-run',
+    slateDate: '2026-07-12',
+    createdAt: '2026-07-12T14:07:00.000Z',
+    executionPolicy: 'fixed-moneyline-total',
+    timeoutMs: 600_000,
+    maxOutputTokens: 16000,
+    fetchStartedAt: '2026-07-12T14:04:00+00:00',
+    fetchCompletedAt: '2026-07-12T14:05:00+00:00',
+    clockMode: 'synthetic-fixture',
+  };
+}
+
+/** A build whose slate game IS the request's game object (the mutation vector). */
+function sharedBuild(request: GameRequest): BuildResult {
+  return {
+    slateBundle: request.requestBundle,
+    slateSha256: request.requestSha256,
+    requests: [request],
+    gameHashes: { [request.gameId]: sha256Hex(canonicalize(request.game)) },
+    excluded: [],
+    provenance: { [request.gameId]: { slug: request.slug, oddsRows: [] } },
+  };
+}
+
+test('a post-preparation mutation of the build slate cannot split the artifact', async () => {
+  const request = makeRequest(CUTOFF);
+  const build = sharedBuild(request);
+  const originalAway = request.game.markets.moneyline.awayDecimal;
+  // A valid response captured BEFORE any mutation — it matches the frozen bundle.
+  const validBody = JSON.stringify(makeValidResponse(request, ARM_A, COHORT));
+
+  // A hostile/buggy adapter that mutates the shared build slate mid-dispatch,
+  // AFTER preparation has already frozen a private clone.
+  let calls = 0;
+  const adapter: ProviderAdapter = {
+    provider: ARM_A.provider,
+    requestedModelId: ARM_A.requestedModelId,
+    credentialEnvVar: ARM_A.credentialEnvVar,
+    hasCredential: () => true,
+    async chat(): Promise<ProviderResponse> {
+      calls += 1;
+      (build.slateBundle.games[0]!.markets.moneyline as { awayDecimal: number }).awayDecimal = 99;
+      return stubResponse(validBody, ARM_A.requestedModelId);
+    },
+  };
+
+  const { results, snapshot } = await runSlate(
+    [ARM_A],
+    new Map([[ARM_A.participantId, adapter]]),
+    build.requests,
+    options(),
+  );
+  assert.equal(calls, 1);
+  // The prompt/validation used the frozen bundle: the pre-mutation response validated.
+  assert.equal(results[0]?.outcome, 'valid');
+
+  // The mutation landed on the mutable build slate...
+  assert.equal(build.slateBundle.games[0]?.markets.moneyline.awayDecimal, 99);
+  // ...but the frozen dispatch snapshot is untouched.
+  assert.equal(snapshot.slate.games[0]?.markets.moneyline.awayDecimal, originalAway);
+
+  // Baselines, records, and summary ALL derive from the frozen snapshot.
+  const ctx = runContext();
+  const records = buildRecords(ctx, build, snapshot, results, NO_COLLISION);
+  const summary = buildSummaryMarkdown(ctx, build, snapshot, results, NO_COLLISION);
+
+  // The away-moneyline baseline and the bundle_game record carry the frozen
+  // price, never the mutated 99.
+  const awayBaseline = records.find(
+    (r) => r['recordType'] === 'baseline_decision' && r['participantId'] === 'baseline-away-ml',
+  );
+  assert.ok(awayBaseline);
+  assert.equal(awayBaseline['observedDecimal'], originalAway);
+  const bundleGame = records.find((r) => r['recordType'] === 'bundle_game');
+  assert.ok(bundleGame);
+  assert.equal((bundleGame['bundle'] as { markets: { moneyline: { awayDecimal: number } } }).markets.moneyline.awayDecimal, originalAway);
+
+  // The whole artifact — records and summary — is internally coherent: the real
+  // integrity verifier finds no baseline/price contradictions.
+  const violations = verifyRunIntegrity(parseRunRecords(records.map((r) => JSON.stringify(r))), {
+    expectedArms: [
+      {
+        participantId: ARM_A.participantId,
+        provider: ARM_A.provider,
+        requestedModelId: ARM_A.requestedModelId,
+        approvedReportedModelIds: [ARM_A.requestedModelId],
+      },
+    ],
+  });
+  assert.deepEqual(violations, []);
+  assert.ok(summary.includes(String(originalAway)));
+});
+
+// The producer boundary rejects independently-substituted inputs before it
+// writes anything — an artifact can never contradict its own verifier.
+
+async function validRun(): Promise<{
+  build: BuildResult;
+  snapshot: DispatchSnapshot;
+  results: ArmGameResult[];
+}> {
+  const validRaw = makeRequest(CUTOFF);
+  const { adapters } = makeAdapters(true, validRaw);
+  const { results, snapshot } = await runSlate([ARM_A], adapters, [validRaw], options());
+  return { build: sharedBuild(validRaw), snapshot, results: [...results] };
+}
+
+test('buildRecords rejects a forged (unsealed) snapshot wrapper', async () => {
+  const { build } = await validRun();
+  // A hand-built snapshot: a genuine prepared request but a substituted slate.
+  const prepared = prepareGameRequest(makeRequest(CUTOFF));
+  const forged = {
+    prepared: [prepared],
+    slate: { ...prepared.requestBundle, games: [{ ...prepared.game, awayTeam: 'HIJACK' }] },
+    slateSha256: 'x'.repeat(64),
+  } as unknown as DispatchSnapshot;
+  assert.throws(
+    () => buildRecords(runContext(), build, forged, [], NO_COLLISION),
+    /not produced by sealDispatch/,
+  );
+});
+
+test('buildRecords rejects an arm result with a foreign cutoff', async () => {
+  const { build, snapshot, results } = await validRun();
+  const foreign = { ...results[0]!, cutoffAt: '2026-07-12T18:00:00+00:00' };
+  assert.throws(
+    () => buildRecords(runContext(), build, snapshot, [foreign], NO_COLLISION),
+    /cutoffAt does not match/,
+  );
+});
+
+test('buildRecords rejects a duplicate arm result', async () => {
+  const { build, snapshot, results } = await validRun();
+  assert.throws(
+    () => buildRecords(runContext(), build, snapshot, [results[0]!, results[0]!], NO_COLLISION),
+    /duplicate arm result/,
+  );
+});
+
+test('sealDispatch rejects a batch with duplicate game IDs', () => {
+  const prepared = prepareGameRequest(makeRequest(CUTOFF));
+  assert.throws(() => sealDispatch([prepared, prepared]), /duplicate game ID/);
+});
+
+test('sealDispatch rejects a batch that mixes slate metadata', () => {
+  const p1 = prepareGameRequest(makeRequest(CUTOFF));
+  // A second, individually-valid request carrying a different bundleTimestamp.
+  const raw2 = makeRequest(CUTOFF, { gameId: '00000000-0000-4000-8000-00000000t099' });
+  raw2.requestBundle.bundleTimestamp = '2026-07-12T14:06:00+00:00';
+  raw2.requestSha256 = sha256Hex(canonicalize(raw2.requestBundle));
+  const p2 = prepareGameRequest(raw2);
+  assert.throws(() => sealDispatch([p1, p2]), /mixes slate metadata/);
 });

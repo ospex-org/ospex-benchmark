@@ -1,8 +1,11 @@
+import { runBaselines } from './baselines.js';
 import { failuresByCode, reportedModelIdsByArm } from './records.js';
+import { assertSealed } from './runner.js';
 import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
+import type { DispatchSnapshot } from './runner.js';
 import type { CollisionCheckResult } from './providers/family.js';
-import type { ArmGameResult, ArmOutcome, BaselineDecision, GameBundle } from './types.js';
+import type { ArmGameResult, ArmOutcome, GameBundle } from './types.js';
 
 const OUTCOME_ORDER: ArmOutcome[] = [
   'valid',
@@ -46,11 +49,19 @@ function slateRow(game: GameBundle): string {
 export function buildSummaryMarkdown(
   ctx: RunContext,
   build: BuildResult,
+  snapshot: DispatchSnapshot,
   armGameResults: ArmGameResult[],
-  baselineDecisions: BaselineDecision[],
   collision: CollisionCheckResult,
 ): string {
-  const { slateBundle, slateSha256, excluded } = build;
+  // Authenticate the sealed snapshot: the rendered game content comes from it,
+  // not the mutable build slate, so the summary can never disagree with the
+  // records or baselines (SPEC-prepared-request.md §2.4).
+  assertSealed(snapshot);
+  const { excluded } = build;
+  const slateBundle = snapshot.slate;
+  const slateSha256 = snapshot.slateSha256;
+  // Baselines are derived from the sealed snapshot, never accepted as an array.
+  const baselineDecisions = runBaselines(snapshot.slate);
   const lines: string[] = [];
   const arms = [...new Map(armGameResults.map((r) => [r.arm.participantId, r.arm])).values()];
   const byArm = (participantId: string): ArmGameResult[] =>

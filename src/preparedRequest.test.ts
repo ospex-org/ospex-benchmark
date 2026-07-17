@@ -326,6 +326,12 @@ test('the prepared slug is the normalized string', () => {
   assert.equal(prepared.slug, 'mil-pit-2026-07-12');
 });
 
+test('an empty slug is rejected — the scorer requires a non-empty slug', () => {
+  const request = base();
+  request.slug = '';
+  assert.throws(() => prepareGameRequest(request), PreparedRequestError);
+});
+
 test('the prepared snapshot is a plain-data object graph — no custom prototype survives', () => {
   // The prompt (S1b) and the hash serialize THIS snapshot, so a plain-object
   // graph is what defeats an inherited toJSON: there is nothing to invoke.
