@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { PreparedRequestError, prepareGameRequest } from './preparedRequest.js';
 import { buildUserMessage } from './prompt.js';
+import type { PromptInputs } from './prompt.js';
 import { runOneArmGame, runSlate } from './runner.js';
 import type { SlateRunOptions } from './runner.js';
 import { makeRequest, makeValidResponse } from './testFactories.js';
@@ -230,4 +231,41 @@ test('runOneArmGame rejects a forged request before any field read, with zero ad
     PreparedRequestError,
   );
   assert.equal(calls(), 0);
+});
+
+test('buildUserMessage cannot be check/use-swapped by a request getter', () => {
+  // The exploit: a getter that returns a genuine branded request to the guard
+  // and a hostile one to the serializer. buildUserMessage must read the request
+  // exactly once, so the hostile object is never reachable.
+  const prepared = prepareGameRequest(makeRequest(CUTOFF));
+  const hostile = {
+    requestSha256: 'b'.repeat(64),
+    cutoffAt: 'hijacked-cutoff',
+    requestBundle: { hijacked: true },
+  } as unknown as PreparedGameRequest;
+  let reads = 0;
+  const inputs: PromptInputs = {
+    cohortId: COHORT,
+    participantId: ARM_A.participantId,
+    requestedModelId: ARM_A.requestedModelId,
+    executionPolicy: 'fixed-moneyline-total',
+    get request(): PreparedGameRequest {
+      reads += 1;
+      return reads === 1 ? prepared : hostile;
+    },
+  };
+
+  const message = buildUserMessage(inputs);
+
+  // The request was read exactly once — the swapped-in hostile value never runs.
+  assert.equal(reads, 1);
+  // And the serialized bundle is the genuine prepared one, never the hostile one.
+  const marker = '\nRequest:\n';
+  const payload = JSON.parse(message.slice(message.indexOf(marker) + marker.length)) as {
+    bundle: unknown;
+    bundleSha256: unknown;
+  };
+  assert.equal(payload.bundleSha256, prepared.requestSha256);
+  assert.equal(canonicalize(payload.bundle), canonicalize(prepared.requestBundle));
+  assert.ok(!message.includes('hijacked'));
 });

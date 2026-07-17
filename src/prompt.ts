@@ -104,11 +104,12 @@ export interface PromptInputs {
 }
 
 export function buildUserMessage(inputs: PromptInputs): string {
-  // Runtime guard: refuse to serialize anything that did not come through the
-  // prepared boundary, before touching the bundle (the type is erased at run
-  // time, so a direct caller could otherwise forge one).
-  assertPrepared(inputs.request);
+  // Read the request EXACTLY ONCE, then guard THAT captured value. inputs.request
+  // could be a getter; re-reading it after the check would let a caller return a
+  // branded request to assertPrepared and a different (unprepared) one to the
+  // serializer — check one object, prompt another. The single read closes that.
   const { request } = inputs;
+  assertPrepared(request);
   const payload = {
     cohortId: inputs.cohortId,
     participantId: inputs.participantId,
