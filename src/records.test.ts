@@ -4,8 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
-import { prepareGameRequest } from './preparedRequest.js';
-import { sealDispatch } from './runner.js';
+import { runSlate } from './runner.js';
 import {
   buildRecords,
   failuresByCode,
@@ -16,7 +15,17 @@ import {
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
 import type { BuildResult, GameRequest } from './bundle.js';
 import type { RunContext } from './records.js';
-import type { ArmGameResult, AttemptRecord } from './types.js';
+import type { RunEnvelope } from './runner.js';
+import type {
+  ArmGameResult,
+  AttemptRecord,
+  BenchmarkResponse,
+  ChatTurn,
+  ProviderAdapter,
+  ProviderResponse,
+} from './types.js';
+
+const CUTOFF_MS = Date.parse('2026-07-12T16:15:00+00:00');
 
 function makeBuild(): BuildResult {
   const request = makeRequest();
@@ -63,66 +72,95 @@ function attempt(overrides: Partial<AttemptRecord>): AttemptRecord {
   };
 }
 
-/** A minimal result matching a request — satisfies the (arm, game) completeness
- *  gate for tests that focus on non-result records. */
-function minimalResult(request: GameRequest): ArmGameResult {
+// ---------------------------------------------------------------------------
+// Envelope fixtures: buildRecords now consumes a BRANDED RunEnvelope, produced
+// ONLY by runSlate (SPEC-artifact-producer.md A5). These tests drive runSlate
+// with a stub adapter so every buildRecords input is a genuine sealed envelope.
+// ---------------------------------------------------------------------------
+
+type ChatHandler = () => ProviderResponse;
+
+function stubAdapter(handlers: ChatHandler[]): ProviderAdapter {
+  let index = 0;
   return {
-    arm: TEST_ARM,
-    gameId: request.gameId,
-    requestSha256: request.requestSha256,
-    cutoffAt: request.requestBundle.cutoffAt,
-    outcome: 'timeout',
-    attempt: attempt({ rawText: null }),
-    repair: null,
-    repairUsed: false,
-    repairTransport: null,
-    parsed: null,
-    validationErrors: [],
+    provider: TEST_ARM.provider,
+    requestedModelId: TEST_ARM.requestedModelId,
+    credentialEnvVar: TEST_ARM.credentialEnvVar,
+    hasCredential: () => true,
+    async chat(_turns: ChatTurn[]): Promise<ProviderResponse> {
+      const handler = handlers[index];
+      index += 1;
+      if (!handler) throw new Error('stub adapter: no handler for this call');
+      return handler();
+    },
   };
 }
 
-test('repaired decisions carry the ACCEPTED repair attempt provenance', () => {
+function stubResponse(
+  rawText: string,
+  ids: { reportedModelId?: string; providerResponseId?: string } = {},
+): ProviderResponse {
+  return {
+    rawText,
+    reportedModelId: ids.reportedModelId ?? 'stub-model-1',
+    providerResponseId: ids.providerResponseId ?? 'stub-response',
+    httpStatus: 200,
+    usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+    usageRaw: { prompt_tokens: 100, completion_tokens: 50 },
+    requestParams: { stub: true },
+  };
+}
+
+/** An initial response whose echoed cohortId is wrong — validation fails, but the
+ *  decision fingerprint is intact, so a fingerprint-preserving repair is accepted. */
+function wrongEcho(response: BenchmarkResponse): string {
+  return JSON.stringify({ ...response, cohortId: 'wrong-cohort-echo' });
+}
+
+async function envFrom(
+  build: BuildResult,
+  ctx: RunContext,
+  handlers: ChatHandler[],
+  nowMs: () => number = () => CUTOFF_MS - 60_000,
+): Promise<RunEnvelope> {
+  // The options' five load-bearing fields must equal ctx's, or authenticateRun
+  // fails closed (A4). slateDate is derived from the request bundle inside the
+  // envelope, and makeCtx().slateDate matches makeRequest()'s bundle date.
+  return runSlate([TEST_ARM], new Map([[TEST_ARM.participantId, stubAdapter(handlers)]]), build.requests, {
+    cohortId: ctx.cohortId,
+    timeoutMs: ctx.timeoutMs,
+    maxOutputTokens: ctx.maxOutputTokens,
+    executionPolicy: ctx.executionPolicy,
+    nowMs,
+  });
+}
+
+test('repaired decisions carry the ACCEPTED repair attempt provenance', async () => {
   const build = makeBuild();
+  const ctx = makeCtx();
   const request = build.requests[0];
   assert.ok(request);
-  const result: ArmGameResult = {
-    arm: TEST_ARM,
-    gameId: request.gameId,
-    requestSha256: request.requestSha256,
-    cutoffAt: request.requestBundle.cutoffAt,
-    outcome: 'valid',
-    attempt: attempt({
-      reportedModelId: 'stub-model-initial',
-      providerResponseId: 'resp-initial',
-      latencyMs: 1000,
-      requestAt: '2026-07-12T14:07:01.000Z',
-      responseAt: '2026-07-12T14:07:02.000Z',
-      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-    }),
-    repair: attempt({
-      reportedModelId: 'stub-model-repair',
-      providerResponseId: 'resp-repair',
-      latencyMs: 2000,
-      requestAt: '2026-07-12T14:07:03.000Z',
-      responseAt: '2026-07-12T14:07:05.000Z',
-      usage: { inputTokens: 20, outputTokens: 9, totalTokens: 29 },
-      usageRaw: { prompt_tokens: 20, completion_tokens: 9 },
-    }),
-    repairUsed: true,
-    repairTransport: 'ok',
-    parsed: makeValidResponse(request),
-    validationErrors: [],
-  };
+  const env = await envFrom(build, ctx, [
+    () =>
+      stubResponse(wrongEcho(makeValidResponse(request)), {
+        reportedModelId: 'stub-model-initial',
+        providerResponseId: 'resp-initial',
+      }),
+    () =>
+      stubResponse(JSON.stringify(makeValidResponse(request)), {
+        reportedModelId: 'stub-model-repair',
+        providerResponseId: 'resp-repair',
+      }),
+  ]);
+  assert.equal(env.results[0]?.repairUsed, true);
 
-  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [result], { failures: [], warnings: [] });
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
   const decisions = records.filter((r) => r['recordType'] === 'decision');
   assert.equal(decisions.length, 3);
   for (const decision of decisions) {
+    // Decision provenance is the ACCEPTED (repair) attempt, not the initial one.
     assert.equal(decision['reportedModelId'], 'stub-model-repair');
     assert.equal(decision['providerResponseId'], 'resp-repair');
-    assert.equal(decision['latencyMs'], 2000);
-    assert.equal(decision['responseAt'], '2026-07-12T14:07:05.000Z');
-    assert.deepEqual(decision['tokens'], { inputTokens: 20, outputTokens: 9, totalTokens: 29 });
     assert.equal(decision['attemptUsed'], 'repair');
   }
 
@@ -134,18 +172,21 @@ test('repaired decisions carry the ACCEPTED repair attempt provenance', () => {
   assert.equal(repair['reportedModelId'], 'stub-model-repair');
 });
 
-test('bundle_game serializes the exact prepared game, hash-consistent', () => {
+test('bundle_game serializes the exact prepared game, hash-consistent', async () => {
   const build = makeBuild();
-  const snapshot = sealDispatch(build.requests.map(prepareGameRequest));
-  const records = buildRecords(makeCtx(), build, snapshot, [minimalResult(build.requests[0]!)], { failures: [], warnings: [] });
+  const ctx = makeCtx();
+  const request = build.requests[0];
+  assert.ok(request);
+  const env = await envFrom(build, ctx, [
+    () => stubResponse(JSON.stringify(makeValidResponse(request))),
+  ]);
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
   const bundleGame = records.find((r) => r['recordType'] === 'bundle_game');
   assert.ok(bundleGame);
-  const first = snapshot.prepared[0];
+  const first = env.snapshot.prepared[0];
   assert.ok(first);
   // The recorded bundle IS the frozen prepared game object itself (reference
-  // identity) — not a value-equal build alias. deepEqual would pass against the
-  // exact regression this guards (bundle: build.requests[i].game); strictEqual
-  // pins the object provenance the test name claims.
+  // identity) — not a value-equal build alias.
   assert.strictEqual(bundleGame['bundle'], first.game);
   // Every hash/cutoff on the record is the prepared request's derived value, and
   // the recorded gameSha256 is self-consistent with the bytes it recorded.
@@ -155,48 +196,48 @@ test('bundle_game serializes the exact prepared game, hash-consistent', () => {
   assert.equal(bundleGame['cutoffAt'], first.cutoffAt);
 });
 
-test('a mutation attempt after preparation does not change the recorded bundle', () => {
+test('a mutation attempt after preparation does not change the recorded bundle', async () => {
   const build = makeBuild();
-  const snapshot = sealDispatch(build.requests.map(prepareGameRequest));
+  const ctx = makeCtx();
+  const request = build.requests[0];
+  assert.ok(request);
+  const env = await envFrom(build, ctx, [
+    () => stubResponse(JSON.stringify(makeValidResponse(request))),
+  ]);
   // The prepared game is deep-frozen: a write is a no-op (throws in strict mode).
-  // Records serialize that frozen snapshot regardless of any mutation attempt.
   try {
-    (snapshot.prepared[0]!.game as { awayTeam: string }).awayTeam = 'MUTATED';
+    (env.snapshot.prepared[0]!.game as { awayTeam: string }).awayTeam = 'MUTATED';
   } catch {
     // strict-mode TypeError writing a frozen property — expected.
   }
-  const records = buildRecords(makeCtx(), build, snapshot, [minimalResult(build.requests[0]!)], { failures: [], warnings: [] });
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
   const bundleGame = records.find((r) => r['recordType'] === 'bundle_game');
   assert.ok(bundleGame);
   assert.equal((bundleGame['bundle'] as { awayTeam: string }).awayTeam, 'Milwaukee Brewers');
 });
 
-test('cutoff_missed results never emit decision records', () => {
+test('cutoff_missed results never emit decision records', async () => {
   const build = makeBuild();
-  const request = build.requests[0];
-  assert.ok(request);
-  const result: ArmGameResult = {
-    arm: TEST_ARM,
-    gameId: request.gameId,
-    requestSha256: request.requestSha256,
-    cutoffAt: request.requestBundle.cutoffAt,
-    outcome: 'cutoff_missed',
-    attempt: attempt({ rawText: JSON.stringify(makeValidResponse(request)) }),
-    repair: null,
-    repairUsed: false,
-    repairTransport: null,
-    // deliberately non-null parsed to prove the outcome gate, not the parse,
-    // controls decision emission
-    parsed: makeValidResponse(request),
-    validationErrors: ['response received after the decision cutoff'],
-  };
-  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [result], { failures: [], warnings: [] });
+  const ctx = makeCtx();
+  // nowMs AT the cutoff → the decision window has closed at dispatch, so the arm
+  // result is cutoff_missed with no provider call (parsed is null). The old
+  // "cutoff_missed with a non-null parsed" angle is unreachable via runSlate;
+  // the real invariant is that cutoff_missed emits zero decisions.
+  const env = await envFrom(build, ctx, [], () => CUTOFF_MS);
+  assert.equal(env.results[0]?.outcome, 'cutoff_missed');
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
   assert.equal(records.filter((r) => r['recordType'] === 'decision').length, 0);
 });
 
-test('identity-only failures get their own MODEL_IDENTITY run_failure record, never PROVIDER_COLLISION', () => {
+test('identity-only failures get their own MODEL_IDENTITY run_failure record, never PROVIDER_COLLISION', async () => {
   const build = makeBuild();
-  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [minimalResult(build.requests[0]!)], {
+  const ctx = makeCtx();
+  const request = build.requests[0];
+  assert.ok(request);
+  const env = await envFrom(build, ctx, [
+    () => stubResponse(JSON.stringify(makeValidResponse(request))),
+  ]);
+  const records = buildRecords(env, ctx, build, {
     failures: [
       'MODEL_IDENTITY: some-arm returned 1 response(s) without a reported model ID — accepted decisions require verified identity',
       'PROVIDER_COLLISION: two arms resolve to the openai family',

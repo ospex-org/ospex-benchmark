@@ -7,13 +7,13 @@ import type { PromptInputs } from './prompt.js';
 import { buildRecords } from './records.js';
 import type { RunContext } from './records.js';
 import { runOneArmGame, runSlate, sealDispatch } from './runner.js';
-import type { DispatchSnapshot, SlateRunOptions } from './runner.js';
+import type { RunEnvelope, SlateRunOptions } from './runner.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
 import { buildSummaryMarkdown } from './summary.js';
 import { makeRequest, makeValidResponse } from './testFactories.js';
 import type { BuildResult, GameRequest } from './bundle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
-import type { ArmGameResult, ArmSpec, ProviderAdapter, ProviderResponse } from './types.js';
+import type { ArmSpec, ProviderAdapter, ProviderResponse } from './types.js';
 
 /**
  * Integration proof for the dispatch boundary (SPEC-prepared-request.md §2.3,
@@ -107,6 +107,7 @@ function options(): SlateRunOptions {
     cohortId: COHORT,
     timeoutMs: 600_000,
     maxOutputTokens: 16000,
+    executionPolicy: 'fixed-moneyline-total',
     nowMs: () => CUTOFF_MS - 60_000,
   };
 }
@@ -134,15 +135,19 @@ function twoGames(valid: GameRequest): GameRequest {
 test('the three-market request prepares and dispatches to every arm', async () => {
   const validRaw = makeRequest(CUTOFF);
   const { adapters, totalCalls } = makeAdapters(true, validRaw);
-  const { results, snapshot } = await runSlate(ARMS, adapters, [validRaw], options());
-  assert.equal(results.length, ARMS.length);
-  for (const result of results) assert.equal(result.outcome, 'valid');
+  const env = await runSlate(ARMS, adapters, [validRaw], options());
+  assert.equal(env.results.length, ARMS.length);
+  for (const result of env.results) assert.equal(result.outcome, 'valid');
   assert.equal(totalCalls(), ARMS.length); // exactly one call per arm
   // runSlate surfaces the frozen snapshot it dispatched (for records/baselines).
-  assert.equal(snapshot.prepared.length, 1);
-  assert.equal(snapshot.prepared[0]?.requestSha256, validRaw.requestSha256);
-  assert.equal(snapshot.slate.games.length, 1);
-  assert.ok(Object.isFrozen(snapshot.prepared)); // the array itself is sealed
+  assert.equal(env.snapshot.prepared.length, 1);
+  assert.equal(env.snapshot.prepared[0]?.requestSha256, validRaw.requestSha256);
+  assert.equal(env.snapshot.slate.games.length, 1);
+  assert.ok(Object.isFrozen(env.snapshot.prepared)); // the snapshot array is sealed
+  // The envelope carries the dispatched roster manifest and the four dispatch fields.
+  assert.deepEqual([...env.expectedArms], ARMS.map((a) => a.participantId));
+  assert.equal(env.dispatch.executionPolicy, 'fixed-moneyline-total');
+  assert.ok(Object.isFrozen(env)); // A2: the whole envelope is deep-frozen
 });
 
 // Each failure rejects at a DIFFERENT stage of preparation (alias check,
@@ -342,7 +347,7 @@ test('a post-preparation mutation of the build slate cannot split the artifact',
     },
   };
 
-  const { results, snapshot } = await runSlate(
+  const env = await runSlate(
     [ARM_A],
     new Map([[ARM_A.participantId, adapter]]),
     build.requests,
@@ -350,17 +355,17 @@ test('a post-preparation mutation of the build slate cannot split the artifact',
   );
   assert.equal(calls, 1);
   // The prompt/validation used the frozen bundle: the pre-mutation response validated.
-  assert.equal(results[0]?.outcome, 'valid');
+  assert.equal(env.results[0]?.outcome, 'valid');
 
   // The mutation landed on the mutable build slate...
   assert.equal(build.slateBundle.games[0]?.markets.moneyline.awayDecimal, 99);
   // ...but the frozen dispatch snapshot is untouched.
-  assert.equal(snapshot.slate.games[0]?.markets.moneyline.awayDecimal, originalAway);
+  assert.equal(env.snapshot.slate.games[0]?.markets.moneyline.awayDecimal, originalAway);
 
-  // Baselines, records, and summary ALL derive from the frozen snapshot.
+  // Baselines, records, and summary ALL derive from the frozen, branded envelope.
   const ctx = runContext();
-  const records = buildRecords(ctx, build, snapshot, results, NO_COLLISION);
-  const summary = buildSummaryMarkdown(ctx, build, snapshot, results, NO_COLLISION);
+  const records = buildRecords(env, ctx, build, NO_COLLISION);
+  const summary = buildSummaryMarkdown(env, ctx, build, NO_COLLISION);
 
   // The away-moneyline baseline and the bundle_game record carry the frozen
   // price, never the mutated 99.
@@ -389,49 +394,30 @@ test('a post-preparation mutation of the build slate cannot split the artifact',
   assert.ok(summary.includes(String(originalAway)));
 });
 
-// The producer boundary rejects independently-substituted inputs before it
-// writes anything — an artifact can never contradict its own verifier.
-
-async function validRun(): Promise<{
-  build: BuildResult;
-  snapshot: DispatchSnapshot;
-  results: ArmGameResult[];
-}> {
-  const validRaw = makeRequest(CUTOFF);
-  const { adapters } = makeAdapters(true, validRaw);
-  const { results, snapshot } = await runSlate([ARM_A], adapters, [validRaw], options());
-  return { build: sharedBuild(validRaw), snapshot, results: [...results] };
-}
-
-test('buildRecords rejects a forged (unsealed) snapshot wrapper', async () => {
-  const { build } = await validRun();
-  // A hand-built snapshot: a genuine prepared request but a substituted slate.
+// A5: the producers authenticate the branded run envelope. A hand-built
+// envelope-shaped object — even with genuine nested pieces or a filtered result
+// graph — is rejected before anything is written. (The full A2–A5 producer
+// matrix lives in runEnvelope.test.ts; this is the boundary sanity check.)
+test('buildRecords rejects a forged (unbranded) run envelope', () => {
   const prepared = prepareGameRequest(makeRequest(CUTOFF));
   const forged = {
-    prepared: [prepared],
-    slate: { ...prepared.requestBundle, games: [{ ...prepared.game, awayTeam: 'HIJACK' }] },
-    slateSha256: 'x'.repeat(64),
-  } as unknown as DispatchSnapshot;
+    snapshot: {
+      prepared: [prepared],
+      slate: { ...prepared.requestBundle, games: [{ ...prepared.game, awayTeam: 'HIJACK' }] },
+      slateSha256: 'x'.repeat(64),
+    },
+    results: [],
+    expectedArms: [ARM_A.participantId],
+    dispatch: {
+      cohortId: COHORT,
+      executionPolicy: 'fixed-moneyline-total',
+      timeoutMs: 600_000,
+      maxOutputTokens: 16000,
+    },
+  } as unknown as RunEnvelope;
   assert.throws(
-    () => buildRecords(runContext(), build, forged, [], NO_COLLISION),
-    /not produced by sealDispatch/,
-  );
-});
-
-test('buildRecords rejects an arm result with a foreign cutoff', async () => {
-  const { build, snapshot, results } = await validRun();
-  const foreign = { ...results[0]!, cutoffAt: '2026-07-12T18:00:00+00:00' };
-  assert.throws(
-    () => buildRecords(runContext(), build, snapshot, [foreign], NO_COLLISION),
-    /cutoffAt does not match/,
-  );
-});
-
-test('buildRecords rejects a duplicate arm result', async () => {
-  const { build, snapshot, results } = await validRun();
-  assert.throws(
-    () => buildRecords(runContext(), build, snapshot, [results[0]!, results[0]!], NO_COLLISION),
-    /duplicate arm result/,
+    () => buildRecords(forged, runContext(), sharedBuild(makeRequest(CUTOFF)), NO_COLLISION),
+    /not produced by runSlate/,
   );
 });
 

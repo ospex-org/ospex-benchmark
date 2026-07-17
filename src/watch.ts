@@ -673,17 +673,19 @@ export async function fireEligibleGame(
     watch: provenance,
   };
 
-  const { results: armGameResults, snapshot } = await runSlate(cfg.arms, cfg.adapters, build.requests, {
+  const env = await runSlate(cfg.arms, cfg.adapters, build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
+    executionPolicy: ctx.executionPolicy,
     nowMs: cfg.nowMs,
     onGameComplete: (line) => cfg.log(`  ${line}`),
   });
+  const armGameResults = env.results;
 
   // buildRecords/buildSummaryMarkdown derive baselines from the sealed snapshot;
   // this copy is only for the fire-outcome count reported to schedulers.
-  const baselineDecisions = runBaselines(snapshot.slate);
+  const baselineDecisions = runBaselines(env.snapshot.slate);
   const reportedByArm = reportedModelIdsByArm(armGameResults);
   const unidentifiedByArm = unidentifiedResponsesByArm(armGameResults);
   const collision = checkProviderCollision(
@@ -697,12 +699,12 @@ export async function fireEligibleGame(
     })),
   );
 
-  const records = buildRecords(ctx, build, snapshot, armGameResults, collision);
+  const records = buildRecords(env, ctx, build, collision);
   const runFile = join(cfg.outDir, `${ctx.runId}.ndjson`);
   writeNdjson(runFile, records);
   writeText(
     join(cfg.outDir, `${ctx.runId}-summary.md`),
-    buildSummaryMarkdown(ctx, build, snapshot, armGameResults, collision),
+    buildSummaryMarkdown(env, ctx, build, collision),
   );
 
   const armOutcomes: Record<string, ArmOutcome> = {};

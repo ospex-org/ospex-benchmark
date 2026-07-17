@@ -40,9 +40,35 @@ export interface DispatchSnapshot {
   slateSha256: string;
 }
 
-export interface SlateRunResult {
-  results: ArmGameResult[];
+/**
+ * The single branded, deeply-immutable run envelope every artifact producer
+ * authenticates and reads from (SPEC-artifact-producer.md). It carries all
+ * dispatched evidence — the sealed snapshot, the complete result graph, the
+ * expected-arm manifest, and the four load-bearing dispatch fields — so the
+ * producers consume ONE authenticated value rather than three independently
+ * substitutable arguments. `slateDate` is NOT a `dispatch` field; it derives
+ * from `snapshot.slate.slateDate` (§4).
+ */
+export interface RunEnvelope {
   snapshot: DispatchSnapshot;
+  results: readonly ArmGameResult[];
+  /** The dispatched roster's participantIds (unique — runSlate rejects a duplicate). */
+  expectedArms: readonly string[];
+  dispatch: {
+    cohortId: string;
+    executionPolicy: 'fixed-moneyline-total';
+    timeoutMs: number;
+    maxOutputTokens: number;
+  };
+}
+
+/** The five load-bearing fields, derived from the envelope and equality-gated (A4). */
+export interface BoundRunContext {
+  slateDate: string;
+  cohortId: string;
+  executionPolicy: 'fixed-moneyline-total';
+  timeoutMs: number;
+  maxOutputTokens: number;
 }
 
 // Module-private registry of snapshots produced by sealDispatch. Nothing
@@ -63,6 +89,71 @@ export function assertSealed(snapshot: DispatchSnapshot): void {
   }
 }
 
+// Module-private registry of run envelopes produced by runSlate. Nothing outside
+// this module can add to it, so membership is unforgeable proof that a
+// RunEnvelope actually came through runSlate — a producer cannot be handed a
+// hand-built envelope-shaped object (genuine or filtered nested pieces) with a
+// substituted wrapper.
+const runEnvelopes = new WeakSet<RunEnvelope>();
+
+/**
+ * Throw unless `env` was produced by `runSlate` (A5). The record and summary
+ * builders call this before emitting anything. The envelope brand transitively
+ * guarantees the nested snapshot (runSlate builds it via sealDispatch), so this
+ * subsumes `assertSealed` — the producers no longer call `assertSealed`
+ * separately.
+ */
+export function assertRunEnvelope(env: RunEnvelope): void {
+  if (!runEnvelopes.has(env)) {
+    throw new Error('run envelope was not produced by runSlate (forged or substituted)');
+  }
+}
+
+/**
+ * Authenticate the run envelope and reconcile the five load-bearing RunContext
+ * fields against it (A4/A5). Returns the AUTHORITATIVE values derived from the
+ * envelope (`slateDate` from the sealed slate, the other four from `dispatch`);
+ * a separately-supplied context that disagrees on any of the five fails closed
+ * before the producer writes anything. The producer records these five from the
+ * returned bound values and its other seven fields from the context verbatim.
+ */
+export function authenticateRun(env: RunEnvelope, ctx: BoundRunContext): BoundRunContext {
+  assertRunEnvelope(env);
+  const bound: BoundRunContext = {
+    slateDate: env.snapshot.slate.slateDate,
+    cohortId: env.dispatch.cohortId,
+    executionPolicy: env.dispatch.executionPolicy,
+    timeoutMs: env.dispatch.timeoutMs,
+    maxOutputTokens: env.dispatch.maxOutputTokens,
+  };
+  const disagreements: string[] = [];
+  if (ctx.slateDate !== bound.slateDate) {
+    disagreements.push(`slateDate (context ${ctx.slateDate} != envelope ${bound.slateDate})`);
+  }
+  if (ctx.cohortId !== bound.cohortId) {
+    disagreements.push(`cohortId (context ${ctx.cohortId} != envelope ${bound.cohortId})`);
+  }
+  if (ctx.executionPolicy !== bound.executionPolicy) {
+    disagreements.push(
+      `executionPolicy (context ${ctx.executionPolicy} != envelope ${bound.executionPolicy})`,
+    );
+  }
+  if (ctx.timeoutMs !== bound.timeoutMs) {
+    disagreements.push(`timeoutMs (context ${ctx.timeoutMs} != envelope ${bound.timeoutMs})`);
+  }
+  if (ctx.maxOutputTokens !== bound.maxOutputTokens) {
+    disagreements.push(
+      `maxOutputTokens (context ${ctx.maxOutputTokens} != envelope ${bound.maxOutputTokens})`,
+    );
+  }
+  if (disagreements.length > 0) {
+    throw new Error(
+      `run context disagrees with the sealed run envelope on: ${disagreements.join('; ')}`,
+    );
+  }
+  return bound;
+}
+
 /**
  * Validate and seal the dispatched games into one frozen, branded snapshot,
  * BEFORE any provider call. Every request must be genuinely prepared, game IDs
@@ -74,16 +165,21 @@ export function assertSealed(snapshot: DispatchSnapshot): void {
  * array included — is deep-frozen and registered in the seal brand.
  */
 export function sealDispatch(prepared: readonly PreparedGameRequest[]): DispatchSnapshot {
-  const first = prepared[0];
+  // A1: capture the batch EXACTLY ONCE into a new plain array. An accessor- or
+  // proxy-backed container can hand back a different element per read; from here
+  // on every read is from this stable copy, never the caller's container, and
+  // the copy (not the caller's array) is what the snapshot retains.
+  const captured: readonly PreparedGameRequest[] = Array.from(prepared);
+  const first = captured[0];
   if (first === undefined) {
     throw new Error('cannot seal a dispatch snapshot from zero prepared requests');
   }
+  // Assert every captured element's runtime origin BEFORE reading any of its
+  // fields, so a forged element is rejected before its `requestBundle` is read.
+  for (const p of captured) assertPrepared(p);
   const base = first.requestBundle;
   const seenIds = new Set<string>();
-  for (const p of prepared) {
-    // Only genuinely-prepared requests may enter a sealed snapshot, so a sealed
-    // snapshot transitively guarantees its prepared are branded.
-    assertPrepared(p);
+  for (const p of captured) {
     if (seenIds.has(p.gameId)) {
       throw new Error(`duplicate game ID in the dispatch batch: ${p.gameId}`);
     }
@@ -99,10 +195,10 @@ export function sealDispatch(prepared: readonly PreparedGameRequest[]): Dispatch
       throw new Error(`dispatch batch mixes slate metadata (game ${p.gameId})`);
     }
   }
-  const byGameId = [...prepared].sort((a, b) =>
+  const byGameId = [...captured].sort((a, b) =>
     a.gameId < b.gameId ? -1 : a.gameId > b.gameId ? 1 : 0,
   );
-  const cutoffAt = prepared
+  const cutoffAt = captured
     .map((p) => p.cutoffAt)
     .reduce((min, c) => (instantMs(c) < instantMs(min) ? c : min));
   const slate: SlateBundle = {
@@ -114,7 +210,7 @@ export function sealDispatch(prepared: readonly PreparedGameRequest[]): Dispatch
     cutoffAt,
     games: byGameId.map((p) => p.game),
   };
-  const snapshot = deepFreeze({ prepared, slate, slateSha256: sha256Hex(canonicalize(slate)) });
+  const snapshot = deepFreeze({ prepared: captured, slate, slateSha256: sha256Hex(canonicalize(slate)) });
   sealedSnapshots.add(snapshot);
   return snapshot;
 }
@@ -124,6 +220,12 @@ export interface SlateRunOptions {
   timeoutMs: number;
   /** Explicit output-token bound applied to every live call and recorded. */
   maxOutputTokens: number;
+  /**
+   * The run's declared execution policy — bound into the run envelope's
+   * `dispatch` (A4) AND echoed into every prompt, so the recorded policy is
+   * single-sourced with what the model is asked to echo back.
+   */
+  executionPolicy: 'fixed-moneyline-total';
   /**
    * Injected clock (epoch ms) used BOTH for cutoff enforcement (checked
    * before initial dispatch, before repair, and on response acceptance) AND
@@ -274,7 +376,7 @@ export async function runOneArmGame(
     cohortId: options.cohortId,
     participantId: arm.participantId,
     requestedModelId: arm.requestedModelId,
-    executionPolicy: 'fixed-moneyline-total',
+    executionPolicy: options.executionPolicy,
     request,
   });
   const baseTurns: ChatTurn[] = [
@@ -427,12 +529,56 @@ export async function runOneArmGame(
  * throw aborts the run (nonzero exit, no artifact); in the watcher it is caught
  * per game and recorded as that game's fire failure.
  */
+/**
+ * A3 construction invariant: the completed results must be exactly the
+ * `expectedArms × dispatched-games` grid — every cell present exactly once, no
+ * foreign arm, no duplicate. runSlate builds this by construction; asserting it
+ * before sealing turns any future regression into a loud failure rather than a
+ * silently incomplete artifact.
+ */
+function assertCompleteGrid(
+  results: readonly ArmGameResult[],
+  expectedArms: readonly string[],
+  prepared: readonly PreparedGameRequest[],
+): void {
+  const expected = new Set(expectedArms);
+  const seen = new Set<string>();
+  for (const r of results) {
+    if (!expected.has(r.arm.participantId)) {
+      throw new Error(`run produced a result for an unexpected arm: ${r.arm.participantId}`);
+    }
+    const cell = `${r.arm.participantId}:${r.gameId}`;
+    if (seen.has(cell)) throw new Error(`run produced a duplicate result for ${cell}`);
+    seen.add(cell);
+  }
+  for (const request of prepared) {
+    for (const armId of expectedArms) {
+      if (!seen.has(`${armId}:${request.gameId}`)) {
+        throw new Error(`run is missing a result for ${armId} on game ${request.gameId}`);
+      }
+    }
+  }
+}
+
 export async function runSlate(
   arms: ArmSpec[],
   adapters: Map<string, ProviderAdapter>,
   requests: GameRequest[],
   options: SlateRunOptions,
-): Promise<SlateRunResult> {
+): Promise<RunEnvelope> {
+  // A3: reject a duplicate configured participantId BEFORE any provider call, so
+  // the dispatched roster is inherently unique (no silent dedup). `expectedArms`
+  // is the manifest of that roster, carried in the envelope.
+  const expectedArms: string[] = [];
+  const seenArms = new Set<string>();
+  for (const arm of arms) {
+    if (seenArms.has(arm.participantId)) {
+      throw new Error(`duplicate participantId in the dispatch roster: ${arm.participantId}`);
+    }
+    seenArms.add(arm.participantId);
+    expectedArms.push(arm.participantId);
+  }
+
   // Seal + validate the whole batch BEFORE any provider call (unique game IDs,
   // identical shared slate metadata, genuine prepared origin). Dispatch then
   // runs on the sealed snapshot, and the artifact is built from it.
@@ -457,8 +603,22 @@ export async function runSlate(
       options.onGameComplete(`game ${index}/${snapshot.prepared.length} ${request.slug}: ${cells}`);
     }
   }
-  // Freeze the results collection and the result envelope — nothing downstream
-  // may mutate what the artifact is built from (the snapshot is already sealed).
-  Object.freeze(all);
-  return Object.freeze({ results: all, snapshot });
+
+  assertCompleteGrid(all, expectedArms, snapshot.prepared);
+
+  // A2/A5: deep-freeze the whole envelope graph and brand it, so the producers
+  // authenticate ONE immutable value as the source of all dispatched evidence.
+  const envelope: RunEnvelope = deepFreeze({
+    snapshot,
+    results: all,
+    expectedArms,
+    dispatch: {
+      cohortId: options.cohortId,
+      executionPolicy: options.executionPolicy,
+      timeoutMs: options.timeoutMs,
+      maxOutputTokens: options.maxOutputTokens,
+    },
+  });
+  runEnvelopes.add(envelope);
+  return envelope;
 }
