@@ -5,6 +5,7 @@ import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
+import type { PreparedGameRequest } from './preparedRequest.js';
 import type { CollisionCheckResult } from './providers/family.js';
 import type { ArmGameResult, AttemptRecord, BaselineDecision } from './types.js';
 
@@ -125,14 +126,20 @@ export function failuresByCode(failures: string[]): Map<string, string[]> {
 export function buildRecords(
   ctx: RunContext,
   build: BuildResult,
+  prepared: PreparedGameRequest[],
   armGameResults: ArmGameResult[],
   baselineDecisions: BaselineDecision[],
   collision: CollisionCheckResult,
 ): JsonRecord[] {
   const records: JsonRecord[] = [];
-  const { slateBundle, slateSha256, requests, gameHashes, excluded, provenance } = build;
-  const requestShaByGame = new Map(requests.map((r) => [r.gameId, r.requestSha256]));
-  const cutoffByGame = new Map(requests.map((r) => [r.gameId, r.requestBundle.cutoffAt]));
+  const { slateBundle, slateSha256, excluded, provenance } = build;
+  // Every per-game record derives from the frozen, hash-verified `prepared`
+  // snapshot that was actually dispatched — never from a separate build alias —
+  // so the recorded game, its hash, and its cutoff are provably the bytes the
+  // provider saw (SPEC-prepared-request.md §2.4).
+  const requestShaByGame = new Map(prepared.map((r) => [r.gameId, r.requestSha256]));
+  const cutoffByGame = new Map(prepared.map((r) => [r.gameId, r.cutoffAt]));
+  const gameShaByGame = new Map(prepared.map((r) => [r.gameId, r.gameSha256]));
 
   records.push({
     recordType: 'run_meta',
@@ -173,15 +180,19 @@ export function buildRecords(
     ...(ctx.watch !== undefined ? { watch: ctx.watch } : {}),
   });
 
-  for (const request of requests) {
+  for (const request of prepared) {
+    // `bundle` is the frozen prepared game itself. Its serialized byte layout
+    // follows the prepared-request schema's key order, whereas `gameSha256` is
+    // order-independent (canonicalize sorts keys) — so a future field reorder
+    // would change these recorded bytes but never the hash, the joins, or scoring.
     records.push({
       recordType: 'bundle_game',
       label: SMOKE_LABEL,
       runId: ctx.runId,
       gameId: request.gameId,
-      gameSha256: gameHashes[request.gameId] ?? null,
+      gameSha256: request.gameSha256,
       requestSha256: request.requestSha256,
-      cutoffAt: request.requestBundle.cutoffAt,
+      cutoffAt: request.cutoffAt,
       slug: request.slug,
       bundle: request.game,
       sourceOddsRows: provenance[request.gameId]?.oddsRows ?? [],
@@ -204,7 +215,7 @@ export function buildRecords(
       runId: ctx.runId,
       cohortId: ctx.cohortId,
       slateSha256,
-      gameSha256: gameHashes[decision.gameId] ?? null,
+      gameSha256: gameShaByGame.get(decision.gameId) ?? null,
       requestSha256: requestShaByGame.get(decision.gameId) ?? null,
       cutoffAt: cutoffByGame.get(decision.gameId) ?? null,
       ...decision,
@@ -245,7 +256,7 @@ export function buildRecords(
           cohortId: ctx.cohortId,
           participantId: result.arm.participantId,
           slateSha256,
-          gameSha256: gameHashes[game.gameId] ?? null,
+          gameSha256: gameShaByGame.get(game.gameId) ?? null,
           bundleSha256: result.requestSha256,
           cutoffAt: result.cutoffAt,
           gameId: game.gameId,

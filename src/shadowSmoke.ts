@@ -218,7 +218,7 @@ async function main(): Promise<number> {
     `dispatching per game in cutoff order: ${build.requests.length} games sequential, ` +
       `${ARMS.length} arms concurrent per game (sealed per game) ...`,
   );
-  const armGameResults = await runSlate(ARMS, adapters, build.requests, {
+  const { results: armGameResults, prepared } = await runSlate(ARMS, adapters, build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
@@ -240,7 +240,7 @@ async function main(): Promise<number> {
     })),
   );
 
-  const records = buildRecords(ctx, build, armGameResults, baselineDecisions, collision);
+  const records = buildRecords(ctx, build, prepared, armGameResults, baselineDecisions, collision);
   const ndjsonPath = join(options.outDir, `${ctx.runId}.ndjson`);
   const summaryPath = join(options.outDir, `${ctx.runId}-summary.md`);
   writeNdjson(ndjsonPath, records);

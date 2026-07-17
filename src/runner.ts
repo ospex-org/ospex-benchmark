@@ -20,6 +20,18 @@ import type {
   RepairTransport,
 } from './types.js';
 
+/**
+ * The dispatched slate: the per-arm results, plus the frozen, hash-verified
+ * requests that were actually dispatched (one per game, in cutoff order). The
+ * records builder serializes THIS `prepared` array — the exact same frozen
+ * snapshot that fed the prompt and the hashes — so a recorded game can never be
+ * a different alias than the one the provider saw (SPEC-prepared-request.md §2.4).
+ */
+export interface SlateRunResult {
+  results: ArmGameResult[];
+  prepared: PreparedGameRequest[];
+}
+
 export interface SlateRunOptions {
   cohortId: string;
   timeoutMs: number;
@@ -333,7 +345,7 @@ export async function runSlate(
   adapters: Map<string, ProviderAdapter>,
   requests: GameRequest[],
   options: SlateRunOptions,
-): Promise<ArmGameResult[]> {
+): Promise<SlateRunResult> {
   const prepared: PreparedGameRequest[] = requests.map(prepareGameRequest);
   const all: ArmGameResult[] = [];
   let index = 0;
@@ -355,5 +367,5 @@ export async function runSlate(
       options.onGameComplete(`game ${index}/${prepared.length} ${request.slug}: ${cells}`);
     }
   }
-  return all;
+  return { results: all, prepared };
 }

@@ -130,10 +130,13 @@ function twoGames(valid: GameRequest): GameRequest {
 test('the three-market request prepares and dispatches to every arm', async () => {
   const validRaw = makeRequest(CUTOFF);
   const { adapters, totalCalls } = makeAdapters(true, validRaw);
-  const results = await runSlate(ARMS, adapters, [validRaw], options());
+  const { results, prepared } = await runSlate(ARMS, adapters, [validRaw], options());
   assert.equal(results.length, ARMS.length);
   for (const result of results) assert.equal(result.outcome, 'valid');
   assert.equal(totalCalls(), ARMS.length); // exactly one call per arm
+  // runSlate surfaces the exact frozen requests it dispatched (for records).
+  assert.equal(prepared.length, 1);
+  assert.equal(prepared[0]?.requestSha256, validRaw.requestSha256);
 });
 
 // Each failure rejects at a DIFFERENT stage of preparation (alias check,

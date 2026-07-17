@@ -673,7 +673,7 @@ export async function fireEligibleGame(
     watch: provenance,
   };
 
-  const armGameResults = await runSlate(cfg.arms, cfg.adapters, build.requests, {
+  const { results: armGameResults, prepared } = await runSlate(cfg.arms, cfg.adapters, build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
@@ -695,7 +695,7 @@ export async function fireEligibleGame(
     })),
   );
 
-  const records = buildRecords(ctx, build, armGameResults, baselineDecisions, collision);
+  const records = buildRecords(ctx, build, prepared, armGameResults, baselineDecisions, collision);
   const runFile = join(cfg.outDir, `${ctx.runId}.ndjson`);
   writeNdjson(runFile, records);
   writeText(
