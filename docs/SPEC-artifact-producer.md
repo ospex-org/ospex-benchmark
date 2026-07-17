@@ -10,7 +10,10 @@ value, so no downstream producer can be handed a split, substituted, mutated, or
 incomplete run.
 
 **Why it exists.** The credibility of every recorded artifact rests on the claim
-that the bytes written are the bytes dispatched and returned. After S1c the
+that its recorded **request** evidence is the normalized, hash-verified bytes that
+were **dispatched**, and its recorded **response** evidence is exactly what the
+**runner captured** from each provider (after secret redaction) — neither split
+across mutable aliases nor swapped after the fact. After S1c the
 *dispatch snapshot* is unforgeable, but the producer still assembles the artifact
 from **three independently-supplied inputs that feed its dispatched claims** — the
 sealed `snapshot`, a separate `ArmGameResult[]`, and a separate load-bearing
@@ -50,8 +53,8 @@ of scope, not a blocker):
   `Array.from`, `structuredClone`, `JSON`, or prototype tampering. Brands and
   freezes assume honest built-ins.
 - **Provider / network dishonesty**: a lying model, a spoofed HTTP response. The
-  provider-response bytes are recorded as returned; their *truth* is not S1d's
-  concern.
+  runner records each response as it captured it (after secret redaction —
+  unchanged by S1d); the *truth* of those bytes is not S1d's concern.
 - **Caller-supplied build / run inputs that are not dispatched evidence** — a
   `BuildResult` (`provenance` / `excluded`) or a `CollisionCheckResult` that
   disagrees with the run. These drive `bundle_game.sourceOddsRows`,
@@ -126,7 +129,7 @@ universal ("unforgeable against any caller") guarantee.
 | **A3** | **Unique, complete-by-construction result grid.** `runSlate` rejects a **duplicate participantId** in the dispatched roster **before any provider call**. It then produces exactly the `expectedArms × dispatched-game` grid (it maps over the unique roster × every game), so the grid is complete-and-unique **by construction** — asserted before sealing as defense-in-depth, not re-derived from a substitutable array. `expectedArms` = the dispatched roster's participantIds. Because the complete grid lives **inside** the branded, deep-frozen envelope, no caller can hand a producer a filtered/omitting result set — A5 rejects a forged wrapper and A2 freezes the real one. | Reject-duplicate-before-dispatch; grid completeness is a construction invariant carried inside the brand, never re-derived from a caller-supplied array. | A misconfigured roster with a **duplicate** arm (otherwise billed and recorded twice). *(A forged/filtered result set that omits an arm is rejected by A5+A2; a genuinely-configured **subset** run is legitimate — full-*expected*-roster completeness is the scorer's backstop, §5.)* |
 | **A4** | **Bound load-bearing context.** The five load-bearing fields are `{ slateDate, cohortId, executionPolicy, timeoutMs, maxOutputTokens }`. The producer **derives** them from the envelope (`slateDate` from `snapshot.slate.slateDate`; the other four from `dispatch`) and records those authoritative values; a separately-supplied `RunContext` that **disagrees on any of the five fails closed** before writing. No other `RunContext` field is bound (§4). | Derive-from-envelope; equality-gate the caller's `RunContext` on the five. | Supplying a `RunContext` with a different `slateDate` or `cohortId` so `run_meta` / recorded picks contradict the dispatched (and model-echoed) values. |
 | **A5** | **Whole-envelope authentication.** `buildRecords` and `buildSummaryMarkdown` accept **the branded envelope** (not independent `snapshot` + `results` + dispatch-context) and call `assertRunEnvelope(env)` before emitting anything; a forged or substituted envelope wrapper is rejected. | Module-private `WeakSet` brand; single authenticated authority for all dispatched evidence. | Hand-building an envelope-shaped object (genuine or filtered nested pieces, substituted wrapper) and passing it to a producer. |
-| **A6** | **Byte-compatible production output.** For a valid run on the real smoke/watch path, the produced artifact (deterministic records **and** `run_meta`) is **byte-identical** to pre-S1d `main` (runId + createdAt normalized). Deep-freeze is byte-neutral; derive-from-envelope is byte-identity-or-rejection (a disagreeing `RunContext` is rejected, never silently re-serialized). The gain is the integrity *guarantee*, not different bytes. | Provenance-only refactor; no value path changes. | Silent output drift hiding behind an integrity change. |
+| **A6** | **Byte-compatible output across both governed producers.** On a deterministic production fixture (stub adapters + synthetic clock), **both** producer outputs are **byte-identical** to pre-S1d `main`: (1) the **complete NDJSON record sequence** — every record type, including the `arm_game_response` / decision records whose result handoff S1d changes, not only `run_meta` + the deterministic records; and (2) the **`buildSummaryMarkdown`** output — after normalizing an **explicitly-listed** set of volatile fields (`runId`, `createdAt`). Deep-freeze is byte-neutral; derive-from-envelope is byte-identity-or-rejection (a disagreeing `RunContext` is rejected, never silently re-serialized). Full tests, dry smoke, and `verifyRunIntegrity(...) === []` are **additional** A6 gates. The gain is the integrity *guarantee*, not different bytes. | Provenance-only refactor over both governed producers; no value path changes. | Silent output drift — in the record sequence OR the summary — hiding behind an integrity change. |
 
 **No new blocker may be added to S1d unless it disproves one of A1–A6 within the
 §1 threat model.** Discovered hardening outside this set is roadmapped, not
@@ -206,9 +209,11 @@ Not part of S1d; each is tracked elsewhere:
 - **A5** — a forged/substituted envelope wrapper (genuine or filtered nested
   pieces, e.g. a result graph missing an arm) is rejected by both `buildRecords`
   and `buildSummaryMarkdown` at `assertRunEnvelope`.
-- **A6** — the normal produced artifact (deterministic records + `run_meta`) is
-  byte-identical to `main` after runId/createdAt normalization; the full suite
-  and dry smoke stay green; `verifyRunIntegrity` returns `[]` for a produced run.
+- **A6** — on a deterministic production fixture (stub adapters + synthetic
+  clock), the **complete NDJSON record sequence** *and* the **summary markdown**
+  are byte-identical to pre-S1d `main` after normalizing the listed volatile
+  fields (`runId`, `createdAt`); additionally, the full suite and dry smoke stay
+  green and `verifyRunIntegrity(...)` returns `[]` for a produced run.
 
 ## 7. Decomposition (spec-first, then one implementation PR)
 
