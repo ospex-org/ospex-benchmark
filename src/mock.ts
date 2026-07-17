@@ -200,7 +200,8 @@ function buildSchemaInvalidResponse(payload: RequestPayload): BenchmarkResponse 
   const invalid = structuredClone(buildValidResponse(payload));
   const game = invalid.games[0];
   if (game) {
-    // Drop the spread forecast: violates the exactly-three-forecasts contract.
+    // Drop the spread forecast: on this full board it leaves a supplied market
+    // unforecast, which the validator's supplied-market gate rejects.
     game.forecasts = game.forecasts.filter((f) => f.market !== 'spread');
     const forecast = game.forecasts[0];
     if (forecast) {
