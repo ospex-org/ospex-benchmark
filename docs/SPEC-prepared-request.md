@@ -5,8 +5,12 @@ identity** that every downstream surface derives from. It is the foundation the
 per-market (dynamic-cardinality) work sits on top of.
 
 **Why it exists.** A benchmark whose credibility rests on a content hash must
-guarantee that the bytes hashed are the bytes prompted, validated, scored, and
-recorded — one object, not several independently-mutable aliases. Today the
+guarantee that the object hashed is the object prompted, validated, scored, and
+recorded — one canonical value, not several independently-mutable aliases. The
+prompt pretty-prints the bundle inside a larger payload, so the bytes are not
+literally identical; the guarantee is that **parsing and canonicalizing the
+prompted bundle reproduces exactly the canonical bytes that were hashed** — same
+fields and values, insignificant JSON formatting aside. Today the
 runner carries `request.gameId`, `request.game`, `requestBundle.games[0]`,
 `requestBundle.cutoffAt`, and `requestSha256` as separate values that
 `buildBundle` happens to create coherently but nothing re-establishes at the
@@ -53,20 +57,19 @@ A `PreparedGameRequest` is the only value the dispatch path may consume.
   canonical value, not independent aliases.
 - `requestBundle.cutoffAt === game.scheduledStartUtc` (the current first-pitch
   cutoff contract): the cutoff cannot be widened past the scheduled start.
-- `requestSha256` is **recomputed** from the normalized request bundle; a
-  supplied hash that does not match is a rejection, never a pass.
+- `requestSha256 = sha256Hex(canonicalize(prepared.requestBundle))` —
+  **recomputed** from the normalized snapshot; a supplied hash that does not
+  match is a rejection, never a pass.
 - `gameSha256` and any slate/record linkage derive from the **same** snapshot.
 - Every timestamp is a canonical offset-qualified instant (the shared instant
   boundary); a malformed timestamp is rejected.
 
-### 2.2 Scoped markets
+### 2.2 Market blocks and cardinality
 
-- **1–3** present markets. Absence means an **omitted own property**; a present
-  own key must hold a structurally-valid block. Runtime enforcement is
-  mandatory; a static `AtLeastOne` type is optional — absent it, do not claim
-  static enforcement.
-- Every block is normalized from the parser's `.data` (plain data), not the
-  original object.
+Block coherence (applies from **S1**, to whatever markets the contract requires):
+
+- Every present market block is normalized from the parser's `.data` (plain
+  data), not the original object.
 - Prices (`awayDecimal`/`homeDecimal`/`overDecimal`/`underDecimal`) are finite
   decimal odds **> 1**; run-line/total `line` is finite.
 - `observedAt` is a canonical offset-qualified instant and must not postdate the
@@ -78,6 +81,18 @@ A `PreparedGameRequest` is the only value the dispatch path may consume.
 - Unknown market keys, inherited market keys, and unknown/extra model-facing
   fields are rejected (or explicitly stripped before hashing/prompting under a
   versioned data policy) — never silently carried.
+
+**Cardinality is slice-owned** — the prepared request carries exactly the
+runner's current market contract:
+
+- **S1:** the **three fixed markets** (moneyline, run line, total) — all present
+  and coherent. A request missing any of the three, or carrying an unknown/extra
+  market, is rejected. **S1 introduces no 1–3 behavior.**
+- **S3:** relaxed to **1–3 present markets**, where absence is an omitted own
+  property and each present market is a structurally-valid block.
+
+Runtime enforcement is mandatory; a static `AtLeastOne` type (an S3 nicety) is
+optional — absent it, do not claim static enforcement.
 
 ### 2.3 Side-effect boundary
 
@@ -96,6 +111,18 @@ The exact same frozen snapshot feeds: canonical request/game hashes; prompt
 serialization; cutoff enforcement; response validation; repair fingerprinting;
 deterministic baselines; `bundle_game`/decision/arm-response records; and
 summaries. A mutation attempt after preparation changes none of these surfaces.
+The prompt may embed the bundle in a larger, differently-formatted JSON payload,
+but `canonicalize(parse(promptedBundle))` yields exactly the bytes used to derive
+`requestSha256`, with no differing field or value.
+
+### 2.5 The pre-claim snapshot is not the prepared request
+
+The evidence model takes a **pre-claim** detection/source snapshot (the candidate
+set observed at detection; evidence spec §3–§4). `PreparedGameRequest` is the
+**final** projection produced **after** retained-scope selection — the exact
+scope that will actually be dispatched. They are different objects: dispatch and
+hashing consume the final `PreparedGameRequest`, never the pre-claim candidate
+set, so a **partial claim cannot dispatch a scope wider than what was retained**.
 
 ## 3. Baseline policy-version isolation
 
@@ -117,6 +144,11 @@ Therefore:
 - Scoring preserves archived `v0.1`/`v0.2` full-board replay and refuses an
   old-version/scoped artifact.
 
+**Slice ownership.** **S2** lands the `v0.1`/`v0.2` full-board guards (fail closed
+on scoped input) and the version gate; it does **not** add any `v0.3` scoped
+behavior. **S3** introduces `v0.3`'s scoped derivation and exercises the
+seven-combination behavior.
+
 ## 4. Committed-contract wording
 
 Benchmark comments and docs are part of the evidence contract; these are fixed in
@@ -133,30 +165,43 @@ the same work:
 
 ## 5. Test matrix
 
-One table-driven suite per group, not scattered patches.
+Table-driven per slice; **each test is owned by exactly one slice** — the
+prepared-request boundary is exercised at exactly three markets in S1, and the
+dynamic 1–3-market / seven-combination behavior belongs to S3.
 
-**Prepared request (§1–2):**
-- the seven non-empty market combinations prepare and dispatch cleanly;
-- empty scope → zero adapter calls;
-- null/primitive/missing-field block → zero adapter calls;
-- mismatched supplied `requestSha256` → zero calls;
-- `gameId` / `game` / bundle-game mismatch → zero calls;
-- zero-game, multi-game, duplicate-game bundle → zero calls;
-- cutoff widened past `scheduledStartUtc` → zero calls;
+**S1 — prepared request (three fixed markets):**
+- the three-market request prepares and dispatches cleanly;
+- a request missing any of the three markets, or carrying an unknown/extra
+  market key → zero adapter calls;
+- a null/primitive/missing-field block → zero adapter calls;
+- a mismatched supplied `requestSha256` → zero calls;
+- `gameId` / `game` / bundle-game alias mismatch → zero calls;
+- a zero-game, multi-game, or duplicate-game bundle → zero calls;
+- a cutoff widened past `scheduledStartUtc` → zero calls;
 - an accessor reading `1.9` then `99` cannot make `99` validate;
 - inherited/custom `toJSON` cannot change the prompted markets;
-- the canonicalized prompted bundle exactly matches the value used to derive
-  `requestSha256`;
-- records serialize the exact prompted game;
+- `canonicalize(parse(promptedBundle))` equals the canonical bytes used to
+  derive `requestSha256`;
+- records serialize the exact prepared game;
 - a mutation after preparation changes nothing downstream;
 - contradictory handicap / timestamp / evidence-ref blocks fail preparation.
 
-**Baseline isolation (§3):**
+**S2 — baseline version isolation (historical guards only):**
 - `v0.1`/`v0.2` full-board goldens unchanged;
-- every 1- and 2-market bundle is rejected under `v0.1`/`v0.2`;
-- all seven non-empty scopes work under `v0.3`;
+- every 1- and 2-market input is rejected under `v0.1`/`v0.2` (fail closed — no
+  partial set);
 - an unknown version stays rejected;
 - a new dynamic cohort cannot boot with `v0.1`/`v0.2`.
+- *(No `v0.3` scoped behavior is added or tested at S2.)*
+
+**S3 — dynamic cardinality + `v0.3` scoped baselines:**
+- the prepared boundary now accepts **1–3** present markets (absence = omitted
+  own property);
+- all **seven** non-empty market combinations prepare, dispatch, validate, and
+  baseline under `v0.3`;
+- `v0.3` derives the baseline set from the present markets, while `v0.1`/`v0.2`
+  still reject scoped input;
+- the archived three-market corpus still replays.
 
 ## 6. Now vs later (the staged boundary)
 
@@ -186,9 +231,9 @@ hard-disabled.
 
 | # | Slice | Scope |
 |---|---|---|
-| **S1** | Prepared request | `prepareGameRequest` + `PreparedGameRequest` (§1–2), wired at the dispatch boundary + user-message guard, with the §5 prepared-request matrix. Built for the current three-market bundle — no cardinality change. May split S1a (pure boundary + parse/derive/freeze/invariants) / S1b (dispatch wiring + zero-adapter-call proof) if the diff runs large. |
-| **S2** | Baseline version isolation | §3, with the §3 matrix. Separable. |
-| **S3** | Dynamic cardinality | Relax the prepared boundary's market count to 1–3 as a producer and re-home the validator/baselines/prompt "derive from present markets" logic on top of the prepared snapshot; fold in §4 wording. |
+| **S1** | Prepared request | `prepareGameRequest` + `PreparedGameRequest` (§1–2), wired at the dispatch boundary + user-message guard, with the §5 **S1** matrix. Uses **exactly the current three markets** — no 1–3 behavior, no cardinality change. May split S1a (pure boundary: parse/derive/freeze/invariants) / S1b (dispatch wiring + zero-adapter-call proof) if the diff runs large. |
+| **S2** | Baseline version isolation | §3 **S2** part only — the `v0.1`/`v0.2` full-board guards + fail-closed-on-scoped-input + version gate, with the §5 **S2** matrix. **No `v0.3` scoped behavior.** Separable. |
+| **S3** | Dynamic cardinality + `v0.3` | Relax the prepared boundary to **1–3** present markets; introduce the `v0.3` scoped baselines; re-home the validator/baselines/prompt "derive from present markets" logic (keep the `runLine` name); run all **seven** combinations (§5 **S3**); fold in the §4 wording. |
 
 Then the previously-planned fire-artifact / detection / claim slices, which now
 build on a request they can trust.
