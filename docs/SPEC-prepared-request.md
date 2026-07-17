@@ -144,10 +144,13 @@ Therefore:
 - Scoring preserves archived `v0.1`/`v0.2` full-board replay and refuses an
   old-version/scoped artifact.
 
-**Slice ownership.** **S2** lands the `v0.1`/`v0.2` full-board guards (fail closed
-on scoped input) and the version gate; it does **not** add any `v0.3` scoped
-behavior. **S3** introduces `v0.3`'s scoped derivation and exercises the
-seven-combination behavior.
+**Slice ownership.** **S2** lands the `v0.1`/`v0.2` full-board input guards (fail
+closed on scoped input), the unchanged historical goldens, and unknown-version
+rejection; it does **not** add any `v0.3` scoped behavior. S2 also cannot
+identify a "dynamic cohort" at boot — the manifest carries no scope/dynamic
+marker yet — so the **dynamic-cohort boot/runtime gate belongs to S3**. **S3**
+introduces `v0.3`'s scoped derivation, the dynamic-cohort gate (a dynamic cohort
+requires `v0.3`), and the seven-combination behavior.
 
 ## 4. Committed-contract wording
 
@@ -190,9 +193,9 @@ dynamic 1–3-market / seven-combination behavior belongs to S3.
 - `v0.1`/`v0.2` full-board goldens unchanged;
 - every 1- and 2-market input is rejected under `v0.1`/`v0.2` (fail closed — no
   partial set);
-- an unknown version stays rejected;
-- a new dynamic cohort cannot boot with `v0.1`/`v0.2`.
-- *(No `v0.3` scoped behavior is added or tested at S2.)*
+- an unknown version stays rejected.
+- *(No `v0.3` scoped behavior, and no dynamic-cohort gate, at S2 — the manifest
+  has no dynamic marker yet.)*
 
 **S3 — dynamic cardinality + `v0.3` scoped baselines:**
 - the prepared boundary now accepts **1–3** present markets (absence = omitted
@@ -201,6 +204,8 @@ dynamic 1–3-market / seven-combination behavior belongs to S3.
   baseline under `v0.3`;
 - `v0.3` derives the baseline set from the present markets, while `v0.1`/`v0.2`
   still reject scoped input;
+- a dynamic cohort requires `v0.3` (the boot/runtime gate); a scoped prepared
+  request is refused under `v0.1`/`v0.2`;
 - the archived three-market corpus still replays.
 
 ## 6. Now vs later (the staged boundary)
@@ -232,8 +237,8 @@ hard-disabled.
 | # | Slice | Scope |
 |---|---|---|
 | **S1** | Prepared request | `prepareGameRequest` + `PreparedGameRequest` (§1–2), wired at the dispatch boundary + user-message guard, with the §5 **S1** matrix. Uses **exactly the current three markets** — no 1–3 behavior, no cardinality change. May split S1a (pure boundary: parse/derive/freeze/invariants) / S1b (dispatch wiring + zero-adapter-call proof) if the diff runs large. |
-| **S2** | Baseline version isolation | §3 **S2** part only — the `v0.1`/`v0.2` full-board guards + fail-closed-on-scoped-input + version gate, with the §5 **S2** matrix. **No `v0.3` scoped behavior.** Separable. |
-| **S3** | Dynamic cardinality + `v0.3` | Relax the prepared boundary to **1–3** present markets; introduce the `v0.3` scoped baselines; re-home the validator/baselines/prompt "derive from present markets" logic (keep the `runLine` name); run all **seven** combinations (§5 **S3**); fold in the §4 wording. |
+| **S2** | Baseline version isolation | §3 **S2** part only — the `v0.1`/`v0.2` full-board guards + fail-closed-on-scoped-input + unknown-version rejection, with the §5 **S2** matrix. **No `v0.3` scoped behavior and no dynamic-cohort gate.** Separable. |
+| **S3** | Dynamic cardinality + `v0.3` | Relax the prepared boundary to **1–3** present markets; introduce the `v0.3` scoped baselines and the **dynamic-cohort boot gate** (a dynamic cohort requires `v0.3`); re-home the validator/baselines/prompt "derive from present markets" logic (keep the `runLine` name); run all **seven** combinations (§5 **S3**); fold in the §4 wording. |
 
 Then the previously-planned fire-artifact / detection / claim slices, which now
 build on a request they can trust.

@@ -3,9 +3,9 @@
 **What this is:** a slicing-and-sequencing plan for **PR 1** of the Tier-0 line-open runner,
 chopped into small, single-purpose, independently-mergeable sub-PRs.
 
-**What this is NOT:** a spec. The two merged specs (`SPEC-line-open-evidence-model.md`,
-`SPEC-line-open-speculation-runner.md`) are the contract; this only says *how the work is
-sliced and in what order*.
+**What this is NOT:** a spec. The specs (`SPEC-line-open-evidence-model.md`,
+`SPEC-line-open-speculation-runner.md`, and `SPEC-prepared-request.md`) are the contract;
+this only says *how the work is sliced and in what order*.
 
 **Review scope:** *is this the right decomposition + ordering?* — **not** the design (that
 is settled in the specs). Please don't grow this doc into another spec; sizes/deps are
@@ -35,7 +35,7 @@ Re-sequenced accordingly (see `SPEC-prepared-request.md` for the contract):
   on top of S1's prepared request. The validator/baseline/prompt derivations from
   the closed first attempt are reused.
 
-S1→S2→S3 replace the single "1.4" row below; 1.5 (attempt provenance) already
+S1→S2→S3 replace the former 1.4 work; 1.5 (attempt provenance) already
 merged; 1.6–1.9 follow S3 and now build on a request they can trust.
 
 ## PR 1 scope (spec §9)
