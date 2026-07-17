@@ -3,10 +3,11 @@ import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { PreparedRequestError, prepareGameRequest } from './preparedRequest.js';
 import { buildUserMessage } from './prompt.js';
-import { runSlate } from './runner.js';
+import { runOneArmGame, runSlate } from './runner.js';
 import type { SlateRunOptions } from './runner.js';
 import { makeRequest, makeValidResponse } from './testFactories.js';
 import type { GameRequest } from './bundle.js';
+import type { PreparedGameRequest } from './preparedRequest.js';
 import type { ArmSpec, ProviderAdapter, ProviderResponse } from './types.js';
 
 /**
@@ -187,4 +188,46 @@ test('the prompted bundle canonicalizes back to the exact bytes behind requestSh
   // caller supplied alongside an unrelated bundle.
   assert.equal(payload.bundleSha256, prepared.requestSha256);
   assert.equal(payload.decisionCutoffUtc, prepared.cutoffAt);
+});
+
+// The compile-time PreparedGameRequest type is erased at runtime, so a direct
+// caller could forge the shape. Both exported entry points must reject a forged
+// request at runtime — before serializing it or dispatching it to a model. Each
+// forgery throws on ANY property read, so a passing test proves the origin
+// guard fired FIRST: were the guard absent, buildUserMessage/runOneArmGame would
+// read a field and surface this Error instead of the clean PreparedRequestError.
+function forgedRequest(): PreparedGameRequest {
+  return new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('a field was read before the origin guard rejected the request');
+      },
+    },
+  ) as unknown as PreparedGameRequest;
+}
+
+test('buildUserMessage rejects a forged request before serializing anything', () => {
+  assert.throws(
+    () =>
+      buildUserMessage({
+        cohortId: COHORT,
+        participantId: ARM_A.participantId,
+        requestedModelId: ARM_A.requestedModelId,
+        executionPolicy: 'fixed-moneyline-total',
+        request: forgedRequest(),
+      }),
+    PreparedRequestError,
+  );
+});
+
+test('runOneArmGame rejects a forged request before any field read, with zero adapter calls', async () => {
+  const { adapter, calls } = countingAdapter(ARM_A, () =>
+    stubResponse('{}', ARM_A.requestedModelId),
+  );
+  await assert.rejects(
+    runOneArmGame(ARM_A, adapter, forgedRequest(), options()),
+    PreparedRequestError,
+  );
+  assert.equal(calls(), 0);
 });

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
-import { PreparedRequestError, prepareGameRequest } from './preparedRequest.js';
+import { assertPrepared, PreparedRequestError, prepareGameRequest } from './preparedRequest.js';
 import { makeRequest } from './testFactories.js';
 import type { GameRequest } from './bundle.js';
+import type { PreparedGameRequest } from './preparedRequest.js';
 
 /**
  * The pure prepared-request boundary (S1a, SPEC-prepared-request.md §1–2 and the
@@ -333,4 +334,31 @@ test('the prepared snapshot is a plain-data object graph — no custom prototype
   assert.equal(Object.getPrototypeOf(prepared.requestBundle), Object.prototype);
   assert.equal(Object.getPrototypeOf(prepared.game.markets.moneyline), Object.prototype);
   assert.ok(!('toJSON' in prepared.game));
+});
+
+test('assertPrepared accepts a real prepared request and rejects a forged look-alike', () => {
+  const prepared = prepareGameRequest(base());
+  assert.doesNotThrow(() => assertPrepared(prepared));
+
+  // A structural clone carries identical content but did NOT come through the
+  // boundary — the runtime brand rejects it by origin, not by shape (the
+  // TypeScript type would let it through).
+  const forged = structuredClone(prepared) as PreparedGameRequest;
+  assert.throws(() => assertPrepared(forged), PreparedRequestError);
+
+  // A hand-forged plain object of the same shape is likewise rejected.
+  const handForged = { ...prepared } as PreparedGameRequest;
+  assert.throws(() => assertPrepared(handForged), PreparedRequestError);
+
+  // A Proxy over the shape is a distinct identity too — rejected without ever
+  // reading a property (WeakSet membership is identity, not shape/access).
+  const proxied = new Proxy(
+    {},
+    {
+      get() {
+        throw new Error('assertPrepared must not read a property to reject');
+      },
+    },
+  ) as unknown as PreparedGameRequest;
+  assert.throws(() => assertPrepared(proxied), PreparedRequestError);
 });

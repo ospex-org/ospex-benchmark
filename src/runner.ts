@@ -7,7 +7,7 @@ import {
   validateResponseText,
 } from './schema.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
-import { prepareGameRequest } from './preparedRequest.js';
+import { assertPrepared, prepareGameRequest } from './preparedRequest.js';
 import type { GameRequest } from './bundle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
 import type {
@@ -117,6 +117,9 @@ export async function runOneArmGame(
   request: PreparedGameRequest,
   options: SlateRunOptions,
 ): Promise<ArmGameResult> {
+  // Runtime guard: never dispatch a request that did not come through the
+  // prepared boundary — before reading any field or touching an adapter method.
+  assertPrepared(request);
   const nowMs = options.nowMs ?? Date.now;
   const cutoffMs = Date.parse(request.cutoffAt);
   const base = {

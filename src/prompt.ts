@@ -1,4 +1,5 @@
 import { sha256Hex } from './canonical.js';
+import { assertPrepared } from './preparedRequest.js';
 import { benchmarkResponseSchema, renderResponseTemplate } from './schema.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
 
@@ -103,6 +104,10 @@ export interface PromptInputs {
 }
 
 export function buildUserMessage(inputs: PromptInputs): string {
+  // Runtime guard: refuse to serialize anything that did not come through the
+  // prepared boundary, before touching the bundle (the type is erased at run
+  // time, so a direct caller could otherwise forge one).
+  assertPrepared(inputs.request);
   const { request } = inputs;
   const payload = {
     cohortId: inputs.cohortId,
