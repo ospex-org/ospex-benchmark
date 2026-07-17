@@ -241,5 +241,16 @@ hard-disabled.
 | **S2** | Baseline version isolation | §3 **S2** part only — the `v0.1`/`v0.2` full-board guards + fail-closed-on-scoped-input + unknown-version rejection, with the §5 **S2** matrix. **No `v0.3` scoped behavior and no dynamic-cohort gate.** Separable. |
 | **S3** | Dynamic cardinality + `v0.3` | Relax the prepared boundary to **1–3** present markets; introduce the `v0.3` scoped baselines and the **dynamic-cohort boot gate** (a dynamic cohort requires `v0.3`); re-home the validator/baselines/prompt "derive from present markets" logic (keep the `runLine` name); run all **seven** combinations (§5 **S3**); fold in the §4 wording. |
 
+**S1d — sealed run envelope (artifact-producer boundary).** Sequenced **after S2
+and before S3**: the hardening deferred from S1c's convergence, specified
+separately in `docs/SPEC-artifact-producer.md` (bounded threat model + closed
+A1–A6 matrix — see that document, not duplicated here). It seals the whole run
+envelope — snapshot + result graph + expected-arm manifest + bound dispatch
+context — that the artifact producers authenticate. It ships as a spec PR
+(paper-reviewed) then one implementation PR judged only on A1–A6.
+
+Status (2026-07-17): **S1 and S2 are merged**; **S1d-spec** is in review (PR #27);
+S1d-impl and S3 follow. Execution order: **S1 → S2 → S1d-spec → S1d-impl → S3**.
+
 Then the previously-planned fire-artifact / detection / claim slices, which now
 build on a request they can trust.
