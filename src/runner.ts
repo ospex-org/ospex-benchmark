@@ -7,7 +7,9 @@ import {
   validateResponseText,
 } from './schema.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
+import { prepareGameRequest } from './preparedRequest.js';
 import type { GameRequest } from './bundle.js';
+import type { PreparedGameRequest } from './preparedRequest.js';
 import type {
   ArmGameResult,
   ArmSpec,
@@ -112,16 +114,16 @@ async function timedChat(
 export async function runOneArmGame(
   arm: ArmSpec,
   adapter: ProviderAdapter,
-  request: GameRequest,
+  request: PreparedGameRequest,
   options: SlateRunOptions,
 ): Promise<ArmGameResult> {
   const nowMs = options.nowMs ?? Date.now;
-  const cutoffMs = Date.parse(request.requestBundle.cutoffAt);
+  const cutoffMs = Date.parse(request.cutoffAt);
   const base = {
     arm,
     gameId: request.gameId,
     requestSha256: request.requestSha256,
-    cutoffAt: request.requestBundle.cutoffAt,
+    cutoffAt: request.cutoffAt,
   };
   const failed = (
     outcome: ArmGameResult['outcome'],
@@ -171,8 +173,7 @@ export async function runOneArmGame(
     participantId: arm.participantId,
     requestedModelId: arm.requestedModelId,
     executionPolicy: 'fixed-moneyline-total',
-    bundleSha256: request.requestSha256,
-    bundle: request.requestBundle,
+    request,
   });
   const baseTurns: ChatTurn[] = [
     { role: 'system', content: SYSTEM_PROMPT },
@@ -312,6 +313,17 @@ export async function runOneArmGame(
  * failure affects only that game. Outputs stay sealed per game — nothing is
  * reported until all four arms for that game have settled, so no arm can be
  * conditioned on another's answer.
+ *
+ * Every request is put through the prepared-request boundary BEFORE any arm is
+ * dispatched (SPEC-prepared-request.md §2.3): `prepareGameRequest` normalizes,
+ * hash-verifies, and freezes each one, and only that frozen value reaches an
+ * arm. This closes the whole batch first, so a request that fails preparation
+ * throws BEFORE a single provider call — never after a partial dispatch. A
+ * preparation failure is a harness/preparation failure (the builder emitted a
+ * request that does not satisfy the contract), surfaced by the throw; it is
+ * never a per-model outcome and never `invalid_schema`. In the smoke CLI the
+ * throw aborts the run (nonzero exit, no artifact); in the watcher it is caught
+ * per game and recorded as that game's fire failure.
  */
 export async function runSlate(
   arms: ArmSpec[],
@@ -319,9 +331,10 @@ export async function runSlate(
   requests: GameRequest[],
   options: SlateRunOptions,
 ): Promise<ArmGameResult[]> {
+  const prepared: PreparedGameRequest[] = requests.map(prepareGameRequest);
   const all: ArmGameResult[] = [];
   let index = 0;
-  for (const request of requests) {
+  for (const request of prepared) {
     index += 1;
     const results = await Promise.all(
       arms.map((arm) => {
@@ -336,7 +349,7 @@ export async function runSlate(
         .map((r) => `${r.arm.provider} ${r.outcome}${r.repairUsed ? ' (repair)' : ''}`)
         .join(' · ');
       // The caller prints through the redacted console chokepoint.
-      options.onGameComplete(`game ${index}/${requests.length} ${request.slug}: ${cells}`);
+      options.onGameComplete(`game ${index}/${prepared.length} ${request.slug}: ${cells}`);
     }
   }
   return all;
