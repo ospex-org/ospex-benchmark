@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
-import { presentMarkets } from './scopedMarkets.js';
+import { requireScopedMarkets } from './scopedMarkets.js';
 import { currentOddsRowSchema, gamesEndpointRowSchema } from './wire.js';
+import type { ScopedBundle } from './scopedMarkets.js';
 import type {
   BenchmarkResponse,
   ChatTurn,
@@ -121,6 +122,7 @@ function devigProbability(selectedDecimal: number, otherDecimal: number): number
 
 function buildForecast(
   game: GameBundle,
+  scoped: ScopedBundle,
   market: 'moneyline' | 'spread' | 'total',
 ): ForecastOutput {
   let selection: string;
@@ -130,7 +132,7 @@ function buildForecast(
   let evidenceRef: string;
 
   if (market === 'moneyline') {
-    const ml = game.markets.moneyline;
+    const ml = scoped.moneyline;
     if (!ml) throw new Error('mock buildForecast: moneyline requested but the scoped bundle has none');
     const homeIsFavorite = ml.homeDecimal <= ml.awayDecimal;
     selection = homeIsFavorite ? game.homeTeam : game.awayTeam;
@@ -139,9 +141,9 @@ function buildForecast(
     line = null;
     evidenceRef = ml.evidenceRef;
   } else if (market === 'spread') {
-    const rl = game.markets.runLine;
+    const rl = scoped.runLine;
     if (!rl) throw new Error('mock buildForecast: spread requested but the scoped bundle has none');
-    const ml = game.markets.moneyline;
+    const ml = scoped.moneyline;
     // Deterministic contrast pick: take the run line on the moneyline underdog
     // when the moneyline is in scope; otherwise (a run-line-only split fire)
     // fall back to the run line's own higher-decimal side, so the mock handles
@@ -155,7 +157,7 @@ function buildForecast(
     line = rl.line;
     evidenceRef = rl.evidenceRef;
   } else {
-    const total = game.markets.total;
+    const total = scoped.total;
     if (!total) throw new Error('mock buildForecast: total requested but the scoped bundle has none');
     selection = 'over';
     observedDecimal = total.overDecimal;
@@ -194,12 +196,16 @@ function buildValidResponse(payload: RequestPayload): BenchmarkResponse {
     requestedModelId: payload.requestedModelId,
     bundleSha256: payload.bundleSha256,
     executionPolicy: payload.executionPolicy,
-    games: payload.bundle.games.map((game) => ({
-      gameId: game.gameId,
-      // One forecast per market present in the scoped bundle (§3.4) — three for
-      // a co-arrival board, fewer for a split fire — never a hard-coded three.
-      forecasts: presentMarkets(game).map((market) => buildForecast(game, market)),
-    })),
+    games: payload.bundle.games.map((game) => {
+      // One forecast per market present in the VALIDATED scoped bundle (§3.4) —
+      // three for a co-arrival board, fewer for a split fire, never a fixed
+      // three; a malformed/empty scope fails closed here.
+      const scoped = requireScopedMarkets(game);
+      return {
+        gameId: game.gameId,
+        forecasts: scoped.markets.map((market) => buildForecast(game, scoped, market)),
+      };
+    }),
   };
 }
 

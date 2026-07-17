@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { presentMarkets } from './scopedMarkets.js';
+import { scopedMarkets } from './scopedMarkets.js';
 import type {
   ArmSpec,
   BenchmarkResponse,
@@ -170,11 +170,21 @@ function checkGame(
 ): void {
   const id = game.gameId;
 
-  // The scoped bundle's market set is the ONE source of the required forecast
-  // set (§3.4): exactly one forecast per present market, and none for a market
-  // absent from this dispatch. Duplicates, extras, and omissions are flagged
-  // individually rather than short-circuiting, so the model sees the full list.
-  const expected = new Set(presentMarkets(bundleGame));
+  // The scoped bundle's market set is the ONE validated source of the required
+  // forecast set (§3.4): exactly one forecast per present market, and none for a
+  // market absent from this dispatch. A malformed/empty scope is rejected here,
+  // fail-closed — otherwise a falsy market block would count as present while
+  // its per-market checks were skipped, smuggling an arbitrary forecast through.
+  const scope = scopedMarkets(bundleGame);
+  if (!scope.ok) {
+    for (const violation of scope.violations) {
+      errors.push(`game ${id}: invalid scoped bundle — ${violation}`);
+    }
+    return;
+  }
+  // Duplicates, extras, and omissions are flagged individually rather than
+  // short-circuiting, so the model sees the full list.
+  const expected = new Set(scope.scoped.markets);
   const byMarket = new Map<MarketKey, ForecastOutput>();
   for (const forecast of game.forecasts) {
     if (byMarket.has(forecast.market)) {
@@ -198,9 +208,9 @@ function checkGame(
   const moneyline = byMarket.get('moneyline');
   const spread = byMarket.get('spread');
   const total = byMarket.get('total');
-  const mlBlock = bundleGame.markets.moneyline;
-  const rlBlock = bundleGame.markets.runLine;
-  const totalBlock = bundleGame.markets.total;
+  const mlBlock = scope.scoped.moneyline;
+  const rlBlock = scope.scoped.runLine;
+  const totalBlock = scope.scoped.total;
   const teams = [bundleGame.awayTeam, bundleGame.homeTeam];
 
   // moneyline — checked only when the market is in BOTH the bundle and response.
@@ -435,9 +445,11 @@ export function extractDecisionFingerprint(
     if (bundleGame === undefined || seenGames.has(game.gameId)) return null;
     seenGames.add(game.gameId);
     // Exactly the scoped bundle's present markets — one forecast each, no
-    // duplicate and none for an absent market. An incomplete or over-complete
-    // decision set cannot prove repair preservation.
-    const expected = new Set(presentMarkets(bundleGame));
+    // duplicate and none for an absent market. A malformed/empty scope, or an
+    // incomplete/over-complete decision set, cannot prove repair preservation.
+    const scope = scopedMarkets(bundleGame);
+    if (!scope.ok) return null;
+    const expected = new Set(scope.scoped.markets);
     const markets = new Set<MarketKey>();
     for (const forecast of game.forecasts) {
       if (markets.has(forecast.market) || !expected.has(forecast.market)) return null;

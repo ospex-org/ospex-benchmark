@@ -1,8 +1,15 @@
 import { failuresByCode, reportedModelIdsByArm } from './records.js';
+import { requireScopedMarkets } from './scopedMarkets.js';
 import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
 import type { CollisionCheckResult } from './providers/family.js';
-import type { ArmGameResult, ArmOutcome, BaselineDecision, GameBundle } from './types.js';
+import type {
+  ArmGameResult,
+  ArmOutcome,
+  BaselineDecision,
+  GameBundle,
+  MoneylineBlock,
+} from './types.js';
 
 const OUTCOME_ORDER: ArmOutcome[] = [
   'valid',
@@ -19,8 +26,7 @@ function formatHandicap(value: number): string {
   return value > 0 ? `+${value}` : `${value}`;
 }
 
-function describeFavorite(game: GameBundle): string {
-  const ml = game.markets.moneyline;
+function describeFavorite(game: GameBundle, ml: MoneylineBlock | undefined): string {
   if (!ml) return '—';
   if (ml.awayDecimal === ml.homeDecimal) return 'pick-em';
   return ml.awayDecimal < ml.homeDecimal
@@ -29,9 +35,11 @@ function describeFavorite(game: GameBundle): string {
 }
 
 function slateRow(game: GameBundle): string {
-  const ml = game.markets.moneyline;
-  const rl = game.markets.runLine;
-  const total = game.markets.total;
+  // Same validated present-set/block lookup as the validator and baselines.
+  const scoped = requireScopedMarkets(game);
+  const ml = scoped.moneyline;
+  const rl = scoped.runLine;
+  const total = scoped.total;
   const matchup = `${game.awayTeam} at ${game.homeTeam}`;
   const moneyline = ml ? `${ml.awayDecimal} / ${ml.homeDecimal}` : '—';
   const runLine = rl
@@ -42,7 +50,7 @@ function slateRow(game: GameBundle): string {
   const pitchers = game.probableStartingPitchers
     ? `${game.probableStartingPitchers.away ?? '—'} / ${game.probableStartingPitchers.home ?? '—'}`
     : '—';
-  return `| ${matchup} | ${game.scheduledStartUtc} | ${moneyline} | ${runLine} | ${totals} | ${pitchers} | ${describeFavorite(game)} |`;
+  return `| ${matchup} | ${game.scheduledStartUtc} | ${moneyline} | ${runLine} | ${totals} | ${pitchers} | ${describeFavorite(game, ml)} |`;
 }
 
 export function buildSummaryMarkdown(

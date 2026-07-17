@@ -202,6 +202,105 @@ test('fingerprint extraction on a scoped bundle: size matches the present set; a
   assert.equal(extractDecisionFingerprint(JSON.stringify(full), request.requestBundle), null);
 });
 
+test('a malformed (falsy) market block cannot smuggle an arbitrary forecast past the validator', () => {
+  // The fail-open surface: a present-but-falsy moneyline block would otherwise
+  // count as present (cardinality) yet skip every per-market check (truthiness),
+  // accepting a forecast for a non-bundle team at a fabricated line/price.
+  for (const badBlock of [null, false, 0, ''] as unknown[]) {
+    const request = makeRequest(); // three-market
+    const bundle = request.requestBundle;
+    (bundle.games[0]!.markets as Record<string, unknown>).moneyline = badBlock;
+    const response: BenchmarkResponse = {
+      schemaVersion: 1,
+      cohortId: TEST_COHORT,
+      participantId: TEST_ARM.participantId,
+      requestedModelId: TEST_ARM.requestedModelId,
+      bundleSha256: request.requestSha256,
+      executionPolicy: 'fixed-moneyline-total',
+      games: [
+        {
+          gameId: bundle.games[0]!.gameId,
+          forecasts: [
+            {
+              market: 'moneyline',
+              selection: 'NOT A BUNDLE TEAM',
+              line: 123,
+              observedDecimal: 99,
+              probabilities: { win: 0.4, push: 0.3, loss: 0.3 },
+              confidence: 0.5,
+              wouldAbstain: false,
+              selectedForExecution: false,
+              rationale: 'arbitrary',
+              evidenceRefs: [bundle.games[0]!.evidenceRefs[0]!],
+              reasonCode: null,
+            },
+          ],
+        },
+      ],
+    };
+    const result = validateResponseText(
+      JSON.stringify(response),
+      bundle,
+      request.requestSha256,
+      TEST_ARM,
+      TEST_COHORT,
+    );
+    assert.ok(result.errors.length > 0, `badBlock ${String(badBlock)} must reject`);
+    assert.ok(result.errors.some((e) => /invalid scoped bundle|malformed/.test(e)));
+  }
+});
+
+test('a malformed bundle yields no repair fingerprint', () => {
+  const request = makeRequest();
+  const bundle = request.requestBundle;
+  (bundle.games[0]!.markets as Record<string, unknown>).moneyline = null;
+  assert.equal(
+    extractDecisionFingerprint(JSON.stringify(makeValidResponse(makeRequest())), bundle),
+    null,
+  );
+});
+
+test('an empty scope is rejected by the validator and cannot produce a response', () => {
+  const request = makeRequest(CUTOFF, {}, []); // empty scope
+  assert.throws(() => makeValidResponse(request)); // fail-closed, not a zero-forecast response
+  const response: BenchmarkResponse = {
+    schemaVersion: 1,
+    cohortId: TEST_COHORT,
+    participantId: TEST_ARM.participantId,
+    requestedModelId: TEST_ARM.requestedModelId,
+    bundleSha256: request.requestSha256,
+    executionPolicy: 'fixed-moneyline-total',
+    games: [
+      {
+        gameId: request.game.gameId,
+        forecasts: [
+          {
+            market: 'moneyline',
+            selection: request.game.awayTeam,
+            line: null,
+            observedDecimal: 2,
+            probabilities: { win: 0.5, push: 0, loss: 0.5 },
+            confidence: 0.5,
+            wouldAbstain: false,
+            selectedForExecution: true,
+            rationale: 'x',
+            evidenceRefs: [request.game.evidenceRefs[0]!],
+            reasonCode: null,
+          },
+        ],
+      },
+    ],
+  };
+  const result = validateResponseText(
+    JSON.stringify(response),
+    request.requestBundle,
+    request.requestSha256,
+    TEST_ARM,
+    TEST_COHORT,
+  );
+  assert.ok(result.errors.some((e) => /empty scope|invalid scoped bundle/.test(e)));
+});
+
 test('compareFingerprints: identical fingerprints produce no diffs', () => {
   const request = makeRequest();
   const a = fingerprintFromParsed(makeValidResponse(request));

@@ -7,6 +7,7 @@ import {
   runBaselines,
   type BaselinePolicyVersion,
 } from './baselines.js';
+import { ScopedBundleError } from './scopedMarkets.js';
 import { makeGameBundle, makeRequest } from './testFactories.js';
 import type { BaselineDecision, GameBundle, MarketKey, SlateBundle } from './types.js';
 
@@ -137,6 +138,14 @@ test('version registry: known versions dispatch, unknown strings do not', () => 
   assert.ok(isBaselinePolicyVersion('baselines-v0.3.0'));
   assert.ok(!isBaselinePolicyVersion('baselines-v9.9.9'));
   assert.ok(!isBaselinePolicyVersion(''));
+});
+
+test('runBaselines rejects a malformed bundle fail-closed (never silently drops a market)', () => {
+  // A present-but-falsy block must not read as "market absent" — that would let
+  // the baseline set and the validator disagree on presence (Hermes PR#21).
+  const slate = slateOf(['moneyline', 'spread', 'total']);
+  (slate.games[0]!.markets as Record<string, unknown>).moneyline = null;
+  assert.throws(() => runBaselines(slate), ScopedBundleError);
 });
 
 test('v0.3.0 derives the baseline set from the scoped bundle present markets', () => {

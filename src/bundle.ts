@@ -1,5 +1,6 @@
 import { canonicalize, sha256Hex } from './canonical.js';
 import { americanToDecimal } from './odds.js';
+import { requireScopedMarkets } from './scopedMarkets.js';
 import { easternCalendarDay } from './slateDate.js';
 import { SMOKE_LABEL } from './types.js';
 import type {
@@ -225,6 +226,11 @@ export function buildBundle(
       excluded.push({ gameId: game.gameId, slug: game.slug, reason: result.reason });
       continue;
     }
+    // Defense-in-depth: a constructed bundle must present a valid scoped market
+    // set (§3.4) before it can reach a prompt/provider. buildGameBundle emits
+    // all three markets today, so this never fires; it is the fail-closed
+    // boundary for the per-market scoped bundles a later slice builds.
+    requireScopedMarkets(result.bundle);
     eligible.push(result.bundle);
     slugs.set(game.gameId, game.slug);
     gameHashes[game.gameId] = sha256Hex(canonicalize(result.bundle));

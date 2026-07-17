@@ -1,5 +1,5 @@
 import { canonicalize, sha256Hex } from './canonical.js';
-import { MARKET_ORDER } from './scopedMarkets.js';
+import { MARKET_ORDER, requireScopedMarkets } from './scopedMarkets.js';
 import { SMOKE_LABEL } from './types.js';
 import type { GameRequest } from './bundle.js';
 import type {
@@ -120,8 +120,11 @@ export function makeValidResponse(
   cohortId: string = TEST_COHORT,
 ): BenchmarkResponse {
   const game = request.game;
+  // Route through the validated scope — an empty/malformed scope throws rather
+  // than silently producing a zero-forecast (schema-invalid) response.
+  const scoped = requireScopedMarkets(game);
   const forecasts: ForecastOutput[] = [];
-  const ml = game.markets.moneyline;
+  const ml = scoped.moneyline;
   if (ml) {
     forecasts.push({
       market: 'moneyline',
@@ -137,7 +140,7 @@ export function makeValidResponse(
       reasonCode: null,
     });
   }
-  const rl = game.markets.runLine;
+  const rl = scoped.runLine;
   if (rl) {
     forecasts.push({
       market: 'spread',
@@ -153,7 +156,7 @@ export function makeValidResponse(
       reasonCode: null,
     });
   }
-  const total = game.markets.total;
+  const total = scoped.total;
   if (total) {
     forecasts.push({
       market: 'total',

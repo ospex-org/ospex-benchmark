@@ -1,3 +1,4 @@
+import { requireScopedMarkets } from './scopedMarkets.js';
 import type { BaselineDecision, SlateBundle } from './types.js';
 
 /**
@@ -44,8 +45,11 @@ export function runBaselines(
   const decisions: BaselineDecision[] = [];
 
   for (const game of bundle.games) {
-    const ml = game.markets.moneyline;
-    const total = game.markets.total;
+    // Fail-closed on a malformed/empty scope (never silently drop a market —
+    // that would let the baseline set and the validator disagree on presence).
+    const scoped = requireScopedMarkets(game);
+    const ml = scoped.moneyline;
+    const total = scoped.total;
 
     // Moneyline baselines — only when the scoped bundle carries the moneyline.
     if (ml) {
@@ -106,7 +110,7 @@ export function runBaselines(
     }
 
     // Run-line pair (v0.2.0+) — only when the scoped bundle carries the run line.
-    const runLine = game.markets.runLine;
+    const runLine = scoped.runLine;
     if (policyVersion !== 'baselines-v0.1.0' && runLine) {
       // Run-line favorite = the side LAYING the runs. The line is stored as
       // the HOME handicap: home lays when the line is negative, away lays
