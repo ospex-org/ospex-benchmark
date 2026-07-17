@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { prepareGameRequest } from './preparedRequest.js';
+import { sealDispatch } from './runner.js';
 import {
   buildRecords,
   failuresByCode,
@@ -95,7 +96,7 @@ test('repaired decisions carry the ACCEPTED repair attempt provenance', () => {
     validationErrors: [],
   };
 
-  const records = buildRecords(makeCtx(), build, build.requests.map(prepareGameRequest), [result], [], { failures: [], warnings: [] });
+  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [result], [], { failures: [], warnings: [] });
   const decisions = records.filter((r) => r['recordType'] === 'decision');
   assert.equal(decisions.length, 3);
   for (const decision of decisions) {
@@ -117,11 +118,11 @@ test('repaired decisions carry the ACCEPTED repair attempt provenance', () => {
 
 test('bundle_game serializes the exact prepared game, hash-consistent', () => {
   const build = makeBuild();
-  const prepared = build.requests.map(prepareGameRequest);
-  const records = buildRecords(makeCtx(), build, prepared, [], [], { failures: [], warnings: [] });
+  const snapshot = sealDispatch(build.requests.map(prepareGameRequest));
+  const records = buildRecords(makeCtx(), build, snapshot, [], [], { failures: [], warnings: [] });
   const bundleGame = records.find((r) => r['recordType'] === 'bundle_game');
   assert.ok(bundleGame);
-  const first = prepared[0];
+  const first = snapshot.prepared[0];
   assert.ok(first);
   // The recorded bundle IS the frozen prepared game object itself (reference
   // identity) — not a value-equal build alias. deepEqual would pass against the
@@ -138,15 +139,15 @@ test('bundle_game serializes the exact prepared game, hash-consistent', () => {
 
 test('a mutation attempt after preparation does not change the recorded bundle', () => {
   const build = makeBuild();
-  const prepared = build.requests.map(prepareGameRequest);
+  const snapshot = sealDispatch(build.requests.map(prepareGameRequest));
   // The prepared game is deep-frozen: a write is a no-op (throws in strict mode).
   // Records serialize that frozen snapshot regardless of any mutation attempt.
   try {
-    (prepared[0]!.game as { awayTeam: string }).awayTeam = 'MUTATED';
+    (snapshot.prepared[0]!.game as { awayTeam: string }).awayTeam = 'MUTATED';
   } catch {
     // strict-mode TypeError writing a frozen property — expected.
   }
-  const records = buildRecords(makeCtx(), build, prepared, [], [], { failures: [], warnings: [] });
+  const records = buildRecords(makeCtx(), build, snapshot, [], [], { failures: [], warnings: [] });
   const bundleGame = records.find((r) => r['recordType'] === 'bundle_game');
   assert.ok(bundleGame);
   assert.equal((bundleGame['bundle'] as { awayTeam: string }).awayTeam, 'Milwaukee Brewers');
@@ -171,13 +172,13 @@ test('cutoff_missed results never emit decision records', () => {
     parsed: makeValidResponse(request),
     validationErrors: ['response received after the decision cutoff'],
   };
-  const records = buildRecords(makeCtx(), build, build.requests.map(prepareGameRequest), [result], [], { failures: [], warnings: [] });
+  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [result], [], { failures: [], warnings: [] });
   assert.equal(records.filter((r) => r['recordType'] === 'decision').length, 0);
 });
 
 test('identity-only failures get their own MODEL_IDENTITY run_failure record, never PROVIDER_COLLISION', () => {
   const build = makeBuild();
-  const records = buildRecords(makeCtx(), build, build.requests.map(prepareGameRequest), [], [], {
+  const records = buildRecords(makeCtx(), build, sealDispatch(build.requests.map(prepareGameRequest)), [], [], {
     failures: [
       'MODEL_IDENTITY: some-arm returned 1 response(s) without a reported model ID — accepted decisions require verified identity',
       'PROVIDER_COLLISION: two arms resolve to the openai family',

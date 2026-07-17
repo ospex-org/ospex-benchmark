@@ -218,7 +218,7 @@ async function main(): Promise<number> {
     `dispatching per game in cutoff order: ${build.requests.length} games sequential, ` +
       `${ARMS.length} arms concurrent per game (sealed per game) ...`,
   );
-  const { results: armGameResults, prepared } = await runSlate(ARMS, adapters, build.requests, {
+  const { results: armGameResults, snapshot } = await runSlate(ARMS, adapters, build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
@@ -226,7 +226,8 @@ async function main(): Promise<number> {
     onGameComplete: (line) => printLine(`  ${line}`),
   });
 
-  const baselineDecisions = runBaselines(build.slateBundle);
+  // Everything the artifact is built from reads the frozen dispatch snapshot.
+  const baselineDecisions = runBaselines(snapshot.slate);
   const reportedByArm = reportedModelIdsByArm(armGameResults);
   const unidentifiedByArm = unidentifiedResponsesByArm(armGameResults);
   const collision = checkProviderCollision(
@@ -240,13 +241,13 @@ async function main(): Promise<number> {
     })),
   );
 
-  const records = buildRecords(ctx, build, prepared, armGameResults, baselineDecisions, collision);
+  const records = buildRecords(ctx, build, snapshot, armGameResults, baselineDecisions, collision);
   const ndjsonPath = join(options.outDir, `${ctx.runId}.ndjson`);
   const summaryPath = join(options.outDir, `${ctx.runId}-summary.md`);
   writeNdjson(ndjsonPath, records);
   writeText(
     summaryPath,
-    buildSummaryMarkdown(ctx, build, armGameResults, baselineDecisions, collision),
+    buildSummaryMarkdown(ctx, build, snapshot, armGameResults, baselineDecisions, collision),
   );
 
   printLine('');

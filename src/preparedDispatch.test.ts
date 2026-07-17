@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
+import { runBaselines } from './baselines.js';
 import { PreparedRequestError, prepareGameRequest } from './preparedRequest.js';
 import { buildUserMessage } from './prompt.js';
 import type { PromptInputs } from './prompt.js';
+import { buildRecords } from './records.js';
+import type { RunContext } from './records.js';
 import { runOneArmGame, runSlate } from './runner.js';
 import type { SlateRunOptions } from './runner.js';
+import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
+import { buildSummaryMarkdown } from './summary.js';
 import { makeRequest, makeValidResponse } from './testFactories.js';
-import type { GameRequest } from './bundle.js';
+import type { BuildResult, GameRequest } from './bundle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
 import type { ArmSpec, ProviderAdapter, ProviderResponse } from './types.js';
 
@@ -130,13 +135,15 @@ function twoGames(valid: GameRequest): GameRequest {
 test('the three-market request prepares and dispatches to every arm', async () => {
   const validRaw = makeRequest(CUTOFF);
   const { adapters, totalCalls } = makeAdapters(true, validRaw);
-  const { results, prepared } = await runSlate(ARMS, adapters, [validRaw], options());
+  const { results, snapshot } = await runSlate(ARMS, adapters, [validRaw], options());
   assert.equal(results.length, ARMS.length);
   for (const result of results) assert.equal(result.outcome, 'valid');
   assert.equal(totalCalls(), ARMS.length); // exactly one call per arm
-  // runSlate surfaces the exact frozen requests it dispatched (for records).
-  assert.equal(prepared.length, 1);
-  assert.equal(prepared[0]?.requestSha256, validRaw.requestSha256);
+  // runSlate surfaces the frozen snapshot it dispatched (for records/baselines).
+  assert.equal(snapshot.prepared.length, 1);
+  assert.equal(snapshot.prepared[0]?.requestSha256, validRaw.requestSha256);
+  assert.equal(snapshot.slate.games.length, 1);
+  assert.ok(Object.isFrozen(snapshot.prepared)); // the array itself is sealed
 });
 
 // Each failure rejects at a DIFFERENT stage of preparation (alias check,
@@ -271,4 +278,104 @@ test('buildUserMessage cannot be check/use-swapped by a request getter', () => {
   assert.equal(payload.bundleSha256, prepared.requestSha256);
   assert.equal(canonicalize(payload.bundle), canonicalize(prepared.requestBundle));
   assert.ok(!message.includes('hijacked'));
+});
+
+const NO_COLLISION = { failures: [], warnings: [] };
+
+function runContext(): RunContext {
+  return {
+    runId: 'smoke-v0-2026-07-12-abcdef',
+    cohortId: COHORT,
+    mode: 'dry-run',
+    slateDate: '2026-07-12',
+    createdAt: '2026-07-12T14:07:00.000Z',
+    executionPolicy: 'fixed-moneyline-total',
+    timeoutMs: 600_000,
+    maxOutputTokens: 16000,
+    fetchStartedAt: '2026-07-12T14:04:00+00:00',
+    fetchCompletedAt: '2026-07-12T14:05:00+00:00',
+    clockMode: 'synthetic-fixture',
+  };
+}
+
+/** A build whose slate game IS the request's game object (the mutation vector). */
+function sharedBuild(request: GameRequest): BuildResult {
+  return {
+    slateBundle: request.requestBundle,
+    slateSha256: request.requestSha256,
+    requests: [request],
+    gameHashes: { [request.gameId]: sha256Hex(canonicalize(request.game)) },
+    excluded: [],
+    provenance: { [request.gameId]: { slug: request.slug, oddsRows: [] } },
+  };
+}
+
+test('a post-preparation mutation of the build slate cannot split the artifact', async () => {
+  const request = makeRequest(CUTOFF);
+  const build = sharedBuild(request);
+  const originalAway = request.game.markets.moneyline.awayDecimal;
+  // A valid response captured BEFORE any mutation — it matches the frozen bundle.
+  const validBody = JSON.stringify(makeValidResponse(request, ARM_A, COHORT));
+
+  // A hostile/buggy adapter that mutates the shared build slate mid-dispatch,
+  // AFTER preparation has already frozen a private clone.
+  let calls = 0;
+  const adapter: ProviderAdapter = {
+    provider: ARM_A.provider,
+    requestedModelId: ARM_A.requestedModelId,
+    credentialEnvVar: ARM_A.credentialEnvVar,
+    hasCredential: () => true,
+    async chat(): Promise<ProviderResponse> {
+      calls += 1;
+      (build.slateBundle.games[0]!.markets.moneyline as { awayDecimal: number }).awayDecimal = 99;
+      return stubResponse(validBody, ARM_A.requestedModelId);
+    },
+  };
+
+  const { results, snapshot } = await runSlate(
+    [ARM_A],
+    new Map([[ARM_A.participantId, adapter]]),
+    build.requests,
+    options(),
+  );
+  assert.equal(calls, 1);
+  // The prompt/validation used the frozen bundle: the pre-mutation response validated.
+  assert.equal(results[0]?.outcome, 'valid');
+
+  // The mutation landed on the mutable build slate...
+  assert.equal(build.slateBundle.games[0]?.markets.moneyline.awayDecimal, 99);
+  // ...but the frozen dispatch snapshot is untouched.
+  assert.equal(snapshot.slate.games[0]?.markets.moneyline.awayDecimal, originalAway);
+
+  // Baselines, records, and summary ALL read the frozen snapshot.
+  const baselines = runBaselines(snapshot.slate);
+  const ctx = runContext();
+  const records = buildRecords(ctx, build, snapshot, results, baselines, NO_COLLISION);
+  const summary = buildSummaryMarkdown(ctx, build, snapshot, results, baselines, NO_COLLISION);
+
+  // The away-moneyline baseline and the bundle_game record carry the frozen
+  // price, never the mutated 99.
+  const awayBaseline = records.find(
+    (r) => r['recordType'] === 'baseline_decision' && r['participantId'] === 'baseline-away-ml',
+  );
+  assert.ok(awayBaseline);
+  assert.equal(awayBaseline['observedDecimal'], originalAway);
+  const bundleGame = records.find((r) => r['recordType'] === 'bundle_game');
+  assert.ok(bundleGame);
+  assert.equal((bundleGame['bundle'] as { markets: { moneyline: { awayDecimal: number } } }).markets.moneyline.awayDecimal, originalAway);
+
+  // The whole artifact — records and summary — is internally coherent: the real
+  // integrity verifier finds no baseline/price contradictions.
+  const violations = verifyRunIntegrity(parseRunRecords(records.map((r) => JSON.stringify(r))), {
+    expectedArms: [
+      {
+        participantId: ARM_A.participantId,
+        provider: ARM_A.provider,
+        requestedModelId: ARM_A.requestedModelId,
+        approvedReportedModelIds: [ARM_A.requestedModelId],
+      },
+    ],
+  });
+  assert.deepEqual(violations, []);
+  assert.ok(summary.includes(String(originalAway)));
 });

@@ -1,6 +1,7 @@
 import { failuresByCode, reportedModelIdsByArm } from './records.js';
 import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
+import type { DispatchSnapshot } from './runner.js';
 import type { CollisionCheckResult } from './providers/family.js';
 import type { ArmGameResult, ArmOutcome, BaselineDecision, GameBundle } from './types.js';
 
@@ -46,11 +47,17 @@ function slateRow(game: GameBundle): string {
 export function buildSummaryMarkdown(
   ctx: RunContext,
   build: BuildResult,
+  snapshot: DispatchSnapshot,
   armGameResults: ArmGameResult[],
   baselineDecisions: BaselineDecision[],
   collision: CollisionCheckResult,
 ): string {
-  const { slateBundle, slateSha256, excluded } = build;
+  const { excluded } = build;
+  // The rendered game content comes from the frozen dispatch snapshot, not the
+  // mutable build slate, so the summary can never disagree with the records or
+  // baselines (SPEC-prepared-request.md §2.4).
+  const slateBundle = snapshot.slate;
+  const slateSha256 = snapshot.slateSha256;
   const lines: string[] = [];
   const arms = [...new Map(armGameResults.map((r) => [r.arm.participantId, r.arm])).values()];
   const byArm = (participantId: string): ArmGameResult[] =>

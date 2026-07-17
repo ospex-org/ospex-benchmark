@@ -8,6 +8,9 @@ import {
 } from './schema.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { assertPrepared, prepareGameRequest } from './preparedRequest.js';
+import { canonicalize, sha256Hex } from './canonical.js';
+import { deepFreeze } from './freeze.js';
+import { instantMs } from './time.js';
 import type { GameRequest } from './bundle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
 import type {
@@ -18,18 +21,59 @@ import type {
   ProviderAdapter,
   ProviderResponse,
   RepairTransport,
+  SlateBundle,
 } from './types.js';
 
 /**
- * The dispatched slate: the per-arm results, plus the frozen, hash-verified
- * requests that were actually dispatched (one per game, in cutoff order). The
- * records builder serializes THIS `prepared` array — the exact same frozen
- * snapshot that fed the prompt and the hashes — so a recorded game can never be
- * a different alias than the one the provider saw (SPEC-prepared-request.md §2.4).
+ * The single frozen snapshot of what was dispatched. EVERY artifact surface —
+ * records, deterministic baselines, run metadata, and the summary — reads its
+ * game content from here, so a post-preparation mutation of the mutable build
+ * slate cannot split the evidence (SPEC-prepared-request.md §2.4). Its
+ * `slate.games` are the SAME frozen objects as the per-game `prepared[i].game`.
  */
+export interface DispatchSnapshot {
+  /** The frozen, hash-verified requests dispatched — one per game, cutoff order. */
+  prepared: readonly PreparedGameRequest[];
+  /** The frozen slate view re-derived from the dispatched games, in gameId order. */
+  slate: SlateBundle;
+  /** sha256Hex(canonicalize(slate)) — the slate hash, derived from the snapshot. */
+  slateSha256: string;
+}
+
 export interface SlateRunResult {
   results: ArmGameResult[];
-  prepared: PreparedGameRequest[];
+  snapshot: DispatchSnapshot;
+}
+
+/**
+ * Seal the dispatched games into one frozen snapshot. The slate view is
+ * re-derived from the frozen prepared games THEMSELVES (canonical gameId order;
+ * slate-level fields taken from the per-game request bundles, which carry them
+ * identically), so nothing downstream needs the mutable build slate. The whole
+ * snapshot — the prepared array included — is deep-frozen.
+ */
+export function sealDispatch(prepared: readonly PreparedGameRequest[]): DispatchSnapshot {
+  const first = prepared[0];
+  if (first === undefined) {
+    throw new Error('cannot seal a dispatch snapshot from zero prepared requests');
+  }
+  const base = first.requestBundle;
+  const byGameId = [...prepared].sort((a, b) =>
+    a.gameId < b.gameId ? -1 : a.gameId > b.gameId ? 1 : 0,
+  );
+  const cutoffAt = prepared
+    .map((p) => p.cutoffAt)
+    .reduce((min, c) => (instantMs(c) < instantMs(min) ? c : min));
+  const slate: SlateBundle = {
+    schemaVersion: base.schemaVersion,
+    label: base.label,
+    league: base.league,
+    slateDate: base.slateDate,
+    bundleTimestamp: base.bundleTimestamp,
+    cutoffAt,
+    games: byGameId.map((p) => p.game),
+  };
+  return deepFreeze({ prepared, slate, slateSha256: sha256Hex(canonicalize(slate)) });
 }
 
 export interface SlateRunOptions {
@@ -367,5 +411,7 @@ export async function runSlate(
       options.onGameComplete(`game ${index}/${prepared.length} ${request.slug}: ${cells}`);
     }
   }
-  return { results: all, prepared };
+  // Seal the dispatched snapshot (deep-frozen) and freeze the result envelope —
+  // nothing downstream may mutate what the artifact is built from.
+  return Object.freeze({ results: all, snapshot: sealDispatch(prepared) });
 }

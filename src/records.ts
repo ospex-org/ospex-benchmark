@@ -2,10 +2,11 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { redactSecrets } from './config.js';
 import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
+import { assertPrepared } from './preparedRequest.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
-import type { PreparedGameRequest } from './preparedRequest.js';
+import type { DispatchSnapshot } from './runner.js';
 import type { CollisionCheckResult } from './providers/family.js';
 import type { ArmGameResult, AttemptRecord, BaselineDecision } from './types.js';
 
@@ -126,18 +127,44 @@ export function failuresByCode(failures: string[]): Map<string, string[]> {
 export function buildRecords(
   ctx: RunContext,
   build: BuildResult,
-  prepared: PreparedGameRequest[],
+  snapshot: DispatchSnapshot,
   armGameResults: ArmGameResult[],
   baselineDecisions: BaselineDecision[],
   collision: CollisionCheckResult,
 ): JsonRecord[] {
+  const { prepared, slate, slateSha256 } = snapshot;
+  const { excluded, provenance } = build;
+
+  // Seal the records boundary BEFORE writing (SPEC §2.3–2.4): the snapshot must
+  // be genuinely prepared (runtime origin, not just the erased type), free of
+  // duplicate game IDs, and every arm result must reference a request that is in
+  // the snapshot at the same hash — so an artifact can never carry contradictory
+  // evidence for a game it did not dispatch, or a game it dispatched differently.
+  const requestShaByGame = new Map<string, string>();
+  for (const request of prepared) {
+    assertPrepared(request);
+    if (requestShaByGame.has(request.gameId)) {
+      throw new Error(`duplicate game ID in the dispatch snapshot: ${request.gameId}`);
+    }
+    requestShaByGame.set(request.gameId, request.requestSha256);
+  }
+  for (const result of armGameResults) {
+    const expected = requestShaByGame.get(result.gameId);
+    if (expected === undefined) {
+      throw new Error(`arm result references a game not in the dispatch snapshot: ${result.gameId}`);
+    }
+    if (result.requestSha256 !== expected) {
+      throw new Error(
+        `arm result requestSha256 does not match the dispatched request for ${result.gameId}`,
+      );
+    }
+  }
+
+  // Every per-game record derives from the frozen, hash-verified snapshot that
+  // was actually dispatched — never from a separate build alias — so the
+  // recorded game, its hash, and its cutoff are provably the bytes the provider
+  // saw, and so are the baselines, the slate metadata, and the summary.
   const records: JsonRecord[] = [];
-  const { slateBundle, slateSha256, excluded, provenance } = build;
-  // Every per-game record derives from the frozen, hash-verified `prepared`
-  // snapshot that was actually dispatched — never from a separate build alias —
-  // so the recorded game, its hash, and its cutoff are provably the bytes the
-  // provider saw (SPEC-prepared-request.md §2.4).
-  const requestShaByGame = new Map(prepared.map((r) => [r.gameId, r.requestSha256]));
   const cutoffByGame = new Map(prepared.map((r) => [r.gameId, r.cutoffAt]));
   const gameShaByGame = new Map(prepared.map((r) => [r.gameId, r.gameSha256]));
 
@@ -154,8 +181,8 @@ export function buildRecords(
     slateSha256,
     fetchStartedAt: ctx.fetchStartedAt,
     fetchCompletedAt: ctx.fetchCompletedAt,
-    bundleTimestamp: slateBundle.bundleTimestamp,
-    slateCutoffAt: slateBundle.cutoffAt,
+    bundleTimestamp: slate.bundleTimestamp,
+    slateCutoffAt: slate.cutoffAt,
     promptScaffoldVersion: PROMPT_SCAFFOLD_VERSION,
     promptScaffoldSha256: promptScaffoldSha256(),
     timeoutMs: ctx.timeoutMs,
@@ -165,7 +192,7 @@ export function buildRecords(
       maxQuoteAgeMs: MAX_QUOTE_AGE_MS,
       futureQuoteSkewMs: FUTURE_QUOTE_SKEW_MS,
     },
-    eligibleGames: slateBundle.games.length,
+    eligibleGames: slate.games.length,
     excludedGames: excluded.length,
     armGameResults: armGameResults.length,
     baselineDecisionCount: baselineDecisions.length,

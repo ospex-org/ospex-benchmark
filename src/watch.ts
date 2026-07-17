@@ -673,7 +673,7 @@ export async function fireEligibleGame(
     watch: provenance,
   };
 
-  const { results: armGameResults, prepared } = await runSlate(cfg.arms, cfg.adapters, build.requests, {
+  const { results: armGameResults, snapshot } = await runSlate(cfg.arms, cfg.adapters, build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
@@ -681,7 +681,8 @@ export async function fireEligibleGame(
     onGameComplete: (line) => cfg.log(`  ${line}`),
   });
 
-  const baselineDecisions = runBaselines(build.slateBundle);
+  // Everything the artifact is built from reads the frozen dispatch snapshot.
+  const baselineDecisions = runBaselines(snapshot.slate);
   const reportedByArm = reportedModelIdsByArm(armGameResults);
   const unidentifiedByArm = unidentifiedResponsesByArm(armGameResults);
   const collision = checkProviderCollision(
@@ -695,12 +696,12 @@ export async function fireEligibleGame(
     })),
   );
 
-  const records = buildRecords(ctx, build, prepared, armGameResults, baselineDecisions, collision);
+  const records = buildRecords(ctx, build, snapshot, armGameResults, baselineDecisions, collision);
   const runFile = join(cfg.outDir, `${ctx.runId}.ndjson`);
   writeNdjson(runFile, records);
   writeText(
     join(cfg.outDir, `${ctx.runId}-summary.md`),
-    buildSummaryMarkdown(ctx, build, armGameResults, baselineDecisions, collision),
+    buildSummaryMarkdown(ctx, build, snapshot, armGameResults, baselineDecisions, collision),
   );
 
   const armOutcomes: Record<string, ArmOutcome> = {};
