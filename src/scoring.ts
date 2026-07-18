@@ -106,20 +106,28 @@ const bundleGameSchema = z
         scheduledStartUtc: z.string().min(1),
         markets: z
           .object({
-            // Every bundle price must be a valid decimal quote (>1), exactly
-            // like decision observedDecimal: BOTH sides feed the
-            // margin-adjusted entry de-vig, so an invalid opposite side must
-            // refuse the file at parse time rather than silently dropping
-            // margin-adjusted values while economic ones still score.
+            // A bundle supplies market blocks (1-3 in practice, S3 dynamic
+            // cardinality); an absent market is an omitted key. Each block is
+            // .optional() with no >=1 floor here — the at-least-one guarantee is
+            // the prepared boundary's job (S3e, spec §2.2), so the scorer parses
+            // 0-3 and a 0-market game contributes 0 coverage. Every PRESENT
+            // block's prices must be valid decimal quotes (>1), exactly like
+            // decision observedDecimal: BOTH sides feed the margin-adjusted entry
+            // de-vig, so an invalid opposite side refuses the file at parse time
+            // rather than silently dropping margin-adjusted values while economic
+            // ones still score.
             moneyline: z
               .object({ awayDecimal: z.number().gt(1), homeDecimal: z.number().gt(1) })
-              .passthrough(),
+              .passthrough()
+              .optional(),
             runLine: z
               .object({ line: z.number(), awayDecimal: z.number().gt(1), homeDecimal: z.number().gt(1) })
-              .passthrough(),
+              .passthrough()
+              .optional(),
             total: z
               .object({ line: z.number(), overDecimal: z.number().gt(1), underDecimal: z.number().gt(1) })
-              .passthrough(),
+              .passthrough()
+              .optional(),
           })
           .passthrough(),
       })
@@ -228,10 +236,14 @@ export interface SourceGame {
   requestSha256: string;
   /** The bundle exactly as recorded, for hash recomputation. */
   rawBundle: unknown;
+  /**
+   * The prices for each market the game SUPPLIES (1-3, S3 dynamic cardinality).
+   * An absent market is an omitted key; on a full board all three are present.
+   */
   prices: {
-    moneyline: { away: number; home: number };
-    runLine: { line: number; away: number; home: number };
-    total: { line: number; over: number; under: number };
+    moneyline?: { away: number; home: number };
+    runLine?: { line: number; away: number; home: number };
+    total?: { line: number; over: number; under: number };
   };
 }
 
@@ -359,21 +371,35 @@ export function parseRunRecords(lines: string[]): SourceRun {
           gameSha256: game.gameSha256,
           requestSha256: game.requestSha256,
           rawBundle: game.bundle,
+          // Reconstruct only the market blocks the recorded bundle supplies
+          // (1-3, S3 dynamic cardinality); on a full board all three are present.
           prices: {
-            moneyline: {
-              away: game.bundle.markets.moneyline.awayDecimal,
-              home: game.bundle.markets.moneyline.homeDecimal,
-            },
-            runLine: {
-              line: game.bundle.markets.runLine.line,
-              away: game.bundle.markets.runLine.awayDecimal,
-              home: game.bundle.markets.runLine.homeDecimal,
-            },
-            total: {
-              line: game.bundle.markets.total.line,
-              over: game.bundle.markets.total.overDecimal,
-              under: game.bundle.markets.total.underDecimal,
-            },
+            ...(game.bundle.markets.moneyline
+              ? {
+                  moneyline: {
+                    away: game.bundle.markets.moneyline.awayDecimal,
+                    home: game.bundle.markets.moneyline.homeDecimal,
+                  },
+                }
+              : {}),
+            ...(game.bundle.markets.runLine
+              ? {
+                  runLine: {
+                    line: game.bundle.markets.runLine.line,
+                    away: game.bundle.markets.runLine.awayDecimal,
+                    home: game.bundle.markets.runLine.homeDecimal,
+                  },
+                }
+              : {}),
+            ...(game.bundle.markets.total
+              ? {
+                  total: {
+                    line: game.bundle.markets.total.line,
+                    over: game.bundle.markets.total.overDecimal,
+                    under: game.bundle.markets.total.underDecimal,
+                  },
+                }
+              : {}),
           },
         });
         break;
@@ -533,24 +559,37 @@ export function parseRunRecords(lines: string[]): SourceRun {
 // Run integrity — a scorecard is only as trustworthy as its input
 // ---------------------------------------------------------------------------
 
+/**
+ * The response-side markets a recorded game SUPPLIES (1-3, S3 dynamic
+ * cardinality), from its reconstructed prices; applies the `spread`<->`runLine`
+ * key mapping. On a full board this is {moneyline, spread, total}.
+ */
+function suppliedMarketsOf(game: SourceGame): Set<MarketKey> {
+  const supplied = new Set<MarketKey>();
+  if (game.prices.moneyline) supplied.add('moneyline');
+  if (game.prices.runLine) supplied.add('spread');
+  if (game.prices.total) supplied.add('total');
+  return supplied;
+}
+
 function expectedEntry(
   game: SourceGame,
   market: MarketKey,
   side: SelectedSide,
 ): { price: number; line: number | null } {
   if (market === 'moneyline') {
-    return { price: side === 'away' ? game.prices.moneyline.away : game.prices.moneyline.home, line: null };
+    const ml = game.prices.moneyline;
+    if (!ml) throw new Error('game supplies no moneyline market');
+    return { price: side === 'away' ? ml.away : ml.home, line: null };
   }
   if (market === 'spread') {
-    return {
-      price: side === 'away' ? game.prices.runLine.away : game.prices.runLine.home,
-      line: game.prices.runLine.line,
-    };
+    const rl = game.prices.runLine;
+    if (!rl) throw new Error('game supplies no spread (run line) market');
+    return { price: side === 'away' ? rl.away : rl.home, line: rl.line };
   }
-  return {
-    price: side === 'away' ? game.prices.total.over : game.prices.total.under,
-    line: game.prices.total.line,
-  };
+  const total = game.prices.total;
+  if (!total) throw new Error('game supplies no total market');
+  return { price: side === 'away' ? total.over : total.under, line: total.line };
 }
 
 /**
@@ -851,40 +890,58 @@ export function verifyRunIntegrity(
       );
     }
   }
-  const expectedBaselines = new Map(
-    runBaselines(reconstructedSlate, baselinePolicyVersion).map((d) => [
-      `${d.participantId}:${d.gameId}`,
-      d,
-    ]),
-  );
-  const seenBaselineKeys = new Set<string>();
-  for (const pick of baselinePicks) {
-    const key = `${pick.participantId}:${pick.gameId}`;
-    if (seenBaselineKeys.has(key)) {
-      violations.push(`duplicate baseline decision for ${key}`);
-      continue;
-    }
-    seenBaselineKeys.add(key);
-    const expected = expectedBaselines.get(key);
-    if (!expected) {
-      violations.push(`baseline decision ${key} is not produced by the deterministic policies`);
-      continue;
-    }
-    if (pick.policyVersion !== baselinePolicyVersion) {
-      violations.push(`baseline decision ${key}: unexpected policyVersion ${pick.policyVersion ?? 'null'}`);
-    }
-    if (
-      pick.market !== expected.market ||
-      pick.selection !== expected.selection ||
-      pick.line !== expected.line ||
-      pick.entryDecimal !== expected.observedDecimal
-    ) {
-      violations.push(`baseline decision ${key} does not match its deterministic re-derivation`);
-    }
+  // Re-derive under the RECORDED policy version. A full-board policy (v0.1/v0.2)
+  // re-run against a SCOPED artifact fails closed inside runBaselines
+  // (assertFullBoard) — that is the "refuses an old-version/scoped artifact" rule
+  // (spec §3): convert the throw into a clean violation rather than crash the
+  // verifier, and skip the per-pick matching (there is nothing to match against).
+  let expectedBaselines = new Map<string, ReturnType<typeof runBaselines>[number]>();
+  let baselineDerivationOk = true;
+  try {
+    expectedBaselines = new Map(
+      runBaselines(reconstructedSlate, baselinePolicyVersion).map((d) => [
+        `${d.participantId}:${d.gameId}`,
+        d,
+      ]),
+    );
+  } catch (error) {
+    baselineDerivationOk = false;
+    violations.push(
+      `baseline re-derivation failed under policy ${baselinePolicyVersion}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
-  for (const key of expectedBaselines.keys()) {
-    if (!seenBaselineKeys.has(key)) {
-      violations.push(`expected deterministic baseline decision ${key} is missing`);
+  if (baselineDerivationOk) {
+    const seenBaselineKeys = new Set<string>();
+    for (const pick of baselinePicks) {
+      const key = `${pick.participantId}:${pick.gameId}`;
+      if (seenBaselineKeys.has(key)) {
+        violations.push(`duplicate baseline decision for ${key}`);
+        continue;
+      }
+      seenBaselineKeys.add(key);
+      const expected = expectedBaselines.get(key);
+      if (!expected) {
+        violations.push(`baseline decision ${key} is not produced by the deterministic policies`);
+        continue;
+      }
+      if (pick.policyVersion !== baselinePolicyVersion) {
+        violations.push(`baseline decision ${key}: unexpected policyVersion ${pick.policyVersion ?? 'null'}`);
+      }
+      if (
+        pick.market !== expected.market ||
+        pick.selection !== expected.selection ||
+        pick.line !== expected.line ||
+        pick.entryDecimal !== expected.observedDecimal
+      ) {
+        violations.push(`baseline decision ${key} does not match its deterministic re-derivation`);
+      }
+    }
+    for (const key of expectedBaselines.keys()) {
+      if (!seenBaselineKeys.has(key)) {
+        violations.push(`expected deterministic baseline decision ${key} is missing`);
+      }
     }
   }
 
@@ -910,7 +967,13 @@ export function verifyRunIntegrity(
       continue;
     }
     const markets = new Set(list.map((p) => p.market));
-    if (list.length !== 3 || markets.size !== 3) {
+    // Exactly one decision per SUPPLIED market (1-3, S3 dynamic cardinality). On
+    // a full board the supplied set is all three, so this reduces to the
+    // historical `!== 3` check; a scoped game requires exactly its own markets.
+    const decisionGame = run.games.get(list[0]?.gameId ?? '');
+    const supplied = decisionGame ? suppliedMarketsOf(decisionGame) : new Set<MarketKey>(MARKETS);
+    const inScope = [...markets].every((m) => supplied.has(m));
+    if (list.length !== supplied.size || markets.size !== supplied.size || !inScope) {
       violations.push(`${key}: expected exactly one decision per market, found ${list.length}`);
     }
 
@@ -1222,6 +1285,15 @@ export function verifyRunIntegrity(
     const game = run.games.get(pick.gameId);
     if (!game) {
       violations.push(`pick ${pick.participantId}:${pick.gameId}:${pick.market} references an unknown game`);
+      continue;
+    }
+    // A pick for a market the game does not supply (a scoped-artifact mismatch)
+    // is a clean violation, never a crash on an absent price block. On a full
+    // board every market is supplied, so this never fires.
+    if (!suppliedMarketsOf(game).has(pick.market)) {
+      violations.push(
+        `${pick.participantId}:${pick.gameId}:${pick.market}: decision for a market the game does not supply`,
+      );
       continue;
     }
     let side: SelectedSide;
@@ -1545,6 +1617,13 @@ export function aggregateByParticipant(
     responsesByParticipant.set(response.participantId, list);
   }
 
+  // Supplied-market set per game (1-3, S3 dynamic cardinality), reused for the
+  // per-scope model denominators. On a full board every set is {ml, spread,
+  // total}, so the denominators below equal the historical responses.length[*3].
+  const suppliedByGameId = new Map<string, Set<MarketKey>>(
+    [...run.games].map(([gameId, game]) => [gameId, suppliedMarketsOf(game)]),
+  );
+
   // Every arm that was dispatched appears, even with zero valid decisions —
   // failures must never vanish from the denominators.
   const participantIds = [
@@ -1597,14 +1676,21 @@ export function aggregateByParticipant(
       (p) => p.result.sensitivity?.marginAdjustedClvPct ?? null,
     );
 
-    // Per-market aggregates use the same game-first clustering as the
-    // pooled primary, scoped to one market — never pooled across markets.
-    // A model arm is eligible in every market of every dispatched game, so
-    // it keeps a (possibly 0/N) entry even when it produced no decisions.
+    // Per-market aggregates use the same game-first clustering as the pooled
+    // primary, scoped to one market — never pooled across markets. A model arm is
+    // eligible in a market for the dispatched games that SUPPLY it (every
+    // dispatched game on a full board), so it keeps a (possibly 0/N) entry even
+    // when it produced no decisions; a market no dispatched game supplies is
+    // omitted (eligible 0, no picks).
     const byMarket: ParticipantStats['byMarket'] = {};
     for (const market of MARKETS) {
       const marketPicks = picks.filter((p) => p.market === market);
-      const eligible = kind === 'model' ? responses.length : marketPicks.length;
+      // A model arm is eligible in this market only for the dispatched games that
+      // SUPPLY it (all of them on a full board, so this stays responses.length).
+      const eligible =
+        kind === 'model'
+          ? responses.filter((r) => suppliedByGameId.get(r.gameId)?.has(market) ?? false).length
+          : marketPicks.length;
       if (eligible === 0 && marketPicks.length === 0) continue;
       const marketEconomic = clusterByGame(marketPicks, (p) => p.result.primaryClvPct);
       const marketMarginAdjusted = clusterByGame(
@@ -1658,7 +1744,13 @@ export function aggregateByParticipant(
         );
       }
     }
-    const totalsEligible = kind === 'model' ? responses.length : totalsPicks.length;
+    // Scope-aware, mirroring byMarket['total']: a model arm is totals-eligible
+    // only for the dispatched games that supply a total (all of them on a full
+    // board, so this stays responses.length) — a total-less board emits no ladder.
+    const totalsEligible =
+      kind === 'model'
+        ? responses.filter((r) => suppliedByGameId.get(r.gameId)?.has('total') ?? false).length
+        : totalsPicks.length;
     const totalsLadder: ParticipantStats['totalsLadder'] =
       totalsEligible === 0 && totalsPicks.length === 0
         ? null
@@ -1679,7 +1771,12 @@ export function aggregateByParticipant(
       participantId,
       kind,
       games: kind === 'model' ? responses.length : new Set(picks.map((p) => p.gameId)).size,
-      eligibleMarkets: kind === 'model' ? responses.length * 3 : picks.length,
+      // Per-scope: sum the supplied-market count over the arm's dispatched games
+      // (3 each on a full board, so this equals the historical responses.length * 3).
+      eligibleMarkets:
+        kind === 'model'
+          ? responses.reduce((sum, r) => sum + (suppliedByGameId.get(r.gameId)?.size ?? 0), 0)
+          : picks.length,
       validDecisions: picks.length,
       armOutcomes,
       primaryScoreable: economic.values.length,

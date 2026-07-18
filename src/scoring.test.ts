@@ -16,7 +16,7 @@ import {
 import { makeGameBundle, makeRequest } from './testFactories.js';
 import type { GameRequest } from './bundle.js';
 import type { MarketStats, ScoredPick } from './scoring.js';
-import type { ClosingLineRow, SlateBundle } from './types.js';
+import type { ClosingLineRow, GameBundle, SlateBundle } from './types.js';
 
 // Fixture ladder parameter: the real committed k so ladder goldens are
 // stable, threaded explicitly like the CLI threads the loaded artifact.
@@ -1636,4 +1636,187 @@ test('conditional-only counts exactly the picks with a conditional and NO primar
   const policy = stats.find((s) => s.participantId === 'synthetic-policy');
   assert.ok(policy);
   assert.equal(policy.conditionalOnly, 1);
+});
+
+// --- S3c: dynamic (scoped) scorer (SPEC-prepared-request.md §3, §6, §5-S3) ---
+
+type ScopeMarket = 'moneyline' | 'spread' | 'total';
+const SCOPE_BLOCK: Record<ScopeMarket, 'moneyline' | 'runLine' | 'total'> = {
+  moneyline: 'moneyline',
+  spread: 'runLine',
+  total: 'total',
+};
+
+/**
+ * A single-game v0.3 run whose game supplies only `present` markets (1-3). Real
+ * hashes (recomputed exactly as the scorer does, via makeRequest's request
+ * bundle), a valid scoped model response, and v0.3 baselines for the supplied
+ * markets. `stampOverride` restamps the baseline policy version WITHOUT changing
+ * the derived rows, so a v0.1/v0.2 stamp yields the scoped-under-full-board-policy
+ * artifact the scorer must refuse.
+ */
+function scopedRun(
+  present: ReadonlyArray<ScopeMarket>,
+  stampOverride?: BaselinePolicyVersion,
+): { lines: string[] } {
+  const full = makeGameBundle({ gameId: GAME_A });
+  const scopedMarkets: Record<string, unknown> = {};
+  for (const marketKey of present) {
+    const blockKey = SCOPE_BLOCK[marketKey];
+    scopedMarkets[blockKey] = full.markets[blockKey];
+  }
+  const request = makeRequest('2026-07-12T16:15:00+00:00', {
+    gameId: GAME_A,
+    markets: scopedMarkets as GameBundle['markets'],
+  });
+  const game = request.game;
+  const requestSha256 = request.requestSha256;
+  const gameSha256 = sha256Hex(canonicalize(game));
+  const slateSha256 = requestSha256; // single-game slate == the request bundle
+
+  const markets = game.markets as Partial<GameBundle['markets']>;
+  const common = {
+    probabilities: { win: 0.5, push: 0, loss: 0.5 },
+    confidence: 0.6,
+    wouldAbstain: false,
+    rationale: 'reference-price read',
+  };
+  const forecasts: Array<Record<string, unknown>> = [];
+  if (markets.moneyline) {
+    forecasts.push({ market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: markets.moneyline.homeDecimal, selectedForExecution: true, evidenceRefs: [markets.moneyline.evidenceRef], ...common });
+  }
+  if (markets.runLine) {
+    forecasts.push({ market: 'spread', selection: game.awayTeam, line: markets.runLine.line, observedDecimal: markets.runLine.awayDecimal, selectedForExecution: false, evidenceRefs: [markets.runLine.evidenceRef], ...common });
+  }
+  if (markets.total) {
+    forecasts.push({ market: 'total', selection: 'over', line: markets.total.line, observedDecimal: markets.total.overDecimal, selectedForExecution: true, evidenceRefs: [markets.total.evidenceRef], ...common });
+  }
+
+  const rawResponse = JSON.stringify({
+    schemaVersion: 1,
+    cohortId: 'test-cohort',
+    participantId: 'model-arm',
+    requestedModelId: 'stub-model-1',
+    bundleSha256: requestSha256,
+    executionPolicy: 'fixed-moneyline-total',
+    games: [{ gameId: game.gameId, forecasts }],
+  });
+
+  const identity = { label: LABEL, runId: 'test-run' };
+  const records: Array<Record<string, unknown>> = [];
+  records.push({ recordType: 'bundle_game', ...identity, gameId: game.gameId, slug: 'mil-pit-2026-07-12', cutoffAt: request.requestBundle.cutoffAt, gameSha256, requestSha256, bundle: game });
+  records.push({ recordType: 'arm_game_response', ...identity, cohortId: 'test-cohort', participantId: 'model-arm', provider: 'openai', requestedModelId: 'stub-model-1', reportedModelId: 'stub-model-1', gameId: game.gameId, requestSha256, outcome: 'valid', cutoffAt: request.requestBundle.cutoffAt, repairUsed: false, attempt: { reportedModelId: 'stub-model-1', providerResponseId: 'resp-1', rawResponse, requestAt: '2026-07-12T14:07:00.001Z', responseAt: '2026-07-12T14:07:00.055Z', latencyMs: 54 }, repair: null });
+  for (const f of forecasts) {
+    records.push({ recordType: 'decision', ...identity, cohortId: 'test-cohort', participantId: 'model-arm', gameId: game.gameId, market: f['market'], selection: f['selection'], line: f['line'], observedDecimal: f['observedDecimal'], probabilities: f['probabilities'], confidence: f['confidence'], selectedForExecution: f['selectedForExecution'], wouldAbstain: f['wouldAbstain'], provider: 'openai', requestedModelId: 'stub-model-1', reportedModelId: 'stub-model-1', providerResponseId: 'resp-1', attemptUsed: 'initial', bundleSha256: requestSha256, gameSha256, slateSha256 });
+  }
+
+  // Always DERIVE the baseline rows under v0.3 (the scoped policy) so the fixture
+  // can be built; STAMP with stampOverride so a v0.1/v0.2 stamp produces the
+  // scoped-under-full-board-policy artifact the scorer refuses.
+  const stampVersion: BaselinePolicyVersion = stampOverride ?? 'baselines-v0.3.0';
+  const slateForBaselines = { ...request.requestBundle } as unknown as SlateBundle;
+  let baselineCount = 0;
+  for (const d of runBaselines(slateForBaselines, 'baselines-v0.3.0')) {
+    records.push({ recordType: 'baseline_decision', ...identity, cohortId: 'test-cohort', participantId: d.participantId, policyVersion: stampVersion, gameId: d.gameId, market: d.market, selection: d.selection, line: d.line, observedDecimal: d.observedDecimal, slateSha256, gameSha256, requestSha256 });
+    baselineCount += 1;
+  }
+  records.unshift({ recordType: 'run_meta', runId: 'test-run', cohortId: 'test-cohort', label: LABEL, mode: 'live', slateDate: '2026-07-12', slateSha256, bundleTimestamp: BUNDLE_TS, slateCutoffAt: '2026-07-12T16:15:00+00:00', eligibleGames: 1, armGameResults: 1, baselineDecisionCount: baselineCount, baselinePolicyVersion: stampVersion });
+
+  return { lines: records.map((l) => JSON.stringify(l)) };
+}
+
+test('S3c: a scoped v0.3 run parses with only its supplied-market prices', () => {
+  const run = parseRunRecords(scopedRun(['moneyline', 'total']).lines);
+  const game = run.games.get(GAME_A);
+  assert.ok(game);
+  assert.ok(game.prices.moneyline);
+  assert.ok(game.prices.total);
+  assert.equal(game.prices.runLine, undefined);
+});
+
+test('S3c: every non-empty scoped board verifies clean under v0.3', () => {
+  const combos: ScopeMarket[][] = [
+    ['moneyline'],
+    ['spread'],
+    ['total'],
+    ['moneyline', 'spread'],
+    ['moneyline', 'total'],
+    ['spread', 'total'],
+    ['moneyline', 'spread', 'total'],
+  ];
+  for (const present of combos) {
+    const run = parseRunRecords(scopedRun(present).lines);
+    assert.deepEqual(
+      verifyRunIntegrity(run, { expectedArms: FIXTURE_ARMS }),
+      [],
+      `scoped board [${present.join('+')}] must verify clean`,
+    );
+  }
+});
+
+test('S3c: a scoped artifact stamped with a full-board policy (v0.2) is refused', () => {
+  const run = parseRunRecords(scopedRun(['moneyline', 'total'], 'baselines-v0.2.0').lines);
+  const violations = verifyRunIntegrity(run, { expectedArms: FIXTURE_ARMS });
+  assert.ok(
+    violations.some((v) => v.includes('requires a full three-market board')),
+    violations.join('; '),
+  );
+});
+
+test('S3c: scoped denominators count only supplied markets', () => {
+  const run = parseRunRecords(scopedRun(['moneyline', 'total']).lines);
+  const scored = scoreRun(run, [], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model);
+  assert.equal(model.eligibleMarkets, 2); // 1 dispatched game x 2 supplied markets
+  assert.equal(model.byMarket['moneyline']?.eligible, 1);
+  assert.equal(model.byMarket['total']?.eligible, 1);
+  assert.equal(model.byMarket['spread'], undefined); // run line not supplied
+});
+
+test('S3c: a decision for a market the scoped game does not supply is a violation', () => {
+  const lines = scopedRun(['moneyline', 'total']).lines;
+  const game = makeGameBundle({ gameId: GAME_A });
+  const spreadDecision = JSON.stringify({
+    recordType: 'decision',
+    label: LABEL,
+    runId: 'test-run',
+    cohortId: 'test-cohort',
+    participantId: 'model-arm',
+    gameId: GAME_A,
+    market: 'spread',
+    selection: game.awayTeam,
+    line: game.markets.runLine.line,
+    observedDecimal: game.markets.runLine.awayDecimal,
+    probabilities: { win: 0.5, push: 0, loss: 0.5 },
+    confidence: 0.6,
+    selectedForExecution: false,
+    wouldAbstain: false,
+    provider: 'openai',
+    requestedModelId: 'stub-model-1',
+    reportedModelId: 'stub-model-1',
+    providerResponseId: 'resp-1',
+    attemptUsed: 'initial',
+    bundleSha256: 'x',
+    gameSha256: null,
+    slateSha256: 'x',
+  });
+  const violations = verifyRunIntegrity(parseRunRecords([...lines, spreadDecision]), {
+    expectedArms: FIXTURE_ARMS,
+  });
+  assert.ok(
+    violations.some((v) => v.includes('does not supply')),
+    violations.join('; '),
+  );
+});
+
+test('S3c: a total-less scoped board emits no totals ladder', () => {
+  const run = parseRunRecords(scopedRun(['moneyline']).lines);
+  const scored = scoreRun(run, [], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model);
+  assert.equal(model.totalsLadder, null); // no total supplied -> no ladder block
+  assert.equal(model.byMarket['total'], undefined);
 });
