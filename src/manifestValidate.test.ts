@@ -36,7 +36,11 @@ function codeConsistentRaw(): Record<string, unknown> {
       approvedReportedModelIds: a.approvedReportedModelIds,
     })),
     toolInferenceConfigSha256: 'b'.repeat(64),
-    baselinePolicyVersion: BASELINE_POLICY_VERSION,
+    // A line-open cohort fires markets independently, so any dispatch may be a
+    // single-market fire — every such cohort needs a scoped-capable baseline
+    // policy. The full-board default (BASELINE_POLICY_VERSION = v0.2) is refused
+    // by the dynamic-cohort gate below.
+    baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
@@ -86,6 +90,39 @@ test('marketPolicyDigest mismatch is flagged (wires to the recomputed digest)', 
 test('unknown baselinePolicyVersion is flagged', () => {
   const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), baselinePolicyVersion: 'baselines-v9.9.9' }));
   assert.ok(v.some((s) => /unknown baselinePolicyVersion/.test(s)), v.join('; '));
+});
+
+test('a cohort declaring a non-scoped-capable baseline policy is flagged (dynamic-cohort gate)', () => {
+  // A line-open cohort fires markets independently, so BOTH full-board policies are
+  // refused — a single-market dispatch fails closed under them. This holds
+  // regardless of the market policy's enabled set.
+  for (const version of [BASELINE_POLICY_VERSION, 'baselines-v0.1.0'] as const) {
+    const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), baselinePolicyVersion: version }));
+    assert.ok(
+      v.some((s) => /not scoped-capable.*requires a scoped-capable baseline policy \(baselines-v0\.3\.0\)/.test(s)),
+      `${version}: ${v.join('; ')}`,
+    );
+  }
+});
+
+test('the dynamic-cohort gate reads baseline capability only — the market policy cannot relax or require it', () => {
+  // Correction-matrix row 3: baseline scoped-capability is the SOLE basis. The
+  // market policy's enabled set never gates this — an all-three-enabled policy
+  // could not relax it, and even an UNKNOWN market policy does not suppress it
+  // (the gate does not consult the policy, so it never throws on the lookup).
+  const v = validateManifestAgainstCode(
+    parse({ ...codeConsistentRaw(), marketPolicyVersion: 'market-policy-v2', baselinePolicyVersion: BASELINE_POLICY_VERSION }),
+  );
+  assert.ok(v.some((s) => /unknown marketPolicyVersion/.test(s)), v.join('; ')); // its own typed refusal
+  assert.ok(v.some((s) => /not scoped-capable/.test(s)), v.join('; ')); // capability gate fires independently
+});
+
+test('the dynamic-cohort gate does not double-flag an already-unknown baseline version', () => {
+  // An unknown baseline version is flagged once (as unknown), not also as a
+  // capability mismatch — capability is checked only for a known version.
+  const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), baselinePolicyVersion: 'baselines-v9.9.9' }));
+  assert.ok(v.some((s) => /unknown baselinePolicyVersion/.test(s)), v.join('; '));
+  assert.ok(!v.some((s) => /not scoped-capable/.test(s)), v.join('; '));
 });
 
 test('promptScaffoldSha256 mismatch is flagged', () => {

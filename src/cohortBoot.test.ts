@@ -44,7 +44,11 @@ function codeConsistentRaw(): Record<string, unknown> {
       approvedReportedModelIds: a.approvedReportedModelIds,
     })),
     toolInferenceConfigSha256: 'b'.repeat(64),
-    baselinePolicyVersion: BASELINE_POLICY_VERSION,
+    // A line-open cohort fires markets independently (a dispatch may carry a single
+    // market), so a code-consistent manifest must declare a scoped-capable baseline
+    // policy; the full-board default (BASELINE_POLICY_VERSION = v0.2) is refused by
+    // the dynamic-cohort gate (see the boot-refusal test below).
+    baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
@@ -111,6 +115,19 @@ test('a code-inconsistent manifest (wrong scoringPolicyVersion) fails boot', () 
     cohortBoot(req({ ...codeConsistentRaw(), scoringPolicyVersion: 'scoring-v0.0.1' })),
   );
   assert.ok(err.violations.some((v) => /scoringPolicyVersion/.test(v)), err.violations.join('; '));
+});
+
+test('a cohort declaring a non-scoped-capable baseline policy is refused (dynamic-cohort gate)', () => {
+  // A line-open cohort fires markets independently, so the full-board default v0.2
+  // must fail boot — a single-market dispatch would fail closed under it. The gate
+  // refuses on baseline capability, not the market policy's enabled set.
+  const err = assertBootError(() =>
+    cohortBoot(req({ ...codeConsistentRaw(), baselinePolicyVersion: BASELINE_POLICY_VERSION })),
+  );
+  assert.ok(
+    err.violations.some((v) => /not scoped-capable.*requires a scoped-capable baseline policy \(baselines-v0\.3\.0\)/.test(v)),
+    err.violations.join('; '),
+  );
 });
 
 test('capacity below the roster fails boot (case 38)', () => {
