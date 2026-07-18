@@ -973,7 +973,7 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
 test('the scoring policy version is pinned to its literal value', () => {
   // A bump must be a conscious edit HERE too. 'scoring-v0.1.0' is reserved
   // for pre-stamp output by definition and must never be emitted.
-  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.4.0');
+  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.5.0');
 });
 
 test('every scored record type is stamped with the scoring policy version', () => {
@@ -1306,7 +1306,7 @@ test('a fully-failed arm keeps 0/N rows in every rendered per-market table', () 
 });
 
 // ---------------------------------------------------------------------------
-// TOTALS_V1 ladder integration (scoring-v0.4.0)
+// TOTALS_V1 ladder integration (added in scoring-v0.4.0)
 // ---------------------------------------------------------------------------
 
 test('every totals pick carries a ladder block; other markets carry none', () => {
@@ -1658,9 +1658,13 @@ const SCOPE_BLOCK: Record<ScopeMarket, 'moneyline' | 'runLine' | 'total'> = {
 function scopedRun(
   present: ReadonlyArray<ScopeMarket>,
   stampOverride?: BaselinePolicyVersion,
+  extraMarkets?: Record<string, unknown>,
 ): { lines: string[] } {
   const full = makeGameBundle({ gameId: GAME_A });
-  const scopedMarkets: Record<string, unknown> = {};
+  // `extraMarkets` is merged in BEFORE hashing so the artifact stays hash-coherent
+  // (e.g. an unknown market block bound into the recorded bundle); the recognized
+  // present blocks then drive forecasts and baselines.
+  const scopedMarkets: Record<string, unknown> = { ...extraMarkets };
   for (const marketKey of present) {
     const blockKey = SCOPE_BLOCK[marketKey];
     scopedMarkets[blockKey] = full.markets[blockKey];
@@ -1819,4 +1823,19 @@ test('S3c: a total-less scoped board emits no totals ladder', () => {
   assert.ok(model);
   assert.equal(model.totalsLadder, null); // no total supplied -> no ladder block
   assert.equal(model.byMarket['total'], undefined);
+});
+
+test('R1: an unknown market key in the recorded bundle is rejected (coherent artifact)', () => {
+  // A hash-coherent v0.3 artifact carrying a recognized moneyline block plus a
+  // raw unknown block: the scorer must not silently accept a four-key markets
+  // object and report one eligible market.
+  const { lines } = scopedRun(['moneyline'], undefined, {
+    mysteryMarket: { awayDecimal: 2, homeDecimal: 2 },
+  });
+  assert.throws(() => parseRunRecords(lines), /Unrecognized key|mysteryMarket/);
+});
+
+test('R1: a zero-known-market bundle is rejected with a direct cardinality error', () => {
+  const { lines } = scopedRun([]);
+  assert.throws(() => parseRunRecords(lines), /at least one known market block/);
 });

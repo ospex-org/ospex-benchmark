@@ -44,8 +44,14 @@ import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } fr
  * included) — sensitivity output, separately labeled, never pooled into the
  * primary columns while the method's independent alternate-ladder
  * validation is pending. All previously scored values are unchanged.
+ * v0.5.0 makes the scorer scope-aware (S3c): it accepts 1-3-market artifacts,
+ * rejects unknown/zero market blocks, and derives per-scope denominators
+ * (eligibleMarkets = sum of supplied markets, not responses * 3). Full-board
+ * numeric/structural output is unchanged apart from this stamp — the new engine
+ * accepts a wider artifact domain and emits different scoped aggregates, so it
+ * must not share a methodology identity with the fixed-three-only v0.4.0.
  */
-export const SCORING_POLICY_VERSION = 'scoring-v0.4.0';
+export const SCORING_POLICY_VERSION = 'scoring-v0.5.0';
 
 /** The scored markets, anchored to MarketKey so drift is a compile error. */
 export const MARKETS: ReadonlyArray<MarketKey> = ['moneyline', 'spread', 'total'];
@@ -106,16 +112,19 @@ const bundleGameSchema = z
         scheduledStartUtc: z.string().min(1),
         markets: z
           .object({
-            // A bundle supplies market blocks (1-3 in practice, S3 dynamic
-            // cardinality); an absent market is an omitted key. Each block is
-            // .optional() with no >=1 floor here — the at-least-one guarantee is
-            // the prepared boundary's job (S3e, spec §2.2), so the scorer parses
-            // 0-3 and a 0-market game contributes 0 coverage. Every PRESENT
-            // block's prices must be valid decimal quotes (>1), exactly like
-            // decision observedDecimal: BOTH sides feed the margin-adjusted entry
-            // de-vig, so an invalid opposite side refuses the file at parse time
-            // rather than silently dropping margin-adjusted values while economic
-            // ones still score.
+            // A recorded bundle supplies 1-3 of the KNOWN markets (moneyline,
+            // runLine, total); an absent market is an omitted key. `.strict()`
+            // rejects any unknown market key, and the refinement rejects a
+            // zero-market bundle with a direct cardinality error — the scorer
+            // enforces the exact known-market scope on the archived artifact, so
+            // a zero-market game is INVALID, not scored as zero coverage. (The
+            // at-least-one guarantee at production time is separately the
+            // prepared boundary's job, S3e, spec §2.2.) Every PRESENT block's
+            // prices must be valid decimal quotes (>1), exactly like decision
+            // observedDecimal: BOTH sides feed the margin-adjusted entry de-vig,
+            // so an invalid opposite side refuses the file at parse time rather
+            // than silently dropping margin-adjusted values while economic ones
+            // still score.
             moneyline: z
               .object({ awayDecimal: z.number().gt(1), homeDecimal: z.number().gt(1) })
               .passthrough()
@@ -129,7 +138,11 @@ const bundleGameSchema = z
               .passthrough()
               .optional(),
           })
-          .passthrough(),
+          .strict()
+          .refine((m) => m.moneyline != null || m.runLine != null || m.total != null, {
+            message:
+              'bundle game must supply at least one known market block (moneyline, runLine, or total)',
+          }),
       })
       .passthrough(),
   })
@@ -600,8 +613,9 @@ function expectedEntry(
  * - every recorded game/request/slate hash must match a recomputation from
  *   the embedded bundles (a tampered price or bundle cannot hide);
  * - every model decision must be backed by a VALID arm response for the same
- *   participant/game/request hash, exactly three decisions per valid
- *   response and none for non-valid ones (no fabricated decisions);
+ *   participant/game/request hash, exactly one decision per SUPPLIED market
+ *   (1-3; the three fixed markets on a full board) per valid response and none
+ *   for non-valid ones (no fabricated decisions);
  * - every decision's echoed selection/line/price must re-verify against the
  *   hash-verified bundle, and its echoed hashes must match.
  */
@@ -1478,7 +1492,8 @@ export interface ParticipantStats {
   kind: 'model' | 'baseline';
   /** Games this arm was dispatched (models) or picked in (baselines). */
   games: number;
-  /** Market-decision opportunities: models 3 per dispatched game; baselines 1 per pick. */
+  /** Market-decision opportunities: models sum the supplied-market count over
+   * dispatched games (3 each on a full board); baselines 1 per pick. */
   eligibleMarkets: number;
   /** Valid decisions present in the run file. */
   validDecisions: number;
