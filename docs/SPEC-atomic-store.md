@@ -126,6 +126,7 @@ concurrency_leases                  -- one slot per row; releasable, crash-expir
   lease_id      text  PK
   cohort_id     text
   fire_id       text
+  owner_id      text                -- acquiring worker/session identity (governing ConcurrencyLeaseV1.ownerId)
   arm_index     int                 -- which roster arm this slot backs (load-bearing for repair idempotency)
   attempt_kind  text                -- initial | repair
   attempt_index int null            -- per-arm repair index (§5 numbers attempts per arm)
@@ -143,39 +144,49 @@ Rationale: the claim PK is at-most-once (case 8). The single `cohort_budget` row
 
 **Global lock order (deadlock-free by construction):** every operation that touches `cohort_budget` acquires `SELECT … FROM cohort_budget WHERE cohort_id = ? FOR UPDATE` **first**, before any `fires` / `claims` / `concurrency_leases` write. `admitDispatch`, `acquireRepairLease`, and `completeClaim` all obey this single order, so no lock cycle can form. `releaseLease` touches only its own lease row and takes **no** budget lock (freeing capacity is conservative — a concurrent admit that has not yet observed the release merely under-admits, never over-admits).
 
+**Input validation is fail-closed (every operation).** Every numeric input — reservation deltas, `actualCalls`/`actualSpend`, the pinned caps/bounds at boot, `armIndex`/`attemptIndex`, and every checked sum/product — must be a **safe non-negative integer** (TypeScript `number` does not itself guarantee this). A negative, `NaN`, fractional, unsafe-magnitude, or null value is a **typed refusal writing nothing** (`invalid_input`), never a value that reaches the cap arithmetic — a naive upper-bound-only check would let a negative `spendΔ` pass the cap and *decrement* the reservation, freeing headroom (`cap 100 → admit −100 → admit +150` both accepted, stored 50). Market keys must be non-empty and one of the known markets. These RPC-level checks are backed by database `CHECK` constraints (non-negative counters, known markets/statuses, non-empty keys) and by exact `bigint` wire representation between TypeScript and Postgres (no float / unsafe-integer ambiguity), so the invariants hold even against a direct write.
+
 ### 4.1 `admitDispatch` — one transaction, all-or-nothing
 
 1. **Version + existence, fail-closed.** `SELECT … FOR UPDATE` the cohort's budget row. **If no row is found, refuse `not_initialized` and write nothing** — a missing pinned row must never fall through to an uncapped, unserialized admission. If `schema_version` ≠ the client's pinned version, refuse `version_mismatch`.
 2. **Idempotency, inside the lock.** With the budget row locked, check for an existing `fires` row for `fireId`. **If it exists, this is a replay of an admission that already committed in full** (the whole admission is one transaction — §5) — return its recorded outcome: the **`claimedKeys`** it owns, the **per-arm** `initial` leases (`{leaseId, armIndex, state}` — live/released/expired), and the fire status (`pending`/`completed`), so a lost-response retry learns the true claimed scope (which co-arrival keys were dropped), can resume per-arm release, tell a live admission from a settled one, and never re-arm a completed fire. A legitimate co-arrival retry re-sends the **original** `proposedKeys`, which is a **superset** of the recorded `claimedKeys` (some keys were dropped) — so the replay is valid whenever `claimedKeys ⊆ proposedKeys`. **Fail loud** (`fire_id_key_mismatch`) **only** when a recorded claimed key is **absent** from the retry's `proposedKeys` — a genuine reuse of the `fireId` for a different dispatch. Do nothing else.
 3. **Recheck scope.** Retain the proposed keys **not already claimed by a different `fire_id`** (`claims.fire_id <> fireId`; after step 2 a same-fire key cannot reach here). A key claimed by another fire is dropped (co-arrival partial claim, §4 / case 24).
 4. **Zero retained → refuse `all_claimed`**, write nothing.
-5. **Derive reservations from pinned values** (not caller magnitudes, §1.1): `callΔ = roster_size × (1 + max_repairs_per_arm)`; `slotCount = roster_size`; the lease bounds from the pinned columns. The **spend** reservation is the caller's per-fire estimate, recorded as-is.
+5. **Derive the call/slot/lease reservations from pinned values** (not caller magnitudes, §1.1): `callΔ = roster_size × (1 + max_repairs_per_arm)`; `slotCount = roster_size`; the lease bounds from the pinned columns. The **spend** reservation `spendΔ` is looked up from the caller's `scopeReservations` table for the **retained** scope (§4.5), together with its `preparedBytesDigest`; a retained scope absent from the table refuses `scope_reservation_missing`.
 6. **Check** all three caps: `calls_reserved + callΔ ≤ call_cap`, `spend_reserved + spendΔ ≤ spend_cap_usd_micros`, and `slotsInUse + slotCount ≤ concurrency_limit`, where `slotsInUse = SUM(1)` over this cohort's leases with `released_at IS NULL AND expires_at > store_now()`.
 7. **If insufficient → refuse** with the binding reason (`call_cap` | `spend_cap` | `concurrency`), write nothing.
-8. **If sufficient:** in the **same** transaction — insert `pending` claims for the retained keys (`ON CONFLICT (cohort_id, game_id, market) DO NOTHING`, capturing the **actual** inserted rows). **If zero rows were actually inserted**, refuse `all_claimed` and write nothing else (a defensive assertion: this transaction holds the budget-row lock, so no concurrent admit can commit a conflicting claim mid-transaction and this is unreachable under the lock order — but it guarantees the atomic-refusal invariant regardless). Otherwise: insert the `fires` row (`call_reserved = callΔ`, `spend_reserved = spendΔ`, `made_calls = slotCount`, `status = pending` — `made_calls` starts at the roster's initial attempts and each repair increments it); increment `calls_reserved += callΔ` and `spend_reserved += spendΔ`; insert `slotCount` one-slot `initial` lease rows (`arm_index` 0…roster−1) with `expires_at = store_clock() + initial_lease_bound_ms`. Commit. Return `Admitted` with the actually-claimed keys and the per-arm `initial` lease ids.
+8. **If sufficient:** in the **same** transaction — insert `pending` claims for the retained keys (`ON CONFLICT (cohort_id, game_id, market) DO NOTHING`, capturing the **actual** inserted rows). **If zero rows were actually inserted**, refuse `all_claimed` and write nothing else (a defensive assertion: this transaction holds the budget-row lock, so no concurrent admit can commit a conflicting claim mid-transaction and this is unreachable under the lock order — but it guarantees the atomic-refusal invariant regardless). Otherwise: insert the `fires` row (`call_reserved = callΔ`, `spend_reserved = spendΔ`, `made_calls = slotCount`, `status = pending` — `made_calls` starts at the roster's initial attempts and each repair increments it); increment `calls_reserved += callΔ` and `spend_reserved += spendΔ`; insert `slotCount` one-slot `initial` lease rows (`arm_index` 0…roster−1, `owner_id`) with `expires_at = store_clock() + initial_lease_bound_ms`. Commit. Return `Admitted` (`dispatchAuthorized: true`) with the actually-claimed keys, the retained scope's `preparedBytesDigest`, and the per-arm `initial` lease ids.
 
 **Atomic refusal is the invariant:** any refusal (missing row, version, `all_claimed`, or a cap) writes **zero** `fires`/`claims`/`lease`/budget rows. Because budget and leases are written **only** on the ≥1-actual-insert path, no phantom reservation or phantom lease is possible.
 
 ### 4.2 `acquireRepairLease` — one slot, same lock, idempotent
 
-Takes the same `cohort_budget … FOR UPDATE` **first** and performs the same fail-closed `not_initialized` / `version_mismatch` checks as `admitDispatch` (the lock also serializes the capacity check, §1.7 / case 45). Idempotent on `(cohortId, fireId, armIndex, attemptIndex)` — the key **must** carry `armIndex` because governing §5 numbers attempts **per arm** (each arm: initial 1, repair 2), so a per-arm-only `attemptIndex` would collide two arms' repairs and hand one arm the other's lease, breaching the ceiling. A retried repair acquire returns the existing lease, never leaking a slot. Checks `slotsInUse + 1 ≤ concurrency_limit`; on success inserts one 1-slot `repair` lease (`expires_at = store_clock() + repair_lease_bound_ms`) and increments `fires.made_calls += 1`; else refuses `concurrency`. It does **not** validate `fireId` against a live claim and does **not** enforce `maxRepairAttemptsPerArm` — the reservation already bought those attempts, and per-arm repair budgeting is the runner's responsibility.
+Takes the same `cohort_budget … FOR UPDATE` **first** and performs the same fail-closed `not_initialized` / `version_mismatch` checks as `admitDispatch`. Inside that lock it enforces, **all as typed refusals writing nothing** (a repair must never escape the reservation — it authorizes a paid HTTP attempt):
+
+- the fire **exists and `fires.status = pending`** — an absent or already-`completed` fire refuses `fire_not_pending`. This closes the repair-vs-`completeClaim` race in **both** orders: if completion commits first (it holds the same budget lock), the repair sees `completed` and refuses;
+- `armIndex ∈ [0, roster_size)` — else `invalid_arm`;
+- `attemptIndex` is the next in-sequence per-arm repair index within `[1, maxRepairsPerArm]` — else `invalid_attempt` / `repair_limit`;
+- **a reserved attempt remains: `fire.made_calls < fire.call_reserved`** — else `call_reserved_exhausted` (this is the hard guard against `made_calls > call_reserved`);
+- capacity: `slotsInUse + 1 ≤ concurrency_limit` — else `concurrency`.
+
+Idempotent on `(cohortId, fireId, armIndex, attemptIndex)` — the key **must** carry `armIndex` (governing §5 numbers attempts per arm; a per-arm-only index would collide two arms' repairs and hand one arm the other's lease). A retried acquire returns the existing lease and does **not** re-increment `made_calls`. On success it inserts one 1-slot `repair` lease — its `(cohortId, fireId, armIndex, attemptIndex)` is the **durable idempotency anchor**, retained per §7 while the fire is replayable (`expires_at = store_clock() + repair_lease_bound_ms`) — and increments `fires.made_calls += 1`.
 
 ### 4.3 `releaseLease` — idempotent, capacity-only, no budget lock
 
-Sets `released_at = store_clock()` for the lease if unreleased; a second call is a no-op. Releasing changes only in-flight capacity; it never refunds a claim/call/spend reservation.
+**Scoped to the lease's owner:** `releaseLease(leaseId, ownerId)` sets `released_at = store_clock()` only if the lease's `owner_id` matches (else a typed `not_owner` refusal — a worker may release only its own slots); a second call is a no-op. Releasing changes only in-flight capacity; it never refunds a claim/call/spend reservation, and it does not delete the row (the durable replay/idempotency record is retained per §7).
 
 ### 4.4 `completeClaim` — budget-lock-first, settle exactly once
 
-Takes `cohort_budget … FOR UPDATE` first (lock order). **A `fireId` with no `fires` row is a no-op** (a crash before admit committed left nothing to settle). **Idempotent:** if the `fires` row is already `completed`, no-op (the settle never runs twice). Otherwise, atomically flip `fires.status` and this fire's claims to `completed`, and settle both counters — settle-down-only, exactly once:
+Takes `cohort_budget … FOR UPDATE` first (lock order) and checks `expectedSchemaVersion` (else `version_mismatch`, no writes). **A `fireId` with no `fires` row is a no-op** (a crash before admit committed left nothing to settle). **Idempotent:** if the `fires` row is already `completed`, no-op (the settle never runs twice). Otherwise it **validates the reported actuals fail-closed**: each supplied actual must be a safe non-negative integer, with `actualCalls ∈ [fire.made_calls, fire.call_reserved]` and `actualSpendUsdMicros ∈ [0, fire.spend_reserved]`. An actual that is **above the reservation, below `made_calls`/zero, unsafe, fractional, or null fails LOUD** (typed `invariant_breach`; no settle, the fire stays `pending`) — it must **never** be silently clamped and the fire certified clean, because an actual above the reservation is a real accounting breach to surface, not hide. On valid actuals it atomically flips `fires.status` and this fire's claims to `completed`, and settles — settle-down-only, exactly once:
 
-- **Calls (store-verified floor):** `calls_reserved -= (fire.call_reserved − clamp(actualCalls, fire.made_calls, fire.call_reserved))`. The floor `fire.made_calls` is the **persisted** attempts-started count (not derived from lease rows, so GC cannot weaken it), never below it, never below zero. If `actualCalls` is omitted, settle calls down to `fire.made_calls`.
-- **Spend (caller-trusted, floor of zero):** `spend_reserved -= (fire.spend_reserved − clamp(actualSpendUsdMicros, 0, fire.spend_reserved))`. The store cannot verify per-fire spend (§1.1), so its only floor is zero and the conservative pre-dispatch bound is the guarantee, not exact billing; a `made_calls` (attempt-count) floor is dimensionally meaningless for USD-micros and is deliberately **not** applied. If `actualSpendUsdMicros` is omitted, spend stays at the full reservation.
+- **Calls:** `calls_reserved -= (fire.call_reserved − actualCalls)`. `fire.made_calls` (the persisted, GC-independent attempts-started count) is the floor an omitted `actualCalls` settles to.
+- **Spend:** `spend_reserved -= (fire.spend_reserved − actualSpendUsdMicros)`. Omitted `actualSpendUsdMicros` leaves spend at the full reservation — the store cannot verify per-fire spend (§1.1), so a `made_calls` (attempt-count) floor is dimensionally meaningless for USD-micros and is deliberately not applied.
 
 A crash before `completeClaim` performs no settle — the conservative reservation stays consumed.
 
 ### 4.5 Retained-scope projection (co-arrival partial claim, governing §3)
 
-The caller computes the spend estimate and prepares the request bytes for its **proposed** scope, then calls `admitDispatch`. The store returns the **actually-claimed** scope, which may be smaller (a co-arrival key claimed by another fire is dropped). The caller then **synchronously re-projects** the request/bundle bytes for exactly the claimed scope before any dispatch (governing §3), and the over-reserved spend for the dropped keys is recovered by the completion **settle** (§4.4) — never a mid-flight refund. The **call/slot** reservation is per-dispatch (roster attempts) and is unchanged by a smaller scope. An already-claimed key receives **no** second provider forecast (case 24).
+Because one game has at most three markets, its co-arrival group has at most **seven** nonempty scope subsets. The caller **precomputes, for every nonempty subset of the proposed markets, the immutable prepared request bytes and their conservative per-attempt spend estimate** (§6), and passes that `scope → {spendReservation, preparedBytesDigest}` table to `admitDispatch`. Inside the transaction, after the store determines the **actually-retained** scope (a co-arrival key claimed by another fire is dropped, case 24), it **selects the table entry for that exact retained subset**, reserves **that** spend (not the proposed-scope estimate), and returns its `preparedBytesDigest` — so the dispatched bytes, token count, and reserved spend are all the same exact retained scope, bound atomically inside the lock. A retained subset absent from the table fails closed (`scope_reservation_missing`). This removes the proposed-vs-retained gap the earlier design had: the store never over-reserves a fitting subset out of the cap, and never under-reserves if per-subset tokenization is non-monotone (no monotonicity assumption is needed). The **call/slot** reservation is per-dispatch (roster attempts) and is unchanged by a smaller scope. An already-claimed key receives **no** second provider forecast (case 24).
 
 ### 4.6 The capacity query is derived, not a counter
 
@@ -188,9 +199,9 @@ In-flight concurrency is always `SUM(1) WHERE released_at IS NULL AND expires_at
 The `fireId` is a client-generated identifier for one dispatch attempt and the store's idempotency anchor.
 
 - **`admitDispatch(fireId, …)` is idempotent per `fireId` — the check runs inside the budget-row lock (§4.1 step 2).** A retry after a lost response necessarily blocks behind the still-in-flight original on the `FOR UPDATE`; once the original commits, the retry sees the committed `fires` row and returns its recorded outcome, never a second reservation. (A pre-lock existence check may exist only as an optimization, never as the authoritative decision.)
-- **Replay return is liveness-aware and resumable:** it reports the fire `status` (`pending`/`completed`), the `claimedKeys`, and the **per-arm** `initial` leases (`{leaseId, armIndex, state}`), so a lost-response retry learns the true claimed scope, can resume per-arm release (behavior 3), never treats a released/expired lease as live, and never re-dispatches a `completed` fire.
+- **A replay is informational, NEVER a fresh dispatch authorization.** Only a newly-committed admission (`outcome: 'admitted'`) authorizes launching the roster; a `replayed` outcome carries `dispatchAuthorized: false`. It reports the fire `status`, the `claimedKeys`, and — for a `pending` fire, whose lease rows are retained per §7 — the per-arm `initial` leases (`{leaseId, armIndex, state}`) so a still-live worker can resume **release** (behavior 3), but it never re-authorizes provider calls. This is the conservative choice: a `pending` row cannot distinguish a lost admission-response *before* any provider call from a crash *after* calls began, so letting a replay dispatch could double provider billing; forbidding it is safe and sacrifices only the rare lost-response-before-dispatch attempt (the same rule applies to a replayed repair lease). A `completed` fire's replay reports `status: 'completed'` + `claimedKeys` and is never re-armed. The idempotency + replay records survive GC (§7 prunes only non-replayable rows).
 - **A same-`fireId` replay is valid when its `proposedKeys` is a superset of the recorded `claimedKeys`** — the co-arrival case: a lost-response retry re-sends the original proposal and learns from the returned `claimedKeys` which keys were dropped. It **fails loud** (`fire_id_key_mismatch`) only when a recorded claimed key is **absent** from the retry's proposal — a genuine reuse of the `fireId` for a different dispatch. (This resolves the prior open question.)
-- **`acquireRepairLease`** is idempotent on `(cohortId, fireId, attemptIndex)`; **`releaseLease`** and **`completeClaim`** are idempotent by construction.
+- **`acquireRepairLease`** is idempotent on `(cohortId, fireId, armIndex, attemptIndex)` (the `armIndex` is required — §4.2); **`releaseLease`** and **`completeClaim`** are idempotent by construction.
 - A crash-and-restart that loses the `fireId` does not need idempotency: the claim rows already exist, so a re-detection's admit (new `fireId`) finds the keys claimed and refuses `all_claimed` — at-most-once is enforced by the claim PK independently of idempotency.
 
 ---
@@ -199,7 +210,7 @@ The `fireId` is a client-generated identifier for one dispatch attempt and the s
 
 - All accounting is **exact integer** arithmetic on safe integers. No floats in the ledger.
 - **Call reservation per dispatch** is **store-derived**: `roster_size × (1 + max_repairs_per_arm)` — initial attempts plus maximum repairs, once per dispatch regardless of scoped-market count. The caller never supplies this magnitude (§1.1).
-- **Spend reservation per dispatch** is the caller's conservative estimate `Σ_arm price(model, inputTokens, maxOutputTokens, toolPolicy) × (1 + maxRepairs)` in USD-micros from the manifest-pinned price table; **unknown pricing for any expected arm fails boot**. The store records it per fire and checks it against the cap; it cannot recompute it (per-fire input tokens), so the trust boundary of §1.1 applies.
+- **Spend reservation per dispatch** is the caller's conservative estimate, priced **per attempt** — the initial attempt and each repair attempt have **separate** input bounds. A repair request appends the entire preceding model response (up to `maxOutputTokens`) plus the repair scaffold / error material to the initial turns, so its input upper bound is strictly **larger** than the initial's; multiplying the initial-attempt price by `(1 + maxRepairs)` under-reserves. The bound is `Σ_arm [ price(initial: initialInput, maxOutputTokens) + maxRepairs × price(repair: initialInput + maxOutputTokens + repairScaffold, maxOutputTokens) ]` in USD-micros from the manifest-pinned price table; **unknown or unpriceable pricing for any attempt fails boot/admission** — never a silent zero. The store records the estimate per fire and checks it against the cap; it cannot recompute it (per-fire input tokens), so the §1.1 trust boundary applies.
 - **Settle-down-only** (§4.4), only once (gated on the `pending`→`completed` transition): **calls** reduce toward the actual but never below the persisted `fire.made_calls` (the store-known attempts started) and never below zero; **spend** reduces toward the caller-reported actual with a floor of **zero** — the store cannot verify per-fire spend (§1.1), so an attempt-count floor is dimensionally meaningless and the conservative pre-dispatch bound is the guarantee. This keeps the cohort's paid surface bounded above by the reservations, across crashes.
 
 The hard guarantees are the **call count**, the **token/output bounds**, and this **conservative estimate** — not exact external billing.
@@ -212,7 +223,7 @@ The hard guarantees are the **call count**, the **token/output bounds**, and thi
 - **`expires_at` is stamped from `store_clock()` (`clock_timestamp()`) at the lease insert** — the *actual* acquire instant, which advances within the transaction. This matters because an admit may wait on the budget-row lock before inserting; anchoring `expires_at` to transaction start would shorten the lease by the lock-wait and could free an in-flight slot early. Stamping at the insert instant gives the lease its full pinned bound from acquisition.
 - **Bounds (pinned, store-derived):** initial lease `maxDispatchLagMs + providerCallTimeoutMs + maxClockSkewMs`; repair lease `providerCallTimeoutMs + maxClockSkewMs`.
 - **A lease is reclaimable only at/after `expires_at`** (the filter excludes it), by the store clock; no worker clock shortens or extends it. Expiry frees only in-flight capacity — never a claim/call/spend refund, never a fire retry.
-- **Optional GC** may delete only **non-counting** rows (`released_at IS NOT NULL OR expires_at <= store_now()`); it must never prune a still-counting lease. Because the settle floor is the **persisted `fires.made_calls`** (not derived from lease rows, §4.4), GC is pure housekeeping and cannot weaken the floor — it may prune freely, including a `pending` (interrupted) fire's released/expired leases.
+- **Optional GC** may delete a lease row only when it is **non-counting AND no longer replayable**: `released_at IS NOT NULL OR expired`, **AND** its fire is `completed`, **AND** a retention window has passed. It must **never** prune a `pending` (or interrupted) fire's lease rows — those are the durable idempotency + replay anchor (a repair retry must stay idempotent, and a pending admission-replay must stay reconstructable). GC removing data that could change a future replay/idempotency outcome is forbidden. Because the settle floor is the persisted `fires.made_calls` (§4.4), GC never weakens the floor; and because the capacity SUM already excludes released/expired leases, retaining them costs only storage, not capacity.
 - **Testing note:** because `transaction_timestamp()` does not advance within a transaction, case 46 expiry cannot be exercised with a `pg_sleep` inside one transaction — the conformance slice must drive expiry **across** transactions.
 
 ---
@@ -235,13 +246,15 @@ At-most-once holds at every point because the claim row exists the instant the a
 
 ```
 AdmitResult =
-  | { outcome: 'admitted'; fireId; claimedKeys; initialLeases: Lease[] }
-  | { outcome: 'replayed'; fireId; claimedKeys; fireStatus: 'pending'|'completed'; initialLeases: Lease[] }
-  | { outcome: 'refused'; reason: 'not_initialized' | 'version_mismatch'
-                                  | 'all_claimed' | 'call_cap' | 'spend_cap' | 'concurrency' }
-  | { outcome: 'error'; kind: 'fire_id_key_mismatch' }
+  | { outcome: 'admitted';  fireId; claimedKeys; preparedBytesDigest; initialLeases: Lease[]; dispatchAuthorized: true }
+  | { outcome: 'replayed';  fireId; claimedKeys; fireStatus: 'pending'|'completed'; initialLeases: Lease[]; dispatchAuthorized: false }
+  | { outcome: 'refused';   reason: 'not_initialized' | 'version_mismatch' | 'invalid_input' | 'all_claimed'
+                                  | 'scope_reservation_missing' | 'call_cap' | 'spend_cap' | 'concurrency' }
+  | { outcome: 'error';     kind: 'fire_id_key_mismatch' }
 
 Lease = { leaseId; armIndex; expiresAt; state: 'live'|'released'|'expired' }
+// Only outcome:'admitted' (dispatchAuthorized:true) authorizes launching the roster (§5/A6a).
+
 ```
 
 `acquireRepairLease` returns `{ leaseId; expiresAt } | { refused: 'concurrency' | 'not_initialized' | 'version_mismatch' }`. The reasons are exhaustive and fail-closed: an unrecognized/uninitialized state never reads as `admitted`, and a refusal writes nothing.
@@ -254,40 +267,53 @@ The contract the durable-operations and conformance slices implement. Instants a
 
 ```ts
 interface AtomicStore {
-  /** Cohort boot: pin the caps AND the reservation constants under cohortId, INSERT-ONCE
-   *  (ON CONFLICT DO NOTHING — never resets the reserved counters). The pinned values are
-   *  invariant for a cohortId because cohortId hashes the manifest. */
+  /** Cohort boot: pin the caps AND the reservation constants under cohortId, INSERT-IF-ABSENT
+   *  (never resets the reserved counters). On a pre-existing row it does NOT silently
+   *  DO-NOTHING — it COMPARES every pinned value (or an authoritative config digest + version)
+   *  and returns `config_mismatch`/`version_mismatch` WITHOUT mutation. The pins are invariant
+   *  for a cohortId (cohortId hashes the manifest), so a mismatch means corruption / inconsistent
+   *  init / a caller bug and MUST fail loud, not be silently retained. */
   initCohortBudget(req: {
     cohortId: string; schemaVersion: number;
     callCap: number; spendCapUsdMicros: number; concurrencyLimit: number;
     rosterSize: number; maxRepairsPerArm: number;
     initialLeaseBoundMs: number; repairLeaseBoundMs: number;
-  }): Promise<void>;
+  }): Promise<{ ok: true } | { refused: 'config_mismatch' | 'version_mismatch' | 'invalid_input' }>;
 
   /** Atomic at-most-once claim + call/spend reservation + one-slot-per-arm initial leases for
    *  the retained scope of one dispatch. Idempotent per fireId (inside the lock). The store
    *  DERIVES the call/slot/lease magnitudes from the pinned constants; only the per-fire spend
    *  estimate is caller-supplied (recorded + cap-checked, §1.1). */
   admitDispatch(req: {
-    cohortId: string; fireId: string; expectedSchemaVersion: number;
+    cohortId: string; fireId: string; ownerId: string; expectedSchemaVersion: number;
     proposedKeys: ReadonlyArray<{ gameId: string; market: MarketKey }>;
-    spendReservationUsdMicros: number;
+    /** One entry per NONEMPTY subset of proposedKeys (≤7 for one game): the immutable prepared
+     *  bytes digest + the conservative per-attempt spend for that EXACT scope (§4.5, §6). The store
+     *  selects the entry for the actually-retained scope inside the lock and reserves that. */
+    scopeReservations: ReadonlyArray<{
+      scope: ReadonlyArray<MarketKey>; spendReservationUsdMicros: number; preparedBytesDigest: string;
+    }>;
   }): Promise<AdmitResult>;
 
-  /** One fresh repair slot, same budget lock, idempotent per (fireId, armIndex, attemptIndex).
-   *  armIndex is required so two arms' repairs cannot collide (§5 numbers attempts per arm). */
+  /** One fresh repair slot, same budget lock. Enforces existing pending fire, valid arm/attempt,
+   *  repair limit, and a remaining reserved attempt (§4.2). Idempotent per (fireId, armIndex, attemptIndex). */
   acquireRepairLease(req: {
-    cohortId: string; fireId: string; armIndex: number; attemptIndex: number; expectedSchemaVersion: number;
+    cohortId: string; fireId: string; ownerId: string; armIndex: number; attemptIndex: number;
+    expectedSchemaVersion: number;
   }): Promise<{ leaseId: string; expiresAt: string }
-            | { refused: 'concurrency' | 'not_initialized' | 'version_mismatch' }>;
+            | { refused: 'concurrency' | 'not_initialized' | 'version_mismatch' | 'fire_not_pending'
+                       | 'invalid_arm' | 'invalid_attempt' | 'repair_limit' | 'call_reserved_exhausted'
+                       | 'invalid_input' }>;
 
-  /** Idempotent release of one slot (the per-arm finally path). No budget lock. */
-  releaseLease(leaseId: string): Promise<void>;
+  /** Idempotent release of one slot, scoped to its owner (the per-arm finally path). No budget lock. */
+  releaseLease(req: { leaseId: string; ownerId: string }): Promise<{ ok: true } | { refused: 'not_owner' }>;
 
-  /** Budget-lock-first, settle-once completion; settle floored at the store-known made-count. */
+  /** Budget-lock-first, settle-once completion; schema-checked; fails LOUD (`invariant_breach`) on
+   *  actuals above the reservation / below made_calls / unsafe/fractional/null (§4.4). */
   completeClaim(req: {
-    cohortId: string; fireId: string; actualCalls?: number; actualSpendUsdMicros?: number;
-  }): Promise<void>;
+    cohortId: string; fireId: string; expectedSchemaVersion: number;
+    actualCalls?: number; actualSpendUsdMicros?: number;
+  }): Promise<{ ok: true } | { refused: 'version_mismatch' | 'invariant_breach' | 'invalid_input' }>;
 }
 ```
 
@@ -304,11 +330,14 @@ There is deliberately **no** `reclaimExpiredLeases` in the correctness path — 
 ```sql
 -- sketch, not final DDL; run against a scratch schema (concurrent sessions, pg_sleep-widened
 -- windows, and a two-session same-fireId race) before writing production code
-create function admit_dispatch(p_cohort text, p_fire text, p_ver int,
-                               p_keys jsonb, p_spend_delta bigint)
+create function admit_dispatch(p_cohort text, p_fire text, p_owner text, p_ver int,
+                               p_keys jsonb, p_scope_reservations jsonb)  -- scope→{spend,bytesDigest} table
 returns jsonb language plpgsql as $$
-declare v cohort_budget%rowtype; v_slots int; v_call_delta bigint; v_retained jsonb; v_inserted int;
+declare v cohort_budget%rowtype; v_slots int; v_call_delta bigint; v_spend_delta bigint;
+        v_retained jsonb; v_inserted int;
 begin
+  -- 0. domain validation, fail-closed (a negative/unsafe spend must NOT reach the cap check)
+  if not all_nonneg_safe_int(p_scope_reservations) then return refused('invalid_input'); end if;
   -- 1. lock + existence + version, fail-closed
   select * into v from cohort_budget where cohort_id = p_cohort for update;
   if not found then return refused('not_initialized'); end if;             -- never fall through uncapped
@@ -326,13 +355,15 @@ begin
                                      and c.game_id = k->>'gameId' and c.market = k->>'market'
                                      and c.fire_id <> p_fire));
   if v_retained is null then return refused('all_claimed'); end if;
-  -- 4. store-derived call/slot magnitudes; spend is the recorded caller estimate
+  -- 4. store-derived call/slot magnitudes; spend = caller estimate for the EXACT retained scope (§4.5)
   v_call_delta := v.roster_size * (1 + v.max_repairs_per_arm);
+  v_spend_delta := scope_reservation_for(p_scope_reservations, v_retained);
+  if v_spend_delta is null then return refused('scope_reservation_missing'); end if;
   select coalesce(sum(1),0) into v_slots from concurrency_leases
     where cohort_id = p_cohort and released_at is null and expires_at > now();  -- now() = txn-stable
   -- 5. caps
   if v.calls_reserved + v_call_delta > v.call_cap                     then return refused('call_cap'); end if;
-  if v.spend_reserved_usd_micros + p_spend_delta > v.spend_cap_usd_micros then return refused('spend_cap'); end if;
+  if v.spend_reserved_usd_micros + v_spend_delta > v.spend_cap_usd_micros then return refused('spend_cap'); end if;
   if v_slots + v.roster_size > v.concurrency_limit                    then return refused('concurrency'); end if;
   -- 6. commit the whole admission; reservation/leases only on ≥1 ACTUAL claim insert
   with ins as (
@@ -344,19 +375,31 @@ begin
   select count(*) into v_inserted from ins;
   if v_inserted = 0 then return refused('all_claimed'); end if;        -- phantom-reservation guard (defensive)
   insert into fires (cohort_id, fire_id, call_reserved, spend_reserved_usd_micros, made_calls, status, admitted_at)
-    values (p_cohort, p_fire, v_call_delta, p_spend_delta, v.roster_size, 'pending', clock_timestamp());
+    values (p_cohort, p_fire, v_call_delta, v_spend_delta, v.roster_size, 'pending', clock_timestamp());
   update cohort_budget set calls_reserved = calls_reserved + v_call_delta,
-                           spend_reserved_usd_micros = spend_reserved_usd_micros + p_spend_delta
+                           spend_reserved_usd_micros = spend_reserved_usd_micros + v_spend_delta
     where cohort_id = p_cohort;
-  insert into concurrency_leases (lease_id, cohort_id, fire_id, arm_index, attempt_kind, acquired_at, expires_at)
-    select gen_random_uuid()::text, p_cohort, p_fire, g.i - 1, 'initial', clock_timestamp(),
+  insert into concurrency_leases (lease_id, cohort_id, fire_id, owner_id, arm_index, attempt_kind, acquired_at, expires_at)
+    select gen_random_uuid()::text, p_cohort, p_fire, p_owner, g.i - 1, 'initial', clock_timestamp(),
            clock_timestamp() + make_interval(secs => v.initial_lease_bound_ms / 1000.0)
     from generate_series(1, v.roster_size) as g(i);
-  return admitted(p_cohort, p_fire);   -- actually-inserted keys + per-arm initial leases
+  return admitted(p_cohort, p_fire);   -- actually-inserted keys + digest + per-arm initial leases
 end $$;
 ```
 
-The `for update` on one row makes the budget/idempotency check-and-reserve serializable without a full serializable isolation level; a same-`fireId` retry blocks on it and observes the committed prior admission at step 2. `now()` (`transaction_timestamp()`) is the stable read clock for the expiry filter; `clock_timestamp()` stamps `expires_at`/`claimed_at` at the true insert instant (§7). `acquire_repair_lease` and `complete_claim` take the same `cohort_budget … for update` first. The operations slice must confirm all of this against a real scratch schema before production DDL.
+The `for update` on one row makes the budget/idempotency check-and-reserve serializable without a full serializable isolation level; a same-`fireId` retry blocks on it and observes the committed prior admission at step 2. `now()` (`transaction_timestamp()`) is the stable read clock for the expiry filter; `clock_timestamp()` stamps `expires_at`/`claimed_at` at the true insert instant (§7). Every RPC also validates its integer inputs non-negative + safe (§4, `invalid_input`) — a negative/unsafe spend in the `p_scope_reservations` table is rejected *before* the cap check, so it can never decrement the reservation and free headroom. `acquire_repair_lease` and `complete_claim` take the same `cohort_budget … for update` first. The operations slice must confirm all of this against a real scratch schema before production DDL.
+
+### 11.1 RPC authority and permissions (fail-closed)
+
+These functions can burn claims/budget, release capacity, or settle fires — and a Postgres function is executable by **any** role by default — so their authority is part of the contract. The durable-operations slice must:
+
+- place the tables and functions in a **private/unexposed schema** (not the API-exposed one), and/or `REVOKE EXECUTE … FROM PUBLIC, anon, authenticated` on every function;
+- `GRANT EXECUTE` only to the **dedicated runtime role** (the runner's service credential) — never `anon`/`authenticated`;
+- choose `SECURITY INVOKER` vs a hardened `SECURITY DEFINER`, and for a `DEFINER` function pin a **safe explicit `search_path`** (Supabase requires this);
+- **deny direct table DML** to the runtime role — all writes go through the atomic functions, so nothing bypasses the single-lock reservation;
+- ship **migration assertions that verify the effective privileges** actually took, failing the migration otherwise.
+
+The store credential is a service-only secret; these RPCs are never reachable from the public `anon`/`authenticated` roles.
 
 ---
 
@@ -393,6 +436,12 @@ Mocks may supplement these but **cannot substitute** for actual overlapping data
 15. `fire_id_key_mismatch`: a same-`fireId` re-admit fails loud (writing nothing) **only** when a recorded claimed key is **absent** from the retry's `proposedKeys` — a genuine reuse for a different dispatch; a superset proposal is a valid replay (§5).
 16. **Per-arm repair idempotency:** two arms' repairs never collide — the idempotency key carries `armIndex`, so each arm gets its own repair lease and the ceiling holds (§4.2).
 17. **Spend settle floor is zero, not the attempt count:** `completeClaim` settles spend toward the caller actual with a floor of zero (caller-trusted, §1.1), while calls floor at the persisted `made_calls`; a missing `fires` row is a no-op (§4.4).
+18. **Retained-scope spend binding:** the store reserves the spend for the EXACT retained subset from the scope table (§4.5); a partial claim whose proposed estimate exceeds the cap but whose retained subset fits is admitted; dispatched bytes/tokens/spend all match the retained scope; a retained subset absent from the table refuses `scope_reservation_missing`.
+19. **Per-attempt pricing:** initial and repair attempts are priced separately; a repair's input bound includes the max prior response + scaffold; unknown pricing fails boot/admission (§6).
+20. **Repair enforcement:** a repair against an absent/completed fire, invalid arm, out-of-range/duplicate attempt, over the repair limit, or with no remaining reserved attempt (`made_calls == call_reserved`) refuses with zero writes; both repair-vs-complete race orders are safe; `made_calls` can never exceed `call_reserved` (§4.2).
+21. **GC-durable idempotency + replay:** a repair retry after release/expiry/GC stays idempotent and re-authorizes nothing; a pending fire's admission-replay is reconstructable after its leases expire; GC prunes only non-replayable rows (§7).
+22. **Fail-closed accounting:** a negative/null/fractional/unsafe/overflow input refuses `invalid_input` and never decrements a reservation; a conflicting re-init refuses `config_mismatch` with no reset; `completeClaim` fails loud (`invariant_breach`) on an actual above the reservation or below `made_calls`, and schema-checks (§4, §4.4).
+23. **Authorization + ownership + RPC authority:** only `outcome: 'admitted'` (`dispatchAuthorized: true`) authorizes launching the roster — a `replayed` never does; leases carry `ownerId` and release is owner-scoped (`not_owner`); the RPCs are revoked from public roles, granted only the runtime role, with migration privilege assertions (§5, §4.3, §11.1).
 
 ---
 
