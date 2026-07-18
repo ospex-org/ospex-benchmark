@@ -5,7 +5,7 @@ import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
 import type { RunEnvelope } from './runner.js';
 import type { CollisionCheckResult } from './providers/family.js';
-import type { ArmGameResult, ArmOutcome, GameBundle } from './types.js';
+import type { ArmGameResult, ArmOutcome, ArmSpec, GameBundle, MarketKey, SlateBundle } from './types.js';
 
 const OUTCOME_ORDER: ArmOutcome[] = [
   'valid',
@@ -22,28 +22,98 @@ function formatHandicap(value: number): string {
   return value > 0 ? `+${value}` : `${value}`;
 }
 
-function describeFavorite(game: GameBundle): string {
-  const ml = game.markets.moneyline;
+/**
+ * The response-side markets a game SUPPLIES (1-3, S3 dynamic cardinality), from
+ * its present blocks; applies the `spread`<->`runLine` key map. Full board:
+ * ['moneyline', 'spread', 'total'].
+ */
+export function suppliedMarketKeys(game: GameBundle): MarketKey[] {
+  const markets = game.markets as Partial<GameBundle['markets']>;
+  const keys: MarketKey[] = [];
+  if (markets.moneyline != null) keys.push('moneyline');
+  if (markets.runLine != null) keys.push('spread');
+  if (markets.total != null) keys.push('total');
+  return keys;
+}
+
+/** Human column label per response-side market key. */
+const MARKET_DISPLAY: Record<MarketKey, string> = {
+  moneyline: 'Moneyline',
+  spread: 'Run line',
+  total: 'Total',
+};
+
+export function describeFavorite(game: GameBundle): string {
+  const ml = (game.markets as Partial<GameBundle['markets']>).moneyline;
+  if (ml == null) return '—';
   if (ml.awayDecimal === ml.homeDecimal) return 'pick-em';
   return ml.awayDecimal < ml.homeDecimal
     ? `${game.awayTeam} (away)`
     : `${game.homeTeam} (home)`;
 }
 
-function slateRow(game: GameBundle): string {
-  const ml = game.markets.moneyline;
-  const rl = game.markets.runLine;
-  const total = game.markets.total;
+export function slateRow(game: GameBundle): string {
+  // A scoped game supplies 1-3 markets (S3); an absent market renders as '—'
+  // rather than crashing on a missing block. A full board is byte-identical.
+  const markets = game.markets as Partial<GameBundle['markets']>;
   const matchup = `${game.awayTeam} at ${game.homeTeam}`;
-  const moneyline = `${ml.awayDecimal} / ${ml.homeDecimal}`;
-  const runLine =
-    `${game.awayTeam} ${formatHandicap(rl.awayHandicap)} @ ${rl.awayDecimal} · ` +
-    `${game.homeTeam} ${formatHandicap(rl.homeHandicap)} @ ${rl.homeDecimal}`;
-  const totals = `${total.line} (o ${total.overDecimal} / u ${total.underDecimal})`;
+  const moneyline = markets.moneyline
+    ? `${markets.moneyline.awayDecimal} / ${markets.moneyline.homeDecimal}`
+    : '—';
+  const runLine = markets.runLine
+    ? `${game.awayTeam} ${formatHandicap(markets.runLine.awayHandicap)} @ ${markets.runLine.awayDecimal} · ` +
+      `${game.homeTeam} ${formatHandicap(markets.runLine.homeHandicap)} @ ${markets.runLine.homeDecimal}`
+    : '—';
+  const totals = markets.total
+    ? `${markets.total.line} (o ${markets.total.overDecimal} / u ${markets.total.underDecimal})`
+    : '—';
   const pitchers = game.probableStartingPitchers
     ? `${game.probableStartingPitchers.away ?? '—'} / ${game.probableStartingPitchers.home ?? '—'}`
     : '—';
   return `| ${matchup} | ${game.scheduledStartUtc} | ${moneyline} | ${runLine} | ${totals} | ${pitchers} | ${describeFavorite(game)} |`;
+}
+
+/**
+ * Model picks rendered from the market set actually PRESENT across the slate
+ * (S3 dynamic cardinality, SPEC-prepared-request.md §6) — one section per
+ * present market, in canonical order, so a scoped (e.g. total-only) run shows
+ * its real forecast instead of a fixed-assumption empty moneyline table. On a
+ * full board the moneyline section is byte-identical to the historical
+ * "Moneyline picks" table, with the run-line and total sections appended.
+ */
+export function buildPickSections(
+  slateBundle: SlateBundle,
+  arms: ArmSpec[],
+  validResults: ArmGameResult[],
+): string[] {
+  const present = new Set<MarketKey>();
+  for (const game of slateBundle.games) {
+    for (const market of suppliedMarketKeys(game)) present.add(market);
+  }
+  const orderedMarkets = (['moneyline', 'spread', 'total'] as MarketKey[]).filter((m) =>
+    present.has(m),
+  );
+  const lines: string[] = [];
+  for (const market of orderedMarkets) {
+    lines.push(`## ${MARKET_DISPLAY[market]} picks (valid arm-games)`);
+    lines.push('');
+    lines.push(`| Game | ${arms.map((a) => a.participantId).join(' | ')} |`);
+    lines.push(`|---|${arms.map(() => '---').join('|')}|`);
+    for (const game of slateBundle.games) {
+      const picks = arms.map((arm) => {
+        const result = validResults.find(
+          (r) => r.arm.participantId === arm.participantId && r.gameId === game.gameId,
+        );
+        const forecast = result?.parsed?.games
+          .find((g) => g.gameId === game.gameId)
+          ?.forecasts.find((f) => f.market === market);
+        return forecast ? `${forecast.selection} (${forecast.probabilities.win})` : '—';
+      });
+      lines.push(`| ${game.awayTeam} at ${game.homeTeam} | ${picks.join(' | ')} |`);
+    }
+    lines.push('');
+  }
+  return lines;
 }
 
 export function buildSummaryMarkdown(
@@ -172,23 +242,9 @@ export function buildSummaryMarkdown(
 
   const validResults = armGameResults.filter((r) => r.outcome === 'valid' && r.parsed !== null);
   if (validResults.length > 0) {
-    lines.push('## Moneyline picks (valid arm-games)');
-    lines.push('');
-    lines.push(`| Game | ${arms.map((a) => a.participantId).join(' | ')} |`);
-    lines.push(`|---|${arms.map(() => '---').join('|')}|`);
-    for (const game of slateBundle.games) {
-      const picks = arms.map((arm) => {
-        const result = validResults.find(
-          (r) => r.arm.participantId === arm.participantId && r.gameId === game.gameId,
-        );
-        const forecast = result?.parsed?.games
-          .find((g) => g.gameId === game.gameId)
-          ?.forecasts.find((f) => f.market === 'moneyline');
-        return forecast ? `${forecast.selection} (${forecast.probabilities.win})` : '—';
-      });
-      lines.push(`| ${game.awayTeam} at ${game.homeTeam} | ${picks.join(' | ')} |`);
-    }
-    lines.push('');
+    // Picks render from the markets PRESENT across the slate (§6), not a fixed
+    // moneyline assumption: one section per present market.
+    lines.push(...buildPickSections(slateBundle, arms, validResults));
   }
 
   const baselineParticipants = [...new Set(baselineDecisions.map((d) => d.participantId))];
