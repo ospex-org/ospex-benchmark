@@ -253,6 +253,29 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
     );
   }
 
+  // 5b. Absence must be an OMITTED key, never an own property with an undefined
+  //     value (spec §2.2). zod `.optional()` RETAINS an explicit `undefined`,
+  //     while canonicalize/JSON drop it — so an undefined-valued market key would
+  //     leave the frozen snapshot's own keys (Object.keys / Object.hasOwn)
+  //     disagreeing with its value-derived scope under an identical request hash
+  //     (two shapes, one identity). Reject it on BOTH the bundle game and the
+  //     supplied alias, so one request identity maps to exactly one object shape.
+  for (const [label, m] of [
+    ['bundle game', game.markets],
+    ['supplied game alias', env.game.markets],
+  ] as const) {
+    for (const key of MARKET_FIELDS) {
+      if (
+        Object.prototype.hasOwnProperty.call(m, key) &&
+        (m as Record<string, unknown>)[key] === undefined
+      ) {
+        violations.push(
+          `${label} market "${key}" is an own property with an undefined value; an absent market must be an omitted key`,
+        );
+      }
+    }
+  }
+
   // 6. Market coherence. The instant fields are already schema-validated, so
   //    instantMs cannot throw here.
   const bundleMs = instantMs(bundle.bundleTimestamp);
