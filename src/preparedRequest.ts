@@ -7,8 +7,9 @@ import { SMOKE_LABEL } from './types.js';
 import type { GameBundle, SlateBundle } from './types.js';
 
 /**
- * The prepared request boundary (SPEC-prepared-request.md §1–2), for the current
- * fixed three-market bundle (S1 — no cardinality change; S3 relaxes to 1–3).
+ * The prepared request boundary (SPEC-prepared-request.md §1–2). A game supplies
+ * 1–3 of the known markets (S3 — moneyline, runLine, total; an absent market is
+ * an omitted key).
  *
  * `prepareGameRequest` turns a caller-supplied request envelope (accepted as
  * `unknown`) into ONE immutable, normalized, plain-data value that every
@@ -16,10 +17,11 @@ import type { GameBundle, SlateBundle } from './types.js';
  * fresh, recursively-plain data (copying own-enumerable values only — so
  * inherited keys and custom prototypes are dropped, each accessor is evaluated
  * once, `toJSON` is never invoked, and a function/unclonable value throws, which
- * becomes a typed rejection), requires each market to be an OWN property,
- * strict-parses the whole envelope, verifies the cross-field identity and timing
- * invariants, DERIVES the hashes (never trusting a supplied hash), and
- * deep-freezes the result. A malformed or inconsistent request throws
+ * becomes a typed rejection), requires at least one own known market and rejects
+ * any unknown market key, strict-parses the whole envelope, verifies the
+ * cross-field identity and timing invariants, DERIVES the hashes (never trusting
+ * a supplied hash), and deep-freezes the result. A malformed or inconsistent
+ * request throws
  * `PreparedRequestError` — the dispatch path (S1b) treats that as a
  * harness/preparation failure and makes zero adapter calls.
  */
@@ -108,7 +110,10 @@ const totalBlock = z
   })
   .strict();
 
-// S1 — exactly the three fixed markets, all present.
+// S3 — 1-3 of the known markets (moneyline, runLine, total); an absent market is
+// an omitted key. `.strict()` rejects any unknown market key and the refinement
+// enforces the at-least-one guarantee at the boundary (SPEC-prepared-request.md
+// §4 pt 2 — the RUNTIME guarantee, since the GameBundle type does not encode it).
 const gameSchema = z
   .object({
     gameId: nonEmpty,
@@ -120,7 +125,16 @@ const gameSchema = z
       .object({ away: z.string().nullable(), home: z.string().nullable() })
       .strict()
       .nullable(),
-    markets: z.object({ moneyline: moneylineBlock, runLine: runLineBlock, total: totalBlock }).strict(),
+    markets: z
+      .object({
+        moneyline: moneylineBlock.optional(),
+        runLine: runLineBlock.optional(),
+        total: totalBlock.optional(),
+      })
+      .strict()
+      .refine((m) => m.moneyline != null || m.runLine != null || m.total != null, {
+        message: 'a game must supply at least one known market (moneyline, runLine, or total)',
+      }),
     evidenceRefs: z.array(nonEmpty),
   })
   .strict();
@@ -193,16 +207,21 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
     throw new PreparedRequestError(['request is not clonable plain data']);
   }
 
-  // 2. Each market must be an OWN property of the raw markets object. The clone
-  //    kept own-enumerable keys only, so an inherited market was dropped and is
-  //    rejected here with a clear message. (S3 relaxes this fixed three-key set
-  //    to the present-market subset; the ownership rule is what carries over.)
+  // 2. Under S3 a game supplies 1-3 known markets; an absent market is simply an
+  //    omitted key. structuredClone kept own-enumerable keys only, so any market
+  //    still present is an OWN property (an inherited market was dropped, never
+  //    smuggled into the hash) and an unknown key is rejected by the strict schema
+  //    below. The remaining boundary invariant is at-least-one own known market —
+  //    surfaced here as an early, clear error before the schema parse.
   const markets = clonedMarkets(clone);
   if (markets !== null) {
-    for (const key of MARKET_FIELDS) {
-      if (!Object.prototype.hasOwnProperty.call(markets, key)) {
-        throw new PreparedRequestError([`markets must contain an own "${key}" property`]);
-      }
+    const present = MARKET_FIELDS.filter((key) =>
+      Object.prototype.hasOwnProperty.call(markets, key),
+    );
+    if (present.length === 0) {
+      throw new PreparedRequestError([
+        'markets must contain at least one own market property (moneyline, runLine, or total)',
+      ]);
     }
   }
 
@@ -210,7 +229,12 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
   const parsed = envelopeSchema.safeParse(clone);
   if (!parsed.success) throw new PreparedRequestError(issueList(parsed.error));
   const env = parsed.data;
-  const bundle: SlateBundle = env.requestBundle;
+  // Keep the parser's inferred type (markets are 1-3, each optional) internally so
+  // TypeScript ENFORCES a presence check before every market deref below; the
+  // final PreparedGameRequest bridges to the GameBundle/SlateBundle types (which
+  // encode a fixed three-market shape) with a single documented cast at step 9,
+  // matching the codebase's runtime-scope-aware treatment of GameBundle.
+  const bundle = env.requestBundle;
 
   // 4. Exactly one game (subsumes duplicate-game-id for a per-game request).
   if (bundle.games.length !== 1) {
@@ -229,22 +253,48 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
     );
   }
 
+  // 5b. Absence must be an OMITTED key, never an own property with an undefined
+  //     value (spec §2.2). zod `.optional()` RETAINS an explicit `undefined`,
+  //     while canonicalize/JSON drop it — so an undefined-valued market key would
+  //     leave the frozen snapshot's own keys (Object.keys / Object.hasOwn)
+  //     disagreeing with its value-derived scope under an identical request hash
+  //     (two shapes, one identity). Reject it on BOTH the bundle game and the
+  //     supplied alias, so one request identity maps to exactly one object shape.
+  for (const [label, m] of [
+    ['bundle game', game.markets],
+    ['supplied game alias', env.game.markets],
+  ] as const) {
+    for (const key of MARKET_FIELDS) {
+      if (
+        Object.prototype.hasOwnProperty.call(m, key) &&
+        (m as Record<string, unknown>)[key] === undefined
+      ) {
+        violations.push(
+          `${label} market "${key}" is an own property with an undefined value; an absent market must be an omitted key`,
+        );
+      }
+    }
+  }
+
   // 6. Market coherence. The instant fields are already schema-validated, so
   //    instantMs cannot throw here.
   const bundleMs = instantMs(bundle.bundleTimestamp);
+  // Run-line redundancy is only checked when the game supplies a run line (S3).
   const rl = game.markets.runLine;
-  if (rl.homeHandicap !== rl.line) {
-    violations.push(`run line homeHandicap ${rl.homeHandicap} must equal line ${rl.line}`);
-  }
-  if (rl.awayHandicap !== -rl.line) {
-    violations.push(`run line awayHandicap ${rl.awayHandicap} must equal -line ${-rl.line}`);
+  if (rl) {
+    if (rl.homeHandicap !== rl.line) {
+      violations.push(`run line homeHandicap ${rl.homeHandicap} must equal line ${rl.line}`);
+    }
+    if (rl.awayHandicap !== -rl.line) {
+      violations.push(`run line awayHandicap ${rl.awayHandicap} must equal -line ${-rl.line}`);
+    }
   }
   const validRefs = new Set(game.evidenceRefs);
-  const blocks: ReadonlyArray<readonly [string, { observedAt: string; evidenceRef: string }]> = [
-    ['moneyline', game.markets.moneyline],
-    ['runLine', game.markets.runLine],
-    ['total', game.markets.total],
-  ];
+  // Freshness + evidence-ref coherence over the markets the game SUPPLIES (1-3).
+  const blocks: Array<readonly [string, { observedAt: string; evidenceRef: string }]> = [];
+  if (game.markets.moneyline) blocks.push(['moneyline', game.markets.moneyline]);
+  if (game.markets.runLine) blocks.push(['runLine', game.markets.runLine]);
+  if (game.markets.total) blocks.push(['total', game.markets.total]);
   for (const [name, block] of blocks) {
     // observedAt must not postdate the bundle timestamp. The build-time freshness
     // policy tolerates FUTURE_QUOTE_SKEW_MS of cross-host clock skew, so this
@@ -279,12 +329,16 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
 
   // 9. Deep-freeze — immutable plain data; game === requestBundle.games[0] —
   //    then register it in the origin brand so the dispatch and prompt
-  //    boundaries can prove at runtime that this value came through here.
+  //    boundaries can prove at runtime that this value came through here. The
+  //    validated 1-3-market game/bundle are cast to the GameBundle/SlateBundle
+  //    types here (their static shape is fixed-three); every downstream consumer
+  //    already presence-checks a market at runtime (S3a-d), so a scoped game is
+  //    handled, not assumed full — this is the single boundary bridge for that.
   const prepared: PreparedGameRequest = deepFreeze({
     gameId: game.gameId,
     slug: env.slug,
-    game,
-    requestBundle: bundle,
+    game: game as GameBundle,
+    requestBundle: bundle as SlateBundle,
     requestSha256,
     gameSha256,
     cutoffAt: bundle.cutoffAt,
