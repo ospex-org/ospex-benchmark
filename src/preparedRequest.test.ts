@@ -9,7 +9,8 @@ import type { PreparedGameRequest } from './preparedRequest.js';
 /**
  * The pure prepared-request boundary (S1a, SPEC-prepared-request.md §1–2 and the
  * §5 S1 matrix, minus the dispatch/prompt/records integration items which are
- * S1b). Every case is a three-market request; the 1–3-market behavior is S3.
+ * S1b). The full-board cases are S1a; the S3 relaxation to 1–3 present markets
+ * (scoped acceptance + supplied-run-line coherence) is covered below.
  */
 
 /** A fresh, valid three-market request (a new object graph each call). */
@@ -65,13 +66,30 @@ test('a mutation after preparation changes nothing', () => {
   assert.equal(canonicalize(prepared.requestBundle), before);
 });
 
-// --- parse-level rejections (strict schema) -------------------------------
+// --- S3: the boundary accepts 1-3 present markets -------------------------
 
-test('a missing market is rejected', () => {
+test('a scoped 1-2-market game is accepted (S3: a missing market is no longer a rejection)', () => {
   const request = base();
+  // Drop the total from the bundle game AND its alias, then recompute the hash —
+  // a coherent moneyline+runLine scoped request. Under S3 it prepares cleanly.
   delete (request.requestBundle.games[0]!.markets as unknown as Record<string, unknown>).total;
-  assert.throws(() => prepareGameRequest(request), PreparedRequestError);
+  delete (request.game.markets as unknown as Record<string, unknown>).total;
+  const prepared = prepareGameRequest(reSha(request));
+  assert.deepEqual(Object.keys(prepared.game.markets).sort(), ['moneyline', 'runLine']);
 });
+
+test('a scoped game with an incoherent run line is still rejected', () => {
+  const request = base();
+  // moneyline+runLine, but the runLine handicap contradicts its line — the
+  // run-line coherence check still fires for a SUPPLIED run line.
+  delete (request.requestBundle.games[0]!.markets as unknown as Record<string, unknown>).total;
+  delete (request.game.markets as unknown as Record<string, unknown>).total;
+  request.requestBundle.games[0]!.markets.runLine.homeHandicap = 99;
+  request.game.markets.runLine.homeHandicap = 99;
+  throwsWith(() => prepareGameRequest(reSha(request)), /run line homeHandicap/);
+});
+
+// --- parse-level rejections (strict schema) -------------------------------
 
 test('an unknown market key is rejected', () => {
   const request = base();

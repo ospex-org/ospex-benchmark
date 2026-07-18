@@ -116,12 +116,24 @@ function reSha(request: GameRequest): GameRequest {
   return { ...request, requestSha256: sha256Hex(canonicalize(request.requestBundle)) };
 }
 
-/** A three-market request with the total market removed from the bundle game. */
-function dropTotal(valid: GameRequest): GameRequest {
+type MarketField = 'moneyline' | 'runLine' | 'total';
+const ALL_MARKETS: readonly MarketField[] = ['moneyline', 'runLine', 'total'];
+
+/** A request scoped to only the named markets (the others removed), hash-recomputed. */
+function scopeTo(valid: GameRequest, present: ReadonlyArray<MarketField>): GameRequest {
   const clone = structuredClone(valid);
-  delete (clone.requestBundle.games[0]!.markets as unknown as Record<string, unknown>)['total'];
-  delete (clone.game.markets as unknown as Record<string, unknown>)['total'];
+  const keep = new Set(present);
+  for (const key of ALL_MARKETS) {
+    if (keep.has(key)) continue;
+    delete (clone.requestBundle.games[0]!.markets as unknown as Record<string, unknown>)[key];
+    delete (clone.game.markets as unknown as Record<string, unknown>)[key];
+  }
   return reSha(clone);
+}
+
+/** A bundle game with every market removed — a zero-market game (S3 rejects it). */
+function dropAllMarkets(valid: GameRequest): GameRequest {
+  return scopeTo(valid, []);
 }
 
 /** A per-game bundle carrying two games instead of one. */
@@ -151,14 +163,16 @@ test('the three-market request prepares and dispatches to every arm', async () =
 });
 
 // Each failure rejects at a DIFFERENT stage of preparation (alias check,
-// own-market gate, cardinality check), proving the dispatch gate covers the
-// whole boundary — not just one check — and never calls an adapter.
+// at-least-one-market gate, cardinality check), proving the dispatch gate covers
+// the whole boundary — not just one check — and never calls an adapter. (A game
+// MISSING a market is no longer a rejection — S3 accepts 1-3 present markets; a
+// game with ZERO markets still is.)
 const malformed: Array<{ name: string; make: (valid: GameRequest) => GameRequest }> = [
   {
     name: 'a supplied requestSha256 that does not match',
     make: (valid) => ({ ...valid, requestSha256: 'b'.repeat(64) }),
   },
-  { name: 'a market block missing from the bundle', make: dropTotal },
+  { name: 'a bundle game with zero markets', make: dropAllMarkets },
   { name: 'a per-game bundle carrying two games', make: twoGames },
 ];
 
@@ -183,6 +197,52 @@ test('runSlate rejects a duplicate-game batch before any provider call', async (
     /duplicate game ID/,
   );
   assert.equal(totalCalls(), 0);
+});
+
+// --- S3: the boundary accepts 1-3 present markets (SPEC-prepared-request.md §2.2, §4 pt 2) ---
+
+test('prepareGameRequest accepts every non-empty market subset (1-3), hashing the scoped snapshot', () => {
+  const valid = makeRequest(CUTOFF);
+  const combos: ReadonlyArray<ReadonlyArray<MarketField>> = [
+    ['moneyline'],
+    ['runLine'],
+    ['total'],
+    ['moneyline', 'runLine'],
+    ['moneyline', 'total'],
+    ['runLine', 'total'],
+    ['moneyline', 'runLine', 'total'],
+  ];
+  for (const present of combos) {
+    const prepared = prepareGameRequest(scopeTo(valid, present));
+    assert.deepEqual(
+      Object.keys(prepared.game.markets).sort(),
+      [...present].sort(),
+      `scoped board [${present.join('+')}]`,
+    );
+    // The derived hashes come from the scoped snapshot itself.
+    assert.equal(prepared.requestSha256, sha256Hex(canonicalize(prepared.requestBundle)));
+    assert.equal(prepared.gameSha256, sha256Hex(canonicalize(prepared.game)));
+  }
+});
+
+test('prepareGameRequest rejects a zero-market game with a direct cardinality error', () => {
+  assert.throws(() => prepareGameRequest(dropAllMarkets(makeRequest(CUTOFF))), /at least one/);
+});
+
+test('prepareGameRequest rejects an unknown market key', () => {
+  const clone = structuredClone(makeRequest(CUTOFF));
+  (clone.requestBundle.games[0]!.markets as unknown as Record<string, unknown>)['mysteryMarket'] = {
+    x: 1,
+  };
+  (clone.game.markets as unknown as Record<string, unknown>)['mysteryMarket'] = { x: 1 };
+  assert.throws(() => prepareGameRequest(reSha(clone)), PreparedRequestError);
+});
+
+test('run-line coherence is only checked when the game supplies a run line', () => {
+  // A moneyline+total scoped game (no run line) prepares cleanly — the run-line
+  // homeHandicap/awayHandicap redundancy check is skipped when there is no run line.
+  const prepared = prepareGameRequest(scopeTo(makeRequest(CUTOFF), ['moneyline', 'total']));
+  assert.deepEqual(Object.keys(prepared.game.markets).sort(), ['moneyline', 'total']);
 });
 
 test('the prompted bundle canonicalizes back to the exact bytes behind requestSha256', () => {
