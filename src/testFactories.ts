@@ -92,6 +92,10 @@ export function makeValidResponse(
   cohortId: string = TEST_COHORT,
 ): BenchmarkResponse {
   const game = request.game;
+  // makeRequest/makeGameBundle always build a full three-market board.
+  const ml = game.markets.moneyline!;
+  const rl = game.markets.runLine!;
+  const total = game.markets.total!;
   return {
     schemaVersion: 1,
     cohortId,
@@ -107,39 +111,39 @@ export function makeValidResponse(
             market: 'moneyline',
             selection: game.awayTeam,
             line: null,
-            observedDecimal: game.markets.moneyline.awayDecimal,
+            observedDecimal: ml.awayDecimal,
             probabilities: { win: 0.55, push: 0, loss: 0.45 },
             confidence: 0.6,
             wouldAbstain: false,
             selectedForExecution: true,
             rationale: 'Reference prices favor the away side.',
-            evidenceRefs: [game.markets.moneyline.evidenceRef],
+            evidenceRefs: [ml.evidenceRef],
             reasonCode: null,
           },
           {
             market: 'spread',
             selection: game.homeTeam,
-            line: game.markets.runLine.line,
-            observedDecimal: game.markets.runLine.homeDecimal,
+            line: rl.line,
+            observedDecimal: rl.homeDecimal,
             probabilities: { win: 0.5, push: 0, loss: 0.5 },
             confidence: 0.5,
             wouldAbstain: false,
             selectedForExecution: false,
             rationale: 'Half-run line at even implied odds.',
-            evidenceRefs: [game.markets.runLine.evidenceRef],
+            evidenceRefs: [rl.evidenceRef],
             reasonCode: null,
           },
           {
             market: 'total',
             selection: 'over',
-            line: game.markets.total.line,
-            observedDecimal: game.markets.total.overDecimal,
+            line: total.line,
+            observedDecimal: total.overDecimal,
             probabilities: { win: 0.5, push: 0, loss: 0.5 },
             confidence: 0.5,
             wouldAbstain: false,
             selectedForExecution: true,
             rationale: 'Total priced evenly at the designated line.',
-            evidenceRefs: [game.markets.total.evidenceRef],
+            evidenceRefs: [total.evidenceRef],
             reasonCode: null,
           },
         ],

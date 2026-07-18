@@ -106,7 +106,7 @@ function emittedMarkets(
   if (policyVersion === 'baselines-v0.1.0') return { moneyline: true, total: true, runLine: false };
   if (policyVersion === 'baselines-v0.2.0') return { moneyline: true, total: true, runLine: true };
   // v0.3.0 (scoped): emit each market only where it is present on this game.
-  const markets = game.markets as Partial<GameBundle['markets']>;
+  const markets = game.markets;
   return {
     moneyline: markets.moneyline != null,
     total: markets.total != null,
@@ -117,10 +117,11 @@ function emittedMarkets(
 /**
  * Fail closed on a scoped input (SPEC-prepared-request.md §3). v0.1/v0.2 are
  * full-board policies and must never emit a partial baseline set for a game
- * that is missing any of the three market blocks. The static type marks all
- * three present; this enforces it at runtime against a scoped value that
- * reached here through a cast (e.g. the scorer reconstructs slates with
- * `as unknown as SlateBundle`). It throws before any decision is emitted.
+ * that is missing any of the three market blocks. The static type marks each
+ * block optional (a game supplies 1-3), so this is the runtime guard that a
+ * full-board policy sees all three before emitting — it also catches a scoped
+ * value that reached here through a cast (e.g. the scorer reconstructs slates
+ * with `as unknown as SlateBundle`). It throws before any decision is emitted.
  *
  * Scope: this detects an ABSENT (null/undefined) block — the scoped-input
  * concern. Structural validity of a PRESENT block (that it is a well-formed
@@ -130,8 +131,8 @@ function emittedMarkets(
  */
 function assertFullBoard(bundle: SlateBundle, policyVersion: BaselinePolicyVersion): void {
   for (const game of bundle.games) {
-    const markets = game.markets as Partial<GameBundle['markets']> | null | undefined;
-    const missing = FULL_BOARD_MARKETS.filter((key) => markets?.[key] == null);
+    const markets = game.markets;
+    const missing = FULL_BOARD_MARKETS.filter((key) => markets[key] == null);
     if (missing.length > 0) {
       throw new Error(
         `baseline policy ${policyVersion} requires a full three-market board; ` +
@@ -167,7 +168,9 @@ export function runBaselines(
     const emit = emittedMarkets(policyVersion, game);
 
     if (emit.moneyline) {
-      const ml = game.markets.moneyline;
+      // Present: a full-board policy passed assertFullBoard, and v0.3 sets
+      // emit.moneyline only when game.markets.moneyline is present.
+      const ml = game.markets.moneyline!;
 
       // Favorite = lower decimal price; exact-price tie breaks to home.
       const favoriteSelection =
@@ -200,7 +203,8 @@ export function runBaselines(
     }
 
     if (emit.total) {
-      const total = game.markets.total;
+      // Present: assertFullBoard for v0.1/v0.2; emit.total tracks presence for v0.3.
+      const total = game.markets.total!;
       decisions.push(
         {
           participantId: 'baseline-over-total',
@@ -226,7 +230,8 @@ export function runBaselines(
     }
 
     if (emit.runLine) {
-      const runLine = game.markets.runLine;
+      // Present: assertFullBoard for v0.2; emit.runLine tracks presence for v0.3.
+      const runLine = game.markets.runLine!;
       // Run-line favorite = the side LAYING the runs. The line is stored as
       // the HOME handicap: home lays when the line is negative, away lays
       // when it is positive, and a zero handicap breaks to home. The rule is

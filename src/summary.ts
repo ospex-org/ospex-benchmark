@@ -28,7 +28,7 @@ function formatHandicap(value: number): string {
  * ['moneyline', 'spread', 'total'].
  */
 export function suppliedMarketKeys(game: GameBundle): MarketKey[] {
-  const markets = game.markets as Partial<GameBundle['markets']>;
+  const markets = game.markets;
   const keys: MarketKey[] = [];
   if (markets.moneyline != null) keys.push('moneyline');
   if (markets.runLine != null) keys.push('spread');
@@ -44,7 +44,7 @@ const MARKET_DISPLAY: Record<MarketKey, string> = {
 };
 
 export function describeFavorite(game: GameBundle): string {
-  const ml = (game.markets as Partial<GameBundle['markets']>).moneyline;
+  const ml = game.markets.moneyline;
   if (ml == null) return '—';
   if (ml.awayDecimal === ml.homeDecimal) return 'pick-em';
   return ml.awayDecimal < ml.homeDecimal
@@ -55,7 +55,7 @@ export function describeFavorite(game: GameBundle): string {
 export function slateRow(game: GameBundle): string {
   // A scoped game supplies 1-3 markets (S3); an absent market renders as '—'
   // rather than crashing on a missing block. A full board is byte-identical.
-  const markets = game.markets as Partial<GameBundle['markets']>;
+  const markets = game.markets;
   const matchup = `${game.awayTeam} at ${game.homeTeam}`;
   const moneyline = markets.moneyline
     ? `${markets.moneyline.awayDecimal} / ${markets.moneyline.homeDecimal}`

@@ -4,7 +4,8 @@
  * The information bundle is deliberately thin (see docs/BENCHMARK_PROMPT_V0.md
  * and the v0 data policy): game identity, scheduled start, probable starting
  * pitchers when the read path exposes them, and timestamped reference prices
- * for the three fixed markets. Nothing else.
+ * for the markets a game supplies (1–3 of the known set; a full board carries
+ * all three). Nothing else.
  */
 
 export type MarketKey = 'moneyline' | 'spread' | 'total';
@@ -93,10 +94,16 @@ export interface GameBundle {
    * absence is visible in the hashed bundle.
    */
   probableStartingPitchers: ProbablePitchers | null;
+  /**
+   * The markets this game supplies: 1–3 of the known set (moneyline, run line,
+   * total). Absence is an OMITTED key — never a key with an `undefined` value
+   * (the prepared-request boundary rejects an explicit-`undefined` market). A
+   * full board carries all three.
+   */
   markets: {
-    moneyline: MoneylineBlock;
-    runLine: RunLineBlock;
-    total: TotalBlock;
+    moneyline?: MoneylineBlock;
+    runLine?: RunLineBlock;
+    total?: TotalBlock;
   };
   /** Every evidenceRef a rationale may cite for this game. */
   evidenceRefs: string[];
