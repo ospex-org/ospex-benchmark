@@ -211,22 +211,22 @@ dynamic 1–3-market / seven-combination behavior belongs to S3.
 
 ## 6. Now vs later (the staged boundary)
 
-These are **not** part of the prepared-request/baseline-isolation work; they are
-hard dependencies that must land **before** the per-market detection slice makes
-a 1- or 2-market artifact reachable, and are tracked separately:
+These were **not** part of the prepared-request/baseline-isolation work; they are
+hard dependencies that had to land **before** the per-market detection slice makes
+a 1- or 2-market artifact reachable, and were tracked separately. The scorer and
+summary dependencies **landed with S3**; the operator docs remain deferred:
 
-- **Dynamic scorer/integrity support** — the scorer still requires all three
-  blocks, dereferences all three, and computes the model denominator as
-  `responses.length * 3`; it must parse the recorded scope, derive denominators
-  per recorded scope, re-run the dynamic validator against the hash-verified
-  request, reject old-version/scoped artifacts, and preserve `v0.1`/`v0.2`
-  full-board replay.
-- **Dynamic human summary** — the "Moneyline picks" section renders from a fixed
-  assumption; it must render from the present market set (or omit honestly) so a
-  total-only run shows its total forecast.
-- **Runtime/operator docs** — `README.md` and `docs/LINE_OPEN_RUNNER.md`
-  describe the currently-reachable full-board watcher; update them when the
-  detection slice changes reachability, not before.
+- **Dynamic scorer/integrity support (LANDED — S3c).** The scorer parses the
+  recorded scope, derives denominators per recorded scope, re-runs the dynamic
+  validator against the hash-verified request, rejects old-version/scoped
+  artifacts, and preserves `v0.1`/`v0.2` full-board replay (`scoring-v0.5.0`). It
+  no longer assumes three blocks or a `responses.length * 3` denominator.
+- **Dynamic human summary (LANDED — S3d).** The picks sections render from the
+  present market set (`buildPickSections`), so a total-only run shows its total
+  forecast instead of a fixed-assumption empty moneyline table.
+- **Runtime/operator docs (STILL DEFERRED).** `README.md` and
+  `docs/LINE_OPEN_RUNNER.md` describe the currently-reachable full-board watcher;
+  update them when the detection slice changes reachability, not before.
 
 Explicitly out of scope for this foundation: odds-history detection/claim,
 watcher scheduling/concurrency, fire-artifact persistence, coverage
@@ -249,8 +249,19 @@ envelope — snapshot + result graph + expected-arm manifest + bound dispatch
 context — that the artifact producers authenticate. It ships as a spec PR
 (paper-reviewed) then one implementation PR judged only on A1–A6.
 
-Status (2026-07-17): **S1 and S2 are merged**; **S1d-spec** is in review (PR #27);
-S1d-impl and S3 follow. Execution order: **S1 → S2 → S1d-spec → S1d-impl → S3**.
+Status (2026-07-18): **the prepared-request / dynamic-cardinality foundation is
+COMPLETE.** S1 (S1a–c), S2, S1d (spec + impl), and S3 are all merged; S3 shipped
+as small slices — S3a (v0.3 scoped baselines), S3b (dynamic prompt + validator),
+S3c (dynamic scope-aware scorer), S3d (dynamic summary), S3e-1 (prepared boundary
+relaxed to 1–3 present markets), S3e-2a (dynamic-cohort baseline boot gate), and
+S3e-2b (the baseline policy version threaded through the artifact producers) —
+plus the §4 committed-contract wording, folded in as each slice landed.
+
+The prepared boundary, baselines, scorer, prompt, validator, and summary now all
+carry the 1–3-market contract; the fixed three-market smoke/watch path stays
+byte-identical under its default `baselines-v0.2.0`.
 
 Then the previously-planned fire-artifact / detection / claim slices, which now
-build on a request they can trust.
+build on a request they can trust. Those are the first to change runtime
+reachability (make a 1- or 2-market artifact reachable), so the operator docs
+deferred in §6 are updated **there**, not before.
