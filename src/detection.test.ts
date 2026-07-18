@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { candidateDisposition, evaluateCandidate } from './detection.js';
-import type { CandidateInput } from './detection.js';
+import type { CandidateDisposition, CandidateInput, CandidateState } from './detection.js';
 import type { TwoSidedHistoryRow } from './oddsHistory.js';
 
 // Observation window and a mid-window detection instant. W = 120 s, skew = 5 s.
@@ -36,6 +36,7 @@ function openerAt(capturedAt: string, overrides: Partial<TwoSidedHistoryRow> = {
 
 function baseInput(overrides: Partial<CandidateInput> = {}): CandidateInput {
   return {
+    gameId: 'game-1', // matches openerAt()'s jsonodds_id
     sport: 'mlb',
     market: 'moneyline',
     sportAllowList: ['mlb'],
@@ -251,4 +252,123 @@ test('throws on a negative clean-entry window', () => {
 
 test('throws on a non-integer clock-skew bound', () => {
   assert.throws(() => evaluateCandidate(baseInput({ maxClockSkewMs: 1.5 })), /maxClockSkewMs/);
+});
+
+// --- candidate ↔ opener identity binding --------------------------
+
+test('throws when the opener is from a different game — jsonodds_id mismatch', () => {
+  const opener = openerAt(shift(DETECTED_AT, -30_000), { jsonodds_id: 'game-b' });
+  assert.throws(
+    () => evaluateCandidate(baseInput({ gameId: 'game-a', opener })),
+    /does not match candidate/,
+  );
+});
+
+test('throws when the opener is for a different market — market mismatch', () => {
+  // Candidate `total`, but a same-game moneyline opener.
+  const opener = openerAt(shift(DETECTED_AT, -30_000)); // market moneyline
+  assert.throws(
+    () => evaluateCandidate(baseInput({ market: 'total', opener })),
+    /does not match candidate/,
+  );
+});
+
+test('refuses the stale-market-via-fresh-sibling substitution', () => {
+  // The exact substitution class the per-market binding eliminates: a fresh TOTAL
+  // opener paired with a MONEYLINE candidate would age-gate as eligible without it.
+  const freshTotalOpener = openerAt(shift(DETECTED_AT, -30_000), { market: 'total', line: 8.5 });
+  assert.throws(
+    () => evaluateCandidate(baseInput({ market: 'moneyline', opener: freshTotalOpener })),
+    /does not match candidate/,
+  );
+});
+
+test('each enabled market is independently evaluable with its OWN opener', () => {
+  const mlOpener = openerAt(shift(DETECTED_AT, -60_000), { market: 'moneyline', line: null });
+  const totalOpener = openerAt(shift(DETECTED_AT, -60_000), { market: 'total', line: 8.5 });
+  assert.equal(evaluateCandidate(baseInput({ market: 'moneyline', opener: mlOpener })).state, 'eligible');
+  assert.equal(evaluateCandidate(baseInput({ market: 'total', opener: totalOpener })).state, 'eligible');
+});
+
+// --- opener time coherence -------------------------------------------
+
+test('throws on an opener whose derived captured_at_ms is NaN', () => {
+  const opener = openerAt(shift(DETECTED_AT, -60_000));
+  opener.captured_at_ms = Number.NaN;
+  assert.throws(() => evaluateCandidate(baseInput({ opener })), /coherent derivation/);
+});
+
+test('throws on an opener whose captured_at_ms is infinite', () => {
+  const opener = openerAt(shift(DETECTED_AT, -60_000));
+  opener.captured_at_ms = Number.POSITIVE_INFINITY;
+  assert.throws(() => evaluateCandidate(baseInput({ opener })), /coherent derivation/);
+});
+
+test('throws when captured_at_ms disagrees with captured_at', () => {
+  const opener = openerAt(shift(DETECTED_AT, -60_000));
+  opener.captured_at_ms += 1_000; // 1 s off the true derivation
+  assert.throws(() => evaluateCandidate(baseInput({ opener })), /coherent derivation/);
+});
+
+test('throws on an opener with a malformed (offset-less) captured_at instant', () => {
+  const opener = openerAt(shift(DETECTED_AT, -60_000));
+  opener.captured_at = '2026-07-18T11:59:00'; // no offset — instantMs rejects it first
+  assert.throws(() => evaluateCandidate(baseInput({ opener })), /offset/);
+});
+
+// --- evidence immutability -------------------------------------------
+
+test('mutating the caller opener after evaluation cannot change the verdict evidence', () => {
+  const opener = openerAt(shift(DETECTED_AT, -60_000));
+  const verdict = evaluateCandidate(baseInput({ opener }));
+  assert.equal(verdict.state, 'eligible');
+  if (verdict.state !== 'eligible') return;
+  const judged = { ...verdict.opener };
+  // Mutate the caller's SOURCE row after the verdict was produced.
+  opener.market = 'total';
+  opener.captured_at = shift(DETECTED_AT, -10_800_000);
+  opener.captured_at_ms = Date.parse(opener.captured_at);
+  // The retained evidence is a detached snapshot — unchanged.
+  assert.deepEqual(verdict.opener, judged);
+  assert.equal(verdict.opener.market, 'moneyline');
+  assert.equal(verdict.openerAgeMs, 60_000);
+});
+
+test('the returned opener evidence is frozen — mutation through the verdict is refused', () => {
+  const opener = openerAt(shift(DETECTED_AT, -60_000));
+  const verdict = evaluateCandidate(baseInput({ opener }));
+  assert.equal(verdict.state, 'eligible');
+  if (verdict.state !== 'eligible') return;
+  assert.ok(Object.isFrozen(verdict.opener));
+  assert.throws(() => {
+    verdict.opener.market = 'total';
+  });
+});
+
+// --- terminal window closure vs opener presence -----------------
+
+test('window-position × opener-presence cross-product', () => {
+  const goodOpener = openerAt(shift(DETECTED_AT, -60_000)); // in-window, matching, age 60 s
+  const before = shift(WINDOW_START, -1);
+  const inside = DETECTED_AT;
+  const atEnd = WINDOW_END;
+  const after = shift(WINDOW_END, 60_000);
+  const cases: Array<[string, string, TwoSidedHistoryRow | undefined, CandidateState, CandidateDisposition]> = [
+    ['before', before, undefined, 'detected_before_window', 'defer'],
+    ['before', before, goodOpener, 'detected_before_window', 'defer'],
+    ['inside', inside, undefined, 'opener_not_visible', 'defer'],
+    ['inside', inside, goodOpener, 'eligible', 'eligible'],
+    // At/after the exclusive windowEnd is TERMINAL regardless of opener visibility —
+    // a missing opener must NOT downgrade it to a transient defer.
+    ['atEnd', atEnd, undefined, 'detected_after_window', 'reject'],
+    ['atEnd', atEnd, goodOpener, 'detected_after_window', 'reject'],
+    ['after', after, undefined, 'detected_after_window', 'reject'],
+    ['after', after, goodOpener, 'detected_after_window', 'reject'],
+  ];
+  for (const [label, detectedAt, opener, expectedState, expectedDisposition] of cases) {
+    const presence = opener ? 'present' : 'absent';
+    const verdict = evaluateCandidate(baseInput({ detectedAt, opener }));
+    assert.equal(verdict.state, expectedState, `${label}/${presence} state`);
+    assert.equal(candidateDisposition(verdict), expectedDisposition, `${label}/${presence} disposition`);
+  }
 });
