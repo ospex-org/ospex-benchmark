@@ -7,10 +7,26 @@ import type {
   ExcludedGame,
   GameBundle,
   GamesEndpointRow,
+  MarketKey,
   ProbablePitchers,
   SlateBundle,
   SlateInputs,
 } from './types.js';
+
+/**
+ * The full board: all three known markets in upstream vocabulary. The batch
+ * slate builder (`buildBundle`) always requests this set, so its per-game output
+ * is byte-identical to the pre-scoped builder. The per-market runtime requests a
+ * SUBSET (the ready markets for one dispatch) instead.
+ */
+export const FULL_BOARD_MARKETS: ReadonlySet<MarketKey> = new Set<MarketKey>([
+  'moneyline',
+  'spread',
+  'total',
+]);
+
+/** A single game's bundle, or a stable exclusion reason code. */
+export type GameBundleResult = { bundle: GameBundle } | { reason: string };
 
 export interface GameRequest {
   gameId: string;
@@ -91,51 +107,122 @@ export function extractProbablePitchers(row: GamesEndpointRow): ProbablePitchers
   return null;
 }
 
-function buildGameBundle(
+/**
+ * Build ONE game's frozen bundle for a caller-supplied set of ready markets, or
+ * return a stable exclusion reason.
+ *
+ * `requestedMarkets` names the markets to include in UPSTREAM vocabulary
+ * (`moneyline` | `spread` | `total`, matching `current_odds` and the market
+ * policy); the emitted bundle uses BUNDLE vocabulary, so the `spread` row becomes
+ * `markets.runLine`. Only the requested markets are read, validated, and emitted:
+ *   - an absent NON-requested market never rejects the game (it is simply not in
+ *     this dispatch);
+ *   - an absent REQUESTED market rejects with `missing_market:<market>`;
+ *   - an absent market is an OMITTED key on `markets`, never an `undefined`-valued
+ *     one (the prepared-request boundary rejects an explicit-`undefined` market).
+ *
+ * Requesting the full board (`FULL_BOARD_MARKETS`) yields output byte-identical to
+ * the pre-scoped builder: the reason precedence and the `evidenceRefs`/`markets`
+ * ordering below are preserved for that case. `requestedMarkets` must be
+ * non-empty (a caller-contract invariant, so it throws — never a data condition).
+ */
+export function buildGameBundle(
   game: GamesEndpointRow,
   odds: Map<string, CurrentOddsRow>,
   assembledAtMs: number,
-): { bundle: GameBundle } | { reason: string } {
-  const moneyline = odds.get('moneyline');
-  const spread = odds.get('spread');
-  const total = odds.get('total');
+  requestedMarkets: ReadonlySet<MarketKey>,
+): GameBundleResult {
+  if (requestedMarkets.size === 0) {
+    throw new Error('buildGameBundle: requestedMarkets must be non-empty');
+  }
+  const moneyline = requestedMarkets.has('moneyline') ? odds.get('moneyline') : undefined;
+  const spread = requestedMarkets.has('spread') ? odds.get('spread') : undefined;
+  const total = requestedMarkets.has('total') ? odds.get('total') : undefined;
   if (!moneyline && !spread && !total) return { reason: 'no_odds_rows' };
-  if (!moneyline) return { reason: 'missing_market:moneyline' };
-  if (!spread) return { reason: 'missing_market:spread' };
-  if (!total) return { reason: 'missing_market:total' };
-  if (moneyline.away_odds_american === null || moneyline.home_odds_american === null) {
-    return { reason: 'one_sided_price:moneyline' };
+  if (requestedMarkets.has('moneyline') && !moneyline) return { reason: 'missing_market:moneyline' };
+  if (requestedMarkets.has('spread') && !spread) return { reason: 'missing_market:spread' };
+  if (requestedMarkets.has('total') && !total) return { reason: 'missing_market:total' };
+  // Per-market price/line validation, guarded by presence so only requested
+  // markets are checked. The nested form gives each present row a direct
+  // non-null narrowing that survives the timestamp loop below (each is a const),
+  // and preserves the pre-scoped reason precedence for the full board.
+  if (moneyline) {
+    if (moneyline.away_odds_american === null || moneyline.home_odds_american === null) {
+      return { reason: 'one_sided_price:moneyline' };
+    }
   }
-  if (spread.away_odds_american === null || spread.home_odds_american === null) {
-    return { reason: 'one_sided_price:spread' };
+  if (spread) {
+    if (spread.away_odds_american === null || spread.home_odds_american === null) {
+      return { reason: 'one_sided_price:spread' };
+    }
+    if (spread.line === null) return { reason: 'missing_line:spread' };
   }
-  if (spread.line === null) return { reason: 'missing_line:spread' };
-  if (total.away_odds_american === null || total.home_odds_american === null) {
-    return { reason: 'one_sided_price:total' };
+  if (total) {
+    if (total.away_odds_american === null || total.home_odds_american === null) {
+      return { reason: 'one_sided_price:total' };
+    }
+    if (total.line === null) return { reason: 'missing_line:total' };
   }
-  if (total.line === null) return { reason: 'missing_line:total' };
-  for (const [market, row] of [
-    ['moneyline', moneyline],
-    ['spread', spread],
-    ['total', total],
-  ] as const) {
+  const presentRows: Array<readonly [MarketKey, CurrentOddsRow]> = [];
+  if (moneyline) presentRows.push(['moneyline', moneyline]);
+  if (spread) presentRows.push(['spread', spread]);
+  if (total) presentRows.push(['total', total]);
+  for (const [market, row] of presentRows) {
     const problem = quoteTimestampProblem(row, market, assembledAtMs);
     if (problem !== null) return { reason: problem };
   }
 
   const gameId = game.gameId;
-  const spreadLine = spread.line;
-  const totalLine = total.line;
   const pitchers = extractProbablePitchers(game);
+  // Only the requested markets contribute an evidenceRef, in the fixed
+  // moneyline → runline → total order (full board ⇒ pre-scoped array).
   const evidenceRefs = [
     evidenceRef(gameId, 'identity'),
     evidenceRef(gameId, 'schedule'),
     ...(pitchers !== null ? [evidenceRef(gameId, 'pitchers')] : []),
-    evidenceRef(gameId, 'moneyline'),
-    evidenceRef(gameId, 'runline'),
-    evidenceRef(gameId, 'total'),
+    ...(moneyline ? [evidenceRef(gameId, 'moneyline')] : []),
+    ...(spread ? [evidenceRef(gameId, 'runline')] : []),
+    ...(total ? [evidenceRef(gameId, 'total')] : []),
   ];
   try {
+    // Absent markets are OMITTED keys — assigned conditionally, never set to
+    // `undefined`. canonicalize() key-sorts, so this matches the pre-scoped
+    // object literal byte-for-byte when all three are present. The `!` on each
+    // price/line is sound: the one_sided_price / missing_line gates above already
+    // returned for any present-market null (TS just cannot carry that narrowing
+    // across the intervening timestamp loop's call).
+    const markets: GameBundle['markets'] = {};
+    if (moneyline) {
+      markets.moneyline = {
+        awayDecimal: americanToDecimal(moneyline.away_odds_american!),
+        homeDecimal: americanToDecimal(moneyline.home_odds_american!),
+        observedAt: moneyline.upstream_last_updated,
+        evidenceRef: evidenceRef(gameId, 'moneyline'),
+      };
+    }
+    if (spread) {
+      const spreadLine = spread.line!;
+      markets.runLine = {
+        line: spreadLine,
+        awayHandicap: -spreadLine,
+        homeHandicap: spreadLine,
+        awayDecimal: americanToDecimal(spread.away_odds_american!),
+        homeDecimal: americanToDecimal(spread.home_odds_american!),
+        observedAt: spread.upstream_last_updated,
+        evidenceRef: evidenceRef(gameId, 'runline'),
+      };
+    }
+    if (total) {
+      const totalLine = total.line!;
+      markets.total = {
+        line: totalLine,
+        // Upstream storage convention: away column = Over, home column = Under.
+        overDecimal: americanToDecimal(total.away_odds_american!),
+        underDecimal: americanToDecimal(total.home_odds_american!),
+        observedAt: total.upstream_last_updated,
+        evidenceRef: evidenceRef(gameId, 'total'),
+      };
+    }
     return {
       bundle: {
         gameId,
@@ -144,31 +231,7 @@ function buildGameBundle(
         awayTeam: game.awayTeam.name,
         homeTeam: game.homeTeam.name,
         probableStartingPitchers: pitchers,
-        markets: {
-          moneyline: {
-            awayDecimal: americanToDecimal(moneyline.away_odds_american),
-            homeDecimal: americanToDecimal(moneyline.home_odds_american),
-            observedAt: moneyline.upstream_last_updated,
-            evidenceRef: evidenceRef(gameId, 'moneyline'),
-          },
-          runLine: {
-            line: spreadLine,
-            awayHandicap: -spreadLine,
-            homeHandicap: spreadLine,
-            awayDecimal: americanToDecimal(spread.away_odds_american),
-            homeDecimal: americanToDecimal(spread.home_odds_american),
-            observedAt: spread.upstream_last_updated,
-            evidenceRef: evidenceRef(gameId, 'runline'),
-          },
-          total: {
-            line: totalLine,
-            // Upstream storage convention: away column = Over, home column = Under.
-            overDecimal: americanToDecimal(total.away_odds_american),
-            underDecimal: americanToDecimal(total.home_odds_american),
-            observedAt: total.upstream_last_updated,
-            evidenceRef: evidenceRef(gameId, 'total'),
-          },
-        },
+        markets,
         evidenceRefs,
       },
     };
@@ -220,7 +283,12 @@ export function buildBundle(
       excluded.push({ gameId: game.gameId, slug: game.slug, reason: 'has_odds_false' });
       continue;
     }
-    const result = buildGameBundle(game, oddsByGame.get(game.gameId) ?? new Map(), assembledAtMs);
+    const result = buildGameBundle(
+      game,
+      oddsByGame.get(game.gameId) ?? new Map(),
+      assembledAtMs,
+      FULL_BOARD_MARKETS,
+    );
     if ('reason' in result) {
       excluded.push({ gameId: game.gameId, slug: game.slug, reason: result.reason });
       continue;

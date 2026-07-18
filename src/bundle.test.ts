@@ -1,7 +1,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildBundle, extractProbablePitchers } from './bundle.js';
-import type { CurrentOddsRow, GamesEndpointRow, SlateInputs } from './types.js';
+import { buildBundle, buildGameBundle, extractProbablePitchers, FULL_BOARD_MARKETS } from './bundle.js';
+import type { GameBundleResult } from './bundle.js';
+import { canonicalize, sha256Hex } from './canonical.js';
+import { prepareGameRequest } from './preparedRequest.js';
+import { SMOKE_LABEL } from './types.js';
+import type {
+  CurrentOddsRow,
+  GameBundle,
+  GamesEndpointRow,
+  MarketKey,
+  SlateBundle,
+  SlateInputs,
+} from './types.js';
 
 const CAPTURED_AT = '2026-07-12T14:05:00.000Z';
 
@@ -192,4 +203,183 @@ test('a late-night ET game on the next UTC day belongs to this slate', () => {
   });
   const build = buildBundle(inputsFor(nightcap), '2026-07-12', { requireFuture: false });
   assert.equal(build.requests.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Scoped single-game builder (buildGameBundle): the per-market runtime asks for
+// a SUBSET of the board (upstream vocabulary: moneyline/spread/total), and the
+// builder emits a 1-3 market bundle for exactly that set, feeding
+// prepareGameRequest. The full board stays byte-identical (the batch builder
+// above and the existing hash/requestSha256 assertions pin that path).
+// ---------------------------------------------------------------------------
+
+const ASSEMBLED_AT_MS = Date.parse(CAPTURED_AT);
+
+/** The odds rows keyed by upstream market, as buildGameBundle consumes them. */
+function oddsMapFor(gameId: string, observedAt?: string): Map<string, CurrentOddsRow> {
+  const rows = observedAt === undefined ? oddsRows(gameId) : oddsRows(gameId, observedAt);
+  return new Map(rows.map((r) => [r.market, r]));
+}
+
+/** Narrow a build result to its bundle, failing loudly with the reason otherwise. */
+function expectBundle(result: GameBundleResult): GameBundle {
+  assert.ok('bundle' in result, `expected a bundle, got ${JSON.stringify(result)}`);
+  return result.bundle;
+}
+
+/** Wrap a scoped bundle into the request envelope prepareGameRequest ingests. */
+function envelopeFor(game: GameBundle): unknown {
+  const requestBundle: SlateBundle = {
+    schemaVersion: 1,
+    label: SMOKE_LABEL,
+    league: 'mlb',
+    slateDate: '2026-07-12',
+    bundleTimestamp: CAPTURED_AT,
+    cutoffAt: game.scheduledStartUtc,
+    games: [game],
+  };
+  return {
+    gameId: game.gameId,
+    slug: 'mil-pit-2026-07-12',
+    game,
+    requestBundle,
+    requestSha256: sha256Hex(canonicalize(requestBundle)),
+  };
+}
+
+test('full board via buildGameBundle equals the batch builder game (byte-identical)', () => {
+  const row = gameRow();
+  const batch = buildBundle(inputsFor(row), '2026-07-12', { requireFuture: false });
+  const scoped = expectBundle(
+    buildGameBundle(row, oddsMapFor(row.gameId), ASSEMBLED_AT_MS, FULL_BOARD_MARKETS),
+  );
+  assert.deepEqual(Object.keys(scoped.markets), ['moneyline', 'runLine', 'total']);
+  assert.deepEqual(scoped.evidenceRefs, [
+    `ev:${row.gameId}:identity`,
+    `ev:${row.gameId}:schedule`,
+    `ev:${row.gameId}:moneyline`,
+    `ev:${row.gameId}:runline`,
+    `ev:${row.gameId}:total`,
+  ]);
+  // Same content hash as the batch path's game — the scoped builder reproduces
+  // the pre-scoped full-board bundle exactly.
+  assert.equal(sha256Hex(canonicalize(scoped)), batch.gameHashes[row.gameId]);
+  assert.deepEqual(scoped, batch.slateBundle.games[0]);
+});
+
+test('scoped {moneyline, total} emits a two-market bundle (no run line) prepareGameRequest accepts', () => {
+  const row = gameRow();
+  const bundle = expectBundle(
+    buildGameBundle(row, oddsMapFor(row.gameId), ASSEMBLED_AT_MS, new Set<MarketKey>(['moneyline', 'total'])),
+  );
+  assert.ok(bundle.markets.moneyline);
+  assert.ok(bundle.markets.total);
+  // Absent market is an OMITTED key, not an undefined-valued one.
+  assert.equal(Object.prototype.hasOwnProperty.call(bundle.markets, 'runLine'), false);
+  assert.deepEqual(Object.keys(bundle.markets), ['moneyline', 'total']);
+  assert.deepEqual(bundle.evidenceRefs, [
+    `ev:${row.gameId}:identity`,
+    `ev:${row.gameId}:schedule`,
+    `ev:${row.gameId}:moneyline`,
+    `ev:${row.gameId}:total`,
+  ]);
+  const prepared = prepareGameRequest(envelopeFor(bundle));
+  assert.ok(prepared.game.markets.moneyline);
+  assert.ok(prepared.game.markets.total);
+  assert.equal(prepared.game.markets.runLine, undefined);
+});
+
+test('scoped {moneyline} emits a single-market bundle prepareGameRequest accepts', () => {
+  const row = gameRow();
+  const bundle = expectBundle(
+    buildGameBundle(row, oddsMapFor(row.gameId), ASSEMBLED_AT_MS, new Set<MarketKey>(['moneyline'])),
+  );
+  assert.deepEqual(Object.keys(bundle.markets), ['moneyline']);
+  assert.deepEqual(bundle.evidenceRefs, [
+    `ev:${row.gameId}:identity`,
+    `ev:${row.gameId}:schedule`,
+    `ev:${row.gameId}:moneyline`,
+  ]);
+  const prepared = prepareGameRequest(envelopeFor(bundle));
+  assert.ok(prepared.game.markets.moneyline);
+  assert.equal(prepared.game.markets.total, undefined);
+});
+
+test('scoped {spread, total} emits run line + total (upstream spread → bundle runLine)', () => {
+  const row = gameRow();
+  const bundle = expectBundle(
+    buildGameBundle(row, oddsMapFor(row.gameId), ASSEMBLED_AT_MS, new Set<MarketKey>(['spread', 'total'])),
+  );
+  assert.ok(bundle.markets.runLine);
+  assert.ok(bundle.markets.total);
+  assert.equal(Object.prototype.hasOwnProperty.call(bundle.markets, 'moneyline'), false);
+  assert.deepEqual(bundle.evidenceRefs, [
+    `ev:${row.gameId}:identity`,
+    `ev:${row.gameId}:schedule`,
+    `ev:${row.gameId}:runline`,
+    `ev:${row.gameId}:total`,
+  ]);
+  const prepared = prepareGameRequest(envelopeFor(bundle));
+  assert.ok(prepared.game.markets.runLine);
+});
+
+test('an absent NON-requested market never rejects the game', () => {
+  const row = gameRow();
+  // Only moneyline + total present; spread absent — the pre-scoped builder would
+  // have rejected the whole game with missing_market:spread.
+  const odds = new Map(
+    oddsRows(row.gameId).filter((r) => r.market !== 'spread').map((r) => [r.market, r]),
+  );
+  const bundle = expectBundle(
+    buildGameBundle(row, odds, ASSEMBLED_AT_MS, new Set<MarketKey>(['moneyline', 'total'])),
+  );
+  assert.deepEqual(Object.keys(bundle.markets), ['moneyline', 'total']);
+});
+
+test('an absent REQUESTED market rejects with missing_market:<market>', () => {
+  const row = gameRow();
+  const odds = new Map(
+    oddsRows(row.gameId).filter((r) => r.market !== 'total').map((r) => [r.market, r]),
+  );
+  const result = buildGameBundle(row, odds, ASSEMBLED_AT_MS, new Set<MarketKey>(['moneyline', 'total']));
+  assert.deepEqual(result, { reason: 'missing_market:total' });
+});
+
+test('a present but NON-requested market is excluded from the bundle', () => {
+  const row = gameRow();
+  const bundle = expectBundle(
+    buildGameBundle(row, oddsMapFor(row.gameId), ASSEMBLED_AT_MS, new Set<MarketKey>(['moneyline'])),
+  );
+  assert.deepEqual(Object.keys(bundle.markets), ['moneyline']);
+});
+
+test('validation applies only to requested markets', () => {
+  const row = gameRow();
+  const rows = oddsRows(row.gameId).map((r) =>
+    r.market === 'spread' ? { ...r, away_odds_american: null } : r,
+  );
+  const odds = new Map(rows.map((r) => [r.market, r]));
+  // spread is one-sided but NOT requested → the game still builds.
+  const ok = buildGameBundle(row, odds, ASSEMBLED_AT_MS, new Set<MarketKey>(['moneyline', 'total']));
+  assert.ok('bundle' in ok);
+  // spread requested → its one-sided price now rejects the game.
+  const bad = buildGameBundle(row, odds, ASSEMBLED_AT_MS, new Set<MarketKey>(['spread', 'total']));
+  assert.deepEqual(bad, { reason: 'one_sided_price:spread' });
+});
+
+test('a requested set with none of its markets present → no_odds_rows', () => {
+  const row = gameRow();
+  const odds = new Map(
+    oddsRows(row.gameId).filter((r) => r.market === 'moneyline').map((r) => [r.market, r]),
+  );
+  const result = buildGameBundle(row, odds, ASSEMBLED_AT_MS, new Set<MarketKey>(['spread', 'total']));
+  assert.deepEqual(result, { reason: 'no_odds_rows' });
+});
+
+test('an empty requested-market set throws (caller-contract invariant)', () => {
+  const row = gameRow();
+  assert.throws(
+    () => buildGameBundle(row, oddsMapFor(row.gameId), ASSEMBLED_AT_MS, new Set<MarketKey>()),
+    /requestedMarkets must be non-empty/,
+  );
 });
