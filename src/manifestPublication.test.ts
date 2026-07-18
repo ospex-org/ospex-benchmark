@@ -53,7 +53,7 @@ function validRaw(overrides: Record<string, unknown> = {}): Record<string, unkno
     toolInferenceConfigSha256: 'c'.repeat(64),
     baselinePolicyVersion: 'baselines-v0.2.0',
     repairPolicyVersion: 'repair-v1',
-    scoringPolicyVersion: 'scoring-v0.4.0',
+    scoringPolicyVersion: 'scoring-v0.5.0',
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: 'prices-v1',
     modelPriceTableDigest: 'd'.repeat(64),

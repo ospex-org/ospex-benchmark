@@ -28,7 +28,7 @@ function validManifest(): Record<string, unknown> {
     toolInferenceConfigSha256: 'b'.repeat(64),
     baselinePolicyVersion: 'baselines-v0.2.0',
     repairPolicyVersion: 'repair-v1',
-    scoringPolicyVersion: 'scoring-v0.4.0',
+    scoringPolicyVersion: 'scoring-v0.5.0',
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: 'prices-v1',
     modelPriceTableDigest: 'c'.repeat(64),
