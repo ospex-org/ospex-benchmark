@@ -76,7 +76,8 @@ function fixtureRun(options?: {
         ? {
             markets: {
               ...gameABase.markets,
-              total: { ...gameABase.markets.total, line: options.totalLineGameA },
+              // makeGameBundle builds a full board, so total is present.
+              total: { ...gameABase.markets.total!, line: options.totalLineGameA },
             },
           }
         : {}),
@@ -143,16 +144,20 @@ function fixtureRun(options?: {
       // flipped arm takes the opposite side of every market at its own
       // bundle-valid price.
       const common = { probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, rationale: 'reference-price read' };
+      // These scenarios build full three-market boards, so every block is present.
+      const ml = game.markets.moneyline!;
+      const rl = game.markets.runLine!;
+      const total = game.markets.total!;
       const forecasts = arm.flipped
         ? [
-            { market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: game.markets.moneyline.awayDecimal, selectedForExecution: true, evidenceRefs: [game.markets.moneyline.evidenceRef], ...common },
-            { market: 'spread', selection: game.homeTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.homeDecimal, selectedForExecution: false, evidenceRefs: [game.markets.runLine.evidenceRef], ...common },
-            { market: 'total', selection: 'under', line: game.markets.total.line, observedDecimal: game.markets.total.underDecimal, selectedForExecution: true, evidenceRefs: [game.markets.total.evidenceRef], ...common },
+            { market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: ml.awayDecimal, selectedForExecution: true, evidenceRefs: [ml.evidenceRef], ...common },
+            { market: 'spread', selection: game.homeTeam, line: rl.line, observedDecimal: rl.homeDecimal, selectedForExecution: false, evidenceRefs: [rl.evidenceRef], ...common },
+            { market: 'total', selection: 'under', line: total.line, observedDecimal: total.underDecimal, selectedForExecution: true, evidenceRefs: [total.evidenceRef], ...common },
           ]
         : [
-            { market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: game.markets.moneyline.homeDecimal, selectedForExecution: true, evidenceRefs: [game.markets.moneyline.evidenceRef], ...common },
-            { market: 'spread', selection: game.awayTeam, line: game.markets.runLine.line, observedDecimal: game.markets.runLine.awayDecimal, selectedForExecution: false, evidenceRefs: [game.markets.runLine.evidenceRef], ...common },
-            { market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, selectedForExecution: true, evidenceRefs: [game.markets.total.evidenceRef], ...common },
+            { market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: ml.homeDecimal, selectedForExecution: true, evidenceRefs: [ml.evidenceRef], ...common },
+            { market: 'spread', selection: game.awayTeam, line: rl.line, observedDecimal: rl.awayDecimal, selectedForExecution: false, evidenceRefs: [rl.evidenceRef], ...common },
+            { market: 'total', selection: 'over', line: total.line, observedDecimal: total.overDecimal, selectedForExecution: true, evidenceRefs: [total.evidenceRef], ...common },
           ];
       const rawResponse = JSON.stringify({
         schemaVersion: 1,
@@ -1678,7 +1683,7 @@ function scopedRun(
   const gameSha256 = sha256Hex(canonicalize(game));
   const slateSha256 = requestSha256; // single-game slate == the request bundle
 
-  const markets = game.markets as Partial<GameBundle['markets']>;
+  const markets = game.markets;
   const common = {
     probabilities: { win: 0.5, push: 0, loss: 0.5 },
     confidence: 0.6,
@@ -1781,6 +1786,7 @@ test('S3c: scoped denominators count only supplied markets', () => {
 
 test('S3c: a decision for a market the scoped game does not supply is a violation', () => {
   const lines = scopedRun(['moneyline', 'total']).lines;
+  // Full board (makeGameBundle) — its run-line price seeds the injected decision.
   const game = makeGameBundle({ gameId: GAME_A });
   const spreadDecision = JSON.stringify({
     recordType: 'decision',
@@ -1791,8 +1797,8 @@ test('S3c: a decision for a market the scoped game does not supply is a violatio
     gameId: GAME_A,
     market: 'spread',
     selection: game.awayTeam,
-    line: game.markets.runLine.line,
-    observedDecimal: game.markets.runLine.awayDecimal,
+    line: game.markets.runLine!.line,
+    observedDecimal: game.markets.runLine!.awayDecimal,
     probabilities: { win: 0.5, push: 0, loss: 0.5 },
     confidence: 0.6,
     selectedForExecution: false,

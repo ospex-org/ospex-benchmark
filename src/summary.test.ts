@@ -105,8 +105,8 @@ test('describeFavorite: full board picks by price; an absent moneyline renders â
   assert.equal(describeFavorite(makeGameBundle()), 'Milwaukee Brewers (away)');
   assert.equal(describeFavorite(scopedGame(['total'])), 'â€”');
   const pickEm = makeGameBundle();
-  pickEm.markets.moneyline.awayDecimal = 1.9;
-  pickEm.markets.moneyline.homeDecimal = 1.9;
+  pickEm.markets.moneyline!.awayDecimal = 1.9;
+  pickEm.markets.moneyline!.homeDecimal = 1.9;
   assert.equal(describeFavorite(pickEm), 'pick-em');
 });
 

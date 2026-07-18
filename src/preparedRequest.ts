@@ -230,10 +230,12 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
   if (!parsed.success) throw new PreparedRequestError(issueList(parsed.error));
   const env = parsed.data;
   // Keep the parser's inferred type (markets are 1-3, each optional) internally so
-  // TypeScript ENFORCES a presence check before every market deref below; the
-  // final PreparedGameRequest bridges to the GameBundle/SlateBundle types (which
-  // encode a fixed three-market shape) with a single documented cast at step 9,
-  // matching the codebase's runtime-scope-aware treatment of GameBundle.
+  // TypeScript ENFORCES a presence check before every market deref below. The
+  // final PreparedGameRequest bridges to GameBundle/SlateBundle, which now carry
+  // the same per-market-optional shape; the only remaining gap is that zod infers
+  // each optional market as `Block | undefined`, which exactOptionalPropertyTypes
+  // rejects against GameBundle's `Block`-only optional — a single documented type
+  // assertion at step 9 bridges exactly that (see there).
   const bundle = env.requestBundle;
 
   // 4. Exactly one game (subsumes duplicate-game-id for a per-game request).
@@ -330,10 +332,15 @@ export function prepareGameRequest(input: unknown): PreparedGameRequest {
   // 9. Deep-freeze — immutable plain data; game === requestBundle.games[0] —
   //    then register it in the origin brand so the dispatch and prompt
   //    boundaries can prove at runtime that this value came through here. The
-  //    validated 1-3-market game/bundle are cast to the GameBundle/SlateBundle
-  //    types here (their static shape is fixed-three); every downstream consumer
-  //    already presence-checks a market at runtime (S3a-d), so a scoped game is
-  //    handled, not assumed full — this is the single boundary bridge for that.
+  //    GameBundle/SlateBundle types now share the parser's per-market-optional
+  //    shape, so this is a pure type bridge — NOT a reshape: `as` still requires
+  //    structural compatibility (it is not `as unknown`), so any real drift would
+  //    still fail. It exists solely because zod's `.optional()` infers each market
+  //    as `Block | undefined`, which exactOptionalPropertyTypes rejects against the
+  //    `Block`-only optional; step 5b already rejected any explicit-undefined market
+  //    key, so a present market is genuinely a Block and an absent one an omitted
+  //    key. The object identity (game === bundle.games[0]) is preserved, so the
+  //    derived hashes and every downstream runtime presence-check (S3a-e) still hold.
   const prepared: PreparedGameRequest = deepFreeze({
     gameId: game.gameId,
     slug: env.slug,

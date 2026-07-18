@@ -121,8 +121,8 @@ test('a scoped game with an incoherent run line is still rejected', () => {
   // run-line coherence check still fires for a SUPPLIED run line.
   delete (request.requestBundle.games[0]!.markets as unknown as Record<string, unknown>).total;
   delete (request.game.markets as unknown as Record<string, unknown>).total;
-  request.requestBundle.games[0]!.markets.runLine.homeHandicap = 99;
-  request.game.markets.runLine.homeHandicap = 99;
+  request.requestBundle.games[0]!.markets.runLine!.homeHandicap = 99;
+  request.game.markets.runLine!.homeHandicap = 99;
   throwsWith(() => prepareGameRequest(reSha(request)), /run line homeHandicap/);
 });
 
@@ -265,7 +265,7 @@ test('a value-changing accessor cannot have its second read validate', () => {
 
 test('an accessor does not survive preparation — the stored value is plain data', () => {
   const request = base();
-  const ml = request.requestBundle.games[0]!.markets.moneyline;
+  const ml = request.requestBundle.games[0]!.markets.moneyline!;
   const fixed = ml.awayDecimal;
   Object.defineProperty(ml, 'awayDecimal', {
     configurable: true,
@@ -276,7 +276,7 @@ test('an accessor does not survive preparation — the stored value is plain dat
   const prepared = prepareGameRequest(request);
   const descriptor = Object.getOwnPropertyDescriptor(prepared.game.markets.moneyline, 'awayDecimal');
   assert.equal(descriptor?.get, undefined, 'stored awayDecimal must be a data property, not an accessor');
-  assert.equal(prepared.game.markets.moneyline.awayDecimal, fixed);
+  assert.equal(prepared.game.markets.moneyline!.awayDecimal, fixed);
 });
 
 test('an inherited (non-market) key such as toJSON is stripped, not carried', () => {

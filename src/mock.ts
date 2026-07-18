@@ -128,8 +128,10 @@ function buildForecast(
   let otherDecimal: number;
   let evidenceRef: string;
 
+  // The dry-run fixture is always a full three-market board (buildBundle emits
+  // all three, and buildValidResponse forecasts each), so every block is present.
   if (market === 'moneyline') {
-    const ml = game.markets.moneyline;
+    const ml = game.markets.moneyline!;
     const homeIsFavorite = ml.homeDecimal <= ml.awayDecimal;
     selection = homeIsFavorite ? game.homeTeam : game.awayTeam;
     observedDecimal = homeIsFavorite ? ml.homeDecimal : ml.awayDecimal;
@@ -137,8 +139,8 @@ function buildForecast(
     line = null;
     evidenceRef = ml.evidenceRef;
   } else if (market === 'spread') {
-    const rl = game.markets.runLine;
-    const ml = game.markets.moneyline;
+    const rl = game.markets.runLine!;
+    const ml = game.markets.moneyline!;
     // Deterministic contrast pick: take the run line on the moneyline underdog.
     const takeAway = ml.awayDecimal >= ml.homeDecimal;
     selection = takeAway ? game.awayTeam : game.homeTeam;
@@ -147,7 +149,7 @@ function buildForecast(
     line = rl.line;
     evidenceRef = rl.evidenceRef;
   } else {
-    const total = game.markets.total;
+    const total = game.markets.total!;
     selection = 'over';
     observedDecimal = total.overDecimal;
     otherDecimal = total.underDecimal;

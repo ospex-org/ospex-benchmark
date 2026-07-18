@@ -388,7 +388,7 @@ function sharedBuild(request: GameRequest): BuildResult {
 test('a post-preparation mutation of the build slate cannot split the artifact', async () => {
   const request = makeRequest(CUTOFF);
   const build = sharedBuild(request);
-  const originalAway = request.game.markets.moneyline.awayDecimal;
+  const originalAway = request.game.markets.moneyline!.awayDecimal;
   // A valid response captured BEFORE any mutation — it matches the frozen bundle.
   const validBody = JSON.stringify(makeValidResponse(request, ARM_A, COHORT));
 
@@ -418,9 +418,9 @@ test('a post-preparation mutation of the build slate cannot split the artifact',
   assert.equal(env.results[0]?.outcome, 'valid');
 
   // The mutation landed on the mutable build slate...
-  assert.equal(build.slateBundle.games[0]?.markets.moneyline.awayDecimal, 99);
+  assert.equal(build.slateBundle.games[0]?.markets.moneyline?.awayDecimal, 99);
   // ...but the frozen dispatch snapshot is untouched.
-  assert.equal(env.snapshot.slate.games[0]?.markets.moneyline.awayDecimal, originalAway);
+  assert.equal(env.snapshot.slate.games[0]?.markets.moneyline?.awayDecimal, originalAway);
 
   // Baselines, records, and summary ALL derive from the frozen, branded envelope.
   const ctx = runContext();

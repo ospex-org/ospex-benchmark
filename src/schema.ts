@@ -170,11 +170,11 @@ function isHalfLine(line: number): boolean {
  * ['moneyline', 'spread', 'total'] — the historical three, in check order.
  */
 function suppliedMarkets(bundleGame: GameBundle): MarketKey[] {
-  const markets = bundleGame.markets as Partial<GameBundle['markets']> | null | undefined;
+  const markets = bundleGame.markets;
   const supplied: MarketKey[] = [];
-  if (markets?.moneyline != null) supplied.push('moneyline');
-  if (markets?.runLine != null) supplied.push('spread');
-  if (markets?.total != null) supplied.push('total');
+  if (markets.moneyline != null) supplied.push('moneyline');
+  if (markets.runLine != null) supplied.push('spread');
+  if (markets.total != null) supplied.push('total');
   return supplied;
 }
 
@@ -216,14 +216,16 @@ function checkGame(
 
   // moneyline
   if (moneyline) {
+    // Gate above: a supplied-market forecast guarantees its bundle block present.
+    const bundleMl = bundleGame.markets.moneyline!;
     if (moneyline.line !== null) errors.push(`game ${id} moneyline: "line" must be null`);
     if (!teams.includes(moneyline.selection)) {
       errors.push(`game ${id} moneyline: selection must be exactly "${bundleGame.awayTeam}" or "${bundleGame.homeTeam}"`);
     } else {
       const expected =
         moneyline.selection === bundleGame.awayTeam
-          ? bundleGame.markets.moneyline.awayDecimal
-          : bundleGame.markets.moneyline.homeDecimal;
+          ? bundleMl.awayDecimal
+          : bundleMl.homeDecimal;
       if (moneyline.observedDecimal !== expected) {
         errors.push(`game ${id} moneyline: observedDecimal must equal the bundle price ${expected} for the selected side`);
       }
@@ -235,42 +237,46 @@ function checkGame(
 
   // spread (designated run line)
   if (spread) {
-    if (spread.line !== bundleGame.markets.runLine.line) {
-      errors.push(`game ${id} spread: line must echo the designated run line ${bundleGame.markets.runLine.line}`);
+    // Gate above: a supplied-market forecast guarantees its bundle block present.
+    const bundleRl = bundleGame.markets.runLine!;
+    if (spread.line !== bundleRl.line) {
+      errors.push(`game ${id} spread: line must echo the designated run line ${bundleRl.line}`);
     }
     if (!teams.includes(spread.selection)) {
       errors.push(`game ${id} spread: selection must be exactly "${bundleGame.awayTeam}" or "${bundleGame.homeTeam}"`);
     } else {
       const expected =
         spread.selection === bundleGame.awayTeam
-          ? bundleGame.markets.runLine.awayDecimal
-          : bundleGame.markets.runLine.homeDecimal;
+          ? bundleRl.awayDecimal
+          : bundleRl.homeDecimal;
       if (spread.observedDecimal !== expected) {
         errors.push(`game ${id} spread: observedDecimal must equal the bundle price ${expected} for the selected side`);
       }
     }
-    if (isHalfLine(bundleGame.markets.runLine.line) && spread.probabilities.push !== 0) {
+    if (isHalfLine(bundleRl.line) && spread.probabilities.push !== 0) {
       errors.push(`game ${id} spread: push probability must be 0 on a half-run line`);
     }
   }
 
   // total
   if (total) {
-    if (total.line !== bundleGame.markets.total.line) {
-      errors.push(`game ${id} total: line must echo the designated total ${bundleGame.markets.total.line}`);
+    // Gate above: a supplied-market forecast guarantees its bundle block present.
+    const bundleTotal = bundleGame.markets.total!;
+    if (total.line !== bundleTotal.line) {
+      errors.push(`game ${id} total: line must echo the designated total ${bundleTotal.line}`);
     }
     if (total.selection !== 'over' && total.selection !== 'under') {
       errors.push(`game ${id} total: selection must be exactly "over" or "under"`);
     } else {
       const expected =
         total.selection === 'over'
-          ? bundleGame.markets.total.overDecimal
-          : bundleGame.markets.total.underDecimal;
+          ? bundleTotal.overDecimal
+          : bundleTotal.underDecimal;
       if (total.observedDecimal !== expected) {
         errors.push(`game ${id} total: observedDecimal must equal the bundle price ${expected} for the selected side`);
       }
     }
-    if (isHalfLine(bundleGame.markets.total.line) && total.probabilities.push !== 0) {
+    if (isHalfLine(bundleTotal.line) && total.probabilities.push !== 0) {
       errors.push(`game ${id} total: push probability must be 0 on a half-point total`);
     }
   }
