@@ -383,3 +383,55 @@ test('an empty requested-market set throws (caller-contract invariant)', () => {
     /requestedMarkets must be non-empty/,
   );
 });
+
+test('scoped {spread} emits a run-line-only bundle prepareGameRequest accepts', () => {
+  const row = gameRow();
+  const bundle = expectBundle(
+    buildGameBundle(row, oddsMapFor(row.gameId), ASSEMBLED_AT_MS, new Set<MarketKey>(['spread'])),
+  );
+  assert.deepEqual(Object.keys(bundle.markets), ['runLine']);
+  assert.deepEqual(bundle.evidenceRefs, [
+    `ev:${row.gameId}:identity`,
+    `ev:${row.gameId}:schedule`,
+    `ev:${row.gameId}:runline`,
+  ]);
+  // Exercises prepareGameRequest's run-line redundancy check on a run-line-only
+  // bundle (homeHandicap === line, awayHandicap === -line).
+  const prepared = prepareGameRequest(envelopeFor(bundle));
+  assert.ok(prepared.game.markets.runLine);
+  assert.equal(prepared.game.markets.moneyline, undefined);
+  assert.equal(prepared.game.markets.total, undefined);
+});
+
+test('scoped {total} emits a total-only bundle prepareGameRequest accepts', () => {
+  const row = gameRow();
+  const bundle = expectBundle(
+    buildGameBundle(row, oddsMapFor(row.gameId), ASSEMBLED_AT_MS, new Set<MarketKey>(['total'])),
+  );
+  assert.deepEqual(Object.keys(bundle.markets), ['total']);
+  const prepared = prepareGameRequest(envelopeFor(bundle));
+  assert.ok(prepared.game.markets.total);
+  assert.equal(prepared.game.markets.moneyline, undefined);
+  assert.equal(prepared.game.markets.runLine, undefined);
+});
+
+test('a requested market with a null line rejects with missing_line:<market>', () => {
+  const row = gameRow();
+  const rows = oddsRows(row.gameId).map((r) => (r.market === 'spread' ? { ...r, line: null } : r));
+  const odds = new Map(rows.map((r) => [r.market, r]));
+  const result = buildGameBundle(row, odds, ASSEMBLED_AT_MS, new Set<MarketKey>(['spread', 'total']));
+  assert.deepEqual(result, { reason: 'missing_line:spread' });
+});
+
+test('FULL_BOARD_MARKETS is a frozen array (a runtime lock, not just a readonly type)', () => {
+  assert.ok(Array.isArray(FULL_BOARD_MARKETS));
+  assert.ok(Object.isFrozen(FULL_BOARD_MARKETS));
+  assert.deepEqual([...FULL_BOARD_MARKETS], ['moneyline', 'spread', 'total']);
+});
+
+test('buildGameBundle accepts an array of markets (any Iterable), not only a Set', () => {
+  const row = gameRow();
+  const markets: MarketKey[] = ['moneyline', 'total'];
+  const bundle = expectBundle(buildGameBundle(row, oddsMapFor(row.gameId), ASSEMBLED_AT_MS, markets));
+  assert.deepEqual(Object.keys(bundle.markets), ['moneyline', 'total']);
+});

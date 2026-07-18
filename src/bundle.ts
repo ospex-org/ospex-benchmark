@@ -1,4 +1,5 @@
 import { canonicalize, sha256Hex } from './canonical.js';
+import { deepFreeze } from './freeze.js';
 import { americanToDecimal } from './odds.js';
 import { easternCalendarDay } from './slateDate.js';
 import { SMOKE_LABEL } from './types.js';
@@ -15,11 +16,18 @@ import type {
 
 /**
  * The full board: all three known markets in upstream vocabulary. The batch
- * slate builder (`buildBundle`) always requests this set, so its per-game output
- * is byte-identical to the pre-scoped builder. The per-market runtime requests a
- * SUBSET (the ready markets for one dispatch) instead.
+ * slate builder (`buildBundle`) always requests this board, so its per-game
+ * output stays byte-identical to the pre-scoped builder; the per-market runtime
+ * requests a SUBSET (the ready markets for one dispatch) instead.
+ *
+ * A `deepFreeze`d `readonly MarketKey[]` — NOT a shared `Set` — because this is a
+ * load-bearing shared constant and TypeScript `readonly` alone is not a runtime
+ * lock (see `freeze.ts`); a `Set`'s `add`/`delete` mutate internal slots that
+ * `Object.freeze`/`deepFreeze` cannot reach, so a frozen array is the only shape
+ * that can't be corrupted process-wide. `buildGameBundle` copies its request into
+ * a fresh `Set`, so the board this constant names can never be mutated.
  */
-export const FULL_BOARD_MARKETS: ReadonlySet<MarketKey> = new Set<MarketKey>([
+export const FULL_BOARD_MARKETS: readonly MarketKey[] = deepFreeze<MarketKey[]>([
   'moneyline',
   'spread',
   'total',
@@ -113,8 +121,11 @@ export function extractProbablePitchers(row: GamesEndpointRow): ProbablePitchers
  *
  * `requestedMarkets` names the markets to include in UPSTREAM vocabulary
  * (`moneyline` | `spread` | `total`, matching `current_odds` and the market
- * policy); the emitted bundle uses BUNDLE vocabulary, so the `spread` row becomes
- * `markets.runLine`. Only the requested markets are read, validated, and emitted:
+ * policy); it is any `Iterable` (a `Set` or an array — e.g. a ready-set from
+ * `effectiveEnabled`), copied into a fresh `Set` here so the caller's collection
+ * is never aliased or mutated. The emitted bundle uses BUNDLE vocabulary, so the
+ * `spread` row becomes `markets.runLine`. Only the requested markets are read,
+ * validated, and emitted:
  *   - an absent NON-requested market never rejects the game (it is simply not in
  *     this dispatch);
  *   - an absent REQUESTED market rejects with `missing_market:<market>`;
@@ -130,18 +141,19 @@ export function buildGameBundle(
   game: GamesEndpointRow,
   odds: Map<string, CurrentOddsRow>,
   assembledAtMs: number,
-  requestedMarkets: ReadonlySet<MarketKey>,
+  requestedMarkets: Iterable<MarketKey>,
 ): GameBundleResult {
-  if (requestedMarkets.size === 0) {
+  const requested = new Set<MarketKey>(requestedMarkets);
+  if (requested.size === 0) {
     throw new Error('buildGameBundle: requestedMarkets must be non-empty');
   }
-  const moneyline = requestedMarkets.has('moneyline') ? odds.get('moneyline') : undefined;
-  const spread = requestedMarkets.has('spread') ? odds.get('spread') : undefined;
-  const total = requestedMarkets.has('total') ? odds.get('total') : undefined;
+  const moneyline = requested.has('moneyline') ? odds.get('moneyline') : undefined;
+  const spread = requested.has('spread') ? odds.get('spread') : undefined;
+  const total = requested.has('total') ? odds.get('total') : undefined;
   if (!moneyline && !spread && !total) return { reason: 'no_odds_rows' };
-  if (requestedMarkets.has('moneyline') && !moneyline) return { reason: 'missing_market:moneyline' };
-  if (requestedMarkets.has('spread') && !spread) return { reason: 'missing_market:spread' };
-  if (requestedMarkets.has('total') && !total) return { reason: 'missing_market:total' };
+  if (requested.has('moneyline') && !moneyline) return { reason: 'missing_market:moneyline' };
+  if (requested.has('spread') && !spread) return { reason: 'missing_market:spread' };
+  if (requested.has('total') && !total) return { reason: 'missing_market:total' };
   // Per-market price/line validation, guarded by presence so only requested
   // markets are checked. The nested form gives each present row a direct
   // non-null narrowing that survives the timestamp loop below (each is a const),
