@@ -1,6 +1,6 @@
 import type { CohortManifestV1 } from './manifest.js';
-import { isMarketPolicyVersion, marketPolicyDigest } from './marketPolicy.js';
-import { isBaselinePolicyVersion } from './baselines.js';
+import { isFullBoardCohort, isMarketPolicyVersion, marketPolicyDigest } from './marketPolicy.js';
+import { isBaselinePolicyVersion, isFullBoardBaselinePolicy } from './baselines.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 
@@ -38,9 +38,26 @@ export function validateManifestAgainstCode(manifest: CohortManifestV1): string[
     }
   }
 
-  // Baseline policy: known version (baselines carry no digest concept).
+  // Baseline policy: known version (baselines carry no digest concept), then the
+  // dynamic-cohort coupling. A cohort whose effective board (sportAllowList ×
+  // market policy) is SCOPED produces games carrying 1–2 markets, on which a
+  // full-board baseline policy (v0.1/v0.2) fails closed — so such a cohort MUST
+  // declare the scoped policy baselines-v0.3.0 (SPEC-prepared-request.md §3, §5-S3;
+  // the runtime/scorer mirror this — a scoped artifact stamped v0.2 is refused).
+  // The coupling is checked only when BOTH versions are known (an unknown market
+  // policy version is already flagged above and would otherwise throw here).
   if (!isBaselinePolicyVersion(manifest.baselinePolicyVersion)) {
     violations.push(`unknown baselinePolicyVersion "${manifest.baselinePolicyVersion}"`);
+  } else if (
+    isMarketPolicyVersion(manifest.marketPolicyVersion) &&
+    isFullBoardBaselinePolicy(manifest.baselinePolicyVersion) &&
+    !isFullBoardCohort(manifest.sportAllowList, manifest.marketPolicyVersion)
+  ) {
+    violations.push(
+      `baselinePolicyVersion "${manifest.baselinePolicyVersion}" requires a full three-market board, ` +
+        `but this cohort's effective board (sportAllowList ${JSON.stringify(manifest.sportAllowList)} × ` +
+        `${manifest.marketPolicyVersion}) is scoped; a dynamic cohort requires baselines-v0.3.0`,
+    );
   }
 
   // Prompt scaffold: the manifest digest must equal the code's scaffold hash.

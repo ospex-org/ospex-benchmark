@@ -59,6 +59,19 @@ const FULL_BOARD_POLICIES = new Set<BaselinePolicyVersion>([
 ]);
 
 /**
+ * Whether a baseline policy version is a FULL-BOARD policy — one defined over the
+ * fixed three-market board that fails closed on a scoped (1–2-market) input
+ * (v0.1/v0.2). The scoped policy v0.3 is NOT full-board. The dynamic-cohort boot
+ * gate uses this to refuse a scoped cohort that declares a full-board baseline
+ * policy (SPEC-prepared-request.md §3): such a cohort's games carry 1–2 markets,
+ * on which a full-board policy would throw. Any future scoped-capable version is
+ * accepted by returning false, so the gate stays version-agnostic.
+ */
+export function isFullBoardBaselinePolicy(version: BaselinePolicyVersion): boolean {
+  return FULL_BOARD_POLICIES.has(version);
+}
+
+/**
  * Which markets a policy emits baselines for on a given game. v0.1 = moneyline
  * + total (never the run line); v0.2 = all three; v0.3 = the PRESENT markets
  * (1–3). Only WHICH markets are emitted differs across versions — the per-market

@@ -6,6 +6,7 @@ import {
   MARKET_POLICY_VERSION,
   MARKET_POLICY_VERSIONS,
   effectiveEnabled,
+  isFullBoardCohort,
   isMarketPolicyVersion,
   marketPolicyDigest,
   marketPolicyEnabled,
@@ -51,6 +52,25 @@ test('effectiveEnabled ANDs the sportAllowList with the market policy', () => {
   assert.equal(effectiveEnabled(['nba'], 'mlb', 'moneyline'), false);
   // In the allow-list but the policy has no entry for that sport → false (default deny).
   assert.equal(effectiveEnabled(['nba'], 'nba', 'moneyline'), false);
+});
+
+test('isFullBoardCohort: an MLB cohort is scoped (run line off); a zero-market sport is scoped', () => {
+  // MLB enables only moneyline + total under market-policy-v1, so no MLB cohort
+  // is full-board — it needs the scoped baseline policy (v0.3).
+  assert.equal(isFullBoardCohort(['mlb']), false);
+  assert.equal(marketPolicyEnabled('mlb', 'spread'), false); // WHY it is scoped: run line off
+  // A sport the policy does not know enables nothing → not full-board.
+  assert.equal(isFullBoardCohort(['nba']), false);
+  // A mixed allow-list where any sport falls short of the full board → not full-board.
+  assert.equal(isFullBoardCohort(['mlb', 'nba']), false);
+});
+
+test('isFullBoardCohort: the vacuous full-board over zero sports is unreachable via a parsed manifest', () => {
+  // `.every` over an empty allow-list is vacuously true. A real cohort can never
+  // hit this: the manifest schema requires a non-empty sportAllowList, so the gate
+  // never mistakes an empty cohort for a full board. Documented so the degenerate
+  // case is a conscious property, not an accidental hole.
+  assert.equal(isFullBoardCohort([]), true);
 });
 
 test('policy isolation: enabling another sport later would not change MLB', () => {

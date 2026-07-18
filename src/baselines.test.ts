@@ -4,6 +4,7 @@ import {
   BASELINE_POLICY_VERSION,
   BASELINE_POLICY_VERSIONS,
   isBaselinePolicyVersion,
+  isFullBoardBaselinePolicy,
   runBaselines,
   type BaselinePolicyVersion,
 } from './baselines.js';
@@ -143,6 +144,14 @@ test('version registry: known versions dispatch, unknown strings do not', () => 
   assert.ok(isBaselinePolicyVersion('baselines-v0.3.0'));
   assert.ok(!isBaselinePolicyVersion('baselines-v9.9.9'));
   assert.ok(!isBaselinePolicyVersion(''));
+});
+
+test('isFullBoardBaselinePolicy: v0.1/v0.2 are full-board, v0.3 (scoped) is not', () => {
+  // The dynamic-cohort boot gate reads this predicate: full-board policies fail
+  // closed on scoped input, so a scoped cohort must NOT declare one.
+  assert.equal(isFullBoardBaselinePolicy('baselines-v0.1.0'), true);
+  assert.equal(isFullBoardBaselinePolicy('baselines-v0.2.0'), true);
+  assert.equal(isFullBoardBaselinePolicy('baselines-v0.3.0'), false);
 });
 
 // --- S2: baseline version isolation (SPEC-prepared-request.md §3, §5-S2) ---

@@ -36,7 +36,11 @@ function codeConsistentRaw(): Record<string, unknown> {
       approvedReportedModelIds: a.approvedReportedModelIds,
     })),
     toolInferenceConfigSha256: 'b'.repeat(64),
-    baselinePolicyVersion: BASELINE_POLICY_VERSION,
+    // MLB under market-policy-v1 enables only moneyline + total (run line OFF),
+    // so this is a SCOPED cohort and must declare the scoped baseline policy —
+    // a full-board policy (BASELINE_POLICY_VERSION = v0.2) is refused by the
+    // dynamic-cohort gate below.
+    baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
@@ -86,6 +90,34 @@ test('marketPolicyDigest mismatch is flagged (wires to the recomputed digest)', 
 test('unknown baselinePolicyVersion is flagged', () => {
   const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), baselinePolicyVersion: 'baselines-v9.9.9' }));
   assert.ok(v.some((s) => /unknown baselinePolicyVersion/.test(s)), v.join('; '));
+});
+
+test('a scoped cohort declaring a full-board baseline policy is flagged (dynamic-cohort gate)', () => {
+  // The MLB fixture is scoped (market-policy-v1: moneyline + total, run line OFF),
+  // so BOTH full-board policies must be refused — they would fail closed at the
+  // producers on a 2-market MLB game.
+  for (const version of [BASELINE_POLICY_VERSION, 'baselines-v0.1.0'] as const) {
+    const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), baselinePolicyVersion: version }));
+    assert.ok(
+      v.some((s) => /requires a full three-market board.*is scoped.*requires baselines-v0\.3\.0/.test(s)),
+      `${version}: ${v.join('; ')}`,
+    );
+  }
+});
+
+test('the dynamic-cohort gate does not double-flag an already-unknown baseline or market policy', () => {
+  // An unknown baseline version is flagged once (as unknown), not also as a scope
+  // mismatch — the coupling is checked only for a known version.
+  const badBaseline = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), baselinePolicyVersion: 'baselines-v9.9.9' }));
+  assert.ok(badBaseline.some((s) => /unknown baselinePolicyVersion/.test(s)), badBaseline.join('; '));
+  assert.ok(!badBaseline.some((s) => /requires a full three-market board/.test(s)), badBaseline.join('; '));
+  // An unknown market policy skips the coupling (it would otherwise throw on the
+  // policy lookup) — the market-policy check reports it instead.
+  const badMarket = validateManifestAgainstCode(
+    parse({ ...codeConsistentRaw(), marketPolicyVersion: 'market-policy-v2', baselinePolicyVersion: BASELINE_POLICY_VERSION }),
+  );
+  assert.ok(badMarket.some((s) => /unknown marketPolicyVersion/.test(s)), badMarket.join('; '));
+  assert.ok(!badMarket.some((s) => /requires a full three-market board/.test(s)), badMarket.join('; '));
 });
 
 test('promptScaffoldSha256 mismatch is flagged', () => {
