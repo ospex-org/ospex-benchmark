@@ -8,6 +8,7 @@ import {
 } from './schema.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { assertPrepared, prepareGameRequest } from './preparedRequest.js';
+import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { deepFreeze } from './freeze.js';
 import { instantMs } from './time.js';
@@ -60,6 +61,18 @@ export interface RunEnvelope {
     timeoutMs: number;
     maxOutputTokens: number;
   };
+  /**
+   * The baseline policy version every artifact producer derives its deterministic
+   * baselines under (S3). Carried on the branded envelope as an authenticated
+   * DERIVATION PARAMETER — read directly like `snapshot`/`results`, NOT one of the
+   * five ctx-reconciled dispatch fields (§4 of the artifact-producer spec): it is
+   * not model-echoed, and `run_meta.baselinePolicyVersion` derives from the emitted
+   * decisions themselves, so there is no `RunContext` copy to reconcile. Defaults
+   * to the full-board `baselines-v0.2.0` (byte-identical to pre-S3e-2b); a dynamic
+   * cohort passes `baselines-v0.3.0` so a scoped slate derives its present-market
+   * baselines instead of failing closed.
+   */
+  baselinePolicyVersion: BaselinePolicyVersion;
 }
 
 /** The five load-bearing fields, derived from the envelope and equality-gated (A4). */
@@ -226,6 +239,14 @@ export interface SlateRunOptions {
    * single-sourced with what the model is asked to echo back.
    */
   executionPolicy: 'fixed-moneyline-total';
+  /**
+   * The baseline policy version the artifact producers derive baselines under,
+   * carried on the envelope (`RunEnvelope.baselinePolicyVersion`). Optional;
+   * defaults to `BASELINE_POLICY_VERSION` (the full-board `baselines-v0.2.0`), so
+   * the fixed-board smoke/watch path is unchanged. A dynamic cohort supplies
+   * `baselines-v0.3.0` so a scoped slate derives its present-market baselines.
+   */
+  baselinePolicyVersion?: BaselinePolicyVersion | undefined;
   /**
    * Injected clock (epoch ms) used BOTH for cutoff enforcement (checked
    * before initial dispatch, before repair, and on response acceptance) AND
@@ -618,6 +639,9 @@ export async function runSlate(
       timeoutMs: options.timeoutMs,
       maxOutputTokens: options.maxOutputTokens,
     },
+    // Authenticated derivation parameter (default: the full-board v0.2). The
+    // producers derive baselines under this, so a scoped run stamps v0.3.
+    baselinePolicyVersion: options.baselinePolicyVersion ?? BASELINE_POLICY_VERSION,
   });
   runEnvelopes.add(envelope);
   return envelope;
