@@ -683,9 +683,10 @@ export async function fireEligibleGame(
   });
   const armGameResults = env.results;
 
-  // buildRecords/buildSummaryMarkdown derive baselines from the sealed snapshot;
-  // this copy is only for the fire-outcome count reported to schedulers.
-  const baselineDecisions = runBaselines(env.snapshot.slate);
+  // buildRecords/buildSummaryMarkdown derive baselines from the sealed snapshot
+  // under the same authenticated envelope version; this copy is only for the
+  // fire-outcome count reported to schedulers.
+  const baselineDecisions = runBaselines(env.snapshot.slate, env.baselinePolicyVersion);
   const reportedByArm = reportedModelIdsByArm(armGameResults);
   const unidentifiedByArm = unidentifiedResponsesByArm(armGameResults);
   const collision = checkProviderCollision(

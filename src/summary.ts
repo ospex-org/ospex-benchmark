@@ -131,8 +131,10 @@ export function buildSummaryMarkdown(
   const armGameResults = env.results;
   const slateBundle = env.snapshot.slate;
   const slateSha256 = env.snapshot.slateSha256;
-  // Baselines are derived from the sealed snapshot, never accepted as an array.
-  const baselineDecisions = runBaselines(env.snapshot.slate);
+  // Baselines are derived from the sealed snapshot under the run's authenticated
+  // baseline policy version (default v0.2; a dynamic cohort's v0.3 handles a
+  // scoped slate), never accepted as an array.
+  const baselineDecisions = runBaselines(env.snapshot.slate, env.baselinePolicyVersion);
   const lines: string[] = [];
   const arms = [...new Map(armGameResults.map((r) => [r.arm.participantId, r.arm])).values()];
   const byArm = (participantId: string): ArmGameResult[] =>

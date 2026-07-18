@@ -141,9 +141,12 @@ export function buildRecords(
   const { prepared, slate, slateSha256 } = snapshot;
   const { excluded, provenance } = build;
 
-  // Baselines are DERIVED from the sealed snapshot, never accepted as a swappable
-  // array — so a missing/foreign/duplicate baseline row cannot be smuggled in.
-  const baselineDecisions = runBaselines(slate);
+  // Baselines are DERIVED from the sealed snapshot under the run's authenticated
+  // baseline policy version, never accepted as a swappable array — so a missing/
+  // foreign/duplicate baseline row cannot be smuggled in. The version comes from
+  // the branded envelope (default v0.2, full-board); a dynamic cohort's v0.3
+  // derives the present-market subset instead of failing closed on a scoped slate.
+  const baselineDecisions = runBaselines(slate, env.baselinePolicyVersion);
 
   const requestShaByGame = new Map(prepared.map((r) => [r.gameId, r.requestSha256]));
   const cutoffByGame = new Map(prepared.map((r) => [r.gameId, r.cutoffAt]));

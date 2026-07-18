@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { runSlate } from './runner.js';
 import {
@@ -12,6 +13,7 @@ import {
   writeNdjson,
   writeText,
 } from './records.js';
+import { buildSummaryMarkdown } from './summary.js';
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
 import type { BuildResult, GameRequest } from './bundle.js';
 import type { RunContext } from './records.js';
@@ -21,6 +23,7 @@ import type {
   AttemptRecord,
   BenchmarkResponse,
   ChatTurn,
+  GameBundle,
   ProviderAdapter,
   ProviderResponse,
 } from './types.js';
@@ -122,17 +125,48 @@ async function envFrom(
   ctx: RunContext,
   handlers: ChatHandler[],
   nowMs: () => number = () => CUTOFF_MS - 60_000,
+  baselinePolicyVersion?: BaselinePolicyVersion,
 ): Promise<RunEnvelope> {
   // The options' five load-bearing fields must equal ctx's, or authenticateRun
   // fails closed (A4). slateDate is derived from the request bundle inside the
   // envelope, and makeCtx().slateDate matches makeRequest()'s bundle date.
+  // baselinePolicyVersion is omitted by default → runSlate stamps v0.2.
   return runSlate([TEST_ARM], new Map([[TEST_ARM.participantId, stubAdapter(handlers)]]), build.requests, {
     cohortId: ctx.cohortId,
     timeoutMs: ctx.timeoutMs,
     maxOutputTokens: ctx.maxOutputTokens,
     executionPolicy: ctx.executionPolicy,
     nowMs,
+    ...(baselinePolicyVersion !== undefined ? { baselinePolicyVersion } : {}),
   });
+}
+
+/**
+ * A scoped GameRequest carrying only the named markets (S3), built by re-scoping
+ * the full-board factory and RECOMPUTING the request hash so the prepared boundary
+ * accepts it. The absent market is an omitted own property. (A shared scope-aware
+ * factory is a deferred follow-up; this local helper covers the producer path.)
+ */
+function scopeRequestTo(present: ReadonlyArray<'moneyline' | 'runLine' | 'total'>): GameRequest {
+  const base = makeRequest();
+  const full = base.game.markets as Record<string, unknown>;
+  const scoped: Record<string, unknown> = {};
+  for (const key of present) scoped[key] = full[key];
+  const game = { ...base.game, markets: scoped } as unknown as GameBundle;
+  const requestBundle = { ...base.requestBundle, games: [game] };
+  return { ...base, game, requestBundle, requestSha256: sha256Hex(canonicalize(requestBundle)) };
+}
+
+/** A single-request BuildResult around any (full-board or scoped) request. */
+function buildFrom(request: GameRequest): BuildResult {
+  return {
+    slateBundle: { ...request.requestBundle },
+    slateSha256: request.requestSha256,
+    requests: [request],
+    gameHashes: { [request.gameId]: 'a'.repeat(64) },
+    excluded: [],
+    provenance: { [request.gameId]: { slug: request.slug, oddsRows: [] } },
+  };
 }
 
 test('repaired decisions carry the ACCEPTED repair attempt provenance', async () => {
@@ -227,6 +261,85 @@ test('cutoff_missed results never emit decision records', async () => {
   assert.equal(env.results[0]?.outcome, 'cutoff_missed');
   const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
   assert.equal(records.filter((r) => r['recordType'] === 'decision').length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// S3e-2b: the run's baseline policy version threads from the envelope into the
+// producers, so a dynamic cohort's v0.3 lets a SCOPED slate complete end-to-end.
+// The default stays v0.2 (full-board byte-identical).
+// ---------------------------------------------------------------------------
+
+test('runSlate stamps the baseline policy version on the envelope (default v0.2; explicit v0.3)', async () => {
+  const build = makeBuild();
+  const ctx = makeCtx();
+  const request = build.requests[0]!;
+  const dflt = await envFrom(build, ctx, [() => stubResponse(JSON.stringify(makeValidResponse(request)))]);
+  assert.equal(dflt.baselinePolicyVersion, BASELINE_POLICY_VERSION);
+  assert.equal(dflt.baselinePolicyVersion, 'baselines-v0.2.0');
+  const v3 = await envFrom(
+    build,
+    ctx,
+    [() => stubResponse(JSON.stringify(makeValidResponse(request)))],
+    undefined,
+    'baselines-v0.3.0',
+  );
+  assert.equal(v3.baselinePolicyVersion, 'baselines-v0.3.0');
+});
+
+test('a full-board run under v0.3 derives v0.3-stamped baselines (same set, only the stamp differs)', async () => {
+  const build = makeBuild();
+  const ctx = makeCtx();
+  const request = build.requests[0]!;
+  const env = await envFrom(
+    build,
+    ctx,
+    [() => stubResponse(JSON.stringify(makeValidResponse(request)))],
+    undefined,
+    'baselines-v0.3.0',
+  );
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
+  const baselines = records.filter((r) => r['recordType'] === 'baseline_decision');
+  assert.equal(baselines.length, 8); // full board: 4 moneyline + 2 total + 2 run line
+  assert.ok(baselines.every((b) => b['policyVersion'] === 'baselines-v0.3.0'), 'every baseline stamped v0.3');
+  const runMeta = records.find((r) => r['recordType'] === 'run_meta')!;
+  assert.equal(runMeta['baselinePolicyVersion'], 'baselines-v0.3.0');
+});
+
+test('a scoped run completes end-to-end under v0.3 (records + summary), deriving present-market baselines', async () => {
+  const request = scopeRequestTo(['moneyline', 'total']); // run line omitted → a 2-market slate
+  const build = buildFrom(request);
+  const ctx = makeCtx();
+  // The stub returns an empty body → invalid_schema (a scope-aware mock that emits
+  // a VALID scoped forecast is a deferred follow-up); the point is that the
+  // PRODUCERS + deterministic baselines complete on a scoped slate under v0.3.
+  const env = await envFrom(build, ctx, [() => stubResponse('{}')], undefined, 'baselines-v0.3.0');
+  assert.equal(env.baselinePolicyVersion, 'baselines-v0.3.0');
+
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
+  const baselines = records.filter((r) => r['recordType'] === 'baseline_decision');
+  assert.equal(baselines.length, 6); // scoped: 4 moneyline + 2 total, NO run-line pair
+  assert.ok(baselines.every((b) => b['policyVersion'] === 'baselines-v0.3.0'));
+  assert.ok(!baselines.some((b) => b['market'] === 'spread'), 'no run-line baseline for a scoped board');
+  const runMeta = records.find((r) => r['recordType'] === 'run_meta')!;
+  assert.equal(runMeta['baselinePolicyVersion'], 'baselines-v0.3.0');
+
+  // buildSummaryMarkdown renders without dereferencing the absent market.
+  const summary = buildSummaryMarkdown(env, ctx, build, { failures: [], warnings: [] });
+  assert.match(summary, /## Deterministic baselines/);
+});
+
+test('a scoped run under the default v0.2 fails closed at the producer (why v0.3 must be threaded)', async () => {
+  const request = scopeRequestTo(['moneyline', 'total']);
+  const build = buildFrom(request);
+  const ctx = makeCtx();
+  const env = await envFrom(build, ctx, [() => stubResponse('{}')]); // default → v0.2
+  assert.equal(env.baselinePolicyVersion, 'baselines-v0.2.0');
+  // v0.2 is full-board-only: deriving baselines on a scoped slate fails closed,
+  // which is exactly why a dynamic cohort must thread v0.3.
+  assert.throws(
+    () => buildRecords(env, ctx, build, { failures: [], warnings: [] }),
+    /requires a full three-market board/,
+  );
 });
 
 test('identity-only failures get their own MODEL_IDENTITY run_failure record, never PROVIDER_COLLISION', async () => {
