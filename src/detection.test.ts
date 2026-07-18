@@ -334,15 +334,45 @@ test('mutating the caller opener after evaluation cannot change the verdict evid
   assert.equal(verdict.openerAgeMs, 60_000);
 });
 
-test('the returned opener evidence is frozen — mutation through the verdict is refused', () => {
+test('the returned verdict is fully frozen — outer property reassignment AND nested mutation are refused', () => {
   const opener = openerAt(shift(DETECTED_AT, -60_000));
   const verdict = evaluateCandidate(baseInput({ opener }));
   assert.equal(verdict.state, 'eligible');
   if (verdict.state !== 'eligible') return;
+  // The WHOLE verdict is frozen, not only its nested opener.
+  assert.ok(Object.isFrozen(verdict));
   assert.ok(Object.isFrozen(verdict.opener));
+  const replacement = openerAt(shift(DETECTED_AT, -10_800_000), { market: 'total', line: 8.5 });
+  // Reassigning an outer property is refused — a downstream holder cannot swap in
+  // an opener/age different from what was judged.
+  assert.throws(() => {
+    verdict.opener = replacement;
+  });
+  assert.throws(() => {
+    verdict.openerAgeMs = 30_000;
+  });
+  // Mutating the nested opener is refused.
   assert.throws(() => {
     verdict.opener.market = 'total';
   });
+  // The judged evidence is unchanged after every refused mutation.
+  assert.equal(verdict.opener.market, 'moneyline');
+  assert.equal(verdict.openerAgeMs, 60_000);
+});
+
+test('every verdict shape is frozen, opener-carrying or not (uniform sealing)', () => {
+  const inputs: CandidateInput[] = [
+    baseInput(), // eligible
+    baseInput({ market: 'spread' }), // not_enabled (no opener carried)
+    baseInput({ opener: undefined }), // opener_not_visible (no opener carried)
+    baseInput({ detectedAt: WINDOW_END }), // detected_after_window (no opener carried)
+    baseInput({ opener: openerAt(WINDOW_END) }), // opener_after_window (opener carried)
+    baseInput({ opener: openerAt(shift(DETECTED_AT, 3_000)) }), // clock_skew_defer (opener carried)
+    baseInput({ opener: openerAt(shift(DETECTED_AT, -(W + 1))) }), // stale_entry (opener carried)
+  ];
+  for (const input of inputs) {
+    assert.ok(Object.isFrozen(evaluateCandidate(input)), `verdict for ${input.market}/${input.detectedAt} frozen`);
+  }
 });
 
 // --- terminal window closure vs opener presence -----------------

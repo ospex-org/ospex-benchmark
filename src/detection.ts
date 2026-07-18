@@ -46,9 +46,13 @@ export type CandidateState =
  * A per-candidate verdict. `eligible`/`stale_entry` carry the derived
  * `openerAgeMs` (= detectedAt − opener), the skew states carry `skewMs`
  * (= opener − detectedAt), and every opener-dependent verdict carries the
- * `opener` it was judged against — a DETACHED, FROZEN snapshot, so neither later
- * mutation of the caller's source row nor mutation through the returned verdict
- * can change the evidence the decision was actually made on.
+ * `opener` it was judged against.
+ *
+ * `evaluateCandidate` returns the WHOLE verdict deep-frozen — the outer wrapper
+ * (so no property, including `opener`, can be REASSIGNED) and the nested opener
+ * (a detached copy of the source row). So neither mutation of the caller's source
+ * row nor any mutation through the returned verdict — nested or outer — can change
+ * the evidence the decision was actually made on.
  */
 export type CandidateVerdict =
   | { state: 'eligible'; opener: TwoSidedHistoryRow; openerAgeMs: number }
@@ -149,19 +153,25 @@ export function evaluateCandidate(input: CandidateInput): CandidateVerdict {
     );
   }
 
+  // Every returned verdict is deep-frozen: immutable at the OUTER wrapper (no
+  // property — state, opener, openerAgeMs, skewMs — can be reassigned) AND at the
+  // nested opener evidence. Downstream code retaining a verdict can therefore
+  // never observe an opener/age different from the one actually judged.
+  const seal = (verdict: CandidateVerdict): CandidateVerdict => deepFreeze(verdict);
+
   // 1. Policy — effective eligibility (sport in the allow-list AND the market
   //    enabled for that sport). One predicate shared with finalization (§3).
   if (!effectiveEnabled(sportAllowList, sport, market, marketPolicyVersion)) {
-    return { state: 'not_enabled' };
+    return seal({ state: 'not_enabled' });
   }
   // 2. Detection window — checked BEFORE opener availability so a CLOSED window is
   //    never masked by a missing opener. detectedAt ≥ windowEnd is TERMINAL (a
   //    later re-evaluation's fresh detectedAt is also past windowEnd); < windowStart
   //    means the cohort has not started (transient).
-  if (detectedAtMs < windowStartMs) return { state: 'detected_before_window' };
-  if (detectedAtMs >= windowEndMs) return { state: 'detected_after_window' };
+  if (detectedAtMs < windowStartMs) return seal({ state: 'detected_before_window' });
+  if (detectedAtMs >= windowEndMs) return seal({ state: 'detected_after_window' });
   // 3. Opener availability — no independent opener yet (transient; defer).
-  if (opener === undefined) return { state: 'opener_not_visible' };
+  if (opener === undefined) return seal({ state: 'opener_not_visible' });
   // 4. Identity binding — the opener MUST be this exact candidate's own. A
   //    mismatch is a caller wiring bug (a sibling market's opener, or another
   //    game's), never a data condition, so it throws. This binding IS the point
@@ -181,29 +191,33 @@ export function evaluateCandidate(input: CandidateInput): CandidateVerdict {
       `opener captured_at_ms (${String(opener.captured_at_ms)}) is not the coherent derivation of captured_at (${opener.captured_at})`,
     );
   }
-  // 6. Detached, frozen evidence — the exact row the verdict was judged against,
-  //    immune to later mutation of the caller's source row OR the returned value.
-  const evidence = deepFreeze({ ...opener });
+  // 6. Detached evidence — a fresh copy of the exact row the verdict was judged
+  //    against. `seal` deep-freezes it together with the whole verdict on return,
+  //    so it is immune to later mutation of the caller's source row OR the
+  //    returned value (outer property reassignment included).
+  const evidence = { ...opener };
 
   // 7. Opener window — an opener outside [windowStart, windowEnd) can never be in
   //    the universe U (§6), so forbid the fire here rather than admitting a
   //    guaranteed X = F − U extra fire (the bare age gate would miss this).
-  if (openerMs < windowStartMs) return { state: 'opener_before_window', opener: evidence };
-  if (openerMs >= windowEndMs) return { state: 'opener_after_window', opener: evidence };
+  if (openerMs < windowStartMs) return seal({ state: 'opener_before_window', opener: evidence });
+  if (openerMs >= windowEndMs) return seal({ state: 'opener_after_window', opener: evidence });
   // 8. Clock skew — an opener stamped AFTER detection never widens the window.
   //    Within tolerance: defer and re-evaluate next tick. Beyond: a source/clock
   //    fault — never claim.
   if (openerMs > detectedAtMs) {
     const skewMs = openerMs - detectedAtMs;
-    return skewMs <= maxClockSkewMs
-      ? { state: 'clock_skew_defer', opener: evidence, skewMs }
-      : { state: 'clock_skew_fault', opener: evidence, skewMs };
+    return seal(
+      skewMs <= maxClockSkewMs
+        ? { state: 'clock_skew_defer', opener: evidence, skewMs }
+        : { state: 'clock_skew_fault', opener: evidence, skewMs },
+    );
   }
   // 9. Clean-entry window — 0 ≤ age ≤ W (age ≥ 0 is guaranteed by step 8).
   const openerAgeMs = detectedAtMs - openerMs;
-  if (openerAgeMs > cleanEntryWindowMs) return { state: 'stale_entry', opener: evidence, openerAgeMs };
+  if (openerAgeMs > cleanEntryWindowMs) return seal({ state: 'stale_entry', opener: evidence, openerAgeMs });
 
-  return { state: 'eligible', opener: evidence, openerAgeMs };
+  return seal({ state: 'eligible', opener: evidence, openerAgeMs });
 }
 
 /**
