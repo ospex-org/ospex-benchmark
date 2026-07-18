@@ -29,8 +29,9 @@ import type { BaselineDecision, GameBundle, SlateBundle } from './types.js';
  * default policy.
  *
  * The default stamped on NEW runs stays v0.2 (the current fixed three-market
- * smoke/watch path); a dynamic cohort requires v0.3 — its boot/runtime gate is
- * a separate S3 slice.
+ * smoke/watch path); a dynamic (line-open) cohort requires a scoped-capable
+ * version (v0.3), enforced at boot by `supportsScopedInput` (the dynamic-cohort
+ * gate) because a per-market fire can carry a single market.
  *
  * The scorer re-derives baselines under the RECORDED policy version, so
  * archived runs keep verifying byte-for-byte as newer versions ship.
@@ -52,23 +53,43 @@ export function isBaselinePolicyVersion(value: string): value is BaselinePolicyV
 /** The market blocks a full-board policy (v0.1/v0.2) requires on every game. */
 const FULL_BOARD_MARKETS = ['moneyline', 'runLine', 'total'] as const;
 
+/**
+ * The single source of truth for each baseline policy's INPUT SHAPE:
+ * - `full-board` — defined over the fixed three-market board; rejects a scoped
+ *   (1–2-market) input and fails closed (v0.1/v0.2).
+ * - `scoped` — derives baselines from the present-market subset, so it accepts a
+ *   scoped input as well as a full board (v0.3).
+ *
+ * The `Record` is exhaustive over `BaselinePolicyVersion`, so a NEW version cannot
+ * compile without an explicit classification here — scoped capability is stated
+ * POSITIVELY and fails closed, never inferred from absence in a negative list.
+ * Both the runtime full-board guard (`FULL_BOARD_POLICIES`, below) and the boot
+ * gate's `supportsScopedInput` derive from this one table, so they can never drift.
+ */
+const BASELINE_INPUT_SHAPE: Record<BaselinePolicyVersion, 'full-board' | 'scoped'> = {
+  'baselines-v0.1.0': 'full-board',
+  'baselines-v0.2.0': 'full-board',
+  'baselines-v0.3.0': 'scoped',
+};
+
 /** Policies defined over the fixed three-market board; they reject scoped input. */
-const FULL_BOARD_POLICIES = new Set<BaselinePolicyVersion>([
-  'baselines-v0.1.0',
-  'baselines-v0.2.0',
-]);
+const FULL_BOARD_POLICIES = new Set<BaselinePolicyVersion>(
+  BASELINE_POLICY_VERSIONS.filter((v) => BASELINE_INPUT_SHAPE[v] === 'full-board'),
+);
 
 /**
- * Whether a baseline policy version is a FULL-BOARD policy — one defined over the
- * fixed three-market board that fails closed on a scoped (1–2-market) input
- * (v0.1/v0.2). The scoped policy v0.3 is NOT full-board. The dynamic-cohort boot
- * gate uses this to refuse a scoped cohort that declares a full-board baseline
- * policy (SPEC-prepared-request.md §3): such a cohort's games carry 1–2 markets,
- * on which a full-board policy would throw. Any future scoped-capable version is
- * accepted by returning false, so the gate stays version-agnostic.
+ * Whether a baseline policy version can derive from a SCOPED (1–2-market) input —
+ * the capability a dynamic cohort requires. A `CohortManifestV1` governs the
+ * per-market, no-wait line-open runner: each `(gameId, market)` fires independently
+ * and a dispatch may carry a single market, so EVERY such cohort produces scoped
+ * fires regardless of how many markets its policy enables. The dynamic-cohort boot
+ * gate refuses a manifest whose baseline policy is not scoped-capable
+ * (SPEC-prepared-request.md §3, §5-S3). Positive and fail-closed: only a version
+ * explicitly classified `scoped` qualifies (today v0.3); v0.1/v0.2 and any
+ * unclassified/cast value do not.
  */
-export function isFullBoardBaselinePolicy(version: BaselinePolicyVersion): boolean {
-  return FULL_BOARD_POLICIES.has(version);
+export function supportsScopedInput(version: BaselinePolicyVersion): boolean {
+  return BASELINE_INPUT_SHAPE[version] === 'scoped';
 }
 
 /**

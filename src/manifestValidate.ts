@@ -1,6 +1,6 @@
 import type { CohortManifestV1 } from './manifest.js';
-import { isFullBoardCohort, isMarketPolicyVersion, marketPolicyDigest } from './marketPolicy.js';
-import { isBaselinePolicyVersion, isFullBoardBaselinePolicy } from './baselines.js';
+import { isMarketPolicyVersion, marketPolicyDigest } from './marketPolicy.js';
+import { isBaselinePolicyVersion, supportsScopedInput } from './baselines.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 
@@ -39,24 +39,25 @@ export function validateManifestAgainstCode(manifest: CohortManifestV1): string[
   }
 
   // Baseline policy: known version (baselines carry no digest concept), then the
-  // dynamic-cohort coupling. A cohort whose effective board (sportAllowList ×
-  // market policy) is SCOPED produces games carrying 1–2 markets, on which a
-  // full-board baseline policy (v0.1/v0.2) fails closed — so such a cohort MUST
-  // declare the scoped policy baselines-v0.3.0 (SPEC-prepared-request.md §3, §5-S3;
-  // the runtime/scorer mirror this — a scoped artifact stamped v0.2 is refused).
-  // The coupling is checked only when BOTH versions are known (an unknown market
-  // policy version is already flagged above and would otherwise throw here).
+  // dynamic-cohort capability gate. A CohortManifestV1 governs the per-market,
+  // no-wait line-open runner: each (gameId, market) is an independent firing unit
+  // and a ready market never waits for a sibling (evidence spec §0, §3), so a
+  // dispatch carries only the markets ready and claimed at that instant — one, two,
+  // or three — regardless of how many the market policy enables. Every such cohort
+  // therefore produces SCOPED fires, on which a full-board baseline policy fails
+  // closed, so a dynamic cohort MUST declare a scoped-capable baseline policy
+  // (baselines-v0.3.0) — SPEC-prepared-request.md §3, §5-S3; the scorer mirrors this
+  // (a scoped artifact stamped v0.2 is refused). The gate reads baseline CAPABILITY
+  // (`supportsScopedInput`, a positive fail-closed classification), NEVER the market
+  // policy's enabled set — the policy's maximum board does not bound dispatch
+  // cardinality, so it can neither require nor relax this.
   if (!isBaselinePolicyVersion(manifest.baselinePolicyVersion)) {
     violations.push(`unknown baselinePolicyVersion "${manifest.baselinePolicyVersion}"`);
-  } else if (
-    isMarketPolicyVersion(manifest.marketPolicyVersion) &&
-    isFullBoardBaselinePolicy(manifest.baselinePolicyVersion) &&
-    !isFullBoardCohort(manifest.sportAllowList, manifest.marketPolicyVersion)
-  ) {
+  } else if (!supportsScopedInput(manifest.baselinePolicyVersion)) {
     violations.push(
-      `baselinePolicyVersion "${manifest.baselinePolicyVersion}" requires a full three-market board, ` +
-        `but this cohort's effective board (sportAllowList ${JSON.stringify(manifest.sportAllowList)} × ` +
-        `${manifest.marketPolicyVersion}) is scoped; a dynamic cohort requires baselines-v0.3.0`,
+      `baselinePolicyVersion "${manifest.baselinePolicyVersion}" is not scoped-capable, but a ` +
+        `line-open cohort fires markets independently (a dispatch may carry a single market); ` +
+        `a dynamic cohort requires a scoped-capable baseline policy (baselines-v0.3.0)`,
     );
   }
 

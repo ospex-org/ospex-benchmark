@@ -4,8 +4,8 @@ import {
   BASELINE_POLICY_VERSION,
   BASELINE_POLICY_VERSIONS,
   isBaselinePolicyVersion,
-  isFullBoardBaselinePolicy,
   runBaselines,
+  supportsScopedInput,
   type BaselinePolicyVersion,
 } from './baselines.js';
 import { makeRequest } from './testFactories.js';
@@ -146,12 +146,31 @@ test('version registry: known versions dispatch, unknown strings do not', () => 
   assert.ok(!isBaselinePolicyVersion(''));
 });
 
-test('isFullBoardBaselinePolicy: v0.1/v0.2 are full-board, v0.3 (scoped) is not', () => {
-  // The dynamic-cohort boot gate reads this predicate: full-board policies fail
-  // closed on scoped input, so a scoped cohort must NOT declare one.
-  assert.equal(isFullBoardBaselinePolicy('baselines-v0.1.0'), true);
-  assert.equal(isFullBoardBaselinePolicy('baselines-v0.2.0'), true);
-  assert.equal(isFullBoardBaselinePolicy('baselines-v0.3.0'), false);
+test('supportsScopedInput: only v0.3 is scoped-capable — positive and fail-closed', () => {
+  // The dynamic-cohort boot gate reads this predicate. Capability is POSITIVE: a
+  // version qualifies only if explicitly classified scoped-capable, never inferred
+  // from absence in a full-board list. v0.1/v0.2 fail closed on scoped input.
+  assert.equal(supportsScopedInput('baselines-v0.3.0'), true);
+  assert.equal(supportsScopedInput('baselines-v0.1.0'), false);
+  assert.equal(supportsScopedInput('baselines-v0.2.0'), false);
+  // Every known version is classified (the backing Record is exhaustive over
+  // BaselinePolicyVersion — a new version cannot compile without a classification),
+  // and capability is coherent with runtime: a version is scoped-capable IFF
+  // runBaselines does NOT fail closed on a scoped input under it.
+  const scopedGame = scopedSlate(['moneyline']);
+  for (const v of BASELINE_POLICY_VERSIONS) {
+    let rejectsScoped = false;
+    try {
+      runBaselines(scopedGame, v);
+    } catch {
+      rejectsScoped = true;
+    }
+    assert.equal(
+      supportsScopedInput(v),
+      !rejectsScoped,
+      `${v}: gate capability must match runtime scoped-input behavior`,
+    );
+  }
 });
 
 // --- S2: baseline version isolation (SPEC-prepared-request.md §3, §5-S2) ---

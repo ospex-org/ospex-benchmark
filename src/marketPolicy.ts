@@ -89,36 +89,6 @@ export function effectiveEnabled(
   return sportAllowList.includes(sport) && marketPolicyEnabled(sport, market, version);
 }
 
-/** The three response-side markets a full board carries (moneyline + run line + total). */
-const FULL_BOARD: readonly MarketKey[] = ['moneyline', 'spread', 'total'];
-
-/**
- * Whether a cohort's EFFECTIVE board is the full three-market board for EVERY
- * sport in its allow-list — i.e. every `(sport, market)` over the full board is
- * `effectiveEnabled`. A cohort that is NOT full-board is SCOPED: at least one
- * sport enables a proper subset of {moneyline, spread, total} (or none at all),
- * so its games carry 1–2 markets. A full-board baseline policy (baselines-v0.1/
- * v0.2) fails closed on such games, so a scoped cohort requires the scoped policy
- * baselines-v0.3.0 — the dynamic-cohort boot gate (SPEC-line-open-evidence-model.md
- * §3; SPEC-prepared-request.md §3). Under `market-policy-v1` MLB enables only
- * moneyline + total, so every MLB cohort is scoped; the full-board branch is
- * reachable only once a policy enumerates all three markets for a sport.
- *
- * Uses the same `effectiveEnabled` predicate that governs runtime dispatch and
- * finalization (evidence spec §3), so the boot-time scope decision can never
- * diverge from what actually enters. The manifest schema guarantees a non-empty
- * allow-list, so a parsed manifest never reaches the vacuous "full board over
- * zero sports" case.
- */
-export function isFullBoardCohort(
-  sportAllowList: readonly string[],
-  version: MarketPolicyVersion = MARKET_POLICY_VERSION,
-): boolean {
-  return sportAllowList.every((sport) =>
-    FULL_BOARD.every((market) => effectiveEnabled(sportAllowList, sport, market, version)),
-  );
-}
-
 /**
  * The recomputed digest of a KNOWN policy version — the SHA-256 of the canonical
  * serialization of its allow-list. The manifest pins `marketPolicyDigest`; the

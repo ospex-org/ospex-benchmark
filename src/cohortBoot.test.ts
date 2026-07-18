@@ -44,10 +44,10 @@ function codeConsistentRaw(): Record<string, unknown> {
       approvedReportedModelIds: a.approvedReportedModelIds,
     })),
     toolInferenceConfigSha256: 'b'.repeat(64),
-    // MLB under market-policy-v1 is scoped (moneyline + total, run line OFF), so a
-    // code-consistent manifest must declare the scoped baseline policy; the
-    // full-board default (BASELINE_POLICY_VERSION = v0.2) is refused by the
-    // dynamic-cohort gate (see the boot-refusal test below).
+    // A line-open cohort fires markets independently (a dispatch may carry a single
+    // market), so a code-consistent manifest must declare a scoped-capable baseline
+    // policy; the full-board default (BASELINE_POLICY_VERSION = v0.2) is refused by
+    // the dynamic-cohort gate (see the boot-refusal test below).
     baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
@@ -117,15 +117,15 @@ test('a code-inconsistent manifest (wrong scoringPolicyVersion) fails boot', () 
   assert.ok(err.violations.some((v) => /scoringPolicyVersion/.test(v)), err.violations.join('; '));
 });
 
-test('a scoped cohort declaring a full-board baseline policy is refused (dynamic-cohort gate)', () => {
-  // The MLB fixture is scoped (market-policy-v1: moneyline + total), so the
-  // full-board default v0.2 must fail boot — the canonical gate refuses a manifest
-  // that would fail closed at the producers on a 2-market game.
+test('a cohort declaring a non-scoped-capable baseline policy is refused (dynamic-cohort gate)', () => {
+  // A line-open cohort fires markets independently, so the full-board default v0.2
+  // must fail boot — a single-market dispatch would fail closed under it. The gate
+  // refuses on baseline capability, not the market policy's enabled set.
   const err = assertBootError(() =>
     cohortBoot(req({ ...codeConsistentRaw(), baselinePolicyVersion: BASELINE_POLICY_VERSION })),
   );
   assert.ok(
-    err.violations.some((v) => /requires a full three-market board.*is scoped.*requires baselines-v0\.3\.0/.test(v)),
+    err.violations.some((v) => /not scoped-capable.*requires a scoped-capable baseline policy \(baselines-v0\.3\.0\)/.test(v)),
     err.violations.join('; '),
   );
 });
