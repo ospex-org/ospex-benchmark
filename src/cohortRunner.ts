@@ -11,7 +11,7 @@ import type { ArtifactSink } from './lineOpenArtifactSink.js';
 import type { ClaimOutcome, ClaimPort, DispatchPermit } from './lineOpenClaim.js';
 import type { PublicationVerified } from './manifestPublication.js';
 import type { TwoSidedHistoryRow } from './oddsHistory.js';
-import type { RunEnvelope, SlateRunOptions } from './runner.js';
+import type { AttemptLifecyclePort, RunEnvelope, SlateRunOptions } from './runner.js';
 import type { AdmitDispatchRequest, ScopeKey, ScopeReservation } from './store/contract.js';
 import type { ArmSpec, CurrentOddsRow, GamesEndpointRow, MarketKey, ProviderAdapter } from './types.js';
 
@@ -76,30 +76,14 @@ export interface StatusSink {
 }
 
 /**
- * One roster arm's per-attempt lease lifecycle (SPEC §4). The real store-backed
- * implementation releases each arm's initial slot the moment its HTTP attempt settles or
- * is skipped, and acquires/releases one fresh repair lease around a repair request; it is
- * wired INTO the dispatch loop by the store-choreographer/loop slices. Designed here so
- * the canonical `FireFn` requires a permit-bearing lifecycle from the start.
+ * The per-arm attempt-lease lifecycle now lives with the dispatch executor that drives it at
+ * the HTTP boundaries (`runner.ts`); it is re-exported here so the runner's seam set stays
+ * discoverable in one place. The canonical `FireFn` threads it into `runSlate`, which
+ * releases each initial lease as its arm settles and sends a repair only under a
+ * freshly-acquired lease.
  */
-export interface AttemptLifecyclePort {
-  releaseInitial(armIndex: number): Promise<void>;
-  acquireRepair(armIndex: number, repairOrdinal: number): Promise<{ authorized: boolean }>;
-  releaseRepair(armIndex: number, repairOrdinal: number): Promise<void>;
-}
-
-/** A no-I/O lifecycle for the skeleton + pure tests; replaced by the store-backed one. */
-export class NoopAttemptLifecycle implements AttemptLifecyclePort {
-  releaseInitial(): Promise<void> {
-    return Promise.resolve();
-  }
-  acquireRepair(): Promise<{ authorized: boolean }> {
-    return Promise.resolve({ authorized: false });
-  }
-  releaseRepair(): Promise<void> {
-    return Promise.resolve();
-  }
-}
+export type { AttemptLifecyclePort } from './runner.js';
+export { NoopAttemptLifecycle } from './runner.js';
 
 /** One scoped market's prepared detection + history context (from detect/read seams). */
 export interface PreparedScopedMarket {
@@ -134,14 +118,19 @@ export interface PreparedFire {
   runOptions: SlateRunOptions;
 }
 
-/** The fire seam: launch the roster under a permit and produce the fire artifact. The
- *  run id is DERIVED from the fire id inside the executor (never passed in), so a fire
- *  artifact can never carry a run id incoherent with its fire id. */
+/**
+ * The fire seam: launch the roster under a permit and produce the fire artifact. The permit
+ * IS the authority — the fire id, run id (a domain-separated digest of it), and every
+ * authorizing dimension are taken from / bound to the permit, never a separately-passed id,
+ * so a fire artifact can never describe a fire the durable admission did not authorize. The
+ * lifecycle is threaded into the dispatch executor so leases are released / acquired at the
+ * actual HTTP boundaries.
+ */
 export interface FireFn {
   fire(
     permit: DispatchPermit,
     fire: PreparedFire,
-    ids: { fireId: string },
+    lifecycle: AttemptLifecyclePort,
   ): Promise<{ env: RunEnvelope; artifact: FireArtifactV1 }>;
 }
 
@@ -210,20 +199,27 @@ export function deriveRunId(fireId: string): string {
  * shared `runSlate`, assembles the `FireContext` (binding each scoped market's claim to
  * this fire), and produces the branded `FireArtifactV1`. For this slice the retained scope
  * equals the proposed scope (full claim); the partial-claim projection from
- * `permit.claimedKeys` is a store-choreographer concern.
+ * `permit.claimedKeys` is a later durable-store-integration concern.
  */
 export class LineOpenFireFn implements FireFn {
   async fire(
     permit: DispatchPermit,
     fire: PreparedFire,
-    ids: { fireId: string },
+    lifecycle: AttemptLifecyclePort,
   ): Promise<{ env: RunEnvelope; artifact: FireArtifactV1 }> {
+    // PRE-DISPATCH AUTHORITY: authenticate the permit and bind EVERY authorizing dimension to
+    // the exact snapshot about to be fired, BEFORE any model adapter is touched. No call is
+    // made unless the permit authorizes this exact cohort, game, scope, request bytes, and a
+    // full-roster unique-live initial-lease bijection.
     assertDispatchPermit(permit);
-    const runId = deriveRunId(ids.fireId); // derived here → always coherent with the fire id
-    const env = await runSlate(fire.arms, fire.adapters, [fire.request], fire.runOptions);
+    bindPermitToFire(permit, fire);
+    const fireId = permit.fireId; // the permit is the authority; there is no separate fire id
+    const runId = deriveRunId(fireId);
+    const dispatchOptions: SlateRunOptions = { ...fire.runOptions, lifecycle };
+    const env = await runSlate(fire.arms, fire.adapters, [fire.request], dispatchOptions);
     const ctx: FireContext = {
       booted: fire.booted,
-      fireId: ids.fireId,
+      fireId,
       runId,
       publication: fire.publication,
       bundleBuiltAt: fire.bundleBuiltAt,
@@ -232,11 +228,65 @@ export class LineOpenFireFn implements FireFn {
         verdict: m.verdict,
         historyRows: m.historyRows,
         historyWatermark: m.historyWatermark,
-        claim: { cohortId: permit.cohortId, fireId: ids.fireId, gameId: fire.gameId, market: m.candidateInput.market },
+        claim: { cohortId: permit.cohortId, fireId, gameId: fire.gameId, market: m.candidateInput.market },
       })),
     };
     const artifact = buildFireArtifact(env, ctx);
     return { env, artifact };
+  }
+}
+
+/** The scoped markets present on the request bundle's one game, canonical order (bundle
+ *  `runLine` is the `spread` MarketKey). */
+function presentRequestMarkets(fire: PreparedFire): MarketKey[] {
+  const m = fire.request.game.markets;
+  const scope: MarketKey[] = [];
+  if (m.moneyline != null) scope.push('moneyline');
+  if (m.runLine != null) scope.push('spread');
+  if (m.total != null) scope.push('total');
+  return scope.sort((a, b) => MARKET_ORDINAL[a] - MARKET_ORDINAL[b]);
+}
+
+function sameMarkets(a: readonly MarketKey[], b: readonly MarketKey[]): boolean {
+  return a.length === b.length && a.every((m, i) => m === b[i]);
+}
+
+/** Every authorizing dimension must agree with the exact snapshot to be dispatched, and the
+ *  initial leases must be a unique live bijection over the roster arm indexes — else no call
+ *  is made. This slice fires a FULL claim: a partial/mismatched claimed scope is refused
+ *  here (a retained-subset projection is a later slice). */
+function bindPermitToFire(permit: DispatchPermit, fire: PreparedFire): void {
+  if (permit.cohortId !== fire.booted.cohortId) {
+    throw new Error('dispatch permit does not authorize this cohort');
+  }
+  if (permit.gameId !== fire.gameId || fire.request.game.gameId !== fire.gameId) {
+    throw new Error('dispatch permit does not authorize this game');
+  }
+  const claimed = [...permit.claimedKeys.map((k) => k.market)].sort((x, y) => MARKET_ORDINAL[x] - MARKET_ORDINAL[y]);
+  const present = presentRequestMarkets(fire);
+  const proposed = canonicalMarkets(fire.proposedMarkets);
+  if (!sameMarkets(claimed, present) || !sameMarkets(claimed, proposed)) {
+    throw new Error('dispatch permit claimed scope does not equal the dispatched request scope');
+  }
+  // Recompute the digest of the EXACT bundle to dispatch — never the stored, possibly-stale
+  // requestSha256 field — and require it equals what the permit authorized. A request mutated
+  // during the awaited admission no longer matches, so no adapter is called.
+  const dispatchedDigest = sha256Hex(canonicalize(fire.request.requestBundle));
+  if (dispatchedDigest !== permit.preparedBytesDigest) {
+    throw new Error('the request to dispatch does not match the digest the permit authorized');
+  }
+  const rosterSize = fire.arms.length;
+  if (permit.initialLeases.length !== rosterSize) {
+    throw new Error(`dispatch permit must carry one initial lease per roster arm (${rosterSize}), got ${permit.initialLeases.length}`);
+  }
+  const seen = new Set<number>();
+  for (const lease of permit.initialLeases) {
+    if (lease.state !== 'live') throw new Error(`initial lease for arm ${lease.armIndex} is not live`);
+    if (!Number.isInteger(lease.armIndex) || lease.armIndex < 0 || lease.armIndex >= rosterSize) {
+      throw new Error(`initial lease arm index ${lease.armIndex} is outside [0, ${rosterSize})`);
+    }
+    if (seen.has(lease.armIndex)) throw new Error(`duplicate initial lease for arm index ${lease.armIndex}`);
+    seen.add(lease.armIndex);
   }
 }
 
@@ -272,6 +322,11 @@ export async function runOneFire(fire: PreparedFire, deps: FireDeps): Promise<Fi
       );
     }
   }
+  // CAPTURE the authorized digest from the exact request bundle BEFORE the store await (never
+  // the stored, possibly-stale requestSha256 field): this is the byte-authority the durable
+  // admission pins. The fire executor RE-COMPUTES it at dispatch and refuses if it no longer
+  // matches, so a request mutated during the awaited admission fires nothing.
+  const authorizedDigest = sha256Hex(canonicalize(fire.request.requestBundle));
   const fireId = deriveFireId({
     cohortId,
     gameId: fire.gameId,
@@ -283,7 +338,7 @@ export async function runOneFire(fire: PreparedFire, deps: FireDeps): Promise<Fi
   const scopeKey = markets.join('+') as ScopeKey;
   const reservation: ScopeReservation = {
     spendReservationUsdMicros: deps.spendReservationUsdMicros,
-    preparedBytesDigest: fire.request.requestSha256,
+    preparedBytesDigest: authorizedDigest,
   };
   const req: AdmitDispatchRequest = {
     cohortId,
@@ -299,10 +354,15 @@ export async function runOneFire(fire: PreparedFire, deps: FireDeps): Promise<Fi
   if (outcome.kind !== 'Authorized') return { fired: false, outcome };
 
   const { permit } = outcome;
-  const { artifact } = await deps.fireFn.fire(permit, fire, { fireId });
-  // Release each arm's initial lease as the fire settles. The real store-backed lifecycle
-  // releases per-arm inside dispatch; here the seam is threaded end-to-end.
-  for (const lease of permit.initialLeases) await deps.lifecycle.releaseInitial(lease.armIndex);
+  // The durable admission must have authorized exactly the fire we requested; a permit for a
+  // different fire id never dispatches.
+  if (permit.fireId !== fireId) {
+    return { fired: false, outcome: { kind: 'Fault', reason: 'admission returned a permit for a different fire id' } };
+  }
+  // The fire executor binds every authorizing dimension (incl. the request digest) before any
+  // model call, and threads the lifecycle into dispatch, which releases each arm's initial
+  // lease at the HTTP boundary (no post-roster release loop).
+  const { artifact } = await deps.fireFn.fire(permit, fire, deps.lifecycle);
   const { path } = deps.artifactSink.write(permit, artifact);
   return { fired: true, outcome, path, artifact };
 }

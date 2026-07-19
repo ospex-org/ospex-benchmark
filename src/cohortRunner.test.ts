@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { test } from 'node:test';
+import { canonicalize, sha256Hex } from './canonical.js';
 import {
   LineOpenFireFn,
   NoopAttemptLifecycle,
@@ -10,56 +11,93 @@ import {
   deriveRunId,
   runOneFire,
 } from './cohortRunner.js';
-import type { FireDeps, PreparedFire } from './cohortRunner.js';
+import type { AttemptLifecyclePort, FireDeps, PreparedFire } from './cohortRunner.js';
+import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import { parseFireArtifactV1, verifyFireArtifactReplay } from './fireArtifactWriter.js';
-import { LineOpenArtifactSink } from './lineOpenArtifactSink.js';
+import { LineOpenArtifactSink, nodeArtifactFs } from './lineOpenArtifactSink.js';
+import type { ArtifactFs } from './lineOpenArtifactSink.js';
 import { RehearsalClaimPort, StoreClaimPort, assertDispatchPermit } from './lineOpenClaim.js';
 import type { DispatchPermit } from './lineOpenClaim.js';
+import { runSlate } from './runner.js';
 import { SqlAtomicStore } from './store/atomicStore.js';
 import type { StoreQuery } from './store/atomicStore.js';
-import type { AdmitDispatchRequest } from './store/contract.js';
-import { LINE_OPEN_ARMS, LINE_OPEN_GAME_ID, prepareLineOpenFire } from './testFactories.js';
-import type { MarketKey } from './types.js';
+import type { AdmitDispatchRequest, ScopeKey, ScopeReservation } from './store/contract.js';
+import { LINE_OPEN_ARMS, LINE_OPEN_GAME_ID, lineOpenScopedResponse, prepareLineOpenFire } from './testFactories.js';
+import type { ArmSpec, MarketKey, ProviderAdapter, ProviderResponse } from './types.js';
 
 /**
  * The line-open runner walking skeleton (SPEC §3/§4/§5): the claim → fire → produce →
- * persist spine, proven end-to-end for one prepared, already-eligible fire through the
- * real store adapter (scripted `admitted` executor), the real `runSlate`, the real
- * `buildFireArtifact`, and the atomic no-clobber sink. Plus the frozen acceptance teeth:
- * rehearsal cannot mint a permit or write an artifact; the sink is permit-gated,
- * atomic/no-clobber, base64url-safe; and the fire id is the pre-admit anchor.
+ * persist spine, plus the pre-dispatch-authority, attempt-lifecycle, and durable-install
+ * guarantees. Every test drives real code — the store adapter (a scripted admitting
+ * executor), the real runSlate, buildFireArtifact, and the atomic sink.
  */
 
-/** A scripted store executor that admits every dispatch (the DB is exercised for real by
- *  the store conformance gate; here the adapter's mapping is what matters). */
+const LEASE_EXPIRES_AT = '2026-07-18T12:10:00.000Z';
+const TMP_PREFIX = join(tmpdir(), 'line-open-sink-');
+
+/** A scripted store executor that admits every dispatch with a valid full-roster lease
+ *  bijection (the DB itself is proven by the store conformance gate). */
 function admittedStoreQuery(rosterSize: number): StoreQuery {
+  return admittedStoreQueryWith(rosterSize, (n) =>
+    Array.from({ length: n }, (_, i) => ({ leaseId: `lease-${i}`, armIndex: i, expiresAt: LEASE_EXPIRES_AT, state: 'live' })),
+  );
+}
+
+/** As above, but with caller-chosen initial leases (for lease-bijection failure tests). */
+function admittedStoreQueryWith(
+  rosterSize: number,
+  leases: (rosterSize: number) => unknown[],
+): StoreQuery {
   return (sql, params) => {
     if (!sql.includes('admit_dispatch')) throw new Error(`unexpected store call in fixture: ${sql}`);
     const gameId = params[4] as string;
     const proposedMarkets = JSON.parse(params[5] as string) as MarketKey[];
     const scope = JSON.parse(params[6] as string) as Record<string, { spend: number; digest: string }>;
-    const scopeKey = proposedMarkets.join('+');
     const r = {
       outcome: 'admitted',
       claimedKeys: proposedMarkets.map((market) => ({ gameId, market })),
-      preparedBytesDigest: scope[scopeKey]?.digest ?? 'f'.repeat(64),
-      initialLeases: Array.from({ length: rosterSize }, (_, i) => ({
-        leaseId: `lease-${i}`,
-        armIndex: i,
-        expiresAt: '2026-07-18T12:10:00.000Z',
-        state: 'live',
-      })),
+      preparedBytesDigest: scope[proposedMarkets.join('+')]?.digest ?? 'f'.repeat(64),
+      initialLeases: leases(rosterSize),
       dispatchAuthorized: true,
     };
     return Promise.resolve([{ r }]);
   };
 }
 
+function requestDigest(fire: PreparedFire): string {
+  return sha256Hex(canonicalize(fire.request.requestBundle));
+}
+
+/** A valid admit request for `fire`, with optional field overrides for authority tests. */
+function admitReqFor(fire: PreparedFire, overrides: Partial<AdmitDispatchRequest> = {}): AdmitDispatchRequest {
+  const markets: MarketKey[] = [...fire.proposedMarkets];
+  const cohortId = overrides.cohortId ?? fire.booted.cohortId;
+  const proposedMarkets = overrides.proposedMarkets ?? markets;
+  const scopeKey = [...proposedMarkets].join('+') as ScopeKey;
+  const reservation: ScopeReservation = { spendReservationUsdMicros: 1_000, preparedBytesDigest: requestDigest(fire) };
+  return {
+    cohortId,
+    fireId: deriveFireId({ cohortId, gameId: fire.gameId, proposedMarkets, detectedAt: fire.detectedAt, preparedSnapshotDigest: fire.preparedSnapshotDigest }),
+    ownerId: 'owner-test',
+    expectedSchemaVersion: 1,
+    gameId: fire.gameId,
+    proposedMarkets,
+    scopeReservations: { [scopeKey]: reservation } as Readonly<Partial<Record<ScopeKey, ScopeReservation>>>,
+    ...overrides,
+  };
+}
+
+async function mintPermit(store: StoreClaimPort, req: AdmitDispatchRequest): Promise<DispatchPermit> {
+  const outcome = await store.admit(req);
+  assert.equal(outcome.kind, 'Authorized', `expected an admitted permit, got ${outcome.kind}`);
+  return (outcome as { permit: DispatchPermit }).permit;
+}
+
 function storeDeps(overrides: Partial<FireDeps> = {}): FireDeps {
   return {
     claimPort: new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length))),
     fireFn: new LineOpenFireFn(),
-    artifactSink: new LineOpenArtifactSink(mkdtempSync(join(tmpdir(), 'f5a-'))),
+    artifactSink: new LineOpenArtifactSink(mkdtempSync(TMP_PREFIX)),
     lifecycle: new NoopAttemptLifecycle(),
     ownerId: 'owner-test',
     storeSchemaVersion: 1,
@@ -68,10 +106,31 @@ function storeDeps(overrides: Partial<FireDeps> = {}): FireDeps {
   };
 }
 
+function sinkDir(deps: FireDeps): string {
+  return (deps.artifactSink as unknown as { baseDir: string }).baseDir;
+}
+
 function cleanup(deps: FireDeps): void {
-  const sink = deps.artifactSink as LineOpenArtifactSink;
-  const dir = (sink as unknown as { baseDir: string }).baseDir;
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(sinkDir(deps), { recursive: true, force: true });
+}
+
+/** Wrap a fire's adapters so every model call is counted (for zero-call assertions). */
+function withCallCounter(fire: PreparedFire): { fire: PreparedFire; calls: () => number } {
+  let count = 0;
+  const adapters = new Map<string, ProviderAdapter>();
+  for (const [id, a] of fire.adapters) {
+    adapters.set(id, {
+      provider: a.provider,
+      requestedModelId: a.requestedModelId,
+      credentialEnvVar: a.credentialEnvVar,
+      hasCredential: a.hasCredential,
+      chat: (...args: Parameters<ProviderAdapter['chat']>) => {
+        count += 1;
+        return a.chat(...args);
+      },
+    });
+  }
+  return { fire: { ...fire, adapters }, calls: () => count };
 }
 
 // --- walking skeleton: one fire, end-to-end ---------------------------------
@@ -84,14 +143,13 @@ test('a 2-market fire runs claim → fire → produce → persist and installs a
     assert.equal(result.fired, true);
     assert.equal(result.outcome.kind, 'Authorized');
     assert.ok(result.path && existsSync(result.path));
-    // The persisted file is self-verifying from its own bytes.
     const reloaded = parseFireArtifactV1(readFileSync(result.path!, 'utf8'));
     assert.deepEqual(verifyFireArtifactReplay(reloaded), []);
     assert.deepEqual(reloaded.scopedMarkets, ['moneyline', 'total']);
     assert.equal(reloaded.gameId, LINE_OPEN_GAME_ID);
     assert.equal(reloaded.arms.length, LINE_OPEN_ARMS.length);
     // The stub roster's responses re-validate, so every arm is a valid terminal outcome —
-    // this exercises the valid-arm accepted-body re-validation path (not just non-valid arms).
+    // exercising the valid-arm accepted-body re-validation path.
     assert.ok(reloaded.arms.every((a) => a.terminalOutcome === 'valid'));
   } finally {
     cleanup(deps);
@@ -112,7 +170,7 @@ test('a 1-market (moneyline-only) fire persists a replay-clean single-market art
   }
 });
 
-// --- frozen tooth: rehearsal cannot mint a permit or write an artifact -------
+// --- rehearsal cannot mint a permit or write an artifact --------------------
 
 test('a rehearsal claim never admits, fires nothing, and writes no artifact', async () => {
   const { fire } = prepareLineOpenFire(['moneyline', 'total']);
@@ -123,95 +181,300 @@ test('a rehearsal claim never admits, fires nothing, and writes no artifact', as
     assert.equal(result.outcome.kind, 'WouldAdmit');
     assert.equal(result.path, undefined);
     assert.equal(result.artifact, undefined);
-    const dir = (deps.artifactSink as unknown as { baseDir: string }).baseDir;
-    assert.deepEqual(readdirSync(dir), []); // nothing installed
+    assert.deepEqual(readdirSync(sinkDir(deps)), []);
   } finally {
     cleanup(deps);
   }
 });
 
 test('a dispatch permit cannot be forged by a structural copy', () => {
-  const forged = {
-    cohortId: 'x',
-    fireId: 'y',
-    gameId: 'z',
-    claimedKeys: [],
-    preparedBytesDigest: 'f'.repeat(64),
-    initialLeases: [],
-  } as DispatchPermit;
+  const forged = { cohortId: 'x', fireId: 'y', gameId: 'z', claimedKeys: [], preparedBytesDigest: 'f'.repeat(64), initialLeases: [] } as DispatchPermit;
   assert.throws(() => assertDispatchPermit(forged), /not minted by a store admission/);
 });
 
-test('the sink refuses to install under a forged permit', async () => {
+test('a minted permit is deeply frozen — nested claimed keys and leases cannot be mutated', async () => {
   const { fire } = prepareLineOpenFire(['moneyline', 'total']);
-  const deps = storeDeps();
+  const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length)));
+  const permit = await mintPermit(store, admitReqFor(fire));
+  assert.throws(() => {
+    (permit.claimedKeys[0] as { market: string }).market = 'total';
+  });
+  assert.throws(() => {
+    (permit.initialLeases[0] as { state: string }).state = 'expired';
+  });
+  assert.equal(permit.claimedKeys[0]!.market, 'moneyline');
+  assert.equal(permit.initialLeases[0]!.state, 'live');
+});
+
+// --- pre-dispatch authority: a mismatched permit fires NOTHING --------------
+// Each case asserts ZERO model calls and no installed artifact: the executor binds every
+// authorizing dimension BEFORE any adapter is touched.
+
+async function assertNoDispatch(mint: (store: StoreClaimPort, fire: PreparedFire) => Promise<DispatchPermit>, message: RegExp): Promise<void> {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+  const counted = withCallCounter(fire);
+  const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length)));
+  const permit = await mint(store, fire);
+  await assert.rejects(() => new LineOpenFireFn().fire(permit, counted.fire, new NoopAttemptLifecycle()), message);
+  assert.equal(counted.calls(), 0, 'no model adapter may be called when the permit does not bind the fire');
+}
+
+test('a permit for a different cohort fires nothing', async () => {
+  await assertNoDispatch((store, fire) => mintPermit(store, admitReqFor(fire, { cohortId: 'a'.repeat(64) })), /does not authorize this cohort/);
+});
+
+test('a permit for a different game fires nothing', async () => {
+  await assertNoDispatch((store, fire) => mintPermit(store, admitReqFor(fire, { gameId: '00000000-0000-4000-8000-0000000000f2' })), /does not authorize this game/);
+});
+
+test('a permit for a different claimed scope fires nothing', async () => {
+  await assertNoDispatch((store, fire) => mintPermit(store, admitReqFor(fire, { proposedMarkets: ['moneyline'] })), /claimed scope does not equal/);
+});
+
+test('a permit whose authorized digest does not match the request fires nothing', async () => {
+  await assertNoDispatch(async (store, fire) => {
+    const req = admitReqFor(fire);
+    const wrong: AdmitDispatchRequest = {
+      ...req,
+      scopeReservations: { 'moneyline+total': { spendReservationUsdMicros: 1_000, preparedBytesDigest: 'a'.repeat(64) } },
+    };
+    return mintPermit(store, wrong);
+  }, /does not match the digest the permit authorized/);
+});
+
+test('a permit with a broken initial-lease bijection fires nothing', async () => {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+  const counted = withCallCounter(fire);
+  // One fewer lease than the roster.
+  const store = new StoreClaimPort(
+    new SqlAtomicStore(admittedStoreQueryWith(LINE_OPEN_ARMS.length, (n) =>
+      Array.from({ length: n - 1 }, (_, i) => ({ leaseId: `lease-${i}`, armIndex: i, expiresAt: LEASE_EXPIRES_AT, state: 'live' })),
+    )),
+  );
+  const permit = await mintPermit(store, admitReqFor(fire));
+  await assert.rejects(() => new LineOpenFireFn().fire(permit, counted.fire, new NoopAttemptLifecycle()), /one initial lease per roster arm/);
+  assert.equal(counted.calls(), 0);
+});
+
+test('a request mutated during the awaited admission fires nothing and installs no artifact', async () => {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+  const counted = withCallCounter(fire);
+  const deps = storeDeps({
+    claimPort: {
+      // A hostile claim port: it mutates the caller-owned request during admission, then
+      // returns a genuine permit for the ORIGINAL (pre-mutation) authorized digest. The
+      // executor re-verifies the digest at dispatch and refuses.
+      admit: async (req: AdmitDispatchRequest) => {
+        const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length)));
+        const outcome = await store.admit(req);
+        (counted.fire.request.requestBundle.games[0]!.markets.moneyline as { awayDecimal: number }).awayDecimal = 9.99;
+        return outcome;
+      },
+    },
+  });
   try {
-    // Produce a genuine artifact, then try to install it with a forged permit.
-    const result = await runOneFire(fire, deps);
-    const forged = {
-      cohortId: result.artifact!.cohortId,
-      fireId: result.artifact!.fireId,
-      gameId: result.artifact!.gameId,
-      claimedKeys: result.artifact!.scopedMarkets.map((m) => ({ gameId: result.artifact!.gameId, market: m })),
-      preparedBytesDigest: 'f'.repeat(64),
-      initialLeases: [],
-    } as DispatchPermit;
-    assert.throws(() => deps.artifactSink.write(forged, result.artifact!), /not minted by a store admission/);
+    await assert.rejects(() => runOneFire(counted.fire, deps), /does not match the digest the permit authorized/);
+    assert.equal(counted.calls(), 0);
+    assert.deepEqual(readdirSync(sinkDir(deps)), []);
   } finally {
     cleanup(deps);
   }
 });
 
-// --- frozen tooth: atomic no-clobber sink -----------------------------------
+test('a permit for a different fire id is refused before dispatch (zero calls)', async () => {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+  const counted = withCallCounter(fire);
+  const deps = storeDeps({
+    claimPort: {
+      // Returns a genuine permit whose fire id is NOT the one runOneFire admitted with.
+      admit: async (req: AdmitDispatchRequest) => {
+        const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length)));
+        return store.admit({ ...req, fireId: 'a'.repeat(64) });
+      },
+    },
+  });
+  try {
+    const result = await runOneFire(counted.fire, deps);
+    assert.equal(result.fired, false);
+    assert.equal(result.outcome.kind, 'Fault');
+    assert.equal(counted.calls(), 0);
+  } finally {
+    cleanup(deps);
+  }
+});
+
+// --- attempt lifecycle at the HTTP boundary ---------------------------------
+
+function recordingLifecycle(opts: { authorized: boolean }): { lifecycle: AttemptLifecyclePort; log: string[] } {
+  const log: string[] = [];
+  return {
+    log,
+    lifecycle: {
+      releaseInitial: (i) => {
+        log.push(`releaseInitial:${i}`);
+        return Promise.resolve();
+      },
+      acquireRepair: (i, o) => {
+        log.push(`acquireRepair:${i}:${o}`);
+        return Promise.resolve({ authorized: opts.authorized });
+      },
+      releaseRepair: (i, o) => {
+        log.push(`releaseRepair:${i}:${o}`);
+        return Promise.resolve();
+      },
+    },
+  };
+}
+
+function scriptedAdapter(arm: ArmSpec, bodies: string[]): { adapter: ProviderAdapter; calls: () => number } {
+  let i = 0;
+  const response = (rawText: string): ProviderResponse => ({
+    rawText,
+    reportedModelId: arm.requestedModelId,
+    providerResponseId: 'stub',
+    httpStatus: 200,
+    usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+    usageRaw: {},
+    requestParams: {},
+  });
+  return {
+    calls: () => i,
+    adapter: {
+      provider: arm.provider,
+      requestedModelId: arm.requestedModelId,
+      credentialEnvVar: arm.credentialEnvVar,
+      hasCredential: () => true,
+      chat: () => {
+        const body = bodies[i];
+        i += 1;
+        if (body === undefined) throw new Error('scripted adapter exhausted');
+        return Promise.resolve(response(body));
+      },
+    },
+  };
+}
+
+test('with a lifecycle, each arm releases its initial lease exactly once', async () => {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+  const lc = recordingLifecycle({ authorized: false });
+  await runSlate(fire.arms, fire.adapters, [fire.request], { ...fire.runOptions, lifecycle: lc.lifecycle });
+  for (let i = 0; i < fire.arms.length; i += 1) {
+    assert.equal(lc.log.filter((l) => l === `releaseInitial:${i}`).length, 1, `arm ${i} releases its initial lease exactly once`);
+  }
+});
+
+test('a repair is sent only under an authorized lease, and its lease is released once', async () => {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+  const arm = fire.arms[0]!;
+  const valid = JSON.stringify(lineOpenScopedResponse(fire.request, arm, fire.booted.cohortId));
+  const invalid = JSON.stringify({ ...(JSON.parse(valid) as Record<string, unknown>), cohortId: 'wrong-cohort-echo' });
+
+  // Denied: acquireRepair returns false → the second HTTP request is never sent.
+  const denied = scriptedAdapter(arm, [invalid, valid]);
+  const deniedLc = recordingLifecycle({ authorized: false });
+  const r1 = await runSlate([arm], new Map([[arm.participantId, denied.adapter]]), [fire.request], { ...fire.runOptions, lifecycle: deniedLc.lifecycle });
+  assert.equal(denied.calls(), 1, 'a denied repair sends only the initial request');
+  assert.equal(r1.results[0]!.outcome, 'invalid_schema');
+  assert.deepEqual(deniedLc.log.filter((l) => l.startsWith('acquireRepair')), ['acquireRepair:0:1']);
+  assert.equal(deniedLc.log.filter((l) => l.startsWith('releaseRepair')).length, 0);
+  assert.equal(deniedLc.log.filter((l) => l === 'releaseInitial:0').length, 1);
+
+  // Authorized: acquireRepair returns true → the repair is sent and released exactly once.
+  const allowed = scriptedAdapter(arm, [invalid, valid]);
+  const allowedLc = recordingLifecycle({ authorized: true });
+  const r2 = await runSlate([arm], new Map([[arm.participantId, allowed.adapter]]), [fire.request], { ...fire.runOptions, lifecycle: allowedLc.lifecycle });
+  assert.equal(allowed.calls(), 2, 'an authorized repair sends the initial + the repair');
+  assert.equal(r2.results[0]!.outcome, 'valid');
+  assert.deepEqual(allowedLc.log.filter((l) => l.startsWith('acquireRepair')), ['acquireRepair:0:1']);
+  assert.deepEqual(allowedLc.log.filter((l) => l.startsWith('releaseRepair')), ['releaseRepair:0:1']);
+  assert.equal(allowedLc.log.filter((l) => l === 'releaseInitial:0').length, 1);
+});
+
+// --- durable, atomic, no-clobber sink ---------------------------------------
+
+async function genuineFire(): Promise<{ permit: DispatchPermit; artifact: FireArtifactV1; fire: PreparedFire }> {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+  const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length)));
+  const permit = await mintPermit(store, admitReqFor(fire));
+  const artifact = (await new LineOpenFireFn().fire(permit, fire, new NoopAttemptLifecycle())).artifact;
+  return { permit, artifact, fire };
+}
+
+function recordingFs(): { fs: ArtifactFs; ops: string[] } {
+  const ops: string[] = [];
+  const wrap =
+    <A extends unknown[], R>(name: string, fn: (...args: A) => R) =>
+    (...args: A): R => {
+      ops.push(name);
+      return fn(...args);
+    };
+  return {
+    ops,
+    fs: {
+      mkdirp: wrap('mkdirp', nodeArtifactFs.mkdirp),
+      openExclusive: wrap('open', nodeArtifactFs.openExclusive),
+      writeAll: wrap('writeAll', nodeArtifactFs.writeAll),
+      fsync: wrap('fsync', nodeArtifactFs.fsync),
+      close: wrap('close', nodeArtifactFs.close),
+      link: wrap('link', nodeArtifactFs.link),
+      syncDir: wrap('syncDir', nodeArtifactFs.syncDir),
+      readFileUtf8: wrap('readFile', nodeArtifactFs.readFileUtf8),
+      unlink: wrap('unlink', nodeArtifactFs.unlink),
+    },
+  };
+}
+
+test('the sink install order is complete-write → temp fsync → no-clobber install → directory fsync', async () => {
+  const dir = mkdtempSync(TMP_PREFIX);
+  try {
+    const { permit, artifact } = await genuineFire();
+    const { fs, ops } = recordingFs();
+    const sink = new LineOpenArtifactSink(dir, fs);
+    const { path } = sink.write(permit, artifact);
+    const order = ops.filter((o) => o === 'writeAll' || o === 'fsync' || o === 'link' || o === 'syncDir');
+    assert.deepEqual(order, ['writeAll', 'fsync', 'link', 'syncDir']);
+    // The complete bytes are on disk and self-verify.
+    const reloaded = parseFireArtifactV1(readFileSync(path, 'utf8'));
+    assert.deepEqual(verifyFireArtifactReplay(reloaded), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a directory-sync failure fails the install rather than reporting durable persistence', async () => {
+  const dir = mkdtempSync(TMP_PREFIX);
+  try {
+    const { permit, artifact } = await genuineFire();
+    const failingDirSync: ArtifactFs = { ...nodeArtifactFs, syncDir: () => { throw new Error('simulated directory sync failure'); } };
+    const sink = new LineOpenArtifactSink(dir, failingDirSync);
+    assert.throws(() => sink.write(permit, artifact), /simulated directory sync failure/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('installing the same artifact twice is idempotent; a byte-different collision fails loud', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'f5a-'));
+  const dir = mkdtempSync(TMP_PREFIX);
   const sink = new LineOpenArtifactSink(dir);
   const fireFn = new LineOpenFireFn();
   try {
     const { fire } = prepareLineOpenFire(['moneyline', 'total']);
-    const cohortId = fire.booted.cohortId;
-    const markets: MarketKey[] = ['moneyline', 'total'];
-    const fireId = deriveFireId({
-      cohortId,
-      gameId: fire.gameId,
-      proposedMarkets: markets,
-      detectedAt: fire.detectedAt,
-      preparedSnapshotDigest: fire.preparedSnapshotDigest,
-    });
-
-    // A genuine permit for this fire id (the store admits it).
     const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length)));
-    const outcome = await store.admit({
-      cohortId,
-      fireId,
-      ownerId: 'owner-test',
-      expectedSchemaVersion: 1,
-      gameId: fire.gameId,
-      proposedMarkets: markets,
-      scopeReservations: { 'moneyline+total': { spendReservationUsdMicros: 1_000, preparedBytesDigest: fire.request.requestSha256 } },
-    });
-    assert.equal(outcome.kind, 'Authorized');
-    const permit = (outcome as { permit: DispatchPermit }).permit;
+    const permit = await mintPermit(store, admitReqFor(fire));
 
-    // Same fire id, but a byte-different artifact (a later bundleBuiltAt is NOT part of the
-    // fire-id derivation, so it collides on the path yet differs in bytes).
-    const a = (await fireFn.fire(permit, fire, { fireId })).artifact;
-    const bFire: PreparedFire = { ...fire, bundleBuiltAt: '2026-07-18T12:00:59.000Z' };
-    const b = (await fireFn.fire(permit, bFire, { fireId })).artifact;
+    // Same permit (⇒ same fire id ⇒ same path), byte-different artifacts: a later bundleBuiltAt
+    // is not part of the fire-id derivation nor the request, so it collides on the path yet
+    // differs in bytes.
+    const a = (await fireFn.fire(permit, fire, new NoopAttemptLifecycle())).artifact;
+    const b = (await fireFn.fire(permit, { ...fire, bundleBuiltAt: '2026-07-18T12:00:59.000Z' }, new NoopAttemptLifecycle())).artifact;
 
     const first = sink.write(permit, a);
     assert.equal(first.created, true);
-    // Same bytes → idempotent completion retry.
     const retry = sink.write(permit, a);
     assert.equal(retry.created, false);
     assert.equal(retry.path, first.path);
-    // Different bytes at the same path → fail loud, never overwrite.
     assert.throws(() => sink.write(permit, b), /byte-different fire artifact already installed/);
-    // Exactly one file remains — the original.
-    const files = readdirSync(join(dir, cohortId));
-    assert.equal(files.length, 1);
-    assert.equal(readFileSync(first.path, 'utf8').length > 0, true);
+    assert.equal(readdirSync(join(dir, fire.booted.cohortId)).length, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -225,7 +488,6 @@ test('the path segment for a game id is base64url-encoded (an arbitrary id canno
     const name = basename(result.path!);
     const seg = Buffer.from(LINE_OPEN_GAME_ID, 'utf8').toString('base64url');
     assert.ok(name.startsWith(`fire-${seg}-`), `path uses the base64url game segment: ${name}`);
-    // base64url of any string — including a path traversal — carries no separators.
     const evil = Buffer.from('../../etc/passwd', 'utf8').toString('base64url');
     assert.equal(evil.includes('/'), false);
     assert.equal(evil.includes('.'), false);
@@ -234,79 +496,24 @@ test('the path segment for a game id is base64url-encoded (an arbitrary id canno
   }
 });
 
-// --- frozen tooth: the store claim port fails closed, never authorizes -------
-
-function validAdmitReq(): AdmitDispatchRequest {
-  return {
-    cohortId: 'a'.repeat(64),
-    fireId: 'b'.repeat(64),
-    ownerId: 'owner-test',
-    expectedSchemaVersion: 1,
-    gameId: LINE_OPEN_GAME_ID,
-    proposedMarkets: ['moneyline', 'total'],
-    scopeReservations: { 'moneyline+total': { spendReservationUsdMicros: 1_000, preparedBytesDigest: 'c'.repeat(64) } },
-  };
-}
+// --- store claim port fails closed, never authorizes ------------------------
 
 test('the store claim port faults (authorizes nothing) when the store throws', async () => {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
   const port = new StoreClaimPort(new SqlAtomicStore(() => Promise.reject(new Error('db unreachable'))));
-  const outcome = await port.admit(validAdmitReq());
+  const outcome = await port.admit(admitReqFor(fire));
   assert.equal(outcome.kind, 'Fault');
 });
 
 test('the store claim port faults (authorizes nothing) on a non-admitted result', async () => {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
   const refusing: StoreQuery = () => Promise.resolve([{ r: { outcome: 'refused', reason: 'all_claimed', dispatchAuthorized: false } }]);
   const port = new StoreClaimPort(new SqlAtomicStore(refusing));
-  const outcome = await port.admit(validAdmitReq());
+  const outcome = await port.admit(admitReqFor(fire));
   assert.equal(outcome.kind, 'Fault');
 });
 
-// --- frozen tooth: sink artifact <-> permit binding gates -------------------
-// The four binding gates (cohortId/fireId/gameId/scope) stop installing an artifact under
-// a permit minted for a DIFFERENT fire. cohortId/gameId/scope all feed the fire id, so for
-// a genuinely-produced artifact a mismatch in any of them also mismatches the fire id; the
-// fireId gate (checked after cohortId) and the cohortId gate (checked first) are the two
-// independently reachable here — the gameId/scope gates are subsumed defense-in-depth.
-
-function admitReqFor(fire: PreparedFire, cohortId: string): AdmitDispatchRequest {
-  const proposedMarkets: MarketKey[] = ['moneyline', 'total'];
-  return {
-    cohortId,
-    fireId: deriveFireId({ cohortId, gameId: fire.gameId, proposedMarkets, detectedAt: fire.detectedAt, preparedSnapshotDigest: fire.preparedSnapshotDigest }),
-    ownerId: 'owner-test',
-    expectedSchemaVersion: 1,
-    gameId: fire.gameId,
-    proposedMarkets,
-    scopeReservations: { 'moneyline+total': { spendReservationUsdMicros: 1_000, preparedBytesDigest: fire.request.requestSha256 } },
-  };
-}
-
-test('the sink refuses an artifact whose fireId or cohortId does not bind to the permit', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'f5a-'));
-  const sink = new LineOpenArtifactSink(dir);
-  const fireFn = new LineOpenFireFn();
-  const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length)));
-  try {
-    const { fire } = prepareLineOpenFire(['moneyline', 'total']);
-    const realCohort = fire.booted.cohortId;
-    const permit = ((await store.admit(admitReqFor(fire, realCohort))) as { permit: DispatchPermit }).permit;
-
-    // fireId gate: a genuine artifact carrying a fireId that is not the permit's.
-    const wrongFire = (await fireFn.fire(permit, fire, { fireId: 'a'.repeat(64) })).artifact;
-    assert.throws(() => sink.write(permit, wrongFire), /fireId does not match the dispatch permit/);
-
-    // cohortId gate: a genuine (real-cohort) artifact installed under a permit minted for a
-    // different cohort id.
-    const realFireId = admitReqFor(fire, realCohort).fireId;
-    const genuine = (await fireFn.fire(permit, fire, { fireId: realFireId })).artifact;
-    const otherPermit = ((await store.admit(admitReqFor(fire, 'b'.repeat(64)))) as { permit: DispatchPermit }).permit;
-    assert.throws(() => sink.write(otherPermit, genuine), /cohortId does not match the dispatch permit/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// --- frozen tooth: fire identity --------------------------------------------
+// --- fire identity ----------------------------------------------------------
 
 test('fireId is a deterministic pre-admit anchor over proposedMarkets, not retained scope', () => {
   const base = {
@@ -316,17 +523,13 @@ test('fireId is a deterministic pre-admit anchor over proposedMarkets, not retai
     detectedAt: '2026-07-18T12:00:30.000Z',
     preparedSnapshotDigest: 'b'.repeat(64),
   };
-  // Deterministic + canonical-order-insensitive on the same set.
   assert.equal(deriveFireId(base), deriveFireId({ ...base, proposedMarkets: ['total', 'moneyline'] }));
   assert.match(deriveFireId(base), /^[0-9a-f]{64}$/);
-  // Every identity operand is load-bearing: a different cohort, game, detection instant,
-  // market set, or snapshot digest → a different id.
   assert.notEqual(deriveFireId(base), deriveFireId({ ...base, cohortId: 'd'.repeat(64) }));
   assert.notEqual(deriveFireId(base), deriveFireId({ ...base, gameId: '00000000-0000-4000-8000-0000000000f2' }));
   assert.notEqual(deriveFireId(base), deriveFireId({ ...base, detectedAt: '2026-07-18T12:00:31.000Z' }));
   assert.notEqual(deriveFireId(base), deriveFireId({ ...base, proposedMarkets: ['moneyline'] }));
   assert.notEqual(deriveFireId(base), deriveFireId({ ...base, preparedSnapshotDigest: 'c'.repeat(64) }));
-  // runId is a domain-separated digest of the fire id (never equal to it, deterministic).
   const fid = deriveFireId(base);
   assert.match(deriveRunId(fid), /^[0-9a-f]{64}$/);
   assert.notEqual(deriveRunId(fid), fid);

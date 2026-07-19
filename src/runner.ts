@@ -228,9 +228,46 @@ export function sealDispatch(prepared: readonly PreparedGameRequest[]): Dispatch
   return snapshot;
 }
 
+/**
+ * One roster arm's per-attempt concurrency-lease lifecycle (SPEC-line-open-evidence-model.md
+ * §4), driven by the dispatch executor at the actual HTTP boundaries: each arm's initial
+ * lease is released the moment its initial attempt settles or is skipped, and a repair
+ * acquires one fresh lease immediately before its request (no lease → no repair) and
+ * releases it when the repair settles. `runSlate` calls these; the canonical runner injects
+ * a store-backed implementation, the legacy paths inject nothing (no gating, unchanged).
+ * The leases are keyed by the stable manifest arm index.
+ */
+export interface AttemptLifecyclePort {
+  releaseInitial(armIndex: number): Promise<void>;
+  acquireRepair(armIndex: number, repairOrdinal: number): Promise<{ authorized: boolean }>;
+  releaseRepair(armIndex: number, repairOrdinal: number): Promise<void>;
+}
+
+/** A no-I/O lifecycle: releases are no-ops and a repair is never leased (so a runner that
+ *  cannot grant a durable repair lease sends no repair). Used by the skeleton + pure tests
+ *  until the store-backed lifecycle is wired. */
+export class NoopAttemptLifecycle implements AttemptLifecyclePort {
+  releaseInitial(): Promise<void> {
+    return Promise.resolve();
+  }
+  acquireRepair(): Promise<{ authorized: boolean }> {
+    return Promise.resolve({ authorized: false });
+  }
+  releaseRepair(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
 export interface SlateRunOptions {
   cohortId: string;
   timeoutMs: number;
+  /**
+   * Optional per-arm attempt-lease lifecycle, driven at the initial/repair HTTP boundaries
+   * of `runOneArmGame`. When omitted (legacy watcher / smoke), no lease call is made and the
+   * repair path is ungated — behaviour is unchanged. When supplied, the initial lease is
+   * released as each arm settles and a repair is sent only if a fresh lease is authorized.
+   */
+  lifecycle?: AttemptLifecyclePort | undefined;
   /** Explicit output-token bound applied to every live call and recorded. */
   maxOutputTokens: number;
   /**
@@ -342,11 +379,40 @@ export async function runOneArmGame(
   adapter: ProviderAdapter,
   request: PreparedGameRequest,
   options: SlateRunOptions,
+  // The arm's stable roster index — the key for its concurrency leases. The batch dispatcher
+  // passes each arm's real index; a direct single-arm caller (with no lifecycle to key) uses 0.
+  armIndex = 0,
 ): Promise<ArmGameResult> {
   // Runtime guard: never dispatch a request that did not come through the
   // prepared boundary — before reading any field or touching an adapter method.
   assertPrepared(request);
+  const lifecycle = options.lifecycle;
+  // The initial concurrency lease is released EXACTLY ONCE — the moment this arm's initial
+  // attempt settles or is skipped — and again as a backstop in the finally, so a throw from
+  // preparation / validation never leaves a slot held. Idempotent via the flag.
+  let initialReleased = false;
+  const releaseInitial = async (): Promise<void> => {
+    if (initialReleased) return;
+    initialReleased = true;
+    if (lifecycle) await lifecycle.releaseInitial(armIndex);
+  };
+  try {
+    return await dispatchArmGame(arm, adapter, request, options, armIndex, releaseInitial);
+  } finally {
+    await releaseInitial();
+  }
+}
+
+async function dispatchArmGame(
+  arm: ArmSpec,
+  adapter: ProviderAdapter,
+  request: PreparedGameRequest,
+  options: SlateRunOptions,
+  armIndex: number,
+  releaseInitial: () => Promise<void>,
+): Promise<ArmGameResult> {
   const nowMs = options.nowMs ?? Date.now;
+  const lifecycle = options.lifecycle;
   const cutoffMs = Date.parse(request.cutoffAt);
   const base = {
     arm,
@@ -373,6 +439,7 @@ export async function runOneArmGame(
   });
 
   if (!adapter.hasCredential()) {
+    await releaseInitial(); // skipped arm frees its initial reservation
     return failed(
       'credential_missing',
       { ...emptyAttempt(), errorDetail: `${arm.credentialEnvVar} is not set` },
@@ -387,6 +454,7 @@ export async function runOneArmGame(
   // already closed is never sent.
   const remainingAtDispatch = cutoffMs - nowMs();
   if (remainingAtDispatch <= 0) {
+    await releaseInitial(); // skipped arm frees its initial reservation
     return failed(
       'cutoff_missed',
       { ...emptyAttempt(), errorDetail: 'decision cutoff had already passed at dispatch' },
@@ -417,6 +485,9 @@ export async function runOneArmGame(
     options.maxOutputTokens,
     nowMs,
   );
+  // The initial HTTP attempt has settled: free its concurrency slot now, before validation /
+  // repair (a repair acquires its own fresh lease below).
+  await releaseInitial();
   const { response: firstResponse, failure: firstFailure, ...attemptRecord } = attempt;
   if (firstFailure !== null || firstResponse === null) {
     return failed(firstFailure ?? 'provider_error', attemptRecord, null, false, null, []);
@@ -486,73 +557,91 @@ export async function runOneArmGame(
     ]);
   }
 
+  // A repair sends a SECOND HTTP request, so it needs a fresh concurrency lease: acquire it
+  // immediately before the call and send nothing unless it is explicitly authorized. Tier-0
+  // pins one repair per arm, so the repair ordinal is 1; the acquired lease is released when
+  // the repair settles (the finally below).
+  if (lifecycle) {
+    const acquired = await lifecycle.acquireRepair(armIndex, 1);
+    if (!acquired.authorized) {
+      return failed('invalid_schema', attemptRecord, null, false, null, [
+        ...firstValidation.errors,
+        'repair not dispatched: no repair concurrency lease was authorized',
+      ]);
+    }
+  }
+
   const repairTurns: ChatTurn[] = [
     ...baseTurns,
     { role: 'assistant', content: firstResponse.rawText },
     { role: 'user', content: buildRepairInstruction(firstValidation.errors) },
   ];
-  const repair = await timedChat(
-    adapter,
-    repairTurns,
-    Math.min(options.timeoutMs, remainingAtRepair),
-    options.maxOutputTokens,
-    nowMs,
-  );
-  const { response: repairResponse, failure: repairFailure, ...repairRecord } = repair;
-  if (repairFailure !== null || repairResponse === null) {
-    // Transport outcome recorded separately: a throttled/failed repair is
-    // never readable as a schema failure alone.
-    return failed('invalid_schema', attemptRecord, repairRecord, true, repairFailure ?? 'provider_error', [
-      ...firstValidation.errors,
-      `repair not received (${repairFailure ?? 'provider_error'}): ${repairRecord.errorDetail ?? 'unknown error'}`,
-    ]);
-  }
-
-  // Clock check on repair acceptance.
-  if (nowMs() >= cutoffMs) {
-    return failed('cutoff_missed', attemptRecord, repairRecord, true, 'ok', [
-      'repair response received after the decision cutoff',
-    ]);
-  }
-
-  const repairValidation = validateResponseText(
-    repairResponse.rawText,
-    request.requestBundle,
-    request.requestSha256,
-    arm,
-    options.cohortId,
-  );
-  if (repairValidation.errors.length === 0 && repairValidation.parsed !== null) {
-    const diffs = compareFingerprints(
-      initialFingerprint,
-      fingerprintFromParsed(repairValidation.parsed),
+  try {
+    const repair = await timedChat(
+      adapter,
+      repairTurns,
+      Math.min(options.timeoutMs, remainingAtRepair),
+      options.maxOutputTokens,
+      nowMs,
     );
-    if (diffs.length > 0) {
-      return failed('invalid_schema', attemptRecord, repairRecord, true, 'ok', diffs);
-    }
-    // Acceptance instant for the repair (the accepted attempt), rechecked
-    // against the cutoff at that instant: a repair accepted at/after first pitch
-    // is never a decision (§5). The initial attempt was NOT accepted, so its
-    // acceptedAt stays null; only the repair carries the truthful accept time.
-    const acceptedMs = nowMs();
-    if (acceptedMs >= cutoffMs) {
-      return failed('cutoff_missed', attemptRecord, repairRecord, true, 'ok', [
-        'repair response accepted after the decision cutoff',
+    const { response: repairResponse, failure: repairFailure, ...repairRecord } = repair;
+    if (repairFailure !== null || repairResponse === null) {
+      // Transport outcome recorded separately: a throttled/failed repair is
+      // never readable as a schema failure alone.
+      return failed('invalid_schema', attemptRecord, repairRecord, true, repairFailure ?? 'provider_error', [
+        ...firstValidation.errors,
+        `repair not received (${repairFailure ?? 'provider_error'}): ${repairRecord.errorDetail ?? 'unknown error'}`,
       ]);
     }
-    return {
-      ...base,
-      outcome: 'valid',
-      attempt: attemptRecord,
-      repair: { ...repairRecord, acceptedAt: new Date(acceptedMs).toISOString() },
-      repairUsed: true,
-      repairTransport: 'ok',
-      parsed: repairValidation.parsed,
-      validationErrors: [],
-    };
-  }
 
-  return failed('invalid_schema', attemptRecord, repairRecord, true, 'ok', repairValidation.errors);
+    // Clock check on repair acceptance.
+    if (nowMs() >= cutoffMs) {
+      return failed('cutoff_missed', attemptRecord, repairRecord, true, 'ok', [
+        'repair response received after the decision cutoff',
+      ]);
+    }
+
+    const repairValidation = validateResponseText(
+      repairResponse.rawText,
+      request.requestBundle,
+      request.requestSha256,
+      arm,
+      options.cohortId,
+    );
+    if (repairValidation.errors.length === 0 && repairValidation.parsed !== null) {
+      const diffs = compareFingerprints(
+        initialFingerprint,
+        fingerprintFromParsed(repairValidation.parsed),
+      );
+      if (diffs.length > 0) {
+        return failed('invalid_schema', attemptRecord, repairRecord, true, 'ok', diffs);
+      }
+      // Acceptance instant for the repair (the accepted attempt), rechecked
+      // against the cutoff at that instant: a repair accepted at/after first pitch
+      // is never a decision (§5). The initial attempt was NOT accepted, so its
+      // acceptedAt stays null; only the repair carries the truthful accept time.
+      const acceptedMs = nowMs();
+      if (acceptedMs >= cutoffMs) {
+        return failed('cutoff_missed', attemptRecord, repairRecord, true, 'ok', [
+          'repair response accepted after the decision cutoff',
+        ]);
+      }
+      return {
+        ...base,
+        outcome: 'valid',
+        attempt: attemptRecord,
+        repair: { ...repairRecord, acceptedAt: new Date(acceptedMs).toISOString() },
+        repairUsed: true,
+        repairTransport: 'ok',
+        parsed: repairValidation.parsed,
+        validationErrors: [],
+      };
+    }
+
+    return failed('invalid_schema', attemptRecord, repairRecord, true, 'ok', repairValidation.errors);
+  } finally {
+    if (lifecycle) await lifecycle.releaseRepair(armIndex, 1);
+  }
 }
 
 /**
@@ -633,10 +722,10 @@ export async function runSlate(
   for (const request of snapshot.prepared) {
     index += 1;
     const results = await Promise.all(
-      arms.map((arm) => {
+      arms.map((arm, armIndex) => {
         const adapter = adapters.get(arm.participantId);
         if (!adapter) throw new Error(`no adapter registered for ${arm.participantId}`);
-        return runOneArmGame(arm, adapter, request, options);
+        return runOneArmGame(arm, adapter, request, options, armIndex);
       }),
     );
     all.push(...results);

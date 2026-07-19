@@ -1,3 +1,4 @@
+import { deepFreeze } from './freeze.js';
 import type { AdmitDispatchRequest, AtomicStore, ClaimKey, Lease } from './store/contract.js';
 
 /**
@@ -30,13 +31,22 @@ const permits = new WeakSet<DispatchPermit>();
  * rehearsal — can produce an authorization.
  */
 function mintDispatchPermit(fields: DispatchPermit): DispatchPermit {
-  const permit: DispatchPermit = Object.freeze({
+  // DETACH (clone) every nested claimed-key / lease from the store result, then DEEP-freeze
+  // the whole graph — so an authorization cannot be changed after minting (a plain
+  // assignment to any nested field is ineffective or throws) and a later mutation of the
+  // store's own arrays cannot reach back into the permit.
+  const permit: DispatchPermit = deepFreeze({
     cohortId: fields.cohortId,
     fireId: fields.fireId,
     gameId: fields.gameId,
-    claimedKeys: Object.freeze([...fields.claimedKeys]),
+    claimedKeys: fields.claimedKeys.map((k) => ({ gameId: k.gameId, market: k.market })),
     preparedBytesDigest: fields.preparedBytesDigest,
-    initialLeases: Object.freeze([...fields.initialLeases]),
+    initialLeases: fields.initialLeases.map((l) => ({
+      leaseId: l.leaseId,
+      armIndex: l.armIndex,
+      expiresAt: l.expiresAt,
+      state: l.state,
+    })),
   });
   permits.add(permit);
   return permit;
@@ -76,8 +86,8 @@ export interface ClaimPort {
  * skeleton needs. The EXHAUSTIVE non-admitted reaction matrix (all_claimed → terminal
  * Skip; call/spend/concurrency → Defer while clean; replay/pending → resume; replay/
  * completed → Skip; invariant/config/wire faults → Fault) and the per-arm lease lifecycle
- * are the store-choreographer slice; here every non-admitted outcome fails loud (a
- * skeleton fires only on a fresh admission).
+ * land in a later durable-store-integration slice; here every non-admitted outcome fails
+ * loud (a skeleton fires only on a fresh admission).
  */
 export class StoreClaimPort implements ClaimPort {
   constructor(private readonly store: AtomicStore) {}
@@ -107,7 +117,7 @@ export class StoreClaimPort implements ClaimPort {
     }
     return {
       kind: 'Fault',
-      reason: `non-admitted admit outcome '${result.outcome}' — the exhaustive reaction matrix is the store-choreographer slice`,
+      reason: `non-admitted admit outcome '${result.outcome}' — the exhaustive reaction matrix is a later slice`,
     };
   }
 }
