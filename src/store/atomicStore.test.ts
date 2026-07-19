@@ -31,6 +31,7 @@ function stub(rows: ReadonlyArray<Record<string, unknown>>): {
   return { store: new SqlAtomicStore(q), calls };
 }
 const r = (result: unknown): ReadonlyArray<Record<string, unknown>> => [{ r: result }];
+const H = (c: string): string => c.repeat(64); // a valid 64-char lowercase-hex digest (c must be a hex char)
 
 const initReq: InitCohortBudgetRequest = {
   cohortId: 'c1',
@@ -51,9 +52,9 @@ const admitReq: AdmitDispatchRequest = {
   gameId: 'g1',
   proposedMarkets: ['moneyline', 'total'],
   scopeReservations: {
-    moneyline: { spendReservationUsdMicros: 500, preparedBytesDigest: 'd1' },
-    total: { spendReservationUsdMicros: 500, preparedBytesDigest: 'd2' },
-    'moneyline+total': { spendReservationUsdMicros: 1000, preparedBytesDigest: 'd3' },
+    moneyline: { spendReservationUsdMicros: 500, preparedBytesDigest: H('a') },
+    total: { spendReservationUsdMicros: 500, preparedBytesDigest: H('b') },
+    'moneyline+total': { spendReservationUsdMicros: 1000, preparedBytesDigest: H('c') },
   },
 };
 const repairReq: AcquireRepairLeaseRequest = { cohortId: 'c1', fireId: 'f1', ownerId: 'w1', armIndex: 0, repairOrdinal: 1, expectedSchemaVersion: 1 };
@@ -77,6 +78,9 @@ test('init: malformed pins refuse invalid_input without touching the DB', async 
     { concurrencyLimit: 2_147_483_648 },
     { rosterSize: 2_147_483_648 },
     { initialLeaseBoundMs: 2_147_483_648 },
+    // derived call product rosterSize*(1+maxRepairs) overflows a safe integer (each operand
+    // is a valid int4, but the product isn't) → refuse, else int4 overflow at admit.
+    { rosterSize: 2_000_000_000, maxRepairsPerArm: 2_000_000_000 },
   ];
   for (const patch of bad) {
     const { store, calls } = stub(r({ outcome: 'initialized' }));
@@ -137,9 +141,14 @@ test('admit: malformed request refuses invalid_input (dispatchAuthorized false) 
     { proposedMarkets: ['moneyline', 'moneyline'] }, // duplicate
     { proposedMarkets: ['x'] as unknown as MarketKey[] }, // unknown market
     { expectedSchemaVersion: 2_147_483_648 }, // above int4 max (p_ver)
-    { scopeReservations: { moneyline: { spendReservationUsdMicros: -1, preparedBytesDigest: 'd' } } },
-    { scopeReservations: { moneyline: { spendReservationUsdMicros: 1.5, preparedBytesDigest: 'd' } } },
-    { scopeReservations: { moneyline: { spendReservationUsdMicros: 1, preparedBytesDigest: '' } } },
+    { cohortId: `c${String.fromCharCode(0)}` }, // a NUL in a text param (would raw-error)
+    { scopeReservations: { moneyline: { spendReservationUsdMicros: -1, preparedBytesDigest: H('a') } } }, // negative spend
+    { scopeReservations: { moneyline: { spendReservationUsdMicros: 1.5, preparedBytesDigest: H('a') } } }, // fractional spend
+    { scopeReservations: { moneyline: { spendReservationUsdMicros: 1, preparedBytesDigest: '' } } }, // empty digest
+    { scopeReservations: { moneyline: { spendReservationUsdMicros: 1, preparedBytesDigest: 'nothex-but-nonempty' } } }, // non-hex digest
+    { scopeReservations: { moneyline: { spendReservationUsdMicros: 1, preparedBytesDigest: H('a').slice(0, 63) } } }, // wrong length
+    { scopeReservations: { moneyline: { spendReservationUsdMicros: 1, preparedBytesDigest: 'A'.repeat(64) } } }, // uppercase, not lowercase hex
+    { scopeReservations: { moneyline: { spendReservationUsdMicros: 1, preparedBytesDigest: `${H('a').slice(0, 63)}${String.fromCharCode(0)}` } } }, // NUL in digest (would raw 22P05)
   ];
   for (const patch of bad) {
     const { store, calls } = stub(r({ outcome: 'admitted' }));
@@ -151,8 +160,8 @@ test('admit: malformed request refuses invalid_input (dispatchAuthorized false) 
 test('admit: maps admitted / replayed(pending,completed) / refused / error', async () => {
   const claimed = [{ gameId: 'g1', market: 'moneyline' }];
   assert.deepEqual(
-    await stub(r({ outcome: 'admitted', claimedKeys: claimed, preparedBytesDigest: 'd3', initialLeases: [leaseJson], dispatchAuthorized: true })).store.admitDispatch(admitReq),
-    { outcome: 'admitted', claimedKeys: claimed, preparedBytesDigest: 'd3', initialLeases: [leaseJson], dispatchAuthorized: true },
+    await stub(r({ outcome: 'admitted', claimedKeys: claimed, preparedBytesDigest: H('c'), initialLeases: [leaseJson], dispatchAuthorized: true })).store.admitDispatch(admitReq),
+    { outcome: 'admitted', claimedKeys: claimed, preparedBytesDigest: H('c'), initialLeases: [leaseJson], dispatchAuthorized: true },
   );
   assert.deepEqual(
     await stub(r({ outcome: 'replayed', fireStatus: 'pending', claimedKeys: claimed, initialLeases: [leaseJson], dispatchAuthorized: false })).store.admitDispatch(admitReq),
@@ -168,22 +177,33 @@ test('admit: maps admitted / replayed(pending,completed) / refused / error', asy
 });
 
 test('admit: off-contract shapes throw StoreWireError', async () => {
+  const claimed = [{ gameId: 'g1', market: 'moneyline' }];
+  const okAdmitted = { outcome: 'admitted', claimedKeys: claimed, preparedBytesDigest: H('c'), initialLeases: [leaseJson], dispatchAuthorized: true };
   await assert.rejects(() => stub(r({ outcome: 'replayed', fireStatus: 'pending', claimedKeys: [], dispatchAuthorized: false })).store.admitDispatch(admitReq), StoreWireError); // pending missing leases
   await assert.rejects(() => stub(r({ outcome: 'admitted' })).store.admitDispatch(admitReq), StoreWireError); // missing fields
   await assert.rejects(() => stub(r({ outcome: 'refused', reason: 'nope', dispatchAuthorized: false })).store.admitDispatch(admitReq), StoreWireError); // unknown reason
+  // strict: an unknown extra field is a skew, not silently stripped.
+  await assert.rejects(() => stub(r({ ...okAdmitted, surprise: 1 })).store.admitDispatch(admitReq), StoreWireError);
+  // a completed replay carrying forbidden leases must throw, not be silently rewritten.
+  await assert.rejects(() => stub(r({ outcome: 'replayed', fireStatus: 'completed', claimedKeys: claimed, initialLeases: [leaseJson], dispatchAuthorized: false })).store.admitDispatch(admitReq), StoreWireError);
+  // result semantics: bad lease instant, empty lease id, empty / non-hex result digest.
+  await assert.rejects(() => stub(r({ ...okAdmitted, initialLeases: [{ ...leaseJson, expiresAt: 'not-an-instant' }] })).store.admitDispatch(admitReq), StoreWireError);
+  await assert.rejects(() => stub(r({ ...okAdmitted, initialLeases: [{ ...leaseJson, leaseId: '' }] })).store.admitDispatch(admitReq), StoreWireError);
+  await assert.rejects(() => stub(r({ ...okAdmitted, preparedBytesDigest: '' })).store.admitDispatch(admitReq), StoreWireError);
+  await assert.rejects(() => stub(r({ ...okAdmitted, preparedBytesDigest: 'nothex' })).store.admitDispatch(admitReq), StoreWireError);
 });
 
 test('admit: maps the request to positional args + a {spend,digest} scope jsonb', async () => {
-  const { store, calls } = stub(r({ outcome: 'admitted', claimedKeys: [], preparedBytesDigest: '', initialLeases: [], dispatchAuthorized: true }));
+  const { store, calls } = stub(r({ outcome: 'admitted', claimedKeys: [], preparedBytesDigest: H('a'), initialLeases: [], dispatchAuthorized: true }));
   await store.admitDispatch(admitReq);
   const { sql, params } = calls[0]!;
   assert.match(sql, /store\.admit_dispatch\(\$1,\$2,\$3,\$4,\$5,\$6::jsonb,\$7::jsonb\)/);
   assert.deepEqual(params.slice(0, 5), ['c1', 'f1', 'w1', 1, 'g1']);
   assert.deepEqual(JSON.parse(params[5] as string), ['moneyline', 'total']);
   assert.deepEqual(JSON.parse(params[6] as string), {
-    moneyline: { spend: 500, digest: 'd1' },
-    total: { spend: 500, digest: 'd2' },
-    'moneyline+total': { spend: 1000, digest: 'd3' },
+    moneyline: { spend: 500, digest: H('a') },
+    total: { spend: 500, digest: H('b') },
+    'moneyline+total': { spend: 1000, digest: H('c') },
   });
 });
 

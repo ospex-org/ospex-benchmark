@@ -18,6 +18,7 @@
  * `pg` types (the executor is structural), so it stays a pure library.
  */
 import { z } from 'zod';
+import { isParseableInstant } from '../time.js';
 import type {
   AtomicStore,
   InitCohortBudgetRequest,
@@ -75,7 +76,15 @@ const INT4_MAX = 2_147_483_647;
  *  would slip past `isSafeNonNegInt` and hit an `(…)::int` cast / `int` bound param as a raw
  *  `integer out of range` driver exception instead of the typed `invalid_input` refusal. */
 const isInt4NonNeg = (n: unknown): n is number => isSafeNonNegInt(n) && n <= INT4_MAX;
-const isNonEmptyString = (s: unknown): s is string => typeof s === 'string' && s.length > 0;
+// Non-empty AND free of a NUL — Postgres `text`/`jsonb` cannot store one, so a NUL in a
+// string param/value reaches the driver as a raw exception, not a typed refusal.
+const NUL = String.fromCharCode(0);
+const isNonEmptyString = (s: unknown): s is string => typeof s === 'string' && s.length > 0 && !s.includes(NUL);
+// The prepared-bytes digest is a sha256 hex string (64 lowercase hex). Anything else is a
+// malformed digest, refused BEFORE the executor (a non-hex/NUL digest otherwise reaches
+// jsonb as a raw 22P05). Both the input reservation and the round-tripped result use this.
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const isSha256Hex = (s: unknown): s is string => typeof s === 'string' && SHA256_HEX.test(s);
 
 const MARKET_ORD: Record<MarketKey, number> = { moneyline: 0, spread: 1, total: 2 };
 const isKnownMarket = (m: unknown): m is MarketKey => m === 'moneyline' || m === 'spread' || m === 'total';
@@ -94,16 +103,17 @@ function marketsValid(markets: readonly MarketKey[]): boolean {
   return true;
 }
 
-/** Every PRESENT scope entry must carry a safe non-negative integer spend and a non-empty
- *  digest (mirrors `_scope_spend_safe`). Completeness is NOT required here: a retained
- *  subset absent from the map is the DB's distinct `scope_reservation_missing`, and an
- *  extra entry outside `proposedMarkets` is simply never selected (SPEC §4.5, reconciled). */
+/** Every PRESENT scope entry must carry a safe non-negative integer spend and a well-formed
+ *  (sha256-hex) digest. A malformed digest is refused here, before the executor — otherwise
+ *  a non-hex / NUL digest reaches jsonb as a raw 22P05. Completeness is NOT required: a
+ *  retained subset absent from the map is the DB's distinct `scope_reservation_missing`, and
+ *  an extra entry outside `proposedMarkets` is simply never selected (SPEC §4.5, reconciled). */
 function scopeReservationsValid(scope: AdmitDispatchRequest['scopeReservations']): boolean {
   if (scope === null || typeof scope !== 'object') return false;
   for (const res of Object.values(scope)) {
     if (res === undefined) continue;
     if (res === null || typeof res !== 'object') return false;
-    if (!isSafeNonNegInt(res.spendReservationUsdMicros) || !isNonEmptyString(res.preparedBytesDigest)) return false;
+    if (!isSafeNonNegInt(res.spendReservationUsdMicros) || !isSha256Hex(res.preparedBytesDigest)) return false;
   }
   return true;
 }
@@ -112,85 +122,90 @@ function scopeReservationsValid(scope: AdmitDispatchRequest['scopeReservations']
 // Result schemas — the JSONB shapes the SQL functions emit (src/store/functions.sql)
 // ---------------------------------------------------------------------------
 
-const leaseSchema = z.object({
-  leaseId: z.string(),
-  armIndex: z.number().int().nonnegative(),
-  expiresAt: z.string(),
-  state: z.enum(['live', 'released', 'expired']),
-});
-const claimKeySchema = z.object({
-  gameId: z.string(),
-  market: z.enum(['moneyline', 'spread', 'total']),
-});
+// Every schema is `.strict()`: an unknown field is a contract skew that must throw
+// StoreWireError, not be silently stripped. Each object lists EXACTLY the keys the SQL's
+// `jsonb_build_object(...)` emits, and the value semantics are validated too — a lease id
+// must be non-empty, `expiresAt` a genuine store instant, a digest sha256-hex.
+const leaseSchema = z
+  .object({
+    leaseId: z.string().min(1),
+    armIndex: z.number().int().nonnegative(),
+    expiresAt: z.string().refine(isParseableInstant, 'lease expiresAt is not a parseable instant'),
+    state: z.enum(['live', 'released', 'expired']),
+  })
+  .strict();
+const claimKeySchema = z.object({ gameId: z.string().min(1), market: z.enum(['moneyline', 'spread', 'total']) }).strict();
+const digestSchema = z.string().regex(SHA256_HEX, 'preparedBytesDigest is not sha256-hex');
 
 const initResultSchema = z.discriminatedUnion('outcome', [
-  z.object({ outcome: z.literal('initialized') }),
+  z.object({ outcome: z.literal('initialized') }).strict(),
   // NB: the SQL never emits `invalid_input` for init (it casts pins) — the adapter injects
   // it client-side above; the DB only returns these two.
-  z.object({ outcome: z.literal('refused'), reason: z.enum(['config_mismatch', 'version_mismatch']) }),
+  z.object({ outcome: z.literal('refused'), reason: z.enum(['config_mismatch', 'version_mismatch']) }).strict(),
 ]);
 
-const admitResultSchema = z.discriminatedUnion('outcome', [
-  z.object({
-    outcome: z.literal('admitted'),
-    claimedKeys: z.array(claimKeySchema),
-    preparedBytesDigest: z.string(),
-    initialLeases: z.array(leaseSchema),
-    dispatchAuthorized: z.literal(true),
-  }),
-  z.object({
-    outcome: z.literal('replayed'),
-    fireStatus: z.enum(['pending', 'completed']),
-    claimedKeys: z.array(claimKeySchema),
-    initialLeases: z.array(leaseSchema).optional(),
-    dispatchAuthorized: z.literal(false),
-  }),
-  z.object({
-    outcome: z.literal('refused'),
-    reason: z.enum([
-      'not_initialized',
-      'version_mismatch',
-      'invalid_input',
-      'all_claimed',
-      'scope_reservation_missing',
-      'call_cap',
-      'spend_cap',
-      'concurrency',
-    ]),
-    dispatchAuthorized: z.literal(false),
-  }),
-  z.object({ outcome: z.literal('error'), reason: z.literal('fire_id_key_mismatch'), dispatchAuthorized: z.literal(false) }),
+// A `pending` replay REQUIRES its per-arm leases; a `completed` replay FORBIDS them (the key
+// is absent from the strict schema, so a completed-with-leases skew throws rather than being
+// silently rewritten). Modelled as separate members, not one optional-leases branch.
+const admitResultSchema = z.union([
+  z
+    .object({
+      outcome: z.literal('admitted'),
+      claimedKeys: z.array(claimKeySchema),
+      preparedBytesDigest: digestSchema,
+      initialLeases: z.array(leaseSchema),
+      dispatchAuthorized: z.literal(true),
+    })
+    .strict(),
+  z.discriminatedUnion('fireStatus', [
+    z
+      .object({
+        outcome: z.literal('replayed'),
+        fireStatus: z.literal('pending'),
+        claimedKeys: z.array(claimKeySchema),
+        initialLeases: z.array(leaseSchema),
+        dispatchAuthorized: z.literal(false),
+      })
+      .strict(),
+    z
+      .object({
+        outcome: z.literal('replayed'),
+        fireStatus: z.literal('completed'),
+        claimedKeys: z.array(claimKeySchema),
+        dispatchAuthorized: z.literal(false),
+      })
+      .strict(),
+  ]),
+  z
+    .object({
+      outcome: z.literal('refused'),
+      reason: z.enum(['not_initialized', 'version_mismatch', 'invalid_input', 'all_claimed', 'scope_reservation_missing', 'call_cap', 'spend_cap', 'concurrency']),
+      dispatchAuthorized: z.literal(false),
+    })
+    .strict(),
+  z.object({ outcome: z.literal('error'), reason: z.literal('fire_id_key_mismatch'), dispatchAuthorized: z.literal(false) }).strict(),
 ]);
 
 const repairResultSchema = z.discriminatedUnion('outcome', [
-  z.object({ outcome: z.literal('acquired'), lease: leaseSchema, requestAuthorized: z.literal(true) }),
-  z.object({ outcome: z.literal('replayed'), lease: leaseSchema, requestAuthorized: z.literal(false) }),
-  z.object({
-    outcome: z.literal('refused'),
-    reason: z.enum([
-      'not_initialized',
-      'version_mismatch',
-      'invalid_input',
-      'fire_not_pending',
-      'invalid_arm',
-      'invalid_attempt',
-      'repair_limit',
-      'call_reserved_exhausted',
-      'concurrency',
-      'not_owner',
-    ]),
-    requestAuthorized: z.literal(false),
-  }),
+  z.object({ outcome: z.literal('acquired'), lease: leaseSchema, requestAuthorized: z.literal(true) }).strict(),
+  z.object({ outcome: z.literal('replayed'), lease: leaseSchema, requestAuthorized: z.literal(false) }).strict(),
+  z
+    .object({
+      outcome: z.literal('refused'),
+      reason: z.enum(['not_initialized', 'version_mismatch', 'invalid_input', 'fire_not_pending', 'invalid_arm', 'invalid_attempt', 'repair_limit', 'call_reserved_exhausted', 'concurrency', 'not_owner']),
+      requestAuthorized: z.literal(false),
+    })
+    .strict(),
 ]);
 
 const releaseResultSchema = z.discriminatedUnion('outcome', [
-  z.object({ outcome: z.literal('released') }),
-  z.object({ outcome: z.literal('refused'), reason: z.literal('not_owner') }),
+  z.object({ outcome: z.literal('released') }).strict(),
+  z.object({ outcome: z.literal('refused'), reason: z.literal('not_owner') }).strict(),
 ]);
 
 const completeResultSchema = z.discriminatedUnion('outcome', [
-  z.object({ outcome: z.literal('completed') }),
-  z.object({ outcome: z.literal('refused'), reason: z.enum(['version_mismatch', 'invariant_breach', 'invalid_input']) }),
+  z.object({ outcome: z.literal('completed') }).strict(),
+  z.object({ outcome: z.literal('refused'), reason: z.enum(['version_mismatch', 'invariant_breach', 'invalid_input']) }).strict(),
 ]);
 
 // ---------------------------------------------------------------------------
@@ -222,7 +237,11 @@ export class SqlAtomicStore implements AtomicStore {
       !isInt4NonNeg(req.rosterSize) ||
       !isInt4NonNeg(req.maxRepairsPerArm) ||
       !isInt4NonNeg(req.initialLeaseBoundMs) ||
-      !isInt4NonNeg(req.repairLeaseBoundMs)
+      !isInt4NonNeg(req.repairLeaseBoundMs) ||
+      // The store DERIVES the per-dispatch call reservation `roster × (1 + maxRepairs)`
+      // (§1.1). Both operands are valid int4, but their product must stay a safe integer —
+      // else it exceeds JS-representable range AND overflows the SQL arithmetic at admit.
+      !isSafeNonNegInt(req.rosterSize * (1 + req.maxRepairsPerArm))
     ) {
       return { outcome: 'refused', reason: 'invalid_input' };
     }
@@ -267,15 +286,10 @@ export class SqlAtomicStore implements AtomicStore {
     );
     const parsed = admitResultSchema.safeParse(raw);
     if (!parsed.success) throw new StoreWireError('admit_dispatch', parsed.error.message);
-    const d = parsed.data;
-    if (d.outcome === 'replayed') {
-      if (d.fireStatus === 'pending') {
-        if (d.initialLeases === undefined) throw new StoreWireError('admit_dispatch', 'pending replay missing initialLeases');
-        return { outcome: 'replayed', fireStatus: 'pending', claimedKeys: d.claimedKeys, initialLeases: d.initialLeases, dispatchAuthorized: false };
-      }
-      return { outcome: 'replayed', fireStatus: 'completed', claimedKeys: d.claimedKeys, dispatchAuthorized: false };
-    }
-    return d;
+    // The strict, split schema makes the parsed value already the exact contract union — a
+    // pending replay carries its leases, a completed one cannot (a completed-with-leases skew
+    // fails the strict schema above), so no manual rewrite is needed or possible.
+    return parsed.data;
   }
 
   async acquireRepairLease(req: AcquireRepairLeaseRequest): Promise<RepairLeaseResult> {
@@ -303,8 +317,12 @@ export class SqlAtomicStore implements AtomicStore {
 
   async releaseLease(req: ReleaseLeaseRequest): Promise<ReleaseResult> {
     // `ReleaseResult` has no `invalid_input`: an unknown lease is an idempotent no-op
-    // (`released`) and a foreign owner is `not_owner`, both handled in SQL. No numeric
-    // inputs to guard; the request's string types are enforced by the compiler.
+    // (`released`) and a foreign owner is `not_owner`. A malformed (empty/NUL) reference
+    // corresponds to no real lease/owner and is resolved WITHOUT the DB — a no-op release
+    // for a malformed lease id, `not_owner` for a malformed owner — so a NUL never reaches
+    // a `text` param as a raw exception (the release analogue of the invalid_input guards).
+    if (!isNonEmptyString(req.leaseId)) return { outcome: 'released' };
+    if (!isNonEmptyString(req.ownerId)) return { outcome: 'refused', reason: 'not_owner' };
     const raw = await this.callOne('release_lease', 'select store.release_lease($1,$2) as r', [req.leaseId, req.ownerId]);
     const parsed = releaseResultSchema.safeParse(raw);
     if (!parsed.success) throw new StoreWireError('release_lease', parsed.error.message);

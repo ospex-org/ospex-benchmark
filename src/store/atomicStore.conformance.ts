@@ -12,6 +12,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
+import { sha256Hex } from '../canonical.js';
 import { SqlAtomicStore, pgStoreQuery } from './atomicStore.js';
 import type { AdmitDispatchRequest, InitCohortBudgetRequest, ScopeKey } from './contract.js';
 import type { MarketKey } from '../types.js';
@@ -39,7 +40,7 @@ function pins(cohortId: string, over: Partial<InitCohortBudgetRequest> = {}): In
   };
 }
 
-const digestOf = (label: string): string => `${'0'.repeat(64 - label.length)}${label}`.slice(0, 64);
+const digestOf = (label: string): string => sha256Hex(label); // a real sha256-hex digest (the adapter validates the format)
 // Contract-shaped scope reservations (the adapter maps these → the SQL {spend,digest}).
 function scope(markets: MarketKey[]): AdmitDispatchRequest['scopeReservations'] {
   const subsets: MarketKey[][] = markets.length === 1 ? [markets] : [[markets[0]!], [markets[1]!], markets];
@@ -166,13 +167,30 @@ async function main(): Promise<void> {
   });
 
   // --- client-side invalid_input writes NOTHING to the DB ---
-  await check('client-side invalid_input refuses before the DB and writes nothing', async () => {
+  await check('client-side invalid_input (negative spend + malformed digest) refuses before the DB and writes nothing', async () => {
     const c = cohortName('badinput');
     await store.initCohortBudget(pins(c));
-    const bad = await store.admitDispatch({ cohortId: c, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: { moneyline: { spendReservationUsdMicros: -100, preparedBytesDigest: digestOf('m') } } });
-    assert.equal(bad.outcome === 'refused' && bad.reason, 'invalid_input');
+    const negSpend = await store.admitDispatch({ cohortId: c, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: { moneyline: { spendReservationUsdMicros: -100, preparedBytesDigest: digestOf('m') } } });
+    assert.equal(negSpend.outcome === 'refused' && negSpend.reason, 'invalid_input');
+    // a malformed (non-hex) digest must ALSO refuse before the DB — else a raw 22P05.
+    const badDigest = await store.admitDispatch({ cohortId: c, fireId: 'f2', ownerId: 'w2', expectedSchemaVersion: VER, gameId: 'g2', proposedMarkets: ['moneyline'], scopeReservations: { moneyline: { spendReservationUsdMicros: 100, preparedBytesDigest: 'not-a-sha256' } } });
+    assert.equal(badDigest.outcome === 'refused' && badDigest.reason, 'invalid_input');
     assert.equal(await claimCount(c), 0);
     assert.equal(await callsReserved(c), 0);
+  });
+
+  // --- the derived call product: bigint SQL arithmetic (no raw overflow) + the client guard ---
+  await check('derived product: a large-but-safe roster yields a TYPED cap refusal (not a raw int4 overflow); a product beyond safe-int refuses invalid_input', async () => {
+    // rosterSize*(1+maxRepairs) = 50000*50001 ≈ 2.5e9 — over int4 max, under 2^53. With the
+    // SQL computing the product in bigint, admit gives a TYPED call_cap refusal, not raw 22003.
+    const big = cohortName('bigroster');
+    await store.initCohortBudget(pins(big, { rosterSize: 50_000, maxRepairsPerArm: 50_000, callCap: 1_000_000 }));
+    const refused = await store.admitDispatch({ cohortId: big, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    assert.equal(refused.outcome === 'refused' && refused.reason, 'call_cap');
+    // a product that overflows a safe integer is refused at init, before any DB row exists.
+    const over = cohortName('overproduct');
+    assert.deepEqual(await store.initCohortBudget(pins(over, { rosterSize: 2_000_000_000, maxRepairsPerArm: 2_000_000_000 })), { outcome: 'refused', reason: 'invalid_input' });
+    assert.equal(Number((await pool.query('select count(*)::int as n from store.cohort_budget where cohort_id=$1', [over])).rows[0]!.n), 0);
   });
 
   // --- release not_owner from real SQL ---

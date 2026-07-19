@@ -155,7 +155,10 @@ begin
   if v_retained is null then return jsonb_build_object('outcome','refused','reason','all_claimed','dispatchAuthorized',false); end if;
 
   -- 4. store-derived magnitudes; spend from the retained scope table (§4.5).
-  v_call_delta := v.roster_size * (1 + v.max_repairs_per_arm);
+  --    roster_size/max_repairs are int4, so multiply in BIGINT (`::bigint`) — an int4×int4
+  --    product would overflow int4 arithmetic before assignment (the adapter also bounds it
+  --    to a safe integer before admit, so the reservation stays exact).
+  v_call_delta := v.roster_size::bigint * (1 + v.max_repairs_per_arm);
   v_scope_key := array_to_string(v_retained, '+');
   if not (p_scope ? v_scope_key) then return jsonb_build_object('outcome','refused','reason','scope_reservation_missing','dispatchAuthorized',false); end if;
   v_spend_delta := (p_scope -> v_scope_key ->> 'spend')::bigint;
@@ -168,7 +171,7 @@ begin
   -- 6. caps.
   if v.calls_reserved + v_call_delta > v.call_cap then return jsonb_build_object('outcome','refused','reason','call_cap','dispatchAuthorized',false); end if;
   if v.spend_reserved_usd_micros + v_spend_delta > v.spend_cap_usd_micros then return jsonb_build_object('outcome','refused','reason','spend_cap','dispatchAuthorized',false); end if;
-  if v_slots + v.roster_size > v.concurrency_limit then return jsonb_build_object('outcome','refused','reason','concurrency','dispatchAuthorized',false); end if;
+  if v_slots::bigint + v.roster_size > v.concurrency_limit then return jsonb_build_object('outcome','refused','reason','concurrency','dispatchAuthorized',false); end if;
 
   -- 7. commit: claims (ON CONFLICT DO NOTHING) → fires → budget → per-arm initial leases.
   with ins as (
@@ -228,7 +231,7 @@ begin
   if v_existing <> p_ordinal - 1 then return jsonb_build_object('outcome','refused','reason','invalid_attempt','requestAuthorized',false); end if;
   if f.made_calls >= f.call_reserved then return jsonb_build_object('outcome','refused','reason','call_reserved_exhausted','requestAuthorized',false); end if;
   select coalesce(sum(1),0) into v_slots from store.concurrency_leases where cohort_id=p_cohort and released_at is null and expires_at > now();
-  if v_slots + 1 > v.concurrency_limit then return jsonb_build_object('outcome','refused','reason','concurrency','requestAuthorized',false); end if;
+  if v_slots::bigint + 1 > v.concurrency_limit then return jsonb_build_object('outcome','refused','reason','concurrency','requestAuthorized',false); end if;
 
   insert into store.concurrency_leases (lease_id, cohort_id, fire_id, owner_id, arm_index, attempt_kind, repair_ordinal, acquired_at, expires_at)
     values (gen_random_uuid()::text, p_cohort, p_fire, p_owner, p_arm, 'repair', p_ordinal, clock_timestamp(), clock_timestamp() + make_interval(secs => v.repair_lease_bound_ms/1000.0))
