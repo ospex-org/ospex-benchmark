@@ -256,6 +256,42 @@ test('a permit with a broken initial-lease bijection fires nothing', async () =>
   assert.equal(counted.calls(), 0);
 });
 
+async function assertNoDispatchLeases(makeLeases: (n: number) => unknown[], message: RegExp): Promise<void> {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+  const counted = withCallCounter(fire);
+  const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQueryWith(LINE_OPEN_ARMS.length, makeLeases)));
+  const permit = await mintPermit(store, admitReqFor(fire));
+  await assert.rejects(() => new LineOpenFireFn().fire(permit, counted.fire, new NoopAttemptLifecycle()), message);
+  assert.equal(counted.calls(), 0, 'a broken lease bijection must dispatch no adapter');
+}
+
+test('a permit with a duplicate initial-lease arm index fires nothing', async () => {
+  await assertNoDispatchLeases(
+    (n) => [
+      ...Array.from({ length: n - 1 }, (_, i) => ({ leaseId: `lease-${i}`, armIndex: i, expiresAt: LEASE_EXPIRES_AT, state: 'live' })),
+      { leaseId: 'dup', armIndex: 0, expiresAt: LEASE_EXPIRES_AT, state: 'live' }, // arm n-1 missing, arm 0 duplicated
+    ],
+    /duplicate initial lease/,
+  );
+});
+
+test('a permit with an out-of-range initial-lease arm index fires nothing', async () => {
+  await assertNoDispatchLeases(
+    (n) => [
+      ...Array.from({ length: n - 1 }, (_, i) => ({ leaseId: `lease-${i}`, armIndex: i, expiresAt: LEASE_EXPIRES_AT, state: 'live' })),
+      { leaseId: 'oor', armIndex: n + 5, expiresAt: LEASE_EXPIRES_AT, state: 'live' },
+    ],
+    /outside \[0/,
+  );
+});
+
+test('a permit with a non-live initial lease fires nothing', async () => {
+  await assertNoDispatchLeases(
+    (n) => Array.from({ length: n }, (_, i) => ({ leaseId: `lease-${i}`, armIndex: i, expiresAt: LEASE_EXPIRES_AT, state: i === 0 ? 'expired' : 'live' })),
+    /is not live/,
+  );
+});
+
 test('a request mutated during the awaited admission fires nothing and installs no artifact', async () => {
   const { fire } = prepareLineOpenFire(['moneyline', 'total']);
   const counted = withCallCounter(fire);
@@ -375,9 +411,9 @@ test('a repair is sent only under an authorized lease, and its lease is released
   const r1 = await runSlate([arm], new Map([[arm.participantId, denied.adapter]]), [fire.request], { ...fire.runOptions, lifecycle: deniedLc.lifecycle });
   assert.equal(denied.calls(), 1, 'a denied repair sends only the initial request');
   assert.equal(r1.results[0]!.outcome, 'invalid_schema');
-  assert.deepEqual(deniedLc.log.filter((l) => l.startsWith('acquireRepair')), ['acquireRepair:0:1']);
-  assert.equal(deniedLc.log.filter((l) => l.startsWith('releaseRepair')).length, 0);
-  assert.equal(deniedLc.log.filter((l) => l === 'releaseInitial:0').length, 1);
+  // The FULL ordered log: the initial lease is released BEFORE the repair lease is acquired
+  // (never a double-hold), and a denied repair acquires-then-refuses with no release.
+  assert.deepEqual(deniedLc.log, ['releaseInitial:0', 'acquireRepair:0:1']);
 
   // Authorized: acquireRepair returns true → the repair is sent and released exactly once.
   const allowed = scriptedAdapter(arm, [invalid, valid]);
@@ -385,9 +421,50 @@ test('a repair is sent only under an authorized lease, and its lease is released
   const r2 = await runSlate([arm], new Map([[arm.participantId, allowed.adapter]]), [fire.request], { ...fire.runOptions, lifecycle: allowedLc.lifecycle });
   assert.equal(allowed.calls(), 2, 'an authorized repair sends the initial + the repair');
   assert.equal(r2.results[0]!.outcome, 'valid');
-  assert.deepEqual(allowedLc.log.filter((l) => l.startsWith('acquireRepair')), ['acquireRepair:0:1']);
-  assert.deepEqual(allowedLc.log.filter((l) => l.startsWith('releaseRepair')), ['releaseRepair:0:1']);
-  assert.equal(allowedLc.log.filter((l) => l === 'releaseInitial:0').length, 1);
+  // Full ordered log: release the initial lease, THEN acquire + release the repair lease —
+  // so the arm never holds two concurrency slots (the exact double-hold this gate prevents).
+  assert.deepEqual(allowedLc.log, ['releaseInitial:0', 'acquireRepair:0:1', 'releaseRepair:0:1']);
+});
+
+test('with a lifecycle, every initial-attempt exit releases the initial lease exactly once', async () => {
+  const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+  const arm = fire.arms[0]!;
+
+  // (a) credential missing → the arm is skipped and its initial lease released once.
+  const noCred = recordingLifecycle({ authorized: true });
+  const noCredAdapter: ProviderAdapter = {
+    provider: arm.provider,
+    requestedModelId: arm.requestedModelId,
+    credentialEnvVar: arm.credentialEnvVar,
+    hasCredential: () => false,
+    chat: () => Promise.reject(new Error('must not be called')),
+  };
+  const rc = await runSlate([arm], new Map([[arm.participantId, noCredAdapter]]), [fire.request], { ...fire.runOptions, lifecycle: noCred.lifecycle });
+  assert.equal(rc.results[0]!.outcome, 'credential_missing');
+  assert.deepEqual(noCred.log, ['releaseInitial:0']);
+
+  // (b) the decision cutoff already passed at dispatch → skipped, released once, no call.
+  const past = recordingLifecycle({ authorized: true });
+  const ok = scriptedAdapter(arm, [JSON.stringify(lineOpenScopedResponse(fire.request, arm, fire.booted.cohortId))]);
+  const afterCutoff = Date.parse(fire.request.game.scheduledStartUtc) + 1_000;
+  const rp = await runSlate([arm], new Map([[arm.participantId, ok.adapter]]), [fire.request], { ...fire.runOptions, nowMs: () => afterCutoff, lifecycle: past.lifecycle });
+  assert.equal(rp.results[0]!.outcome, 'cutoff_missed');
+  assert.equal(ok.calls(), 0);
+  assert.deepEqual(past.log, ['releaseInitial:0']);
+
+  // (c) a throw before the initial attempt → the finally backstop releases exactly once.
+  const thrown = recordingLifecycle({ authorized: true });
+  const throwingAdapter: ProviderAdapter = {
+    provider: arm.provider,
+    requestedModelId: arm.requestedModelId,
+    credentialEnvVar: arm.credentialEnvVar,
+    hasCredential: () => {
+      throw new Error('credential probe failed');
+    },
+    chat: () => Promise.reject(new Error('must not be called')),
+  };
+  await assert.rejects(() => runSlate([arm], new Map([[arm.participantId, throwingAdapter]]), [fire.request], { ...fire.runOptions, lifecycle: thrown.lifecycle }));
+  assert.deepEqual(thrown.log, ['releaseInitial:0']);
 });
 
 // --- durable, atomic, no-clobber sink ---------------------------------------
@@ -441,13 +518,31 @@ test('the sink install order is complete-write → temp fsync → no-clobber ins
   }
 });
 
-test('a directory-sync failure fails the install rather than reporting durable persistence', async () => {
+test('a directory-sync failure fails the install; a completion retry re-syncs the directory', async () => {
   const dir = mkdtempSync(TMP_PREFIX);
   try {
     const { permit, artifact } = await genuineFire();
-    const failingDirSync: ArtifactFs = { ...nodeArtifactFs, syncDir: () => { throw new Error('simulated directory sync failure'); } };
-    const sink = new LineOpenArtifactSink(dir, failingDirSync);
+    let syncDirCalls = 0;
+    let failNext = true;
+    const flaky: ArtifactFs = {
+      ...nodeArtifactFs,
+      syncDir: (d) => {
+        syncDirCalls += 1;
+        if (failNext) {
+          failNext = false;
+          throw new Error('simulated directory sync failure');
+        }
+        nodeArtifactFs.syncDir(d);
+      },
+    };
+    const sink = new LineOpenArtifactSink(dir, flaky);
+    // The fresh link succeeds but its directory fsync fails → the whole call fails.
     assert.throws(() => sink.write(permit, artifact), /simulated directory sync failure/);
+    // The completion retry (EEXIST, identical bytes) re-establishes directory durability
+    // rather than papering over the un-synced entry.
+    const retry = sink.write(permit, artifact);
+    assert.equal(retry.created, false);
+    assert.equal(syncDirCalls, 2, 'syncDir is attempted on the fresh link AND on the idempotent retry');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

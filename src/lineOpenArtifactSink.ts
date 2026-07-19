@@ -172,6 +172,10 @@ export class LineOpenArtifactSink implements ArtifactSink {
         if (existing !== bytes) {
           throw new Error(`refusing to overwrite a byte-different fire artifact already installed at ${finalPath}`);
         }
+        // Re-establish directory durability on a completion retry too: a prior attempt may
+        // have linked the final entry and then failed at its own directory fsync, so the
+        // idempotent path must not report durable success without syncing the entry itself.
+        this.fs.syncDir(dir);
         result = { path: finalPath, created: false };
       }
       cleanupTemp();

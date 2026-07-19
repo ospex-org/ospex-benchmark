@@ -383,9 +383,6 @@ export async function runOneArmGame(
   // passes each arm's real index; a direct single-arm caller (with no lifecycle to key) uses 0.
   armIndex = 0,
 ): Promise<ArmGameResult> {
-  // Runtime guard: never dispatch a request that did not come through the
-  // prepared boundary — before reading any field or touching an adapter method.
-  assertPrepared(request);
   const lifecycle = options.lifecycle;
   // The initial concurrency lease is released EXACTLY ONCE — the moment this arm's initial
   // attempt settles or is skipped — and again as a backstop in the finally, so a throw from
@@ -397,6 +394,10 @@ export async function runOneArmGame(
     if (lifecycle) await lifecycle.releaseInitial(armIndex);
   };
   try {
+    // Runtime guard: never dispatch a request that did not come through the prepared
+    // boundary — before reading any field or touching an adapter method. Inside the try so
+    // its (unreachable-in-canonical-flow) throw still releases the initial slot.
+    assertPrepared(request);
     return await dispatchArmGame(arm, adapter, request, options, armIndex, releaseInitial);
   } finally {
     await releaseInitial();
@@ -571,12 +572,12 @@ async function dispatchArmGame(
     }
   }
 
-  const repairTurns: ChatTurn[] = [
-    ...baseTurns,
-    { role: 'assistant', content: firstResponse.rawText },
-    { role: 'user', content: buildRepairInstruction(firstValidation.errors) },
-  ];
   try {
+    const repairTurns: ChatTurn[] = [
+      ...baseTurns,
+      { role: 'assistant', content: firstResponse.rawText },
+      { role: 'user', content: buildRepairInstruction(firstValidation.errors) },
+    ];
     const repair = await timedChat(
       adapter,
       repairTurns,
