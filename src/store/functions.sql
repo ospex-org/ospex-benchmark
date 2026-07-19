@@ -155,10 +155,11 @@ begin
   if v_retained is null then return jsonb_build_object('outcome','refused','reason','all_claimed','dispatchAuthorized',false); end if;
 
   -- 4. store-derived magnitudes; spend from the retained scope table (§4.5).
-  --    roster_size/max_repairs are int4, so multiply in BIGINT (`::bigint`) — an int4×int4
-  --    product would overflow int4 arithmetic before assignment (the adapter also bounds it
-  --    to a safe integer before admit, so the reservation stays exact).
-  v_call_delta := v.roster_size::bigint * (1 + v.max_repairs_per_arm);
+  --    roster_size/max_repairs are int4, so do the WHOLE product in BIGINT — both the
+  --    multiply AND the inner `1 + max_repairs` (an int4 `1 + max_repairs` overflows when
+  --    max_repairs is near int4 max, before the multiply). The adapter also bounds the
+  --    product to a safe integer before admit, so the reservation stays exact.
+  v_call_delta := v.roster_size::bigint * (1::bigint + v.max_repairs_per_arm::bigint);
   v_scope_key := array_to_string(v_retained, '+');
   if not (p_scope ? v_scope_key) then return jsonb_build_object('outcome','refused','reason','scope_reservation_missing','dispatchAuthorized',false); end if;
   v_spend_delta := (p_scope -> v_scope_key ->> 'spend')::bigint;

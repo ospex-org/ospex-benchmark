@@ -95,6 +95,14 @@ test('init: a bigint cap above int4 max is accepted (bigint fields are not over-
   assert.equal(calls.length, 1, 'a safe bigint above int4 max must pass client validation and reach the DB');
 });
 
+test('init: maxRepairsPerArm at int4 max (roster 1) is accepted — the derived product stays a safe integer', async () => {
+  const { store, calls } = stub(r({ outcome: 'initialized' }));
+  // product = 1 * (1 + 2147483647) = 2147483648: a safe int, so the adapter admits it; the SQL
+  // must then compute the inner `1 + maxRepairs` in bigint (proven end-to-end in conformance).
+  assert.deepEqual(await store.initCohortBudget({ ...initReq, rosterSize: 1, maxRepairsPerArm: 2_147_483_647 }), { outcome: 'initialized' });
+  assert.equal(calls.length, 1);
+});
+
 test('init: maps initialized / config_mismatch / version_mismatch', async () => {
   assert.deepEqual(await stub(r({ outcome: 'initialized' })).store.initCohortBudget(initReq), { outcome: 'initialized' });
   assert.deepEqual(await stub(r({ outcome: 'refused', reason: 'config_mismatch' })).store.initCohortBudget(initReq), { outcome: 'refused', reason: 'config_mismatch' });

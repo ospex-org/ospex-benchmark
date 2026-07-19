@@ -187,6 +187,13 @@ async function main(): Promise<void> {
     await store.initCohortBudget(pins(big, { rosterSize: 50_000, maxRepairsPerArm: 50_000, callCap: 1_000_000 }));
     const refused = await store.admitDispatch({ cohortId: big, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
     assert.equal(refused.outcome === 'refused' && refused.reason, 'call_cap');
+    // boundary: maxRepairsPerArm at int4 max, roster 1 → the INNER `1 + maxRepairs` must also
+    // be bigint (the product 2147483648 is a safe int, so the adapter admits it to the DB); a
+    // raw 22003 here means the inner addition wasn't promoted.
+    const edge = cohortName('addedge');
+    await store.initCohortBudget(pins(edge, { rosterSize: 1, maxRepairsPerArm: 2_147_483_647, callCap: 1_000_000 }));
+    const edgeRefused = await store.admitDispatch({ cohortId: edge, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    assert.equal(edgeRefused.outcome === 'refused' && edgeRefused.reason, 'call_cap');
     // a product that overflows a safe integer is refused at init, before any DB row exists.
     const over = cohortName('overproduct');
     assert.deepEqual(await store.initCohortBudget(pins(over, { rosterSize: 2_000_000_000, maxRepairsPerArm: 2_000_000_000 })), { outcome: 'refused', reason: 'invalid_input' });
