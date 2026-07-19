@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
+import { cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
 import {
   assertFireArtifact,
@@ -8,16 +9,19 @@ import {
   fireArtifactV1Schema,
 } from './fireArtifactProducer.js';
 import type { FireContext, MarketFireContextV1 } from './fireArtifactProducer.js';
-import { cohortId as deriveCohortId, parseManifest } from './manifest.js';
+import { checkPublication } from './manifestPublication.js';
+import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
+import { promptScaffoldSha256 } from './prompt.js';
 import { ProviderTimeoutError } from './providers/errors.js';
 import { runSlate } from './runner.js';
-import { SMOKE_LABEL } from './types.js';
+import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 import type { BootedCohort } from './cohortBoot.js';
 import type { CandidateInput } from './detection.js';
 import type { PublicationVerified } from './manifestPublication.js';
 import type { TwoSidedHistoryRow } from './oddsHistory.js';
 import type { RunEnvelope } from './runner.js';
 import type { GameRequest } from './bundle.js';
+import { SMOKE_LABEL } from './types.js';
 import type {
   ArmSpec,
   BenchmarkResponse,
@@ -25,86 +29,72 @@ import type {
   GameBundle,
   MarketKey,
   ProviderAdapter,
+  ProviderName,
   ProviderResponse,
   SlateBundle,
 } from './types.js';
 
 /**
- * The fire-artifact producer (SPEC §4/§5/§6). Every test drives real code: the
- * envelope comes through `runSlate` (branded), the detection context re-evaluates
+ * The fire-artifact producer (SPEC §4/§5). Every test drives real code: the
+ * envelope comes through `runSlate` (branded), the booted cohort through the
+ * canonical `cohortBoot` (a code-consistent manifest), the publication through
+ * `checkPublication` (branded, cohort-bound), the detection context re-evaluates
  * through the real `evaluateCandidate`, and the opener/as-of/baselines are
  * re-derived — so each gate is exercised against the actual guard.
  *
  * MLB's market policy enables moneyline + total only (the run line is off), so a
- * fire's scope is a subset of {moneyline, total}; fixtures respect that and use
- * the scoped baseline policy (v0.3).
+ * fire's scope is a subset of {moneyline, total}; fixtures respect that and use the
+ * scoped baseline policy (v0.3).
  */
 
 const GAME_ID = '00000000-0000-4000-8000-0000000000f1';
+const GAME_ID_2 = '00000000-0000-4000-8000-0000000000f2';
 const CUTOFF = '2026-07-18T20:00:00+00:00';
 const WINDOW_START = '2026-07-18T00:00:00.000Z';
 const WINDOW_END = '2026-07-19T00:00:00.000Z';
 const BUNDLE_TS = '2026-07-18T12:00:00.000Z';
-const DETECTED_AT = '2026-07-18T12:00:30.000Z';
-const OPENER_AT = '2026-07-18T11:59:30.000Z'; // 60 s before detection, in window
+const DETECTED_AT = '2026-07-18T12:00:30.000Z'; // 60 s after opener, in window
+const OPENER_AT = '2026-07-18T11:59:30.000Z';
 const OBSERVED_AT = '2026-07-18T11:58:00+00:00'; // market quote, before the bundle
+const BUNDLE_BUILT_AT = '2026-07-18T12:00:31.000Z';
+const COMMITTER_TS = '2026-07-17T23:00:00+00:00'; // strictly before windowStart
 const NOW_MS = Date.parse('2026-07-18T12:00:40.000Z'); // after detection, before cutoff
 const W = 120_000;
 const SKEW = 5_000;
 
-const ARM_A: ArmSpec = {
-  participantId: 'arm-a',
-  provider: 'openai',
-  requestedModelId: 'model-a',
-  credentialEnvVar: 'STUB_A_KEY',
-};
-const ARM_B: ArmSpec = {
-  participantId: 'arm-b',
-  provider: 'anthropic',
-  requestedModelId: 'model-b',
-  credentialEnvVar: 'STUB_B_KEY',
-};
+// The real code roster (the manifest must equal it to pass cohortBoot).
+const CODE_ARMS = defaultExpectedArms();
+const ARMS: ArmSpec[] = CODE_ARMS.map((a) => ({
+  participantId: a.participantId,
+  provider: a.provider as ProviderName,
+  requestedModelId: a.requestedModelId,
+  credentialEnvVar: `${a.participantId.replace(/[^a-z0-9]/gi, '_').toUpperCase()}_KEY`,
+}));
 
 // --- game / request / response fixtures (scoped to a market subset) ---------
 
-function scopedGame(markets: readonly MarketKey[]): GameBundle {
+function scopedGame(markets: readonly MarketKey[], gameId = GAME_ID): GameBundle {
   const m: GameBundle['markets'] = {};
   if (markets.includes('moneyline')) {
-    m.moneyline = {
-      awayDecimal: 1.74627,
-      homeDecimal: 2.17,
-      observedAt: OBSERVED_AT,
-      evidenceRef: `ev:${GAME_ID}:moneyline`,
-    };
+    m.moneyline = { awayDecimal: 1.74627, homeDecimal: 2.17, observedAt: OBSERVED_AT, evidenceRef: `ev:${gameId}:moneyline` };
   }
   if (markets.includes('total')) {
-    m.total = {
-      line: 8.5,
-      overDecimal: 1.90909,
-      underDecimal: 1.90909,
-      observedAt: OBSERVED_AT,
-      evidenceRef: `ev:${GAME_ID}:total`,
-    };
+    m.total = { line: 8.5, overDecimal: 1.90909, underDecimal: 1.90909, observedAt: OBSERVED_AT, evidenceRef: `ev:${gameId}:total` };
   }
   return {
-    gameId: GAME_ID,
+    gameId,
     league: 'mlb',
     scheduledStartUtc: CUTOFF,
     awayTeam: 'Milwaukee Brewers',
     homeTeam: 'Pittsburgh Pirates',
     probableStartingPitchers: null,
     markets: m,
-    evidenceRefs: [
-      `ev:${GAME_ID}:identity`,
-      `ev:${GAME_ID}:schedule`,
-      `ev:${GAME_ID}:moneyline`,
-      `ev:${GAME_ID}:total`,
-    ],
+    evidenceRefs: [`ev:${gameId}:identity`, `ev:${gameId}:schedule`, `ev:${gameId}:moneyline`, `ev:${gameId}:total`],
   };
 }
 
-function scopedRequest(markets: readonly MarketKey[]): GameRequest {
-  const game = scopedGame(markets);
+function scopedRequest(markets: readonly MarketKey[], gameId = GAME_ID): GameRequest {
+  const game = scopedGame(markets, gameId);
   const requestBundle: SlateBundle = {
     schemaVersion: 1,
     label: SMOKE_LABEL,
@@ -114,13 +104,7 @@ function scopedRequest(markets: readonly MarketKey[]): GameRequest {
     cutoffAt: CUTOFF,
     games: [game],
   };
-  return {
-    gameId: GAME_ID,
-    slug: 'mil-pit-2026-07-18',
-    game,
-    requestBundle,
-    requestSha256: sha256Hex(canonicalize(requestBundle)),
-  };
+  return { gameId, slug: 'mil-pit-2026-07-18', game, requestBundle, requestSha256: sha256Hex(canonicalize(requestBundle)) };
 }
 
 function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): BenchmarkResponse {
@@ -199,45 +183,37 @@ function stubAdapter(arm: ArmSpec, handlers: Array<() => ProviderResponse>): Pro
 
 // --- manifest / boot / publication fixtures ---------------------------------
 
-function rosterOf(arms: readonly ArmSpec[]): unknown[] {
-  return arms.map((a) => ({
-    participantId: a.participantId,
-    provider: a.provider,
-    requestedModelId: a.requestedModelId,
-    approvedReportedModelIds: [a.requestedModelId],
-  }));
-}
-
-function rawManifest(opts: {
-  roster: unknown[];
-  network?: string;
-  baselinePolicyVersion?: string;
-}): unknown {
+function manifestObject(over: { baselinePolicyVersion?: string; network?: string } = {}): Record<string, unknown> {
   return {
     artifactSchemaVersion: 1,
-    network: opts.network ?? 'polygon',
+    network: over.network ?? 'polygon',
     sportAllowList: ['mlb'],
     windowStart: WINDOW_START,
     windowEnd: WINDOW_END,
     source: 'jsonodds',
     sourceQueryVersion: 'source-query-v1',
-    marketPolicyVersion: 'market-policy-v1',
-    marketPolicyDigest: 'a'.repeat(64),
-    promptScaffoldSha256: 'b'.repeat(64),
-    expectedArmRoster: opts.roster,
+    marketPolicyVersion: MARKET_POLICY_VERSION,
+    marketPolicyDigest: MARKET_POLICY_DIGEST,
+    promptScaffoldSha256: promptScaffoldSha256(),
+    expectedArmRoster: CODE_ARMS.map((a) => ({
+      participantId: a.participantId,
+      provider: a.provider,
+      requestedModelId: a.requestedModelId,
+      approvedReportedModelIds: [...a.approvedReportedModelIds],
+    })),
     toolInferenceConfigSha256: 'c'.repeat(64),
-    baselinePolicyVersion: opts.baselinePolicyVersion ?? 'baselines-v0.3.0',
+    baselinePolicyVersion: over.baselinePolicyVersion ?? 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
-    scoringPolicyVersion: 'scoring-v1',
+    scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: 'prices-v1',
     modelPriceTableDigest: 'd'.repeat(64),
     runnerCommitSha: 'e'.repeat(40),
     constants: {
       pollIntervalMs: 30_000,
-      cleanEntryWindowMs: 120_000,
+      cleanEntryWindowMs: W,
       gameDiscoveryWindowHours: 168,
-      maxClockSkewMs: 5_000,
+      maxClockSkewMs: SKEW,
       freshFireMs: 30_000,
       maxDispatchLagMs: 10_000,
       historyReadTimeoutMs: 30_000,
@@ -246,7 +222,7 @@ function rawManifest(opts: {
       maxRepairAttemptsPerArm: 1,
       ingestionGraceMs: 900_000,
       scheduleChangeToleranceMs: 60_000,
-      maxConcurrentProviderRequests: 4,
+      maxConcurrentProviderRequests: Math.max(8, CODE_ARMS.length),
       maxDispatchesPerTick: 8,
     },
     cohortCallCap: 1_000,
@@ -254,28 +230,21 @@ function rawManifest(opts: {
   };
 }
 
-function bootedFrom(opts: { roster: unknown[]; network?: string; baselinePolicyVersion?: string }): BootedCohort {
-  const manifest = parseManifest(rawManifest(opts));
-  return { cohortId: deriveCohortId(manifest), manifest };
+function manifestJson(over?: { baselinePolicyVersion?: string; network?: string }): string {
+  return JSON.stringify(manifestObject(over));
 }
 
-function bootedFor(
-  arms: readonly ArmSpec[],
-  o: { network?: string; baselinePolicyVersion?: string } = {},
-): BootedCohort {
-  return bootedFrom({ roster: rosterOf(arms), ...o });
+function bootFrom(json: string): BootedCohort {
+  return cohortBoot({ live: false, manifestBytes: json });
 }
 
-function publication(): PublicationVerified {
-  return {
-    publication: {
-      repositoryOwner: 'ospex-org',
-      repositoryName: 'ospex-benchmark',
-      path: 'manifests/cohort.json',
-      commitSha: 'a'.repeat(40),
-    },
-    committerTimestamp: '2026-07-17T23:00:00+00:00',
-  };
+function publicationFor(json: string): PublicationVerified {
+  const bytes = new TextEncoder().encode(json);
+  return checkPublication({
+    localManifestBytes: bytes,
+    publication: { repositoryOwner: 'ospex-org', repositoryName: 'ospex-benchmark', path: 'manifests/cohort.json', commitSha: 'a'.repeat(40) },
+    resolved: { blobBytes: bytes, committerTimestamp: COMMITTER_TS },
+  });
 }
 
 // --- detection context fixtures ---------------------------------------------
@@ -303,7 +272,7 @@ function candidateInput(market: MarketKey, over: Partial<CandidateInput> = {}): 
     sport: 'mlb',
     market,
     sportAllowList: ['mlb'],
-    marketPolicyVersion: 'market-policy-v1',
+    marketPolicyVersion: MARKET_POLICY_VERSION,
     opener: historyRow(market),
     detectedAt: DETECTED_AT,
     windowStart: WINDOW_START,
@@ -333,6 +302,7 @@ function marketCtx(
 function makeCtx(
   cohortId: string,
   booted: BootedCohort,
+  publication: PublicationVerified,
   markets: readonly MarketKey[],
   fireId = 'fire-1',
 ): FireContext {
@@ -340,8 +310,8 @@ function makeCtx(
     booted,
     fireId,
     runId: 'run-1',
-    publication: publication(),
-    bundleBuiltAt: '2026-07-18T12:00:31.000Z',
+    publication,
+    bundleBuiltAt: BUNDLE_BUILT_AT,
     perMarket: markets.map((m) => marketCtx(m, cohortId, fireId)),
   };
 }
@@ -375,21 +345,23 @@ async function makeEnv(opts: {
   });
 }
 
-/** A complete, valid fire: env + context sharing one booted cohort. */
+/** A complete, valid fire: authenticated booted cohort + publication + branded env. */
 async function buildFire(
   opts: {
     markets?: readonly MarketKey[];
     arms?: readonly ArmSpec[];
     outcomeFor?: (arm: ArmSpec) => 'valid' | 'timeout';
   } = {},
-): Promise<{ env: RunEnvelope; ctx: FireContext; booted: BootedCohort; cohortId: string; markets: readonly MarketKey[] }> {
+): Promise<{ env: RunEnvelope; ctx: FireContext; booted: BootedCohort; publication: PublicationVerified; cohortId: string; markets: readonly MarketKey[] }> {
   const markets = opts.markets ?? (['moneyline', 'total'] as const);
-  const arms = opts.arms ?? [ARM_A];
-  const booted = bootedFor(arms);
+  const arms = opts.arms ?? ARMS;
+  const json = manifestJson();
+  const booted = bootFrom(json);
+  const publication = publicationFor(json);
   const cohortId = booted.cohortId;
   const env = await makeEnv({ markets, arms, cohortId, ...(opts.outcomeFor ? { outcomeFor: opts.outcomeFor } : {}) });
-  const ctx = makeCtx(cohortId, booted, markets);
-  return { env, ctx, booted, cohortId, markets };
+  const ctx = makeCtx(cohortId, booted, publication, markets);
+  return { env, ctx, booted, publication, cohortId, markets };
 }
 
 // --- happy path -------------------------------------------------------------
@@ -400,16 +372,14 @@ test('builds a valid 2-market fire artifact with the expected shape', async () =
 
   assert.equal(artifact.artifactSchemaVersion, 1);
   assert.equal(artifact.cohortId, cohortId);
+  assert.equal(artifact.publication.cohortId, cohortId);
   assert.equal(artifact.fireId, 'fire-1');
-  assert.equal(artifact.runId, 'run-1');
   assert.equal(artifact.gameId, GAME_ID);
   assert.equal(artifact.sport, 'mlb');
   assert.deepEqual(artifact.scopedMarkets, ['moneyline', 'total']);
   assert.equal(artifact.scheduledAtAtFire, CUTOFF);
   assert.equal(artifact.detectedAt, DETECTED_AT);
   assert.equal(artifact.preparedSnapshotTs, BUNDLE_TS);
-  assert.equal(artifact.requestSha256, env.snapshot.prepared[0]?.requestSha256);
-  assert.equal(artifact.slateSha256, env.snapshot.slateSha256);
 
   assert.equal(artifact.marketEvidence.length, 2);
   assert.deepEqual(artifact.marketEvidence.map((m) => m.market), ['moneyline', 'total']);
@@ -417,15 +387,13 @@ test('builds a valid 2-market fire artifact with the expected shape', async () =
   assert.deepEqual(artifact.marketEvidence[0]?.historyReadMode, { mode: 'live-unbounded' });
   assert.equal(artifact.claims.length, 2);
 
-  assert.equal(artifact.arms.length, 1);
-  const arm = artifact.arms[0]!;
-  assert.equal(arm.terminalOutcome, 'valid');
-  assert.match(arm.armDigest, /^[0-9a-f]{64}$/);
-  assert.equal(arm.acceptedResponseDigest?.length, 64);
-  assert.deepEqual(arm.acceptedDecisionFingerprint?.map((d) => d.market), ['moneyline', 'total']);
-  assert.equal(arm.expectedArmIdentity.participantId, 'arm-a');
+  assert.equal(artifact.arms.length, ARMS.length);
+  assert.equal(artifact.expectedArmIdentities.length, ARMS.length);
+  const anyArm = artifact.arms[0]!;
+  assert.match(anyArm.armDigest, /^[0-9a-f]{64}$/);
+  assert.ok(artifact.arms.every((a) => a.terminalOutcome === 'valid'));
+  assert.deepEqual(anyArm.acceptedDecisionFingerprint?.map((d) => d.market), ['moneyline', 'total']);
 
-  // baselines cover exactly the scope, all on this game
   const baselineMarkets = [...new Set(artifact.baselineDecisions.map((d) => d.market))].sort();
   assert.deepEqual(baselineMarkets, ['moneyline', 'total']);
   assert.ok(artifact.baselineDecisions.every((d) => d.gameId === GAME_ID));
@@ -441,13 +409,25 @@ test('a 1-market (moneyline-only) fire scopes everything to that market', async 
   assert.deepEqual(artifact.arms[0]?.acceptedDecisionFingerprint?.map((d) => d.market), ['moneyline']);
 });
 
+test('retains the exact scoped request bundle as the digest preimage', async () => {
+  const { env, ctx } = await buildFire();
+  const artifact = buildFireArtifact(env, ctx);
+  const sealed = env.snapshot.prepared[0]!.requestBundle;
+  // The retained request graph is the exact sealed bundle, detached + plain JSON.
+  assert.deepEqual(JSON.parse(JSON.stringify(artifact.requestBundle)), JSON.parse(JSON.stringify(sealed)));
+  // All three digests recompute from the retained value.
+  assert.equal(sha256Hex(canonicalize(artifact.requestBundle)), artifact.requestSha256);
+  assert.equal(sha256Hex(canonicalize(artifact.requestBundle.games[0])), artifact.gameSha256);
+  assert.equal(artifact.slateSha256, artifact.requestSha256); // single-game slate == request
+  // The scope is the present markets in the retained request game.
+  const g = artifact.requestBundle.games[0]!;
+  assert.ok(g.markets.moneyline && g.markets.total && !g.markets.runLine);
+});
+
 test('the produced artifact is deterministic (byte-identical canonicalization)', async () => {
   const a = await buildFire();
   const b = await buildFire();
-  assert.equal(
-    canonicalize(buildFireArtifact(a.env, a.ctx)),
-    canonicalize(buildFireArtifact(b.env, b.ctx)),
-  );
+  assert.equal(canonicalize(buildFireArtifact(a.env, a.ctx)), canonicalize(buildFireArtifact(b.env, b.ctx)));
 });
 
 test('the output is deeply frozen and branded, rejecting any copy', async () => {
@@ -455,18 +435,14 @@ test('the output is deeply frozen and branded, rejecting any copy', async () => 
   const artifact = buildFireArtifact(env, ctx);
   assert.ok(Object.isFrozen(artifact));
   assert.ok(Object.isFrozen(artifact.arms));
-  assert.ok(Object.isFrozen(artifact.arms[0]));
+  assert.ok(Object.isFrozen(artifact.requestBundle));
   assert.ok(Object.isFrozen(artifact.marketEvidence[0]?.opener));
   assert.throws(() => {
     (artifact as { fireId: string }).fireId = 'tampered';
   });
-  // The brand accepts the genuine artifact and rejects a structurally-identical copy.
   assert.doesNotThrow(() => assertFireArtifact(artifact));
   assert.throws(() => assertFireArtifact({ ...artifact }), /not produced by buildFireArtifact/);
-  assert.throws(
-    () => assertFireArtifact(JSON.parse(JSON.stringify(artifact))),
-    /not produced by buildFireArtifact/,
-  );
+  assert.throws(() => assertFireArtifact(JSON.parse(JSON.stringify(artifact))), /not produced by buildFireArtifact/);
 });
 
 test('the output round-trips through its own strict schema unchanged', async () => {
@@ -477,13 +453,13 @@ test('the output round-trips through its own strict schema unchanged', async () 
 });
 
 test('a frozen-watermark read mode is persisted on the market evidence', async () => {
-  const { env, cohortId, booted } = await buildFire();
+  const { env, cohortId, booted, publication } = await buildFire();
   const ctx: FireContext = {
     booted,
     fireId: 'fire-1',
     runId: 'run-1',
-    publication: publication(),
-    bundleBuiltAt: '2026-07-18T12:00:31.000Z',
+    publication,
+    bundleBuiltAt: BUNDLE_BUILT_AT,
     perMarket: (['moneyline', 'total'] as const).map((m) => marketCtx(m, cohortId, 'fire-1', { watermark: 500 })),
   };
   const artifact = buildFireArtifact(env, ctx);
@@ -491,27 +467,22 @@ test('a frozen-watermark read mode is persisted on the market evidence', async (
 });
 
 test('a non-valid arm is retained with one terminal outcome and no accepted decision', async () => {
-  const { env, cohortId, booted } = await buildFire({
-    arms: [ARM_A, ARM_B],
-    outcomeFor: (arm) => (arm.participantId === ARM_B.participantId ? 'timeout' : 'valid'),
+  const timeoutArm = ARMS[ARMS.length - 1]!;
+  const { env, ctx } = await buildFire({
+    outcomeFor: (arm) => (arm.participantId === timeoutArm.participantId ? 'timeout' : 'valid'),
   });
-  const ctx = makeCtx(cohortId, booted, ['moneyline', 'total']);
   const artifact = buildFireArtifact(env, ctx);
-
-  assert.equal(artifact.arms.length, 2);
-  assert.deepEqual(artifact.expectedArmIdentities.map((i) => i.participantId), ['arm-a', 'arm-b']);
-  const armB = artifact.arms.find((a) => a.expectedArmIdentity.participantId === 'arm-b')!;
-  assert.equal(armB.terminalOutcome, 'timeout');
-  assert.equal(armB.acceptedResponseDigest, null);
-  assert.equal(armB.acceptedDecisionFingerprint, null);
-  assert.equal(armB.orderedAttempts.length, 1); // the sent-but-timed-out initial attempt
-  assert.equal(armB.orderedAttempts[0]?.transport, 'timeout');
-  assert.match(armB.armDigest, /^[0-9a-f]{64}$/);
-  const armA = artifact.arms.find((a) => a.expectedArmIdentity.participantId === 'arm-a')!;
-  assert.equal(armA.terminalOutcome, 'valid');
+  assert.equal(artifact.arms.length, ARMS.length);
+  const armT = artifact.arms.find((a) => a.expectedArmIdentity.participantId === timeoutArm.participantId)!;
+  assert.equal(armT.terminalOutcome, 'timeout');
+  assert.equal(armT.acceptedResponseDigest, null);
+  assert.equal(armT.acceptedDecisionFingerprint, null);
+  assert.equal(armT.orderedAttempts.length, 1);
+  assert.equal(armT.orderedAttempts[0]?.transport, 'timeout');
+  assert.match(armT.armDigest, /^[0-9a-f]{64}$/);
 });
 
-// --- adversarial: fail-closed guards ----------------------------------------
+// --- adversarial: authority-input authentication ----------------------------
 
 test('rejects a forged (unbranded) envelope', async () => {
   const { env, ctx } = await buildFire();
@@ -525,28 +496,103 @@ test('rejects a forged (unbranded) envelope', async () => {
   assert.throws(() => buildFireArtifact(forged, ctx), /not produced by runSlate/);
 });
 
+test('rejects a hand-built (unbranded) booted cohort', async () => {
+  const { env, ctx, booted } = await buildFire();
+  const fake: BootedCohort = { cohortId: booted.cohortId, manifest: booted.manifest };
+  assert.throws(() => buildFireArtifact(env, { ...ctx, booted: fake }), /not produced by cohortBoot/);
+});
+
+test('rejects a structurally-identical copy of a genuine booted cohort', async () => {
+  const { env, ctx, booted } = await buildFire();
+  assert.throws(() => buildFireArtifact(env, { ...ctx, booted: { ...booted } }), /not produced by cohortBoot/);
+});
+
+test('rejects a hand-built (unbranded) publication record', async () => {
+  const { env, ctx, booted } = await buildFire();
+  const fake: PublicationVerified = {
+    publication: { repositoryOwner: 'ospex-org', repositoryName: 'ospex-benchmark', path: 'm.json', commitSha: 'a'.repeat(40) },
+    committerTimestamp: COMMITTER_TS,
+    cohortId: booted.cohortId,
+  };
+  assert.throws(() => buildFireArtifact(env, { ...ctx, publication: fake }), /not produced by checkPublication/);
+});
+
+test('rejects a genuine publication verified for a different cohort', async () => {
+  const { env, ctx } = await buildFire();
+  const otherPub = publicationFor(manifestJson({ network: 'ethereum' })); // branded, but a different cohortId
+  assert.throws(() => buildFireArtifact(env, { ...ctx, publication: otherPub }), /publication was verified for cohort/);
+});
+
+// --- adversarial: candidate authority reconciliation ------------------------
+
+test('rejects a candidate whose clean-entry window is widened over the manifest', async () => {
+  const { env, ctx } = await buildFire();
+  const widened: MarketFireContextV1 = {
+    ...ctx.perMarket[0]!,
+    candidateInput: { ...ctx.perMarket[0]!.candidateInput, cleanEntryWindowMs: 600_000 },
+  };
+  assert.throws(
+    () => buildFireArtifact(env, { ...ctx, perMarket: [widened, ctx.perMarket[1]!] }),
+    /cleanEntryWindowMs 600000 != manifest 120000/,
+  );
+});
+
+test('rejects a candidate window that disagrees with the manifest', async () => {
+  const { env, ctx } = await buildFire();
+  const shifted: MarketFireContextV1 = {
+    ...ctx.perMarket[0]!,
+    candidateInput: { ...ctx.perMarket[0]!.candidateInput, windowStart: '2026-07-17T00:00:00.000Z' },
+  };
+  assert.throws(() => buildFireArtifact(env, { ...ctx, perMarket: [shifted, ctx.perMarket[1]!] }), /windowStart .* != manifest/);
+});
+
+test('rejects a candidate whose sportAllowList disagrees with the manifest', async () => {
+  const { env, ctx } = await buildFire();
+  const bad: MarketFireContextV1 = {
+    ...ctx.perMarket[0]!,
+    candidateInput: { ...ctx.perMarket[0]!.candidateInput, sportAllowList: ['mlb', 'nfl'] },
+  };
+  assert.throws(() => buildFireArtifact(env, { ...ctx, perMarket: [bad, ctx.perMarket[1]!] }), /sportAllowList != manifest/);
+});
+
+// --- adversarial: history / timestamp grammar -------------------------------
+
+test('rejects a history row whose captured_at is not a coherent instant', async () => {
+  const { env, ctx } = await buildFire();
+  const badRow = historyRow('moneyline', {
+    id: 2,
+    captured_at: 'not-an-instant',
+    captured_at_ms: Date.parse('2026-07-18T11:59:45.000Z'),
+  });
+  const bad: MarketFireContextV1 = { ...ctx.perMarket[0]!, historyRows: [historyRow('moneyline'), badRow] };
+  assert.throws(() => buildFireArtifact(env, { ...ctx, perMarket: [bad, ctx.perMarket[1]!] }), /invalid row/);
+});
+
+test('rejects a malformed bundleBuiltAt instant', async () => {
+  const { env, ctx } = await buildFire();
+  assert.throws(() => buildFireArtifact(env, { ...ctx, bundleBuiltAt: 'not-an-instant' }), /instant/i);
+});
+
+// --- adversarial: structure / identity / bijection --------------------------
+
 test('rejects a multi-game envelope', async () => {
-  const arms = [ARM_A];
-  const booted = bootedFor(arms);
+  const json = manifestJson();
+  const booted = bootFrom(json);
+  const publication = publicationFor(json);
   const cohortId = booted.cohortId;
-  const reqA = scopedRequest(['moneyline', 'total']);
-  const reqB: GameRequest = (() => {
-    const r = scopedRequest(['moneyline', 'total']);
-    const game = { ...r.game, gameId: '00000000-0000-4000-8000-0000000000f2' };
-    const requestBundle: SlateBundle = { ...r.requestBundle, games: [game] };
-    return {
-      gameId: game.gameId,
-      slug: 'other',
-      game,
-      requestBundle,
-      requestSha256: sha256Hex(canonicalize(requestBundle)),
-    };
-  })();
-  const adapter = stubAdapter(ARM_A, [
-    () => stubResponse(JSON.stringify(scopedResponse(reqA, ARM_A, cohortId)), ARM_A.requestedModelId),
-    () => stubResponse(JSON.stringify(scopedResponse(reqB, ARM_A, cohortId)), ARM_A.requestedModelId),
-  ]);
-  const env = await runSlate([ARM_A], new Map([[ARM_A.participantId, adapter]]), [reqA, reqB], {
+  const reqA = scopedRequest(['moneyline', 'total'], GAME_ID);
+  const reqB = scopedRequest(['moneyline', 'total'], GAME_ID_2);
+  const adapters = new Map<string, ProviderAdapter>();
+  for (const arm of ARMS) {
+    adapters.set(
+      arm.participantId,
+      stubAdapter(arm, [
+        () => stubResponse(JSON.stringify(scopedResponse(reqA, arm, cohortId)), arm.requestedModelId),
+        () => stubResponse(JSON.stringify(scopedResponse(reqB, arm, cohortId)), arm.requestedModelId),
+      ]),
+    );
+  }
+  const env = await runSlate([...ARMS], adapters, [reqA, reqB], {
     cohortId,
     timeoutMs: 600_000,
     maxOutputTokens: 16_000,
@@ -554,47 +600,45 @@ test('rejects a multi-game envelope', async () => {
     baselinePolicyVersion: 'baselines-v0.3.0',
     nowMs: () => NOW_MS,
   });
-  const ctx = makeCtx(cohortId, booted, ['moneyline', 'total']);
+  const ctx = makeCtx(cohortId, booted, publication, ['moneyline', 'total']);
   assert.throws(() => buildFireArtifact(env, ctx), /exactly one dispatched game/);
 });
 
 test('rejects a booted cohort whose identity disagrees with the envelope', async () => {
-  const { env } = await buildFire();
-  const otherBooted = bootedFor([ARM_A], { network: 'ethereum' }); // different cohortId
-  const ctx = makeCtx(otherBooted.cohortId, otherBooted, ['moneyline', 'total']);
+  const { env } = await buildFire(); // envelope on the default (polygon) cohort
+  const otherJson = manifestJson({ network: 'ethereum' });
+  const otherBooted = bootFrom(otherJson);
+  const otherPub = publicationFor(otherJson);
+  const ctx = makeCtx(otherBooted.cohortId, otherBooted, otherPub, ['moneyline', 'total']);
   assert.throws(() => buildFireArtifact(env, ctx), /!= booted cohortId/);
 });
 
 test('rejects a context whose markets differ from the dispatched scope', async () => {
   const { env, ctx } = await buildFire({ markets: ['moneyline', 'total'] });
-  const short: FireContext = { ...ctx, perMarket: [ctx.perMarket[0]!] }; // moneyline only
-  assert.throws(() => buildFireArtifact(env, short), /fire context markets .* != scope/);
+  assert.throws(() => buildFireArtifact(env, { ...ctx, perMarket: [ctx.perMarket[0]!] }), /fire context markets .* != scope/);
 });
 
 test('rejects a candidate bound to a different game', async () => {
   const { env, ctx, cohortId } = await buildFire();
-  const badMarket: MarketFireContextV1 = {
+  const bad: MarketFireContextV1 = {
     ...ctx.perMarket[0]!,
     candidateInput: { ...ctx.perMarket[0]!.candidateInput, gameId: 'some-other-game' },
     claim: { cohortId, fireId: 'fire-1', gameId: GAME_ID, market: 'moneyline' },
   };
-  const bad: FireContext = { ...ctx, perMarket: [badMarket, ctx.perMarket[1]!] };
-  assert.throws(() => buildFireArtifact(env, bad), /candidate gameId some-other-game != fire gameId/);
+  assert.throws(() => buildFireArtifact(env, { ...ctx, perMarket: [bad, ctx.perMarket[1]!] }), /candidate gameId some-other-game != fire gameId/);
 });
 
 test('rejects an ineligible re-evaluation', async () => {
   const { env, ctx, cohortId } = await buildFire();
-  // detectedAt after windowEnd → detected_after_window, not eligible.
   const lateInput = candidateInput('moneyline', { detectedAt: '2026-07-20T00:00:00.000Z' });
-  const badMarket: MarketFireContextV1 = {
+  const bad: MarketFireContextV1 = {
     candidateInput: lateInput,
     verdict: evaluateCandidate(lateInput),
     historyRows: [historyRow('moneyline')],
     historyWatermark: null,
     claim: { cohortId, fireId: 'fire-1', gameId: GAME_ID, market: 'moneyline' },
   };
-  const bad: FireContext = { ...ctx, perMarket: [badMarket, ctx.perMarket[1]!] };
-  assert.throws(() => buildFireArtifact(env, bad), /re-evaluates to detected_after_window, not eligible/);
+  assert.throws(() => buildFireArtifact(env, { ...ctx, perMarket: [bad, ctx.perMarket[1]!] }), /re-evaluates to detected_after_window, not eligible/);
 });
 
 test('rejects a recorded verdict that disagrees with its re-derivation', async () => {
@@ -606,82 +650,75 @@ test('rejects a recorded verdict that disagrees with its re-derivation', async (
     ...real,
     verdict: { ...realVerdict, openerAgeMs: (realVerdict as { openerAgeMs: number }).openerAgeMs + 1 },
   };
-  const bad: FireContext = { ...ctx, perMarket: [tampered, ctx.perMarket[1]!] };
-  assert.throws(() => buildFireArtifact(env, bad), /does not match its re-derivation/);
+  assert.throws(() => buildFireArtifact(env, { ...ctx, perMarket: [tampered, ctx.perMarket[1]!] }), /does not match its re-derivation/);
 });
 
 test('rejects an opener that is not the firstTwoSided of the supplied history', async () => {
   const { env, ctx } = await buildFire();
-  const real = ctx.perMarket[0]!;
-  // History whose earliest row is a DIFFERENT (earlier) row than the candidate's opener.
   const earlier = historyRow('moneyline', {
     id: 99,
     captured_at: '2026-07-18T11:00:00.000Z',
     captured_at_ms: Date.parse('2026-07-18T11:00:00.000Z'),
   });
-  const bad: FireContext = {
-    ...ctx,
-    perMarket: [{ ...real, historyRows: [earlier] }, ctx.perMarket[1]!],
-  };
-  assert.throws(() => buildFireArtifact(env, bad), /is not the firstTwoSided of the supplied history/);
+  const bad: MarketFireContextV1 = { ...ctx.perMarket[0]!, historyRows: [earlier] };
+  assert.throws(() => buildFireArtifact(env, { ...ctx, perMarket: [bad, ctx.perMarket[1]!] }), /is not the firstTwoSided of the supplied history/);
 });
 
 test('rejects a claim not bound to the fire', async () => {
   const { env, ctx, cohortId } = await buildFire();
-  const real = ctx.perMarket[0]!;
-  const bad: FireContext = {
-    ...ctx,
-    perMarket: [
-      { ...real, claim: { cohortId, fireId: 'a-different-fire', gameId: GAME_ID, market: 'moneyline' } },
-      ctx.perMarket[1]!,
-    ],
+  const bad: MarketFireContextV1 = {
+    ...ctx.perMarket[0]!,
+    claim: { cohortId, fireId: 'a-different-fire', gameId: GAME_ID, market: 'moneyline' },
   };
-  assert.throws(() => buildFireArtifact(env, bad), /claim reference does not bind to fire/);
+  assert.throws(() => buildFireArtifact(env, { ...ctx, perMarket: [bad, ctx.perMarket[1]!] }), /claim reference does not bind to fire/);
 });
 
 test('rejects scoped markets that disagree on the detection instant', async () => {
-  const { env, cohortId, booted } = await buildFire();
+  const { env, cohortId, booted, publication } = await buildFire();
   const ctx: FireContext = {
     booted,
     fireId: 'fire-1',
     runId: 'run-1',
-    publication: publication(),
-    bundleBuiltAt: '2026-07-18T12:00:31.000Z',
+    publication,
+    bundleBuiltAt: BUNDLE_BUILT_AT,
     perMarket: [
       marketCtx('moneyline', cohortId, 'fire-1'),
-      marketCtx('total', cohortId, 'fire-1', { detectedAt: '2026-07-18T12:00:40.000Z' }), // different instant
+      marketCtx('total', cohortId, 'fire-1', { detectedAt: '2026-07-18T12:00:45.000Z' }),
     ],
   };
   assert.throws(() => buildFireArtifact(env, ctx), /share one detection instant/);
 });
 
 test('rejects a baseline policy that disagrees with the manifest', async () => {
-  const arms = [ARM_A];
-  // Manifest pins v0.2, but the dispatched envelope carries v0.3.
-  const booted = bootedFor(arms, { baselinePolicyVersion: 'baselines-v0.2.0' });
+  const json = manifestJson(); // manifest pins v0.3
+  const booted = bootFrom(json);
+  const publication = publicationFor(json);
   const cohortId = booted.cohortId;
-  const env = await makeEnv({ markets: ['moneyline', 'total'], arms, cohortId, baselinePolicyVersion: 'baselines-v0.3.0' });
-  const ctx = makeCtx(cohortId, booted, ['moneyline', 'total']);
+  const env = await makeEnv({ markets: ['moneyline', 'total'], arms: ARMS, cohortId, baselinePolicyVersion: 'baselines-v0.2.0' });
+  const ctx = makeCtx(cohortId, booted, publication, ['moneyline', 'total']);
   assert.throws(() => buildFireArtifact(env, ctx), /baselinePolicyVersion .* != manifest/);
 });
 
 test('rejects a dispatched roster that is not the manifest roster', async () => {
-  const booted = bootedFor([ARM_A, ARM_B]); // manifest expects two arms
+  const json = manifestJson();
+  const booted = bootFrom(json);
+  const publication = publicationFor(json);
   const cohortId = booted.cohortId;
-  const env = await makeEnv({ markets: ['moneyline', 'total'], arms: [ARM_A], cohortId }); // only one dispatched
-  const ctx = makeCtx(cohortId, booted, ['moneyline', 'total']);
+  const subset = ARMS.slice(0, ARMS.length - 1); // dispatch fewer than the manifest roster
+  const env = await makeEnv({ markets: ['moneyline', 'total'], arms: subset, cohortId });
+  const ctx = makeCtx(cohortId, booted, publication, ['moneyline', 'total']);
   assert.throws(() => buildFireArtifact(env, ctx), /dispatched roster does not equal the manifest/);
 });
 
 test('rejects an arm-family mismatch between the dispatch and the manifest', async () => {
-  // Manifest says arm-a is a google arm; the dispatched arm-a is an openai arm.
-  const booted = bootedFrom({
-    roster: [
-      { participantId: 'arm-a', provider: 'google', requestedModelId: 'model-a', approvedReportedModelIds: ['model-a'] },
-    ],
-  });
+  const json = manifestJson();
+  const booted = bootFrom(json);
+  const publication = publicationFor(json);
   const cohortId = booted.cohortId;
-  const env = await makeEnv({ markets: ['moneyline', 'total'], arms: [ARM_A], cohortId });
-  const ctx = makeCtx(cohortId, booted, ['moneyline', 'total']);
-  assert.throws(() => buildFireArtifact(env, ctx), /manifest expects google/);
+  // Dispatch the first arm under a deliberately-wrong provider.
+  const wrongProvider: ProviderName = ARMS[0]!.provider === 'openai' ? 'anthropic' : 'openai';
+  const arms = ARMS.map((a, i) => (i === 0 ? { ...a, provider: wrongProvider } : a));
+  const env = await makeEnv({ markets: ['moneyline', 'total'], arms, cohortId });
+  const ctx = makeCtx(cohortId, booted, publication, ['moneyline', 'total']);
+  assert.throws(() => buildFireArtifact(env, ctx), /manifest expects/);
 });

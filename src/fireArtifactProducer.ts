@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { deepFreeze } from './freeze.js';
 import { runBaselines } from './baselines.js';
+import { assertBootedCohort } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
 import {
   armDigest,
@@ -13,33 +14,47 @@ import {
   toPersistedAttempts,
 } from './fireArtifact.js';
 import { cohortId as deriveCohortId } from './manifest.js';
-import { manifestPublicationV1Schema } from './manifestPublication.js';
-import { asOfQuote, firstTwoSided } from './oddsHistory.js';
+import { assertPublicationVerified, manifestPublicationV1Schema } from './manifestPublication.js';
+import { asOfQuote, firstTwoSided, instantMs, parseTwoSidedHistoryRows } from './oddsHistory.js';
 import { assertRunEnvelope } from './runner.js';
+import { isParseableInstant } from './time.js';
+import { SMOKE_LABEL } from './types.js';
 import type { ArmEvidenceV1, ExpectedArmIdentityV1 } from './fireArtifact.js';
 import type { BootedCohort } from './cohortBoot.js';
 import type { CandidateInput, CandidateVerdict } from './detection.js';
+import type { CohortManifestV1 } from './manifest.js';
 import type { PublicationVerified } from './manifestPublication.js';
 import type { TwoSidedHistoryRow } from './oddsHistory.js';
 import type { RunEnvelope } from './runner.js';
-import type { ArmGameResult, GameBundle, MarketKey } from './types.js';
+import type { ArmGameResult, GameBundle, MarketKey, SlateBundle } from './types.js';
 
 /**
  * The fire-artifact PRODUCER (SPEC-line-open-evidence-model.md §4/§5): assemble the
  * single, deeply-immutable, publication-verifiable record of ONE fire — one game,
  * one `fireId`, a 1–3-market scope — from an authenticated dispatched-evidence
  * envelope and the trusted internal fire context. It composes the arm-integrity
- * core (`./fireArtifact.ts`, §5) with the top-level scope / opener-and-as-of /
- * baseline / roster / claim evidence, enforcing the §4/§5/§6 bijections and
- * cardinality invariants so the producer can never emit an artifact its own
- * verifier would reject.
+ * core (`./fireArtifact.ts`, §5) with the top-level scope, the scoped request
+ * preimage, per-market opener/as-of evidence, baselines, roster, and claim
+ * linkage.
  *
- * The producer RE-DERIVES every recomputable quantity (bundle hashes, the detection
- * verdict, the opener, the as-of quote, the scoped baselines, the per-arm digest)
- * rather than trusting a supplied value, and fails closed on any disagreement.
- * Pure and I/O-free: no store, watcher, provider, close-capture, CLV, scoring, or
- * filesystem write — those are separate slices. Nullable fields use explicit
- * `null` (never `undefined`, which `canonicalize` drops).
+ * It AUTHENTICATES every authority input by unforgeable origin brand — the run
+ * envelope (`assertRunEnvelope`), the booted cohort (`assertBootedCohort`), and the
+ * verified publication (`assertPublicationVerified`, additionally bound to this
+ * cohort) — and it RECONCILES the candidate policy/config fields to the manifest,
+ * so eligibility is judged under the authenticated cohort policy, never a caller's.
+ * Every recomputable quantity is RE-DERIVED (the scoped request hashes from the
+ * retained bundle, the detection verdict, the opener, the as-of quote from
+ * re-validated history rows, the scoped baselines, the per-arm digest) and any
+ * disagreement fails closed.
+ *
+ * The result is a STRUCTURALLY COMPLETE, AUTHENTICATED evidence value. This is NOT
+ * the entry/integrity verifier: a later phase may still mark a retained fire
+ * entry-invalid or unscoreable — a dirty/failed fire and every terminal arm outcome
+ * stay observable, never deleted, and the retained request/history/identity
+ * evidence is what lets that later verifier classify them. Pure and I/O-free: no
+ * store, watcher, provider, close-capture, CLV, scoring, or filesystem write.
+ * Nullable fields use explicit `null` (never `undefined`, which `canonicalize`
+ * drops).
  */
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
@@ -47,11 +62,37 @@ const nonEmpty = z.string().min(1);
 const marketKeySchema = z.enum(['moneyline', 'spread', 'total']);
 const safeInt = z.number().int().safe();
 const nonnegSafeInt = z.number().int().safe().nonnegative();
+const finiteNumber = z.number().finite();
+const decimalOdds = z.number().finite().gt(1);
+const nonZeroAmerican = safeInt.refine((n) => n !== 0, { message: 'american odds must be a non-zero integer' });
+
+/** The repository's canonical offset-qualified instant grammar, applied to every
+ *  context/output timestamp this producer introduces so a persisted instant is
+ *  deterministically orderable and recomputable — never "not-an-instant". */
+const instantString = z.string().refine(isParseableInstant, {
+  message: 'must be an offset-qualified ISO-8601 instant',
+});
+
+/** Whether a persisted `captured_at_ms` is the coherent derivation of its
+ *  `captured_at` (guarded so a malformed instant fails the refinement rather than
+ *  throwing out of it). */
+function coherentCapturedMs(capturedAt: string, capturedAtMs: number): boolean {
+  try {
+    return capturedAtMs === instantMs(capturedAt);
+  } catch {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
-// Persisted odds_history row: exactly the validated TwoSidedHistoryRow fields
-// (§4 "row identity and the exact opening quote"), projected clean so no source
-// passthrough column (sportspage_id, created_at, ...) leaks into the evidence.
+// Persisted odds_history row (§4 "row identity and the exact opening quote").
+// REUSES the canonical source-row semantics of `oddsHistory.ts`
+// (`validTwoSidedHistoryRowV1`) rather than a weaker second contract: American odds
+// are safe non-zero integers, decimal odds finite and > 1, `line` is null for
+// moneyline and finite for spread/total, `captured_at` is an offset-qualified
+// instant, and `captured_at_ms` MUST equal `instantMs(captured_at)` (so a scorer
+// reproduces the exact ordering the artifact was built under). Rows are also
+// re-parsed through the canonical parser before ordering (below).
 // ---------------------------------------------------------------------------
 
 const persistedHistoryRowSchemaV1 = z
@@ -60,29 +101,32 @@ const persistedHistoryRowSchemaV1 = z
     jsonodds_id: nonEmpty,
     market: marketKeySchema,
     source: z.literal('jsonodds'),
-    line: z.number().nullable(),
-    away_odds_american: safeInt,
-    away_odds_decimal: z.number(),
-    home_odds_american: safeInt,
-    home_odds_decimal: z.number(),
-    captured_at: nonEmpty,
+    line: finiteNumber.nullable(),
+    away_odds_american: nonZeroAmerican,
+    away_odds_decimal: decimalOdds,
+    home_odds_american: nonZeroAmerican,
+    home_odds_decimal: decimalOdds,
+    captured_at: instantString,
     captured_at_ms: safeInt,
   })
-  .strict();
+  .strict()
+  .refine((r) => coherentCapturedMs(r.captured_at, r.captured_at_ms), {
+    message: 'captured_at_ms must equal instantMs(captured_at)',
+  })
+  .refine((r) => (r.market === 'moneyline' ? r.line === null : typeof r.line === 'number'), {
+    message: 'line must be null for moneyline and finite for spread/total',
+  });
 export type PersistedHistoryRowV1 = z.infer<typeof persistedHistoryRowSchemaV1>;
 
 /** The read mode the as-of derivation ran under: unbounded live detection, or a
- *  frozen scoring watermark (`id <= watermark`). Persisted so the scorer knows
- *  which bound reproduced the opener/as-of rows. */
+ *  frozen scoring watermark (`id <= watermark`). */
 const historyReadModeSchemaV1 = z.discriminatedUnion('mode', [
   z.object({ mode: z.literal('live-unbounded') }).strict(),
   z.object({ mode: z.literal('frozen-watermark'), watermark: nonnegSafeInt }).strict(),
 ]);
 export type HistoryReadModeV1 = z.infer<typeof historyReadModeSchemaV1>;
 
-/** The at-most-once claim key bound to this fire (§4 claim/completion linkage):
- *  `(cohortId, fireId, gameId, market)`. The key rejects a duplicate fire; the
- *  `fireId` binds this scoped claim to this completed artifact. */
+/** The at-most-once claim key bound to this fire (§4 claim/completion linkage). */
 const claimReferenceSchemaV1 = z
   .object({
     cohortId: sha256Schema,
@@ -93,14 +137,11 @@ const claimReferenceSchemaV1 = z
   .strict();
 export type ClaimReferenceV1 = z.infer<typeof claimReferenceSchemaV1>;
 
-/** Per-scoped-market entry verification evidence (§4/§5-V1/V2): the opener
- *  (first two-sided appearance, for the age gate) and the as-of quote at
- *  `detectedAt` (the price the model saw), each a detached full row, plus the
- *  read mode and the market's claim key. */
+/** Per-scoped-market entry verification evidence (§4/§5-V1/V2). */
 const marketFireEvidenceSchemaV1 = z
   .object({
     market: marketKeySchema,
-    detectedAt: nonEmpty,
+    detectedAt: instantString,
     openerAgeMs: nonnegSafeInt,
     opener: persistedHistoryRowSchemaV1,
     asOf: persistedHistoryRowSchemaV1,
@@ -118,8 +159,8 @@ const baselineDecisionSchemaV1 = z
     gameId: nonEmpty,
     market: marketKeySchema,
     selection: nonEmpty,
-    line: z.number().nullable(),
-    observedDecimal: z.number(),
+    line: finiteNumber.nullable(),
+    observedDecimal: finiteNumber,
     track: z.literal('common-cutoff'),
   })
   .strict();
@@ -128,7 +169,66 @@ const baselineDecisionSchemaV1 = z
 const publicationVerifiedSchemaV1 = z
   .object({
     publication: manifestPublicationV1Schema,
-    committerTimestamp: nonEmpty,
+    committerTimestamp: instantString,
+    cohortId: sha256Schema,
+  })
+  .strict();
+
+// ---------------------------------------------------------------------------
+// The exact scoped request bundle value (§4 "scoped bundle bytes"): the retained
+// preimage of requestSha256/gameSha256. Mirrors the prepared-request boundary's
+// shape so the persisted value recomputes those hashes and reconstructs the exact
+// model-facing request (teams, evidence refs, prices, lines, market blocks). Absent
+// markets are OMITTED keys; `.strict()` rejects any unknown field.
+// ---------------------------------------------------------------------------
+
+const moneylineBlockSchemaV1 = z
+  .object({ awayDecimal: decimalOdds, homeDecimal: decimalOdds, observedAt: instantString, evidenceRef: nonEmpty })
+  .strict();
+const runLineBlockSchemaV1 = z
+  .object({
+    line: finiteNumber,
+    awayHandicap: finiteNumber,
+    homeHandicap: finiteNumber,
+    awayDecimal: decimalOdds,
+    homeDecimal: decimalOdds,
+    observedAt: instantString,
+    evidenceRef: nonEmpty,
+  })
+  .strict();
+const totalBlockSchemaV1 = z
+  .object({ line: finiteNumber, overDecimal: decimalOdds, underDecimal: decimalOdds, observedAt: instantString, evidenceRef: nonEmpty })
+  .strict();
+const gameBundleSchemaV1 = z
+  .object({
+    gameId: nonEmpty,
+    league: z.literal('mlb'),
+    scheduledStartUtc: instantString,
+    awayTeam: nonEmpty,
+    homeTeam: nonEmpty,
+    probableStartingPitchers: z
+      .object({ away: z.string().nullable(), home: z.string().nullable() })
+      .strict()
+      .nullable(),
+    markets: z
+      .object({
+        moneyline: moneylineBlockSchemaV1.optional(),
+        runLine: runLineBlockSchemaV1.optional(),
+        total: totalBlockSchemaV1.optional(),
+      })
+      .strict(),
+    evidenceRefs: z.array(nonEmpty),
+  })
+  .strict();
+const slateBundleSchemaV1 = z
+  .object({
+    schemaVersion: z.literal(1),
+    label: z.literal(SMOKE_LABEL),
+    league: z.literal('mlb'),
+    slateDate: nonEmpty,
+    bundleTimestamp: instantString,
+    cutoffAt: instantString,
+    games: z.array(gameBundleSchemaV1),
   })
   .strict();
 
@@ -151,13 +251,14 @@ export const fireArtifactV1Schema = z
     sport: nonEmpty,
     scopedMarkets: z.array(marketKeySchema).min(1).max(3),
 
-    // Fire timing (§4).
-    preparedSnapshotTs: nonEmpty,
-    detectedAt: nonEmpty,
-    bundleBuiltAt: nonEmpty,
-    scheduledAtAtFire: nonEmpty,
+    // Fire timing (§4) — offset-qualified instants.
+    preparedSnapshotTs: instantString,
+    detectedAt: instantString,
+    bundleBuiltAt: instantString,
+    scheduledAtAtFire: instantString,
 
-    // Scoped bundle bytes/hashes (§4).
+    // Scoped bundle value (the preimage) + its hashes (§4).
+    requestBundle: slateBundleSchemaV1,
     requestSha256: sha256Schema,
     gameSha256: sha256Schema,
     slateSha256: sha256Schema,
@@ -181,13 +282,14 @@ export const fireArtifactV1Schema = z
 export type FireArtifactV1 = z.infer<typeof fireArtifactV1Schema>;
 
 // ---------------------------------------------------------------------------
-// Fire context: the trusted internal inputs the producer reconciles (never
-// invents). Everything recomputable here is RE-DERIVED and cross-checked.
+// Fire context: the trusted internal inputs the producer reconciles. The authority
+// objects (booted cohort, publication) are AUTHENTICATED by brand; everything
+// recomputable is re-derived and cross-checked.
 // ---------------------------------------------------------------------------
 
 /** One scoped market's detection + history context. */
 export interface MarketFireContextV1 {
-  /** The exact detection input the runner recorded — RE-EVALUATED here. */
+  /** The exact detection input the runner recorded — reconciled + RE-EVALUATED here. */
   candidateInput: CandidateInput;
   /** The verdict the runner recorded — must match the pure re-derivation. */
   verdict: CandidateVerdict;
@@ -200,10 +302,11 @@ export interface MarketFireContextV1 {
 }
 
 export interface FireContext {
+  /** MUST be a genuine `cohortBoot` output (authenticated by brand). */
   booted: BootedCohort;
   fireId: string;
   runId: string;
-  /** The verified public-Git precommitment record (§2). */
+  /** MUST be a genuine `checkPublication` output for this cohort (brand + cohortId). */
   publication: PublicationVerified;
   /** When the scoped bundle was projected (§3 step 6); may follow `detectedAt`. */
   bundleBuiltAt: string;
@@ -212,8 +315,7 @@ export interface FireContext {
 }
 
 // ---------------------------------------------------------------------------
-// Producer brand: membership in this WeakSet is unforgeable proof a value came
-// through buildFireArtifact (same pattern as sealDispatch / runSlate / prepared).
+// Producer brand.
 // ---------------------------------------------------------------------------
 
 const fireArtifacts = new WeakSet<FireArtifactV1>();
@@ -232,11 +334,10 @@ export function assertFireArtifact(artifact: FireArtifactV1): void {
 const byCanonicalOrder = (a: MarketKey, b: MarketKey): number => MARKET_ORDINAL[a] - MARKET_ORDINAL[b];
 
 /**
- * The scoped market set (§4 "cardinality derives from the scoped market set"):
- * the markets PRESENT on the dispatched game, in canonical `(gameId, market)`
- * order. The bundle stores the run line under `markets.runLine`; it is the
- * `spread` `MarketKey` everywhere else (detection, baselines, decisions), so the
- * mapping is applied here once.
+ * The scoped market set (§4): the markets PRESENT on the dispatched game, in
+ * canonical `(gameId, market)` order. The bundle stores the run line under
+ * `markets.runLine`; it is the `spread` `MarketKey` everywhere else, so the mapping
+ * is applied here once.
  */
 function scopeOf(game: GameBundle): MarketKey[] {
   const scope: MarketKey[] = [];
@@ -254,6 +355,11 @@ function marketsEqual(a: readonly MarketKey[], b: readonly MarketKey[]): boolean
   return sa.every((m, i) => m === sb[i]);
 }
 
+/** Exact-sequence equality of two string arrays. */
+function sameStrings(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
 /** Project a validated history row to the persisted 11-field shape (no passthrough). */
 function projectRow(row: TwoSidedHistoryRow): PersistedHistoryRowV1 {
   return {
@@ -269,6 +375,34 @@ function projectRow(row: TwoSidedHistoryRow): PersistedHistoryRowV1 {
     captured_at: row.captured_at,
     captured_at_ms: row.captured_at_ms,
   };
+}
+
+/**
+ * Reconcile a candidate's policy/config authority partition to the authenticated
+ * manifest and the prepared game (§3). The runner supplies a `CandidateInput`
+ * carrying its OWN window/policy constants; if a caller widened them (e.g. a
+ * 600 s clean-entry window over the manifest's 120 s), a stale opener would judge
+ * `eligible` under caller policy. Every authority field must therefore equal the
+ * cohort's before the verdict is re-derived under it.
+ */
+function reconcileCandidate(ci: CandidateInput, manifest: CohortManifestV1, game: GameBundle): void {
+  const problems: string[] = [];
+  if (ci.sport !== game.league) problems.push(`sport ${ci.sport} != prepared game identity ${game.league}`);
+  if (!sameStrings(ci.sportAllowList, manifest.sportAllowList)) problems.push('sportAllowList != manifest');
+  if (ci.marketPolicyVersion !== manifest.marketPolicyVersion) {
+    problems.push(`marketPolicyVersion ${ci.marketPolicyVersion} != manifest ${manifest.marketPolicyVersion}`);
+  }
+  if (ci.windowStart !== manifest.windowStart) problems.push(`windowStart ${ci.windowStart} != manifest ${manifest.windowStart}`);
+  if (ci.windowEnd !== manifest.windowEnd) problems.push(`windowEnd ${ci.windowEnd} != manifest ${manifest.windowEnd}`);
+  if (ci.cleanEntryWindowMs !== manifest.constants.cleanEntryWindowMs) {
+    problems.push(`cleanEntryWindowMs ${ci.cleanEntryWindowMs} != manifest ${manifest.constants.cleanEntryWindowMs}`);
+  }
+  if (ci.maxClockSkewMs !== manifest.constants.maxClockSkewMs) {
+    problems.push(`maxClockSkewMs ${ci.maxClockSkewMs} != manifest ${manifest.constants.maxClockSkewMs}`);
+  }
+  if (problems.length > 0) {
+    throw new Error(`candidate (${ci.gameId}, ${ci.market}) authority disagrees with the cohort: ${problems.join('; ')}`);
+  }
 }
 
 interface FireIdentity {
@@ -364,14 +498,18 @@ function buildArmEvidence(
 
 /**
  * Build the fire artifact for ONE fire from an authenticated run envelope and the
- * trusted fire context. Fails closed on any structural, identity, binding,
- * bijection, or cardinality violation; returns a deeply-frozen, branded,
- * strict-schema-validated `FireArtifactV1`.
+ * trusted fire context. Fails closed on any authentication, structural, identity,
+ * binding, bijection, cardinality, or grammar violation; returns a deeply-frozen,
+ * branded, strict-schema-validated `FireArtifactV1`.
  */
 export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtifactV1 {
-  // (1) Authenticate the branded run envelope — a forged/substituted wrapper is
-  //     rejected before any evidence is read.
+  // (1) Authenticate every authority input by unforgeable origin brand — a forged,
+  //     substituted, or structurally-copied envelope / booted cohort / publication
+  //     is rejected before any evidence is read.
   assertRunEnvelope(env);
+  assertBootedCohort(ctx.booted);
+  assertPublicationVerified(ctx.publication);
+  const manifest = ctx.booted.manifest;
 
   // (2) A fire is exactly ONE game (1–3 scoped markets); the dispatched grid is
   //     that game × the expected roster.
@@ -388,15 +526,18 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
     );
   }
 
-  // (3) Cohort identity: the envelope dispatch cohortId, the booted cohortId, and
-  //     the cohortId re-derived from the manifest bytes must all agree — binding
-  //     the artifact identity to the authenticated manifest.
+  // (3) Cohort identity, bound four ways: the envelope dispatch cohortId, the booted
+  //     cohortId, the cohortId re-derived from the manifest bytes, and the cohort
+  //     the publication was verified for must all agree.
   const cohortId = ctx.booted.cohortId;
   if (env.dispatch.cohortId !== cohortId) {
     throw new Error(`envelope dispatch cohortId ${env.dispatch.cohortId} != booted cohortId ${cohortId}`);
   }
-  if (deriveCohortId(ctx.booted.manifest) !== cohortId) {
+  if (deriveCohortId(manifest) !== cohortId) {
     throw new Error('booted cohortId does not match the cohortId derived from the manifest bytes');
+  }
+  if (ctx.publication.cohortId !== cohortId) {
+    throw new Error(`publication was verified for cohort ${ctx.publication.cohortId}, not this cohort ${cohortId}`);
   }
 
   // (4) Scope: the present markets on the dispatched game, canonical order.
@@ -405,13 +546,20 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
     throw new Error('dispatched game supplies no known market');
   }
 
-  // (5) Fire-level bundle identity + hashes, re-derived (recomputable evidence).
-  const requestSha256 = sha256Hex(canonicalize(p.requestBundle));
+  // (5) Scoped request evidence: retain the EXACT sealed request bundle (§4) and
+  //     bind all three hashes to it. A single-game fire's sealed slate is the same
+  //     canonical value as its request bundle, so slateSha256 == requestSha256 and
+  //     is recomputable from the retained bundle.
+  const requestBundle = p.requestBundle;
+  const requestSha256 = sha256Hex(canonicalize(requestBundle));
   const gameSha256 = sha256Hex(canonicalize(game));
   const slateSha256 = sha256Hex(canonicalize(env.snapshot.slate));
   if (requestSha256 !== p.requestSha256) throw new Error('recomputed requestSha256 != sealed requestSha256');
   if (gameSha256 !== p.gameSha256) throw new Error('recomputed gameSha256 != sealed gameSha256');
   if (slateSha256 !== env.snapshot.slateSha256) throw new Error('recomputed slateSha256 != sealed slateSha256');
+  if (canonicalize(env.snapshot.slate) !== canonicalize(requestBundle)) {
+    throw new Error('single-game slate must be the same canonical value as the request bundle');
+  }
   const scheduledAtAtFire = p.cutoffAt;
   const preparedSnapshotTs = env.snapshot.slate.bundleTimestamp;
 
@@ -435,10 +583,11 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
     if (ci.gameId !== gameId) {
       throw new Error(`candidate gameId ${ci.gameId} != fire gameId ${gameId} (market ${market})`);
     }
-    // Re-derive the detection verdict from the SAME input the runner recorded and
-    // require it eligible; the carried verdict must equal the pure re-derivation
-    // (a runner/context divergence fails closed). evaluateCandidate itself
-    // fail-closes on an opener that is not this candidate's own.
+    // Reconcile the candidate's policy/config authority to the authenticated
+    // manifest + prepared game, so eligibility is judged under cohort policy.
+    reconcileCandidate(ci, manifest, game);
+    // Re-derive the detection verdict from the (now authoritative) input and require
+    // it eligible; the carried verdict must equal the pure re-derivation.
     const reVerdict = evaluateCandidate(ci);
     if (reVerdict.state !== 'eligible') {
       throw new Error(`candidate (${gameId}, ${market}) re-evaluates to ${reVerdict.state}, not eligible`);
@@ -450,17 +599,22 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
     if (opener.jsonodds_id !== gameId || opener.market !== market) {
       throw new Error(`opener (${opener.jsonodds_id}, ${opener.market}) does not bind to fire (${gameId}, ${market})`);
     }
-    // The opener must be the firstTwoSided of the SAME history rows the as-of
-    // derives from — so the whole per-market quote evidence is recomputable from
-    // one source, under the recorded read mode.
+    // Re-validate EVERY history row through the canonical parser before ordering, so
+    // the opener/as-of derivations run on coherent rows (valid odds/lines, and
+    // captured_at_ms == instantMs(captured_at)); a malformed row fails closed.
     const watermark = mc.historyWatermark === null ? undefined : mc.historyWatermark;
-    const derivedOpener = firstTwoSided(mc.historyRows, watermark);
+    const { rows: validRows, dropped } = parseTwoSidedHistoryRows(mc.historyRows);
+    if (dropped > 0) {
+      throw new Error(`fire history for (${gameId}, ${market}) has ${dropped} invalid row(s)`);
+    }
+    // The opener must be the firstTwoSided of the SAME re-validated history the
+    // as-of derives from — so the whole per-market quote evidence is recomputable
+    // from one source, under the recorded read mode.
+    const derivedOpener = firstTwoSided(validRows, watermark);
     if (derivedOpener === undefined || canonicalize(projectRow(derivedOpener)) !== canonicalize(projectRow(opener))) {
       throw new Error(`opener for (${gameId}, ${market}) is not the firstTwoSided of the supplied history`);
     }
-    // As-of quote at detectedAt (the price the model saw, §5-V1). asOfQuote
-    // fail-closes on a mixed-pair rows array.
-    const asOf = asOfQuote(mc.historyRows, ci.detectedAt, watermark);
+    const asOf = asOfQuote(validRows, ci.detectedAt, watermark);
     if (asOf === undefined) {
       throw new Error(`no as-of quote at ${ci.detectedAt} for (${gameId}, ${market})`);
     }
@@ -483,7 +637,7 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
       market,
       detectedAt: ci.detectedAt,
       openerAgeMs: reVerdict.openerAgeMs,
-      opener: projectRow(opener),
+      opener: projectRow(derivedOpener),
       asOf: projectRow(asOf),
       historyReadMode:
         mc.historyWatermark === null
@@ -503,7 +657,7 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
   const sport = [...sports][0]!;
 
   // (7) Roster + arms (§4/§5 roster bijection; one terminal outcome per expected arm).
-  const roster = ctx.booted.manifest.expectedArmRoster;
+  const roster = manifest.expectedArmRoster;
   const rosterIds = roster.map((e) => e.participantId);
   const rosterSet = new Set(rosterIds);
   if (rosterSet.size !== rosterIds.length) {
@@ -550,9 +704,9 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
   // (8) Deterministic baselines from the SAME sealed slate + envelope-carried
   //     policy; the pinned manifest baseline policy must match, and the distinct
   //     baseline markets must equal the scope, all on this game.
-  if (env.baselinePolicyVersion !== ctx.booted.manifest.baselinePolicyVersion) {
+  if (env.baselinePolicyVersion !== manifest.baselinePolicyVersion) {
     throw new Error(
-      `envelope baselinePolicyVersion ${env.baselinePolicyVersion} != manifest ${ctx.booted.manifest.baselinePolicyVersion}`,
+      `envelope baselinePolicyVersion ${env.baselinePolicyVersion} != manifest ${manifest.baselinePolicyVersion}`,
     );
   }
   const baselineDecisions = runBaselines(env.snapshot.slate, env.baselinePolicyVersion);
@@ -571,8 +725,9 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
 
   const claims = marketEvidence.map((m) => m.claim);
 
-  // (9) Assemble, strict-parse (fail-closed: the producer must not emit what its
-  //     own verifier rejects), deep-freeze, and brand.
+  // (9) Assemble, strict-parse (fail-closed on any grammar/shape violation),
+  //     re-verify the RETAINED request preimage recomputes its digests, deep-freeze,
+  //     and brand.
   const validated = fireArtifactV1Schema.parse({
     artifactSchemaVersion: 1,
     cohortId,
@@ -586,6 +741,7 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
     detectedAt,
     bundleBuiltAt: ctx.bundleBuiltAt,
     scheduledAtAtFire,
+    requestBundle,
     requestSha256,
     gameSha256,
     slateSha256,
@@ -596,6 +752,13 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
     baselineDecisions,
     claims,
   });
+  if (sha256Hex(canonicalize(validated.requestBundle)) !== requestSha256) {
+    throw new Error('persisted request bundle does not recompute requestSha256');
+  }
+  const persistedGame = validated.requestBundle.games[0];
+  if (persistedGame === undefined || sha256Hex(canonicalize(persistedGame)) !== gameSha256) {
+    throw new Error('persisted request game does not recompute gameSha256');
+  }
   const frozen = deepFreeze(validated);
   fireArtifacts.add(frozen);
   return frozen;
