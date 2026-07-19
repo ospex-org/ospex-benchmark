@@ -17,6 +17,7 @@ import { RehearsalClaimPort, StoreClaimPort, assertDispatchPermit } from './line
 import type { DispatchPermit } from './lineOpenClaim.js';
 import { SqlAtomicStore } from './store/atomicStore.js';
 import type { StoreQuery } from './store/atomicStore.js';
+import type { AdmitDispatchRequest } from './store/contract.js';
 import { LINE_OPEN_ARMS, LINE_OPEN_GAME_ID, prepareLineOpenFire } from './testFactories.js';
 import type { MarketKey } from './types.js';
 
@@ -89,6 +90,9 @@ test('a 2-market fire runs claim → fire → produce → persist and installs a
     assert.deepEqual(reloaded.scopedMarkets, ['moneyline', 'total']);
     assert.equal(reloaded.gameId, LINE_OPEN_GAME_ID);
     assert.equal(reloaded.arms.length, LINE_OPEN_ARMS.length);
+    // The stub roster's responses re-validate, so every arm is a valid terminal outcome —
+    // this exercises the valid-arm accepted-body re-validation path (not just non-valid arms).
+    assert.ok(reloaded.arms.every((a) => a.terminalOutcome === 'valid'));
   } finally {
     cleanup(deps);
   }
@@ -175,7 +179,6 @@ test('installing the same artifact twice is idempotent; a byte-different collisi
       detectedAt: fire.detectedAt,
       preparedSnapshotDigest: fire.preparedSnapshotDigest,
     });
-    const runId = deriveRunId(fireId);
 
     // A genuine permit for this fire id (the store admits it).
     const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length)));
@@ -193,9 +196,9 @@ test('installing the same artifact twice is idempotent; a byte-different collisi
 
     // Same fire id, but a byte-different artifact (a later bundleBuiltAt is NOT part of the
     // fire-id derivation, so it collides on the path yet differs in bytes).
-    const a = (await fireFn.fire(permit, fire, { fireId, runId })).artifact;
+    const a = (await fireFn.fire(permit, fire, { fireId })).artifact;
     const bFire: PreparedFire = { ...fire, bundleBuiltAt: '2026-07-18T12:00:59.000Z' };
-    const b = (await fireFn.fire(permit, bFire, { fireId, runId })).artifact;
+    const b = (await fireFn.fire(permit, bFire, { fireId })).artifact;
 
     const first = sink.write(permit, a);
     assert.equal(first.created, true);
@@ -231,6 +234,78 @@ test('the path segment for a game id is base64url-encoded (an arbitrary id canno
   }
 });
 
+// --- frozen tooth: the store claim port fails closed, never authorizes -------
+
+function validAdmitReq(): AdmitDispatchRequest {
+  return {
+    cohortId: 'a'.repeat(64),
+    fireId: 'b'.repeat(64),
+    ownerId: 'owner-test',
+    expectedSchemaVersion: 1,
+    gameId: LINE_OPEN_GAME_ID,
+    proposedMarkets: ['moneyline', 'total'],
+    scopeReservations: { 'moneyline+total': { spendReservationUsdMicros: 1_000, preparedBytesDigest: 'c'.repeat(64) } },
+  };
+}
+
+test('the store claim port faults (authorizes nothing) when the store throws', async () => {
+  const port = new StoreClaimPort(new SqlAtomicStore(() => Promise.reject(new Error('db unreachable'))));
+  const outcome = await port.admit(validAdmitReq());
+  assert.equal(outcome.kind, 'Fault');
+});
+
+test('the store claim port faults (authorizes nothing) on a non-admitted result', async () => {
+  const refusing: StoreQuery = () => Promise.resolve([{ r: { outcome: 'refused', reason: 'all_claimed', dispatchAuthorized: false } }]);
+  const port = new StoreClaimPort(new SqlAtomicStore(refusing));
+  const outcome = await port.admit(validAdmitReq());
+  assert.equal(outcome.kind, 'Fault');
+});
+
+// --- frozen tooth: sink artifact <-> permit binding gates -------------------
+// The four binding gates (cohortId/fireId/gameId/scope) stop installing an artifact under
+// a permit minted for a DIFFERENT fire. cohortId/gameId/scope all feed the fire id, so for
+// a genuinely-produced artifact a mismatch in any of them also mismatches the fire id; the
+// fireId gate (checked after cohortId) and the cohortId gate (checked first) are the two
+// independently reachable here — the gameId/scope gates are subsumed defense-in-depth.
+
+function admitReqFor(fire: PreparedFire, cohortId: string): AdmitDispatchRequest {
+  const proposedMarkets: MarketKey[] = ['moneyline', 'total'];
+  return {
+    cohortId,
+    fireId: deriveFireId({ cohortId, gameId: fire.gameId, proposedMarkets, detectedAt: fire.detectedAt, preparedSnapshotDigest: fire.preparedSnapshotDigest }),
+    ownerId: 'owner-test',
+    expectedSchemaVersion: 1,
+    gameId: fire.gameId,
+    proposedMarkets,
+    scopeReservations: { 'moneyline+total': { spendReservationUsdMicros: 1_000, preparedBytesDigest: fire.request.requestSha256 } },
+  };
+}
+
+test('the sink refuses an artifact whose fireId or cohortId does not bind to the permit', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'f5a-'));
+  const sink = new LineOpenArtifactSink(dir);
+  const fireFn = new LineOpenFireFn();
+  const store = new StoreClaimPort(new SqlAtomicStore(admittedStoreQuery(LINE_OPEN_ARMS.length)));
+  try {
+    const { fire } = prepareLineOpenFire(['moneyline', 'total']);
+    const realCohort = fire.booted.cohortId;
+    const permit = ((await store.admit(admitReqFor(fire, realCohort))) as { permit: DispatchPermit }).permit;
+
+    // fireId gate: a genuine artifact carrying a fireId that is not the permit's.
+    const wrongFire = (await fireFn.fire(permit, fire, { fireId: 'a'.repeat(64) })).artifact;
+    assert.throws(() => sink.write(permit, wrongFire), /fireId does not match the dispatch permit/);
+
+    // cohortId gate: a genuine (real-cohort) artifact installed under a permit minted for a
+    // different cohort id.
+    const realFireId = admitReqFor(fire, realCohort).fireId;
+    const genuine = (await fireFn.fire(permit, fire, { fireId: realFireId })).artifact;
+    const otherPermit = ((await store.admit(admitReqFor(fire, 'b'.repeat(64)))) as { permit: DispatchPermit }).permit;
+    assert.throws(() => sink.write(otherPermit, genuine), /cohortId does not match the dispatch permit/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // --- frozen tooth: fire identity --------------------------------------------
 
 test('fireId is a deterministic pre-admit anchor over proposedMarkets, not retained scope', () => {
@@ -244,7 +319,10 @@ test('fireId is a deterministic pre-admit anchor over proposedMarkets, not retai
   // Deterministic + canonical-order-insensitive on the same set.
   assert.equal(deriveFireId(base), deriveFireId({ ...base, proposedMarkets: ['total', 'moneyline'] }));
   assert.match(deriveFireId(base), /^[0-9a-f]{64}$/);
-  // A different detection instant, market set, or snapshot digest → a different id.
+  // Every identity operand is load-bearing: a different cohort, game, detection instant,
+  // market set, or snapshot digest → a different id.
+  assert.notEqual(deriveFireId(base), deriveFireId({ ...base, cohortId: 'd'.repeat(64) }));
+  assert.notEqual(deriveFireId(base), deriveFireId({ ...base, gameId: '00000000-0000-4000-8000-0000000000f2' }));
   assert.notEqual(deriveFireId(base), deriveFireId({ ...base, detectedAt: '2026-07-18T12:00:31.000Z' }));
   assert.notEqual(deriveFireId(base), deriveFireId({ ...base, proposedMarkets: ['moneyline'] }));
   assert.notEqual(deriveFireId(base), deriveFireId({ ...base, preparedSnapshotDigest: 'c'.repeat(64) }));

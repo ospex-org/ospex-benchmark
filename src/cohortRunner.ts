@@ -134,12 +134,14 @@ export interface PreparedFire {
   runOptions: SlateRunOptions;
 }
 
-/** The fire seam: launch the roster under a permit and produce the fire artifact. */
+/** The fire seam: launch the roster under a permit and produce the fire artifact. The
+ *  run id is DERIVED from the fire id inside the executor (never passed in), so a fire
+ *  artifact can never carry a run id incoherent with its fire id. */
 export interface FireFn {
   fire(
     permit: DispatchPermit,
     fire: PreparedFire,
-    ids: { fireId: string; runId: string },
+    ids: { fireId: string },
   ): Promise<{ env: RunEnvelope; artifact: FireArtifactV1 }>;
 }
 
@@ -214,14 +216,15 @@ export class LineOpenFireFn implements FireFn {
   async fire(
     permit: DispatchPermit,
     fire: PreparedFire,
-    ids: { fireId: string; runId: string },
+    ids: { fireId: string },
   ): Promise<{ env: RunEnvelope; artifact: FireArtifactV1 }> {
     assertDispatchPermit(permit);
+    const runId = deriveRunId(ids.fireId); // derived here → always coherent with the fire id
     const env = await runSlate(fire.arms, fire.adapters, [fire.request], fire.runOptions);
     const ctx: FireContext = {
       booted: fire.booted,
       fireId: ids.fireId,
-      runId: ids.runId,
+      runId,
       publication: fire.publication,
       bundleBuiltAt: fire.bundleBuiltAt,
       perMarket: fire.perMarket.map((m) => ({
@@ -258,6 +261,17 @@ export interface FireResult {
 export async function runOneFire(fire: PreparedFire, deps: FireDeps): Promise<FireResult> {
   const cohortId = fire.booted.cohortId;
   const markets = canonicalMarkets(fire.proposedMarkets);
+  // Bind the fire-id's detectedAt operand to the evidence the artifact certifies: every
+  // scoped market shares the one prepared-group detection instant (buildFireArtifact
+  // requires the candidate detectedAts equal EACH OTHER, but not this fire-level one), so
+  // the fire id can never hash an instant that contradicts the certified detectedAt.
+  for (const m of fire.perMarket) {
+    if (m.candidateInput.detectedAt !== fire.detectedAt) {
+      throw new Error(
+        `prepared fire detectedAt (${fire.detectedAt}) does not equal candidate detectedAt for ${m.candidateInput.market} (${m.candidateInput.detectedAt})`,
+      );
+    }
+  }
   const fireId = deriveFireId({
     cohortId,
     gameId: fire.gameId,
@@ -265,7 +279,6 @@ export async function runOneFire(fire: PreparedFire, deps: FireDeps): Promise<Fi
     detectedAt: fire.detectedAt,
     preparedSnapshotDigest: fire.preparedSnapshotDigest,
   });
-  const runId = deriveRunId(fireId);
 
   const scopeKey = markets.join('+') as ScopeKey;
   const reservation: ScopeReservation = {
@@ -286,7 +299,7 @@ export async function runOneFire(fire: PreparedFire, deps: FireDeps): Promise<Fi
   if (outcome.kind !== 'Authorized') return { fired: false, outcome };
 
   const { permit } = outcome;
-  const { artifact } = await deps.fireFn.fire(permit, fire, { fireId, runId });
+  const { artifact } = await deps.fireFn.fire(permit, fire, { fireId });
   // Release each arm's initial lease as the fire settles. The real store-backed lifecycle
   // releases per-arm inside dispatch; here the seam is threaded end-to-end.
   for (const lease of permit.initialLeases) await deps.lifecycle.releaseInitial(lease.armIndex);

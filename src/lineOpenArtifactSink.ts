@@ -80,30 +80,49 @@ export class LineOpenArtifactSink implements ArtifactSink {
     mkdirSync(dir, { recursive: true });
 
     // 5. Write + fsync a same-directory exclusive temp file, then install by hard link —
-    //    which fails EEXIST rather than clobbering an existing final path.
+    //    which fails EEXIST rather than clobbering an existing final path. The temp is
+    //    cleaned on EVERY exit path by a best-effort helper that swallows its own error, so
+    //    cleanup can never mask the primary result (a durable install) or the primary
+    //    exception (a loud collision / write failure), and only a temp WE created is removed.
     const tmpPath = join(dir, `.${artifact.fireId}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
-    const fd = openSync(tmpPath, 'wx'); // exclusive create
-    try {
-      writeSync(fd, bytes);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    try {
-      linkSync(tmpPath, finalPath); // atomic no-clobber: EEXIST if the final path exists
-      return { path: finalPath, created: true };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-        // Idempotent completion retry iff the installed bytes are EXACTLY ours; a
-        // byte-different artifact at the same path is a fire-identity collision (a bug)
-        // and must fail loud, never overwrite.
-        const existing = readFileSync(finalPath, 'utf8');
-        if (existing === bytes) return { path: finalPath, created: false };
-        throw new Error(`refusing to overwrite a byte-different fire artifact already installed at ${finalPath}`);
+    let tempCreated = false;
+    const cleanupTemp = (): void => {
+      if (!tempCreated) return;
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        /* best-effort: never override the primary return or exception */
       }
+    };
+    try {
+      const fd = openSync(tmpPath, 'wx'); // exclusive create; only now do we own the temp
+      tempCreated = true;
+      try {
+        writeSync(fd, bytes);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      let result: { path: string; created: boolean };
+      try {
+        linkSync(tmpPath, finalPath); // atomic no-clobber: EEXIST if the final path exists
+        result = { path: finalPath, created: true };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        // A final path already exists: an idempotent completion retry iff its bytes are
+        // EXACTLY ours; a byte-different artifact at the same path is a fire-identity
+        // collision (a bug) and must fail loud, never overwrite.
+        const existing = readFileSync(finalPath, 'utf8');
+        if (existing !== bytes) {
+          throw new Error(`refusing to overwrite a byte-different fire artifact already installed at ${finalPath}`);
+        }
+        result = { path: finalPath, created: false };
+      }
+      cleanupTemp();
+      return result;
+    } catch (error) {
+      cleanupTemp(); // remove the orphan temp on any write / fsync / link failure
       throw error;
-    } finally {
-      unlinkSync(tmpPath); // the temp is always removed (the hard link, or nothing, survives)
     }
   }
 }
