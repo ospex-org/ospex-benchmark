@@ -279,15 +279,72 @@ test('the arm-level strict schemas reject unknown fields', () => {
   assert.throws(() => persistedAttemptSchemaV1.parse({ ...first(toPersistedAttempts(armResult())), extra: 1 }));
 });
 
-test('armEvidenceSchemaV1 round-trips a valid arm evidence and rejects an unknown outcome', () => {
-  const evidence = {
+function validEvidence() {
+  return {
     expectedArmIdentity: expectedArmIdentity(ROSTER_ENTRY),
     terminalOutcome: 'valid' as const,
+    initialRequestStartedAt: '2026-07-16T00:00:05.000Z',
     orderedAttempts: toPersistedAttempts(armResult()),
     acceptedResponseDigest: 'b'.repeat(64),
     acceptedDecisionFingerprint: decisionFingerprint(response([forecast()])),
     armDigest: armDigest(digestInput()),
   };
+}
+
+test('armEvidenceSchemaV1 round-trips a valid arm evidence and rejects an unknown outcome', () => {
+  const evidence = validEvidence();
   assert.deepEqual(armEvidenceSchemaV1.parse(evidence), evidence);
   assert.throws(() => armEvidenceSchemaV1.parse({ ...evidence, terminalOutcome: 'bogus_outcome' }));
+});
+
+test('armEvidenceSchemaV1 requires the distinct initialRequestStartedAt (nullable, not absent)', () => {
+  const { initialRequestStartedAt: _drop, ...missing } = validEvidence();
+  void _drop;
+  assert.throws(() => armEvidenceSchemaV1.parse(missing));
+  assert.doesNotThrow(() => armEvidenceSchemaV1.parse({ ...validEvidence(), initialRequestStartedAt: null }));
+});
+
+// --- armDigest fails closed on its exact domain ---
+
+test('armDigest rejects an unknown 11th field, a missing/undefined field, and a malformed field', () => {
+  assert.throws(() => armDigest({ ...digestInput(), sneaky: 1 } as unknown as ArmDigestInputV1));
+  assert.throws(() => armDigest({ ...digestInput(), fireId: undefined } as unknown as ArmDigestInputV1));
+  assert.throws(() => armDigest({ ...digestInput(), requestSha256: 'not-a-sha' } as unknown as ArmDigestInputV1));
+});
+
+// --- per-attempt transport + usage (integrity truth) ---
+
+test('a repair timeout and a repair provider_error persist distinctly (transport retained)', () => {
+  const mk = (t: 'timeout' | 'provider_error') =>
+    toPersistedAttempts(
+      armResult({
+        outcome: 'invalid_schema',
+        repairUsed: true,
+        repairTransport: t,
+        repair: attempt({ rawText: null, httpStatus: null, acceptedAt: null, reportedModelId: null, requestAt: '2026-07-16T00:00:10.000Z', responseAt: '2026-07-16T00:00:11.000Z' }),
+      }),
+    );
+  const a = mk('timeout');
+  const b = mk('provider_error');
+  assert.equal(a[1]?.transport, 'timeout');
+  assert.equal(b[1]?.transport, 'provider_error');
+  assert.notEqual(JSON.stringify(a), JSON.stringify(b));
+});
+
+test('a received attempt has transport ok and detached, normalized usage', () => {
+  const usage = { inputTokens: 100, outputTokens: 50, totalTokens: 150 };
+  const a = first(toPersistedAttempts(armResult({ attempt: attempt({ usage }) })));
+  assert.equal(a.transport, 'ok');
+  assert.deepEqual(a.usage, usage);
+  usage.inputTokens = 999; // detached: mutating the source must not leak in
+  assert.equal(a.usage?.inputTokens, 100);
+});
+
+test('transport and usage are bound into armDigest via orderedAttempts', () => {
+  const base = armDigest(digestInput());
+  const attempts = toPersistedAttempts(armResult());
+  const diffUsage = attempts.map((a) => ({ ...a, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }));
+  assert.notEqual(armDigest(digestInput({ orderedAttempts: diffUsage })), base);
+  const diffTransport = attempts.map((a) => ({ ...a, transport: 'timeout' as const }));
+  assert.notEqual(armDigest(digestInput({ orderedAttempts: diffTransport })), base);
 });

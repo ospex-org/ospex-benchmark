@@ -4,7 +4,7 @@ import { redactSecrets } from './config.js';
 import { deepFreeze } from './freeze.js';
 import { forecastFingerprint } from './schema.js';
 import type { CohortManifestV1 } from './manifest.js';
-import type { ArmGameResult, ArmOutcome, AttemptRecord, BenchmarkResponse, MarketKey } from './types.js';
+import type { ArmGameResult, ArmOutcome, AttemptRecord, BenchmarkResponse, MarketKey, ProviderUsage } from './types.js';
 
 /**
  * The fire artifact's ARM INTEGRITY CORE (SPEC-line-open-evidence-model.md
@@ -38,6 +38,22 @@ const _armOutcomeParity: AssertEqual<z.infer<typeof armOutcomeSchemaV1>, ArmOutc
 void _armOutcomeParity;
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
+
+/** The transport outcome of a SENT attempt (a received body is `ok`; the rest are
+ *  the failure classifications). Never `null` — an unsent attempt is not persisted. */
+const attemptTransportSchemaV1 = z.enum(['ok', 'timeout', 'rate_limited', 'provider_error']);
+export type AttemptTransportV1 = z.infer<typeof attemptTransportSchemaV1>;
+
+const providerUsageSchemaV1 = z
+  .object({
+    inputTokens: z.number().nullable(),
+    outputTokens: z.number().nullable(),
+    totalTokens: z.number().nullable(),
+  })
+  .strict();
+// Compile-time parity: the persisted usage shape must equal the normalized ProviderUsage.
+const _usageParity: AssertEqual<z.infer<typeof providerUsageSchemaV1>, ProviderUsage> = true;
+void _usageParity;
 
 // ---------------------------------------------------------------------------
 // Expected-arm identity: the authenticated manifest roster-entry projection
@@ -166,6 +182,11 @@ export interface PersistedAttemptV1 {
   persistedResponseBody: string | null;
   /** `sha256Hex(persistedResponseBody)`, or `null` with no body. */
   responseSha256: string | null;
+  /** The typed transport outcome of this sent attempt (distinguishes a timeout
+   *  from a provider error, which a body-less attempt otherwise cannot). */
+  transport: AttemptTransportV1;
+  /** Detached, normalized token usage for this attempt, or `null`. */
+  usage: ProviderUsage | null;
 }
 
 export const persistedAttemptSchemaV1 = z
@@ -179,6 +200,8 @@ export const persistedAttemptSchemaV1 = z
     httpStatus: z.number().int().nullable(),
     persistedResponseBody: z.string().nullable(),
     responseSha256: sha256Schema.nullable(),
+    transport: attemptTransportSchemaV1,
+    usage: providerUsageSchemaV1.nullable(),
   })
   .strict();
 
@@ -191,10 +214,23 @@ export const persistedAttemptSchemaV1 = z
  * response was received (`requestReceivedAt = responseAt`); a timeout/transport
  * settle with neither means no receipt (`null`). The response digest follows the
  * response-digest byte rule: `sha256Hex(redactSecrets(rawText))` (idempotent — the runner
- * already redacts), or `null` with no body. The result is detached and deep-frozen.
+ * already redacts), or `null` with no body. Each sent attempt also retains its typed
+ * transport (so a timeout is distinct from a provider error) and detached normalized
+ * usage. The result is detached and deep-frozen.
  */
 export function toPersistedAttempts(result: ArmGameResult): readonly PersistedAttemptV1[] {
   const attempts: PersistedAttemptV1[] = [];
+  // The transport of a sent attempt: a received body is `ok`; otherwise the repair's
+  // own `repairTransport`, or — for a body-less initial (a sole attempt, since a
+  // repair needs the initial body) — the arm's terminal outcome, which carries the
+  // exact failure classification.
+  const transportOf = (record: AttemptRecord, kind: 'initial' | 'repair'): AttemptTransportV1 => {
+    if (record.rawText !== null) return 'ok';
+    if (kind === 'repair') return result.repairTransport ?? 'provider_error';
+    return result.outcome === 'timeout' || result.outcome === 'rate_limited'
+      ? result.outcome
+      : 'provider_error';
+  };
   const mapOne = (record: AttemptRecord, attemptNumber: number, kind: 'initial' | 'repair'): void => {
     const requestStartedAt = record.requestAt;
     if (requestStartedAt === null) return; // unsent — not a sent attempt
@@ -212,6 +248,8 @@ export function toPersistedAttempts(result: ArmGameResult): readonly PersistedAt
       httpStatus: record.httpStatus,
       persistedResponseBody,
       responseSha256,
+      transport: transportOf(record, kind),
+      usage: record.usage === null ? null : { ...record.usage },
     });
   };
   mapOne(result.attempt, 1, 'initial');
@@ -239,15 +277,37 @@ export interface ArmDigestInputV1 {
 }
 
 /**
- * The recomputable per-arm digest (SPEC §5): `sha256Hex(canonicalize(input))` over
- * exactly the ten domain-bound fields. `canonicalize` key-sorts objects but
- * PRESERVES array order (so `approvedReportedModelIds`, `orderedAttempts`, and the
- * decision fingerprint keep their canonical order). Domain-bound to
- * cohort/fire/run/participant so an arm record cannot be replayed into another fire
- * without changing the digest.
+ * The exact ten-field digest domain, strict — an unknown, missing, own-`undefined`,
+ * or malformed field fails parse, so the digest can bind ONLY these fields (a bare
+ * `canonicalize` would silently hash an 11th field and silently drop an `undefined`
+ * required one, yielding a digest a producer cannot recompute from the ten).
+ */
+export const armDigestInputSchemaV1 = z
+  .object({
+    cohortId: z.string().min(1),
+    fireId: z.string().min(1),
+    runId: z.string().min(1),
+    participantId: z.string().min(1),
+    requestSha256: sha256Schema,
+    expectedArmIdentity: expectedArmIdentitySchemaV1,
+    orderedAttempts: z.array(persistedAttemptSchemaV1),
+    terminalOutcome: armOutcomeSchemaV1,
+    acceptedResponseDigestOrNull: sha256Schema.nullable(),
+    acceptedDecisionFingerprintOrNull: acceptedDecisionFingerprintSchemaV1.nullable(),
+  })
+  .strict();
+
+/**
+ * The recomputable per-arm digest (SPEC §5): `sha256Hex(canonicalize(...))` over
+ * exactly the ten domain-bound fields — the input is strict-parsed first, so unknown,
+ * missing, own-`undefined`, and malformed fields fail closed. `canonicalize`
+ * key-sorts objects but PRESERVES array order (so `approvedReportedModelIds`,
+ * `orderedAttempts`, and the decision fingerprint keep their canonical order).
+ * Domain-bound to cohort/fire/run/participant so an arm record cannot be replayed
+ * into another fire without changing the digest.
  */
 export function armDigest(input: ArmDigestInputV1): string {
-  return sha256Hex(canonicalize(input));
+  return sha256Hex(canonicalize(armDigestInputSchemaV1.parse(input)));
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +317,10 @@ export function armDigest(input: ArmDigestInputV1): string {
 export interface ArmEvidenceV1 {
   expectedArmIdentity: ExpectedArmIdentityV1;
   terminalOutcome: ArmOutcome;
+  /** The initial attempt's request-start instant — the SOLE V-lag operand, kept
+   *  distinct from `orderedAttempts` so the scorer never applies the initial V-lag
+   *  to a repair; `null` when the initial was never sent. */
+  initialRequestStartedAt: string | null;
   orderedAttempts: readonly PersistedAttemptV1[];
   acceptedResponseDigest: string | null;
   acceptedDecisionFingerprint: AcceptedDecisionFingerprintV1 | null;
@@ -267,6 +331,7 @@ export const armEvidenceSchemaV1 = z
   .object({
     expectedArmIdentity: expectedArmIdentitySchemaV1,
     terminalOutcome: armOutcomeSchemaV1,
+    initialRequestStartedAt: z.string().min(1).nullable(),
     orderedAttempts: z.array(persistedAttemptSchemaV1),
     acceptedResponseDigest: sha256Schema.nullable(),
     acceptedDecisionFingerprint: acceptedDecisionFingerprintSchemaV1.nullable(),
