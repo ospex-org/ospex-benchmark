@@ -274,8 +274,9 @@ export const fireArtifactV1Schema = z
     baselinePolicyVersion: nonEmpty,
     baselineDecisions: z.array(baselineDecisionSchemaV1),
 
-    // Claim/completion linkage (§4).
-    claims: z.array(claimReferenceSchemaV1).min(1).max(3),
+    // Claim/completion linkage (§4) is carried per scoped market on
+    // `marketEvidence[].claim` — the sole authoritative claim carrier (no
+    // duplicated top-level aggregation to drift out of sync).
   })
   .strict();
 
@@ -723,8 +724,6 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
     }
   }
 
-  const claims = marketEvidence.map((m) => m.claim);
-
   // (9) Assemble, strict-parse (fail-closed on any grammar/shape violation),
   //     re-verify the RETAINED request preimage recomputes its digests, deep-freeze,
   //     and brand.
@@ -750,7 +749,6 @@ export function buildFireArtifact(env: RunEnvelope, ctx: FireContext): FireArtif
     arms,
     baselinePolicyVersion: env.baselinePolicyVersion,
     baselineDecisions,
-    claims,
   });
   if (sha256Hex(canonicalize(validated.requestBundle)) !== requestSha256) {
     throw new Error('persisted request bundle does not recompute requestSha256');
