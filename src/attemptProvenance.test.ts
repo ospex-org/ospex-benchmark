@@ -63,10 +63,15 @@ test('acceptedAt without a requestReceivedAt is an impossible provenance', () =>
   assert.ok(violations.some((m) => m.includes('acceptedAt present without a requestReceivedAt')));
 });
 
-test('a repair after a receipt-less initial does not fabricate an ordering violation', () => {
-  assert.deepEqual(
-    order([initial({ requestReceivedAt: null, acceptedAt: null }), repair()], INITIAL_START),
-    [],
+test('a repair present with a receipt-less initial is an impossible causal timeline', () => {
+  // A repair is dispatched only after the initial RESPONSE supplies a decision
+  // fingerprint, so a repair cannot coexist with a receipt-less initial.
+  const violations = order(
+    [initial({ requestReceivedAt: null, acceptedAt: null }), repair()],
+    INITIAL_START,
+  );
+  assert.ok(
+    violations.some((m) => m.includes('repair attempt present without an initial requestReceivedAt')),
   );
 });
 

@@ -154,6 +154,13 @@ export function verifyAttemptOrdering(
     if (initial.requestStartedAt !== initialRequestStartedAt) {
       violations.push("fire initialRequestStartedAt must equal the initial attempt's requestStartedAt");
     }
+    // A repair is causally downstream of the initial's RESPONSE — it needs the
+    // initial body to build the decision fingerprint it must preserve — so a
+    // repair cannot legitimately exist when the initial never received a
+    // response. That timeline is impossible; fail closed on it.
+    if (repairCount > 0 && initial.requestReceivedAt === null) {
+      violations.push('repair attempt present without an initial requestReceivedAt');
+    }
     // Each repair must start no earlier than the initial's response was received
     // (checked only when the initial actually received one).
     const initialReceivedMs = parsed.find((p) => p.attempt === initial)?.receivedMs;
