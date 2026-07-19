@@ -69,6 +69,7 @@ function attempt(overrides: Partial<AttemptRecord>): AttemptRecord {
     requestParams: null,
     requestAt: null,
     responseAt: null,
+    acceptedAt: null,
     latencyMs: null,
     errorDetail: null,
     ...overrides,

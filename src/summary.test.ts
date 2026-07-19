@@ -37,6 +37,7 @@ const STUB_ATTEMPT: AttemptRecord = {
   requestParams: null,
   requestAt: null,
   responseAt: null,
+  acceptedAt: null,
   latencyMs: null,
   errorDetail: null,
 };

@@ -25,7 +25,13 @@ export interface AttemptTiming {
   attemptNumber: number;
   kind: AttemptKind;
   requestStartedAt: string;
-  requestReceivedAt: string;
+  /**
+   * When a provider response was RECEIVED — `null` for a timeout / transport
+   * failure that settled without an HTTP response. Distinct from the attempt's
+   * settled instant: the mapper derives receipt only when a response body or
+   * HTTP status is present, else `null`.
+   */
+  requestReceivedAt: string | null;
   acceptedAt: string | null;
 }
 
@@ -102,7 +108,10 @@ export function verifyAttemptOrdering(
   const parsed = attempts.map((attempt) => ({
     attempt,
     startedMs: safeMs(`attempt ${attempt.attemptNumber} requestStartedAt`, attempt.requestStartedAt, violations),
-    receivedMs: safeMs(`attempt ${attempt.attemptNumber} requestReceivedAt`, attempt.requestReceivedAt, violations),
+    receivedMs:
+      attempt.requestReceivedAt === null
+        ? null
+        : safeMs(`attempt ${attempt.attemptNumber} requestReceivedAt`, attempt.requestReceivedAt, violations),
     acceptedMs:
       attempt.acceptedAt === null
         ? null
@@ -124,13 +133,19 @@ export function verifyAttemptOrdering(
     }
   }
 
-  // Causal order within each attempt: started <= received <= accepted (if present).
+  // Causal order within each attempt: started <= received <= accepted (each
+  // bound only when present; a timeout/transport attempt has no receipt).
   for (const p of parsed) {
-    if (p.startedMs !== undefined && p.receivedMs !== undefined && p.startedMs > p.receivedMs) {
+    if (p.startedMs !== undefined && p.receivedMs != null && p.startedMs > p.receivedMs) {
       violations.push(`attempt ${p.attempt.attemptNumber}: requestStartedAt is after requestReceivedAt`);
     }
-    if (p.receivedMs !== undefined && p.acceptedMs != null && p.receivedMs > p.acceptedMs) {
+    if (p.receivedMs != null && p.acceptedMs != null && p.receivedMs > p.acceptedMs) {
       violations.push(`attempt ${p.attempt.attemptNumber}: requestReceivedAt is after acceptedAt`);
+    }
+    // An accepted attempt must have received a response: acceptedAt without a
+    // requestReceivedAt is an impossible provenance.
+    if (p.attempt.acceptedAt !== null && p.attempt.requestReceivedAt === null) {
+      violations.push(`attempt ${p.attempt.attemptNumber}: acceptedAt present without a requestReceivedAt`);
     }
   }
 
@@ -139,11 +154,12 @@ export function verifyAttemptOrdering(
     if (initial.requestStartedAt !== initialRequestStartedAt) {
       violations.push("fire initialRequestStartedAt must equal the initial attempt's requestStartedAt");
     }
-    // Each repair must start no earlier than the initial's response was received.
+    // Each repair must start no earlier than the initial's response was received
+    // (checked only when the initial actually received one).
     const initialReceivedMs = parsed.find((p) => p.attempt === initial)?.receivedMs;
     for (const p of parsed) {
       if (p.attempt.kind !== 'repair') continue;
-      if (initialReceivedMs !== undefined && p.startedMs !== undefined && p.startedMs < initialReceivedMs) {
+      if (initialReceivedMs != null && p.startedMs !== undefined && p.startedMs < initialReceivedMs) {
         violations.push(`repair ${p.attempt.attemptNumber}: requestStartedAt is before the initial's requestReceivedAt`);
       }
     }
@@ -212,9 +228,11 @@ export function cutoffViolations(input: {
     if (startedMs !== undefined && firstPitchMs !== undefined && startedMs >= firstPitchMs) {
       violations.push(`${attempt.kind} request (attempt ${attempt.attemptNumber}) started at/after first pitch`);
     }
-    const receivedMs = safeMs(`attempt ${attempt.attemptNumber} requestReceivedAt`, attempt.requestReceivedAt, violations);
-    if (receivedMs !== undefined && firstPitchMs !== undefined && receivedMs >= firstPitchMs) {
-      violations.push(`${attempt.kind} response (attempt ${attempt.attemptNumber}) received at/after first pitch`);
+    if (attempt.requestReceivedAt !== null) {
+      const receivedMs = safeMs(`attempt ${attempt.attemptNumber} requestReceivedAt`, attempt.requestReceivedAt, violations);
+      if (receivedMs !== undefined && firstPitchMs !== undefined && receivedMs >= firstPitchMs) {
+        violations.push(`${attempt.kind} response (attempt ${attempt.attemptNumber}) received at/after first pitch`);
+      }
     }
     if (attempt.acceptedAt !== null) {
       const acceptedMs = safeMs(`attempt ${attempt.attemptNumber} acceptedAt`, attempt.acceptedAt, violations);

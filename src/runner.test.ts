@@ -84,6 +84,71 @@ test('valid response crossing the cutoff: cutoff_missed, no decisions', async ()
   assert.ok(result.validationErrors.some((e) => e.includes('after the decision cutoff')));
 });
 
+test('a valid initial response stamps a truthful acceptedAt; the (absent) repair is untouched', async () => {
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  const adapter = stubAdapter([async () => stubResponse(JSON.stringify(makeValidResponse(request)))]);
+  const result = await runOneArmGame(
+    TEST_ARM,
+    adapter,
+    request,
+    baseOptions(() => CUTOFF_MS - 60_000),
+  );
+  assert.equal(result.outcome, 'valid');
+  assert.equal(result.repair, null);
+  assert.equal(result.attempt.acceptedAt, new Date(CUTOFF_MS - 60_000).toISOString());
+});
+
+test('a valid repair stamps acceptedAt on the repair; the un-accepted initial stays null', async () => {
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  const adapter = stubAdapter([
+    async () => stubResponse(wrongEcho(makeValidResponse(request))),
+    async () => stubResponse(JSON.stringify(makeValidResponse(request))),
+  ]);
+  const result = await runOneArmGame(
+    TEST_ARM,
+    adapter,
+    request,
+    baseOptions(() => CUTOFF_MS - 60_000),
+  );
+  assert.equal(result.outcome, 'valid');
+  assert.equal(result.repairUsed, true);
+  assert.equal(result.attempt.acceptedAt, null);
+  assert.equal(result.repair?.acceptedAt, new Date(CUTOFF_MS - 60_000).toISOString());
+});
+
+test('received in time but accepted after cutoff: cutoff_missed, acceptedAt unset', async () => {
+  // The receipt cutoff check passes, but the acceptance instant — rechecked
+  // after validation — has crossed first pitch. nowMs read order: dispatch
+  // check, request start, response stamp, receipt check (in time), acceptance
+  // recheck (crossed).
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  const reads = [CUTOFF_MS - 60_000, CUTOFF_MS - 60_000, CUTOFF_MS - 2, CUTOFF_MS - 1, CUTOFF_MS + 1];
+  let index = 0;
+  const nowMs = (): number => reads[Math.min(index++, reads.length - 1)] as number;
+  const adapter = stubAdapter([async () => stubResponse(JSON.stringify(makeValidResponse(request)))]);
+  const result = await runOneArmGame(TEST_ARM, adapter, request, baseOptions(nowMs));
+  assert.equal(result.outcome, 'cutoff_missed');
+  assert.equal(result.attempt.acceptedAt, null);
+  assert.ok(result.validationErrors.some((e) => e.includes('accepted after the decision cutoff')));
+});
+
+test('an invalid_schema outcome leaves acceptedAt null on every attempt', async () => {
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  const adapter = stubAdapter([
+    async () => stubResponse(wrongEcho(makeValidResponse(request))),
+    async () => stubResponse(wrongEcho(makeValidResponse(request))),
+  ]);
+  const result = await runOneArmGame(
+    TEST_ARM,
+    adapter,
+    request,
+    baseOptions(() => CUTOFF_MS - 60_000),
+  );
+  assert.equal(result.outcome, 'invalid_schema');
+  assert.equal(result.attempt.acceptedAt, null);
+  assert.equal(result.repair?.acceptedAt, null);
+});
+
 test('repair crossing the cutoff: cutoff_missed even though the repaired content is valid', async () => {
   const request = prepareGameRequest(makeRequest(CUTOFF));
   let now = CUTOFF_MS - 60_000;

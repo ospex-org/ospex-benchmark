@@ -289,7 +289,22 @@ export interface AttemptRecord {
   usageRaw: unknown;
   requestParams: Record<string, unknown> | null;
   requestAt: string | null;
+  /**
+   * Attempt-SETTLED instant (offset ISO): stamped on a received provider
+   * response AND on a timeout/transport failure, so it is not a truthful
+   * "response received" signal on its own. Kept unchanged for record
+   * compatibility; a downstream mapper derives a truthful receipt from it only
+   * when a response body / HTTP status is present.
+   */
   responseAt: string | null;
+  /**
+   * Truthful ACCEPTED instant (offset ISO): stamped only after the response
+   * passed complete validation (and, for a repair, fingerprint preservation)
+   * and before the accepting cutoff, immediately before `outcome: 'valid'`.
+   * `null` for every non-accepted attempt (unsent, timeout, transport failure,
+   * schema-invalid, or accepted after the decision cutoff).
+   */
+  acceptedAt: string | null;
   latencyMs: number | null;
   errorDetail: string | null;
 }

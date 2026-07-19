@@ -52,6 +52,36 @@ test('a clean single initial (not accepted) has no ordering violations', () => {
   assert.deepEqual(order([initial({ acceptedAt: null })], INITIAL_START), []);
 });
 
+// --- nullable requestReceivedAt: a timeout/transport attempt has no receipt ---
+
+test('a single unaccepted initial with no receipt (timeout) has no ordering violations', () => {
+  assert.deepEqual(order([initial({ requestReceivedAt: null, acceptedAt: null })], INITIAL_START), []);
+});
+
+test('acceptedAt without a requestReceivedAt is an impossible provenance', () => {
+  const violations = order([initial({ requestReceivedAt: null })], INITIAL_START);
+  assert.ok(violations.some((m) => m.includes('acceptedAt present without a requestReceivedAt')));
+});
+
+test('a repair after a receipt-less initial does not fabricate an ordering violation', () => {
+  assert.deepEqual(
+    order([initial({ requestReceivedAt: null, acceptedAt: null }), repair()], INITIAL_START),
+    [],
+  );
+});
+
+test('cutoffViolations skips the receipt check for a receipt-less attempt', () => {
+  assert.deepEqual(
+    cutoffViolations({
+      windowEnd: WINDOW_END,
+      scheduledAtAtFire: FIRST_PITCH,
+      initialRequestStartedAt: INITIAL_START,
+      attempts: [initial({ requestReceivedAt: null, acceptedAt: null })],
+    }),
+    [],
+  );
+});
+
 test('empty attempts is flagged', () => {
   assert.ok(order([], INITIAL_START).some((v) => /no attempts/.test(v)));
 });
