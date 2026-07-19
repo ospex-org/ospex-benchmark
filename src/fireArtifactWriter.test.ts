@@ -524,6 +524,15 @@ test('replay catches a foreign market-evidence opener identity', async () => {
   assert.ok(has(verifyFireArtifactReplay(t), 'opener identity does not bind'));
 });
 
+test('replay catches a per-market claim not bound to the fire identity', async () => {
+  // marketEvidence[].claim is the SOLE authoritative claim carrier; a claim whose
+  // fire identity is substituted must fail replay (no top-level claims[] to disagree).
+  const parsed = await parsedFire();
+  const me0 = { ...parsed.marketEvidence[0]!, claim: { ...parsed.marketEvidence[0]!.claim, fireId: 'foreign-fire' } };
+  const t = { ...parsed, marketEvidence: [me0, ...parsed.marketEvidence.slice(1)] };
+  assert.ok(has(verifyFireArtifactReplay(t), 'claim does not bind'));
+});
+
 test('replay catches a publication verified for a different cohort identity', async () => {
   const parsed = await parsedFire();
   const t = { ...parsed, publication: { ...parsed.publication, cohortId: 'a'.repeat(64) } };

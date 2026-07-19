@@ -385,7 +385,9 @@ test('builds a valid 2-market fire artifact with the expected shape', async () =
   assert.deepEqual(artifact.marketEvidence.map((m) => m.market), ['moneyline', 'total']);
   assert.equal(artifact.marketEvidence[0]?.openerAgeMs, 60_000);
   assert.deepEqual(artifact.marketEvidence[0]?.historyReadMode, { mode: 'live-unbounded' });
-  assert.equal(artifact.claims.length, 2);
+  // The claim linkage is the sole per-market carrier, bound to (cohort, fire, game, market).
+  assert.deepEqual(artifact.marketEvidence[0]?.claim, { cohortId: artifact.cohortId, fireId: 'fire-1', gameId: GAME_ID, market: 'moneyline' });
+  assert.deepEqual(artifact.marketEvidence[1]?.claim, { cohortId: artifact.cohortId, fireId: 'fire-1', gameId: GAME_ID, market: 'total' });
 
   assert.equal(artifact.arms.length, ARMS.length);
   assert.equal(artifact.expectedArmIdentities.length, ARMS.length);
@@ -404,7 +406,7 @@ test('a 1-market (moneyline-only) fire scopes everything to that market', async 
   const artifact = buildFireArtifact(env, ctx);
   assert.deepEqual(artifact.scopedMarkets, ['moneyline']);
   assert.equal(artifact.marketEvidence.length, 1);
-  assert.equal(artifact.claims.length, 1);
+  assert.deepEqual(artifact.marketEvidence[0]?.claim, { cohortId: artifact.cohortId, fireId: 'fire-1', gameId: GAME_ID, market: 'moneyline' });
   assert.deepEqual([...new Set(artifact.baselineDecisions.map((d) => d.market))], ['moneyline']);
   assert.deepEqual(artifact.arms[0]?.acceptedDecisionFingerprint?.map((d) => d.market), ['moneyline']);
 });

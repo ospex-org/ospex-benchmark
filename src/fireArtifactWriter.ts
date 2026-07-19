@@ -248,9 +248,10 @@ export function verifyFireArtifactRelations(artifact: FireArtifactV1): string[] 
   if (bundle.cutoffAt !== game.scheduledStartUtc) violations.push('requestBundle.cutoffAt does not equal game.scheduledStartUtc');
   if (!sameMarkets(artifact.scopedMarkets, scope)) violations.push('scopedMarkets do not equal the present retained-request markets');
 
-  // Scope bijection across every carrier.
+  // Scope bijection across every carrier. The claim linkage is the sole per-market
+  // `marketEvidence[].claim` (bound below), so there is no separate top-level
+  // claims[] to cross-check.
   if (!sameMarkets(artifact.marketEvidence.map((m) => m.market), scope)) violations.push('market evidence markets do not equal the scope');
-  if (!sameMarkets(artifact.claims.map((c) => c.market), scope)) violations.push('claim markets do not equal the scope');
 
   // Per-market-evidence internal identity / coherence / linkage.
   const detectedMs = safe(() => instantMs(artifact.detectedAt));
