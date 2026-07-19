@@ -92,12 +92,37 @@ export interface PublicationResolver {
 
 /**
  * The verified precommitment record persisted in every fire and cohort artifact
- * (§2 step 6): the descriptor plus the observed committer timestamp. Deep-frozen
- * so the persisted evidence cannot drift after verification.
+ * (§2 step 6): the descriptor, the observed committer timestamp, and the cohort
+ * identity the verification was performed for (the local == blob `cohortId`, which
+ * this check proved equal). Deep-frozen so the persisted evidence cannot drift
+ * after verification, and carrying `cohortId` so a consumer can bind the record to
+ * its own cohort (rejecting a genuine verification performed for a DIFFERENT
+ * cohort). Produced only by `checkPublication` and registered in the verification
+ * brand below.
  */
 export interface PublicationVerified {
   readonly publication: ManifestPublicationV1;
   readonly committerTimestamp: string;
+  /** The cohort identity this publication was verified for (blob == local). */
+  readonly cohortId: string;
+}
+
+// Module-private registry of records produced by checkPublication. Nothing outside
+// this module can add to it, so membership is unforgeable proof that a
+// PublicationVerified actually came through public-Git precommitment verification —
+// a consumer cannot be handed a hand-built descriptor with a plausible timestamp.
+const verifiedPublications = new WeakSet<PublicationVerified>();
+
+/**
+ * Throw unless `record` was produced by `checkPublication` / `verifyPublication`.
+ * A consumer that persists the precommitment as authenticated evidence (e.g. the
+ * fire-artifact producer) calls this; a forged or structurally-copied record is
+ * rejected. Bind `record.cohortId` to the consumer's own cohort separately.
+ */
+export function assertPublicationVerified(record: PublicationVerified): void {
+  if (!verifiedPublications.has(record)) {
+    throw new Error('publication record was not produced by checkPublication (forged or substituted)');
+  }
 }
 
 /** A precommitment refusal carrying the exact reasons, mirroring
@@ -220,11 +245,21 @@ export function checkPublication(input: CheckPublicationInput): PublicationVerif
   }
 
   // (6) The record persisted in every fire and cohort artifact. `descriptor.success`
-  //     is necessarily true here (any failure pushed a violation and threw above).
-  return deepFreeze({
+  //     and `localCohortId` are necessarily defined here (any failure pushed a
+  //     violation and threw above); assert the latter defensively so the record
+  //     always binds the verified cohort identity, then register it in the brand.
+  if (localCohortId === undefined) {
+    throw new PublicationError('publication verification could not resolve the local cohort identity', [
+      'local cohortId unresolved',
+    ]);
+  }
+  const record: PublicationVerified = deepFreeze({
     publication: descriptor.success ? descriptor.data : input.publication,
     committerTimestamp: resolved.committerTimestamp,
+    cohortId: localCohortId,
   });
+  verifiedPublications.add(record);
+  return record;
 }
 
 export interface VerifyPublicationInput {

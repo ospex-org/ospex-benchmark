@@ -95,6 +95,25 @@ export interface BootedCohort {
   readonly manifest: CohortManifestV1;
 }
 
+// Module-private registry of cohorts produced by cohortBoot. Nothing outside this
+// module can add to it, so membership is unforgeable proof that a BootedCohort
+// actually came through the canonical boot gate (--live hard-disable, strict
+// parse, code-consistency validation, config-lock) — a consumer that authenticates
+// against it cannot be handed a hand-built or structurally-copied cohort whose
+// manifest never passed `validateManifestAgainstCode`.
+const bootedCohorts = new WeakSet<BootedCohort>();
+
+/**
+ * Throw unless `booted` was produced by `cohortBoot`. A consumer that must trust
+ * the cohort's authenticated identity/config (e.g. the fire-artifact producer)
+ * calls this; a forged or structurally-identical copy is rejected.
+ */
+export function assertBootedCohort(booted: BootedCohort): void {
+  if (!bootedCohorts.has(booted)) {
+    throw new Error('booted cohort was not produced by cohortBoot (forged or substituted)');
+  }
+}
+
 /**
  * The manifest constants a CLI override is allowed to name — the subset of
  * eligibility-/completion-/scoring-affecting values that have a legacy CLI flag
@@ -174,6 +193,9 @@ export function cohortBoot(request: CohortBootRequest): BootedCohort {
   //     Freezing AFTER the checks and BEFORE returning means no downstream `as`
   //     cast can drift the eligibility / completion / scoring config post-boot —
   //     the same immutability rule that governs the canonical code registries.
+  //     Register in the boot brand so a consumer can prove genuine origin.
   const frozen = deepFreeze(manifest);
-  return Object.freeze({ cohortId: deriveCohortId(frozen), manifest: frozen });
+  const booted: BootedCohort = Object.freeze({ cohortId: deriveCohortId(frozen), manifest: frozen });
+  bootedCohorts.add(booted);
+  return booted;
 }

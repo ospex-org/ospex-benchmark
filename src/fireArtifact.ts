@@ -17,8 +17,9 @@ import type { ArmGameResult, ArmOutcome, AttemptRecord, BenchmarkResponse, Marke
  * `null` (never `undefined`, which `canonicalize` drops).
  */
 
-/** Canonical market order (SPEC §3): moneyline < spread < total. */
-const MARKET_ORDINAL: Readonly<Record<MarketKey, number>> = { moneyline: 0, spread: 1, total: 2 };
+/** Canonical market order (SPEC §3): moneyline < spread < total. Exported so the
+ *  producer slice orders its scoped market set / evidence by the SAME order. */
+export const MARKET_ORDINAL: Readonly<Record<MarketKey, number>> = { moneyline: 0, spread: 1, total: 2 };
 
 const armOutcomeSchemaV1 = z.enum([
   'valid',

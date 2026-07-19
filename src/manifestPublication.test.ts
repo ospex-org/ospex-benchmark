@@ -11,6 +11,7 @@ import type {
   PublicationResolver,
   ResolvedPublication,
 } from './manifestPublication.js';
+import { cohortId as deriveCohortId, parseManifest } from './manifest.js';
 
 /**
  * Public-Git precommitment verification (§2, case 17). Fixtures are structurally
@@ -84,6 +85,7 @@ const bytesOf = (raw: Record<string, unknown>, pretty = false): Buffer =>
   Buffer.from(JSON.stringify(raw, null, pretty ? 2 : undefined), 'utf-8');
 
 const LOCAL_BYTES = bytesOf(validRaw());
+const LOCAL_COHORT_ID = deriveCohortId(parseManifest(validRaw()));
 
 function resolved(over: Partial<ResolvedPublication> = {}): ResolvedPublication {
   return { blobBytes: LOCAL_BYTES, committerTimestamp: BEFORE, ...over };
@@ -106,7 +108,7 @@ test('parseManifestPublication accepts a valid descriptor and rejects malformed 
 
 test('a matching, timely precommitment verifies and returns a frozen record', () => {
   const verified = checkPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolved: resolved() });
-  assert.deepEqual(verified, { publication: PUB, committerTimestamp: BEFORE });
+  assert.deepEqual(verified, { publication: PUB, committerTimestamp: BEFORE, cohortId: LOCAL_COHORT_ID });
   // Frozen: neither the record nor its nested descriptor can drift after verification.
   assert.throws(() => {
     (verified as unknown as { committerTimestamp: string }).committerTimestamp = 'x';
@@ -228,7 +230,7 @@ test('a descriptor that bypassed strict parsing (branch-name commitSha) is refus
 test('verifyPublication resolves via the injected resolver and returns the verified record', async () => {
   const resolver: PublicationResolver = { resolve: () => Promise.resolve(resolved()) };
   const verified = await verifyPublication({ localManifestBytes: LOCAL_BYTES, publication: PUB, resolver });
-  assert.deepEqual(verified, { publication: PUB, committerTimestamp: BEFORE });
+  assert.deepEqual(verified, { publication: PUB, committerTimestamp: BEFORE, cohortId: LOCAL_COHORT_ID });
 });
 
 test('a resolver that cannot resolve the commit fails the run', async () => {
