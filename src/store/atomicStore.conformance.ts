@@ -5,11 +5,13 @@
  * branch emits, the request→arg mapping drives the functions end-to-end, AND (the
  * conformance gate F5 depends on) that the adapter is correct under GENUINELY OVERLAPPING
  * transactions and crash/restart. The overlap is proven three ways: a held-row BARRIER with
- * asserted lock-waits on distinct backends (case 25, same-fireId, and the admit-vs-repair
- * ceiling race — §13 row 8); unbarriered concurrent STRESS races (case 8, budget stress);
- * and SEQUENTIAL release/expiry/crash tests driven across transactions (cases 45/46,
- * completion, crash/restart §8). Mirrors the SQL spike's setup (drop + apply schema/functions
- * on a scratch DB). NOT part of `yarn test` (that suite is pure and DB-free).
+ * asserted lock-waits on distinct backends (case 8 claim race, case 25 budget race,
+ * same-fireId, and the admit-vs-repair ceiling race — §13 row 8) — a serialized run cannot
+ * pass these, since both competitors must be simultaneously lock-waiting before the gate
+ * opens; an unbarriered concurrent STRESS race (budget stress, guarded against silent
+ * serialization); and SEQUENTIAL release/expiry/crash tests driven across transactions
+ * (cases 45/46, completion, crash/restart §8). Mirrors the SQL spike's setup (drop + apply
+ * schema/functions on a scratch DB). NOT part of `yarn test` (that suite is pure and DB-free).
  *
  * Run: `docker run` a Postgres, then `STORE_DATABASE_URL=… yarn store:adapter`
  * (defaults to the spike's local Docker Postgres).
@@ -397,16 +399,27 @@ async function main(): Promise<void> {
     );
   });
 
-  // case 8: many concurrent admits (distinct fireIds) on ONE key → exactly one claim.
-  await check('case 8 (stress, adapter): 8 concurrent admits (distinct fireIds) on one key → exactly one claim', async () => {
-    assertPoolParallel();
+  // case 8: two distinct-backend admits, DIFFERENT fireIds on the SAME key, gated + asserted
+  // Lock-waiting → at-most-once holds: exactly one admitted, one all_claimed, one claim /
+  // reservation / lease set. Barrier-proven (not Promise.all) so a serialized / non-overlapping
+  // run cannot pass — the two admits must be simultaneously lock-waiting before the gate opens.
+  await check('case 8 (overlap-proven, adapter): gated distinct-backend admits, different fireIds on ONE key → one admitted, one all_claimed, one claim', async () => {
     const c = cohortName('cc-case8');
     await store.initCohortBudget(pins(c));
-    const outcomes = await Promise.all(
-      Array.from({ length: 8 }, (_, k) => store.admitDispatch({ cohortId: c, fireId: `f${k}`, ownerId: `w${k}`, expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) })),
+    await withGate<AdmitResult, AdmitResult>(
+      pool,
+      c,
+      (s) => s.admitDispatch({ cohortId: c, fireId: 'fA', ownerId: 'wA', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) }),
+      (s) => s.admitDispatch({ cohortId: c, fireId: 'fB', ownerId: 'wB', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) }),
+      async (a, b) => {
+        assert.deepEqual([a.outcome, b.outcome].sort(), ['admitted', 'refused'], JSON.stringify([a, b]));
+        const ref = a.outcome === 'refused' ? a : b;
+        assert.equal(ref.outcome === 'refused' && ref.reason, 'all_claimed');
+        assert.equal(await claimCount(c), 1); // at-most-once: exactly one claim
+        assert.equal(await callsReserved(c), 8); // one reservation
+        assert.deepEqual([await initialLeaseCount(c, 'fA'), await initialLeaseCount(c, 'fB')].sort(), [0, 4]); // one lease set
+      },
     );
-    assert.equal(outcomes.filter((o) => o.outcome === 'admitted').length, 1, JSON.stringify(outcomes.map((o) => o.outcome)));
-    assert.equal(await claimCount(c), 1);
   });
 
   // budget stress: 8 concurrent admits race a scarce cap → exactly 3 admitted, no over-reservation.
