@@ -420,7 +420,7 @@ export interface ForecastFingerprint {
 
 export type DecisionFingerprint = Map<string, ForecastFingerprint>;
 
-function forecastFingerprint(forecast: ForecastOutput): ForecastFingerprint {
+export function forecastFingerprint(forecast: ForecastOutput): ForecastFingerprint {
   return {
     selection: forecast.selection,
     line: forecast.line,
