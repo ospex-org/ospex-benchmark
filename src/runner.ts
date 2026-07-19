@@ -270,6 +270,7 @@ function emptyAttempt(): AttemptRecord {
     requestParams: null,
     requestAt: null,
     responseAt: null,
+    acceptedAt: null,
     latencyMs: null,
     errorDetail: null,
   };
@@ -309,6 +310,9 @@ async function timedChat(
       requestParams: response.requestParams,
       requestAt,
       responseAt: new Date(respondedAt).toISOString(),
+      // A received response is not yet ACCEPTED — acceptance is stamped in
+      // runOneArmGame only after validation (and repair fingerprint) passes.
+      acceptedAt: null,
       latencyMs: respondedAt - startedAt,
       errorDetail: null,
       response,
@@ -434,10 +438,20 @@ export async function runOneArmGame(
     options.cohortId,
   );
   if (firstValidation.errors.length === 0 && firstValidation.parsed !== null) {
+    // Acceptance instant, rechecked against the cutoff at that instant: a
+    // response accepted at/after first pitch is never a decision (§5), so it
+    // stays cutoff_missed with acceptedAt unset. Otherwise stamp the truthful
+    // accept time (distinct from the received-response stamp).
+    const acceptedMs = nowMs();
+    if (acceptedMs >= cutoffMs) {
+      return failed('cutoff_missed', attemptRecord, null, false, null, [
+        'response accepted after the decision cutoff',
+      ]);
+    }
     return {
       ...base,
       outcome: 'valid',
-      attempt: attemptRecord,
+      attempt: { ...attemptRecord, acceptedAt: new Date(acceptedMs).toISOString() },
       repair: null,
       repairUsed: false,
       repairTransport: null,
@@ -516,11 +530,21 @@ export async function runOneArmGame(
     if (diffs.length > 0) {
       return failed('invalid_schema', attemptRecord, repairRecord, true, 'ok', diffs);
     }
+    // Acceptance instant for the repair (the accepted attempt), rechecked
+    // against the cutoff at that instant: a repair accepted at/after first pitch
+    // is never a decision (§5). The initial attempt was NOT accepted, so its
+    // acceptedAt stays null; only the repair carries the truthful accept time.
+    const acceptedMs = nowMs();
+    if (acceptedMs >= cutoffMs) {
+      return failed('cutoff_missed', attemptRecord, repairRecord, true, 'ok', [
+        'repair response accepted after the decision cutoff',
+      ]);
+    }
     return {
       ...base,
       outcome: 'valid',
       attempt: attemptRecord,
-      repair: repairRecord,
+      repair: { ...repairRecord, acceptedAt: new Date(acceptedMs).toISOString() },
       repairUsed: true,
       repairTransport: 'ok',
       parsed: repairValidation.parsed,
