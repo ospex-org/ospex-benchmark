@@ -2,9 +2,14 @@
  * Adapter conformance against REAL Postgres (SPEC-atomic-store.md): the `SqlAtomicStore`
  * driven over the checked-in SQL functions. It proves what the pure `atomicStore.test.ts`
  * suite cannot — that the adapter's zod result schemas accept EXACTLY the JSONB every SQL
- * branch emits, and the request→arg mapping drives the functions correctly end-to-end.
- * Mirrors the SQL spike's setup (drop + apply schema/functions on a scratch DB). NOT part
- * of `yarn test` (that suite is pure and DB-free).
+ * branch emits, the request→arg mapping drives the functions end-to-end, AND (the
+ * conformance gate F5 depends on) that the adapter is correct under GENUINELY OVERLAPPING
+ * transactions and crash/restart. The overlap is proven three ways: a held-row BARRIER with
+ * asserted lock-waits on distinct backends (case 25, same-fireId, and the admit-vs-repair
+ * ceiling race — §13 row 8); unbarriered concurrent STRESS races (case 8, budget stress);
+ * and SEQUENTIAL release/expiry/crash tests driven across transactions (cases 45/46,
+ * completion, crash/restart §8). Mirrors the SQL spike's setup (drop + apply schema/functions
+ * on a scratch DB). NOT part of `yarn test` (that suite is pure and DB-free).
  *
  * Run: `docker run` a Postgres, then `STORE_DATABASE_URL=… yarn store:adapter`
  * (defaults to the spike's local Docker Postgres).
@@ -12,9 +17,10 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
+import type { PoolClient } from 'pg';
 import { sha256Hex } from '../canonical.js';
 import { SqlAtomicStore, pgStoreQuery } from './atomicStore.js';
-import type { AdmitDispatchRequest, InitCohortBudgetRequest, ScopeKey } from './contract.js';
+import type { AdmitDispatchRequest, AdmitResult, InitCohortBudgetRequest, RepairLeaseResult, ScopeKey } from './contract.js';
 import type { MarketKey } from '../types.js';
 
 const DATABASE_URL = process.env.STORE_DATABASE_URL ?? 'postgres://postgres:spike@localhost:5433/store_spike';
@@ -61,8 +67,87 @@ async function check(name: string, fn: () => Promise<void>): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Concurrency machinery — genuinely overlapping transactions THROUGH the adapter (the
+// conformance gate F5 depends on): each worker is a SqlAtomicStore over its OWN pooled
+// backend (distinct pg_backend_pid), so a race is real and each backend's lock-wait is
+// observable. Mocks cannot substitute for actual overlapping transactions (SPEC §12).
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+interface Tracked<T> { promise: Promise<T>; settled: () => boolean; }
+function track<T>(p: Promise<T>): Tracked<T> {
+  let done = false;
+  const promise = p.then((v) => { done = true; return v; }, (e: unknown) => { done = true; throw e; });
+  return { promise, settled: () => done };
+}
+
+interface Worker { store: SqlAtomicStore; client: PoolClient; pid: number; }
+async function makeWorkers(pool: Pool, n: number): Promise<Worker[]> {
+  const out: Worker[] = [];
+  try {
+    for (let i = 0; i < n; i += 1) {
+      const client = await pool.connect();
+      const pid = Number((await client.query('select pg_backend_pid() as pid')).rows[0]!.pid);
+      out.push({ store: new SqlAtomicStore(pgStoreQuery(client)), client, pid });
+    }
+  } catch (err) {
+    for (const w of out) w.client.release();
+    throw err;
+  }
+  const pids = new Set(out.map((w) => w.pid));
+  assert.equal(pids.size, n, `expected ${n} distinct backend PIDs, got ${JSON.stringify([...pids])}`);
+  return out;
+}
+
+async function bothLockWaiting(pool: Pool, pids: number[], timeoutMs = 8000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    const { rows } = await pool.query('select pid, state, wait_event_type from pg_stat_activity where pid = any($1::int[])', [pids]);
+    const waiting = rows.filter((r) => r.state === 'active' && r.wait_event_type === 'Lock');
+    if (waiting.length === pids.length) return;
+    if (Date.now() - start > timeoutMs) throw new Error(`barrier: expected ${pids.length} sessions Lock-waiting; saw ${JSON.stringify(rows)}`);
+    await sleep(25);
+  }
+}
+
+// Race two adapter operations (distinct backends) behind a gate holding the cohort's budget
+// row: both are asserted Lock-waiting + unresolved before the gate opens, then the store's own
+// FOR UPDATE serializes them. Proves the ADAPTER (not just the SQL) is correct under overlap.
+// Generic over the two op result types so an admit can race a repair-acquire (§13 row 8).
+async function withGate<A, B>(
+  pool: Pool,
+  cohortId: string,
+  buildA: (store: SqlAtomicStore) => Promise<A>,
+  buildB: (store: SqlAtomicStore) => Promise<B>,
+  after: (a: A, b: B) => Promise<void>,
+): Promise<void> {
+  const [gate, wa, wb] = (await makeWorkers(pool, 3)) as [Worker, Worker, Worker];
+  let ta: Tracked<A> | null = null;
+  let tb: Tracked<B> | null = null;
+  try {
+    await gate.client.query('begin');
+    await gate.client.query('select 1 from store.cohort_budget where cohort_id=$1 for update', [cohortId]);
+    ta = track(buildA(wa.store));
+    tb = track(buildB(wb.store));
+    await bothLockWaiting(pool, [wa.pid, wb.pid]);
+    assert.ok(!ta.settled() && !tb.settled(), 'both adapter ops must block on the budget lock before release');
+    await gate.client.query('rollback');
+    const [a, b] = await Promise.all([ta.promise, tb.promise]);
+    await after(a, b);
+  } finally {
+    try { await gate.client.query('rollback'); } catch { /* already ended */ }
+    if (ta) await ta.promise.catch(() => undefined);
+    if (tb) await tb.promise.catch(() => undefined);
+    gate.client.release(); wa.client.release(); wb.client.release();
+  }
+}
+
 async function main(): Promise<void> {
-  const pool = new Pool({ connectionString: DATABASE_URL, max: 8 });
+  // max 12 gives headroom for the 8-worker stress + the 3-client barriers; connectionTimeout
+  // so a starved pool throws rather than hangs.
+  const pool = new Pool({ connectionString: DATABASE_URL, max: 12, connectionTimeoutMillis: 8000 });
   await pool.query('drop schema if exists store cascade');
   await pool.query(SCHEMA_SQL);
   await pool.query(FUNCTIONS_SQL);
@@ -70,6 +155,16 @@ async function main(): Promise<void> {
   const store = new SqlAtomicStore(pgStoreQuery(pool));
   const claimCount = async (c: string): Promise<number> => Number((await pool.query('select count(*) as v from store.claims where cohort_id=$1', [c])).rows[0]!.v);
   const callsReserved = async (c: string): Promise<number> => Number((await pool.query('select calls_reserved as v from store.cohort_budget where cohort_id=$1', [c])).rows[0]!.v);
+  const activeSlots = async (c: string): Promise<number> =>
+    Number((await pool.query('select coalesce(sum(1),0) as v from store.concurrency_leases where cohort_id=$1 and released_at is null and expires_at > now()', [c])).rows[0]!.v);
+  const claimStatus = async (c: string, g: string, m: string): Promise<string | null> =>
+    (((await pool.query('select status as v from store.claims where cohort_id=$1 and game_id=$2 and market=$3', [c, g, m])).rows[0]?.v) ?? null) as string | null;
+  const initialLeaseCount = async (c: string, f: string): Promise<number> =>
+    Number((await pool.query("select count(*) as v from store.concurrency_leases where cohort_id=$1 and fire_id=$2 and attempt_kind='initial'", [c, f])).rows[0]!.v);
+  // Guard the unbarriered stress races: if the pool can't supply the fan-out width, they would
+  // silently serialize and lose their concurrency coverage. Fail loud instead.
+  const FANOUT = 8;
+  const assertPoolParallel = (): void => assert.ok((pool.options.max ?? 0) >= FANOUT, `stress fan-out needs pool max >= ${FANOUT}`);
 
   // --- the mapped happy-path lifecycle ---
   await check('lifecycle: init → admit(admitted) → acquireRepair(acquired) → release → complete(completed)', async () => {
@@ -258,6 +353,168 @@ async function main(): Promise<void> {
     await store.admitDispatch({ cohortId: vc, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
     const cv = await store.completeClaim({ cohortId: vc, fireId: 'f1', expectedSchemaVersion: 999 });
     assert.equal(cv.outcome === 'refused' && cv.reason, 'version_mismatch');
+  });
+
+  // =========================================================================
+  // Genuinely-overlapping + crash/restart conformance through the adapter
+  // (the committed gate F5 depends on; SPEC §12 cases 8/25/45/46 + §8 crash).
+  // =========================================================================
+
+  // case 25: two distinct-backend admits, gated + asserted Lock-waiting → exactly one admitted.
+  await check('case 25 (overlap-proven, adapter): gated distinct-backend admits race the budget → exactly one admitted', async () => {
+    const c = cohortName('cc-case25');
+    await store.initCohortBudget(pins(c, { callCap: 8 })); // exactly one dispatch's callΔ (4×2) fits
+    await withGate(
+      pool,
+      c,
+      (s) => s.admitDispatch({ cohortId: c, fireId: 'fA', ownerId: 'wA', expectedSchemaVersion: VER, gameId: 'gA', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) }),
+      (s) => s.admitDispatch({ cohortId: c, fireId: 'fB', ownerId: 'wB', expectedSchemaVersion: VER, gameId: 'gB', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) }),
+      async (a, b) => {
+        assert.deepEqual([a.outcome, b.outcome].sort(), ['admitted', 'refused'], JSON.stringify([a, b]));
+        const ref = a.outcome === 'refused' ? a : b;
+        assert.equal(ref.outcome === 'refused' && ref.reason, 'call_cap');
+        assert.equal(await callsReserved(c), 8);
+      },
+    );
+  });
+
+  // same-fireId: two distinct-backend admits of ONE fireId, gated → one admitted, one replayed.
+  await check('same-fireId (overlap-proven, adapter): gated distinct-backend, SAME fireId → one admitted, one replayed, one reservation', async () => {
+    const c = cohortName('cc-samefire');
+    await store.initCohortBudget(pins(c));
+    const req: AdmitDispatchRequest = { cohortId: c, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) };
+    await withGate(
+      pool,
+      c,
+      (s) => s.admitDispatch(req),
+      (s) => s.admitDispatch(req),
+      async (a, b) => {
+        assert.deepEqual([a.outcome, b.outcome].sort(), ['admitted', 'replayed'], JSON.stringify([a, b]));
+        assert.equal(await callsReserved(c), 8); // one reservation
+        assert.equal(await claimCount(c), 1); // one claim
+        assert.equal(await initialLeaseCount(c, 'f1'), 4); // one lease set (§12 new-case)
+      },
+    );
+  });
+
+  // case 8: many concurrent admits (distinct fireIds) on ONE key → exactly one claim.
+  await check('case 8 (stress, adapter): 8 concurrent admits (distinct fireIds) on one key → exactly one claim', async () => {
+    assertPoolParallel();
+    const c = cohortName('cc-case8');
+    await store.initCohortBudget(pins(c));
+    const outcomes = await Promise.all(
+      Array.from({ length: 8 }, (_, k) => store.admitDispatch({ cohortId: c, fireId: `f${k}`, ownerId: `w${k}`, expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) })),
+    );
+    assert.equal(outcomes.filter((o) => o.outcome === 'admitted').length, 1, JSON.stringify(outcomes.map((o) => o.outcome)));
+    assert.equal(await claimCount(c), 1);
+  });
+
+  // budget stress: 8 concurrent admits race a scarce cap → exactly 3 admitted, no over-reservation.
+  await check('budget stress (adapter): 8 concurrent admits race 3 budget slots → exactly 3 admitted', async () => {
+    assertPoolParallel();
+    const c = cohortName('cc-stress');
+    await store.initCohortBudget(pins(c, { callCap: 24 })); // 3 × callΔ(8)
+    const outcomes = await Promise.all(
+      Array.from({ length: 8 }, (_, k) => store.admitDispatch({ cohortId: c, fireId: `f${k}`, ownerId: `w${k}`, expectedSchemaVersion: VER, gameId: `g${k}`, proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) })),
+    );
+    assert.equal(outcomes.filter((o) => o.outcome === 'admitted').length, 3, JSON.stringify(outcomes.map((o) => o.outcome)));
+    assert.equal(await callsReserved(c), 24);
+  });
+
+  // case 45: saturate concurrency → per-arm releaseLease → re-acquire; ceiling holds throughout.
+  await check('case 45 (adapter): saturate concurrency → per-arm releaseLease → re-acquire; SUM(active) never exceeds the limit', async () => {
+    const c = cohortName('cc-case45');
+    await store.initCohortBudget(pins(c, { concurrencyLimit: 4 }));
+    const a1 = await store.admitDispatch({ cohortId: c, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    if (a1.outcome !== 'admitted') throw new Error('expected admitted');
+    assert.equal(await activeSlots(c), 4);
+    const blocked = await store.admitDispatch({ cohortId: c, fireId: 'f2', ownerId: 'w2', expectedSchemaVersion: VER, gameId: 'g2', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    assert.equal(blocked.outcome === 'refused' && blocked.reason, 'concurrency');
+    for (const lease of a1.initialLeases) {
+      assert.equal((await store.releaseLease({ leaseId: lease.leaseId, ownerId: 'w1' })).outcome, 'released');
+      assert.ok((await activeSlots(c)) <= 4);
+    }
+    assert.equal(await activeSlots(c), 0);
+    assert.equal((await store.admitDispatch({ cohortId: c, fireId: 'f2', ownerId: 'w2', expectedSchemaVersion: VER, gameId: 'g2', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) })).outcome, 'admitted');
+  });
+
+  // case 46: crash (never release), driven ACROSS transactions → capacity self-heals at expiry;
+  // the crashed fire's claim stays pending, budget stays consumed, freed capacity is reusable.
+  await check('case 46 (adapter): crash-expiry across txns — capacity freed after expiresAt; claim pending, budget consumed, capacity reusable', async () => {
+    const c = cohortName('cc-case46');
+    // A 3s bound gives the PRE-expiry reads a wide margin (they only race a JS stall > the
+    // bound); the post-expiry sleep(4000) clears it by 1s. `setTimeout` only fires late, never
+    // early, so both directions have real slack — no spurious failure on a loaded runner.
+    await store.initCohortBudget(pins(c, { concurrencyLimit: 4, initialLeaseBoundMs: 3000 }));
+    const a1 = await store.admitDispatch({ cohortId: c, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    assert.equal(a1.outcome, 'admitted');
+    assert.equal(await activeSlots(c), 4);
+    const blocked = await store.admitDispatch({ cohortId: c, fireId: 'f2', ownerId: 'w2', expectedSchemaVersion: VER, gameId: 'g2', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    assert.equal(blocked.outcome === 'refused' && blocked.reason, 'concurrency');
+    const reservedBefore = await callsReserved(c);
+    await sleep(4000); // real time, across transactions, past the 3s bound — the lease self-heals
+    assert.equal(await activeSlots(c), 0);
+    const a2 = await store.admitDispatch({ cohortId: c, fireId: 'f2', ownerId: 'w2', expectedSchemaVersion: VER, gameId: 'g2', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    assert.equal(a2.outcome, 'admitted', 'freed capacity is reusable after expiry');
+    assert.equal(await claimStatus(c, 'g1', 'moneyline'), 'pending'); // the crashed fire's claim persists
+    assert.equal(await callsReserved(c), reservedBefore + 8); // budget stayed consumed, then grew for f2
+  });
+
+  // crash/restart: a crashed fire's claim survives a restart (a NEW fireId re-admitting the key
+  // refuses all_claimed, no second reservation); a stray complete of an unknown fire is a no-op.
+  await check('crash/restart (adapter): the crashed claim blocks a NEW-fireId re-admit (all_claimed, no second reservation); an unknown complete is a no-op', async () => {
+    const c = cohortName('cc-restart');
+    await store.initCohortBudget(pins(c));
+    const crashed = await store.admitDispatch({ cohortId: c, fireId: 'crashed', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    assert.equal(crashed.outcome, 'admitted');
+    const reserved = await callsReserved(c);
+    // restart: the fireId is lost; a re-detection generates a NEW fireId and re-admits the same key.
+    const readmit = await store.admitDispatch({ cohortId: c, fireId: 'restarted', ownerId: 'w2', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    assert.equal(readmit.outcome === 'refused' && readmit.reason, 'all_claimed'); // at-most-once survives the restart
+    assert.equal(await callsReserved(c), reserved); // no second reservation
+    assert.equal(await claimStatus(c, 'g1', 'moneyline'), 'pending'); // still the crashed fire's claim
+    assert.deepEqual(await store.completeClaim({ cohortId: c, fireId: 'never-admitted', expectedSchemaVersion: VER }), { outcome: 'completed' }); // unknown fire → no-op
+  });
+
+  // §13 row 8: a gated admit-vs-repair-acquire race at the ceiling never exceeds the limit;
+  // the repair-path `concurrency` refusal is exercised. roster 4, limit 5 → a pending fire
+  // holds 4 slots, exactly 1 free: an admit needs 4 (can't fit), a repair needs 1 (fits).
+  await check('ceiling (adapter): a gated admit-vs-repair-acquire race holds SUM(active) ≤ limit; the repair concurrency refusal emits', async () => {
+    const c = cohortName('cc-ceiling');
+    await store.initCohortBudget(pins(c, { rosterSize: 4, maxRepairsPerArm: 1, concurrencyLimit: 5 }));
+    assert.equal((await store.admitDispatch({ cohortId: c, fireId: 'f0', ownerId: 'w0', expectedSchemaVersion: VER, gameId: 'g0', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) })).outcome, 'admitted');
+    assert.equal(await activeSlots(c), 4);
+    // gated race on distinct backends: whichever wins the budget lock, the ceiling holds —
+    // the admit can't fit 4 in 1 free slot (→ concurrency), the repair takes the last slot.
+    await withGate<AdmitResult, RepairLeaseResult>(
+      pool,
+      c,
+      (s) => s.admitDispatch({ cohortId: c, fireId: 'fN', ownerId: 'wN', expectedSchemaVersion: VER, gameId: 'gN', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) }),
+      (s) => s.acquireRepairLease({ cohortId: c, fireId: 'f0', ownerId: 'w0', armIndex: 0, repairOrdinal: 1, expectedSchemaVersion: VER }),
+      async (a, b) => {
+        assert.equal(a.outcome === 'refused' && a.reason, 'concurrency');
+        assert.equal(b.outcome, 'acquired');
+        assert.equal(await activeSlots(c), 5); // exactly the limit, never exceeded
+      },
+    );
+    // now saturated (5 = limit): a further repair-acquire drives the repair-path concurrency refusal.
+    const overRepair = await store.acquireRepairLease({ cohortId: c, fireId: 'f0', ownerId: 'w0', armIndex: 1, repairOrdinal: 1, expectedSchemaVersion: VER });
+    assert.equal(overRepair.outcome === 'refused' && overRepair.reason, 'concurrency');
+  });
+
+  // §13 row 9 / §8 clean-completion: a full-roster dispatch whose arms are all released and
+  // which then completes holds NO active leases (completeClaim does not release — the caller's
+  // per-arm finally does — so the whole flow must be driven to prove the property).
+  await check('completion (adapter): a full-roster dispatch, all arms released then completed, holds NO active leases', async () => {
+    const c = cohortName('cc-complete');
+    await store.initCohortBudget(pins(c, { concurrencyLimit: 8 }));
+    const a = await store.admitDispatch({ cohortId: c, fireId: 'f1', ownerId: 'w1', expectedSchemaVersion: VER, gameId: 'g1', proposedMarkets: ['moneyline'], scopeReservations: scope(['moneyline']) });
+    if (a.outcome !== 'admitted') throw new Error('expected admitted');
+    assert.equal(await activeSlots(c), 4);
+    for (const lease of a.initialLeases) assert.equal((await store.releaseLease({ leaseId: lease.leaseId, ownerId: 'w1' })).outcome, 'released'); // each arm's finally
+    assert.equal((await store.completeClaim({ cohortId: c, fireId: 'f1', expectedSchemaVersion: VER })).outcome, 'completed');
+    assert.equal(await activeSlots(c), 0); // a cleanly-completed dispatch holds no active leases
+    assert.equal(await claimStatus(c, 'g1', 'moneyline'), 'completed');
   });
 
   await pool.end();
