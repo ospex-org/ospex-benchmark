@@ -44,11 +44,15 @@ const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
 const attemptTransportSchemaV1 = z.enum(['ok', 'timeout', 'rate_limited', 'provider_error']);
 export type AttemptTransportV1 = z.infer<typeof attemptTransportSchemaV1>;
 
+// Token counts are hash-bound (usage folds into armDigest via orderedAttempts), so
+// they must be SAFE non-negative integers: two distinct raw upstream integers above
+// Number.MAX_SAFE_INTEGER collapse to the same JS value and would collide pre-hash.
+const tokenCountSchemaV1 = z.number().int().safe().nonnegative().nullable();
 const providerUsageSchemaV1 = z
   .object({
-    inputTokens: z.number().nullable(),
-    outputTokens: z.number().nullable(),
-    totalTokens: z.number().nullable(),
+    inputTokens: tokenCountSchemaV1,
+    outputTokens: tokenCountSchemaV1,
+    totalTokens: tokenCountSchemaV1,
   })
   .strict();
 // Compile-time parity: the persisted usage shape must equal the normalized ProviderUsage.

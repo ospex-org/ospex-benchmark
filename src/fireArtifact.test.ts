@@ -348,3 +348,15 @@ test('transport and usage are bound into armDigest via orderedAttempts', () => {
   const diffTransport = attempts.map((a) => ({ ...a, transport: 'timeout' as const }));
   assert.notEqual(armDigest(digestInput({ orderedAttempts: diffTransport })), base);
 });
+
+test('persisted usage token counts must be null or safe non-negative integers', () => {
+  const baseAttempt = first(toPersistedAttempts(armResult()));
+  const withToken = (inputTokens: unknown): unknown =>
+    persistedAttemptSchemaV1.parse({ ...baseAttempt, usage: { inputTokens, outputTokens: 0, totalTokens: 0 } });
+  for (const ok of [null, 0, 42, Number.MAX_SAFE_INTEGER]) {
+    assert.doesNotThrow(() => withToken(ok), `token count ${String(ok)} must be accepted`);
+  }
+  for (const bad of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => withToken(bad), `token count ${String(bad)} must be rejected`);
+  }
+});
