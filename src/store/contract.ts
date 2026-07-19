@@ -115,13 +115,17 @@ export type InitResult =
  * One dispatch's atomic claim + reservation request. The single-game boundary is
  * STRUCTURAL: one `gameId` and its `proposedMarkets`, never an array of
  * `(gameId, market)` pairs — a multi-game request cannot be represented. Runtime
- * validation (durable-operations slice), before any arithmetic, additionally rejects
- * — each an `invalid_input` refusal writing nothing:
+ * validation (durable-operations slice), before any arithmetic, rejects — each an
+ * `invalid_input` refusal writing nothing:
  *  - an empty `proposedMarkets`, or duplicate / unknown markets, or non-canonical
  *    market ordering;
- *  - a `scopeReservations` map that is not EXACTLY the nonempty subsets of
- *    `proposedMarkets` (a missing subset, or an extra subset outside `proposedMarkets`);
- *  - a malformed prepared-bytes digest, or a non-safe / negative spend value.
+ *  - any PRESENT `scopeReservations` entry with a malformed prepared-bytes digest or a
+ *    non-safe / negative spend value.
+ * The map is NOT required to enumerate every subset up front: `scopeReservations` is
+ * validated entry-by-entry, and a subset absent from it is not itself `invalid_input`.
+ * The store selects only the ACTUALLY-RETAINED subset's entry inside the lock (§4.5),
+ * so a RETAINED subset missing from the map is the distinct `scope_reservation_missing`
+ * refusal (below), and an extra entry outside `proposedMarkets` is simply never selected.
  */
 export interface AdmitDispatchRequest {
   cohortId: string;
@@ -132,10 +136,11 @@ export interface AdmitDispatchRequest {
   /** This game's proposed markets — canonical order, no duplicates (runtime-checked). */
   proposedMarkets: readonly MarketKey[];
   /**
-   * Exactly one reservation per nonempty subset of `proposedMarkets`, keyed by its
-   * canonical `ScopeKey`. The store selects the entry for the ACTUALLY-RETAINED scope
-   * inside the budget lock and reserves that (SPEC §4.5); a retained subset absent
-   * from the map refuses `scope_reservation_missing`.
+   * The caller SHOULD supply one reservation per nonempty subset of `proposedMarkets`,
+   * keyed by its canonical `ScopeKey`, so that whichever subset survives co-arrival is
+   * covered. The store does not validate completeness up front: it selects the entry for
+   * the ACTUALLY-RETAINED scope inside the budget lock and reserves that (SPEC §4.5), and
+   * a retained subset absent from the map refuses `scope_reservation_missing`.
    */
   scopeReservations: Readonly<Partial<Record<ScopeKey, ScopeReservation>>>;
 }

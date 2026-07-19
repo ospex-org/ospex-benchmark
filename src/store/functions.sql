@@ -64,29 +64,46 @@ end $$;
 -- ---------------------------------------------------------------------------
 
 create or replace function store.init_cohort_budget(p jsonb) returns jsonb language plpgsql as $$
-declare v store.cohort_budget%rowtype;
+declare v store.cohort_budget%rowtype; v_id text := p ->> 'cohortId';
 begin
-  select * into v from store.cohort_budget where cohort_id = p ->> 'cohortId' for update;
-  if found then
-    if v.schema_version <> (p ->> 'schemaVersion')::int then return jsonb_build_object('outcome','refused','reason','version_mismatch'); end if;
-    if v.call_cap <> (p ->> 'callCap')::bigint
-       or v.spend_cap_usd_micros <> (p ->> 'spendCapUsdMicros')::bigint
-       or v.concurrency_limit <> (p ->> 'concurrencyLimit')::int
-       or v.roster_size <> (p ->> 'rosterSize')::int
-       or v.max_repairs_per_arm <> (p ->> 'maxRepairsPerArm')::int
-       or v.initial_lease_bound_ms <> (p ->> 'initialLeaseBoundMs')::int
-       or v.repair_lease_bound_ms <> (p ->> 'repairLeaseBoundMs')::int then
-      return jsonb_build_object('outcome','refused','reason','config_mismatch');  -- fail loud, NO reset
+  -- Fast path: a row is already visible → lock it and compare (no insert attempt).
+  select * into v from store.cohort_budget where cohort_id = v_id for update;
+  if not found then
+    -- No visible row. TWO concurrent initializers both observe absence here, so the
+    -- absent-row check cannot be the decision: an absent row cannot be row-locked. The
+    -- UNIQUE insert is the serialization point — exactly one INSERT wins; a loser's
+    -- ON CONFLICT DO NOTHING blocks until the winner commits, then affects ZERO rows.
+    -- A loser must NOT report success on its own (unstored) pins: it loads + LOCKs the
+    -- winning row and compares (fail loud on drift), exactly like a pre-existing row.
+    insert into store.cohort_budget (cohort_id, schema_version, call_cap, spend_cap_usd_micros, concurrency_limit,
+                                     roster_size, max_repairs_per_arm, initial_lease_bound_ms, repair_lease_bound_ms)
+    values (v_id, (p ->> 'schemaVersion')::int, (p ->> 'callCap')::bigint, (p ->> 'spendCapUsdMicros')::bigint,
+            (p ->> 'concurrencyLimit')::int, (p ->> 'rosterSize')::int, (p ->> 'maxRepairsPerArm')::int,
+            (p ->> 'initialLeaseBoundMs')::int, (p ->> 'repairLeaseBoundMs')::int)
+    on conflict (cohort_id) do nothing;
+    if found then
+      return jsonb_build_object('outcome','initialized');  -- WE inserted the authoritative row
     end if;
-    return jsonb_build_object('outcome','initialized');  -- existing consistent row: preserve reservations
+    -- Lost the race: load + LOCK the winner's committed row (visible under READ COMMITTED
+    -- once our conflicting insert returned) and fall through to the shared compare.
+    select * into v from store.cohort_budget where cohort_id = v_id for update;
+    if not found then
+      -- Unreachable (the winner is committed + visible); fail closed, never a false success.
+      return jsonb_build_object('outcome','refused','reason','config_mismatch');
+    end if;
   end if;
-  insert into store.cohort_budget (cohort_id, schema_version, call_cap, spend_cap_usd_micros, concurrency_limit,
-                                   roster_size, max_repairs_per_arm, initial_lease_bound_ms, repair_lease_bound_ms)
-  values (p ->> 'cohortId', (p ->> 'schemaVersion')::int, (p ->> 'callCap')::bigint, (p ->> 'spendCapUsdMicros')::bigint,
-          (p ->> 'concurrencyLimit')::int, (p ->> 'rosterSize')::int, (p ->> 'maxRepairsPerArm')::int,
-          (p ->> 'initialLeaseBoundMs')::int, (p ->> 'repairLeaseBoundMs')::int)
-  on conflict (cohort_id) do nothing;
-  return jsonb_build_object('outcome','initialized');
+  -- Pre-existing OR concurrently-won row: compare every pin, fail loud with NO reset.
+  if v.schema_version <> (p ->> 'schemaVersion')::int then return jsonb_build_object('outcome','refused','reason','version_mismatch'); end if;
+  if v.call_cap <> (p ->> 'callCap')::bigint
+     or v.spend_cap_usd_micros <> (p ->> 'spendCapUsdMicros')::bigint
+     or v.concurrency_limit <> (p ->> 'concurrencyLimit')::int
+     or v.roster_size <> (p ->> 'rosterSize')::int
+     or v.max_repairs_per_arm <> (p ->> 'maxRepairsPerArm')::int
+     or v.initial_lease_bound_ms <> (p ->> 'initialLeaseBoundMs')::int
+     or v.repair_lease_bound_ms <> (p ->> 'repairLeaseBoundMs')::int then
+    return jsonb_build_object('outcome','refused','reason','config_mismatch');  -- fail loud, NO reset
+  end if;
+  return jsonb_build_object('outcome','initialized');  -- existing consistent row: preserve reservations
 end $$;
 
 -- ---------------------------------------------------------------------------

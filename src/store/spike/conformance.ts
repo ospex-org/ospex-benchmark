@@ -12,6 +12,15 @@
  *   - settle-down-only floors at made_calls, and a negative spend cannot decrement a
  *     reservation (cases 12, 22).
  *
+ * The load-bearing races are proven with a GENUINE-OVERLAP barrier, not just Promise.all:
+ * competing calls run on DISTINCT pooled backends (asserted by pg_backend_pid); a gate
+ * session holds the budget row (or, for the init race, an advisory lock via a scratch
+ * BEFORE INSERT trigger) so both competitors are observably Lock-waiting in
+ * pg_stat_activity — and unresolved — before the gate opens (§4). The store's own lock
+ * then serializes them. The Promise.all loops remain as supplementary stress.
+ * Self-test: `STORE_POOL_MAX=1 yarn store:spike` serializes every backend onto one
+ * connection, so the barrier checks FAIL — a serialized harness cannot fake overlap.
+ *
  * Run: `docker run` a Postgres, then `STORE_DATABASE_URL=… yarn store:spike`
  * (defaults to the spike's local Docker Postgres). NOT part of `yarn test` (that
  * suite is pure and DB-free); this is the store's real-Postgres gate.
@@ -105,6 +114,146 @@ function fullScope(markets: string[]): Record<string, { spend: number; digest: s
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------------------
+// Real-overlap barrier machinery: distinct backends, a held gate, and an asserted
+// lock-wait — so a genuinely-overlapping race is a TESTED fact, not an artifact of
+// Promise.all that a single serialized connection would satisfy just as well.
+// ---------------------------------------------------------------------------
+
+interface Tracked<T> { promise: Promise<T>; settled: () => boolean; }
+function track<T>(p: Promise<T>): Tracked<T> {
+  let done = false;
+  const promise = p.then(
+    (v) => { done = true; return v; },
+    (e: unknown) => { done = true; throw e; },
+  );
+  return { promise, settled: () => done };
+}
+
+interface Session { client: PoolClient; pid: number; }
+// Acquire n DISTINCT pooled backends (asserted by pg_backend_pid). Under a starved pool
+// (STORE_POOL_MAX=1) the 2nd connect() hits connectionTimeoutMillis and throws — so a
+// serialized single-connection harness FAILS every barrier check instead of faking overlap.
+async function distinctSessions(pool: Pool, n: number): Promise<Session[]> {
+  const out: Session[] = [];
+  try {
+    for (let i = 0; i < n; i += 1) {
+      const client = await pool.connect();
+      const pid = Number((await client.query('select pg_backend_pid() as pid')).rows[0].pid);
+      out.push({ client, pid });
+    }
+  } catch (err) {
+    for (const ssn of out) ssn.client.release();
+    throw err;
+  }
+  const pids = new Set(out.map((ssn) => ssn.pid));
+  assert.equal(pids.size, n, `expected ${n} distinct backend PIDs, got ${JSON.stringify([...pids])}`);
+  return out;
+}
+
+// Poll pg_stat_activity until EVERY listed backend is actively waiting on a Lock — the
+// proof that both competitors are simultaneously in flight, blocked, before the gate opens.
+async function bothLockWaiting(pool: Pool, pids: number[], timeoutMs = 8000): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    const { rows } = await pool.query(
+      'select pid, state, wait_event_type, wait_event from pg_stat_activity where pid = any($1::int[])',
+      [pids],
+    );
+    const waiting = rows.filter((r) => r.state === 'active' && r.wait_event_type === 'Lock');
+    if (waiting.length === pids.length) return;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`barrier: expected ${pids.length} sessions Lock-waiting; saw ${JSON.stringify(rows)}`);
+    }
+    await sleep(25);
+  }
+}
+
+async function admitOn(client: PoolClient, a: AdmitArgs): Promise<Record<string, unknown>> {
+  const res = await client.query('select store.admit_dispatch($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb) as r', [
+    a.cohort, a.fire, a.owner, VER, a.game, JSON.stringify(a.markets), JSON.stringify(a.scope),
+  ]);
+  return res.rows[0].r as Record<string, unknown>;
+}
+async function initOn(client: PoolClient, p: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const res = await client.query('select store.init_cohort_budget($1::jsonb) as r', [JSON.stringify(p)]);
+  return res.rows[0].r as Record<string, unknown>;
+}
+
+// Run `body` with two competitors blocked behind a gate that holds the cohort's budget
+// row (the exact `FOR UPDATE` every admit takes first, §4). Asserts both are lock-waiting
+// and unresolved before opening the gate; drains + releases every client on every path.
+async function withBudgetGate(
+  pool: Pool,
+  cohortId: string,
+  start: (a: PoolClient, b: PoolClient) => { a: Promise<Record<string, unknown>>; b: Promise<Record<string, unknown>> },
+  after: (ra: Record<string, unknown>, rb: Record<string, unknown>) => Promise<void>,
+): Promise<void> {
+  const [gate, a, b] = (await distinctSessions(pool, 3)) as [Session, Session, Session];
+  let tA: Tracked<Record<string, unknown>> | null = null;
+  let tB: Tracked<Record<string, unknown>> | null = null;
+  try {
+    await gate.client.query('begin');
+    await gate.client.query('select 1 from store.cohort_budget where cohort_id=$1 for update', [cohortId]);
+    const started = start(a.client, b.client);
+    tA = track(started.a);
+    tB = track(started.b);
+    await bothLockWaiting(pool, [a.pid, b.pid]);
+    assert.ok(!tA.settled() && !tB.settled(), 'both competitors must block on the budget lock before release');
+    await gate.client.query('rollback'); // open the gate; the store's own FOR UPDATE now serializes them
+    const [ra, rb] = await Promise.all([tA.promise, tB.promise]);
+    await after(ra, rb);
+  } finally {
+    try { await gate.client.query('rollback'); } catch { /* already ended */ }
+    if (tA) await tA.promise.catch(() => undefined);
+    if (tB) await tB.promise.catch(() => undefined);
+    gate.client.release(); a.client.release(); b.client.release();
+  }
+}
+
+// Force two initializers to overlap DETERMINISTICALLY. The scratch _spike_init_gate trigger
+// (armed only for GATE:* cohorts) blocks every insert on an advisory lock the gate session
+// holds, so both callers pass their "row absent?" SELECT and reach the INSERT before either
+// commits — the exact double-absence window the init fix closes. Releasing the gate lets exactly
+// one INSERT win; the loser's ON CONFLICT DO NOTHING affects zero rows, re-reads, and compares.
+async function initRace(
+  pool: Pool,
+  label: string,
+  overA: Partial<Record<string, number>>,
+  overB: Partial<Record<string, number>>,
+): Promise<{ cohortId: string; outcomes: string[]; reasons: unknown[]; rows: number; storedCallCap: number }> {
+  const c = `GATE:${label}-${process.pid}-${(nonce += 1)}`;
+  const [gate, a, b] = (await distinctSessions(pool, 3)) as [Session, Session, Session];
+  let tA: Tracked<Record<string, unknown>> | null = null;
+  let tB: Tracked<Record<string, unknown>> | null = null;
+  try {
+    const key = Number((await gate.client.query('select hashtext($1) as k', [c])).rows[0].k);
+    await gate.client.query('select pg_advisory_lock($1::bigint)', [key]);
+    tA = track(initOn(a.client, pins(c, overA)));
+    tB = track(initOn(b.client, pins(c, overB)));
+    await bothLockWaiting(pool, [a.pid, b.pid]);
+    assert.ok(!tA.settled() && !tB.settled(), 'both inits must block in the widened insert window before release');
+    await gate.client.query('select pg_advisory_unlock($1::bigint)', [key]);
+    const [ra, rb] = await Promise.all([tA.promise, tB.promise]);
+    const agg = await pool.query(
+      'select count(*)::int as n, max(call_cap) as cap from store.cohort_budget where cohort_id=$1',
+      [c],
+    );
+    return {
+      cohortId: c,
+      outcomes: [String(ra.outcome), String(rb.outcome)].sort(),
+      reasons: [ra.reason, rb.reason],
+      rows: Number(agg.rows[0].n),
+      storedCallCap: Number(agg.rows[0].cap),
+    };
+  } finally {
+    try { await gate.client.query('select pg_advisory_unlock_all()'); } catch { /* already released */ }
+    if (tA) await tA.promise.catch(() => undefined);
+    if (tB) await tB.promise.catch(() => undefined);
+    gate.client.release(); a.client.release(); b.client.release();
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 const results: Array<{ name: string; ok: boolean; detail?: string }> = [];
 async function check(name: string, fn: () => Promise<void>): Promise<void> {
@@ -119,13 +268,28 @@ async function check(name: string, fn: () => Promise<void>): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const pool = new Pool({ connectionString: DATABASE_URL, max: 12 });
+  // Default max 12 for real overlap; STORE_POOL_MAX=1 is the serialized-harness self-test
+  // (the barrier checks must FAIL). connectionTimeoutMillis makes a starved pool throw
+  // rather than hang, so the self-test terminates.
+  const POOL_MAX = Number(process.env.STORE_POOL_MAX ?? '12');
+  const pool = new Pool({ connectionString: DATABASE_URL, max: POOL_MAX, connectionTimeoutMillis: 8000 });
   const s = storeFor((sql, params) => pool.query(sql, params));
 
   // Fresh schema each run so a rerun is deterministic.
   await pool.query('drop schema if exists store cascade');
   await pool.query(SCHEMA_SQL);
   await pool.query(FUNCTIONS_SQL);
+
+  // Harness-only scaffolding (NOT part of the production DDL in schema.sql/functions.sql):
+  // a BEFORE INSERT trigger that lets the init-race checks force two initializers to overlap
+  // deterministically. It arms ONLY for GATE:* cohorts (used exclusively by initRace), so it
+  // is inert for every other conformance cohort.
+  await pool.query(`create or replace function store._spike_init_gate() returns trigger language plpgsql as $fn$
+begin
+  if NEW.cohort_id like 'GATE:%' then perform pg_advisory_xact_lock(hashtext(NEW.cohort_id)::bigint); end if;
+  return NEW;
+end $fn$;`);
+  await pool.query('create or replace trigger _spike_init_gate before insert on store.cohort_budget for each row execute function store._spike_init_gate()');
 
   // --- sanity: init + happy admit + idempotent replay ---
   await check('init + admit + idempotent same-fireId replay (sequential)', async () => {
@@ -150,6 +314,29 @@ async function main(): Promise<void> {
     assert.equal(await s.claimCount(c), 0);
   });
 
+  // --- concurrent conflicting init must fail loud (real overlap, gated) ---
+  await check('init race (same config): two SAME-config initializers overlap → both initialized, one row, counters preserved', async () => {
+    const r = await initRace(pool, 'same', {}, {});
+    assert.deepEqual(r.outcomes, ['initialized', 'initialized'], JSON.stringify(r));
+    assert.equal(r.rows, 1);
+    assert.equal(await s.callsReserved(r.cohortId), 0); // insert-once, never a reset
+  });
+
+  await check('init race (differing config): two DIFFERING-config initializers overlap → one initialized, one config_mismatch (loser never falsely initialized)', async () => {
+    const r = await initRace(pool, 'cap', { callCap: 101 }, { callCap: 202 });
+    assert.deepEqual(r.outcomes, ['initialized', 'refused'], JSON.stringify(r));
+    assert.ok(r.reasons.includes('config_mismatch'), JSON.stringify(r));
+    assert.equal(r.rows, 1); // exactly one row
+    assert.ok(r.storedCallCap === 101 || r.storedCallCap === 202, `stored ${r.storedCallCap}`); // the winner's pins
+  });
+
+  await check('init race (differing version): two DIFFERING-version initializers overlap → one initialized, one version_mismatch', async () => {
+    const r = await initRace(pool, 'ver', { schemaVersion: 1 }, { schemaVersion: 2 });
+    assert.deepEqual(r.outcomes, ['initialized', 'refused'], JSON.stringify(r));
+    assert.ok(r.reasons.includes('version_mismatch'), JSON.stringify(r));
+    assert.equal(r.rows, 1);
+  });
+
   // --- case 8: at-most-once claim under a real race ---
   await check('case 8: concurrent admits (different fireIds, same key) → exactly one claims it', async () => {
     for (let i = 0; i < 12; i += 1) {
@@ -164,8 +351,9 @@ async function main(): Promise<void> {
     }
   });
 
-  // --- case 25: budget race → at most one reservation ---
-  await check('case 25: concurrent admits race the final call slot → exactly one admitted', async () => {
+  // --- case 25: budget race → at most one reservation (Promise.all stress; the gated
+  //     overlap proof is 'case 25 (overlap-proven)' below) ---
+  await check('case 25 (stress loop): concurrent admits race the final call slot → exactly one admitted', async () => {
     for (let i = 0; i < 12; i += 1) {
       const c = cohortName(`case25-${i}`);
       await s.init(pins(c, { callCap: 8 })); // exactly ONE dispatch's callΔ (4×2) fits
@@ -178,8 +366,9 @@ async function main(): Promise<void> {
     }
   });
 
-  // --- same-fireId race: exactly one reservation + one lease set ---
-  await check('new case: two concurrent SAME-fireId admits → one admitted, one replayed, one reservation', async () => {
+  // --- same-fireId race: exactly one reservation + one lease set (Promise.all stress;
+  //     the gated overlap proof is 'same-fireId (overlap-proven)' below) ---
+  await check('same-fireId (stress loop): two concurrent SAME-fireId admits → one admitted, one replayed, one reservation', async () => {
     for (let i = 0; i < 12; i += 1) {
       const c = cohortName(`samefire-${i}`);
       await s.init(pins(c));
@@ -190,6 +379,41 @@ async function main(): Promise<void> {
       assert.equal(await s.callsReserved(c), 8); // one reservation
       assert.equal((await s.leaseIdsFor(c, 'f1')).length, 4); // one lease set
     }
+  });
+
+  // --- real-overlap proof — a held budget row gates two DISTINCT sessions ---
+  await check('case 25 (overlap-proven): gated distinct sessions both Lock-wait on the budget row; release → exactly one admitted', async () => {
+    const c = cohortName('case25-barrier');
+    await s.init(pins(c, { callCap: 8 })); // exactly ONE dispatch's callΔ (4×2) fits
+    await withBudgetGate(
+      pool,
+      c,
+      (a, b) => ({
+        a: admitOn(a, { cohort: c, fire: 'fA', owner: 'wA', game: 'gA', markets: ['moneyline'], scope: fullScope(['moneyline']) }),
+        b: admitOn(b, { cohort: c, fire: 'fB', owner: 'wB', game: 'gB', markets: ['moneyline'], scope: fullScope(['moneyline']) }),
+      }),
+      async (ra, rb) => {
+        assert.deepEqual([String(ra.outcome), String(rb.outcome)].sort(), ['admitted', 'refused'], JSON.stringify([ra, rb]));
+        assert.equal((ra.outcome === 'refused' ? ra : rb).reason, 'call_cap');
+        assert.equal(await s.callsReserved(c), 8); // exactly one reservation, never 16
+      },
+    );
+  });
+
+  await check('same-fireId (overlap-proven): gated distinct sessions, SAME fireId; release → one admitted, one replayed, one reservation + one lease set', async () => {
+    const c = cohortName('samefire-barrier');
+    await s.init(pins(c));
+    const args: AdmitArgs = { cohort: c, fire: 'f1', owner: 'w1', game: 'g1', markets: ['moneyline', 'total'], scope: fullScope(['moneyline', 'total']) };
+    await withBudgetGate(
+      pool,
+      c,
+      (a, b) => ({ a: admitOn(a, args), b: admitOn(b, args) }),
+      async (ra, rb) => {
+        assert.deepEqual([String(ra.outcome), String(rb.outcome)].sort(), ['admitted', 'replayed'], JSON.stringify([ra, rb]));
+        assert.equal(await s.callsReserved(c), 8); // one reservation
+        assert.equal((await s.leaseIdsFor(c, 'f1')).length, 4); // one lease set
+      },
+    );
   });
 
   // --- case 46: DB-time lease expiry across transactions; no refund ---

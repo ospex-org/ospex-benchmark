@@ -11,25 +11,37 @@ and then the conformance slice.
 
 A real Postgres 16 (local Docker) with the store's DDL (`src/store/schema.sql`) and
 plpgsql operations (`src/store/functions.sql`), driven by a Node conformance harness
-(`src/store/spike/conformance.ts`) over a connection **pool** so the concurrency
-cases execute as genuinely overlapping transactions — mocks cannot substitute for
-that (§12).
+(`src/store/spike/conformance.ts`). The load-bearing races are proven with a
+**genuine-overlap barrier**, not merely `Promise.all`: the two competitors run on
+**distinct pooled backends** (asserted by `pg_backend_pid`), a gate session holds the
+budget row (or, for the init race, an advisory lock via a scratch trigger), and the
+harness asserts **both competitors are simultaneously `Lock`-waiting in
+`pg_stat_activity` and still unresolved** before the gate opens — the store's own lock
+then serializes them (§12). The `Promise.all` loops remain as supplementary stress.
+Mocks cannot substitute for actual overlapping transactions.
 
 ```
 docker run -d -e POSTGRES_PASSWORD=spike -e POSTGRES_DB=store_spike -p 5433:5432 postgres:16-alpine
 STORE_DATABASE_URL=postgres://postgres:spike@localhost:5433/store_spike yarn store:spike
+
+# self-test: a serialized single-connection pool CANNOT satisfy the barrier, so the five
+# overlap/init-race checks FAIL (12/17, non-zero exit) — proving the gate requires real
+# overlap, not `Promise.all` on one backend:
+STORE_POOL_MAX=1 STORE_DATABASE_URL=… yarn store:spike
 ```
 
 `yarn store:spike` is NOT part of `yarn test` (that suite is pure and DB-free); this
 is the store's real-Postgres gate, run on demand / in a Postgres-enabled CI.
 
-## Result: 12/12 conformance checks passed
+## Result: 17/17 conformance checks passed
 
 The load-bearing mechanisms — the ones where "does Postgres actually do this under
 concurrency?" was the open question — are empirically confirmed:
 
 | Mechanism (spec) | Case | Proven by |
 |---|---|---|
+| concurrent conflicting init fails loud (never a false `initialized`) | init-race | two gated initializers race the UNIQUE insert; the loser's `ON CONFLICT DO NOTHING` affects zero rows, re-reads + **locks** the winning row, compares every pin → winner `initialized`, a differing-config/version loser `refused` (`config_mismatch`/`version_mismatch`), exactly one row; two same-config inits both `initialized` (no reset) |
+| genuine overlap is a TESTED fact, not a `Promise.all` artifact | 25, same-fire | competitors on distinct backends (distinct `pg_backend_pid`), asserted `Lock`-waiting + unresolved before the gate opens; `STORE_POOL_MAX=1` (one serialized backend) FAILS these checks — so a serialized harness cannot pass |
 | `cohort_budget FOR UPDATE` serializes the budget race | 25 | 2- and 8-worker admits racing a scarce call cap → exactly one (resp. exactly three) admitted; `calls_reserved` never over-reserved (12 iters) |
 | claim PK + `ON CONFLICT DO NOTHING` = at-most-once | 8 | 2- and 8-worker admits (distinct fireIds) on one key → exactly one `admitted` + one claim row (12 iters) |
 | idempotency check **inside** the budget lock | new | two concurrent SAME-`fireId` admits → one `admitted`, one `replayed`; one reservation, one lease set (12 iters) |
@@ -55,13 +67,24 @@ concurrency?" was the open question — are empirically confirmed:
 
 ## Decisions this spike settles (for the durable-ops slice)
 
+- **Concurrent conflicting init fails loud**: the absent-row path uses the
+  UNIQUE insert as the serialization point. A loser whose `ON CONFLICT DO NOTHING`
+  affects zero rows re-reads + **locks** the committed winning row and compares every
+  pin, so a differing-config/version initializer is `refused`
+  (`config_mismatch`/`version_mismatch`), never falsely told `initialized`. Two
+  concurrent same-config inits both `initialized` (one row, no reset). The
+  select-then-insert absent-row check alone cannot decide this (two callers both observe
+  absence); only the post-insert re-read can. Proven deterministically via the gated
+  init-race barrier (A1–A3).
 - **Scope-reservation validation** (resolves an F3a open item): the impl does **not**
   pre-enforce that `scopeReservations` is *exactly* the nonempty subsets. `invalid_input`
   catches a malformed/negative/unsafe **spend or empty digest** value; a **retained**
   subset absent from the map is the reachable, distinct `scope_reservation_missing`.
   This keeps the two reasons disjoint and both reachable. `contract.ts`'s
-  `AdmitDispatchRequest` JSDoc and spec §4.5 should be reconciled to this in the
-  durable-ops slice (drop the "a missing subset → `invalid_input`" clause).
+  `AdmitDispatchRequest` JSDoc and the spec's acceptance rows are reconciled to this
+  **in this PR**: the "a missing subset → `invalid_input`" clause is dropped;
+  the completed-replay-returns-no-leases and post-GC-repair-`fire_not_pending` acceptance
+  rows are aligned to the typed contract (`contract.ts` governs).
 - **Replay leases**: a `pending`-fire replay returns the per-arm initial leases; a
   `completed`-fire replay returns none — matching `contract.ts` `AdmitReplayResult`.
 - **Backend shape**: these are plpgsql functions = one function call is one
