@@ -315,11 +315,11 @@ end $fn$;`);
   });
 
   // --- concurrent conflicting init must fail loud (real overlap, gated) ---
-  await check('init race (same config): two SAME-config initializers overlap → both initialized, one row, counters preserved', async () => {
+  await check('init race (same config): two SAME-config initializers overlap → both initialized, one row', async () => {
     const r = await initRace(pool, 'same', {}, {});
     assert.deepEqual(r.outcomes, ['initialized', 'initialized'], JSON.stringify(r));
-    assert.equal(r.rows, 1);
-    assert.equal(await s.callsReserved(r.cohortId), 0); // insert-once, never a reset
+    assert.equal(r.rows, 1); // one row; the loser re-read the winner and matched → no false config_mismatch
+    // (the no-reset invariant is proven separately, on NONZERO counters — see 'init insert-once' below)
   });
 
   await check('init race (differing config): two DIFFERING-config initializers overlap → one initialized, one config_mismatch (loser never falsely initialized)', async () => {
@@ -335,6 +335,22 @@ end $fn$;`);
     assert.deepEqual(r.outcomes, ['initialized', 'refused'], JSON.stringify(r));
     assert.ok(r.reasons.includes('version_mismatch'), JSON.stringify(r));
     assert.equal(r.rows, 1);
+  });
+
+  // The no-reset invariant is load-bearing ONLY against NONZERO consumed counters: admit
+  // to reserve, then re-init with the SAME config (a worker restart) and assert both
+  // counters are UNCHANGED. A reset on the consistent-row path (which would double-spend
+  // the cap after a restart) fails this — see the reset-mutation negative control in the PR.
+  await check('init insert-once: a consistent re-init preserves NONZERO calls/spend reservations (never resets)', async () => {
+    const c = cohortName('reinit-preserve');
+    assert.equal((await s.init(pins(c))).outcome, 'initialized');
+    await s.admit({ cohort: c, fire: 'f1', owner: 'w1', game: 'g1', markets: ['moneyline', 'total'], scope: fullScope(['moneyline', 'total']) });
+    const calls = await s.callsReserved(c);
+    const spend = await s.spendReserved(c);
+    assert.ok(calls > 0 && spend > 0, `precondition: nonzero reservations, got calls=${calls} spend=${spend}`);
+    assert.equal((await s.init(pins(c))).outcome, 'initialized'); // consistent re-init → initialized, no rewrite
+    assert.equal(await s.callsReserved(c), calls); // NOT reset
+    assert.equal(await s.spendReserved(c), spend); // NOT reset
   });
 
   // --- case 8: at-most-once claim under a real race ---

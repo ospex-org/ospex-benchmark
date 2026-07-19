@@ -25,7 +25,7 @@ docker run -d -e POSTGRES_PASSWORD=spike -e POSTGRES_DB=store_spike -p 5433:5432
 STORE_DATABASE_URL=postgres://postgres:spike@localhost:5433/store_spike yarn store:spike
 
 # self-test: a serialized single-connection pool CANNOT satisfy the barrier, so the five
-# overlap/init-race checks FAIL (12/17, non-zero exit) — proving the gate requires real
+# overlap/init-race checks FAIL (13/18, non-zero exit) — proving the gate requires real
 # overlap, not `Promise.all` on one backend:
 STORE_POOL_MAX=1 STORE_DATABASE_URL=… yarn store:spike
 ```
@@ -33,14 +33,15 @@ STORE_POOL_MAX=1 STORE_DATABASE_URL=… yarn store:spike
 `yarn store:spike` is NOT part of `yarn test` (that suite is pure and DB-free); this
 is the store's real-Postgres gate, run on demand / in a Postgres-enabled CI.
 
-## Result: 17/17 conformance checks passed
+## Result: 18/18 conformance checks passed
 
 The load-bearing mechanisms — the ones where "does Postgres actually do this under
 concurrency?" was the open question — are empirically confirmed:
 
 | Mechanism (spec) | Case | Proven by |
 |---|---|---|
-| concurrent conflicting init fails loud (never a false `initialized`) | init-race | two gated initializers race the UNIQUE insert; the loser's `ON CONFLICT DO NOTHING` affects zero rows, re-reads + **locks** the winning row, compares every pin → winner `initialized`, a differing-config/version loser `refused` (`config_mismatch`/`version_mismatch`), exactly one row; two same-config inits both `initialized` (no reset) |
+| concurrent conflicting init fails loud (never a false `initialized`) | init-race | two gated initializers race the UNIQUE insert; the loser's `ON CONFLICT DO NOTHING` affects zero rows, re-reads + **locks** the winning row, compares every pin → winner `initialized`, a differing-config/version loser `refused` (`config_mismatch`/`version_mismatch`), exactly one row; two same-config inits both `initialized` |
+| init is insert-once — a consistent re-init preserves NONZERO reservations | reinit | admit to reserve (calls/spend > 0), then re-init with the SAME config → `initialized` with both counters **unchanged**; a reset on the consistent-row path (which would double-spend the cap on a restart) FAILS this check (proven by a reset-mutation negative control) |
 | genuine overlap is a TESTED fact, not a `Promise.all` artifact | 25, same-fire | competitors on distinct backends (distinct `pg_backend_pid`), asserted `Lock`-waiting + unresolved before the gate opens; `STORE_POOL_MAX=1` (one serialized backend) FAILS these checks — so a serialized harness cannot pass |
 | `cohort_budget FOR UPDATE` serializes the budget race | 25 | 2- and 8-worker admits racing a scarce call cap → exactly one (resp. exactly three) admitted; `calls_reserved` never over-reserved (12 iters) |
 | claim PK + `ON CONFLICT DO NOTHING` = at-most-once | 8 | 2- and 8-worker admits (distinct fireIds) on one key → exactly one `admitted` + one claim row (12 iters) |
@@ -72,10 +73,12 @@ concurrency?" was the open question — are empirically confirmed:
   affects zero rows re-reads + **locks** the committed winning row and compares every
   pin, so a differing-config/version initializer is `refused`
   (`config_mismatch`/`version_mismatch`), never falsely told `initialized`. Two
-  concurrent same-config inits both `initialized` (one row, no reset). The
-  select-then-insert absent-row check alone cannot decide this (two callers both observe
-  absence); only the post-insert re-read can. Proven deterministically via the gated
-  init-race barrier (A1–A3).
+  concurrent same-config inits both `initialized` (one row). The select-then-insert
+  absent-row check alone cannot decide this (two callers both observe absence); only the
+  post-insert re-read can. Proven deterministically via the gated init-race barrier
+  (same-config / differing-config / differing-version). The insert-once **no-reset**
+  invariant — a consistent re-init preserves the consumed counters — is proven separately
+  against NONZERO reservations (a reset mutation fails that check).
 - **Scope-reservation validation** (resolves an F3a open item): the impl does **not**
   pre-enforce that `scopeReservations` is *exactly* the nonempty subsets. `invalid_input`
   catches a malformed/negative/unsafe **spend or empty digest** value; a **retained**
