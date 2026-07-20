@@ -15,7 +15,7 @@ import { instantMs } from './time.js';
 import type { GameRequest } from './bundle.js';
 import { assertAuthorizedDispatch, PreDispatchCleanupError } from './lineOpenDispatch.js';
 import type { AuthorizedDispatch } from './lineOpenDispatch.js';
-import { createAttemptLifecycle, LifecycleFaultError } from './lineOpenLifecycle.js';
+import { AttemptCleanupFaultError, createAttemptLifecycle, LifecycleFaultError } from './lineOpenLifecycle.js';
 import type { AttemptLifecyclePort } from './lineOpenLifecycle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
 import type {
@@ -381,10 +381,12 @@ export async function runOneArmGame(
  * With a lifecycle, the arm's initial slot is freed exactly once the moment its initial
  * attempt settles — or is skipped without a call — and BEFORE any validation, fingerprint, or
  * repair work, so a slow validation never holds capacity. A repair reserves a fresh slot
- * immediately before its request, RE-CHECKS the cutoff after that await (the acquisition
- * itself takes time, and a repair that would land after first pitch must not be sent), and
- * frees the slot on every exit. Without a lifecycle (`null`) the behaviour is exactly the
- * legacy path — no gate is added and nothing is released, because there is no durable lease.
+ * immediately before its request, RE-CHECKS the cutoff after that await and INSIDE the release
+ * scope (the acquisition itself takes time, a repair that would land after first pitch must not
+ * be sent, and a clock that throws must not leak the slot), and frees the slot on every exit.
+ * A cleanup that fails while another failure is propagating is composed with it, never
+ * discarded. Without a lifecycle (`null`) the behaviour is exactly the legacy path — no gate is
+ * added and nothing is released, because there is no durable lease.
  */
 async function dispatchArm(
   target: DispatchTarget,
@@ -404,13 +406,15 @@ async function dispatchArm(
     return await dispatchArmCore(target, request, options, lifecycle, armIndex, releaseInitial);
   } catch (error) {
     // Backstop for a throw before the settle-time release (e.g. a synchronous pre-call
-    // failure): free the slot without masking the primary error.
+    // failure): free the slot exactly once, never retried. If that release ALSO fails, BOTH
+    // truths matter — the primary is what broke the attempt, and the cleanup fault means this
+    // arm's durable slot is still held, which a lone primary would hide entirely.
     if (lifecycle !== null && !initialReleased) {
       initialReleased = true;
       try {
         await lifecycle.releaseInitial(armIndex);
-      } catch {
-        /* the primary error wins */
+      } catch (fault) {
+        throw new AttemptCleanupFaultError(error, fault);
       }
     }
     throw error;
@@ -591,9 +595,6 @@ async function dispatchArmCore(
   // taken). With no lifecycle the legacy path is ungated — there is no durable lease to hold.
   const repairOrdinal = 1;
   let repairLeaseHeld = false;
-  // The window to send the repair in. Without a lifecycle nothing is awaited between the
-  // check above and the call, so the legacy path reads the clock no more times than before.
-  let remainingForRepair = remainingAtRepair;
   if (lifecycle !== null) {
     const acquired = await lifecycle.acquireRepair(armIndex, repairOrdinal);
     if (!acquired.authorized) {
@@ -603,12 +604,16 @@ async function dispatchArmCore(
       ]);
     }
     repairLeaseHeld = true;
-    // The acquisition itself awaited the store, so RE-CHECK first pitch immediately before the
-    // HTTP call: a repair that would land after the cutoff must not be sent at all.
-    remainingForRepair = cutoffMs - nowMs();
   }
 
   try {
+    // The acquisition itself awaited the store, so RE-CHECK first pitch immediately before the
+    // HTTP call: a repair that would land after the cutoff must not be sent at all. This runs
+    // INSIDE the release scope — the clock is an injected dependency, and a throw here must
+    // still give the acquired slot back rather than leak it. Without a lifecycle nothing was
+    // awaited since the check above, so the legacy path reads the clock no more times than
+    // before and reuses that reading.
+    const remainingForRepair = lifecycle === null ? remainingAtRepair : cutoffMs - nowMs();
     if (remainingForRepair <= 0) {
       return failed('cutoff_missed', attemptRecord, null, false, null, [
         ...firstValidation.errors,
@@ -739,31 +744,52 @@ function assertCompleteGrid(
 }
 
 /**
- * Await EVERY launched arm before resolving or rejecting. `Promise.all` rejects on the first
- * failure while its siblings are still in flight — which, once a lease lifecycle is involved,
- * would let the caller proceed while a sibling's HTTP request and its durable slot are still
- * live. Collecting all settlements first means a fast arm never waits for a slow one, and a
- * failure is reported only after every sibling has finished and freed what it held.
+ * Every arm failure of ONE authorized dispatch. Reporting a single primary would hide the fact
+ * that a sibling arm ALSO failed — and each lifecycle fault names a durable slot this fire may
+ * still be holding, so no failure may be discarded.
  */
-async function settleAll(tasks: readonly Promise<ArmGameResult>[]): Promise<ArmGameResult[]> {
-  // Capture the CHRONOLOGICALLY first rejection — the exact error `Promise.all` would have
-  // rejected with — while still awaiting every sibling. The change here is WHEN the caller is
-  // told (after every arm has settled and freed what it held), never WHAT it is told: neither
-  // a new aggregate nor the first-by-position failure would be the error a legacy caller saw.
-  const firstRejection: Array<{ reason: unknown }> = [];
+export class AuthorizedDispatchFaultError extends Error {
+  /** One entry per rejected arm, in roster (arm index) order — never completion order. */
+  readonly failures: readonly unknown[];
+  constructor(failures: readonly unknown[], total: number) {
+    // Our own counts only: coercing an arm's thrown value could throw and destroy this error
+    // exactly when every retained cause is needed.
+    super(`authorized dispatch failed: ${failures.length} of ${total} arm(s) raised`);
+    this.name = 'AuthorizedDispatchFaultError';
+    this.failures = Object.freeze([...failures]);
+  }
+}
+
+/**
+ * The CANONICAL settlement policy: await EVERY launched arm, then report every failure.
+ *
+ * `Promise.all` rejects on the first failure while its siblings are still in flight — which,
+ * once a lease lifecycle is involved, would let the caller proceed while a sibling's HTTP
+ * request and its durable slot are still live. Collecting all settlements first means a fast
+ * arm never waits for a slow one, and a failure is reported only after every sibling has
+ * finished and freed what it held. Keeping EVERY failure matters for the same reason: a
+ * discarded second fault is a lease this fire may still hold that nobody is ever told about.
+ *
+ * This policy belongs to the authorized path alone — the legacy path has no durable leases and
+ * keeps its pre-existing `Promise.all` behaviour.
+ */
+async function settleAllArms(tasks: readonly Promise<ArmGameResult>[]): Promise<ArmGameResult[]> {
   const outcomes = await Promise.all(
     tasks.map((task) =>
       task.then(
         (value) => ({ ok: true as const, value }),
-        (reason: unknown) => {
-          if (firstRejection.length === 0) firstRejection.push({ reason });
-          return { ok: false as const };
-        },
+        (reason: unknown) => ({ ok: false as const, reason }),
       ),
     ),
   );
-  if (firstRejection.length > 0) throw firstRejection[0]!.reason;
-  return outcomes.map((o) => (o as { ok: true; value: ArmGameResult }).value);
+  const values: ArmGameResult[] = [];
+  const failures: unknown[] = [];
+  for (const outcome of outcomes) {
+    if (outcome.ok) values.push(outcome.value);
+    else failures.push(outcome.reason);
+  }
+  if (failures.length > 0) throw new AuthorizedDispatchFaultError(failures, tasks.length);
+  return values;
 }
 
 export async function runSlate(
@@ -807,7 +833,12 @@ export async function runSlate(
   let index = 0;
   for (const request of snapshot.prepared) {
     index += 1;
-    const results = await settleAll(
+    // LEGACY settlement, deliberately NOT the canonical all-settled policy: with no lifecycle
+    // there is no durable slot a sibling could still be holding, so this path keeps the exact
+    // pre-existing `Promise.all` rejection identity AND timing. Routing it through the
+    // canonical helper to share code would silently make a legacy caller wait for a slow
+    // sibling and change the error it sees.
+    const results = await Promise.all(
       targets.map((target) => dispatchArm(target, request, options, null, 0)),
     );
     all.push(...results);
@@ -851,8 +882,9 @@ export async function runSlate(
  * caller that assembles the pieces itself, and the arms dispatched are exactly the facades
  * captured before the claim was taken. The complete grid is resolved BEFORE any arm launches;
  * a preflight failure after authorization frees every unstarted initial lease and then
- * propagates, so a claim is never left holding capacity for a fire that never ran. Every
- * launched arm is awaited before this resolves or rejects.
+ * propagates (with the complete cleanup log), so a claim is never left holding capacity for a
+ * fire that never ran. Every launched arm is awaited before this resolves or rejects, and
+ * EVERY arm failure is reported in one `AuthorizedDispatchFaultError`.
  *
  * It produces the same branded `RunEnvelope` the legacy path produces; artifact production,
  * installation, and claim completion remain their own owners'.
@@ -914,18 +946,18 @@ export async function runAuthorizedDispatch(
       cleanupFault = failure;
     }
     if (cleanupFault instanceof LifecycleFaultError && error instanceof Error) {
-      throw new PreDispatchCleanupError(
-        error,
-        cleanupFault.failures.map((f) => ({ leaseId: f.leaseId, result: f.outcome === 'not_owner' ? 'not_owner' : 'threw' })),
-        cleanupFault.failures.map((f) => ({ leaseId: f.leaseId, result: f.outcome === 'not_owner' ? 'not_owner' : 'threw' })),
-      );
+      // The lifecycle's attempt log IS the cleanup log — the complete ordered set of leases it
+      // tried, with the still-held ones as its non-released subset. Passing the failures as
+      // both would report "2 of 2 failed" for a cleanup that actually attempted four.
+      throw new PreDispatchCleanupError(error, cleanupFault.failures, cleanupFault.attempts);
     }
     throw error;
   }
 
   // Launch the roster concurrently; a fast arm releases its slot without waiting for a slow
-  // sibling, and every launched arm is awaited before this settles.
-  const results = await settleAll(
+  // sibling, every launched arm is awaited before this settles, and every arm failure is
+  // reported rather than only the first.
+  const results = await settleAllArms(
     targets.map((target, armIndex) => dispatchArm(target, prepared, options, lifecycle, armIndex)),
   );
   assertCompleteGrid(results, expectedArms, [prepared]);

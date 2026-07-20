@@ -330,3 +330,56 @@ test('a missing adapter is refused before ANY arm launches — arm 0 never start
   );
   assert.equal(armACalls, 0, 'arm 0 must not start when a later arm has no adapter');
 });
+
+test('the legacy path keeps its rejection timing: a fast failure never waits for a slow sibling', async () => {
+  // No lease lifecycle exists here, so there is no durable slot a sibling could still be
+  // holding — the legacy contract is the pre-existing rejection identity AND timing. Routing
+  // this path through the authorized path's all-settled policy to share a helper would
+  // silently make every legacy caller wait for its slowest arm.
+  const request = makeRequest(CUTOFF);
+  const armA: ArmSpec = { ...TEST_ARM, participantId: 'arm-a' };
+  const armB: ArmSpec = { ...TEST_ARM, participantId: 'arm-b' };
+  let openGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    openGate = resolve;
+  });
+  let slowFinished = false;
+  const adapterA = {
+    ...stubAdapter([]),
+    hasCredential: (): boolean => {
+      throw new Error('legacy credential probe exploded');
+    },
+  };
+  const adapterB = stubAdapter([
+    async () => {
+      await gate; // arm B is held in flight
+      slowFinished = true;
+      return stubResponse(JSON.stringify(makeValidResponse(request, armB)));
+    },
+  ]);
+
+  const run = runSlate(
+    [armA, armB],
+    new Map([
+      [armA.participantId, adapterA],
+      [armB.participantId, adapterB],
+    ]),
+    [request],
+    { ...baseOptions(() => CUTOFF_MS - 60_000), cohortId: TEST_COHORT },
+  );
+  const settled = await Promise.race([
+    run.then(() => 'resolved' as const, (error: unknown) => ({ error })),
+    new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 50)),
+  ]);
+  const finishedBeforeRejection = slowFinished;
+  openGate(); // never strand arm B, whatever the assertions below decide
+
+  assert.notEqual(settled, 'pending', 'the legacy run must reject while the slow sibling is still in flight');
+  assert.ok(
+    typeof settled === 'object' &&
+      settled.error instanceof Error &&
+      /legacy credential probe exploded/.test(settled.error.message),
+    'the base rejection identity is unchanged',
+  );
+  assert.equal(finishedBeforeRejection, false, 'the slow sibling had not settled when the run rejected');
+});

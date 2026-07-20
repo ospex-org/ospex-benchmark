@@ -5,14 +5,14 @@ import { evaluateCandidate } from './detection.js';
 import { StoreClaimPort } from './lineOpenClaim.js';
 import { authorizePreparedDispatch, PreDispatchCleanupError } from './lineOpenDispatch.js';
 import type { AuthorizedDispatch } from './lineOpenDispatch.js';
-import { createAttemptLifecycle, LifecycleFaultError } from './lineOpenLifecycle.js';
+import { AttemptCleanupFaultError, createAttemptLifecycle, LifecycleFaultError } from './lineOpenLifecycle.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { checkPublication } from './manifestPublication.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import { sealPreparedFire } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
 import { promptScaffoldSha256 } from './prompt.js';
-import { runAuthorizedDispatch } from './runner.js';
+import { AuthorizedDispatchFaultError, runAuthorizedDispatch } from './runner.js';
 import type { SlateRunOptions } from './runner.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 import { SMOKE_LABEL } from './types.js';
@@ -723,6 +723,170 @@ test('every no-repair exit releases the arm initial lease exactly once', async (
       `${label}: exactly one release of the arm's initial lease`,
     );
   }
+});
+
+// ===========================================================================
+// Failure convergence: once a lease exists, no failure may erase cleanup truth
+// ===========================================================================
+
+/** Run one authorized dispatch and return what it threw (or `null` when it resolved). */
+async function faultOf(dispatch: AuthorizedDispatch, opts: SlateRunOptions): Promise<unknown> {
+  return runAuthorizedDispatch(dispatch, opts).then(
+    () => null,
+    (error: unknown) => error,
+  );
+}
+
+test('a clock that throws at the post-acquire recheck still frees the acquired repair slot', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  const scripts: Scripted[] = [];
+  const { dispatch, store } = await authorize((s) => {
+    const map = new Map<string, ProviderAdapter>();
+    s.expectedArmIdentities.forEach((id, i) => {
+      const script = scriptedAdapter(id, (call) =>
+        i === 0 && call === 1
+          ? wrongEcho(validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256))
+          : validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256),
+      );
+      scripts.push(script);
+      map.set(id.participantId, script.adapter);
+    });
+    return map;
+  });
+  // The clock starts throwing the instant the repair slot is taken — so it throws at the
+  // post-acquire cutoff recheck, the very next clock read on that arm. The slot is already
+  // held, so it must come back regardless.
+  let acquired = false;
+  const acquire = store.onRepair;
+  store.onRepair = (req): Promise<RepairLeaseResult> => {
+    acquired = true;
+    return acquire(req);
+  };
+  const nowMs = (): number => {
+    if (acquired) throw new Error('post-acquire clock exploded');
+    return NOW_MS;
+  };
+
+  const fault = await faultOf(dispatch, options(nowMs, cohortId));
+  assert.ok(fault instanceof AuthorizedDispatchFaultError, 'the clock failure is reported');
+  assert.ok(
+    fault.failures.some((f) => f instanceof Error && /post-acquire clock exploded/.test(f.message)),
+    'the clock error itself stays observable',
+  );
+  assert.equal(store.calls.filter((c) => c.op === 'repair').length, 1, 'one repair slot was acquired');
+  assert.deepEqual(
+    releaseIds(store).filter((id) => id === 'repair-0-1'),
+    ['repair-0-1'],
+    'the acquired repair slot was released exactly once',
+  );
+  assert.equal(scripts[0]!.calls, 1, 'no repair request was sent');
+});
+
+test('a pre-call failure whose lease cleanup ALSO fails reports both causes', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  const { dispatch, store } = await authorize((s) => {
+    const map = new Map<string, ProviderAdapter>();
+    s.expectedArmIdentities.forEach((id, i) => {
+      map.set(
+        id.participantId,
+        i === 0
+          ? {
+              ...scriptedAdapter(id, () => '').adapter,
+              hasCredential: (): boolean => {
+                throw new Error('credential probe exploded');
+              },
+            }
+          : scriptedAdapter(id, () => validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256)).adapter,
+      );
+    });
+    return map;
+  });
+  const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
+  // Only arm 0's slot refuses to come back: its primary failure would otherwise hide the fact
+  // that this fire is still holding durable capacity.
+  store.onRelease = (req): Promise<ReleaseResult> =>
+    req.leaseId === arm0Lease
+      ? Promise.resolve({ outcome: 'refused', reason: 'not_owner' })
+      : Promise.resolve({ outcome: 'released' });
+
+  const fault = await faultOf(dispatch, options(() => NOW_MS, cohortId));
+  assert.ok(fault instanceof AuthorizedDispatchFaultError);
+  const composite = fault.failures.find((f): f is AttemptCleanupFaultError => f instanceof AttemptCleanupFaultError);
+  assert.ok(composite, 'the cleanup fault must not be discarded in favour of the primary');
+  assert.ok(
+    composite.primary instanceof Error && /credential probe exploded/.test(composite.primary.message),
+    'the primary pre-call failure is retained',
+  );
+  assert.ok(composite.cleanup instanceof LifecycleFaultError, 'the lifecycle cleanup fault is retained');
+  assert.deepEqual(
+    releaseIds(store).filter((id) => id === arm0Lease),
+    [arm0Lease],
+    'exactly one release attempt — a local release is never retried',
+  );
+});
+
+test('a partly-failing pre-launch cleanup exposes the COMPLETE attempt log, failures being its subset', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  const built: Scripted[] = [];
+  const { dispatch, store } = await authorize((s) => {
+    const r = validAdapters(s, cohortId);
+    built.push(...r.scripts);
+    return r.map;
+  });
+  const ids = dispatch.permit.initialLeases.map((l) => l.leaseId);
+  assert.ok(ids.length >= 4, 'fixture: the roster must be large enough for a MIXED cleanup');
+  // Two leases come back, one refuses, one throws — the case a uniformly-failing store hides,
+  // because there `failures` and the complete attempt log are the same array.
+  store.onRelease = (req): Promise<ReleaseResult> =>
+    req.leaseId === ids[1]
+      ? Promise.resolve({ outcome: 'refused', reason: 'not_owner' })
+      : req.leaseId === ids[2]
+        ? Promise.reject(new Error('store down'))
+        : Promise.resolve({ outcome: 'released' });
+
+  await assert.rejects(
+    () => runAuthorizedDispatch(dispatch, options(() => NOW_MS, 'a-different-cohort')),
+    (error) => {
+      assert.ok(error instanceof PreDispatchCleanupError);
+      assert.deepEqual(error.attempts.map((a) => a.leaseId), ids, 'every lease was attempted, in permit order');
+      assert.deepEqual(
+        error.attempts.map((a) => a.result),
+        ids.map((_, i) => (i === 1 ? 'not_owner' : i === 2 ? 'threw' : 'released')),
+        'each attempt records its own outcome',
+      );
+      assert.deepEqual(
+        error.failures.map((a) => a.leaseId),
+        [ids[1], ids[2]],
+        'the still-held leases are exactly the non-released attempts',
+      );
+      return true;
+    },
+  );
+  assert.equal(built.reduce((n, s) => n + s.calls, 0), 0, 'no adapter was called');
+});
+
+test('every arm failure is reported, not only the first', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  const { dispatch, store } = await authorize((s) => validAdapters(s, cohortId).map);
+  const initial = dispatch.permit.initialLeases;
+  const refusing = new Set(
+    [0, 1].map((armIndex) => initial.find((l) => l.armIndex === armIndex)!.leaseId),
+  );
+  assert.equal(refusing.size, 2, 'fixture: two DISTINCT arms must fail');
+  store.onRelease = (req): Promise<ReleaseResult> =>
+    refusing.has(req.leaseId)
+      ? Promise.resolve({ outcome: 'refused', reason: 'not_owner' })
+      : Promise.resolve({ outcome: 'released' });
+
+  const fault = await faultOf(dispatch, options(() => NOW_MS, cohortId));
+  assert.ok(fault instanceof AuthorizedDispatchFaultError, 'the failures are aggregated, not collapsed');
+  assert.equal(fault.failures.length, 2, 'a second held-lease fault must not be discarded');
+  assert.ok(
+    fault.failures.every((f) => f instanceof LifecycleFaultError),
+    'each retained cause is the arm lifecycle fault itself',
+  );
+  // Every arm still settled and attempted its own release before the run reported.
+  assert.deepEqual([...releaseIds(store)].sort(), initial.map((l) => l.leaseId).sort());
 });
 
 test('a pre-launch cleanup failure is reported with the preflight cause and the held leases', async () => {
