@@ -447,7 +447,7 @@ function expectedPath(baseDir: string, artifact: FireArtifactV1): string {
 }
 
 // ===========================================================================
-// S4-T1 — end-to-end happy path
+// end-to-end happy path
 // ===========================================================================
 
 test('one fire runs admit->authorize->dispatch->produce->reconcile->install exactly once', async () => {
@@ -475,7 +475,7 @@ test('one fire runs admit->authorize->dispatch->produce->reconcile->install exac
 });
 
 // ===========================================================================
-// S4-T2 — derivation, brand, and option capture
+// derivation, brand, and option capture
 // ===========================================================================
 
 test('the admission request is derived from the snapshot, plus only the three admission fields', async () => {
@@ -568,7 +568,7 @@ test('mutating the caller inputs while the claim is pending does not redirect th
 });
 
 // ===========================================================================
-// S4-T3 — ordinary non-admitted values are quiet
+// ordinary non-admitted values are quiet
 // ===========================================================================
 
 test('every ordinary NotAdmitted outcome is returned by identity with zero side effects', async () => {
@@ -600,7 +600,7 @@ test('every ordinary NotAdmitted outcome is returned by identity with zero side 
 });
 
 // ===========================================================================
-// S4-T4 — unknown commit and admitted-refusal cleanup
+// unknown commit and admitted-refusal cleanup
 // ===========================================================================
 
 test('a claim-port throw propagates unchanged with zero side effects', async () => {
@@ -665,7 +665,7 @@ test('a narrowed scope whose cleanup also fails surfaces the cleanup error, inst
 });
 
 // ===========================================================================
-// S4-T5 — dispatch and producer failure containment
+// dispatch and producer failure containment
 // ===========================================================================
 
 test('a dispatch fault propagates and installs nothing', async () => {
@@ -703,7 +703,7 @@ test('a producer failure after dispatch leaves leases settled and installs nothi
 });
 
 // ===========================================================================
-// S4-T6 — canonical permit zipper and source ownership
+// canonical permit zipper and source ownership
 // ===========================================================================
 
 test('a store returning reversed claimed keys still yields canonical artifact evidence bound to the permit', async () => {
@@ -734,7 +734,7 @@ test('the spine builds each claim from the permit, not from snapshot identities'
 });
 
 // ===========================================================================
-// S4-T7 — reconciliation matrix
+// reconciliation matrix
 // ===========================================================================
 
 test('genuine pairs that disagree on a dimension raise a FireReconciliationError naming it', async () => {
@@ -814,7 +814,7 @@ test('a forged artifact or permit fails its own brand, not a wrapped reconciliat
 });
 
 // ===========================================================================
-// S4-T8 — authorized wrapper ordering and identity
+// authorized wrapper ordering and identity
 // ===========================================================================
 
 test('installReconciledArtifact installs nothing on a mismatch and the exact artifact on a match', async () => {
@@ -843,7 +843,7 @@ test('installReconciledArtifact returns the exact sink result and propagates a s
 });
 
 // ===========================================================================
-// S4-T9 — idempotent install passthrough
+// idempotent install passthrough
 // ===========================================================================
 
 test('a second install of the same genuine artifact returns created:false, byte-identical', async () => {
@@ -860,7 +860,7 @@ test('a second install of the same genuine artifact returns created:false, byte-
 });
 
 // ===========================================================================
-// S4-T10 — source / ownership gate
+// source / ownership gate
 // ===========================================================================
 
 test('the spine imports no runtime store/authority, calls no completion, and orders its stages', () => {
@@ -893,8 +893,8 @@ test('the spine imports no runtime store/authority, calls no completion, and ord
   assert.ok(wrapper.indexOf('reconcileArtifactToPermit(') < wrapper.indexOf('sink.install('), 'reconcile precedes install');
 
   // Each reconciliation dimension is present and reported. The runtime negative for the roster
-  // dimension is unconstructible with genuine values (see S4-T7), so — like the permit-provenance
-  // tooth — its presence is pinned here: dropping it (S4-M8h) turns this red.
+  // dimension is unconstructible with genuine values (see the reconciliation-matrix test above), so — like the permit-provenance
+  // tooth — its presence is pinned here: dropping the dimension turns this red.
   for (const dimension of ['cohortId', 'fireId', 'runId', 'gameId', 'scopedMarkets', 'marketClaims', 'requestSha256', 'initialLeaseRoster']) {
     assert.ok(src.includes(`failed.push('${dimension}')`), `reconcile computes and reports ${dimension}`);
   }
