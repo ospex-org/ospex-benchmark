@@ -13,6 +13,10 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { deepFreeze } from './freeze.js';
 import { instantMs } from './time.js';
 import type { GameRequest } from './bundle.js';
+import { assertAuthorizedDispatch } from './lineOpenDispatch.js';
+import type { AuthorizedDispatch } from './lineOpenDispatch.js';
+import { createAttemptLifecycle } from './lineOpenLifecycle.js';
+import type { AttemptLifecyclePort } from './lineOpenLifecycle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
 import type {
   ArmGameResult,
@@ -283,8 +287,20 @@ function classifyFailure(error: unknown): 'timeout' | 'rate_limited' | 'provider
   return 'provider_error';
 }
 
+/**
+ * What one arm's dispatch actually needs: the identity recorded in its result, plus the two
+ * provider methods. The legacy path builds this from an `(ArmSpec, ProviderAdapter)` pair in a
+ * complete preflight; the authorized path takes it from the already-captured plan facade, so
+ * no caller-owned adapter map is read after a claim is taken.
+ */
+interface DispatchTarget {
+  readonly arm: ArmSpec;
+  hasCredential(): boolean;
+  chat(turns: ChatTurn[], timeoutMs: number, options?: { maxOutputTokens?: number | undefined }): Promise<ProviderResponse>;
+}
+
 async function timedChat(
-  adapter: ProviderAdapter,
+  adapter: Pick<DispatchTarget, 'chat'>,
   turns: ChatTurn[],
   timeoutMs: number,
   maxOutputTokens: number,
@@ -346,6 +362,70 @@ export async function runOneArmGame(
   // Runtime guard: never dispatch a request that did not come through the
   // prepared boundary — before reading any field or touching an adapter method.
   assertPrepared(request);
+  return dispatchArm(
+    {
+      arm,
+      hasCredential: () => adapter.hasCredential(),
+      chat: (turns, timeoutMs, callOptions) => adapter.chat(turns, timeoutMs, callOptions),
+    },
+    request,
+    options,
+    null,
+    0,
+  );
+}
+
+/**
+ * Dispatch ONE arm, optionally under a permit-bound lease lifecycle.
+ *
+ * With a lifecycle, the arm's initial slot is freed exactly once the moment its initial
+ * attempt settles — or is skipped without a call — and BEFORE any validation, fingerprint, or
+ * repair work, so a slow validation never holds capacity. A repair reserves a fresh slot
+ * immediately before its request, RE-CHECKS the cutoff after that await (the acquisition
+ * itself takes time, and a repair that would land after first pitch must not be sent), and
+ * frees the slot on every exit. Without a lifecycle (`null`) the behaviour is exactly the
+ * legacy path — no gate is added and nothing is released, because there is no durable lease.
+ */
+async function dispatchArm(
+  target: DispatchTarget,
+  request: PreparedGameRequest,
+  options: SlateRunOptions,
+  lifecycle: AttemptLifecyclePort | null,
+  armIndex: number,
+): Promise<ArmGameResult> {
+  assertPrepared(request);
+  let initialReleased = false;
+  const releaseInitial = async (): Promise<void> => {
+    if (lifecycle === null || initialReleased) return;
+    initialReleased = true;
+    await lifecycle.releaseInitial(armIndex);
+  };
+  try {
+    return await dispatchArmCore(target, request, options, lifecycle, armIndex, releaseInitial);
+  } catch (error) {
+    // Backstop for a throw before the settle-time release (e.g. a synchronous pre-call
+    // failure): free the slot without masking the primary error.
+    if (lifecycle !== null && !initialReleased) {
+      initialReleased = true;
+      try {
+        await lifecycle.releaseInitial(armIndex);
+      } catch {
+        /* the primary error wins */
+      }
+    }
+    throw error;
+  }
+}
+
+async function dispatchArmCore(
+  target: DispatchTarget,
+  request: PreparedGameRequest,
+  options: SlateRunOptions,
+  lifecycle: AttemptLifecyclePort | null,
+  armIndex: number,
+  releaseInitial: () => Promise<void>,
+): Promise<ArmGameResult> {
+  const arm = target.arm;
   const nowMs = options.nowMs ?? Date.now;
   const cutoffMs = Date.parse(request.cutoffAt);
   const base = {
@@ -372,7 +452,9 @@ export async function runOneArmGame(
     validationErrors,
   });
 
-  if (!adapter.hasCredential()) {
+  if (!target.hasCredential()) {
+    // No initial call will be made: free the slot now.
+    await releaseInitial();
     return failed(
       'credential_missing',
       { ...emptyAttempt(), errorDetail: `${arm.credentialEnvVar} is not set` },
@@ -387,6 +469,7 @@ export async function runOneArmGame(
   // already closed is never sent.
   const remainingAtDispatch = cutoffMs - nowMs();
   if (remainingAtDispatch <= 0) {
+    await releaseInitial(); // skipped without a call
     return failed(
       'cutoff_missed',
       { ...emptyAttempt(), errorDetail: 'decision cutoff had already passed at dispatch' },
@@ -411,12 +494,17 @@ export async function runOneArmGame(
 
   // Each request is bounded by the remaining time to cutoff.
   const attempt = await timedChat(
-    adapter,
+    target,
     baseTurns,
     Math.min(options.timeoutMs, remainingAtDispatch),
     options.maxOutputTokens,
     nowMs,
   );
+  // The initial request has SETTLED (by response, timeout, or transport failure): free its
+  // slot now — before any validation, fingerprint, or repair work — so capacity is never held
+  // by this process's own bookkeeping. A release failure is a lifecycle fault: it propagates
+  // and no repair begins.
+  await releaseInitial();
   const { response: firstResponse, failure: firstFailure, ...attemptRecord } = attempt;
   if (firstFailure !== null || firstResponse === null) {
     return failed(firstFailure ?? 'provider_error', attemptRecord, null, false, null, []);
@@ -475,6 +563,10 @@ export async function runOneArmGame(
     ]);
   }
 
+  // Capture the narrowed fingerprint: the repair sender below is a nested (hoisted)
+  // function, so the null-narrowing above does not flow into it.
+  const initialDecisions = initialFingerprint;
+
   // Clock check BEFORE repair: if the decision window closed before the
   // repair could be dispatched, no acceptable response can exist any more —
   // that is a missed cutoff, not a schema verdict.
@@ -486,15 +578,55 @@ export async function runOneArmGame(
     ]);
   }
 
+  // The repair turns are built deterministically BEFORE any capacity is reserved, so a slot is
+  // never held across work that could have been done without it.
   const repairTurns: ChatTurn[] = [
     ...baseTurns,
     { role: 'assistant', content: firstResponse.rawText },
     { role: 'user', content: buildRepairInstruction(firstValidation.errors) },
   ];
+
+  // Reserve one fresh repair slot immediately before the request. A denied or replayed
+  // acquisition authorizes nothing: no request is sent, and nothing is released (nothing was
+  // taken). With no lifecycle the legacy path is ungated — there is no durable lease to hold.
+  const repairOrdinal = 1;
+  let repairLeaseHeld = false;
+  // The window to send the repair in. Without a lifecycle nothing is awaited between the
+  // check above and the call, so the legacy path reads the clock no more times than before.
+  let remainingForRepair = remainingAtRepair;
+  if (lifecycle !== null) {
+    const acquired = await lifecycle.acquireRepair(armIndex, repairOrdinal);
+    if (!acquired.authorized) {
+      return failed('invalid_schema', attemptRecord, null, false, null, [
+        ...firstValidation.errors,
+        'repair not dispatched: no repair concurrency slot was authorized',
+      ]);
+    }
+    repairLeaseHeld = true;
+    // The acquisition itself awaited the store, so RE-CHECK first pitch immediately before the
+    // HTTP call: a repair that would land after the cutoff must not be sent at all.
+    remainingForRepair = cutoffMs - nowMs();
+  }
+
+  try {
+    if (remainingForRepair <= 0) {
+      return failed('cutoff_missed', attemptRecord, null, false, null, [
+        ...firstValidation.errors,
+        'repair not dispatched: decision cutoff passed while the repair slot was acquired',
+      ]);
+    }
+    return await sendRepair(remainingForRepair);
+  } finally {
+    // Free the repair slot on every exit — response, timeout, transport failure, validation
+    // throw, or acceptance.
+    if (repairLeaseHeld && lifecycle !== null) await lifecycle.releaseRepair(armIndex, repairOrdinal);
+  }
+
+  async function sendRepair(remainingMs: number): Promise<ArmGameResult> {
   const repair = await timedChat(
-    adapter,
+    target,
     repairTurns,
-    Math.min(options.timeoutMs, remainingAtRepair),
+    Math.min(options.timeoutMs, remainingMs),
     options.maxOutputTokens,
     nowMs,
   );
@@ -524,7 +656,7 @@ export async function runOneArmGame(
   );
   if (repairValidation.errors.length === 0 && repairValidation.parsed !== null) {
     const diffs = compareFingerprints(
-      initialFingerprint,
+      initialDecisions,
       fingerprintFromParsed(repairValidation.parsed),
     );
     if (diffs.length > 0) {
@@ -553,6 +685,7 @@ export async function runOneArmGame(
   }
 
   return failed('invalid_schema', attemptRecord, repairRecord, true, 'ok', repairValidation.errors);
+  }
 }
 
 /**
@@ -605,6 +738,27 @@ function assertCompleteGrid(
   }
 }
 
+/**
+ * Await EVERY launched arm before resolving or rejecting. `Promise.all` rejects on the first
+ * failure while its siblings are still in flight — which, once a lease lifecycle is involved,
+ * would let the caller proceed while a sibling's HTTP request and its durable slot are still
+ * live. Collecting all settlements first means a fast arm never waits for a slow one, and a
+ * failure is reported only after every sibling has finished and freed what it held.
+ */
+async function settleAll(tasks: readonly Promise<ArmGameResult>[]): Promise<ArmGameResult[]> {
+  const settled = await Promise.allSettled(tasks);
+  const failures = settled.filter((s): s is PromiseRejectedResult => s.status === 'rejected');
+  if (failures.length > 0) {
+    const first = failures[0]!.reason;
+    if (failures.length === 1) throw first;
+    throw new AggregateError(
+      failures.map((f) => f.reason),
+      `${failures.length} arms failed during dispatch`,
+    );
+  }
+  return settled.map((s) => (s as PromiseFulfilledResult<ArmGameResult>).value);
+}
+
 export async function runSlate(
   arms: ArmSpec[],
   adapters: Map<string, ProviderAdapter>,
@@ -628,16 +782,26 @@ export async function runSlate(
   // identical shared slate metadata, genuine prepared origin). Dispatch then
   // runs on the sealed snapshot, and the artifact is built from it.
   const snapshot = sealDispatch(requests.map(prepareGameRequest));
+
+  // Resolve the COMPLETE arm→adapter grid before any arm launches. Looking an adapter up
+  // inside the launching map would let arm 0's request start and only then discover that a
+  // later arm has no adapter — a partial dispatch. Resolving first makes that impossible.
+  const targets: DispatchTarget[] = arms.map((arm) => {
+    const adapter = adapters.get(arm.participantId);
+    if (!adapter) throw new Error(`no adapter registered for ${arm.participantId}`);
+    return {
+      arm,
+      hasCredential: () => adapter.hasCredential(),
+      chat: (turns, timeoutMs, callOptions) => adapter.chat(turns, timeoutMs, callOptions),
+    };
+  });
+
   const all: ArmGameResult[] = [];
   let index = 0;
   for (const request of snapshot.prepared) {
     index += 1;
-    const results = await Promise.all(
-      arms.map((arm) => {
-        const adapter = adapters.get(arm.participantId);
-        if (!adapter) throw new Error(`no adapter registered for ${arm.participantId}`);
-        return runOneArmGame(arm, adapter, request, options);
-      }),
+    const results = await settleAll(
+      targets.map((target) => dispatchArm(target, request, options, null, 0)),
     );
     all.push(...results);
     if (options.onGameComplete) {
@@ -665,6 +829,100 @@ export async function runSlate(
     },
     // Authenticated derivation parameter (default: the full-board v0.2). The
     // producers derive baselines under this, so a scoped run stamps v0.3.
+    baselinePolicyVersion: options.baselinePolicyVersion ?? BASELINE_POLICY_VERSION,
+  });
+  runEnvelopes.add(envelope);
+  return envelope;
+}
+
+/**
+ * The canonical authorized dispatch path: run ONE admitted fire's roster under its
+ * permit-bound lease lifecycle.
+ *
+ * It accepts only a branded `AuthorizedDispatch` — never a raw `{permit, snapshot, plan}`
+ * tuple and never a caller-owned adapter map — so the admission gate cannot be skipped by a
+ * caller that assembles the pieces itself, and the arms dispatched are exactly the facades
+ * captured before the claim was taken. The complete grid is resolved BEFORE any arm launches;
+ * a preflight failure after authorization frees every unstarted initial lease and then
+ * propagates, so a claim is never left holding capacity for a fire that never ran. Every
+ * launched arm is awaited before this resolves or rejects.
+ *
+ * It produces the same branded `RunEnvelope` the legacy path produces; artifact production,
+ * installation, and claim completion remain their own owners'.
+ */
+export async function runAuthorizedDispatch(
+  dispatch: AuthorizedDispatch,
+  options: SlateRunOptions,
+): Promise<RunEnvelope> {
+  assertAuthorizedDispatch(dispatch);
+  const lifecycle = createAttemptLifecycle(dispatch);
+  const permit = dispatch.permit;
+  const prepared = dispatch.snapshot.prepared;
+
+  // Complete preflight BEFORE any launch. Anything that can fail synchronously fails here,
+  // while every initial lease is still unstarted and can be freed.
+  let targets: DispatchTarget[];
+  let expectedArms: string[];
+  try {
+    assertPrepared(prepared);
+    if (options.cohortId !== permit.cohortId) {
+      throw new Error(
+        `run options cohortId ${options.cohortId} does not equal the authorized cohort ${permit.cohortId}`,
+      );
+    }
+    if (prepared.gameId !== permit.gameId) {
+      throw new Error('the authorized snapshot request is not the permitted game');
+    }
+    const facades = dispatch.plan.arms;
+    if (facades.length === 0) throw new Error('the authorized plan carries no arms');
+    const seen = new Set<string>();
+    expectedArms = [];
+    targets = facades.map((facade) => {
+      if (seen.has(facade.participantId)) {
+        throw new Error(`duplicate participantId in the authorized plan: ${facade.participantId}`);
+      }
+      seen.add(facade.participantId);
+      expectedArms.push(facade.participantId);
+      return {
+        arm: {
+          participantId: facade.participantId,
+          provider: facade.provider as ArmSpec['provider'],
+          requestedModelId: facade.requestedModelId,
+          credentialEnvVar: facade.credentialEnvVar,
+        },
+        // The facades' bound methods — captured before the claim, never re-read from a map.
+        hasCredential: () => facade.hasCredential(),
+        chat: (turns, timeoutMs, callOptions) => facade.chat(turns, timeoutMs, callOptions),
+      };
+    });
+  } catch (error) {
+    // Nothing launched: free every unstarted initial lease, then surface the failure. A
+    // cleanup failure is reported without masking the preflight cause.
+    try {
+      await lifecycle.releaseAllUnstarted();
+    } catch {
+      /* the preflight cause wins */
+    }
+    throw error;
+  }
+
+  // Launch the roster concurrently; a fast arm releases its slot without waiting for a slow
+  // sibling, and every launched arm is awaited before this settles.
+  const results = await settleAll(
+    targets.map((target, armIndex) => dispatchArm(target, prepared, options, lifecycle, armIndex)),
+  );
+  assertCompleteGrid(results, expectedArms, [prepared]);
+
+  const envelope: RunEnvelope = deepFreeze({
+    snapshot: sealDispatch([prepared]),
+    results,
+    expectedArms,
+    dispatch: {
+      cohortId: options.cohortId,
+      executionPolicy: options.executionPolicy,
+      timeoutMs: options.timeoutMs,
+      maxOutputTokens: options.maxOutputTokens,
+    },
     baselinePolicyVersion: options.baselinePolicyVersion ?? BASELINE_POLICY_VERSION,
   });
   runEnvelopes.add(envelope);

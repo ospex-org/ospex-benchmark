@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { prepareGameRequest } from './preparedRequest.js';
-import { runOneArmGame } from './runner.js';
+import { runOneArmGame, runSlate } from './runner.js';
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
-import type {
+import type { ArmSpec,
   BenchmarkResponse,
   ChatTurn,
   ProviderAdapter,
@@ -305,4 +305,28 @@ test('initial timeout classifies as timeout', async () => {
     baseOptions(() => CUTOFF_MS - 60_000),
   );
   assert.equal(result.outcome, 'timeout');
+});
+
+test('a missing adapter is refused before ANY arm launches — arm 0 never starts', async () => {
+  // The legacy grid is resolved completely before launch, so a gap at a LATER roster
+  // position cannot let an earlier arm's request go out first (a partial dispatch).
+  const request = makeRequest(CUTOFF);
+  const armA: ArmSpec = { ...TEST_ARM, participantId: 'arm-a' };
+  const armB: ArmSpec = { ...TEST_ARM, participantId: 'arm-b' };
+  let armACalls = 0;
+  const adapterA = stubAdapter([
+    async () => {
+      armACalls += 1;
+      return stubResponse(JSON.stringify(makeValidResponse(request, armA)));
+    },
+  ]);
+  await assert.rejects(
+    () =>
+      runSlate([armA, armB], new Map([[armA.participantId, adapterA]]), [request], {
+        ...baseOptions(() => CUTOFF_MS - 60_000),
+        cohortId: TEST_COHORT,
+      }),
+    /no adapter registered for arm-b/,
+  );
+  assert.equal(armACalls, 0, 'arm 0 must not start when a later arm has no adapter');
 });
