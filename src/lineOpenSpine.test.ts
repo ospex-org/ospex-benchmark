@@ -10,6 +10,7 @@ import { StoreClaimPort } from './lineOpenClaim.js';
 import type { DispatchPermit } from './lineOpenClaim.js';
 import { DispatchAuthorizationError, PreDispatchCleanupError, scopeKeyOf } from './lineOpenDispatch.js';
 import { AuthorizedDispatchFaultError } from './runner.js';
+import { LifecycleFaultError } from './lineOpenLifecycle.js';
 import {
   buildFullScopeAdmitRequest,
   FireReconciliationError,
@@ -669,21 +670,25 @@ test('a narrowed scope whose cleanup also fails surfaces the cleanup error, inst
   store.onRelease = () => Promise.resolve({ outcome: 'refused', reason: 'not_owner' });
   const { map } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
-  const expectedLeaseIds = snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`).sort();
+  // Permit initial-lease order, UNSORTED — the retained evidence must preserve it, so a reversal
+  // of the failures (or attempts) is caught here rather than normalized away by a sort.
+  const expectedLeaseIds = snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`);
   await assert.rejects(
     () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION }),
     (error: unknown) => {
-      // The typed cleanup error is propagated UNCHANGED — its structured evidence must survive, so
-      // wrapping it in a plain Error carrying the same prose is a regression this catches.
+      // The typed cleanup error is propagated UNCHANGED — its structured, ORDERED evidence must
+      // survive, so a re-wrap that reverses the retained failures is a regression this catches.
       assert.ok(error instanceof PreDispatchCleanupError, 'a PreDispatchCleanupError, not a plain Error');
       assert.ok(
         error.primary instanceof DispatchAuthorizationError && error.primary.reason === 'retained_scope_not_supported',
         'the primary is the retained-scope refusal',
       );
-      // Every lease was attempted, in permit order, and every attempt failed not_owner.
-      assert.deepEqual(error.attempts.map((a) => a.leaseId), expectedLeaseIds.map((_, i) => `lease-${i}`), 'complete ordered attempts');
+      // Every lease was attempted in permit order; every attempt failed not_owner.
+      assert.deepEqual(error.attempts.map((a) => a.leaseId), expectedLeaseIds, 'complete ordered attempts');
       assert.ok(error.attempts.every((a) => a.result === 'not_owner'), 'each attempt records not_owner');
-      assert.deepEqual([...error.failures].map((a) => a.leaseId).sort(), expectedLeaseIds, 'failures are the still-held leases');
+      // The still-held failures preserve permit order and their result vocabulary — no sort.
+      assert.deepEqual(error.failures.map((f) => f.leaseId), expectedLeaseIds, 'failures remain in permit initial-lease order');
+      assert.deepEqual(error.failures.map((f) => f.result), expectedLeaseIds.map(() => 'not_owner'), 'every ordered failure retains its result');
       return true;
     },
   );
@@ -705,10 +710,19 @@ test('a dispatch fault propagates and installs nothing', async () => {
   await assert.rejects(
     () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION }),
     (error: unknown) => {
-      // The typed dispatch fault is propagated UNCHANGED — every retained arm cause must survive, so
-      // wrapping it in a plain Error carrying the same prose is a regression this catches.
+      // The typed dispatch fault is propagated UNCHANGED — every retained arm cause must survive in
+      // roster order, so a re-wrap that reverses the causes is caught here.
       assert.ok(error instanceof AuthorizedDispatchFaultError, 'a typed dispatch fault, not a plain Error');
-      assert.equal(error.failures.length, snapshot.expectedArmIdentities.length, 'every arm failure retained (roster-sized)');
+      assert.equal(error.failures.length, snapshot.expectedArmIdentities.length, 'exactly one cause per arm');
+      for (let i = 0; i < error.failures.length; i += 1) {
+        const failure = error.failures[i];
+        assert.ok(failure instanceof LifecycleFaultError, `arm ${i}: lifecycle fault retained`);
+        assert.match(
+          (failure as LifecycleFaultError).message,
+          new RegExp(`^arm ${i} initial lease release `),
+          `arm ${i}: cause remains in roster position`,
+        );
+      }
       return true;
     },
   );
