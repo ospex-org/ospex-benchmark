@@ -96,18 +96,25 @@ export function assertLeaseAuthority(authority: AdmissionLeaseAuthority): void {
 }
 
 /**
- * Throw unless `authority` is the one minted WITH `permit`. Both brands can be genuine
- * separately, so authenticating each alone is not enough: a caller-supplied `ClaimPort` could
- * pair one admission's permit with another admission's authority, and every later bind check
- * reads only the permit — the authority's closed-over owner/cohort/fire/schema is opaque and
- * would never be compared. Releases would then be issued for THIS fire's leases under the
- * OTHER fire's owner (refused as `not_owner`, leaking every lease to expiry). Pairing is
- * therefore checked before any lease work.
+ * The authority minted WITH `permit` — the operational one, resolved from the permit itself
+ * rather than taken from whatever a caller supplied alongside it.
+ *
+ * This is what makes "same-admission" mechanical. Both brands can be genuine separately, so
+ * authenticating each alone is not enough: a caller-supplied `ClaimPort` could pair one
+ * admission's permit with another's authority, and every later bind check reads only the
+ * permit — the authority's closed-over owner/cohort/fire/schema is opaque and would never be
+ * compared, so releases would be issued for THIS fire's leases under the OTHER fire's owner.
+ * Resolving here means a consumer never has to trust the pairing it was handed, AND a crossed
+ * pair is still cleanable: this permit's own leases can be released through this authority.
  */
-export function assertSameAdmission(permit: DispatchPermit, authority: AdmissionLeaseAuthority): void {
-  if (authorityOfPermit.get(permit) !== authority) {
-    throw new Error('lease authority was not minted with this permit (crossed admissions)');
+export function leaseAuthorityForPermit(permit: DispatchPermit): AdmissionLeaseAuthority {
+  assertDispatchPermit(permit);
+  const authority = authorityOfPermit.get(permit);
+  if (authority === undefined) {
+    // Unreachable for a genuine permit — the mint records the pair before returning it.
+    throw new Error('no lease authority is mapped to this permit');
   }
+  return authority;
 }
 
 // ---------------------------------------------------------------------------

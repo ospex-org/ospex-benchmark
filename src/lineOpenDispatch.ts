@@ -1,6 +1,6 @@
 import { MARKET_ORDINAL } from './fireArtifact.js';
 import { deepFreeze } from './freeze.js';
-import { assertDispatchPermit, assertLeaseAuthority, assertSameAdmission, captureAdmitRequest } from './lineOpenClaim.js';
+import { assertDispatchPermit, captureAdmitRequest, leaseAuthorityForPermit } from './lineOpenClaim.js';
 import type { AdmissionLeaseAuthority, ClaimOutcome, ClaimPort, DispatchPermit } from './lineOpenClaim.js';
 import { assertPreparedFireSnapshot, deriveFireId } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
@@ -57,6 +57,7 @@ export type DispatchRefusalReason =
   | 'permit_digest_mismatch'
   | 'permit_owner_mismatch'
   | 'permit_schema_mismatch'
+  | 'lease_authority_mismatch'
   | 'claim_key_game_mismatch'
   | 'claim_key_duplicate'
   | 'claim_scope_mismatch'
@@ -429,16 +430,28 @@ export async function authorizePreparedDispatch(
     // No permit ⇒ no ids or ownership to act on: zero releases, zero dispatch.
     return { kind: 'NotAdmitted', outcome };
   }
-  const { permit, leaseAuthority } = outcome;
+  const permit = outcome.permit;
+  const suppliedAuthority: AdmissionLeaseAuthority | undefined = outcome.leaseAuthority;
 
   // (5) Bind every authorizing dimension to the exact snapshot / plan / captured request.
   //     From here every refusal first releases the admitted leases.
+  //
+  //     The PERMIT is the authority anchor: the operational lease authority is resolved from
+  //     the permit's own mint, never taken from what the claim outcome supplied. So a supplied
+  //     authority is only ever COMPARED — a missing, forged, or crossed one is a typed refusal
+  //     and is never called — while this permit's leases stay cleanable through their own
+  //     authority. Trusting the supplied value instead would either release this fire's leases
+  //     under another admission's owner, or (refusing without cleanup) leak them to expiry.
   assertDispatchPermit(permit);
-  assertLeaseAuthority(leaseAuthority);
-  // Both brands can be genuine SEPARATELY, so the pairing is checked before any lease work:
-  // a crossed pair would release this fire's leases under another admission's owner. There is
-  // no trustworthy authority for these leases, so this refuses WITHOUT attempting cleanup.
-  assertSameAdmission(permit, leaseAuthority);
+  const leaseAuthority = leaseAuthorityForPermit(permit);
+  if (suppliedAuthority !== leaseAuthority) {
+    return refuseAfterAdmission(
+      'lease_authority_mismatch',
+      'the supplied lease authority is not the one minted with this permit',
+      permit,
+      leaseAuthority,
+    );
+  }
 
   if (permit.cohortId !== snapshot.booted.cohortId) {
     return refuseAfterAdmission('permit_cohort_mismatch', 'permit cohort != snapshot cohort', permit, leaseAuthority);

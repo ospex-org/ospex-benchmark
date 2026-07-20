@@ -486,30 +486,109 @@ test('the plan captured before the claim is the plan authorized — the caller m
 // Crossed admissions
 // ===========================================================================
 
-test('a permit paired with ANOTHER admission lease authority is refused and releases nothing', async () => {
-  const snapshot = sealedSnapshot();
+/** Mint two independent genuine admissions, A and B, each on its own scripted store. */
+async function twoAdmissions(snapshot: PreparedFireSnapshot, overA: Partial<AdmitAdmittedResult> = {}) {
   const storeA = new ScriptedStore();
   const storeB = new ScriptedStore();
-  const { outcome: outcomeA } = await mintPermit(storeA, request(snapshot), admitted({}, snapshot));
-  const { outcome: outcomeB } = await mintPermit(storeB, request(snapshot, { ownerId: 'owner-B' }), admitted({}, snapshot));
-  assert.equal(outcomeA.kind, 'Authorized');
-  assert.equal(outcomeB.kind, 'Authorized');
-  if (outcomeA.kind !== 'Authorized' || outcomeB.kind !== 'Authorized') return;
+  const { outcome: a } = await mintPermit(storeA, request(snapshot), admitted(overA, snapshot));
+  const { outcome: b } = await mintPermit(storeB, request(snapshot, { ownerId: 'owner-B' }), admitted({}, snapshot));
+  if (a.kind !== 'Authorized' || b.kind !== 'Authorized') throw new Error('fixture: expected two authorized mints');
   storeA.releaseCalls.length = 0;
   storeB.releaseCalls.length = 0;
+  return { storeA, storeB, a, b };
+}
 
-  // Both pieces are individually GENUINE, but they come from different admissions.
-  const crossed: ClaimOutcome = { kind: 'Authorized', permit: outcomeA.permit, leaseAuthority: outcomeB.leaseAuthority };
-  const adapters = adapterMap(snapshot);
+test('the operational lease authority is resolved from the permit, and a foreign one is refused but still cleaned', async () => {
+  const snapshot = sealedSnapshot();
+
+  // (1) permit A + authority A → authorized, nothing released.
+  {
+    const { storeA, a } = await twoAdmissions(snapshot);
+    const adapters = adapterMap(snapshot);
+    const result = await authorizeWith({ snapshot, adapters, request: request(snapshot), outcome: a });
+    assert.equal(result.kind, 'Authorized');
+    if (result.kind !== 'Authorized') return;
+    // The carried authority is the one mapped to the permit, not merely the supplied property.
+    assert.strictEqual(result.dispatch.leaseAuthority, a.leaseAuthority);
+    assert.deepEqual(storeA.releaseCalls, []);
+  }
+
+  // (2) permit A + a GENUINE authority from another admission, and (3) a forged/missing one.
+  //     Each is a typed refusal that cleans A's leases through A's OWN authority, and the
+  //     foreign value is never called.
+  const foreignCases: Array<[string, (b: ClaimOutcome) => unknown]> = [
+    ['another admission authority', (b) => (b as { leaseAuthority?: unknown }).leaseAuthority],
+    ['forged authority', () => ({ releaseLease: () => Promise.resolve({ outcome: 'released' }), acquireRepairLease: () => Promise.reject(new Error('x')) })],
+    ['missing authority', () => undefined],
+  ];
+  for (const [label, pick] of foreignCases) {
+    const { storeA, storeB, a, b } = await twoAdmissions(snapshot);
+    const permitA = a.permit;
+    const crossed = { kind: 'Authorized', permit: permitA, leaseAuthority: pick(b) } as unknown as ClaimOutcome;
+    const adapters = adapterMap(snapshot);
+    await assert.rejects(
+      () => authorizeWith({ snapshot, adapters, request: request(snapshot), outcome: crossed }),
+      (e) => e instanceof DispatchAuthorizationError && e.reason === 'lease_authority_mismatch',
+      label,
+    );
+    // Every distinct lease of permit A is released once, under A's own owner …
+    assert.deepEqual(
+      storeA.releaseCalls.map((r) => r.leaseId),
+      permitA.initialLeases.map((l) => l.leaseId),
+      `${label}: A's leases are released through A's authority`,
+    );
+    assert.ok(storeA.releaseCalls.every((r) => r.ownerId === permitA.ownerId), `${label}: A's owner`);
+    // … and the foreign authority is never called.
+    assert.deepEqual(storeB.releaseCalls, [], `${label}: the foreign authority is never used`);
+    assert.equal(totalFacadeCalls(adapters), 0, `${label}: no adapter call`);
+  }
+});
+
+test('an authority mismatch on a permit with duplicate lease ids releases each distinct id once', async () => {
+  const snapshot = sealedSnapshot();
+  const dup = leases(snapshot.expectedArmIdentities.length);
+  dup[1] = { ...dup[1]!, leaseId: dup[0]!.leaseId };
+  const { storeA, storeB, a, b } = await twoAdmissions(snapshot, { initialLeases: dup });
+  const crossed: ClaimOutcome = {
+    kind: 'Authorized',
+    permit: a.permit,
+    leaseAuthority: b.leaseAuthority,
+  };
   await assert.rejects(
-    () => authorizeWith({ snapshot, adapters, request: request(snapshot), outcome: crossed }),
-    /crossed admissions/,
+    () => authorizeWith({ snapshot, adapters: adapterMap(snapshot), request: request(snapshot), outcome: crossed }),
+    (e) => e instanceof DispatchAuthorizationError && e.reason === 'lease_authority_mismatch',
   );
-  // No release may be issued: fire A's leases under fire B's owner would be refused as
-  // not_owner and leak, so there is no trustworthy authority to clean up with.
-  assert.deepEqual(storeA.releaseCalls, []);
+  assert.deepEqual(storeA.releaseCalls.map((r) => r.leaseId), [...new Set(dup.map((l) => l.leaseId))]);
   assert.deepEqual(storeB.releaseCalls, []);
-  assert.equal(totalFacadeCalls(adapters), 0);
+});
+
+test('an authority mismatch whose cleanup partly fails still attempts every lease and retains the mismatch cause', async () => {
+  const snapshot = sealedSnapshot();
+  const { storeA, storeB, a, b } = await twoAdmissions(snapshot);
+  const permitA = a.permit;
+  storeA.onRelease = (req): Promise<ReleaseResult> => {
+    if (req.leaseId === 'lease-1') return Promise.resolve({ outcome: 'refused', reason: 'not_owner' });
+    if (req.leaseId === 'lease-2') return Promise.reject(new Error('release boom'));
+    return Promise.resolve({ outcome: 'released' });
+  };
+  const crossed: ClaimOutcome = {
+    kind: 'Authorized',
+    permit: permitA,
+    leaseAuthority: b.leaseAuthority,
+  };
+  await assert.rejects(
+    () => authorizeWith({ snapshot, adapters: adapterMap(snapshot), request: request(snapshot), outcome: crossed }),
+    (error) => {
+      assert.ok(error instanceof PreDispatchCleanupError);
+      assert.ok(error.primary instanceof DispatchAuthorizationError);
+      assert.equal((error.primary as DispatchAuthorizationError).reason, 'lease_authority_mismatch');
+      assert.deepEqual(error.failures.map((f) => `${f.leaseId}=${f.result}`), ['lease-1=not_owner', 'lease-2=threw']);
+      assert.deepEqual(error.attempts.map((x) => x.leaseId), permitA.initialLeases.map((l) => l.leaseId));
+      return true;
+    },
+  );
+  assert.deepEqual(storeA.releaseCalls.map((r) => r.leaseId), permitA.initialLeases.map((l) => l.leaseId));
+  assert.deepEqual(storeB.releaseCalls, []);
 });
 
 // ===========================================================================
