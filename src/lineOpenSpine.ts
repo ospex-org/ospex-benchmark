@@ -192,10 +192,26 @@ export function reconcileArtifactToPermit(artifact: FireArtifactV1, permit: Disp
 
   // marketClaims: every artifact claim equals its canonical permit key (cohort/fire from the
   // permit, game/market from the key), field by field, mapped by market — never positionally.
-  const aClaimByMarket = new Map<MarketKey, (typeof aClaims)[number]>(aClaims.map((c) => [c.market, c]));
-  let marketClaimsOk = aClaims.length === canonicalKeys.length;
+  // marketClaims is a ONE-TO-ONE relation: both sides must be a set of DISTINCT markets, the two
+  // market sets must be equal, and each artifact claim must match its permit key field by field.
+  // Equal array length alone is insufficient — duplicate permit keys [ml, ml] against an artifact
+  // [ml, total] have equal length yet leave the total claim with no permit key.
+  const permitKeyByMarket = new Map<MarketKey, ClaimKey>();
+  let permitMarketsDistinct = true;
   for (const key of canonicalKeys) {
-    const claim = aClaimByMarket.get(key.market);
+    if (permitKeyByMarket.has(key.market)) permitMarketsDistinct = false;
+    permitKeyByMarket.set(key.market, key);
+  }
+  const claimByMarket = new Map<MarketKey, (typeof aClaims)[number]>();
+  let claimMarketsDistinct = true;
+  for (const claim of aClaims) {
+    if (claimByMarket.has(claim.market)) claimMarketsDistinct = false;
+    claimByMarket.set(claim.market, claim);
+  }
+  let marketClaimsOk =
+    permitMarketsDistinct && claimMarketsDistinct && permitKeyByMarket.size === claimByMarket.size;
+  for (const [market, key] of permitKeyByMarket) {
+    const claim = claimByMarket.get(market);
     if (
       claim === undefined ||
       claim.cohortId !== pCohortId ||

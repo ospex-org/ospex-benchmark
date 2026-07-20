@@ -8,7 +8,8 @@ import { cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
 import { StoreClaimPort } from './lineOpenClaim.js';
 import type { DispatchPermit } from './lineOpenClaim.js';
-import { scopeKeyOf } from './lineOpenDispatch.js';
+import { DispatchAuthorizationError, PreDispatchCleanupError, scopeKeyOf } from './lineOpenDispatch.js';
+import { AuthorizedDispatchFaultError } from './runner.js';
 import {
   buildFullScopeAdmitRequest,
   FireReconciliationError,
@@ -541,7 +542,10 @@ test('each run-option field is read once, before admission, and a later mutation
   }
   const { outcome } = await fireOf({ runOptions: counting });
   assert.equal(outcome.kind, 'Installed');
-  for (const field of ['timeoutMs', 'maxOutputTokens', 'executionPolicy', 'baselinePolicyVersion', 'nowMs'] as const) {
+  // All SIX run-option fields — onGameComplete included — are read exactly once, before admission;
+  // a post-admission re-read of any of them (e.g. `onGameComplete: input.runOptions.onGameComplete`)
+  // reads its getter twice and turns this red.
+  for (const field of ['timeoutMs', 'maxOutputTokens', 'executionPolicy', 'baselinePolicyVersion', 'nowMs', 'onGameComplete'] as const) {
     assert.equal(reads[field], 1, `${field} read exactly once`);
   }
 });
@@ -647,8 +651,11 @@ test('an admitted narrowed scope propagates the refusal and releases every lease
     () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION }),
     /retained_scope_not_supported|does not|narrower/,
   );
-  assert.deepEqual([...releaseIds(store)].sort(), store.calls.filter((c) => c.op === 'release').map((c) => (c as { leaseId: string }).leaseId).sort());
-  assert.equal(releaseIds(store).length, snapshot.expectedArmIdentities.length, 'every initial lease released once');
+  // Exactly the distinct initial-lease IDs are released once each — compared to the expected set,
+  // not to a second projection of the same store log.
+  const expectedLeaseIds = snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`).sort();
+  assert.deepEqual([...releaseIds(store)].sort(), expectedLeaseIds, 'every initial lease released once');
+  assert.equal(new Set(releaseIds(store)).size, expectedLeaseIds.length, 'distinct lease IDs');
   assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0, 'no adapter called');
   assert.equal(sink.calls.length, 0, 'nothing installed');
 });
@@ -662,11 +669,21 @@ test('a narrowed scope whose cleanup also fails surfaces the cleanup error, inst
   store.onRelease = () => Promise.resolve({ outcome: 'refused', reason: 'not_owner' });
   const { map } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  const expectedLeaseIds = snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`).sort();
   await assert.rejects(
     () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION }),
     (error: unknown) => {
-      // The cleanup error type from S2a carries the primary + attempts.
-      assert.ok(error instanceof Error && /cleanup|retained_scope|not_owner/.test(error.message), 'the cleanup failure is surfaced');
+      // The typed cleanup error is propagated UNCHANGED — its structured evidence must survive, so
+      // wrapping it in a plain Error carrying the same prose is a regression this catches.
+      assert.ok(error instanceof PreDispatchCleanupError, 'a PreDispatchCleanupError, not a plain Error');
+      assert.ok(
+        error.primary instanceof DispatchAuthorizationError && error.primary.reason === 'retained_scope_not_supported',
+        'the primary is the retained-scope refusal',
+      );
+      // Every lease was attempted, in permit order, and every attempt failed not_owner.
+      assert.deepEqual(error.attempts.map((a) => a.leaseId), expectedLeaseIds.map((_, i) => `lease-${i}`), 'complete ordered attempts');
+      assert.ok(error.attempts.every((a) => a.result === 'not_owner'), 'each attempt records not_owner');
+      assert.deepEqual([...error.failures].map((a) => a.leaseId).sort(), expectedLeaseIds, 'failures are the still-held leases');
       return true;
     },
   );
@@ -687,9 +704,19 @@ test('a dispatch fault propagates and installs nothing', async () => {
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
     () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION }),
-    (error: unknown) => error instanceof Error && /authorized dispatch failed|release/.test(error.message),
+    (error: unknown) => {
+      // The typed dispatch fault is propagated UNCHANGED — every retained arm cause must survive, so
+      // wrapping it in a plain Error carrying the same prose is a regression this catches.
+      assert.ok(error instanceof AuthorizedDispatchFaultError, 'a typed dispatch fault, not a plain Error');
+      assert.equal(error.failures.length, snapshot.expectedArmIdentities.length, 'every arm failure retained (roster-sized)');
+      return true;
+    },
   );
   assert.equal(sink.calls.length, 0, 'a fire that could not dispatch leaves no record');
+  // Every launched arm settled and every expected initial-lease release was attempted exactly once.
+  const dispatchLeaseIds = snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`).sort();
+  assert.deepEqual([...releaseIds(store)].sort(), dispatchLeaseIds, 'every arm attempted its release');
+  assert.equal(new Set(releaseIds(store)).size, dispatchLeaseIds.length, 'each release attempted once');
 });
 
 test('a producer failure after dispatch leaves leases settled and installs nothing', async () => {
@@ -787,6 +814,30 @@ test('genuine pairs that disagree on a dimension raise a FireReconciliationError
   const rosterMint = await new StoreClaimPort(badRosterStore).admit(buildFullScopeAdmitRequest(rosterSnapshot, ADMISSION));
   assert.equal(rosterMint.kind, 'Authorized', 'the bad-roster permit is brand-genuine');
   if (rosterMint.kind === 'Authorized') check(base.artifact, rosterMint.permit, 'initialLeaseRoster');
+
+  // marketClaims is one-to-one: a genuine permit with DUPLICATE claimed keys [moneyline, moneyline]
+  // crossed with the good [moneyline, total] artifact leaves the artifact's total claim with no
+  // permit key. Equal array length alone would miss it; the relation must reject the duplicate.
+  const dupStore = new ScriptedStore(4);
+  dupStore.admitMarkets = ['moneyline', 'moneyline'];
+  const dupMint = await new StoreClaimPort(dupStore).admit(buildFullScopeAdmitRequest(sealed(), ADMISSION));
+  assert.equal(dupMint.kind, 'Authorized', 'the duplicate-key permit is brand-genuine');
+  if (dupMint.kind === 'Authorized') {
+    let raised: FireReconciliationError | null = null;
+    try {
+      reconcileArtifactToPermit(base.artifact, dupMint.permit);
+    } catch (error) {
+      raised = error as FireReconciliationError;
+    }
+    assert.ok(raised instanceof FireReconciliationError, 'the duplicate-key permit must not reconcile');
+    // Both scopedMarkets (artifact [ml,total] vs permit [ml,ml]) and marketClaims fail — reported
+    // in the fixed canonical order.
+    assert.deepEqual(
+      raised.dimensions.filter((d) => d === 'scopedMarkets' || d === 'marketClaims'),
+      ['scopedMarkets', 'marketClaims'],
+      'both scope and one-to-one claims fail, in fixed order',
+    );
+  }
 
   // Positive control: two genuine same-roster values never spuriously flag the dimension.
   for (const permit of [diffGame.permit, diffCohort.permit, diffScope.permit]) {
