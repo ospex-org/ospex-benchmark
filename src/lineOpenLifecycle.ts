@@ -21,10 +21,20 @@ import type { Lease } from './store/contract.js';
  */
 
 /** A lifecycle misuse or store failure. Never raised for an ordinary refusal to authorize. */
+export interface LeaseReleaseFailure {
+  readonly armIndex: number;
+  readonly leaseId: string;
+  /** The store's refusal reason, or `threw` when the release raised. */
+  readonly outcome: string;
+}
+
 export class LifecycleFaultError extends Error {
-  constructor(message: string) {
+  /** Leases this fire still holds — non-empty only for a bulk release that partly failed. */
+  readonly failures: readonly LeaseReleaseFailure[];
+  constructor(message: string, failures: readonly LeaseReleaseFailure[] = []) {
     super(message);
     this.name = 'LifecycleFaultError';
+    this.failures = Object.freeze([...failures]);
   }
 }
 
@@ -124,11 +134,8 @@ export function createAttemptLifecycle(dispatch: AuthorizedDispatch): AdmissionA
       } catch {
         throw new LifecycleFaultError(`repair ${repairOrdinal} for arm ${armIndex} acquire threw`);
       }
-      // Only a fresh acquisition carrying the authorization literal permits one paid request;
-      // a replay or refusal takes nothing, so nothing is released for it either.
-      if (result.outcome !== 'acquired' || result.requestAuthorized !== true) {
-        return { authorized: false };
-      }
+      // A replay or refusal takes nothing, so nothing is released for it either.
+      if (result.outcome !== 'acquired') return { authorized: false };
 
       // A returned lease must actually back THIS arm's repair and must not alias a slot this
       // lifecycle already holds — otherwise a later release would free the wrong slot.
@@ -138,7 +145,12 @@ export function createAttemptLifecycle(dispatch: AuthorizedDispatch): AdmissionA
         ...[...repairLeases.values()].map((l) => l.leaseId),
       ]);
       const problem =
-        lease.armIndex !== armIndex
+        // An `acquired` outcome WITHOUT the authorization literal is self-contradictory: the
+        // store handed back a slot while denying the request, so the slot must be returned
+        // rather than silently leaked (every other malformed `acquired` shape is cleaned too).
+        result.requestAuthorized !== true
+          ? 'was not authorized'
+          : lease.armIndex !== armIndex
           ? 'is bound to a different arm'
           : lease.state !== 'live'
             ? 'is not live'
@@ -181,18 +193,23 @@ export function createAttemptLifecycle(dispatch: AuthorizedDispatch): AdmissionA
     async releaseAllUnstarted(): Promise<void> {
       // Pre-launch only: no arm has begun an HTTP request, so every unreleased initial lease
       // is unstarted. Attempt them all — one failure must not strand the rest.
-      const failures: string[] = [];
+      const failures: LeaseReleaseFailure[] = [];
       for (const [armIndex, lease] of initialByArm) {
         if (initialReleaseStarted.has(armIndex)) continue;
         initialReleaseStarted.add(armIndex);
         try {
           await release(lease.leaseId, `arm ${armIndex} initial lease`);
-        } catch {
-          failures.push(`arm ${armIndex}`);
+        } catch (error) {
+          // Retain WHICH lease is still held — an operator needs the identity, not a count.
+          const outcome = error instanceof LifecycleFaultError && error.message.includes('refused') ? 'not_owner' : 'threw';
+          failures.push({ armIndex, leaseId: lease.leaseId, outcome });
         }
       }
       if (failures.length > 0) {
-        throw new LifecycleFaultError(`pre-launch lease release failed for ${failures.join(', ')}`);
+        throw new LifecycleFaultError(
+          `pre-launch lease release failed for ${failures.length} lease(s)`,
+          failures,
+        );
       }
     },
   };

@@ -13,9 +13,9 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { deepFreeze } from './freeze.js';
 import { instantMs } from './time.js';
 import type { GameRequest } from './bundle.js';
-import { assertAuthorizedDispatch } from './lineOpenDispatch.js';
+import { assertAuthorizedDispatch, PreDispatchCleanupError } from './lineOpenDispatch.js';
 import type { AuthorizedDispatch } from './lineOpenDispatch.js';
-import { createAttemptLifecycle } from './lineOpenLifecycle.js';
+import { createAttemptLifecycle, LifecycleFaultError } from './lineOpenLifecycle.js';
 import type { AttemptLifecyclePort } from './lineOpenLifecycle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
 import type {
@@ -903,12 +903,22 @@ export async function runAuthorizedDispatch(
       };
     });
   } catch (error) {
-    // Nothing launched: free every unstarted initial lease, then surface the failure. A
-    // cleanup failure is reported without masking the preflight cause.
+    // Nothing launched: free every unstarted initial lease, then surface the failure. If a
+    // release itself failed, the preflight cause alone would hide the fact that this fire is
+    // still holding durable capacity — so the cleanup fault is REPORTED, retaining the
+    // preflight cause as its primary and naming every lease that is still held.
+    let cleanupFault: unknown = null;
     try {
       await lifecycle.releaseAllUnstarted();
-    } catch {
-      /* the preflight cause wins */
+    } catch (failure) {
+      cleanupFault = failure;
+    }
+    if (cleanupFault instanceof LifecycleFaultError && error instanceof Error) {
+      throw new PreDispatchCleanupError(
+        error,
+        cleanupFault.failures.map((f) => ({ leaseId: f.leaseId, result: f.outcome === 'not_owner' ? 'not_owner' : 'threw' })),
+        cleanupFault.failures.map((f) => ({ leaseId: f.leaseId, result: f.outcome === 'not_owner' ? 'not_owner' : 'threw' })),
+      );
     }
     throw error;
   }

@@ -3,9 +3,10 @@ import { test } from 'node:test';
 import { cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
 import { StoreClaimPort } from './lineOpenClaim.js';
-import { authorizePreparedDispatch } from './lineOpenDispatch.js';
+import { authorizePreparedDispatch, PreDispatchCleanupError } from './lineOpenDispatch.js';
 import type { AuthorizedDispatch } from './lineOpenDispatch.js';
 import { createAttemptLifecycle, LifecycleFaultError } from './lineOpenLifecycle.js';
+import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { checkPublication } from './manifestPublication.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import { sealPreparedFire } from './preparedFire.js';
@@ -181,9 +182,9 @@ function sealedSnapshot(): PreparedFireSnapshot {
   });
 }
 
-function leases(count: number): Lease[] {
+function leases(count: number, prefix = ''): Lease[] {
   return Array.from({ length: count }, (_, i) => ({
-    leaseId: `lease-${i}`,
+    leaseId: `${prefix}lease-${i}`,
     armIndex: i,
     expiresAt: '2026-07-18T12:10:00.000Z',
     state: 'live' as const,
@@ -201,7 +202,7 @@ class ScriptedStore implements AtomicStore {
       lease: { leaseId: `repair-${req.armIndex}-${req.repairOrdinal}`, armIndex: req.armIndex, expiresAt: '2026-07-18T12:20:00.000Z', state: 'live' },
       requestAuthorized: true,
     });
-  constructor(private readonly rosterSize: number) {}
+  constructor(private readonly rosterSize: number, private readonly leasePrefix = '') {}
 
   initCohortBudget(_r: InitCohortBudgetRequest): Promise<InitResult> {
     throw new Error('not used');
@@ -211,7 +212,7 @@ class ScriptedStore implements AtomicStore {
       outcome: 'admitted',
       claimedKeys: MARKETS.map((market) => ({ gameId: req.gameId, market })),
       preparedBytesDigest: req.scopeReservations['moneyline+total']!.preparedBytesDigest,
-      initialLeases: leases(this.rosterSize),
+      initialLeases: leases(this.rosterSize, this.leasePrefix),
       dispatchAuthorized: true,
     });
   }
@@ -264,7 +265,7 @@ function wrongEcho(body: string): string {
 
 function scriptedAdapter(
   identity: { participantId: string; provider: string; requestedModelId: string },
-  bodies: (call: number) => string | Promise<never>,
+  bodies: (call: number) => string | Promise<string>,
   opts: { hasCredential?: boolean } = {},
 ): Scripted {
   const state = { calls: 0 };
@@ -296,9 +297,10 @@ function options(nowMs: () => number = () => NOW_MS, cohortId?: string): SlateRu
 /** Authorize one fire; returns the branded dispatch plus its store and adapters. */
 async function authorize(
   build: (snapshot: PreparedFireSnapshot) => Map<string, ProviderAdapter>,
+  leasePrefix = '',
 ): Promise<{ dispatch: AuthorizedDispatch; store: ScriptedStore; snapshot: PreparedFireSnapshot }> {
   const snapshot = sealedSnapshot();
-  const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+  const store = new ScriptedStore(snapshot.expectedArmIdentities.length, leasePrefix);
   const result = await authorizePreparedDispatch({
     snapshot,
     adapters: build(snapshot),
@@ -369,7 +371,7 @@ test('a repair is authorized only by a fresh acquisition carrying a coherent liv
     ['refused', () => Promise.resolve({ outcome: 'refused', reason: 'concurrency', requestAuthorized: false }), { authorized: false, faults: false, cleaned: false }],
     // A wire skew: the ACQUIRED outcome without the authorization literal. The outcome name
     // alone must never authorize a paid request.
-    ['acquired without the authorization literal', (req) => Promise.resolve({ outcome: 'acquired', lease: { leaseId: `r-skew-${req.armIndex}`, armIndex: req.armIndex, expiresAt: 'x', state: 'live' }, requestAuthorized: false } as unknown as RepairLeaseResult), { authorized: false, faults: false, cleaned: false }],
+    ['acquired without the authorization literal', (req) => Promise.resolve({ outcome: 'acquired', lease: { leaseId: `r-skew-${req.armIndex}`, armIndex: req.armIndex, expiresAt: 'x', state: 'live' }, requestAuthorized: false } as unknown as RepairLeaseResult), { authorized: false, faults: true, cleaned: true }],
     ['wrong arm', (req) => Promise.resolve({ outcome: 'acquired', lease: { leaseId: 'r-x', armIndex: req.armIndex + 5, expiresAt: 'x', state: 'live' }, requestAuthorized: true }), { authorized: false, faults: true, cleaned: true }],
     ['not live', (req) => Promise.resolve({ outcome: 'acquired', lease: { leaseId: 'r-y', armIndex: req.armIndex, expiresAt: 'x', state: 'expired' }, requestAuthorized: true }), { authorized: false, faults: true, cleaned: true }],
     ['aliases an initial lease', (req) => Promise.resolve({ outcome: 'acquired', lease: { leaseId: 'lease-0', armIndex: req.armIndex, expiresAt: 'x', state: 'live' }, requestAuthorized: true }), { authorized: false, faults: true, cleaned: true }],
@@ -423,17 +425,24 @@ test('unknown arms, repeated releases and unacquired repairs are lifecycle fault
 });
 
 test('two concurrent fires never touch each other lease identities', async () => {
-  const a = await authorize((s) => validAdapters(s, s.booted.cohortId).map);
-  const b = await authorize((s) => validAdapters(s, s.booted.cohortId).map);
+  // DISTINCT lease ids per fire: with identical ids, a shared (module-global) arm map would
+  // resolve one fire's arm to the other's lease object and still look correct.
+  const a = await authorize((s) => validAdapters(s, s.booted.cohortId).map, 'A-');
+  const b = await authorize((s) => validAdapters(s, s.booted.cohortId).map, 'B-');
   const lifeA = createAttemptLifecycle(a.dispatch);
   const lifeB = createAttemptLifecycle(b.dispatch);
   await lifeA.releaseInitial(0);
   await lifeB.releaseInitial(1);
   assert.deepEqual(releaseIds(a.store), [a.dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId]);
   assert.deepEqual(releaseIds(b.store), [b.dispatch.permit.initialLeases.find((l) => l.armIndex === 1)!.leaseId]);
-  // A's release did not appear in B's store and vice versa.
+  // A's release did not appear in B's store and vice versa …
   assert.equal(a.store.calls.length, 1);
   assert.equal(b.store.calls.length, 1);
+  // … and neither fire released an id belonging to the other's lease set.
+  const aIds = new Set(a.dispatch.permit.initialLeases.map((l) => l.leaseId));
+  const bIds = new Set(b.dispatch.permit.initialLeases.map((l) => l.leaseId));
+  assert.ok(releaseIds(b.store).every((id) => !aIds.has(id)), "B released one of A's leases");
+  assert.ok(releaseIds(a.store).every((id) => !bIds.has(id)), "A released one of B's leases");
 });
 
 test('a refused or throwing release is a lifecycle fault', async () => {
@@ -565,4 +574,173 @@ test('a cutoff that passes while the repair slot is acquired sends no repair and
   assert.equal(arm0.outcome, 'cutoff_missed');
   assert.equal(scripts[0]!.calls, 1, 'the repair request was never sent');
   assert.ok(releaseIds(store).includes('repair-0-1'), 'the acquired slot was released');
+});
+
+// ===========================================================================
+// The complete ORDERED lifecycle log — a count alone cannot see a double-held slot
+// ===========================================================================
+
+/** This fire's ordered lifecycle operations for ONE arm (siblings are filtered out, so
+ *  concurrent arms cannot make the sequence nondeterministic). */
+function armLog(store: ScriptedStore, initialLeaseId: string, armIndex: number): string[] {
+  return store.calls
+    .filter((c) =>
+      c.op === 'release'
+        ? c.leaseId === initialLeaseId || c.leaseId === `repair-${armIndex}-1`
+        : c.req.armIndex === armIndex,
+    )
+    .map((c) =>
+      c.op === 'repair' ? 'acquireRepair' : c.leaseId === initialLeaseId ? 'releaseInitial' : 'releaseRepair',
+    );
+}
+
+/** A roster whose arm 0 answers invalidly first (so it repairs) and validly on retry. */
+function repairingAdapters(s: PreparedFireSnapshot, cohortId: string): Map<string, ProviderAdapter> {
+  const map = new Map<string, ProviderAdapter>();
+  s.expectedArmIdentities.forEach((id, i) => {
+    const script = scriptedAdapter(id, (call) =>
+      i === 0 && call === 1
+        ? wrongEcho(validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256))
+        : validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256),
+    );
+    map.set(id.participantId, script.adapter);
+  });
+  return map;
+}
+
+test('an authorized repair drives releaseInitial then acquireRepair then releaseRepair, never holding both', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  const { dispatch, store } = await authorize((s) => repairingAdapters(s, cohortId));
+  await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId));
+  const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
+  // The initial slot is freed BEFORE the repair slot is taken: the two are never held at once.
+  assert.deepEqual(armLog(store, arm0Lease, 0), ['releaseInitial', 'acquireRepair', 'releaseRepair']);
+});
+
+test('a denied repair ends the arm log at the acquire — nothing is released for a slot never taken', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  const { dispatch, store } = await authorize((s) => repairingAdapters(s, cohortId));
+  store.onRepair = () => Promise.resolve({ outcome: 'refused', reason: 'concurrency', requestAuthorized: false });
+  await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId));
+  const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
+  assert.deepEqual(armLog(store, arm0Lease, 0), ['releaseInitial', 'acquireRepair']);
+});
+
+// ===========================================================================
+// All-settled containment: one arm's fault must not let the run return early
+// ===========================================================================
+
+test('a lifecycle fault in one arm waits for every sibling to settle and release', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  let openGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    openGate = resolve;
+  });
+  let slowFinished = false;
+  const { dispatch, store } = await authorize((s) => {
+    const map = new Map<string, ProviderAdapter>();
+    s.expectedArmIdentities.forEach((id, i) => {
+      const script = scriptedAdapter(id, async () => {
+        if (i === 1) {
+          await gate; // arm 1 is held in flight
+          slowFinished = true;
+        }
+        return validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256);
+      });
+      map.set(id.participantId, script.adapter);
+    });
+    return map;
+  });
+  // Arm 0's initial release fails — a lifecycle fault raised while arm 1 is still in flight.
+  const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
+  const arm1Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 1)!.leaseId;
+  store.onRelease = (req): Promise<ReleaseResult> =>
+    req.leaseId === arm0Lease
+      ? Promise.resolve({ outcome: 'refused', reason: 'not_owner' })
+      : Promise.resolve({ outcome: 'released' });
+
+  let settled = false;
+  const run = runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId)).then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  // Give the fault every chance to propagate early.
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(settled, false, 'the run must not settle while a sibling request is still in flight');
+  assert.equal(slowFinished, false);
+
+  openGate();
+  await run;
+  assert.equal(settled, true);
+  assert.equal(slowFinished, true, 'the slow sibling ran to completion');
+  assert.ok(releaseIds(store).includes(arm1Lease), 'the sibling released its own slot');
+});
+
+// ===========================================================================
+// The initial-release exit matrix
+// ===========================================================================
+
+test('every no-repair exit releases the arm initial lease exactly once', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  const exits: Array<[string, (id: { participantId: string; provider: string; requestedModelId: string }) => ProviderAdapter]> = [
+    [
+      'hasCredential throws',
+      (id) => ({
+        ...scriptedAdapter(id, () => '').adapter,
+        hasCredential: (): boolean => {
+          throw new Error('credential probe blew up');
+        },
+      }),
+    ],
+    ['provider timeout', (id) => scriptedAdapter(id, () => Promise.reject(new ProviderTimeoutError(id.provider as ProviderName, 1))).adapter],
+    ['rate limited', (id) => scriptedAdapter(id, () => Promise.reject(new ProviderHttpError(id.provider as ProviderName, 429, 'rate limited'))).adapter],
+    ['generic provider throw', (id) => scriptedAdapter(id, () => Promise.reject(new Error('provider exploded'))).adapter],
+    ['unparseable body', (id) => scriptedAdapter(id, () => 'not json at all').adapter],
+  ];
+  for (const [label, build] of exits) {
+    const { dispatch, store } = await authorize((s) => {
+      const map = new Map<string, ProviderAdapter>();
+      s.expectedArmIdentities.forEach((id, i) => {
+        map.set(
+          id.participantId,
+          i === 0
+            ? build(id)
+            : scriptedAdapter(id, () => validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256)).adapter,
+        );
+      });
+      return map;
+    });
+    const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
+    // A throwing hasCredential propagates as an arm failure; the rest resolve to outcomes.
+    await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId)).catch(() => undefined);
+    assert.deepEqual(
+      releaseIds(store).filter((id) => id === arm0Lease),
+      [arm0Lease],
+      `${label}: exactly one release of the arm's initial lease`,
+    );
+  }
+});
+
+test('a pre-launch cleanup failure is reported with the preflight cause and the held leases', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  const { dispatch, store } = await authorize((s) => validAdapters(s, cohortId).map);
+  store.onRelease = () => Promise.resolve({ outcome: 'refused', reason: 'not_owner' });
+  // A cohort that disagrees with the permit fails preflight; every release then refuses.
+  await assert.rejects(
+    () => runAuthorizedDispatch(dispatch, options(() => NOW_MS, 'a-different-cohort')),
+    (error) => {
+      assert.ok(error instanceof PreDispatchCleanupError, 'the cleanup failure must not be swallowed');
+      assert.ok(/does not equal the authorized cohort/.test(error.primary.message), 'the preflight cause is retained');
+      assert.deepEqual(
+        error.failures.map((f) => f.leaseId).sort(),
+        dispatch.permit.initialLeases.map((l) => l.leaseId).sort(),
+        'every still-held lease is named',
+      );
+      return true;
+    },
+  );
 });
