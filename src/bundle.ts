@@ -1,6 +1,7 @@
 import { canonicalize, sha256Hex } from './canonical.js';
 import { deepFreeze } from './freeze.js';
 import { americanToDecimal } from './odds.js';
+import { buildGameRequest } from './scopedRequest.js';
 import { easternCalendarDay } from './slateDate.js';
 import { SMOKE_LABEL } from './types.js';
 import type {
@@ -346,24 +347,9 @@ export function buildBundle(
   // earliest-starting game is always dispatched first, with the stable
   // game-ID tie-breaker. Game IDs are opaque UUIDs and carry no time order.
   const requests: GameRequest[] = eligible
-    .map((game) => {
-      const requestBundle: SlateBundle = {
-        schemaVersion: 1,
-        label: SMOKE_LABEL,
-        league: 'mlb',
-        slateDate,
-        bundleTimestamp: inputs.fetchCompletedAt,
-        cutoffAt: game.scheduledStartUtc,
-        games: [game],
-      };
-      return {
-        gameId: game.gameId,
-        slug: slugs.get(game.gameId) ?? game.gameId,
-        game,
-        requestBundle,
-        requestSha256: sha256Hex(canonicalize(requestBundle)),
-      };
-    })
+    .map((game) =>
+      buildGameRequest(game, slugs.get(game.gameId) ?? game.gameId, slateDate, inputs.fetchCompletedAt),
+    )
     .sort((a, b) => {
       const timeDiff =
         Date.parse(a.game.scheduledStartUtc) - Date.parse(b.game.scheduledStartUtc);

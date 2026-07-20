@@ -18,8 +18,11 @@ import type { ArmGameResult, ArmOutcome, AttemptRecord, BenchmarkResponse, Marke
  */
 
 /** Canonical market order (SPEC §3): moneyline < spread < total. Exported so the
- *  producer slice orders its scoped market set / evidence by the SAME order. */
-export const MARKET_ORDINAL: Readonly<Record<MarketKey, number>> = { moneyline: 0, spread: 1, total: 2 };
+ *  producer slice orders its scoped market set / evidence by the SAME order. It is
+ *  RUNTIME-FROZEN (not merely `readonly`, which is compile-time only): the fire-id
+ *  derivation sorts through it, so a mutable ordinal would let ambient mutation
+ *  change a fire identity for the same input — the value must be an immutable owner. */
+export const MARKET_ORDINAL: Readonly<Record<MarketKey, number>> = Object.freeze({ moneyline: 0, spread: 1, total: 2 });
 
 const armOutcomeSchemaV1 = z.enum([
   'valid',
