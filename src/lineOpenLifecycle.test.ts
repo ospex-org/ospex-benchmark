@@ -782,6 +782,63 @@ test('a clock that throws at the post-acquire recheck still frees the acquired r
   assert.equal(scripts[0]!.calls, 1, 'no repair request was sent');
 });
 
+/** A roster where ONLY arm 0 holds a credential, so it is the sole reader of the injected
+ *  clock — the siblings return before the first clock read. Arm 0 answers invalidly first, so
+ *  it repairs. */
+function soloClockReaderAdapters(s: PreparedFireSnapshot, cohortId: string): Map<string, ProviderAdapter> {
+  const map = new Map<string, ProviderAdapter>();
+  s.expectedArmIdentities.forEach((id, i) => {
+    const script = scriptedAdapter(
+      id,
+      (call) =>
+        call === 1
+          ? wrongEcho(validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256))
+          : validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256),
+      { hasCredential: i === 0 },
+    );
+    map.set(id.participantId, script.adapter);
+  });
+  return map;
+}
+
+test('a clock throw whose repair-slot cleanup ALSO fails reports both causes', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  const { dispatch, store } = await authorize((s) => soloClockReaderAdapters(s, cohortId));
+  let acquired = false;
+  const acquire = store.onRepair;
+  store.onRepair = (req): Promise<RepairLeaseResult> => {
+    acquired = true;
+    return acquire(req);
+  };
+  // The clock throws at the post-acquire recheck AND the slot refuses to come back. Freeing the
+  // slot must not annihilate the cause that actually broke the attempt: a `finally` whose own
+  // release throws would replace it, leaving an operator chasing the store while the real fault
+  // is a broken clock that will keep killing every later fire.
+  store.onRelease = (req): Promise<ReleaseResult> =>
+    req.leaseId === 'repair-0-1'
+      ? Promise.resolve({ outcome: 'refused', reason: 'not_owner' })
+      : Promise.resolve({ outcome: 'released' });
+  const nowMs = (): number => {
+    if (acquired) throw new Error('post-acquire clock exploded');
+    return NOW_MS;
+  };
+
+  const fault = await faultOf(dispatch, options(nowMs, cohortId));
+  assert.ok(fault instanceof AuthorizedDispatchFaultError, 'the arm failure is reported');
+  const composite = fault.failures.find((f): f is AttemptCleanupFaultError => f instanceof AttemptCleanupFaultError);
+  assert.ok(composite, 'a failing repair release must not replace the failure already propagating');
+  assert.ok(
+    composite.primary instanceof Error && /post-acquire clock exploded/.test(composite.primary.message),
+    'the clock cause is retained',
+  );
+  assert.ok(composite.cleanup instanceof LifecycleFaultError, 'the repair cleanup fault is retained');
+  assert.deepEqual(
+    releaseIds(store).filter((id) => id === 'repair-0-1'),
+    ['repair-0-1'],
+    'the slot was handed back exactly once, never retried',
+  );
+});
+
 test('a pre-call failure whose lease cleanup ALSO fails reports both causes', async () => {
   const cohortId = sealedSnapshot().booted.cohortId;
   const { dispatch, store } = await authorize((s) => {
@@ -810,7 +867,7 @@ test('a pre-call failure whose lease cleanup ALSO fails reports both causes', as
       : Promise.resolve({ outcome: 'released' });
 
   const fault = await faultOf(dispatch, options(() => NOW_MS, cohortId));
-  assert.ok(fault instanceof AuthorizedDispatchFaultError);
+  assert.ok(fault instanceof AuthorizedDispatchFaultError, 'the arm failure is reported');
   const composite = fault.failures.find((f): f is AttemptCleanupFaultError => f instanceof AttemptCleanupFaultError);
   assert.ok(composite, 'the cleanup fault must not be discarded in favour of the primary');
   assert.ok(
@@ -847,7 +904,7 @@ test('a partly-failing pre-launch cleanup exposes the COMPLETE attempt log, fail
   await assert.rejects(
     () => runAuthorizedDispatch(dispatch, options(() => NOW_MS, 'a-different-cohort')),
     (error) => {
-      assert.ok(error instanceof PreDispatchCleanupError);
+      assert.ok(error instanceof PreDispatchCleanupError, 'the cleanup failure is reported');
       assert.deepEqual(error.attempts.map((a) => a.leaseId), ids, 'every lease was attempted, in permit order');
       assert.deepEqual(
         error.attempts.map((a) => a.result),

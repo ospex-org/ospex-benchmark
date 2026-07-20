@@ -621,9 +621,23 @@ async function dispatchArmCore(
       ]);
     }
     return await sendRepair(remainingForRepair);
+  } catch (error) {
+    // Free the slot while a failure is already propagating — and COMPOSE, never replace. A bare
+    // `finally` whose release throws would annihilate the cause that actually broke the attempt
+    // (the clock read above sits inside this scope precisely so its throw cannot leak the slot),
+    // which is the same defect the initial-lease backstop composes away.
+    if (repairLeaseHeld && lifecycle !== null) {
+      repairLeaseHeld = false;
+      try {
+        await lifecycle.releaseRepair(armIndex, repairOrdinal);
+      } catch (fault) {
+        throw new AttemptCleanupFaultError(error, fault);
+      }
+    }
+    throw error;
   } finally {
-    // Free the repair slot on every exit — response, timeout, transport failure, validation
-    // throw, or acceptance.
+    // Free the repair slot on every NON-throwing exit — response, cutoff return, transport
+    // outcome, or acceptance. (A throwing exit released above and cleared the flag.)
     if (repairLeaseHeld && lifecycle !== null) await lifecycle.releaseRepair(armIndex, repairOrdinal);
   }
 
