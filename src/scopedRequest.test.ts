@@ -59,10 +59,16 @@ function twoGameInputs(): SlateInputs {
 
 test('buildBundle delegates every per-game request to the shared buildGameRequest (byte-identical)', () => {
   const inputs = twoGameInputs();
+  // Pin the expected slug from the ORIGINAL games fixture, not from the produced
+  // request — otherwise a wrong-slug helper call would self-feed the mutated output
+  // and stay green. This also asserts buildBundle emits the fixture slug.
+  const expectedSlug = new Map(inputs.gamesRows.map((g) => [g.gameId, g.slug]));
   const build = buildBundle(inputs, SLATE_DATE, { requireFuture: false });
   assert.equal(build.requests.length, 2);
   for (const req of build.requests) {
-    const viaHelper = buildGameRequest(req.game, req.slug, SLATE_DATE, inputs.fetchCompletedAt);
+    const slug = expectedSlug.get(req.gameId)!;
+    assert.equal(req.slug, slug);
+    const viaHelper = buildGameRequest(req.game, slug, SLATE_DATE, inputs.fetchCompletedAt);
     // Whole-request canonical equality — not just the hash — so a drift in any field
     // (bundle timestamp, cutoff, slug, game bytes) is caught.
     assert.equal(canonicalize(viaHelper), canonicalize(req));

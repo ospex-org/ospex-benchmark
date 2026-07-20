@@ -180,12 +180,19 @@ export function deriveFireId(input: {
   detectedAt: string;
   preparedSnapshotDigest: string;
 }): string {
+  // The proposed market set is runtime-validated HERE, at the exported identity
+  // owner (through the SAME single validator `sealPreparedFire` uses), so a direct
+  // caller cannot derive an id from an empty / duplicate / unknown-market scope. The
+  // sort runs through the runtime-frozen `MARKET_ORDINAL`, so the id is stable
+  // against ambient registry mutation.
+  const { canonical, violations } = checkProposedMarkets(input.proposedMarkets);
+  if (violations.length > 0) throw new PreparedFireError(violations);
   return sha256Hex(
     canonicalize({
       domain: FIRE_ID_DOMAIN,
       cohortId: input.cohortId,
       gameId: input.gameId,
-      proposedMarkets: canonicalMarkets(input.proposedMarkets),
+      proposedMarkets: canonical,
       detectedAt: input.detectedAt,
       preparedSnapshotDigest: input.preparedSnapshotDigest,
     }),
@@ -281,12 +288,18 @@ function marketsEqual(a: readonly MarketKey[], b: readonly MarketKey[]): boolean
   return sa.length === sb.length && sa.every((m, i) => m === sb[i]);
 }
 
-/** Validate the proposed scope (nonempty, unique, known keys) and return it in
- *  canonical order; a violation is accumulated and the valid unique subset returned. */
-function canonicalizeProposedMarkets(markets: readonly MarketKey[], violations: string[]): MarketKey[] {
+/**
+ * Validate the proposed scope (nonempty, unique, known keys) and return it in
+ * canonical order together with any violations. The ONE runtime rule with a single
+ * source of truth: the exported `deriveFireId` calls this and THROWS on any
+ * violation, while `sealPreparedFire` calls it and ACCUMULATES — so the identity
+ * owner and the sealer can never diverge on which market scopes are admissible.
+ */
+function checkProposedMarkets(markets: readonly MarketKey[]): { canonical: MarketKey[]; violations: string[] } {
+  const violations: string[] = [];
   if (!Array.isArray(markets) || markets.length === 0) {
     violations.push('proposedMarkets must be a nonempty array');
-    return [];
+    return { canonical: [], violations };
   }
   const known = new Set<MarketKey>(KNOWN_MARKETS);
   const seen = new Set<MarketKey>();
@@ -295,12 +308,21 @@ function canonicalizeProposedMarkets(markets: readonly MarketKey[], violations: 
     else if (seen.has(m)) violations.push(`duplicate proposed market: ${m}`);
     else seen.add(m);
   }
-  return canonicalMarkets([...seen]);
+  return { canonical: canonicalMarkets([...seen]), violations };
 }
 
 // ---------------------------------------------------------------------------
 // The seal
 // ---------------------------------------------------------------------------
+
+/** One per-market entry captured (materialized) exactly once from the caller: plain,
+ *  detached data that validation, the digest, and the returned snapshot all share. */
+interface CapturedMarketEvidence {
+  candidateInput: CandidateInput;
+  verdict: CandidateVerdict;
+  historyRows: TwoSidedHistoryRow[];
+  historyWatermark: number | null;
+}
 
 /**
  * Seal one prepared fire. Synchronous and fail-closed: it authenticates the trust
@@ -310,25 +332,40 @@ function canonicalizeProposedMarkets(markets: readonly MarketKey[], violations: 
  * authenticated `PreparedFireSnapshot`.
  */
 export function sealPreparedFire(input: SealPreparedFireInput): PreparedFireSnapshot {
-  // (1) Authenticate the trust roots by unforgeable origin brand before reading any
-  //     authority field: a forged / structurally-copied booted cohort or publication
-  //     is rejected, and the publication must have been verified for THIS cohort.
-  assertBootedCohort(input.booted);
-  assertPublicationVerified(input.publication);
-  if (input.publication.cohortId !== input.booted.cohortId) {
+  // Capture EVERY caller-owned property exactly once into a local. A property accessor
+  // can return a different value on each read, so authenticating or validating one read
+  // and then re-reading the caller property for the digest or the returned snapshot
+  // would let a swapping getter substitute an unauthenticated authority, invalid timing,
+  // or wrong evidence into a branded snapshot. Every step below operates on these
+  // locals; `input.*` and caller entry fields are never re-read.
+  const booted = input.booted;
+  const publication = input.publication;
+  const detectedAt = input.detectedAt;
+  const bundleBuiltAt = input.bundleBuiltAt;
+  const game = input.game;
+  const slug = input.slug;
+  const slateDate = input.slateDate;
+  const bundleTimestamp = input.bundleTimestamp;
+  const proposedMarketsRaw = input.proposedMarkets;
+  const perMarketRaw = input.perMarket;
+
+  // (1) Authenticate the captured trust roots by unforgeable origin brand. Once these
+  //     pass, each is a genuine, deep-frozen owner output, so its later field reads are
+  //     stable; the publication must have been verified for THIS cohort.
+  assertBootedCohort(booted);
+  assertPublicationVerified(publication);
+  if (publication.cohortId !== booted.cohortId) {
     throw new PreparedFireError([
-      `publication was verified for cohort ${input.publication.cohortId}, not this cohort ${input.booted.cohortId}`,
+      `publication was verified for cohort ${publication.cohortId}, not this cohort ${booted.cohortId}`,
     ]);
   }
-  const cohortId = input.booted.cohortId;
+  const cohortId = booted.cohortId;
 
   // (2) Build + authenticate the exact request through the existing owner exactly
   //     once (never a second hash owner): buildGameRequest wraps the frozen game,
   //     prepareGameRequest strict-validates, derives the hashes, deep-freezes, and
   //     brands. A malformed request is its own typed rejection (PreparedRequestError).
-  const prepared = prepareGameRequest(
-    buildGameRequest(input.game, input.slug, input.slateDate, input.bundleTimestamp),
-  );
+  const prepared = prepareGameRequest(buildGameRequest(game, slug, slateDate, bundleTimestamp));
   const gameId = prepared.gameId;
 
   const violations: string[] = [];
@@ -336,16 +373,17 @@ export function sealPreparedFire(input: SealPreparedFireInput): PreparedFireSnap
   // (3) Fire timing: offset-qualified instants (the prepared-request owner stays
   //     authoritative for request/quote timing; these are the detection/projection
   //     instants this snapshot introduces).
-  if (!isParseableInstant(input.detectedAt)) {
-    violations.push(`detectedAt "${input.detectedAt}" is not an offset-qualified instant`);
+  if (!isParseableInstant(detectedAt)) {
+    violations.push(`detectedAt "${detectedAt}" is not an offset-qualified instant`);
   }
-  if (!isParseableInstant(input.bundleBuiltAt)) {
-    violations.push(`bundleBuiltAt "${input.bundleBuiltAt}" is not an offset-qualified instant`);
+  if (!isParseableInstant(bundleBuiltAt)) {
+    violations.push(`bundleBuiltAt "${bundleBuiltAt}" is not an offset-qualified instant`);
   }
 
   // (4) Proposed scope: a nonempty unique subset of the known market keys, stored in
   //     canonical order, and EQUAL to the request's actual present-market scope.
-  const proposed = canonicalizeProposedMarkets(input.proposedMarkets, violations);
+  const { canonical: proposed, violations: scopeViolations } = checkProposedMarkets(proposedMarketsRaw);
+  violations.push(...scopeViolations);
   const scope = requestScope(prepared.game);
   if (proposed.length > 0 && !marketsEqual(proposed, scope)) {
     violations.push(`proposed markets [${proposed.join(',')}] != request scope [${scope.join(',')}]`);
@@ -356,9 +394,20 @@ export function sealPreparedFire(input: SealPreparedFireInput): PreparedFireSnap
   //     re-derivation; every candidate carries the one detection instant; the history
   //     rows and watermark bind to the same (gameId, market). Evidence is detached
   //     (cloned) and re-derived, never aliased to a caller object.
+  // Materialize each per-market entry's evidence ONCE: structuredClone reads the outer
+  // collection, each entry, and each entry field a single time and yields plain,
+  // detached data. Validation, the digest, and the returned snapshot then all bind the
+  // SAME captured value, so a swapping getter cannot substitute post-check evidence.
+  const capturedPerMarket: CapturedMarketEvidence[] = Array.from(perMarketRaw, (entry) => ({
+    candidateInput: structuredClone(entry.candidateInput),
+    verdict: structuredClone(entry.verdict),
+    historyRows: structuredClone([...entry.historyRows]),
+    historyWatermark: entry.historyWatermark,
+  }));
+
   const proposedSet = new Set<MarketKey>(proposed);
-  const byMarket = new Map<MarketKey, PreparedMarketEvidenceInput>();
-  for (const entry of input.perMarket) {
+  const byMarket = new Map<MarketKey, CapturedMarketEvidence>();
+  for (const entry of capturedPerMarket) {
     const m = entry.candidateInput.market;
     if (!proposedSet.has(m)) {
       violations.push(`per-market evidence market "${m}" is not a proposed market`);
@@ -378,18 +427,17 @@ export function sealPreparedFire(input: SealPreparedFireInput): PreparedFireSnap
   for (const m of proposed) {
     const entry = byMarket.get(m);
     if (entry === undefined) continue; // missing — already flagged
-    // Detach the candidate before re-derivation so the verdict, the stored input, and
-    // the digest all bind the sealed copy — never a caller object mutable after seal.
-    const candidateInput = structuredClone(entry.candidateInput);
+    // Every check + the retained value use the SAME captured clone (never a re-read).
+    const candidateInput = entry.candidateInput;
     if (candidateInput.gameId !== gameId) {
       violations.push(`candidate gameId ${candidateInput.gameId} != fire gameId ${gameId} (market ${m})`);
     }
     if (candidateInput.market !== m) {
       violations.push(`candidate market ${candidateInput.market} != evidence market ${m}`);
     }
-    if (candidateInput.detectedAt !== input.detectedAt) {
+    if (candidateInput.detectedAt !== detectedAt) {
       violations.push(
-        `candidate (${gameId}, ${m}) detectedAt ${candidateInput.detectedAt} != fire detectedAt ${input.detectedAt}`,
+        `candidate (${gameId}, ${m}) detectedAt ${candidateInput.detectedAt} != fire detectedAt ${detectedAt}`,
       );
     }
     for (const row of entry.historyRows) {
@@ -403,7 +451,7 @@ export function sealPreparedFire(input: SealPreparedFireInput): PreparedFireSnap
     ) {
       violations.push(`history watermark for (${gameId}, ${m}) must be null or a nonnegative safe integer`);
     }
-    // Re-derive the verdict from the detached candidate and require the recorded one to
+    // Re-derive the verdict from the captured candidate and require the recorded one to
     // equal it canonically — the exact detection the fire was prepared under. A caller/
     // evidence-integrity bug throws out of evaluateCandidate; that is a rejection here.
     let reVerdict: CandidateVerdict;
@@ -419,22 +467,21 @@ export function sealPreparedFire(input: SealPreparedFireInput): PreparedFireSnap
       violations.push(`recorded verdict for (${gameId}, ${m}) does not match its re-derivation`);
       continue;
     }
-    // Detached clones — NOT frozen here on purpose: the whole snapshot is recursively
-    // deep-frozen at return (step 8), so that recursion is the single load-bearing
-    // immutability lock over this nested evidence (a shallow freeze would leave it
-    // mutable). Detachment comes from the clone; immutability from the recursive freeze.
+    // The captured clones are retained as-is (already detached); the whole snapshot is
+    // recursively deep-frozen at return (step 8) — that recursion is the single
+    // load-bearing immutability lock over this nested evidence.
     sealedPerMarket.push({
       market: m,
       candidateInput,
       verdict: reVerdict, // detached + deep-frozen by evaluateCandidate
-      historyRows: structuredClone([...entry.historyRows]),
+      historyRows: entry.historyRows,
       historyWatermark: entry.historyWatermark,
     });
   }
 
   // (6) Expected roster identity — derived ONLY from the authenticated cohort manifest
   //     (never a second caller-supplied roster); each entry detached + deep-frozen.
-  const expectedArmIdentities = input.booted.manifest.expectedArmRoster.map(expectedArmIdentity);
+  const expectedArmIdentities = booted.manifest.expectedArmRoster.map(expectedArmIdentity);
 
   if (violations.length > 0) throw new PreparedFireError(violations);
 
@@ -443,11 +490,11 @@ export function sealPreparedFire(input: SealPreparedFireInput): PreparedFireSnap
   //     supply none of the three derived identities.
   const preparedSnapshotDigest = computePreparedSnapshotDigest({
     cohortId,
-    publication: input.publication,
+    publication,
     prepared,
     proposedMarkets: proposed,
-    detectedAt: input.detectedAt,
-    bundleBuiltAt: input.bundleBuiltAt,
+    detectedAt,
+    bundleBuiltAt,
     perMarket: sealedPerMarket,
     expectedArmIdentities,
   });
@@ -455,23 +502,23 @@ export function sealPreparedFire(input: SealPreparedFireInput): PreparedFireSnap
     cohortId,
     gameId,
     proposedMarkets: proposed,
-    detectedAt: input.detectedAt,
+    detectedAt,
     preparedSnapshotDigest,
   });
   const runId = deriveRunId(fireId);
 
   // (8) Assemble the detached, deeply immutable, runtime-authenticated snapshot. The
   //     already-branded + deep-frozen booted / publication / prepared values are
-  //     retained by identity; every other field is fresh, cloned, plain data.
+  //     retained by identity; every other field is a captured, cloned, plain value.
   const snapshot: PreparedFireSnapshot = deepFreeze({
     fireId,
     runId,
     preparedSnapshotDigest,
     prepared,
-    booted: input.booted,
-    publication: input.publication,
-    detectedAt: input.detectedAt,
-    bundleBuiltAt: input.bundleBuiltAt,
+    booted,
+    publication,
+    detectedAt,
+    bundleBuiltAt,
     proposedMarkets: proposed,
     perMarket: sealedPerMarket,
     expectedArmIdentities,

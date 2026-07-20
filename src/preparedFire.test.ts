@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
-import { cohortBoot } from './cohortBoot.js';
+import { assertBootedCohort, cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
-import { checkPublication } from './manifestPublication.js';
+import { MARKET_ORDINAL } from './fireArtifact.js';
+import { assertPublicationVerified, checkPublication } from './manifestPublication.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import {
   assertPreparedFireSnapshot,
@@ -12,8 +13,9 @@ import {
   PreparedFireError,
   sealPreparedFire,
 } from './preparedFire.js';
-import type { PreparedFireSnapshot, SealPreparedFireInput } from './preparedFire.js';
+import type { PreparedFireSnapshot, PreparedMarketEvidenceInput, SealPreparedFireInput } from './preparedFire.js';
 import { assertPrepared } from './preparedRequest.js';
+import { isParseableInstant } from './time.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 import type { BootedCohort } from './cohortBoot.js';
@@ -534,4 +536,151 @@ test('changing each digest field class changes the digest and the fire id', () =
   }));
   assert.notEqual(otherWatermark.preparedSnapshotDigest, base.preparedSnapshotDigest);
   assert.notEqual(otherWatermark.fireId, base.fireId);
+});
+
+// ===========================================================================
+// Identity-domain closure — the exported deriveFireId validates directly, and the
+// canonical-order owner is runtime-immutable so identity is stable.
+// ===========================================================================
+
+test('deriveFireId rejects an empty, duplicate, or unknown market set directly', () => {
+  assert.throws(() => deriveFireId({ ...FIRE_ID_ARGS, proposedMarkets: [] }), PreparedFireError);
+  assert.throws(() => deriveFireId({ ...FIRE_ID_ARGS, proposedMarkets: ['moneyline', 'moneyline'] }), PreparedFireError);
+  assert.throws(() => deriveFireId({ ...FIRE_ID_ARGS, proposedMarkets: ['bogus' as MarketKey] }), PreparedFireError);
+});
+
+test('the canonical market-order owner is runtime-frozen, so the fire id is stable against ambient mutation', () => {
+  assert.equal(Object.isFrozen(MARKET_ORDINAL), true);
+  const before = deriveFireId(FIRE_ID_ARGS);
+  const savedMoneyline = MARKET_ORDINAL.moneyline;
+  const savedTotal = MARKET_ORDINAL.total;
+  try {
+    // Tolerates throw (strict-mode frozen assignment) or silent rejection; the values
+    // must not change and the same identity input must still produce the same id.
+    attemptMutation(() => ((MARKET_ORDINAL as Record<string, number>).moneyline = 99));
+    attemptMutation(() => ((MARKET_ORDINAL as Record<string, number>).total = -5));
+    assert.equal(MARKET_ORDINAL.moneyline, 0);
+    assert.equal(MARKET_ORDINAL.total, 2);
+    assert.equal(deriveFireId(FIRE_ID_ARGS), before);
+  } finally {
+    // Restore defensively so a weakened-freeze negative-control run cannot pollute
+    // later tests (a no-op when the owner is genuinely frozen).
+    attemptMutation(() => {
+      (MARKET_ORDINAL as Record<string, number>).moneyline = savedMoneyline;
+      (MARKET_ORDINAL as Record<string, number>).total = savedTotal;
+    });
+  }
+});
+
+// ===========================================================================
+// Capture-once — a swapping getter cannot substitute a post-check value.
+// Each getter returns the genuine/valid value on the FIRST read and a forged/invalid
+// value thereafter; the seal must read it exactly once and retain the first value.
+// ===========================================================================
+
+/** Wrap `base` so property `key` returns `first` on the first access and `rest`
+ *  after, counting reads — a probe for the single-read (capture-once) invariant. */
+function swappingProp<T extends object>(
+  base: T,
+  key: keyof T & string,
+  first: unknown,
+  rest: unknown,
+): { value: T; counter: { reads: number } } {
+  const counter = { reads: 0 };
+  const value = { ...base } as T;
+  Object.defineProperty(value, key, {
+    get() {
+      counter.reads += 1;
+      return counter.reads === 1 ? first : rest;
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  return { value, counter };
+}
+
+test('capture-once: a swapping booted getter is read once and the authenticated cohort is retained', () => {
+  const json = manifestJson();
+  const booted = bootFrom(json);
+  const publication = publicationFor(json);
+  const forgedBooted = { cohortId: booted.cohortId, manifest: booted.manifest } as BootedCohort;
+  const { value: input, counter } = swappingProp(
+    sealInput(['moneyline', 'total'], { booted, publication }),
+    'booted',
+    booted,
+    forgedBooted,
+  );
+  const snap = sealPreparedFire(input);
+  assert.equal(counter.reads, 1);
+  assert.strictEqual(snap.booted, booted);
+  assert.doesNotThrow(() => assertBootedCohort(snap.booted));
+});
+
+test('capture-once: a swapping publication getter is read once and the verified publication is retained', () => {
+  const json = manifestJson();
+  const booted = bootFrom(json);
+  const publication = publicationFor(json);
+  const forgedPub = {
+    publication: publication.publication,
+    committerTimestamp: publication.committerTimestamp,
+    cohortId: publication.cohortId,
+  } as PublicationVerified;
+  const { value: input, counter } = swappingProp(
+    sealInput(['moneyline', 'total'], { booted, publication }),
+    'publication',
+    publication,
+    forgedPub,
+  );
+  const snap = sealPreparedFire(input);
+  assert.equal(counter.reads, 1);
+  assert.strictEqual(snap.publication, publication);
+  assert.doesNotThrow(() => assertPublicationVerified(snap.publication));
+});
+
+test('capture-once: a swapping detectedAt getter is read once and the validated instant is retained', () => {
+  const { value: input, counter } = swappingProp(sealInput(['moneyline', 'total']), 'detectedAt', DETECTED_AT, 'not-an-instant');
+  const snap = sealPreparedFire(input);
+  assert.equal(counter.reads, 1);
+  assert.equal(snap.detectedAt, DETECTED_AT);
+  assert.equal(isParseableInstant(snap.detectedAt), true);
+});
+
+test('capture-once: a swapping bundleBuiltAt getter is read once and the validated instant is retained', () => {
+  const { value: input, counter } = swappingProp(sealInput(['moneyline', 'total']), 'bundleBuiltAt', BUNDLE_BUILT_AT, 'not-an-instant');
+  const snap = sealPreparedFire(input);
+  assert.equal(counter.reads, 1);
+  assert.equal(snap.bundleBuiltAt, BUNDLE_BUILT_AT);
+  assert.equal(isParseableInstant(snap.bundleBuiltAt), true);
+});
+
+test('capture-once: a swapping per-market historyRows getter is read once and the correct-game rows are retained', () => {
+  const goodRows = [historyRow('total')];
+  const badRows = [historyRow('total', { jsonodds_id: '00000000-0000-4000-8000-0000000000f9' })];
+  const baseEntry: PreparedMarketEvidenceInput = {
+    candidateInput: candidateInput('total'),
+    verdict: evaluateCandidate(candidateInput('total')),
+    historyRows: [historyRow('total')], // placeholder; overridden by the swapping getter
+    historyWatermark: null,
+  };
+  const { value: entry, counter } = swappingProp(baseEntry, 'historyRows', goodRows, badRows);
+  const snap = sealPreparedFire(
+    sealInput(['total'], { proposedMarkets: ['total'], game: scopedGame(['total']), perMarket: [entry] }),
+  );
+  assert.equal(counter.reads, 1);
+  for (const row of snap.perMarket[0]!.historyRows) assert.equal(row.jsonodds_id, GAME_ID);
+});
+
+test('capture-once: a swapping per-market historyWatermark getter is read once and the validated value is retained', () => {
+  const baseEntry: PreparedMarketEvidenceInput = {
+    candidateInput: candidateInput('total'),
+    verdict: evaluateCandidate(candidateInput('total')),
+    historyRows: [historyRow('total')],
+    historyWatermark: null, // placeholder; overridden by the swapping getter
+  };
+  const { value: entry, counter } = swappingProp(baseEntry, 'historyWatermark', null, -1);
+  const snap = sealPreparedFire(
+    sealInput(['total'], { proposedMarkets: ['total'], game: scopedGame(['total']), perMarket: [entry] }),
+  );
+  assert.equal(counter.reads, 1);
+  assert.equal(snap.perMarket[0]!.historyWatermark, null);
 });
