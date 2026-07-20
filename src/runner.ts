@@ -746,17 +746,24 @@ function assertCompleteGrid(
  * failure is reported only after every sibling has finished and freed what it held.
  */
 async function settleAll(tasks: readonly Promise<ArmGameResult>[]): Promise<ArmGameResult[]> {
-  const settled = await Promise.allSettled(tasks);
-  const failures = settled.filter((s): s is PromiseRejectedResult => s.status === 'rejected');
-  if (failures.length > 0) {
-    const first = failures[0]!.reason;
-    if (failures.length === 1) throw first;
-    throw new AggregateError(
-      failures.map((f) => f.reason),
-      `${failures.length} arms failed during dispatch`,
-    );
-  }
-  return settled.map((s) => (s as PromiseFulfilledResult<ArmGameResult>).value);
+  // Capture the CHRONOLOGICALLY first rejection — the exact error `Promise.all` would have
+  // rejected with — while still awaiting every sibling. The change here is WHEN the caller is
+  // told (after every arm has settled and freed what it held), never WHAT it is told: neither
+  // a new aggregate nor the first-by-position failure would be the error a legacy caller saw.
+  const firstRejection: Array<{ reason: unknown }> = [];
+  const outcomes = await Promise.all(
+    tasks.map((task) =>
+      task.then(
+        (value) => ({ ok: true as const, value }),
+        (reason: unknown) => {
+          if (firstRejection.length === 0) firstRejection.push({ reason });
+          return { ok: false as const };
+        },
+      ),
+    ),
+  );
+  if (firstRejection.length > 0) throw firstRejection[0]!.reason;
+  return outcomes.map((o) => (o as { ok: true; value: ArmGameResult }).value);
 }
 
 export async function runSlate(

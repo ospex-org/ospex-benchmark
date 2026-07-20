@@ -367,6 +367,9 @@ test('a repair is authorized only by a fresh acquisition carrying a coherent liv
   const cases: Array<[string, ScriptedStore['onRepair'], { authorized: boolean; faults: boolean; cleaned: boolean }]> = [
     ['replayed', (req) => Promise.resolve({ outcome: 'replayed', lease: { leaseId: 'r', armIndex: req.armIndex, expiresAt: 'x', state: 'live' }, requestAuthorized: false }), { authorized: false, faults: false, cleaned: false }],
     ['refused', () => Promise.resolve({ outcome: 'refused', reason: 'concurrency', requestAuthorized: false }), { authorized: false, faults: false, cleaned: false }],
+    // A wire skew: the ACQUIRED outcome without the authorization literal. The outcome name
+    // alone must never authorize a paid request.
+    ['acquired without the authorization literal', (req) => Promise.resolve({ outcome: 'acquired', lease: { leaseId: `r-skew-${req.armIndex}`, armIndex: req.armIndex, expiresAt: 'x', state: 'live' }, requestAuthorized: false } as unknown as RepairLeaseResult), { authorized: false, faults: false, cleaned: false }],
     ['wrong arm', (req) => Promise.resolve({ outcome: 'acquired', lease: { leaseId: 'r-x', armIndex: req.armIndex + 5, expiresAt: 'x', state: 'live' }, requestAuthorized: true }), { authorized: false, faults: true, cleaned: true }],
     ['not live', (req) => Promise.resolve({ outcome: 'acquired', lease: { leaseId: 'r-y', armIndex: req.armIndex, expiresAt: 'x', state: 'expired' }, requestAuthorized: true }), { authorized: false, faults: true, cleaned: true }],
     ['aliases an initial lease', (req) => Promise.resolve({ outcome: 'acquired', lease: { leaseId: 'lease-0', armIndex: req.armIndex, expiresAt: 'x', state: 'live' }, requestAuthorized: true }), { authorized: false, faults: true, cleaned: true }],
