@@ -641,6 +641,30 @@ test('identical retry returns created:false and re-syncs the directory', async (
   assert.deepEqual(fs.log, ['mkdirp', 'openExclusive', 'write', 'fsync', 'close', 'link', 'readFile', 'syncDir', 'unlink']);
 });
 
+test('an EEXIST-coded fresh directory-sync failure propagates — it is not read as a collision', async () => {
+  // The install must classify reconciliation by the ERROR'S ORIGIN, not by its code: once the
+  // link has succeeded, a syncDir failure that merely happens to carry an EEXIST code is a
+  // durability failure of THIS call, never a pre-existing-path idempotent completion.
+  const artifact = await producedFire();
+  const fs = new FakeFs();
+  const syncErr = eexist(); // EEXIST-coded, but thrown by syncDir AFTER a successful link
+  fs.syncDirFailFirstOnly = syncErr;
+  const sink = new FireArtifactSink('/base', fs);
+
+  assert.throws(() => sink.install(artifact), (e) => e === syncErr); // the EXACT error
+  assert.equal(fs.log.filter((op) => op === 'syncDir').length, 1); // synced once, not twice
+  assert.ok(!fs.log.includes('readFile')); // never entered raw-byte reconciliation
+  assert.ok(fs.log.includes('unlink')); // cleanup still attempted
+
+  // The linked entry remains, so a later retry hits a GENUINE link EEXIST → re-sync → false.
+  const finalPath = expectedPath('/base', artifact);
+  assert.ok(fs.files.has(finalPath));
+  fs.log.length = 0;
+  const retry = sink.install(artifact);
+  assert.deepEqual(retry, { path: finalPath, created: false });
+  assert.ok(fs.log.includes('readFile') && fs.log.includes('syncDir'));
+});
+
 test('a fresh directory-sync failure is recoverable by the identical retry', async () => {
   const artifact = await producedFire();
   const fs = new FakeFs();

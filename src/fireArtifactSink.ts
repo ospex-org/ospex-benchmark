@@ -196,13 +196,28 @@ export class FireArtifactSink {
 
       // Atomic no-clobber install → directory fsync; a pre-existing final path is an
       // idempotent retry ONLY for exact raw-byte identity, else a fail-loud collision.
-      let result: { path: string; created: boolean };
+      //
+      // The catch below wraps ONLY `link`, so reconciliation is entered solely by an EEXIST
+      // that ORIGINATED THERE. Once the link has succeeded, this fire's durable entry exists
+      // and every later failure — including one that merely happens to carry an EEXIST code,
+      // e.g. from `syncDir` — must propagate as the primary error rather than be read as a
+      // pre-existing-path collision. (An origin-blind `code === 'EEXIST'` test over both calls
+      // would report a durably-unsynced install as an idempotent completion.)
+      let linkFoundExisting = false;
       try {
         this.fs.link(tmpPath, finalPath);
-        this.fs.syncDir(dir);
-        result = { path: finalPath, created: true };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        linkFoundExisting = true;
+      }
+
+      let result: { path: string; created: boolean };
+      if (!linkFoundExisting) {
+        // The link installed this call's bytes; a directory-sync failure fails the call (the
+        // entry may exist but is not durable — recoverable by the identical-byte retry below).
+        this.fs.syncDir(dir);
+        result = { path: finalPath, created: true };
+      } else {
         const existing = this.fs.readFile(finalPath);
         if (!existing.equals(buffer)) {
           throw new Error(`refusing to overwrite a byte-different fire artifact already installed at ${finalPath}`);
