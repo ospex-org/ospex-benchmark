@@ -215,13 +215,17 @@ function sealed(opts: SealOpts = {}): PreparedFireSnapshot {
   });
 }
 
-function leaseSet(count: number, prefix = ''): Lease[] {
-  return Array.from({ length: count }, (_, i) => ({
-    leaseId: `${prefix}lease-${i}`,
-    armIndex: i,
+function leasesFor(indexes: readonly number[], prefix = ''): Lease[] {
+  return indexes.map((armIndex) => ({
+    leaseId: `${prefix}lease-${armIndex}`,
+    armIndex,
     expiresAt: '2026-07-18T12:10:00.000Z',
     state: 'live' as const,
   }));
+}
+
+function leaseSet(count: number, prefix = ''): Lease[] {
+  return leasesFor(Array.from({ length: count }, (_, i) => i), prefix);
 }
 
 type StoreCall = { op: 'release'; leaseId: string; ownerId: string } | { op: 'repair'; req: AcquireRepairLeaseRequest };
@@ -242,6 +246,11 @@ class ScriptedStore implements AtomicStore {
   admitMarkets?: readonly MarketKey[];
   /** When set, reverse the claimedKeys order the store returns (canonical-zipper test). */
   reverseKeys = false;
+  /** When set, the admitted initial leases carry THESE arm indexes (to mint a genuine but
+   *  non-bijective roster — `authorizePreparedDispatch` would refuse it, but a direct
+   *  `StoreClaimPort.admit` mints a brand-genuine permit the reconcile roster dimension defends
+   *  against). */
+  badRoster?: readonly number[];
 
   constructor(private readonly rosterSize: number, private readonly leasePrefix = '') {}
 
@@ -257,7 +266,7 @@ class ScriptedStore implements AtomicStore {
       outcome: 'admitted',
       claimedKeys: ordered.map((market) => ({ gameId: req.gameId, market })),
       preparedBytesDigest: reservation.preparedBytesDigest,
-      initialLeases: leaseSet(this.rosterSize, this.leasePrefix),
+      initialLeases: this.badRoster ? leasesFor(this.badRoster, this.leasePrefix) : leaseSet(this.rosterSize, this.leasePrefix),
       dispatchAuthorized: true,
     });
   }
@@ -764,19 +773,29 @@ test('genuine pairs that disagree on a dimension raise a FireReconciliationError
   check(base.artifact, diffGame.permit, 'marketClaims');
   check(base.artifact, diffGame.permit, 'requestSha256');
 
-  // initialLeaseRoster is the eighth dimension. It CANNOT be made to disagree between two genuine
-  // values: cohortBoot pins the roster to the code arms and authorization forces every permit to
-  // carry a canonical [0,N) lease bijection, so every genuine artifact/permit pair shares a
-  // canonical roster. This positive control proves it is never spuriously flagged even by a
-  // maximally-different cross; the dimension is pinned load-bearing by the source gate (T10),
-  // exactly as permit-claim provenance is pinned there — a runtime negative is unconstructible.
+  // initialLeaseRoster, the eighth dimension. A permit minted DIRECTLY through the real
+  // StoreClaimPort with a non-bijective roster is brand-genuine (StoreClaimPort gates only on
+  // admitted+dispatchAuthorized and clones the leases verbatim; the [0,N) bijection check lives
+  // downstream in authorizePreparedDispatch). Crossing it with a good artifact from the SAME fire
+  // isolates the roster dimension — every other identity matches — which is precisely the case
+  // the roster dimension defends against (a store slipping a bad roster past its own count/index
+  // gate). authorizePreparedDispatch would refuse such a roster; reconcile, a direct unit call
+  // over genuine branded values, must still catch it.
+  const badRosterStore = new ScriptedStore(4);
+  badRosterStore.badRoster = [0, 1, 2, 4];
+  const rosterSnapshot = sealed();
+  const rosterMint = await new StoreClaimPort(badRosterStore).admit(buildFullScopeAdmitRequest(rosterSnapshot, ADMISSION));
+  assert.equal(rosterMint.kind, 'Authorized', 'the bad-roster permit is brand-genuine');
+  if (rosterMint.kind === 'Authorized') check(base.artifact, rosterMint.permit, 'initialLeaseRoster');
+
+  // Positive control: two genuine same-roster values never spuriously flag the dimension.
   for (const permit of [diffGame.permit, diffCohort.permit, diffScope.permit]) {
     try {
       reconcileArtifactToPermit(base.artifact, permit);
     } catch (error) {
       assert.ok(
         !(error as FireReconciliationError).dimensions.includes('initialLeaseRoster'),
-        'roster is never spuriously flagged for genuine values',
+        'roster is never spuriously flagged for a canonical-roster cross',
       );
     }
   }
@@ -884,17 +903,19 @@ test('the spine imports no runtime store/authority, calls no completion, and ord
   assert.ok(/import type \{[^}]*\} from '\.\/store\/contract\.js'/.test(src), 'store/contract is type-only');
   assert.ok(!/^import \{[^}]*\} from '\.\/store\//m.test(src), 'no runtime store import');
 
-  // Stage order inside runOneFire: dispatch precedes production, which precedes install.
+  // Stage order inside runOneFire: dispatch is the first fallible op after authorization — no S4
+  // work (context mapping, production, install) may run between Authorized and dispatch (§4/R5).
   const body = src.slice(src.indexOf('export async function runOneFire'));
+  assert.ok(body.indexOf('runAuthorizedDispatch(') < body.indexOf('const keyByMarket'), 'context mapping follows dispatch');
   assert.ok(body.indexOf('runAuthorizedDispatch(') < body.indexOf('buildFireArtifact('), 'dispatch precedes production');
   assert.ok(body.indexOf('buildFireArtifact(') < body.indexOf('installReconciledArtifact('), 'production precedes install');
   // Inside the wrapper, reconcile precedes install.
   const wrapper = src.slice(src.indexOf('export function installReconciledArtifact'), src.indexOf('export async function runOneFire'));
   assert.ok(wrapper.indexOf('reconcileArtifactToPermit(') < wrapper.indexOf('sink.install('), 'reconcile precedes install');
 
-  // Each reconciliation dimension is present and reported. The runtime negative for the roster
-  // dimension is unconstructible with genuine values (see the reconciliation-matrix test above), so — like the permit-provenance
-  // tooth — its presence is pinned here: dropping the dimension turns this red.
+  // Each reconciliation dimension is present and reported — defense in depth alongside the
+  // reconciliation-matrix test, which exercises every dimension (roster included) over genuine
+  // branded values.
   for (const dimension of ['cohortId', 'fireId', 'runId', 'gameId', 'scopedMarkets', 'marketClaims', 'requestSha256', 'initialLeaseRoster']) {
     assert.ok(src.includes(`failed.push('${dimension}')`), `reconcile computes and reports ${dimension}`);
   }
