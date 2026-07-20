@@ -263,8 +263,12 @@ function sameSequence(a: readonly MarketKey[], b: readonly MarketKey[]): boolean
   return a.length === b.length && a.every((m, i) => m === b[i]);
 }
 
-/** The canonical reservation key for a market set (the store's `ScopeKey` grammar). */
-function scopeKeyOf(markets: readonly MarketKey[]): ScopeKey {
+/**
+ * The canonical reservation key for a market set (the store's `ScopeKey` grammar). Exported so
+ * the composition spine keys its single full-scope reservation through the SAME canonical
+ * sort/join the gate uses, rather than duplicating the canonicalization.
+ */
+export function scopeKeyOf(markets: readonly MarketKey[]): ScopeKey {
   return canonicalMarkets(markets).join('+') as ScopeKey;
 }
 

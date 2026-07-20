@@ -1,0 +1,364 @@
+import { assertPreparedFireSnapshot, deriveRunId } from './preparedFire.js';
+import type { PreparedFireSnapshot } from './preparedFire.js';
+import { assertDispatchPermit } from './lineOpenClaim.js';
+import type { ClaimPort, DispatchPermit } from './lineOpenClaim.js';
+import { authorizePreparedDispatch, scopeKeyOf } from './lineOpenDispatch.js';
+import type { AuthorizePreparedDispatchResult } from './lineOpenDispatch.js';
+import { runAuthorizedDispatch } from './runner.js';
+import type { SlateRunOptions } from './runner.js';
+import { assertFireArtifact, buildFireArtifact } from './fireArtifactProducer.js';
+import type { FireArtifactV1, FireContext, MarketFireContextV1 } from './fireArtifactProducer.js';
+import { MARKET_ORDINAL } from './fireArtifact.js';
+import { FireArtifactSink } from './fireArtifactSink.js';
+import type { MarketKey, ProviderAdapter } from './types.js';
+import type { AdmitDispatchRequest, ClaimKey } from './store/contract.js';
+
+/**
+ * The composition spine (F5a S4): the single thin entry that runs ONE sealed fire end to end —
+ * admit, authorize, dispatch, produce, reconcile, install — and returns a typed outcome.
+ *
+ * Every stage it calls is already merged and already fail-closed by its own brand: this module
+ * mints no permit, plan, dispatch, artifact, or lease authority, and holds no store, provider, or
+ * filesystem of its own. Its only genuinely new logic is (a) DERIVING the full-scope admission
+ * request from the sealed snapshot, and (b) the permit↔artifact RECONCILIATION the durable sink
+ * reserves for "a later slice's thin authorized wrapper" — the check that the fire we admitted is
+ * the fire we are about to persist. The sink deliberately never sees a permit, and the producer
+ * never sees one either, so nothing else in the pipeline compares the admission's identity to the
+ * artifact's; this module is where those two independently-derived paths meet.
+ *
+ * S4 stays non-activating: nothing schedules `runOneFire`, no CLI/watcher/smoke calls it, and it
+ * touches no `--live` path. It settles no claim — completion is a later slice's owner.
+ */
+
+// ---------------------------------------------------------------------------
+// Public surface
+// ---------------------------------------------------------------------------
+
+/** The pricing/config inputs the caller supplies; everything else is derived from the snapshot. */
+export interface LineOpenAdmissionParameters {
+  readonly ownerId: string;
+  readonly expectedSchemaVersion: number;
+  readonly spendReservationUsdMicros: number;
+}
+
+/** Run options WITHOUT `cohortId`: the spine derives the cohort from the admitted permit, so a
+ *  caller can never point the runner at a cohort other than the one the store authorized. */
+export type LineOpenRunOptions = Omit<SlateRunOptions, 'cohortId'>;
+
+/** Exactly the sink capability the spine needs — the single `install` method, nothing else. */
+export type ArtifactInstaller = Pick<FireArtifactSink, 'install'>;
+export type ArtifactInstallResult = ReturnType<FireArtifactSink['install']>;
+
+/** The eight independently-derived dimensions on which a produced artifact must agree with the
+ *  admission permit, in the fixed order the error reports them. */
+export type FireReconciliationDimension =
+  | 'cohortId'
+  | 'fireId'
+  | 'runId'
+  | 'gameId'
+  | 'scopedMarkets'
+  | 'marketClaims'
+  | 'requestSha256'
+  | 'initialLeaseRoster';
+
+/** The fixed report order; also the order `reconcileArtifactToPermit` evaluates and lists. */
+const RECONCILIATION_ORDER: readonly FireReconciliationDimension[] = [
+  'cohortId',
+  'fireId',
+  'runId',
+  'gameId',
+  'scopedMarkets',
+  'marketClaims',
+  'requestSha256',
+  'initialLeaseRoster',
+];
+
+/**
+ * A produced artifact whose identity disagrees with the admission permit. Genuine branded values
+ * that fail to reconcile raise this; a forged/substituted artifact or permit instead fails its own
+ * brand assertion, which propagates unwrapped. The message is built ONLY from S4's own dimension
+ * labels — never a compared value — so a hostile field cannot destroy this typed error.
+ */
+export class FireReconciliationError extends Error {
+  readonly dimensions: readonly FireReconciliationDimension[];
+  constructor(dimensions: readonly FireReconciliationDimension[]) {
+    super(`fire artifact does not reconcile with the admission permit on: ${dimensions.join(', ')}`);
+    this.name = 'FireReconciliationError';
+    this.dimensions = Object.freeze([...dimensions]);
+  }
+}
+
+/** A non-authorizing admission is returned by identity; a successful fire returns its narrow
+ *  Installed result. No envelope, completion status, pricing actual, or raw model response. */
+export type LineOpenFireOutcome =
+  | Extract<AuthorizePreparedDispatchResult, { kind: 'NotAdmitted' }>
+  | {
+      readonly kind: 'Installed';
+      readonly permit: DispatchPermit;
+      readonly artifact: FireArtifactV1;
+      readonly install: ArtifactInstallResult;
+    };
+
+export interface RunOneFireInput {
+  readonly snapshot: PreparedFireSnapshot;
+  readonly adapters: ReadonlyMap<string, ProviderAdapter>;
+  readonly claimPort: ClaimPort;
+  readonly sink: ArtifactInstaller;
+  readonly runOptions: LineOpenRunOptions;
+  readonly admission: LineOpenAdmissionParameters;
+}
+
+// ---------------------------------------------------------------------------
+// The full-scope admission request (derived, never accepted)
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the admission request for the WHOLE proposed scope from the sealed snapshot. The
+ * snapshot is authenticated before any field is read, and every identity/scope/digest field comes
+ * from it — only the owner, schema version, and spend estimate are caller-supplied (pricing is a
+ * later slice's). The one reservation is keyed by the full-scope key: S4 is the full-scope fixture
+ * path, and the store refuses (post-admission, releasing every lease) any narrower retained scope.
+ */
+export function buildFullScopeAdmitRequest(
+  snapshot: PreparedFireSnapshot,
+  admission: LineOpenAdmissionParameters,
+): AdmitDispatchRequest {
+  assertPreparedFireSnapshot(snapshot);
+  // Capture the caller's admission fields exactly once.
+  const ownerId = admission.ownerId;
+  const expectedSchemaVersion = admission.expectedSchemaVersion;
+  const spendReservationUsdMicros = admission.spendReservationUsdMicros;
+  // Every remaining field is DERIVED from the authenticated snapshot.
+  const proposedMarkets = [...snapshot.proposedMarkets];
+  const scopeKey = scopeKeyOf(snapshot.proposedMarkets);
+  return {
+    cohortId: snapshot.booted.cohortId,
+    fireId: snapshot.fireId,
+    ownerId,
+    expectedSchemaVersion,
+    gameId: snapshot.prepared.gameId,
+    proposedMarkets,
+    scopeReservations: {
+      [scopeKey]: {
+        spendReservationUsdMicros,
+        preparedBytesDigest: snapshot.prepared.requestSha256,
+      },
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation
+// ---------------------------------------------------------------------------
+
+/**
+ * Fail closed unless the produced artifact reconciles with the admission permit on all eight
+ * dimensions. Both inputs are authenticated by their own brand BEFORE any field is read, so a
+ * forged artifact or permit fails its brand assertion (which propagates unwrapped) rather than
+ * reaching this comparison. Every compared property is captured once; the permit's claimed keys
+ * and lease indexes are canonicalized locally, never positionally zipped in raw store order; all
+ * eight dimensions are computed with no early exit; and a single `FireReconciliationError` lists
+ * every disagreeing dimension in the fixed order.
+ */
+export function reconcileArtifactToPermit(artifact: FireArtifactV1, permit: DispatchPermit): void {
+  assertFireArtifact(artifact);
+  assertDispatchPermit(permit);
+
+  // Capture every compared property/array exactly once.
+  const aCohortId = artifact.cohortId;
+  const aFireId = artifact.fireId;
+  const aRunId = artifact.runId;
+  const aGameId = artifact.gameId;
+  const aScopedMarkets = [...artifact.scopedMarkets];
+  const aClaims = artifact.marketEvidence.map((e) => e.claim);
+  const aRequestSha256 = artifact.requestSha256;
+  const aExpectedArmCount = artifact.expectedArmIdentities.length;
+
+  const pCohortId = permit.cohortId;
+  const pFireId = permit.fireId;
+  const pGameId = permit.gameId;
+  const pPreparedBytesDigest = permit.preparedBytesDigest;
+  const pClaimedKeys = [...permit.claimedKeys];
+  const pLeaseIndexes = permit.initialLeases.map((l) => l.armIndex);
+
+  // Canonicalize the permit's keys and lease indexes locally.
+  const canonicalKeys = [...pClaimedKeys].sort((a, b) => MARKET_ORDINAL[a.market] - MARKET_ORDINAL[b.market]);
+  const permitMarkets = canonicalKeys.map((k) => k.market);
+  const sortedLeaseIndexes = [...pLeaseIndexes].sort((a, b) => a - b);
+
+  // scopedMarkets: the artifact's scope equals the permit's canonical claimed-market sequence.
+  const scopedMarketsOk =
+    aScopedMarkets.length === permitMarkets.length && aScopedMarkets.every((m, i) => m === permitMarkets[i]);
+
+  // marketClaims: every artifact claim equals its canonical permit key (cohort/fire from the
+  // permit, game/market from the key), field by field, mapped by market — never positionally.
+  const aClaimByMarket = new Map<MarketKey, (typeof aClaims)[number]>(aClaims.map((c) => [c.market, c]));
+  let marketClaimsOk = aClaims.length === canonicalKeys.length;
+  for (const key of canonicalKeys) {
+    const claim = aClaimByMarket.get(key.market);
+    if (
+      claim === undefined ||
+      claim.cohortId !== pCohortId ||
+      claim.fireId !== pFireId ||
+      claim.gameId !== key.gameId ||
+      claim.market !== key.market
+    ) {
+      marketClaimsOk = false;
+    }
+  }
+
+  // initialLeaseRoster: sorted permit arm indexes are exactly 0..N-1 for N expected arms — this
+  // detects a missing, duplicated, or foreign index, and any cardinality mismatch.
+  let rosterOk = sortedLeaseIndexes.length === aExpectedArmCount;
+  for (let i = 0; i < sortedLeaseIndexes.length; i += 1) {
+    if (sortedLeaseIndexes[i] !== i) rosterOk = false;
+  }
+
+  const failed: FireReconciliationDimension[] = [];
+  if (aCohortId !== pCohortId) failed.push('cohortId');
+  if (aFireId !== pFireId) failed.push('fireId');
+  if (aRunId !== deriveRunId(pFireId)) failed.push('runId');
+  if (aGameId !== pGameId) failed.push('gameId');
+  if (!scopedMarketsOk) failed.push('scopedMarkets');
+  if (!marketClaimsOk) failed.push('marketClaims');
+  if (aRequestSha256 !== pPreparedBytesDigest) failed.push('requestSha256');
+  if (!rosterOk) failed.push('initialLeaseRoster');
+
+  if (failed.length > 0) {
+    // Report in the fixed order (the pushes above already follow it; this pin makes it explicit).
+    throw new FireReconciliationError(RECONCILIATION_ORDER.filter((d) => failed.includes(d)));
+  }
+}
+
+/**
+ * The thin authorized wrapper the durable sink reserved: reconcile, then install the EXACT artifact
+ * object. On reconciliation failure the sink is never called; on success the sink receives the same
+ * object by identity (no copy, spread, re-wrap, or reconstruction — the producer brand and the
+ * sink's parse both depend on it), a sink throw propagates unchanged, and a `{created:false}`
+ * idempotent result is returned as-is.
+ */
+export function installReconciledArtifact(
+  artifact: FireArtifactV1,
+  permit: DispatchPermit,
+  sink: ArtifactInstaller,
+): ArtifactInstallResult {
+  reconcileArtifactToPermit(artifact, permit);
+  return sink.install(artifact);
+}
+
+// ---------------------------------------------------------------------------
+// The spine
+// ---------------------------------------------------------------------------
+
+/**
+ * Run one sealed fire end to end. The stage order is fixed: capture every caller input before the
+ * first await; authenticate the snapshot and derive the admission request; authorize; and — the
+ * instant a genuine `AuthorizedDispatch` exists — run the permit-bound dispatch as the first
+ * fallible post-admission operation, so no S4 work can throw or leak while leases are held.
+ * Context assembly, production, reconciliation, and install happen only after the lifecycle runner
+ * has settled every lease.
+ */
+export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOutcome> {
+  // (1-2) Capture top-level references and admission fields once.
+  const snapshot = input.snapshot;
+  const adapters = input.adapters;
+  const claimPort = input.claimPort;
+  const sink = input.sink;
+  const runOptions = input.runOptions;
+  const ownerId = input.admission.ownerId;
+  const expectedSchemaVersion = input.admission.expectedSchemaVersion;
+  const spendReservationUsdMicros = input.admission.spendReservationUsdMicros;
+
+  // (3) Capture each run-option field into a fresh plain object, explicitly OMITTING any
+  //     runtime-extra `cohortId` a hostile caller may have stuck on the options object.
+  const capturedOptions = {
+    timeoutMs: runOptions.timeoutMs,
+    maxOutputTokens: runOptions.maxOutputTokens,
+    executionPolicy: runOptions.executionPolicy,
+    baselinePolicyVersion: runOptions.baselinePolicyVersion,
+    nowMs: runOptions.nowMs,
+    onGameComplete: runOptions.onGameComplete,
+  };
+
+  // (4) Bind the claim and install method references now, so a later swap of the caller's
+  //     `claimPort.admit` / `sink.install` across an await cannot redirect the operation.
+  const admit = claimPort.admit.bind(claimPort);
+  const install = sink.install.bind(sink);
+  const capturedClaimPort: ClaimPort = { admit };
+  const capturedInstaller: ArtifactInstaller = { install };
+
+  // (5) Authenticate the snapshot and derive the full-scope admission request.
+  const request = buildFullScopeAdmitRequest(snapshot, {
+    ownerId,
+    expectedSchemaVersion,
+    spendReservationUsdMicros,
+  });
+
+  // (6) S2 captures the adapter plan (from the caller's map) before it takes the claim.
+  const result = await authorizePreparedDispatch({
+    snapshot,
+    adapters,
+    request,
+    claimPort: capturedClaimPort,
+  });
+
+  // A non-authorizing admission is terminal: return the exact result by identity, dispatch nothing.
+  // A claim-port throw has already propagated out of the await unchanged.
+  if (result.kind === 'NotAdmitted') return result;
+
+  const dispatch = result.dispatch;
+  const permit = dispatch.permit;
+
+  // Dispatch is the FIRST fallible post-admission operation: no S4 check runs between a successful
+  // authorization and this call. The cohort is derived from the permit and written last onto a
+  // fresh options object; no caller `runOptions` object is spread or re-read after admission.
+  const runnerOptions: SlateRunOptions = {
+    timeoutMs: capturedOptions.timeoutMs,
+    maxOutputTokens: capturedOptions.maxOutputTokens,
+    executionPolicy: capturedOptions.executionPolicy,
+    baselinePolicyVersion: capturedOptions.baselinePolicyVersion,
+    nowMs: capturedOptions.nowMs,
+    onGameComplete: capturedOptions.onGameComplete,
+    cohortId: permit.cohortId,
+  };
+  // A dispatch rejection propagates unchanged with its retained causes; no producer/reconcile/
+  // install stage runs, so a fire that could not complete leaves no durable record.
+  const envelope = await runAuthorizedDispatch(dispatch, runnerOptions);
+
+  // Only now — every lease settled — assemble the fire context. Its evidence comes from the sealed
+  // snapshot; each claim is built from the PERMIT (cohort/fire from the permit, game/market from
+  // the captured, canonicalized permit claimed key), mapped by market, never positionally zipped.
+  const canonicalKeys = [...permit.claimedKeys].sort(
+    (a, b) => MARKET_ORDINAL[a.market] - MARKET_ORDINAL[b.market],
+  );
+  const keyByMarket = new Map<MarketKey, ClaimKey>(canonicalKeys.map((k) => [k.market, k]));
+  const perMarket: MarketFireContextV1[] = snapshot.perMarket.map((evidence) => {
+    const key = keyByMarket.get(evidence.market);
+    if (key === undefined) {
+      // Unreachable on the authorized path: S2 admission guarantees the claimed markets equal the
+      // snapshot's proposed scope. This is a total-function guard for an exhaustive map, not a
+      // snapshot-vs-permit scope re-check (that relation is S2's, and reconciliation's below).
+      throw new Error(`no admitted claim key for market ${evidence.market}`);
+    }
+    return {
+      candidateInput: evidence.candidateInput,
+      verdict: evidence.verdict,
+      historyRows: evidence.historyRows,
+      historyWatermark: evidence.historyWatermark,
+      claim: { cohortId: permit.cohortId, fireId: permit.fireId, gameId: key.gameId, market: key.market },
+    };
+  });
+
+  const ctx: FireContext = {
+    booted: snapshot.booted,
+    fireId: snapshot.fireId,
+    runId: snapshot.runId,
+    publication: snapshot.publication,
+    bundleBuiltAt: snapshot.bundleBuiltAt,
+    perMarket,
+  };
+
+  const artifact = buildFireArtifact(envelope, ctx);
+  const installed = installReconciledArtifact(artifact, permit, capturedInstaller);
+  return { kind: 'Installed', permit, artifact, install: installed };
+}
