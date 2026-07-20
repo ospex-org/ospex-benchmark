@@ -85,11 +85,28 @@ export interface AdmissionLeaseAuthority {
 }
 
 const leaseAuthorities = new WeakSet<AdmissionLeaseAuthority>();
+/** The authority minted WITH each permit — the pairing is what makes "same-admission" real. */
+const authorityOfPermit = new WeakMap<DispatchPermit, AdmissionLeaseAuthority>();
 
 /** Throw unless `authority` was minted by a genuine store admission. */
 export function assertLeaseAuthority(authority: AdmissionLeaseAuthority): void {
   if (!leaseAuthorities.has(authority)) {
     throw new Error('lease authority was not minted by a store admission (forged or substituted)');
+  }
+}
+
+/**
+ * Throw unless `authority` is the one minted WITH `permit`. Both brands can be genuine
+ * separately, so authenticating each alone is not enough: a caller-supplied `ClaimPort` could
+ * pair one admission's permit with another admission's authority, and every later bind check
+ * reads only the permit — the authority's closed-over owner/cohort/fire/schema is opaque and
+ * would never be compared. Releases would then be issued for THIS fire's leases under the
+ * OTHER fire's owner (refused as `not_owner`, leaking every lease to expiry). Pairing is
+ * therefore checked before any lease work.
+ */
+export function assertSameAdmission(permit: DispatchPermit, authority: AdmissionLeaseAuthority): void {
+  if (authorityOfPermit.get(permit) !== authority) {
+    throw new Error('lease authority was not minted with this permit (crossed admissions)');
   }
 }
 
@@ -213,6 +230,7 @@ function mintAdmission(
       }),
   });
   leaseAuthorities.add(leaseAuthority);
+  authorityOfPermit.set(permit, leaseAuthority); // the pairing this admission authorizes
 
   return { permit, leaseAuthority };
 }
@@ -252,12 +270,16 @@ export class StoreClaimPort implements ClaimPort {
       // Do NOT format the thrown value (see above) — a fixed reason keeps the mapping total.
       return { kind: 'Fault', reason: 'store admitDispatch failed' };
     }
-    if (result.outcome === 'admitted' && result.dispatchAuthorized === true) {
+    // Read the discriminant ONCE; never coerce it into a message (the store's own value is
+    // untrusted, and a hostile `toString` in a reason string would escape this mapping just
+    // as a hostile raise would escape the catch above).
+    const outcome: unknown = result.outcome;
+    if (outcome === 'admitted' && result.dispatchAuthorized === true) {
       return { kind: 'Authorized', ...mintAdmission(this.store, captured, result) };
     }
     // Every replay, refusal, error result, and wire skew authorizes nothing. The terminal /
     // transient / replay-recovery reaction matrix is a later slice; here it is a loud fault.
-    return { kind: 'Fault', reason: `admit did not authorize dispatch (outcome '${String(result.outcome)}')` };
+    return { kind: 'Fault', reason: 'store admit did not authorize dispatch' };
   }
 }
 

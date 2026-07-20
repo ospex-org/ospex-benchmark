@@ -1,6 +1,6 @@
 import { MARKET_ORDINAL } from './fireArtifact.js';
 import { deepFreeze } from './freeze.js';
-import { assertDispatchPermit, assertLeaseAuthority, captureAdmitRequest } from './lineOpenClaim.js';
+import { assertDispatchPermit, assertLeaseAuthority, assertSameAdmission, captureAdmitRequest } from './lineOpenClaim.js';
 import type { AdmissionLeaseAuthority, ClaimOutcome, ClaimPort, DispatchPermit } from './lineOpenClaim.js';
 import { assertPreparedFireSnapshot, deriveFireId } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
@@ -95,9 +95,12 @@ export class PreDispatchCleanupError extends Error {
   readonly failures: readonly CleanupAttempt[];
   readonly attempts: readonly CleanupAttempt[];
   constructor(primary: Error, failures: readonly CleanupAttempt[], attempts: readonly CleanupAttempt[]) {
+    // The message is built from OUR OWN counts and result codes only — never from a
+    // store-supplied lease id, whose coercion could throw and destroy this typed error
+    // (losing the primary cause and the failed-lease list exactly when they are needed).
     super(
-      `pre-dispatch cleanup failed for ${failures.length} lease(s) after ${primary.name}: ` +
-        failures.map((f) => `${f.leaseId}=${f.result}`).join(', '),
+      `pre-dispatch cleanup failed for ${failures.length} of ${attempts.length} lease(s) after ` +
+        `${primary.name}: ${failures.map((f) => f.result).join(', ')}`,
     );
     this.name = 'PreDispatchCleanupError';
     this.primary = primary;
@@ -169,27 +172,37 @@ export function buildDispatchPlan(
         `no adapter for expected arm "${identity.participantId}"`,
       );
     }
-    if (adapter.provider !== identity.provider || adapter.requestedModelId !== identity.requestedModelId) {
+    // Read every adapter property EXACTLY ONCE, then validate and retain those locals. An
+    // accessor can return a different value per read, so validating one read and capturing
+    // another would let a per-read adapter pass this gate and dispatch something else.
+    const provider: unknown = adapter.provider;
+    const requestedModelId: unknown = adapter.requestedModelId;
+    const credentialEnvVar: unknown = adapter.credentialEnvVar;
+    const hasCredential: unknown = adapter.hasCredential;
+    const chat: unknown = adapter.chat;
+    if (provider !== identity.provider || requestedModelId !== identity.requestedModelId) {
       throw new DispatchAuthorizationError(
         'plan_identity_mismatch',
-        `adapter "${identity.participantId}" is ${adapter.provider}/${adapter.requestedModelId}, ` +
-          `expected ${identity.provider}/${identity.requestedModelId}`,
+        `adapter "${identity.participantId}" does not match its authenticated provider/model identity`,
       );
     }
-    if (typeof adapter.hasCredential !== 'function' || typeof adapter.chat !== 'function') {
+    if (typeof hasCredential !== 'function' || typeof chat !== 'function') {
       throw new DispatchAuthorizationError(
         'plan_method_not_callable',
         `adapter "${identity.participantId}" does not expose callable hasCredential/chat`,
       );
     }
     return {
+      // Identity comes from the AUTHENTICATED roster, never from the adapter — the adapter's
+      // values were only ever checked for equality against it.
       participantId: identity.participantId,
-      provider: adapter.provider,
-      requestedModelId: adapter.requestedModelId,
-      credentialEnvVar: adapter.credentialEnvVar,
-      // Bind NOW: a later rewrite of adapter.hasCredential / adapter.chat cannot be observed.
-      hasCredential: adapter.hasCredential.bind(adapter),
-      chat: adapter.chat.bind(adapter),
+      provider: identity.provider,
+      requestedModelId: identity.requestedModelId,
+      credentialEnvVar: typeof credentialEnvVar === 'string' ? credentialEnvVar : '',
+      // Bind the captured references NOW: a later rewrite of adapter.hasCredential /
+      // adapter.chat, or a replacement of the map entry, cannot be observed.
+      hasCredential: (hasCredential as () => boolean).bind(adapter),
+      chat: (chat as ArmFacade['chat']).bind(adapter),
     };
   });
   const plan: DispatchPlan = Object.freeze({ arms: Object.freeze(arms.map((a) => Object.freeze(a))) });
@@ -236,10 +249,17 @@ function canonicalMarkets(markets: readonly MarketKey[]): MarketKey[] {
   return [...markets].sort((a, b) => MARKET_ORDINAL[a] - MARKET_ORDINAL[b]);
 }
 
+/** Set equality, order-insensitive — for a relation whose order the STORE chooses. */
 function sameMarkets(a: readonly MarketKey[], b: readonly MarketKey[]): boolean {
   const sa = canonicalMarkets(a);
   const sb = canonicalMarkets(b);
   return sa.length === sb.length && sa.every((m, i) => m === sb[i]);
+}
+
+/** Exact-sequence equality — for a proposal, which must already BE canonical. A
+ *  non-canonically-ordered proposal is a caller/store defect, not a presentation detail. */
+function sameSequence(a: readonly MarketKey[], b: readonly MarketKey[]): boolean {
+  return a.length === b.length && a.every((m, i) => m === b[i]);
 }
 
 /** The canonical reservation key for a market set (the store's `ScopeKey` grammar). */
@@ -385,8 +405,8 @@ export async function authorizePreparedDispatch(
   if (request.gameId !== snapshot.prepared.gameId) {
     refuse('request_game_mismatch', `request game ${request.gameId} != snapshot ${snapshot.prepared.gameId}`);
   }
-  if (!sameMarkets(request.proposedMarkets, snapshot.proposedMarkets)) {
-    refuse('request_proposal_mismatch', 'request proposed markets != the snapshot proposal');
+  if (!sameSequence(request.proposedMarkets, snapshot.proposedMarkets)) {
+    refuse('request_proposal_mismatch', 'request proposed markets != the canonical snapshot proposal');
   }
   // The consumed S1 guarantee, re-checked rather than redefined.
   if (!sameMarkets(presentScope(snapshot.prepared.game), snapshot.proposedMarkets)) {
@@ -415,6 +435,10 @@ export async function authorizePreparedDispatch(
   //     From here every refusal first releases the admitted leases.
   assertDispatchPermit(permit);
   assertLeaseAuthority(leaseAuthority);
+  // Both brands can be genuine SEPARATELY, so the pairing is checked before any lease work:
+  // a crossed pair would release this fire's leases under another admission's owner. There is
+  // no trustworthy authority for these leases, so this refuses WITHOUT attempting cleanup.
+  assertSameAdmission(permit, leaseAuthority);
 
   if (permit.cohortId !== snapshot.booted.cohortId) {
     return refuseAfterAdmission('permit_cohort_mismatch', 'permit cohort != snapshot cohort', permit, leaseAuthority);
@@ -425,8 +449,8 @@ export async function authorizePreparedDispatch(
   if (permit.fireId !== snapshot.fireId || permit.fireId !== recomputedFireId) {
     return refuseAfterAdmission('permit_fire_id_mismatch', 'permit fire id != the recomputed snapshot fire id', permit, leaseAuthority);
   }
-  if (!sameMarkets(permit.proposedMarkets, snapshot.proposedMarkets)) {
-    return refuseAfterAdmission('permit_proposal_mismatch', 'permit proposal != snapshot proposal', permit, leaseAuthority);
+  if (!sameSequence(permit.proposedMarkets, snapshot.proposedMarkets)) {
+    return refuseAfterAdmission('permit_proposal_mismatch', 'permit proposal != the canonical snapshot proposal', permit, leaseAuthority);
   }
   if (permit.preparedBytesDigest !== snapshot.prepared.requestSha256) {
     return refuseAfterAdmission('permit_digest_mismatch', 'permit digest != the prepared request digest', permit, leaseAuthority);
@@ -439,17 +463,20 @@ export async function authorizePreparedDispatch(
     return refuseAfterAdmission('permit_schema_mismatch', 'permit schema version != the captured admission version', permit, leaseAuthority);
   }
 
-  // Claimed keys: each bound to this game, each tuple unique.
-  const claimedTuples = new Set<string>();
-  for (const key of permit.claimedKeys) {
+  // Claimed keys: each bound to this game, each tuple unique. Detail strings are built from
+  // OUR OWN positions — never by coercing a store-supplied value, whose `toString` could throw
+  // and escape as a raw error before the refusal (and its lease cleanup) ever ran.
+  const claimedMarketSet = new Set<unknown>();
+  for (const [i, key] of permit.claimedKeys.entries()) {
     if (key.gameId !== permit.gameId) {
-      return refuseAfterAdmission('claim_key_game_mismatch', `claimed key game ${key.gameId} != permit game ${permit.gameId}`, permit, leaseAuthority);
+      return refuseAfterAdmission('claim_key_game_mismatch', `claimed key at position ${i} is not bound to the permit game`, permit, leaseAuthority);
     }
-    const tuple = `${key.gameId}::${key.market}`;
-    if (claimedTuples.has(tuple)) {
-      return refuseAfterAdmission('claim_key_duplicate', `duplicate claimed key ${tuple}`, permit, leaseAuthority);
+    // gameId is now proven identical for every key, so tuple uniqueness reduces to market
+    // uniqueness — compared by value in a Set, never by building a coerced string key.
+    if (claimedMarketSet.has(key.market)) {
+      return refuseAfterAdmission('claim_key_duplicate', `claimed key at position ${i} repeats an earlier market`, permit, leaseAuthority);
     }
-    claimedTuples.add(tuple);
+    claimedMarketSet.add(key.market);
   }
   // Full-claim only: the retained scope must equal the proposal (and the prepared scope). A
   // strict subset is a typed refusal — the per-subset projection is a later slice.
@@ -458,7 +485,7 @@ export async function authorizePreparedDispatch(
     const proposed = new Set<MarketKey>(snapshot.proposedMarkets);
     const isStrictSubset = claimedMarkets.length < proposed.size && claimedMarkets.every((m) => proposed.has(m));
     return isStrictSubset
-      ? refuseAfterAdmission('retained_scope_not_supported', `retained scope [${canonicalMarkets(claimedMarkets).join('+')}] is narrower than the proposal`, permit, leaseAuthority)
+      ? refuseAfterAdmission('retained_scope_not_supported', `the retained scope (${claimedMarkets.length} of ${proposed.size} markets) is narrower than the proposal`, permit, leaseAuthority)
       : refuseAfterAdmission('claim_scope_mismatch', 'claimed markets != the proposed / prepared scope', permit, leaseAuthority);
   }
 
@@ -469,21 +496,21 @@ export async function authorizePreparedDispatch(
     return refuseAfterAdmission('lease_count_mismatch', `${permit.initialLeases.length} initial leases != roster ${rosterSize}`, permit, leaseAuthority);
   }
   const seenArmIndexes = new Set<number>();
-  const seenLeaseIds = new Set<string>();
-  for (const lease of permit.initialLeases) {
+  const seenLeaseIds = new Set<unknown>();
+  for (const [i, lease] of permit.initialLeases.entries()) {
     if (!Number.isInteger(lease.armIndex) || lease.armIndex < 0 || lease.armIndex >= rosterSize) {
-      return refuseAfterAdmission('lease_arm_index_invalid', `lease arm index ${String(lease.armIndex)} outside [0, ${rosterSize})`, permit, leaseAuthority);
+      return refuseAfterAdmission('lease_arm_index_invalid', `initial lease at position ${i} has an arm index outside [0, ${rosterSize})`, permit, leaseAuthority);
     }
     if (seenArmIndexes.has(lease.armIndex)) {
-      return refuseAfterAdmission('lease_arm_index_duplicate', `duplicate lease arm index ${lease.armIndex}`, permit, leaseAuthority);
+      return refuseAfterAdmission('lease_arm_index_duplicate', `initial lease at position ${i} repeats an earlier arm index`, permit, leaseAuthority);
     }
     seenArmIndexes.add(lease.armIndex);
     if (seenLeaseIds.has(lease.leaseId)) {
-      return refuseAfterAdmission('lease_id_duplicate', `duplicate lease id ${lease.leaseId}`, permit, leaseAuthority);
+      return refuseAfterAdmission('lease_id_duplicate', `initial lease at position ${i} repeats an earlier lease id`, permit, leaseAuthority);
     }
     seenLeaseIds.add(lease.leaseId);
     if (lease.state !== 'live') {
-      return refuseAfterAdmission('lease_not_live', `lease ${lease.leaseId} is ${lease.state}, not live`, permit, leaseAuthority);
+      return refuseAfterAdmission('lease_not_live', `initial lease at position ${i} is not live`, permit, leaseAuthority);
     }
   }
 

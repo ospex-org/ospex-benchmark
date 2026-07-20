@@ -437,6 +437,81 @@ test('the captured facades survive every later mutation of the caller map and ad
   assert.equal(rewritten.chat, 0);
 });
 
+test('the plan captured before the claim is the plan authorized — the caller map is never re-read after admission', async () => {
+  const snapshot = sealedSnapshot();
+  const adapters = adapterMap(snapshot);
+  const first = snapshot.expectedArmIdentities[0]!;
+  const original = adapters.get(first.participantId)!;
+  const replacement = syntheticAdapter(first);
+
+  // Hold the admission open, then mutate the caller's map + adapters while it is in flight.
+  const store = new ScriptedStore();
+  let openGate!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    openGate = resolve;
+  });
+  store.onAdmit = async () => {
+    await gate;
+    return admitted({}, snapshot);
+  };
+  const pending = authorizePreparedDispatch({
+    snapshot,
+    adapters,
+    request: request(snapshot),
+    claimPort: new StoreClaimPort(store),
+  });
+  adapters.set(first.participantId, replacement); // swap the entry mid-admission
+  const rewritten = { hasCredential: 0, chat: 0 };
+  (original as unknown as { hasCredential: () => boolean }).hasCredential = () => {
+    rewritten.hasCredential += 1;
+    return false;
+  };
+  (original as unknown as { requestedModelId: string }).requestedModelId = 'tampered-model';
+  openGate();
+
+  const result = await pending;
+  assert.equal(result.kind, 'Authorized');
+  if (result.kind !== 'Authorized') return;
+  // The authorized plan is the one captured BEFORE the claim: authenticated identity …
+  assert.equal(result.dispatch.plan.arms[0]!.participantId, first.participantId);
+  assert.equal(result.dispatch.plan.arms[0]!.requestedModelId, first.requestedModelId);
+  // … and the originally bound methods, not the swapped-in adapter's and not the rewrites.
+  assert.equal(result.dispatch.plan.arms[0]!.hasCredential(), true);
+  assert.equal(original.counts.hasCredential, 1);
+  assert.equal(replacement.counts.hasCredential, 0);
+  assert.equal(rewritten.hasCredential, 0);
+});
+
+// ===========================================================================
+// Crossed admissions
+// ===========================================================================
+
+test('a permit paired with ANOTHER admission lease authority is refused and releases nothing', async () => {
+  const snapshot = sealedSnapshot();
+  const storeA = new ScriptedStore();
+  const storeB = new ScriptedStore();
+  const { outcome: outcomeA } = await mintPermit(storeA, request(snapshot), admitted({}, snapshot));
+  const { outcome: outcomeB } = await mintPermit(storeB, request(snapshot, { ownerId: 'owner-B' }), admitted({}, snapshot));
+  assert.equal(outcomeA.kind, 'Authorized');
+  assert.equal(outcomeB.kind, 'Authorized');
+  if (outcomeA.kind !== 'Authorized' || outcomeB.kind !== 'Authorized') return;
+  storeA.releaseCalls.length = 0;
+  storeB.releaseCalls.length = 0;
+
+  // Both pieces are individually GENUINE, but they come from different admissions.
+  const crossed: ClaimOutcome = { kind: 'Authorized', permit: outcomeA.permit, leaseAuthority: outcomeB.leaseAuthority };
+  const adapters = adapterMap(snapshot);
+  await assert.rejects(
+    () => authorizeWith({ snapshot, adapters, request: request(snapshot), outcome: crossed }),
+    /crossed admissions/,
+  );
+  // No release may be issued: fire A's leases under fire B's owner would be refused as
+  // not_owner and leak, so there is no trustworthy authority to clean up with.
+  assert.deepEqual(storeA.releaseCalls, []);
+  assert.deepEqual(storeB.releaseCalls, []);
+  assert.equal(totalFacadeCalls(adapters), 0);
+});
+
 // ===========================================================================
 // Pre-admission request coherence
 // ===========================================================================
