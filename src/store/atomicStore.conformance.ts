@@ -29,7 +29,7 @@ const DATABASE_URL = process.env.STORE_DATABASE_URL ?? 'postgres://postgres:spik
 const SCHEMA_SQL = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
 const FUNCTIONS_SQL = readFileSync(new URL('./functions.sql', import.meta.url), 'utf8');
 
-const VER = 1;
+import { STORE_SCHEMA_VERSION as VER } from './constants.js';
 let nonce = 0;
 const cohortName = (label: string): string => `adapter-${label}-${process.pid}-${(nonce += 1)}`;
 

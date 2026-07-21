@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { SqlAtomicStore, StoreWireError, pgStoreQuery } from './atomicStore.js';
+import { STORE_SCHEMA_VERSION } from './constants.js';
 import type { StoreQuery } from './atomicStore.js';
 import type {
   AcquireRepairLeaseRequest,
@@ -35,7 +36,7 @@ const H = (c: string): string => c.repeat(64); // a valid 64-char lowercase-hex 
 
 const initReq: InitCohortBudgetRequest = {
   cohortId: 'c1',
-  schemaVersion: 1,
+  schemaVersion: STORE_SCHEMA_VERSION,
   callCap: 100,
   spendCapUsdMicros: 1000,
   concurrencyLimit: 10,
@@ -48,7 +49,7 @@ const admitReq: AdmitDispatchRequest = {
   cohortId: 'c1',
   fireId: 'f1',
   ownerId: 'w1',
-  expectedSchemaVersion: 1,
+  expectedSchemaVersion: STORE_SCHEMA_VERSION,
   gameId: 'g1',
   proposedMarkets: ['moneyline', 'total'],
   scopeReservations: {
@@ -57,8 +58,8 @@ const admitReq: AdmitDispatchRequest = {
     'moneyline+total': { spendReservationUsdMicros: 1000, preparedBytesDigest: H('c') },
   },
 };
-const repairReq: AcquireRepairLeaseRequest = { cohortId: 'c1', fireId: 'f1', ownerId: 'w1', armIndex: 0, repairOrdinal: 1, expectedSchemaVersion: 1 };
-const completeReq: CompleteClaimRequest = { cohortId: 'c1', fireId: 'f1', expectedSchemaVersion: 1 };
+const repairReq: AcquireRepairLeaseRequest = { cohortId: 'c1', fireId: 'f1', ownerId: 'w1', armIndex: 0, repairOrdinal: 1, expectedSchemaVersion: STORE_SCHEMA_VERSION };
+const completeReq: CompleteClaimRequest = { cohortId: 'c1', fireId: 'f1', expectedSchemaVersion: STORE_SCHEMA_VERSION };
 const leaseJson = { leaseId: 'L1', armIndex: 0, expiresAt: '2026-07-19T00:00:00.000Z', state: 'live' };
 
 // --- initCohortBudget ---
@@ -124,7 +125,7 @@ test('init: sends the pinned config as one jsonb arg', async () => {
   assert.match(calls[0]!.sql, /store\.init_cohort_budget\(\$1::jsonb\)/);
   assert.deepEqual(JSON.parse(calls[0]!.params[0] as string), {
     cohortId: 'c1',
-    schemaVersion: 1,
+    schemaVersion: STORE_SCHEMA_VERSION,
     callCap: 100,
     spendCapUsdMicros: 1000,
     concurrencyLimit: 10,
@@ -206,7 +207,7 @@ test('admit: maps the request to positional args + a {spend,digest} scope jsonb'
   await store.admitDispatch(admitReq);
   const { sql, params } = calls[0]!;
   assert.match(sql, /store\.admit_dispatch\(\$1,\$2,\$3,\$4,\$5,\$6::jsonb,\$7::jsonb\)/);
-  assert.deepEqual(params.slice(0, 5), ['c1', 'f1', 'w1', 1, 'g1']);
+  assert.deepEqual(params.slice(0, 5), ['c1', 'f1', 'w1', STORE_SCHEMA_VERSION, 'g1']);
   assert.deepEqual(JSON.parse(params[5] as string), ['moneyline', 'total']);
   assert.deepEqual(JSON.parse(params[6] as string), {
     moneyline: { spend: 500, digest: H('a') },
@@ -273,10 +274,10 @@ test('complete: a present malformed actual refuses invalid_input; omitted actual
   }
   const omitted = stub(r({ outcome: 'completed' }));
   await omitted.store.completeClaim(completeReq);
-  assert.deepEqual(omitted.calls[0]!.params, ['c1', 'f1', 1, null, null]);
+  assert.deepEqual(omitted.calls[0]!.params, ['c1', 'f1', STORE_SCHEMA_VERSION, null, null]);
   const present = stub(r({ outcome: 'completed' }));
   await present.store.completeClaim({ ...completeReq, actualCalls: 4, actualSpendUsdMicros: 250 });
-  assert.deepEqual(present.calls[0]!.params, ['c1', 'f1', 1, 4, 250]);
+  assert.deepEqual(present.calls[0]!.params, ['c1', 'f1', STORE_SCHEMA_VERSION, 4, 250]);
 });
 
 test('complete: maps completed / refused', async () => {

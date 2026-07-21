@@ -18,6 +18,7 @@
  * `pg` types (the executor is structural), so it stays a pure library.
  */
 import { z } from 'zod';
+import { isInt4NonNeg } from './constants.js';
 import { isParseableInstant } from '../time.js';
 import type {
   AtomicStore,
@@ -70,12 +71,6 @@ export class StoreWireError extends Error {
 /** Safe non-negative integer — the bound for the store's `bigint` fields (call/spend caps
  *  + reservations, actual calls/spend). `number` alone guarantees none of this. */
 const isSafeNonNegInt = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
-const INT4_MAX = 2_147_483_647;
-/** Non-negative Postgres `int` (int4). The int4 columns/params are bounded TIGHTER than
- *  `bigint`: an unsafe-magnitude value that is a safe JS integer (≤ 2^53-1) but > int4 max
- *  would slip past `isSafeNonNegInt` and hit an `(…)::int` cast / `int` bound param as a raw
- *  `integer out of range` driver exception instead of the typed `invalid_input` refusal. */
-const isInt4NonNeg = (n: unknown): n is number => isSafeNonNegInt(n) && n <= INT4_MAX;
 // Non-empty AND free of a NUL — Postgres `text`/`jsonb` cannot store one, so a NUL in a
 // string param/value reaches the driver as a raw exception, not a typed refusal.
 const NUL = String.fromCharCode(0);
