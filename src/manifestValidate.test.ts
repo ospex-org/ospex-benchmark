@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, BASELINE_POLICY_VERSIONS, isBaselinePolicyVersion } from './baselines.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
+import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
 import { cohortId, parseManifest } from './manifest.js';
 import { validateManifestAgainstCode } from './manifestValidate.js';
 import { APPROVED_REPORTED_MODEL_IDS, ARMS, approvedReportedModelIds } from './providers/index.js';
@@ -44,8 +45,8 @@ function codeConsistentRaw(): Record<string, unknown> {
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
-    modelPriceTableVersion: 'prices-v1',
-    modelPriceTableDigest: 'c'.repeat(64),
+    modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
+    modelPriceTableDigest: MODEL_PRICE_TABLE_DIGEST,
     runnerCommitSha: 'd'.repeat(40),
     constants: {
       pollIntervalMs: 30000,
@@ -85,6 +86,22 @@ test('unknown marketPolicyVersion is flagged', () => {
 test('marketPolicyDigest mismatch is flagged (wires to the recomputed digest)', () => {
   const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), marketPolicyDigest: 'c'.repeat(64) }));
   assert.ok(v.some((s) => /marketPolicyDigest mismatch/.test(s)), v.join('; '));
+});
+
+test('a code-consistent manifest has no modelPriceTable violation', () => {
+  const v = validateManifestAgainstCode(parse(codeConsistentRaw()));
+  assert.ok(!v.some((s) => /modelPriceTable/.test(s)), v.join('; '));
+});
+
+test('unknown modelPriceTableVersion is flagged, and does not also produce a digest mismatch', () => {
+  const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), modelPriceTableVersion: 'prices-v2' }));
+  assert.ok(v.some((s) => /unknown modelPriceTableVersion/.test(s)), v.join('; '));
+  assert.ok(!v.some((s) => /modelPriceTableDigest mismatch/.test(s)), v.join('; '));
+});
+
+test('modelPriceTableDigest mismatch is flagged (wires to the recomputed digest)', () => {
+  const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), modelPriceTableDigest: 'c'.repeat(64) }));
+  assert.ok(v.some((s) => /modelPriceTableDigest mismatch/.test(s)), v.join('; '));
 });
 
 test('unknown baselinePolicyVersion is flagged', () => {

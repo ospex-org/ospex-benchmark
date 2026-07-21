@@ -1,5 +1,6 @@
 import type { CohortManifestV1 } from './manifest.js';
 import { isMarketPolicyVersion, marketPolicyDigest } from './marketPolicy.js';
+import { isModelPriceTableVersion, modelPriceTableDigest } from './modelPriceTable.js';
 import { isBaselinePolicyVersion, supportsScopedInput } from './baselines.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
@@ -19,9 +20,9 @@ import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
  *
  * Deliberately NOT checked (no code module exists yet — validated when their
  * module lands): `sourceQueryVersion` (its finalizer/history predicate is a
- * later PR), `toolInferenceConfigSha256`, `repairPolicyVersion`,
- * `uncertaintyPolicyVersion`, `modelPriceTableVersion`/`modelPriceTableDigest`.
- * Credential presence is a live/boot concern (network), not this pure check.
+ * later PR), `toolInferenceConfigSha256`, `repairPolicyVersion`, and
+ * `uncertaintyPolicyVersion`. Credential presence is a live/boot concern
+ * (network), not this pure check.
  */
 export function validateManifestAgainstCode(manifest: CohortManifestV1): string[] {
   const violations: string[] = [];
@@ -34,6 +35,20 @@ export function validateManifestAgainstCode(manifest: CohortManifestV1): string[
     if (recomputed !== manifest.marketPolicyDigest) {
       violations.push(
         `marketPolicyDigest mismatch: manifest "${manifest.marketPolicyDigest}" != recomputed "${recomputed}"`,
+      );
+    }
+  }
+
+  // Model price table: known version, then recomputed digest must match. An
+  // unknown version does not also produce a digest mismatch — the else branch
+  // never calls the digest accessor.
+  if (!isModelPriceTableVersion(manifest.modelPriceTableVersion)) {
+    violations.push(`unknown modelPriceTableVersion "${manifest.modelPriceTableVersion}"`);
+  } else {
+    const recomputed = modelPriceTableDigest(manifest.modelPriceTableVersion);
+    if (recomputed !== manifest.modelPriceTableDigest) {
+      violations.push(
+        `modelPriceTableDigest mismatch: manifest "${manifest.modelPriceTableDigest}" != recomputed "${recomputed}"`,
       );
     }
   }
