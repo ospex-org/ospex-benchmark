@@ -58,6 +58,7 @@ function validRaw(overrides: Record<string, unknown> = {}): Record<string, unkno
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: 'prices-v1',
     modelPriceTableDigest: 'd'.repeat(64),
+    spendReservationPolicyVersion: 'fixed-attempt-v1',
     runnerCommitSha: 'e'.repeat(40),
     constants: {
       pollIntervalMs: 30000,
@@ -70,6 +71,7 @@ function validRaw(overrides: Record<string, unknown> = {}): Record<string, unkno
       providerCallTimeoutMs: 300000,
       maxOutputTokens: 16000,
       maxRepairAttemptsPerArm: 1,
+      providerAttemptReservationUsdMicros: 100_000_000,
       ingestionGraceMs: 900000,
       scheduleChangeToleranceMs: 60000,
       maxConcurrentProviderRequests: 1,

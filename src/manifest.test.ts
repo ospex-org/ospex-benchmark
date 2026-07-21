@@ -32,6 +32,7 @@ function validManifest(): Record<string, unknown> {
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: 'prices-v1',
     modelPriceTableDigest: 'c'.repeat(64),
+    spendReservationPolicyVersion: 'fixed-attempt-v1',
     runnerCommitSha: 'd'.repeat(40),
     constants: {
       pollIntervalMs: 30000,
@@ -44,6 +45,7 @@ function validManifest(): Record<string, unknown> {
       providerCallTimeoutMs: 300000,
       maxOutputTokens: 16000,
       maxRepairAttemptsPerArm: 1,
+      providerAttemptReservationUsdMicros: 100_000_000,
       ingestionGraceMs: 900000,
       scheduleChangeToleranceMs: 60000,
       maxConcurrentProviderRequests: 4,

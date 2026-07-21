@@ -48,6 +48,7 @@ function codeConsistentRaw(): Record<string, unknown> {
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
     modelPriceTableDigest: MODEL_PRICE_TABLE_DIGEST,
+    spendReservationPolicyVersion: 'fixed-attempt-v1',
     runnerCommitSha: 'd'.repeat(40),
     constants: {
       pollIntervalMs: 30000,
@@ -60,6 +61,7 @@ function codeConsistentRaw(): Record<string, unknown> {
       providerCallTimeoutMs: 300000,
       maxOutputTokens: 16000,
       maxRepairAttemptsPerArm: 1,
+      providerAttemptReservationUsdMicros: 100_000_000,
       ingestionGraceMs: 900000,
       scheduleChangeToleranceMs: 60000,
       maxConcurrentProviderRequests: arms.length,
@@ -140,6 +142,50 @@ test('an unknown repair version AND a wrong cap are BOTH reported (independent c
     v.some((s) => s === 'maxRepairAttemptsPerArm (2) does not match code repair capability (1)'),
     v.join('; '),
   );
+});
+
+test('a code-consistent manifest has no spend-reservation violation', () => {
+  const v = validateManifestAgainstCode(parse(codeConsistentRaw()));
+  assert.ok(
+    !v.some((s) => /spendReservationPolicyVersion|does not match code spend-reservation policy/.test(s)),
+    v.join('; '),
+  );
+});
+
+test('unknown spendReservationPolicyVersion is flagged, and does not also produce an amount mismatch', () => {
+  const v = validateManifestAgainstCode(
+    parse({ ...codeConsistentRaw(), spendReservationPolicyVersion: 'fixed-attempt-v2' }),
+  );
+  assert.ok(v.some((s) => s === 'unknown spendReservationPolicyVersion "fixed-attempt-v2"'), v.join('; '));
+  assert.ok(!v.some((s) => /does not match code spend-reservation policy/.test(s)), v.join('; '));
+});
+
+test('providerAttemptReservationUsdMicros must equal the code policy amount (100000000)', () => {
+  for (const amount of [99_999_999, 100_000_001]) {
+    const raw = codeConsistentRaw();
+    (raw.constants as Record<string, unknown>).providerAttemptReservationUsdMicros = amount;
+    const v = validateManifestAgainstCode(parse(raw));
+    assert.ok(
+      v.some(
+        (s) =>
+          s ===
+          `providerAttemptReservationUsdMicros (${amount}) does not match code spend-reservation policy (100000000)`,
+      ),
+      `amount ${amount}: ${v.join('; ')}`,
+    );
+  }
+  // The code-consistent amount produces no mismatch.
+  const ok = validateManifestAgainstCode(parse(codeConsistentRaw()));
+  assert.ok(!ok.some((s) => /does not match code spend-reservation policy/.test(s)), ok.join('; '));
+});
+
+test('an unknown spend version does not cascade an amount mismatch (unknown-version only)', () => {
+  const raw = codeConsistentRaw();
+  raw.spendReservationPolicyVersion = 'fixed-attempt-v2';
+  (raw.constants as Record<string, unknown>).providerAttemptReservationUsdMicros = 99_999_999;
+  const v = validateManifestAgainstCode(parse(raw));
+  assert.ok(v.some((s) => s === 'unknown spendReservationPolicyVersion "fixed-attempt-v2"'), v.join('; '));
+  assert.ok(!v.some((s) => /does not match code spend-reservation policy/.test(s)), v.join('; '));
 });
 
 test('unknown baselinePolicyVersion is flagged', () => {
