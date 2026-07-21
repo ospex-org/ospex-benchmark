@@ -36,7 +36,7 @@ const COHORT = 'c'.repeat(64);
 const FIRE = 'f'.repeat(64);
 const GAME = '00000000-0000-4000-8000-0000000000f1';
 const OWNER = 'owner-host-1234-abc';
-const SCHEMA = 1;
+import { STORE_SCHEMA_VERSION as SCHEMA } from './store/constants.js';
 
 function leases(count: number): Lease[] {
   return Array.from({ length: count }, (_, i) => ({

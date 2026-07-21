@@ -83,7 +83,7 @@ const NOW_MS = Date.parse('2026-07-18T12:00:40.000Z');
 const W = 120_000;
 const SKEW = 5_000;
 const OWNER = 'owner-host-1234-abc';
-const SCHEMA = 1;
+import { STORE_SCHEMA_VERSION as SCHEMA } from './store/constants.js';
 const BOTH: readonly MarketKey[] = ['moneyline', 'total'];
 const CODE_ARMS = defaultExpectedArms();
 
