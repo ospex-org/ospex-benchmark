@@ -325,7 +325,7 @@ test('a pending replay Skip carries detached, frozen keys + leases + a genuine r
   // The capability is genuine and RELEASE-ONLY (no repair-acquisition surface).
   assert.doesNotThrow(() => assertReplayReleaseCapability(recovery.cleanup));
   assert.ok(!('acquireRepairLease' in recovery.cleanup));
-  // Minting it released nothing — F5c1 never auto-releases.
+  // Minting it released nothing — the claim port never auto-releases a pending replay.
   assert.deepEqual(store.releaseCalls, []);
   // A structural copy of the capability is rejected before any release.
   assert.throws(() => assertReplayReleaseCapability({ ...recovery.cleanup }), /not minted/);
