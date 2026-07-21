@@ -378,9 +378,13 @@ claim**; an eventual miss is disclosed in `M` (§6).
 **Capacity is bounded, not poisoning.** Deterministic caps apply, all from the manifest:
 `maxDispatchesPerTick` bounds new dispatches admitted per tick; `maxConcurrentProviderRequests`
 bounds simultaneously in-flight provider HTTP requests across all arms and markets; and
-`cohortCallCap`/`cohortSpendCapUsdMicros` bound the cohort total (§4). A candidate not
-admitted is deferred to a later tick; a market that never cleanly fires within the cohort
-is a **reported coverage miss** (§6), never a cohort-poisoning event. The runner reads
+`cohortCallCap`/`cohortSpendCapUsdMicros` bound the cohort total (§4). A store admission that
+is not authorized is **classified**, not uniformly deferred: a **capacity refusal**
+(`call_cap`/`spend_cap`/`concurrency`) **defers** while the candidate remains clean; **`all_claimed`**
+is **terminal** for this candidate because another fire already owns the key; and a
+state/config/input/scope fault surfaces **loudly**. Coverage is not a local verdict — whether a
+market that never cleanly fires ultimately counts as a miss is the globally derived `M = U − F`
+result (§6), never a cohort-poisoning event. The runner reads
 `games`/current inputs to build the prompt, identify teams, classify `sport`, and enforce
 `first_pitch_passed` — these are **fire inputs**, not cohort-membership evidence.
 

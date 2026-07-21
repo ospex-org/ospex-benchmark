@@ -355,8 +355,10 @@ export interface AuthorizePreparedDispatchInput {
 
 export type AuthorizePreparedDispatchResult =
   | { readonly kind: 'Authorized'; readonly dispatch: AuthorizedDispatch }
-  /** The claim did not authorize (rehearsal, fault, or any non-admitted outcome): nothing to
-   *  release, no dispatch. The reaction policy for these outcomes is a later slice. */
+  /** The claim did not authorize a paid dispatch — a rehearsal, a capacity `Defer` (retryable
+   *  while clean), a terminal `Skip`, or a `Fault`. This wrapper dispatches nothing and holds no
+   *  lease of its own; a pending-replay `Skip` carries its own detached release-only recovery
+   *  capability, which a later slice decides whether to invoke. */
   | { readonly kind: 'NotAdmitted'; readonly outcome: Exclude<ClaimOutcome, { kind: 'Authorized' }> };
 
 /**

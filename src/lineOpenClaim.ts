@@ -1,6 +1,8 @@
 import { deepFreeze } from './freeze.js';
+import { StoreWireError } from './store/atomicStore.js';
 import type {
   AdmitDispatchRequest,
+  AdmitResult,
   AtomicStore,
   ClaimKey,
   Lease,
@@ -122,20 +124,73 @@ export function leaseAuthorityForPermit(permit: DispatchPermit): AdmissionLeaseA
 // ---------------------------------------------------------------------------
 
 /**
- * A claim attempt's outcome. Only `Authorized` carries a permit (and its lease authority);
- * every other outcome authorizes zero dispatch and zero lease work. `WouldAdmit` is the
- * report-only rehearsal outcome — visibly non-canonical, never a permit.
- *
- * `Defer` / `Skip` are retained for later compatibility but are NOT produced here: this
- * slice maps a fresh admission and faults loud on everything else. Classifying replays and
- * refusals into terminal-vs-transient reactions is a later slice's contract.
+ * A capacity refusal — the candidate stays clean and MAY be retried on a later tick. Never
+ * terminal: turning a transient capacity refusal into a permanent loss would burn a live
+ * speculation that self-heals as sibling reservations settle.
+ */
+export type DeferReason = 'call_cap' | 'spend_cap' | 'concurrency';
+
+/**
+ * A terminal-for-dispatch outcome for THIS candidate. It carries NO coverage verdict — whether
+ * a verified artifact ultimately exists is derived globally elsewhere, not asserted here.
+ */
+export type SkipReason = 'all_claimed' | 'replayed_pending' | 'replayed_completed';
+
+export type FaultReason =
+  | 'not_initialized'
+  | 'version_mismatch'
+  | 'invalid_input'
+  | 'scope_reservation_missing'
+  | 'fire_id_key_mismatch'
+  | 'admitted_without_authorization'
+  | 'store_result_mismatch'
+  | 'store_admit_failed';
+
+/**
+ * The opaque, RELEASE-ONLY cleanup capability for a pending-replay fire. It closes over the
+ * exact `AtomicStore` and the captured `ownerId`, so a consumer supplies only a lease id and
+ * CANNOT substitute a different owner or store. It exposes release ONLY — never repair
+ * acquisition, provider authorization, or a permit — and it is runtime-authenticated: a forged
+ * or structurally-copied capability is rejected by `assertReplayReleaseCapability` before any
+ * release. This slice MINTS it but never invokes it; a later slice owns the release decision
+ * (`not_owner` / expiry / interruption) and drives it.
+ */
+export interface ReplayReleaseCapability {
+  releaseLease(leaseId: string): Promise<ReleaseResult>;
+}
+
+const replayReleaseCapabilities = new WeakSet<ReplayReleaseCapability>();
+
+/** Throw unless `capability` was minted by a genuine pending-replay (forged or substituted). */
+export function assertReplayReleaseCapability(capability: ReplayReleaseCapability): void {
+  if (!replayReleaseCapabilities.has(capability)) {
+    throw new Error('replay release capability was not minted by a store admission (forged or substituted)');
+  }
+}
+
+/** The detached recovery state a pending-replay Skip carries for a later slice to release. */
+export interface ReplayPendingRecovery {
+  readonly claimedKeys: readonly ClaimKey[];
+  readonly initialLeases: readonly Lease[];
+  readonly cleanup: ReplayReleaseCapability;
+}
+
+/**
+ * A claim attempt's outcome. Only `Authorized` carries a permit (and its lease authority) and
+ * authorizes paid dispatch; every other outcome authorizes zero dispatch. `WouldAdmit` is the
+ * report-only rehearsal outcome — visibly non-canonical, never a permit. `Defer` is retryable
+ * while the candidate is clean; `Skip` is terminal for THIS dispatch (with no coverage verdict);
+ * `Fault` is a loud non-authorizing failure. The typed reason discriminates why, so a consumer
+ * never parses prose. A `replayed_pending` Skip additionally carries detached recovery state.
  */
 export type ClaimOutcome =
   | { readonly kind: 'Authorized'; readonly permit: DispatchPermit; readonly leaseAuthority: AdmissionLeaseAuthority }
   | { readonly kind: 'WouldAdmit' }
-  | { readonly kind: 'Defer'; readonly reason: string }
-  | { readonly kind: 'Skip'; readonly reason: string }
-  | { readonly kind: 'Fault'; readonly reason: string };
+  | { readonly kind: 'Defer'; readonly reason: DeferReason }
+  | { readonly kind: 'Skip'; readonly reason: 'all_claimed' }
+  | { readonly kind: 'Skip'; readonly reason: 'replayed_completed'; readonly claimedKeys: readonly ClaimKey[] }
+  | { readonly kind: 'Skip'; readonly reason: 'replayed_pending'; readonly recovery: ReplayPendingRecovery }
+  | { readonly kind: 'Fault'; readonly reason: FaultReason };
 
 /** The claim seam: admit one fire's dispatch, atomically, at most once. */
 export interface ClaimPort {
@@ -242,19 +297,65 @@ function mintAdmission(
   return { permit, leaseAuthority };
 }
 
+/**
+ * Mint the detached recovery state for a pending-replay result: cloned + deeply-frozen
+ * `claimedKeys` and `initialLeases` (so a later store mutation of its own returned arrays
+ * cannot reach the outcome), plus a RELEASE-ONLY capability closed over the exact store and
+ * captured owner. The capability exposes no repair acquisition and mints no permit, and this
+ * function NEVER invokes a release — a later slice decides when a pending replay may be
+ * cleaned up. Every value comes from the SAME `admitDispatch` result the caller already read.
+ */
+function mintReplayCleanup(
+  store: AtomicStore,
+  captured: CapturedAdmitRequest,
+  result: { claimedKeys: readonly ClaimKey[]; initialLeases: readonly Lease[] },
+): ReplayPendingRecovery {
+  const cleanup: ReplayReleaseCapability = Object.freeze({
+    releaseLease: (leaseId: string): Promise<ReleaseResult> =>
+      store.releaseLease({ leaseId, ownerId: captured.ownerId }),
+  });
+  replayReleaseCapabilities.add(cleanup);
+  return deepFreeze({
+    claimedKeys: result.claimedKeys.map((k) => ({ gameId: k.gameId, market: k.market })),
+    initialLeases: result.initialLeases.map((l) => ({
+      leaseId: l.leaseId,
+      armIndex: l.armIndex,
+      expiresAt: l.expiresAt,
+      state: l.state,
+    })),
+    cleanup,
+  });
+}
+
+/** Clone claimed keys out of a store result so a later store mutation cannot reach the outcome. */
+function cloneClaimedKeys(keys: readonly ClaimKey[]): readonly ClaimKey[] {
+  return deepFreeze(keys.map((k) => ({ gameId: k.gameId, market: k.market })));
+}
+
 // ---------------------------------------------------------------------------
 // Ports
 // ---------------------------------------------------------------------------
 
 /**
- * The store-backed claim port. It captures the request before the await, gates STRICTLY on
- * the `admitted` outcome AND its `dispatchAuthorized: true` literal (never the outcome name
- * alone), and mints only then.
+ * The store-backed claim port. It captures the request before the await, then classifies the
+ * store's admit result into an EXHAUSTIVE, typed reaction:
+ *  - `admitted` AND the `dispatchAuthorized: true` literal → `Authorized` (the sole paid gate is
+ *    the conjunction, never the outcome name alone); `admitted` WITHOUT the literal → a loud
+ *    `Fault` (a runtime-skew store never authorizes);
+ *  - `replayed`/`pending` → a `Skip` carrying detached recovery state + a release-only cleanup
+ *    capability (a later slice releases); `replayed`/`completed` → a `Skip` with detached keys;
+ *  - a capacity refusal (`call_cap`/`spend_cap`/`concurrency`) → `Defer` (retryable while clean);
+ *  - `all_claimed` → a terminal `Skip`; the loud refusals + `fire_id_key_mismatch` → `Fault`.
+ * The nested `switch` is compiler-exhaustive over the outcome, replay status, and refusal reason
+ * (a new store union member breaks the build); a value a cast or custom store slips past the
+ * types still collapses to a fixed non-authorizing `Fault`.
  *
- * The failure path is TOTAL: a store rejection is caught without reading, coercing, or
- * formatting the thrown value — a hostile value whose `message` getter or `Symbol.toPrimitive`
- * throws would otherwise escape the fail-closed mapping as a raw error. The reason is a fixed
- * safe string.
+ * The failure path is TOTAL: a store rejection is classified WITHOUT reading, coercing, or
+ * formatting the thrown value. A genuine `StoreWireError` re-throws by identity (a loud
+ * contract-skew signal); everything else — ordinary errors, primitives, hostile getters or
+ * coercers, `getPrototypeOf`-trapping proxies, and revoked proxies — collapses to a fixed safe
+ * `Fault`. Because a plain `instanceof` itself THROWS for a revoked or prototype-trapping proxy,
+ * the check is guarded so such a value can never escape.
  */
 export class StoreClaimPort implements ClaimPort {
   constructor(private readonly store: AtomicStore) {}
@@ -262,7 +363,7 @@ export class StoreClaimPort implements ClaimPort {
   async admit(req: AdmitDispatchRequest): Promise<ClaimOutcome> {
     // Capture BEFORE the await; the caller's object is never read again.
     const captured = captureAdmitRequest(req);
-    let result;
+    let result: AdmitResult;
     try {
       result = await this.store.admitDispatch({
         cohortId: captured.cohortId,
@@ -273,20 +374,89 @@ export class StoreClaimPort implements ClaimPort {
         proposedMarkets: captured.proposedMarkets,
         scopeReservations: captured.scopeReservations,
       });
-    } catch {
-      // Do NOT format the thrown value (see above) — a fixed reason keeps the mapping total.
-      return { kind: 'Fault', reason: 'store admitDispatch failed' };
+    } catch (thrown) {
+      // A plain `instanceof` walks the prototype chain, which a revoked or `getPrototypeOf`-
+      // trapping proxy makes THROW — so guard it. A genuine wire skew re-throws by identity;
+      // every other thrown value collapses to the fixed reason WITHOUT being read or formatted.
+      let wire = false;
+      try {
+        wire = thrown instanceof StoreWireError;
+      } catch {
+        wire = false;
+      }
+      if (wire) throw thrown;
+      return { kind: 'Fault', reason: 'store_admit_failed' };
     }
-    // Read the discriminant ONCE; never coerce it into a message (the store's own value is
-    // untrusted, and a hostile `toString` in a reason string would escape this mapping just
-    // as a hostile raise would escape the catch above).
-    const outcome: unknown = result.outcome;
-    if (outcome === 'admitted' && result.dispatchAuthorized === true) {
-      return { kind: 'Authorized', ...mintAdmission(this.store, captured, result) };
+    return this.classify(captured, result);
+  }
+
+  /**
+   * Exhaustively classify a genuine store result. The compile-time `never` at each nested
+   * default makes a new outcome / replay status / refusal reason a BUILD error; the runtime
+   * fault at each default fail-closes a value a cast or custom store slipped past the types.
+   */
+  private classify(captured: CapturedAdmitRequest, result: AdmitResult): ClaimOutcome {
+    switch (result.outcome) {
+      case 'admitted': {
+        // The sole paid gate is the conjunction — the outcome AND the literal `true`. Widen to
+        // boolean so a runtime-skew store returning `false` is caught (the type says `true`).
+        const authorized: boolean = result.dispatchAuthorized;
+        if (!authorized) {
+          return { kind: 'Fault', reason: 'admitted_without_authorization' };
+        }
+        return { kind: 'Authorized', ...mintAdmission(this.store, captured, result) };
+      }
+      case 'replayed':
+        switch (result.fireStatus) {
+          case 'pending':
+            return {
+              kind: 'Skip',
+              reason: 'replayed_pending',
+              recovery: mintReplayCleanup(this.store, captured, result),
+            };
+          case 'completed':
+            return { kind: 'Skip', reason: 'replayed_completed', claimedKeys: cloneClaimedKeys(result.claimedKeys) };
+          default: {
+            const _exhaustiveReplay: never = result;
+            void _exhaustiveReplay;
+            return { kind: 'Fault', reason: 'store_result_mismatch' };
+          }
+        }
+      case 'refused':
+        switch (result.reason) {
+          case 'call_cap':
+          case 'spend_cap':
+          case 'concurrency':
+            return { kind: 'Defer', reason: result.reason };
+          case 'all_claimed':
+            return { kind: 'Skip', reason: 'all_claimed' };
+          case 'not_initialized':
+          case 'version_mismatch':
+          case 'invalid_input':
+          case 'scope_reservation_missing':
+            return { kind: 'Fault', reason: result.reason };
+          default: {
+            const _exhaustiveRefusal: never = result;
+            void _exhaustiveRefusal;
+            return { kind: 'Fault', reason: 'store_result_mismatch' };
+          }
+        }
+      case 'error':
+        switch (result.reason) {
+          case 'fire_id_key_mismatch':
+            return { kind: 'Fault', reason: 'fire_id_key_mismatch' };
+          default: {
+            const _exhaustiveError: never = result;
+            void _exhaustiveError;
+            return { kind: 'Fault', reason: 'store_result_mismatch' };
+          }
+        }
+      default: {
+        const _exhaustiveOutcome: never = result;
+        void _exhaustiveOutcome;
+        return { kind: 'Fault', reason: 'store_result_mismatch' };
+      }
     }
-    // Every replay, refusal, error result, and wire skew authorizes nothing. The terminal /
-    // transient / replay-recovery reaction matrix is a later slice; here it is a loud fault.
-    return { kind: 'Fault', reason: 'store admit did not authorize dispatch' };
   }
 }
 

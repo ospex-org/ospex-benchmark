@@ -685,9 +685,9 @@ test('mutating the caller inputs while the claim is pending does not redirect th
 test('every ordinary NotAdmitted outcome is returned by identity with zero side effects', async () => {
   const outcomes = [
     { kind: 'WouldAdmit' as const },
-    { kind: 'Defer' as const, reason: 'r' },
-    { kind: 'Skip' as const, reason: 'r' },
-    { kind: 'Fault' as const, reason: 'r' },
+    { kind: 'Defer' as const, reason: 'concurrency' as const },
+    { kind: 'Skip' as const, reason: 'all_claimed' as const },
+    { kind: 'Fault' as const, reason: 'store_admit_failed' as const },
   ];
   for (const claimOutcome of outcomes) {
     const snapshot = sealed();
