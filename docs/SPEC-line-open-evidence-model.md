@@ -587,11 +587,14 @@ narrow and safety-load-bearing:
 - **No current canonical caller.** The release helper is non-activating; the safe-invocation predicate
   belongs to the loop/coordinator, and activation wiring is blocked until that predicate and its tests
   land. The safe default everywhere is store-clock expiry.
-- **Completion reconciliation is a separate, named activation decision.** Reclaiming the *budget* of an
-  installed-but-unconfirmed fire is durable artifact-backed completion reconciliation — a separate later
-  operation that must verify durable exact-artifact evidence before any idempotent completion and must
-  never settle a genuinely crashed-before-install fire. If it is deferred at the first canary, an
-  `unsettled` fire hard-stops/escalates to an operator flow rather than silently consuming the call cap.
+- **Completion reconciliation is a separate, named activation decision.** Reconciling an
+  installed-but-unconfirmed fire can release only unused **call-reservation** headroom down to the
+  store-known `made_calls` floor. Because `actualSpendUsdMicros` remains omitted, the full conservative
+  fixed-attempt spend reservation remains consumed — this operation does **not** reclaim spend. It is
+  durable artifact-backed reconciliation: it must verify durable exact-artifact evidence before any
+  idempotent completion and must never settle a genuinely crashed-before-install fire. If it is deferred
+  at the first canary, an `unsettled` fire hard-stops/escalates to an operator flow rather than silently
+  consuming the call cap.
 
 ## 5. Per-fire entry verification and arm provenance
 

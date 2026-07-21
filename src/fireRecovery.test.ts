@@ -31,11 +31,15 @@ const GAME = '00000000-0000-4000-8000-0000000000f1';
 const OWNER = 'owner-host-1234-abc';
 const DIGEST = 'a'.repeat(64);
 
-/** A store that admits as `replayed`/`pending` with the given lease ids, and scripts `releaseLease`. */
+/** A store that admits as `replayed`/`pending` with the given lease ids, and scripts `releaseLease`.
+ *  `states` (optional, by index) stamps each lease's advisory replay state — default `live`. */
 class RecoveryStore implements AtomicStore {
   readonly releaseCalls: ReleaseLeaseRequest[] = [];
   onRelease: (req: ReleaseLeaseRequest) => Promise<ReleaseResult> = () => Promise.resolve({ outcome: 'released' });
-  constructor(private readonly leaseIds: readonly string[]) {}
+  constructor(
+    private readonly leaseIds: readonly string[],
+    private readonly states?: readonly ('live' | 'released' | 'expired')[],
+  ) {}
   initCohortBudget(_r: InitCohortBudgetRequest): Promise<InitResult> {
     throw new Error('not used');
   }
@@ -48,7 +52,7 @@ class RecoveryStore implements AtomicStore {
         leaseId,
         armIndex: i,
         expiresAt: '2026-07-18T12:10:00.000Z',
-        state: 'live' as const,
+        state: this.states?.[i] ?? 'live',
       })),
       dispatchAuthorized: false,
     });
@@ -227,6 +231,22 @@ test('every malformed resolved release value maps to failed, never not_owner, an
 // ===========================================================================
 // dedup, counts, freeze, empty
 // ===========================================================================
+
+test('every distinct lease is attempted in recorded order regardless of advisory state (live/released/expired)', async () => {
+  // The carried replay `state` is a stale advisory snapshot — the helper releases EVERY distinct
+  // authenticated lease id and never filters on it. A forbidden `if (lease.state !== 'live') continue;`
+  // filter would drop the released/expired leases and reds this test.
+  const store = new RecoveryStore(['live-lease', 'released-lease', 'expired-lease'], ['live', 'released', 'expired']);
+  const recovery = await genuineRecovery(store);
+  const out = await releasePendingReplay(recovery);
+  assert.deepEqual(
+    store.releaseCalls.map((c) => c.leaseId),
+    ['live-lease', 'released-lease', 'expired-lease'],
+    'all distinct leases attempted once, in recorded order — no advisory-state filter',
+  );
+  assert.deepEqual(out.attempts.map((a) => a.leaseId), ['live-lease', 'released-lease', 'expired-lease']);
+  assert.equal(out.attempts.length, 3);
+});
 
 test('duplicate lease ids are attempted only on first occurrence, order stable', async () => {
   const store = new RecoveryStore(['l0', 'l0', 'l1', 'l0']);

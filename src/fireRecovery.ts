@@ -74,17 +74,37 @@ export async function releasePendingReplay(recovery: ReplayPendingRecovery): Pro
     let result: 'released' | 'not_owner' | 'failed';
     try {
       const r = await cleanup.releaseLease(leaseId);
-      // Capture each discriminator EXACTLY ONCE inside the guarded boundary. A throwing getter, a
-      // primitive, or null is caught below and folds to `failed`; an unknown outcome/reason folds to
-      // `failed`, never `not_owner`. Never format or inspect an arbitrary value.
-      const outcome: unknown = (r as { outcome?: unknown }).outcome;
-      if (outcome === 'released') {
-        result = 'released';
-      } else if (outcome === 'refused') {
-        const reason: unknown = (r as { reason?: unknown }).reason;
-        result = reason === 'not_owner' ? 'not_owner' : 'failed';
-      } else {
-        result = 'failed';
+      // Typed, single-read discriminators with `never` defaults: a new legitimate `ReleaseResult`
+      // variant breaks `tsc` HERE (compile-time exhaustiveness), while a cast/custom-store skew — an
+      // unknown outcome/reason, or a hostile getter/primitive/null caught by the surrounding try —
+      // still folds to the fixed `failed` (never `not_owner`, the value never read or formatted). Each
+      // discriminator is snapshotted exactly once inside the guarded boundary.
+      const outcome = r.outcome;
+      switch (outcome) {
+        case 'released':
+          result = 'released';
+          break;
+        case 'refused': {
+          const reason = r.reason;
+          switch (reason) {
+            case 'not_owner':
+              result = 'not_owner';
+              break;
+            default: {
+              const _exhaustiveReason: never = reason;
+              void _exhaustiveReason;
+              result = 'failed';
+              break;
+            }
+          }
+          break;
+        }
+        default: {
+          const _exhaustiveOutcome: never = outcome;
+          void _exhaustiveOutcome;
+          result = 'failed';
+          break;
+        }
       }
     } catch {
       // Rejection / synchronous throw — unconfirmed; the thrown value is never read or formatted.
