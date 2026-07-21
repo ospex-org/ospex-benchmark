@@ -56,6 +56,7 @@ function codeConsistentRaw(): Record<string, unknown> {
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
     modelPriceTableDigest: MODEL_PRICE_TABLE_DIGEST,
+    spendReservationPolicyVersion: 'fixed-attempt-v1',
     runnerCommitSha: 'd'.repeat(40),
     constants: {
       pollIntervalMs: LOCKED_CONSTANTS.pollIntervalMs,
@@ -68,6 +69,7 @@ function codeConsistentRaw(): Record<string, unknown> {
       providerCallTimeoutMs: LOCKED_CONSTANTS.providerCallTimeoutMs,
       maxOutputTokens: LOCKED_CONSTANTS.maxOutputTokens,
       maxRepairAttemptsPerArm: 1,
+      providerAttemptReservationUsdMicros: 100_000_000,
       ingestionGraceMs: 900000,
       scheduleChangeToleranceMs: 60000,
       maxConcurrentProviderRequests: arms.length,
@@ -112,6 +114,30 @@ test('cohortBoot rejects a maxRepairAttemptsPerArm that disagrees with the code 
     );
   }
   // The code-consistent cap of 1 continues to boot.
+  assert.doesNotThrow(() => cohortBoot(req(codeConsistentRaw())));
+});
+
+test('cohortBoot rejects an unknown spend-reservation version and a wrong per-attempt reservation', () => {
+  assert.throws(
+    () => cohortBoot(req({ ...codeConsistentRaw(), spendReservationPolicyVersion: 'fixed-attempt-v2' })),
+    (e: unknown) =>
+      e instanceof CohortBootError && /unknown spendReservationPolicyVersion "fixed-attempt-v2"/.test(e.message),
+  );
+  // A dollar below and a micro above the pinned $100 per attempt.
+  for (const amount of [99_999_999, 100_000_001]) {
+    const raw = codeConsistentRaw();
+    (raw.constants as Record<string, unknown>).providerAttemptReservationUsdMicros = amount;
+    assert.throws(
+      () => cohortBoot(req(raw)),
+      (e: unknown) =>
+        e instanceof CohortBootError &&
+        e.message.includes(
+          `providerAttemptReservationUsdMicros (${amount}) does not match code spend-reservation policy (100000000)`,
+        ),
+      `amount ${amount}`,
+    );
+  }
+  // The code-consistent values continue to boot.
   assert.doesNotThrow(() => cohortBoot(req(codeConsistentRaw())));
 });
 

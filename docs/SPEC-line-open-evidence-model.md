@@ -114,6 +114,7 @@ CohortManifestV1 {
   scoringPolicyVersion,
   uncertaintyPolicyVersion,
   modelPriceTableVersion, modelPriceTableDigest,
+  spendReservationPolicyVersion,   // fixed-attempt spend-reservation policy (no digest — the scalar is in constants)
   runnerCommitSha,
 
   constants: {
@@ -127,6 +128,7 @@ CohortManifestV1 {
     providerCallTimeoutMs:     300_000,
     maxOutputTokens:           16_000,
     maxRepairAttemptsPerArm:   1,
+    providerAttemptReservationUsdMicros: 100_000_000,  // fixed per-provider-HTTP-attempt spend reservation ($100)
     ingestionGraceMs:          900_000,
     scheduleChangeToleranceMs: 60_000,
     maxConcurrentProviderRequests,       // required positive integer; must be >= expectedArmRoster.length (§3)
@@ -159,7 +161,11 @@ rule applies to the prompt (`promptScaffoldSha256`), tool/inference config
 (`toolInferenceConfigSha256`), baseline (`baselinePolicyVersion`), repair
 (`repairPolicyVersion`), scoring (`scoringPolicyVersion`), and uncertainty
 (`uncertaintyPolicyVersion`) policies, and to the model price table
-(`modelPriceTableVersion`/`modelPriceTableDigest`). Unknown pricing **fails boot** (§4).
+(`modelPriceTableVersion`/`modelPriceTableDigest`). Unknown pricing **fails boot** (§4). The
+spend-reservation policy (`spendReservationPolicyVersion`) is known-version-checked, and its
+manifest `providerAttemptReservationUsdMicros` must equal the code-owned amount for that
+version — there is **no** digest, because the single material scalar is directly in the hashed
+manifest and `runnerCommitSha` pins the algorithm.
 
 ### Public-Git precommitment (Tier 0, not on-chain)
 
@@ -329,7 +335,8 @@ prepared snapshot, not the final bundle):
    - deterministically select the retained scope (candidate ordering above);
    - **synchronously project** the final bundle/request bytes from the prepared snapshot
      for exactly that scope;
-   - compute exact input tokens and the worst-case call/spend/**concurrency** reservation;
+   - derive the provider-attempt count and the fixed monetary spend reservation from the
+     manifest-pinned spend-reservation policy, plus the worst-case **concurrency** reservation;
    - atomically persist claims and reservations.
 5. If no key remains, create **no** claim/reservation/artifact and send **no** request.
 6. Persist `bundleBuiltAt` separately; it may be **after** `detectedAt`, but bundle
@@ -438,11 +445,20 @@ expectedArmRoster.length × (1 + maxRepairAttemptsPerArm)
 A co-arrival multi-market bundle is **one dispatch** and does **not** multiply arm HTTP
 attempts by market count.
 
-**`cohortSpendCapUsdMicros` is a conservative pre-dispatch estimate** from the
-manifest-pinned model price table (`modelPriceTableVersion`/`Digest`), the exact
-input-token count, `maxOutputTokens`, the tool policy, and the repair reservation. Unknown
-pricing **fails boot**. It is **not** exact external billing; the hard guarantees are call
-count, token/output bounds, and this conservative estimate.
+**`cohortSpendCapUsdMicros` is enforced with a conservative administrative reservation**
+(`spendReservationPolicyVersion`/`providerAttemptReservationUsdMicros`; `fixed-attempt-v1`).
+Each possible provider HTTP attempt reserves the manifest-pinned
+`providerAttemptReservationUsdMicros`; a fire reserves
+`expectedArmRoster.length × (1 + maxRepairAttemptsPerArm)` attempts. The **same** reservation
+magnitude applies to every retained market subset, because market count does not change the
+provider-attempt count. This is intentionally coarse: it protects the brokered spend boundary
+and makes **no** claim of tokenizer or provider-template equivalence. Provider-reported tokens
+and estimated/API cost are **descriptive** evidence — never admission authority or a normalized
+cross-provider fairness metric. The model price table
+(`modelPriceTableVersion`/`modelPriceTableDigest`) still pins per-model rates for a
+clearly-labeled completion estimate, and unknown model pricing still **fails boot**; the hard
+guarantees remain the call count, the `maxOutputTokens`/repair bounds, and this conservative
+reservation — **not** exact external billing.
 
 **Two distinct state classes.** *Consumed cohort accounting* — the claim, the call
 reservation, and the spend reservation — stays consumed per the conservative rules above; a

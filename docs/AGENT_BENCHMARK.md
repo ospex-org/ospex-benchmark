@@ -274,9 +274,19 @@ Secondary outputs:
 
 ROI remains important because actual funds move through Ospex, but it should not rank a one-week cohort ahead of CLV and calibration.
 
+## Provider asymmetry and transparency
+
+The benchmark controls the common task and data cutoff, not the providers' internals. Every arm receives the **same declared task, the same frozen logical information bundle, the same decision cutoff, the same published prompt/tool policy, the same output schema, and the same repair rule.** What differs between labs — and is **disclosed, not normalized** — is provider-side chat templates, tokenizers, hidden reasoning, and input normalization, plus provider-side billing and token accounting.
+
+Ospex makes a **best effort** at fairness but does **not** claim perfect cross-lab equivalence: it is not achievable, and it decays whenever a provider changes its stack. A provider-specific quirk is handled by recording it, publishing it, pinning the exact cohort manifest + `runnerCommitSha`, labeling results honestly, and moving forward unless it invalidates the common task itself.
+
+**Provider token usage is reported as each provider defines it and is never normalized into a ranking metric;** estimated API cost is a descriptive secondary output, not a fairness input. A methodology change creates a **new** manifest / `runnerCommitSha` / cohort rather than rewriting an old one — old cohorts keep their original identity and are never retrospectively normalized.
+
 ## Publication and claims policy
 
 Before a canonical cohort starts, publish or timestamp the methodology manifest, prompt/tool hashes, model IDs/settings, cutoff/exclusion rules, stake rule, and CLV formulas (economic and margin-adjusted, with the de-vig methods named and versioned). Afterward publish sanitized inputs, decisions, fills/transactions, closing snapshots, outcomes, costs, and caveats.
+
+Publish, per participant, the provider-specific execution surface: provider/model ID; adapter transport shape; system-prompt handling; max output; sampling/reasoning/tool settings; repair/retry behavior; reported-usage semantics; and known caveats/errata. Token usage and API cost are labeled **secondary, provider-reported/estimated, and not directly normalized across labs.**
 
 Defensible wording:
 
@@ -339,7 +349,7 @@ Not ready for a public canonical benchmark yet:
 
 - dedicated wallets for each model participant;
 - direct API credentials/routes for all four labs;
-- a provider-neutral runner with equivalent tools and explicit reasoning settings;
+- a provider-adapted runner with a shared task/tool policy and publicly documented provider-specific transport/settings differences;
 - exact-line CLV coverage for moved spreads/totals;
 - stable aggregate pre-live gate and first-attempt postgame schema handling;
 - a live canonical participant registry in the frontend;

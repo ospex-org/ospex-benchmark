@@ -114,6 +114,7 @@ function manifestJson(extra: Record<string, unknown> = {}): string {
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
     modelPriceTableDigest: MODEL_PRICE_TABLE_DIGEST,
+    spendReservationPolicyVersion: 'fixed-attempt-v1',
     runnerCommitSha: 'e'.repeat(40),
     constants: {
       pollIntervalMs: 30_000,
@@ -126,6 +127,7 @@ function manifestJson(extra: Record<string, unknown> = {}): string {
       providerCallTimeoutMs: 300_000,
       maxOutputTokens: 16_000,
       maxRepairAttemptsPerArm: 1,
+      providerAttemptReservationUsdMicros: 100_000_000,
       ingestionGraceMs: 900_000,
       scheduleChangeToleranceMs: 60_000,
       maxConcurrentProviderRequests: Math.max(8, CODE_ARMS.length),

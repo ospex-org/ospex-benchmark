@@ -32,6 +32,7 @@ function validManifest(): Record<string, unknown> {
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: 'prices-v1',
     modelPriceTableDigest: 'c'.repeat(64),
+    spendReservationPolicyVersion: 'fixed-attempt-v1',
     runnerCommitSha: 'd'.repeat(40),
     constants: {
       pollIntervalMs: 30000,
@@ -44,6 +45,7 @@ function validManifest(): Record<string, unknown> {
       providerCallTimeoutMs: 300000,
       maxOutputTokens: 16000,
       maxRepairAttemptsPerArm: 1,
+      providerAttemptReservationUsdMicros: 100_000_000,
       ingestionGraceMs: 900000,
       scheduleChangeToleranceMs: 60000,
       maxConcurrentProviderRequests: 4,
@@ -138,6 +140,70 @@ test('broken window/poll invariants are rejected', () => {
   const slowPoll = validManifest();
   (slowPoll.constants as Record<string, unknown>).pollIntervalMs = 120000; // == window, not <
   assert.throws(() => parseManifest(slowPoll), /pollIntervalMs must be < cleanEntryWindowMs/);
+});
+
+test('the spend-reservation fields are strictly validated (version + per-attempt amount domain)', () => {
+  // Both new fields are REQUIRED.
+  const noVersion = validManifest();
+  delete noVersion.spendReservationPolicyVersion;
+  assert.throws(() => parseManifest(noVersion), /invalid cohort manifest/);
+  const noAmount = validManifest();
+  delete (noAmount.constants as Record<string, unknown>).providerAttemptReservationUsdMicros;
+  assert.throws(() => parseManifest(noAmount), /invalid cohort manifest/);
+
+  // spendReservationPolicyVersion must be a NON-EMPTY string (guards a z.string().min(1) -> z.string() weaken).
+  for (const badVersion of ['', 123, null, true]) {
+    assert.throws(
+      () => parseManifest({ ...validManifest(), spendReservationPolicyVersion: badVersion }),
+      /invalid cohort manifest/,
+      `version ${String(badVersion)} must reject`,
+    );
+  }
+
+  // providerAttemptReservationUsdMicros must be a POSITIVE SAFE INTEGER (guards a
+  // positiveSafeInteger -> z.number() weaken): reject zero, negative, fractional, unsafe
+  // magnitude, NaN, infinities, and non-number shapes.
+  const badAmounts: unknown[] = [
+    0,
+    -1,
+    -100_000_000,
+    1.5,
+    100_000_000.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+    '100000000',
+    true,
+    false,
+    null,
+  ];
+  for (const bad of badAmounts) {
+    const raw = validManifest();
+    (raw.constants as Record<string, unknown>).providerAttemptReservationUsdMicros = bad;
+    assert.throws(() => parseManifest(raw), /invalid cohort manifest/, `amount ${String(bad)} must reject`);
+  }
+
+  // Number.MAX_SAFE_INTEGER is accepted STRUCTURALLY (the code-amount cross-check is a separate
+  // boot gate, not this structural parse).
+  const maxSafe = validManifest();
+  (maxSafe.constants as Record<string, unknown>).providerAttemptReservationUsdMicros = Number.MAX_SAFE_INTEGER;
+  assert.doesNotThrow(() => parseManifest(maxSafe));
+
+  // Two ADJACENT unsafe JSON integer literals round to the same double; neither may be accepted,
+  // so a per-attempt amount above the safe range can never form an ambiguous cohortId.
+  for (const literal of ['9007199254740992', '9007199254740993']) {
+    const bytes = JSON.stringify(validManifest()).replace(
+      /"providerAttemptReservationUsdMicros":100000000/,
+      `"providerAttemptReservationUsdMicros":${literal}`,
+    );
+    assert.notEqual(bytes, JSON.stringify(validManifest()), 'the JSON amount substitution must apply');
+    assert.throws(
+      () => parseManifest(JSON.parse(bytes)),
+      /invalid cohort manifest/,
+      `JSON literal ${literal} must reject`,
+    );
+  }
 });
 
 test('empty required arrays and an out-of-range discovery horizon are rejected', () => {

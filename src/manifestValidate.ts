@@ -2,6 +2,7 @@ import type { CohortManifestV1 } from './manifest.js';
 import { isMarketPolicyVersion, marketPolicyDigest } from './marketPolicy.js';
 import { isModelPriceTableVersion, modelPriceTableDigest } from './modelPriceTable.js';
 import { CODE_MAX_REPAIRS_PER_ARM, isRepairPolicyVersion } from './repairPolicy.js';
+import { isSpendReservationPolicyVersion, spendReservationPolicyForVersion } from './spendReservationPolicy.js';
 import { isBaselinePolicyVersion, supportsScopedInput } from './baselines.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
@@ -67,6 +68,26 @@ export function validateManifestAgainstCode(manifest: CohortManifestV1): string[
       `maxRepairAttemptsPerArm (${manifest.constants.maxRepairAttemptsPerArm}) ` +
         `does not match code repair capability (${CODE_MAX_REPAIRS_PER_ARM})`,
     );
+  }
+
+  // Spend-reservation policy: known version, AND (for a known version) the manifest's
+  // per-attempt reservation must equal the code-owned amount for that version. The trusted
+  // admission builder derives the per-fire reservation from this amount, so a divergent
+  // amount would mis-reserve against the pinned cohort spend cap. The two checks are
+  // independent, but an unknown version does NOT call the fail-closed accessor and does NOT
+  // add a cascading amount mismatch for a policy whose semantics are unknown.
+  if (!isSpendReservationPolicyVersion(manifest.spendReservationPolicyVersion)) {
+    violations.push(`unknown spendReservationPolicyVersion "${manifest.spendReservationPolicyVersion}"`);
+  } else {
+    const policy = spendReservationPolicyForVersion(manifest.spendReservationPolicyVersion);
+    if (
+      manifest.constants.providerAttemptReservationUsdMicros !== policy.providerAttemptReservationUsdMicros
+    ) {
+      violations.push(
+        `providerAttemptReservationUsdMicros (${manifest.constants.providerAttemptReservationUsdMicros}) ` +
+          `does not match code spend-reservation policy (${policy.providerAttemptReservationUsdMicros})`,
+      );
+    }
   }
 
   // Baseline policy: known version (baselines carry no digest concept), then the

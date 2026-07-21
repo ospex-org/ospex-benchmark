@@ -52,6 +52,10 @@ const constantsSchema = z
     providerCallTimeoutMs: positiveSafeInteger,
     maxOutputTokens: positiveSafeInteger,
     maxRepairAttemptsPerArm: nonnegativeSafeInteger,
+    // The fixed per-provider-HTTP-attempt spend reservation, in integer USD-micros. It is
+    // directly visible in the hashed manifest (no separate digest); canonical boot
+    // cross-checks it against the code-owned spendReservationPolicyVersion amount.
+    providerAttemptReservationUsdMicros: positiveSafeInteger,
     ingestionGraceMs: nonnegativeSafeInteger,
     scheduleChangeToleranceMs: nonnegativeSafeInteger,
     maxConcurrentProviderRequests: positiveSafeInteger,
@@ -87,6 +91,7 @@ export const cohortManifestV1Schema = z
     uncertaintyPolicyVersion: z.string().min(1),
     modelPriceTableVersion: z.string().min(1),
     modelPriceTableDigest: sha256HexSchema,
+    spendReservationPolicyVersion: z.string().min(1),
     runnerCommitSha: z.string().regex(/^[0-9a-f]{40}$/),
 
     constants: constantsSchema,
