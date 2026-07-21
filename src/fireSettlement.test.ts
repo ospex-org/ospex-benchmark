@@ -119,6 +119,23 @@ test('every malformed / hostile resolved value folds to store_result_mismatch, n
   });
 });
 
+test('the refusal reason is read exactly once — an alternating getter cannot escape the domain', () => {
+  // An accessor that returns a recognized reason first and an out-of-domain value on any second read
+  // must NOT escape CompletionUnsettledReason: the classifier reads the reason once into a local and
+  // switches/returns only that local. (Reverting to `unsettled(result.reason)` reds this on both.)
+  let reads = 0;
+  const result = {
+    outcome: 'refused' as const,
+    get reason() {
+      reads += 1;
+      return reads === 1 ? 'version_mismatch' : 'attacker_defined_reason';
+    },
+  };
+  const status = classifyCompleteResult(result as unknown as CompleteResult);
+  assert.equal(reads, 1, 'the reason getter is read exactly once');
+  assert.deepEqual(status, { status: 'unsettled', reason: 'version_mismatch' }, 'only the first validated reason is returned');
+});
+
 // ===========================================================================
 // settleCompletedFire — resolve, invoke, classify
 // ===========================================================================

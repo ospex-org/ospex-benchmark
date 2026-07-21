@@ -112,9 +112,10 @@ export class FireReconciliationError extends Error {
 }
 
 /** A non-authorizing admission is returned by identity; a successful fire returns its narrow Installed
- *  result — the durable artifact plus the store-settlement status. `kind: 'Installed'` describes durable
- *  artifact presence; `completion.status` independently describes whether the store settled the claim.
- *  No envelope, pricing actual, or raw model response. */
+ *  result — the durable artifact plus the completion status. `kind: 'Installed'` describes durable
+ *  artifact presence; `completion.status` independently reports completion CONFIRMATION (`settled`, or
+ *  `unsettled` with a reason whose store-state confidence a consumer reads), not omniscient canonical
+ *  state. No envelope, pricing actual, or raw model response. */
 export type LineOpenFireOutcome =
   | Extract<AuthorizePreparedDispatchResult, { kind: 'NotAdmitted' }>
   | {
@@ -434,9 +435,11 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
   const installed = await installReconciledArtifact(artifact, permit, capturedInstaller);
   // Only after the artifact is durably installed does this run settle the claim exactly once. A settle
   // refusal or throw NEVER discards the persisted artifact: it folds to a typed `unsettled` completion
-  // (the claim stays pending and its reservation conservatively consumed) for an activation consumer to
-  // escalate. Install throwing/rejecting propagates BEFORE this line, so settlement never runs for a
-  // fire whose evidence did not persist.
+  // for an activation consumer to escalate. A known refusal leaves the claim confirmed `pending`; a
+  // failed/mismatched completion is UNCONFIRMED (the store may be `pending` or already `completed`), but
+  // the artifact is preserved and the reservation is only ever conservatively held — never over-admitting
+  // and never a blind re-settle. Install throwing/rejecting propagates BEFORE this line, so settlement
+  // never runs for a fire whose evidence did not persist.
   const completion = await settleCompletedFire(permit);
   return { kind: 'Installed', permit, artifact, install: installed, completion };
 }

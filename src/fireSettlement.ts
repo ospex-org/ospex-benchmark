@@ -14,11 +14,18 @@ import type { CompleteResult } from './store/contract.js';
  * relabel the artifact and does not reject the run: it folds to a typed `unsettled` status. This is the
  * deliberate asymmetry with admission — an admission/store-wire failure is pre-paid and pre-durable and
  * must stop before authority, whereas a completion failure is post-artifact and must preserve the
- * artifact and merely expose `unsettled`. An `unsettled` fire leaves its claim `pending` and its
- * call/spend reservation conservatively consumed; nothing settles it today (lease expiry recovers only
- * concurrency, and a re-detected fire replays without re-settling), so an `unsettled` status is an
- * activation-consumer escalation signal, never a clean-settlement signal. A later recovery slice may
- * re-settle an aged `pending` fire only against durable exact-artifact proof.
+ * artifact and merely expose `unsettled`. `CompletionStatus` reports completion CONFIRMATION, not
+ * omniscient canonical store state. A known refusal (`version_mismatch` / `invariant_breach` /
+ * `invalid_input`) is atomic and wrote nothing, so the claim is confirmed still `pending` with its
+ * reservations unchanged. A `store_complete_failed` (a rejected/lost `complete()`) or a
+ * `store_result_mismatch` (an unrecognizable resolved value) is UNCONFIRMED: the store transaction may
+ * have committed before its acknowledgement was lost, so the canonical fire may be `pending` (reservations
+ * retained) OR already `completed` (calls settled to the `made_calls` floor; spend still fully consumed,
+ * since this request omits `actualSpendUsdMicros`). In every `unsettled` case the artifact stays installed,
+ * no provider is re-dispatched, and an activation consumer escalates; a later recovery slice reconciles an
+ * aged fire through the store's idempotent, artifact-backed completion (never a blind re-settle). Nothing
+ * self-heals it today — lease expiry recovers only concurrency, and a re-detected fire replays without
+ * re-settling — so an `unsettled` status is an escalation signal, never a clean-settlement signal.
  *
  * Capability RESOLUTION is kept outside all folding: `completionForPermit` asserts the permit brand, so
  * a forged or substituted permit propagates its assertion (never folded to `unsettled`). Only the
@@ -26,11 +33,14 @@ import type { CompleteResult } from './store/contract.js';
  */
 
 /**
- * Why a settle did not cleanly complete. `version_mismatch` / `invariant_breach` / `invalid_input` are
- * the store's own refusal reasons; `store_result_mismatch` is a resolved value whose shape is neither
- * `completed` nor a known refusal (a runtime skew, including a hostile discriminator); and
- * `store_complete_failed` is a rejection/throw from `complete()`. A thrown or malformed value is never
- * read, coerced, formatted, or embedded.
+ * Why a settle did not cleanly complete. The reason also encodes the store-state confidence a consumer
+ * may rely on. `version_mismatch` / `invariant_breach` / `invalid_input` are the store's own atomic
+ * refusal reasons — the completion was refused, so the claim is confirmed still `pending`. By contrast
+ * `store_complete_failed` (a rejection/throw from `complete()`) and `store_result_mismatch` (a resolved
+ * value whose shape is neither `completed` nor a known refusal — a runtime skew, including a hostile
+ * discriminator) are UNCONFIRMED: the store may have committed before its acknowledgement was lost, so
+ * the canonical fire may be `pending` or already `completed`. A thrown or malformed value is never read,
+ * coerced, formatted, or embedded.
  */
 export type CompletionUnsettledReason =
   | 'version_mismatch'
@@ -39,7 +49,10 @@ export type CompletionUnsettledReason =
   | 'store_result_mismatch'
   | 'store_complete_failed';
 
-/** Whether the store settled the fire. Independent of durable artifact presence (that is `Installed`). */
+/** Completion CONFIRMATION for a durably-installed fire — not omniscient canonical store state.
+ *  `settled` is a confirmed `completed`; `unsettled` carries the reason, whose confidence a consumer
+ *  reads (a known refusal is confirmed `pending`; a failed/mismatched completion is unconfirmed).
+ *  Independent of durable artifact presence, which is `Installed`. */
 export type CompletionStatus =
   | { readonly status: 'settled' }
   | { readonly status: 'unsettled'; readonly reason: CompletionUnsettledReason };
@@ -66,18 +79,25 @@ export function classifyCompleteResult(result: CompleteResult): CompletionStatus
     switch (result.outcome) {
       case 'completed':
         return SETTLED;
-      case 'refused':
-        switch (result.reason) {
+      case 'refused': {
+        // Read the nested discriminator EXACTLY ONCE into a local: `result.reason` is store-result-
+        // owned runtime state, and an accessor could return a recognized reason on the first read and
+        // an arbitrary out-of-domain value on a second — so validating one read and returning another
+        // would let a hostile reason escape the `CompletionUnsettledReason` union. Switch and return
+        // only the captured local.
+        const reason = result.reason;
+        switch (reason) {
           case 'version_mismatch':
           case 'invariant_breach':
           case 'invalid_input':
-            return unsettled(result.reason);
+            return unsettled(reason);
           default: {
-            const _exhaustiveReason: never = result.reason;
+            const _exhaustiveReason: never = reason;
             void _exhaustiveReason;
             return UNSETTLED_RESULT_MISMATCH;
           }
         }
+      }
       default: {
         const _exhaustiveOutcome: never = result;
         void _exhaustiveOutcome;
