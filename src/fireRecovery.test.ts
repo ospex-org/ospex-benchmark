@@ -237,11 +237,24 @@ test('duplicate lease ids are attempted only on first occurrence, order stable',
   assert.equal(out.releasedCount, 2);
 });
 
-test('counts equal the tallies of the single attempts array, and the outcome graph is deeply frozen', async () => {
-  const store = new RecoveryStore(['l0', 'l1']);
+test('each count equals its own tally in the single attempts array, and the outcome graph is deeply frozen', async () => {
+  // Mixed outcomes so no count equals the lease/attempt total — a count derived from any separate
+  // source (e.g. `leases.length`) diverges from its tally and reds here, not only by luck of a fixture.
+  const store = new RecoveryStore(['l0', 'l1', 'l2']);
+  store.onRelease = (req) =>
+    req.leaseId === 'l0'
+      ? Promise.resolve({ outcome: 'released' })
+      : req.leaseId === 'l1'
+        ? Promise.resolve({ outcome: 'refused', reason: 'not_owner' })
+        : Promise.reject(new Error('transport failed'));
   const recovery = await genuineRecovery(store);
   const out = await releasePendingReplay(recovery);
+  assert.equal(out.releasedCount, out.attempts.filter((a) => a.result === 'released').length);
+  assert.equal(out.notOwnerCount, out.attempts.filter((a) => a.result === 'not_owner').length);
+  assert.equal(out.failedCount, out.attempts.filter((a) => a.result === 'failed').length);
   assert.equal(out.releasedCount + out.notOwnerCount + out.failedCount, out.attempts.length);
+  assert.notEqual(out.releasedCount, out.attempts.length, 'the fixture is mixed, so no count equals the total');
+  // Deeply frozen + detached.
   assert.ok(Object.isFrozen(out), 'outcome frozen');
   assert.ok(Object.isFrozen(out.attempts), 'attempts array frozen');
   assert.ok(out.attempts.every((a) => Object.isFrozen(a)), 'each attempt frozen');
