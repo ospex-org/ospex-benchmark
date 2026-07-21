@@ -5,6 +5,7 @@ import { CohortBootError, cohortBoot } from './cohortBoot.js';
 import type { CanonicalOverrides } from './cohortBoot.js';
 import { cohortId, parseManifest } from './manifest.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
+import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 
@@ -52,8 +53,8 @@ function codeConsistentRaw(): Record<string, unknown> {
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
-    modelPriceTableVersion: 'prices-v1',
-    modelPriceTableDigest: 'c'.repeat(64),
+    modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
+    modelPriceTableDigest: MODEL_PRICE_TABLE_DIGEST,
     runnerCommitSha: 'd'.repeat(40),
     constants: {
       pollIntervalMs: LOCKED_CONSTANTS.pollIntervalMs,
@@ -87,6 +88,14 @@ test('a code-consistent manifest boots and returns the derived cohortId + manife
   const booted = cohortBoot(req(raw));
   assert.equal(booted.cohortId, cohortId(parseManifest(raw)));
   assert.deepEqual(booted.manifest, parseManifest(raw));
+});
+
+test('a known price version with a wrong price digest fails cohortBoot (semantic price cross-check)', () => {
+  const raw = { ...codeConsistentRaw(), modelPriceTableDigest: 'c'.repeat(64) };
+  assert.throws(
+    () => cohortBoot(req(raw)),
+    (e: unknown) => e instanceof CohortBootError && /modelPriceTableDigest mismatch/.test(e.message),
+  );
 });
 
 test('--live is hard-disabled — refused BEFORE the manifest is even parsed', () => {

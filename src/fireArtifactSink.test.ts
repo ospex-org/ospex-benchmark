@@ -15,6 +15,7 @@ import type { ArtifactFs, SinkOwners } from './fireArtifactSink.js';
 import { parseFireArtifactV1, serializeFireArtifactV1, verifyFireArtifactReplay } from './fireArtifactWriter.js';
 import { checkPublication } from './manifestPublication.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
+import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { runSlate } from './runner.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
@@ -200,8 +201,8 @@ function manifestJson(): string {
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
-    modelPriceTableVersion: 'prices-v1',
-    modelPriceTableDigest: 'd'.repeat(64),
+    modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
+    modelPriceTableDigest: MODEL_PRICE_TABLE_DIGEST,
     runnerCommitSha: 'e'.repeat(40),
     constants: {
       pollIntervalMs: 30_000,

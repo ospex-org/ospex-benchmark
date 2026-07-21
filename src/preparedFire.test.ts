@@ -6,6 +6,7 @@ import { evaluateCandidate } from './detection.js';
 import { MARKET_ORDINAL } from './fireArtifact.js';
 import { assertPublicationVerified, checkPublication } from './manifestPublication.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
+import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
 import {
   assertPreparedFireSnapshot,
   deriveFireId,
@@ -73,8 +74,8 @@ function manifestObject(over: { network?: string } = {}): Record<string, unknown
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
-    modelPriceTableVersion: 'prices-v1',
-    modelPriceTableDigest: 'd'.repeat(64),
+    modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
+    modelPriceTableDigest: MODEL_PRICE_TABLE_DIGEST,
     runnerCommitSha: 'e'.repeat(40),
     constants: {
       pollIntervalMs: 30_000,
