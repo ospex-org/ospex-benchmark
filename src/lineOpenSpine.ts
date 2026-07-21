@@ -349,8 +349,9 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
     claimPort: capturedClaimPort,
   });
 
-  // A non-authorizing admission is terminal: return the exact result by identity, dispatch nothing.
-  // A claim-port throw has already propagated out of the await unchanged.
+  // A non-authorizing admission does not dispatch here: return the exact classified result by
+  // identity (a capacity `Defer` is retryable next tick; a `Skip` is terminal for this dispatch;
+  // a `Fault` is loud). A claim-port throw has already propagated out of the await unchanged.
   if (result.kind === 'NotAdmitted') return result;
 
   const dispatch = result.dispatch;

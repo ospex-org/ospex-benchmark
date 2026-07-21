@@ -3,11 +3,13 @@ import { test } from 'node:test';
 import {
   assertDispatchPermit,
   assertLeaseAuthority,
+  assertReplayReleaseCapability,
   captureAdmitRequest,
   RehearsalClaimPort,
   StoreClaimPort,
 } from './lineOpenClaim.js';
-import type { DispatchPermit } from './lineOpenClaim.js';
+import type { ClaimOutcome, DispatchPermit } from './lineOpenClaim.js';
+import { StoreWireError } from './store/atomicStore.js';
 import type {
   AcquireRepairLeaseRequest,
   AdmitAdmittedResult,
@@ -230,37 +232,180 @@ test('captureAdmitRequest detaches the proposal and every reservation entry', ()
 });
 
 // ===========================================================================
-// Fail-closed result / throw matrix
+// A — authorization: the literal conjunction is the sole paid gate
 // ===========================================================================
 
-test('only an admitted result carrying the dispatchAuthorized literal authorizes', async () => {
-  const nonAuthorizing: AdmitResult[] = [
-    // a wire skew: the admitted shape without the authorization literal
-    { outcome: 'admitted', claimedKeys: claimedKeys(['moneyline']), preparedBytesDigest: 'a'.repeat(64), initialLeases: leases(1), dispatchAuthorized: false } as unknown as AdmitResult,
-    { outcome: 'replayed', fireStatus: 'pending', claimedKeys: claimedKeys(['moneyline']), initialLeases: leases(1), dispatchAuthorized: false },
-    { outcome: 'replayed', fireStatus: 'completed', claimedKeys: claimedKeys(['moneyline']), dispatchAuthorized: false },
-    { outcome: 'refused', reason: 'all_claimed', dispatchAuthorized: false },
-    { outcome: 'refused', reason: 'call_cap', dispatchAuthorized: false },
-    { outcome: 'refused', reason: 'spend_cap', dispatchAuthorized: false },
-    { outcome: 'refused', reason: 'concurrency', dispatchAuthorized: false },
-    { outcome: 'refused', reason: 'scope_reservation_missing', dispatchAuthorized: false },
-    { outcome: 'refused', reason: 'invalid_input', dispatchAuthorized: false },
-    { outcome: 'refused', reason: 'not_initialized', dispatchAuthorized: false },
-    { outcome: 'refused', reason: 'version_mismatch', dispatchAuthorized: false },
-    { outcome: 'error', reason: 'fire_id_key_mismatch', dispatchAuthorized: false },
+test('authorization requires admitted AND the dispatchAuthorized literal — never the outcome name', async () => {
+  // admitted + literal true -> Authorized (with a genuine permit).
+  const authorized = await admitAuthorized(new ScriptedStore());
+  assert.doesNotThrow(() => assertDispatchPermit(authorized.permit));
+
+  // admitted WITHOUT the literal (a runtime skew) -> loud Fault, never a permit.
+  const skewStore = new ScriptedStore();
+  skewStore.onAdmit = () =>
+    Promise.resolve({
+      outcome: 'admitted',
+      claimedKeys: claimedKeys(['moneyline']),
+      preparedBytesDigest: 'a'.repeat(64),
+      initialLeases: leases(1),
+      dispatchAuthorized: false,
+    } as unknown as AdmitResult);
+  const skew = await new StoreClaimPort(skewStore).admit(request());
+  assert.equal(skew.kind, 'Fault');
+  assert.equal((skew as { reason?: string }).reason, 'admitted_without_authorization');
+  assert.ok(!('permit' in skew));
+
+  // TRUTHY NON-BOOLEAN values (a skewed store, a JSON round-trip, a hostile object) must NOT
+  // authorize a paid dispatch — only the boolean `true` does. A truthiness check would wrongly
+  // authorize every one of these; the `!== true` literal gate rejects them.
+  for (const skewed of [1, 'true', {}, [], 'false', 0, null] as unknown[]) {
+    const truthyStore = new ScriptedStore();
+    truthyStore.onAdmit = () =>
+      Promise.resolve({
+        outcome: 'admitted',
+        claimedKeys: claimedKeys(['moneyline']),
+        preparedBytesDigest: 'a'.repeat(64),
+        initialLeases: leases(1),
+        dispatchAuthorized: skewed,
+      } as unknown as AdmitResult);
+    const outcome = await new StoreClaimPort(truthyStore).admit(request());
+    assert.equal(outcome.kind, 'Fault', `dispatchAuthorized=${JSON.stringify(skewed)} must not authorize`);
+    assert.equal((outcome as { reason?: string }).reason, 'admitted_without_authorization');
+    assert.ok(!('permit' in outcome), `dispatchAuthorized=${JSON.stringify(skewed)} minted no permit`);
+  }
+
+  // A replay carrying a HOSTILE dispatchAuthorized:true still routes to its replay reaction,
+  // never Authorized — the switch keys authorization on the admitted conjunction alone.
+  const replayAuthStore = new ScriptedStore();
+  replayAuthStore.onAdmit = () =>
+    Promise.resolve({
+      outcome: 'replayed',
+      fireStatus: 'completed',
+      claimedKeys: claimedKeys(['moneyline']),
+      dispatchAuthorized: true,
+    } as unknown as AdmitResult);
+  const replayAuth = await new StoreClaimPort(replayAuthStore).admit(request());
+  assert.equal(replayAuth.kind, 'Skip');
+  assert.ok(!('permit' in replayAuth));
+});
+
+// ===========================================================================
+// B — the exhaustive admit-reaction matrix
+// ===========================================================================
+
+test('every store admit outcome maps to its exact typed reaction, with no coverage verdict', async () => {
+  const cases: Array<{ result: AdmitResult; kind: ClaimOutcome['kind']; reason: string }> = [
+    { result: { outcome: 'replayed', fireStatus: 'pending', claimedKeys: claimedKeys(['moneyline']), initialLeases: leases(1), dispatchAuthorized: false }, kind: 'Skip', reason: 'replayed_pending' },
+    { result: { outcome: 'replayed', fireStatus: 'completed', claimedKeys: claimedKeys(['moneyline']), dispatchAuthorized: false }, kind: 'Skip', reason: 'replayed_completed' },
+    { result: { outcome: 'refused', reason: 'all_claimed', dispatchAuthorized: false }, kind: 'Skip', reason: 'all_claimed' },
+    { result: { outcome: 'refused', reason: 'call_cap', dispatchAuthorized: false }, kind: 'Defer', reason: 'call_cap' },
+    { result: { outcome: 'refused', reason: 'spend_cap', dispatchAuthorized: false }, kind: 'Defer', reason: 'spend_cap' },
+    { result: { outcome: 'refused', reason: 'concurrency', dispatchAuthorized: false }, kind: 'Defer', reason: 'concurrency' },
+    { result: { outcome: 'refused', reason: 'not_initialized', dispatchAuthorized: false }, kind: 'Fault', reason: 'not_initialized' },
+    { result: { outcome: 'refused', reason: 'version_mismatch', dispatchAuthorized: false }, kind: 'Fault', reason: 'version_mismatch' },
+    { result: { outcome: 'refused', reason: 'invalid_input', dispatchAuthorized: false }, kind: 'Fault', reason: 'invalid_input' },
+    { result: { outcome: 'refused', reason: 'scope_reservation_missing', dispatchAuthorized: false }, kind: 'Fault', reason: 'scope_reservation_missing' },
+    { result: { outcome: 'error', reason: 'fire_id_key_mismatch', dispatchAuthorized: false }, kind: 'Fault', reason: 'fire_id_key_mismatch' },
   ];
-  for (const result of nonAuthorizing) {
+  for (const c of cases) {
     const store = new ScriptedStore();
-    store.onAdmit = () => Promise.resolve(result);
+    store.onAdmit = () => Promise.resolve(c.result);
     const outcome = await new StoreClaimPort(store).admit(request());
-    assert.equal(outcome.kind, 'Fault', `expected Fault for ${String(result.outcome)}`);
-    assert.ok(!('permit' in outcome));
-    assert.deepEqual(store.releaseCalls, []); // nothing was minted, so nothing is released
+    assert.equal(outcome.kind, c.kind, `${String(c.result.outcome)}/${c.reason}: kind`);
+    assert.equal((outcome as { reason?: string }).reason, c.reason, `${c.reason}: reason`);
+    assert.ok(!('permit' in outcome), `${c.reason}: no permit`);
+    // No local coverage verdict is ever manufactured (coverage is globally derived).
+    assert.ok(!('coverageMiss' in outcome) && !('terminal' in outcome), `${c.reason}: no coverage field`);
+    assert.deepEqual(store.releaseCalls, [], `${c.reason}: no release`);
+    assert.deepEqual(store.repairCalls, [], `${c.reason}: no repair`);
   }
 });
 
-test('a store rejection is total — an ordinary error and a hostile non-coercible value both fault', async () => {
-  const hostile = {
+// ===========================================================================
+// C — pending / completed replay recovery state
+// ===========================================================================
+
+test('a pending replay Skip carries detached, frozen keys + leases + a genuine release-only capability', async () => {
+  const store = new ScriptedStore();
+  const result: AdmitResult = {
+    outcome: 'replayed',
+    fireStatus: 'pending',
+    claimedKeys: claimedKeys(['moneyline', 'total']),
+    initialLeases: leases(3),
+    dispatchAuthorized: false,
+  };
+  store.onAdmit = () => Promise.resolve(result);
+  const outcome = await new StoreClaimPort(store).admit(request());
+  assert.equal(outcome.kind, 'Skip');
+  if (outcome.kind !== 'Skip' || outcome.reason !== 'replayed_pending') throw new Error('expected replayed_pending Skip');
+  const { recovery } = outcome;
+  assert.equal(recovery.claimedKeys.length, 2);
+  assert.equal(recovery.initialLeases.length, 3);
+  // The capability is genuine and RELEASE-ONLY (no repair-acquisition surface).
+  assert.doesNotThrow(() => assertReplayReleaseCapability(recovery.cleanup));
+  assert.ok(!('acquireRepairLease' in recovery.cleanup));
+  // Minting it released nothing — the claim port never auto-releases a pending replay.
+  assert.deepEqual(store.releaseCalls, []);
+  // Binding is unit-testable: invoking the capability releases through the CAPTURED store + the
+  // CAPTURED owner (a consumer supplies only a leaseId — it cannot substitute a different owner or
+  // store). Production invocation is a later slice; a wrong-owner binding breaks this exact call.
+  await recovery.cleanup.releaseLease('lease-0');
+  assert.deepEqual(store.releaseCalls, [{ leaseId: 'lease-0', ownerId: OWNER }]);
+  // A structural copy of the capability is rejected before any release.
+  assert.throws(() => assertReplayReleaseCapability({ ...recovery.cleanup }), /not minted/);
+  // A store mutation of its own returned arrays AFTER admit cannot alter the outcome.
+  (result.claimedKeys as ClaimKey[]).push({ gameId: 'other', market: 'spread' });
+  (result.claimedKeys[0] as { gameId: string }).gameId = 'tampered';
+  (result.initialLeases as Lease[]).pop();
+  (result.initialLeases[0] as { leaseId: string }).leaseId = 'tampered';
+  assert.equal(recovery.claimedKeys.length, 2);
+  assert.equal(recovery.claimedKeys[0]!.gameId, GAME);
+  assert.equal(recovery.initialLeases.length, 3);
+  assert.equal(recovery.initialLeases[0]!.leaseId, 'lease-0');
+  // The recovery graph is frozen.
+  assert.throws(() => (recovery.claimedKeys as ClaimKey[]).push({ gameId: 'x', market: 'spread' }));
+});
+
+test('a completed replay Skip carries detached keys and NO leases or capability', async () => {
+  const store = new ScriptedStore();
+  const result: AdmitResult = {
+    outcome: 'replayed',
+    fireStatus: 'completed',
+    claimedKeys: claimedKeys(['moneyline']),
+    dispatchAuthorized: false,
+  };
+  store.onAdmit = () => Promise.resolve(result);
+  const outcome = await new StoreClaimPort(store).admit(request());
+  assert.equal(outcome.kind, 'Skip');
+  if (outcome.kind !== 'Skip' || outcome.reason !== 'replayed_completed') throw new Error('expected replayed_completed Skip');
+  assert.equal(outcome.claimedKeys.length, 1);
+  assert.ok(!('recovery' in outcome) && !('initialLeases' in outcome));
+  // A post-return store mutation cannot alter it.
+  (result.claimedKeys as ClaimKey[]).push({ gameId: 'other', market: 'spread' });
+  (result.claimedKeys[0] as { gameId: string }).gameId = 'tampered';
+  assert.equal(outcome.claimedKeys.length, 1);
+  assert.equal(outcome.claimedKeys[0]!.gameId, GAME);
+  assert.deepEqual(store.releaseCalls, []);
+});
+
+// ===========================================================================
+// D — thrown values: a genuine wire skew rejects; everything else faults
+// ===========================================================================
+
+test('a genuine StoreWireError propagates by identity (rejects) — never a soft Fault', async () => {
+  const wire = new StoreWireError('admitDispatch', 'contract skew');
+  const store = new ScriptedStore();
+  store.onAdmit = () => Promise.reject(wire);
+  await assert.rejects(() => new StoreClaimPort(store).admit(request()), (e: unknown) => e === wire);
+  const store2 = new ScriptedStore();
+  store2.onAdmit = () => {
+    throw wire;
+  };
+  await assert.rejects(() => new StoreClaimPort(store2).admit(request()), (e: unknown) => e === wire);
+});
+
+test('every non-wire thrown value collapses to a fixed Fault without being read or formatted', async () => {
+  const hostileMessage = {
     get message(): string {
       throw new Error('hostile message getter');
     },
@@ -268,24 +413,36 @@ test('a store rejection is total — an ordinary error and a hostile non-coercib
       throw new Error('hostile toPrimitive');
     },
   };
-  for (const thrown of [new Error('ordinary'), hostile, null, undefined]) {
+  // A `getPrototypeOf`-trapping proxy and a revoked proxy each make a PLAIN `instanceof` throw.
+  const protoTrap = new Proxy(
+    {},
+    {
+      getPrototypeOf() {
+        throw new Error('getPrototypeOf trap');
+      },
+    },
+  );
+  const revocable = Proxy.revocable({}, {});
+  revocable.revoke();
+  const thrownValues: unknown[] = [
+    new Error('ordinary'),
+    hostileMessage,
+    protoTrap,
+    revocable.proxy,
+    null,
+    undefined,
+    'a primitive string',
+    42,
+  ];
+  for (const thrown of thrownValues) {
     const store = new ScriptedStore();
     store.onAdmit = () => Promise.reject(thrown);
     const outcome = await new StoreClaimPort(store).admit(request());
-    assert.equal(outcome.kind, 'Fault');
+    assert.equal(outcome.kind, 'Fault', `thrown ${typeof thrown}`);
+    assert.equal((outcome as { reason?: string }).reason, 'store_admit_failed');
     assert.ok(!('permit' in outcome));
     assert.deepEqual(store.releaseCalls, []);
   }
-});
-
-test('a synchronous store throw also faults without minting', async () => {
-  const store = new ScriptedStore();
-  store.onAdmit = () => {
-    throw new Error('sync boom');
-  };
-  const outcome = await new StoreClaimPort(store).admit(request());
-  assert.equal(outcome.kind, 'Fault');
-  assert.deepEqual(store.releaseCalls, []);
 });
 
 // ===========================================================================

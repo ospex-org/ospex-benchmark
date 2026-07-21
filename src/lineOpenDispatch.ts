@@ -355,8 +355,10 @@ export interface AuthorizePreparedDispatchInput {
 
 export type AuthorizePreparedDispatchResult =
   | { readonly kind: 'Authorized'; readonly dispatch: AuthorizedDispatch }
-  /** The claim did not authorize (rehearsal, fault, or any non-admitted outcome): nothing to
-   *  release, no dispatch. The reaction policy for these outcomes is a later slice. */
+  /** The claim did not authorize a paid dispatch — a rehearsal, a capacity `Defer` (retryable
+   *  while clean), a terminal `Skip`, or a `Fault`. This wrapper dispatches nothing and holds no
+   *  lease of its own; a pending-replay `Skip` carries its own detached release-only recovery
+   *  capability, which a later slice decides whether to invoke. */
   | { readonly kind: 'NotAdmitted'; readonly outcome: Exclude<ClaimOutcome, { kind: 'Authorized' }> };
 
 /**
@@ -431,7 +433,9 @@ export async function authorizePreparedDispatch(
   // (4) Take the claim. Only a genuine admission yields a permit + lease authority.
   const outcome = await claimPort.admit(request);
   if (outcome.kind !== 'Authorized') {
-    // No permit ⇒ no ids or ownership to act on: zero releases, zero dispatch.
+    // A non-authorized outcome is forwarded intact — it carries its own typed reason, and a
+    // pending replay carries detached keys/leases + a release-only recovery capability for a later
+    // slice. This dispatch boundary itself releases nothing and dispatches nothing.
     return { kind: 'NotAdmitted', outcome };
   }
   const permit = outcome.permit;
