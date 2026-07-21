@@ -4,13 +4,15 @@ import {
   assertClaimCompletionCapability,
   assertDispatchPermit,
   assertLeaseAuthority,
+  assertReplayPendingRecovery,
   assertReplayReleaseCapability,
   captureAdmitRequest,
   completionForPermit,
   RehearsalClaimPort,
+  replayReleaseCapabilityForRecovery,
   StoreClaimPort,
 } from './lineOpenClaim.js';
-import type { ClaimOutcome, DispatchPermit } from './lineOpenClaim.js';
+import type { ClaimOutcome, DispatchPermit, ReplayPendingRecovery } from './lineOpenClaim.js';
 import { StoreWireError } from './store/atomicStore.js';
 import type {
   AcquireRepairLeaseRequest,
@@ -370,6 +372,47 @@ test('a pending replay Skip carries detached, frozen keys + leases + a genuine r
   assert.equal(recovery.initialLeases[0]!.leaseId, 'lease-0');
   // The recovery graph is frozen.
   assert.throws(() => (recovery.claimedKeys as ClaimKey[]).push({ gameId: 'x', market: 'spread' }));
+});
+
+test('the pending-replay recovery aggregate is branded, self-identifying, and its capability is lease-set-bound', async () => {
+  const store = new ScriptedStore();
+  store.onAdmit = () =>
+    Promise.resolve({
+      outcome: 'replayed',
+      fireStatus: 'pending',
+      claimedKeys: claimedKeys(['moneyline', 'total']),
+      initialLeases: leases(3),
+      dispatchAuthorized: false,
+    });
+  const outcome = await new StoreClaimPort(store).admit(request());
+  if (outcome.kind !== 'Skip' || outcome.reason !== 'replayed_pending') throw new Error('expected replayed_pending Skip');
+  const { recovery } = outcome;
+
+  // Self-identifying with the CAPTURED admission identity (never a caller argument).
+  assert.equal(recovery.cohortId, COHORT);
+  assert.equal(recovery.fireId, FIRE);
+  assert.equal(recovery.ownerId, OWNER);
+
+  // The AGGREGATE is branded; a spread/structural copy or a Proxy wrapper is not (the brand check reads
+  // no property, so a property-trapping proxy is rejected before any field is touched).
+  assert.doesNotThrow(() => assertReplayPendingRecovery(recovery));
+  assert.throws(() => assertReplayPendingRecovery({ ...recovery }), /not minted/);
+  let proxied = 0;
+  const proxy = new Proxy(recovery, { get(t, p, r) { proxied += 1; return Reflect.get(t, p, r); } });
+  assert.throws(() => assertReplayPendingRecovery(proxy as ReplayPendingRecovery), /not minted/);
+  assert.equal(proxied, 0, 'the aggregate brand reads no property of a forged recovery');
+
+  // The capability is resolved FROM the authenticated aggregate; a forged recovery throws (propagates).
+  assert.strictEqual(replayReleaseCapabilityForRecovery(recovery), recovery.cleanup);
+  assert.throws(() => replayReleaseCapabilityForRecovery({ ...recovery }), /not minted/);
+
+  // Lease-set bound: the genuine capability REFUSES a lease id not in its own recovery BEFORE any store
+  // call — a genuine capability of one fire can never release another fire's lease under a shared owner.
+  await assert.rejects(() => recovery.cleanup.releaseLease('foreign-lease-B'), /outside its recovery/);
+  assert.deepEqual(store.releaseCalls, [], 'a foreign lease id makes zero store calls');
+  // Its own leases still release, through the captured store + owner.
+  await recovery.cleanup.releaseLease('lease-1');
+  assert.deepEqual(store.releaseCalls, [{ leaseId: 'lease-1', ownerId: OWNER }]);
 });
 
 test('a completed replay Skip carries detached keys and NO leases or capability', async () => {

@@ -200,13 +200,14 @@ export type FaultReason =
   | 'store_admit_failed';
 
 /**
- * The opaque, RELEASE-ONLY cleanup capability for a pending-replay fire. It closes over the
- * exact `AtomicStore` and the captured `ownerId`, so a consumer supplies only a lease id and
- * CANNOT substitute a different owner or store. It exposes release ONLY — never repair
- * acquisition, provider authorization, or a permit — and it is runtime-authenticated: a forged
- * or structurally-copied capability is rejected by `assertReplayReleaseCapability` before any
- * release. This slice MINTS it but never invokes it; a later slice owns the release decision
- * (`not_owner` / expiry / interruption) and drives it.
+ * The opaque, RELEASE-ONLY cleanup capability for a pending-replay fire. It closes over the exact
+ * `AtomicStore`, the captured `ownerId`, AND the exact set of the recovery's own initial lease ids, so
+ * a consumer supplies only a lease id and CANNOT substitute a different owner or store — and CANNOT
+ * release a lease outside its own recovery: a lease id not in the bound set is refused with a fixed
+ * authority error BEFORE any store call (a genuine capability of one fire can never release another
+ * fire's lease, even under a shared owner). It exposes release ONLY — never repair acquisition,
+ * provider authorization, or a permit. This slice MINTS it but never invokes it; a later slice owns the
+ * release decision (`not_owner` / expiry / interruption) and drives it.
  */
 export interface ReplayReleaseCapability {
   releaseLease(leaseId: string): Promise<ReleaseResult>;
@@ -221,11 +222,49 @@ export function assertReplayReleaseCapability(capability: ReplayReleaseCapabilit
   }
 }
 
-/** The detached recovery state a pending-replay Skip carries for a later slice to release. */
+/**
+ * The detached recovery state a pending-replay Skip carries for a later slice to release. It is
+ * SELF-IDENTIFYING (the captured `cohortId` / `fireId` / `ownerId` of the admission this recovery
+ * belongs to), deeply frozen, WeakSet-BRANDED, and privately paired to its cleanup capability — so a
+ * later consumer resolves the capability FROM the authenticated aggregate (`replayReleaseCapabilityForRecovery`)
+ * rather than trusting a `recovery.cleanup` supplied alongside a free lease list. A structural/spread
+ * copy or a `Proxy` wrapper is not branded and is rejected before any field is read.
+ */
 export interface ReplayPendingRecovery {
+  readonly cohortId: string;
+  readonly fireId: string;
+  readonly ownerId: string;
   readonly claimedKeys: readonly ClaimKey[];
   readonly initialLeases: readonly Lease[];
   readonly cleanup: ReplayReleaseCapability;
+}
+
+const replayRecoveries = new WeakSet<ReplayPendingRecovery>();
+/** The cleanup capability minted WITH each recovery — resolved from the recovery, never supplied. */
+const capabilityOfRecovery = new WeakMap<ReplayPendingRecovery, ReplayReleaseCapability>();
+
+/** Throw unless `recovery` was minted by a genuine pending-replay (forged, spread-copied, or proxied). */
+export function assertReplayPendingRecovery(recovery: ReplayPendingRecovery): void {
+  if (!replayRecoveries.has(recovery)) {
+    throw new Error('replay pending recovery was not minted by a store admission (forged or substituted)');
+  }
+}
+
+/**
+ * The cleanup capability paired WITH `recovery` — resolved from the recovery itself after
+ * authenticating the exact aggregate, never taken from a caller-supplied `recovery.cleanup`. The
+ * aggregate brand is asserted FIRST (before any field read), so a forged/crossed recovery throws here
+ * (the assertion propagates) before any release; a genuine recovery yields the capability bound to that
+ * recovery's own leases.
+ */
+export function replayReleaseCapabilityForRecovery(recovery: ReplayPendingRecovery): ReplayReleaseCapability {
+  assertReplayPendingRecovery(recovery);
+  const capability = capabilityOfRecovery.get(recovery);
+  if (capability === undefined) {
+    // Unreachable for a genuine recovery — the mint records the pairing before returning it.
+    throw new Error('no cleanup capability is mapped to this pending recovery');
+  }
+  return capability;
 }
 
 /**
@@ -366,33 +405,56 @@ function mintAdmission(
 }
 
 /**
- * Mint the detached recovery state for a pending-replay result: cloned + deeply-frozen
- * `claimedKeys` and `initialLeases` (so a later store mutation of its own returned arrays
- * cannot reach the outcome), plus a RELEASE-ONLY capability closed over the exact store and
- * captured owner. The capability exposes no repair acquisition and mints no permit, and this
- * function NEVER invokes a release — a later slice decides when a pending replay may be
- * cleaned up. Every value comes from the SAME `admitDispatch` result the caller already read.
+ * Mint the detached recovery state for a pending-replay result. Order: clone the exact claimed keys and
+ * initial leases (so a later store mutation of its own returned arrays cannot reach the outcome), build
+ * the exact allowed lease-id Set from the cloned leases, build the RELEASE-ONLY capability closed over
+ * the exact store + captured owner + that Set, build + deep-freeze the recovery with the captured
+ * identity, then BRAND the recovery and privately PAIR it to its capability. This function NEVER invokes
+ * a release — a later slice decides when a pending replay may be cleaned up. Every value comes from the
+ * SAME `admitDispatch` result the caller already read.
+ *
+ * The capability is bound to the recovery's own lease ids: a lease id not in the set is refused with a
+ * fixed authority error (the untrusted id is NEVER put in the message) before any store call, so a
+ * genuine capability can never release another fire's lease under a shared owner.
  */
 function mintReplayCleanup(
   store: AtomicStore,
   captured: CapturedAdmitRequest,
   result: { claimedKeys: readonly ClaimKey[]; initialLeases: readonly Lease[] },
 ): ReplayPendingRecovery {
+  const claimedKeys = result.claimedKeys.map((k) => ({ gameId: k.gameId, market: k.market }));
+  const initialLeases = result.initialLeases.map((l) => ({
+    leaseId: l.leaseId,
+    armIndex: l.armIndex,
+    expiresAt: l.expiresAt,
+    state: l.state,
+  }));
+  // The exact set of THIS recovery's own lease ids — unreachable to any consumer.
+  const allowedLeaseIds = new Set(initialLeases.map((l) => l.leaseId));
+
   const cleanup: ReplayReleaseCapability = Object.freeze({
-    releaseLease: (leaseId: string): Promise<ReleaseResult> =>
-      store.releaseLease({ leaseId, ownerId: captured.ownerId }),
+    releaseLease: (leaseId: string): Promise<ReleaseResult> => {
+      if (!allowedLeaseIds.has(leaseId)) {
+        // A lease outside this recovery — refuse before any store call. The untrusted id is not read
+        // into the message; only this fire's own leases can be released through this capability.
+        return Promise.reject(new Error('replay release capability was asked to release a lease outside its recovery'));
+      }
+      return store.releaseLease({ leaseId, ownerId: captured.ownerId });
+    },
   });
   replayReleaseCapabilities.add(cleanup);
-  return deepFreeze({
-    claimedKeys: result.claimedKeys.map((k) => ({ gameId: k.gameId, market: k.market })),
-    initialLeases: result.initialLeases.map((l) => ({
-      leaseId: l.leaseId,
-      armIndex: l.armIndex,
-      expiresAt: l.expiresAt,
-      state: l.state,
-    })),
+
+  const recovery: ReplayPendingRecovery = deepFreeze({
+    cohortId: captured.cohortId,
+    fireId: captured.fireId,
+    ownerId: captured.ownerId,
+    claimedKeys,
+    initialLeases,
     cleanup,
   });
+  replayRecoveries.add(recovery);
+  capabilityOfRecovery.set(recovery, cleanup); // the pairing this admission authorizes
+  return recovery;
 }
 
 /** Clone claimed keys out of a store result so a later store mutation cannot reach the outcome. */
