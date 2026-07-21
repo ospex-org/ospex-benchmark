@@ -433,7 +433,9 @@ export async function authorizePreparedDispatch(
   // (4) Take the claim. Only a genuine admission yields a permit + lease authority.
   const outcome = await claimPort.admit(request);
   if (outcome.kind !== 'Authorized') {
-    // No permit ⇒ no ids or ownership to act on: zero releases, zero dispatch.
+    // A non-authorized outcome is forwarded intact — it carries its own typed reason, and a
+    // pending replay carries detached keys/leases + a release-only recovery capability for a later
+    // slice. This dispatch boundary itself releases nothing and dispatches nothing.
     return { kind: 'NotAdmitted', outcome };
   }
   const permit = outcome.permit;

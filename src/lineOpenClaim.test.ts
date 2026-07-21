@@ -255,6 +255,25 @@ test('authorization requires admitted AND the dispatchAuthorized literal — nev
   assert.equal((skew as { reason?: string }).reason, 'admitted_without_authorization');
   assert.ok(!('permit' in skew));
 
+  // TRUTHY NON-BOOLEAN values (a skewed store, a JSON round-trip, a hostile object) must NOT
+  // authorize a paid dispatch — only the boolean `true` does. A truthiness check would wrongly
+  // authorize every one of these; the `!== true` literal gate rejects them.
+  for (const skewed of [1, 'true', {}, [], 'false', 0, null] as unknown[]) {
+    const truthyStore = new ScriptedStore();
+    truthyStore.onAdmit = () =>
+      Promise.resolve({
+        outcome: 'admitted',
+        claimedKeys: claimedKeys(['moneyline']),
+        preparedBytesDigest: 'a'.repeat(64),
+        initialLeases: leases(1),
+        dispatchAuthorized: skewed,
+      } as unknown as AdmitResult);
+    const outcome = await new StoreClaimPort(truthyStore).admit(request());
+    assert.equal(outcome.kind, 'Fault', `dispatchAuthorized=${JSON.stringify(skewed)} must not authorize`);
+    assert.equal((outcome as { reason?: string }).reason, 'admitted_without_authorization');
+    assert.ok(!('permit' in outcome), `dispatchAuthorized=${JSON.stringify(skewed)} minted no permit`);
+  }
+
   // A replay carrying a HOSTILE dispatchAuthorized:true still routes to its replay reaction,
   // never Authorized — the switch keys authorization on the admitted conjunction alone.
   const replayAuthStore = new ScriptedStore();
@@ -327,6 +346,11 @@ test('a pending replay Skip carries detached, frozen keys + leases + a genuine r
   assert.ok(!('acquireRepairLease' in recovery.cleanup));
   // Minting it released nothing — the claim port never auto-releases a pending replay.
   assert.deepEqual(store.releaseCalls, []);
+  // Binding is unit-testable: invoking the capability releases through the CAPTURED store + the
+  // CAPTURED owner (a consumer supplies only a leaseId — it cannot substitute a different owner or
+  // store). Production invocation is a later slice; a wrong-owner binding breaks this exact call.
+  await recovery.cleanup.releaseLease('lease-0');
+  assert.deepEqual(store.releaseCalls, [{ leaseId: 'lease-0', ownerId: OWNER }]);
   // A structural copy of the capability is rejected before any release.
   assert.throws(() => assertReplayReleaseCapability({ ...recovery.cleanup }), /not minted/);
   // A store mutation of its own returned arrays AFTER admit cannot alter the outcome.

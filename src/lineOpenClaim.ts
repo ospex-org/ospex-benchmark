@@ -124,9 +124,11 @@ export function leaseAuthorityForPermit(permit: DispatchPermit): AdmissionLeaseA
 // ---------------------------------------------------------------------------
 
 /**
- * A capacity refusal — the candidate stays clean and MAY be retried on a later tick. Never
- * terminal: turning a transient capacity refusal into a permanent loss would burn a live
- * speculation that self-heals as sibling reservations settle.
+ * A capacity refusal — the candidate stays clean and MAY be retried on a later tick, never
+ * terminal: turning it into a permanent loss would burn a live speculation. A call/spend
+ * reservation MAY settle downward as siblings complete, but an omitted actual spend keeps the
+ * full reservation, so a spend refusal is not guaranteed to clear; deferral is bounded by the
+ * clean-window / cutoff policy — the scheduler stops retrying once the candidate is no longer clean.
  */
 export type DeferReason = 'call_cap' | 'spend_cap' | 'concurrency';
 
@@ -398,10 +400,11 @@ export class StoreClaimPort implements ClaimPort {
   private classify(captured: CapturedAdmitRequest, result: AdmitResult): ClaimOutcome {
     switch (result.outcome) {
       case 'admitted': {
-        // The sole paid gate is the conjunction — the outcome AND the literal `true`. Widen to
-        // boolean so a runtime-skew store returning `false` is caught (the type says `true`).
-        const authorized: boolean = result.dispatchAuthorized;
-        if (!authorized) {
+        // The sole paid gate is the conjunction — the outcome AND the literal `true`. The type
+        // annotation is erased at runtime, so compare by STRICT IDENTITY, never truthiness: a
+        // skewed store returning a truthy non-boolean (`1`, `"true"`, `{}`, `[]`) must NOT
+        // authorize a paid dispatch — only the boolean `true` does.
+        if (result.dispatchAuthorized !== true) {
           return { kind: 'Fault', reason: 'admitted_without_authorization' };
         }
         return { kind: 'Authorized', ...mintAdmission(this.store, captured, result) };
