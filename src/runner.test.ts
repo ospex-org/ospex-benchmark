@@ -4,6 +4,7 @@ import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { prepareGameRequest } from './preparedRequest.js';
 import { runOneArmGame, runSlate } from './runner.js';
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
+import { CODE_MAX_REPAIRS_PER_ARM } from './repairPolicy.js';
 import type { ArmSpec,
   BenchmarkResponse,
   ChatTurn,
@@ -147,6 +148,23 @@ test('an invalid_schema outcome leaves acceptedAt null on every attempt', async 
   assert.equal(result.outcome, 'invalid_schema');
   assert.equal(result.attempt.acceptedAt, null);
   assert.equal(result.repair?.acceptedAt, null);
+});
+
+test('the runner exhausts exactly CODE_MAX_REPAIRS_PER_ARM repair(s) on a fingerprintable-invalid arm', async () => {
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  // The initial response is schema-invalid but yields a complete decision fingerprint,
+  // so a repair IS dispatched; the repair response stays invalid, so the permitted
+  // repair budget is exhausted and the outcome remains a truthful invalid.
+  const adapter = stubAdapter([
+    async () => stubResponse(wrongEcho(makeValidResponse(request))),
+    async () => stubResponse(wrongEcho(makeValidResponse(request))),
+  ]);
+  const result = await runOneArmGame(TEST_ARM, adapter, request, baseOptions(() => CUTOFF_MS - 60_000));
+  assert.equal(result.outcome, 'invalid_schema');
+  assert.equal(result.repairUsed, true);
+  const repairCalls = adapter.calls.length - 1; // total adapter calls minus the one initial call
+  assert.equal(repairCalls, CODE_MAX_REPAIRS_PER_ARM);
+  assert.equal(repairCalls, 1);
 });
 
 test('repair crossing the cutoff: cutoff_missed even though the repaired content is valid', async () => {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, BASELINE_POLICY_VERSIONS, isBaselinePolicyVersion } from './baselines.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
+import { REPAIR_POLICY_VERSION, REPAIR_POLICY_VERSIONS, isRepairPolicyVersion } from './repairPolicy.js';
 import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
 import { cohortId, parseManifest } from './manifest.js';
 import { validateManifestAgainstCode } from './manifestValidate.js';
@@ -42,7 +43,7 @@ function codeConsistentRaw(): Record<string, unknown> {
     // policy. The full-board default (BASELINE_POLICY_VERSION = v0.2) is refused
     // by the dynamic-cohort gate below.
     baselinePolicyVersion: 'baselines-v0.3.0',
-    repairPolicyVersion: 'repair-v1',
+    repairPolicyVersion: REPAIR_POLICY_VERSION,
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
@@ -102,6 +103,43 @@ test('unknown modelPriceTableVersion is flagged, and does not also produce a dig
 test('modelPriceTableDigest mismatch is flagged (wires to the recomputed digest)', () => {
   const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), modelPriceTableDigest: 'c'.repeat(64) }));
   assert.ok(v.some((s) => /modelPriceTableDigest mismatch/.test(s)), v.join('; '));
+});
+
+test('a code-consistent manifest has no repair-policy violation', () => {
+  const v = validateManifestAgainstCode(parse(codeConsistentRaw()));
+  assert.ok(!v.some((s) => /repairPolicyVersion|does not match code repair capability/.test(s)), v.join('; '));
+});
+
+test('unknown repairPolicyVersion is flagged', () => {
+  const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), repairPolicyVersion: 'repair-v2' }));
+  assert.ok(v.some((s) => s === 'unknown repairPolicyVersion "repair-v2"'), v.join('; '));
+});
+
+test('maxRepairAttemptsPerArm must equal the code repair capability (1)', () => {
+  for (const cap of [0, 2]) {
+    const raw = codeConsistentRaw();
+    (raw.constants as Record<string, unknown>).maxRepairAttemptsPerArm = cap;
+    const v = validateManifestAgainstCode(parse(raw));
+    assert.ok(
+      v.some((s) => s === `maxRepairAttemptsPerArm (${cap}) does not match code repair capability (1)`),
+      `cap ${cap}: ${v.join('; ')}`,
+    );
+  }
+  // The code-consistent cap of 1 produces no mismatch.
+  const ok = validateManifestAgainstCode(parse(codeConsistentRaw()));
+  assert.ok(!ok.some((s) => /does not match code repair capability/.test(s)), ok.join('; '));
+});
+
+test('an unknown repair version AND a wrong cap are BOTH reported (independent checks)', () => {
+  const raw = codeConsistentRaw();
+  raw.repairPolicyVersion = 'repair-v2';
+  (raw.constants as Record<string, unknown>).maxRepairAttemptsPerArm = 2;
+  const v = validateManifestAgainstCode(parse(raw));
+  assert.ok(v.some((s) => s === 'unknown repairPolicyVersion "repair-v2"'), v.join('; '));
+  assert.ok(
+    v.some((s) => s === 'maxRepairAttemptsPerArm (2) does not match code repair capability (1)'),
+    v.join('; '),
+  );
 });
 
 test('unknown baselinePolicyVersion is flagged', () => {
@@ -230,6 +268,9 @@ test('canonical registries are frozen — no post-preflight mutation drifts beha
   assert.throws(() => {
     (MARKETS as unknown as { length: number }).length = 1;
   });
+  // (f) append a fake repair-policy version — frozen → throws; membership unchanged.
+  assert.throws(() => (REPAIR_POLICY_VERSIONS as unknown as string[]).push('repair-v2'));
+  assert.equal(isRepairPolicyVersion('repair-v2'), false);
 
   // Nothing drifted: registries, known-version membership, cohortId, re-preflight.
   assert.equal(ARMS[0]!.requestedModelId, armModelBefore);

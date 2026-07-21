@@ -5,6 +5,7 @@ import { CohortBootError, cohortBoot } from './cohortBoot.js';
 import type { CanonicalOverrides } from './cohortBoot.js';
 import { cohortId, parseManifest } from './manifest.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
+import { REPAIR_POLICY_VERSION } from './repairPolicy.js';
 import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
@@ -50,7 +51,7 @@ function codeConsistentRaw(): Record<string, unknown> {
     // policy; the full-board default (BASELINE_POLICY_VERSION = v0.2) is refused by
     // the dynamic-cohort gate (see the boot-refusal test below).
     baselinePolicyVersion: 'baselines-v0.3.0',
-    repairPolicyVersion: 'repair-v1',
+    repairPolicyVersion: REPAIR_POLICY_VERSION,
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
     modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
@@ -96,6 +97,22 @@ test('a known price version with a wrong price digest fails cohortBoot (semantic
     () => cohortBoot(req(raw)),
     (e: unknown) => e instanceof CohortBootError && /modelPriceTableDigest mismatch/.test(e.message),
   );
+});
+
+test('cohortBoot rejects a maxRepairAttemptsPerArm that disagrees with the code repair capability', () => {
+  for (const cap of [0, 2]) {
+    const raw = codeConsistentRaw();
+    (raw.constants as Record<string, unknown>).maxRepairAttemptsPerArm = cap;
+    assert.throws(
+      () => cohortBoot(req(raw)),
+      (e: unknown) =>
+        e instanceof CohortBootError &&
+        e.message.includes(`maxRepairAttemptsPerArm (${cap}) does not match code repair capability (1)`),
+      `cap ${cap}`,
+    );
+  }
+  // The code-consistent cap of 1 continues to boot.
+  assert.doesNotThrow(() => cohortBoot(req(codeConsistentRaw())));
 });
 
 test('--live is hard-disabled — refused BEFORE the manifest is even parsed', () => {

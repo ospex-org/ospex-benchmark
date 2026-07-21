@@ -1,6 +1,7 @@
 import type { CohortManifestV1 } from './manifest.js';
 import { isMarketPolicyVersion, marketPolicyDigest } from './marketPolicy.js';
 import { isModelPriceTableVersion, modelPriceTableDigest } from './modelPriceTable.js';
+import { CODE_MAX_REPAIRS_PER_ARM, isRepairPolicyVersion } from './repairPolicy.js';
 import { isBaselinePolicyVersion, supportsScopedInput } from './baselines.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
@@ -20,8 +21,8 @@ import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
  *
  * Deliberately NOT checked (no code module exists yet — validated when their
  * module lands): `sourceQueryVersion` (its finalizer/history predicate is a
- * later PR), `toolInferenceConfigSha256`, `repairPolicyVersion`, and
- * `uncertaintyPolicyVersion`. Credential presence is a live/boot concern
+ * later PR), `toolInferenceConfigSha256`, and `uncertaintyPolicyVersion`.
+ * Credential presence is a live/boot concern
  * (network), not this pure check.
  */
 export function validateManifestAgainstCode(manifest: CohortManifestV1): string[] {
@@ -51,6 +52,21 @@ export function validateManifestAgainstCode(manifest: CohortManifestV1): string[
         `modelPriceTableDigest mismatch: manifest "${manifest.modelPriceTableDigest}" != recomputed "${recomputed}"`,
       );
     }
+  }
+
+  // Repair policy: known version, AND the manifest's max-repairs cap must equal the
+  // runner's audited one-repair capability. The store's call reservation and the
+  // spend estimator both derive from `maxRepairAttemptsPerArm`, so a divergent cap
+  // would mis-reserve. The two checks are independent — an unknown version does not
+  // suppress the cap check, and vice versa.
+  if (!isRepairPolicyVersion(manifest.repairPolicyVersion)) {
+    violations.push(`unknown repairPolicyVersion "${manifest.repairPolicyVersion}"`);
+  }
+  if (manifest.constants.maxRepairAttemptsPerArm !== CODE_MAX_REPAIRS_PER_ARM) {
+    violations.push(
+      `maxRepairAttemptsPerArm (${manifest.constants.maxRepairAttemptsPerArm}) ` +
+        `does not match code repair capability (${CODE_MAX_REPAIRS_PER_ARM})`,
+    );
   }
 
   // Baseline policy: known version (baselines carry no digest concept), then the
