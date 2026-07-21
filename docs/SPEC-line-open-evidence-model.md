@@ -556,6 +556,46 @@ persistence order above (claim/reserve → dispatch → persist artifact → set
   canonical evidence root. The install boundary is awaitable so such a sink drops in without
   reopening the completion ordering.
 
+### Pending-replay cleanup (recovery mechanics)
+
+A re-submitted dispatch whose claim already exists as `pending` returns a replay outcome that retains
+the pending fire's initial concurrency leases (§4 above; SPEC-atomic-store §4.1/§5). A best-effort
+helper can release those leases through the replay's own release-only authority, but the semantics are
+narrow and safety-load-bearing:
+
+- **A pending replay is ambiguous.** It proves only that a prior admission with this `fireId` committed
+  and that this retry is not authorized to dispatch. It does **not** prove same owner, one process, that
+  no provider call started, that the original worker is dead, or that the artifact is absent — the
+  fire-id preimage excludes owner identity, and the store is expressly cross-process, so the same
+  `fireId` can be produced by two workers.
+- **Release requires known-no-dispatch, same-owner provenance.** Releasing a pending fire's leases is
+  safe **only** for an explicit retry of a prior same-owner admission attempt that received no dispatch
+  authority, started no provider call, and whose original invocation has terminated and can never later
+  start a call. Releasing while the original invocation may still dispatch (after admission commits but
+  before its first call) or holds an active call over-admits past the concurrency ceiling. Establishing
+  that provenance is the coordinator's obligation; if any fact is uncertain, perform **zero** release
+  and let store-clock expiry recover capacity.
+- **Owner-token lifetime.** A concurrency owner token is allocated per canonical fire execution, unique
+  across concurrently live executions, and reused only for an explicit retry of that exact execution. A
+  process restart/deploy uses a fresh owner and normally receives `not_owner`; capacity then recovers at
+  the store-clock `expiresAt`. Prompt cross-restart release would require a separately specified fenced
+  takeover mechanism and is out of scope.
+- **A `released` result is an acknowledgement, not a freed slot.** The store's release is idempotent, so
+  an unknown, already-released, or expired lease can also acknowledge `released`. The only authoritative
+  capacity state is the store's capacity query; a released acknowledgement is never reported as capacity
+  freed.
+- **No current canonical caller.** The release helper is non-activating; the safe-invocation predicate
+  belongs to the loop/coordinator, and activation wiring is blocked until that predicate and its tests
+  land. The safe default everywhere is store-clock expiry.
+- **Completion reconciliation is a separate, named activation decision.** Reconciling an
+  installed-but-unconfirmed fire can release only unused **call-reservation** headroom down to the
+  store-known `made_calls` floor. Because `actualSpendUsdMicros` remains omitted, the full conservative
+  fixed-attempt spend reservation remains consumed — this operation does **not** reclaim spend. It is
+  durable artifact-backed reconciliation: it must verify durable exact-artifact evidence before any
+  idempotent completion and must never settle a genuinely crashed-before-install fire. If it is deferred
+  at the first canary, an `unsettled` fire hard-stops/escalates to an operator flow rather than silently
+  consuming the call cap.
+
 ## 5. Per-fire entry verification and arm provenance
 
 ### Entry verification
