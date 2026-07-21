@@ -2,6 +2,8 @@ import { assertPreparedFireSnapshot, deriveRunId } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
 import { assertDispatchPermit } from './lineOpenClaim.js';
 import type { ClaimPort, DispatchPermit } from './lineOpenClaim.js';
+import { settleCompletedFire } from './fireSettlement.js';
+import type { CompletionStatus } from './fireSettlement.js';
 import { authorizePreparedDispatch, scopeKeyOf } from './lineOpenDispatch.js';
 import type { AuthorizePreparedDispatchResult } from './lineOpenDispatch.js';
 import { runAuthorizedDispatch } from './runner.js';
@@ -16,20 +18,27 @@ import type { MarketKey, ProviderAdapter } from './types.js';
 import type { AdmitDispatchRequest, ClaimKey } from './store/contract.js';
 
 /**
- * The composition spine (F5a S4): the single thin entry that runs ONE sealed fire end to end —
- * admit, authorize, dispatch, produce, reconcile, install — and returns a typed outcome.
+ * The composition spine: the single thin entry that runs ONE sealed fire end to end — admit,
+ * authorize, dispatch, produce, reconcile, install, settle — and returns a typed outcome.
  *
  * Every stage it calls is already merged and already fail-closed by its own brand: this module
  * mints no permit, plan, dispatch, artifact, or lease authority, and holds no store, provider, or
  * filesystem of its own. Its only genuinely new logic is (a) DERIVING the full-scope admission
- * request from the sealed snapshot, and (b) the permit↔artifact RECONCILIATION the durable sink
+ * request from the sealed snapshot, (b) the permit↔artifact RECONCILIATION the durable sink
  * reserves for "a later slice's thin authorized wrapper" — the check that the fire we admitted is
- * the fire we are about to persist. The sink deliberately never sees a permit, and the producer
- * never sees one either, so nothing else in the pipeline compares the admission's identity to the
+ * the fire we are about to persist — and (c) settling the claim exactly once, strictly AFTER the
+ * artifact is durably installed. The sink deliberately never sees a permit, and the producer never
+ * sees one either, so nothing else in the pipeline compares the admission's identity to the
  * artifact's; this module is where those two independently-derived paths meet.
  *
- * S4 stays non-activating: nothing schedules `runOneFire`, no CLI/watcher/smoke calls it, and it
- * touches no `--live` path. It settles no claim — completion is a later slice's owner.
+ * This stays non-activating: nothing schedules `runOneFire`, no CLI/watcher/smoke calls it, and it
+ * touches no `--live` path. It settles the claim only through the permit-resolved completion
+ * capability, and it folds any settle failure to a typed `unsettled` completion that never discards
+ * the persisted artifact — an activation consumer must branch on `completion.status` and escalate
+ * `unsettled` (a later recovery slice re-settles an aged `unsettled` fire against durable
+ * exact-artifact proof). Canonical persistence must survive the production host lifecycle: the local
+ * filesystem sink is crash-consistent only on a persistent POSIX filesystem, so a durable
+ * external/mounted sink — not dyno-local files — is the canonical evidence root at activation.
  */
 
 // ---------------------------------------------------------------------------
@@ -47,9 +56,21 @@ export interface LineOpenAdmissionParameters {
  *  caller can never point the runner at a cohort other than the one the store authorized. */
 export type LineOpenRunOptions = Omit<SlateRunOptions, 'cohortId'>;
 
-/** Exactly the sink capability the spine needs — the single `install` method, nothing else. */
-export type ArtifactInstaller = Pick<FireArtifactSink, 'install'>;
+/** The resolved outcome of one durable install: the canonical path and whether THIS call created it. */
 export type ArtifactInstallResult = ReturnType<FireArtifactSink['install']>;
+
+/**
+ * Exactly the sink capability the spine needs — the single `install` method, nothing else. Its return
+ * may be synchronous or a promise: the local filesystem sink resolves synchronously, but a durable
+ * external/object sink is normally asynchronous. The spine awaits the install, so completion ordering
+ * holds for either — a pending install promise must resolve before settlement begins, and it must
+ * never run before an install that could still reject. A dyno-local filesystem is not canonical durable
+ * evidence (see the module header); the awaitable seam lets a reviewed durable sink drop in later
+ * without reopening the ordering.
+ */
+export interface ArtifactInstaller {
+  install(artifact: FireArtifactV1): ArtifactInstallResult | Promise<ArtifactInstallResult>;
+}
 
 /** The eight independently-derived dimensions on which a produced artifact must agree with the
  *  admission permit, in the fixed order the error reports them. */
@@ -90,8 +111,10 @@ export class FireReconciliationError extends Error {
   }
 }
 
-/** A non-authorizing admission is returned by identity; a successful fire returns its narrow
- *  Installed result. No envelope, completion status, pricing actual, or raw model response. */
+/** A non-authorizing admission is returned by identity; a successful fire returns its narrow Installed
+ *  result — the durable artifact plus the store-settlement status. `kind: 'Installed'` describes durable
+ *  artifact presence; `completion.status` independently describes whether the store settled the claim.
+ *  No envelope, pricing actual, or raw model response. */
 export type LineOpenFireOutcome =
   | Extract<AuthorizePreparedDispatchResult, { kind: 'NotAdmitted' }>
   | {
@@ -99,6 +122,7 @@ export type LineOpenFireOutcome =
       readonly permit: DispatchPermit;
       readonly artifact: FireArtifactV1;
       readonly install: ArtifactInstallResult;
+      readonly completion: CompletionStatus;
     };
 
 export interface RunOneFireInput {
@@ -286,13 +310,13 @@ export function reconcileArtifactToPermit(artifact: FireArtifactV1, permit: Disp
  * sink's parse both depend on it), a sink throw propagates unchanged, and a `{created:false}`
  * idempotent result is returned as-is.
  */
-export function installReconciledArtifact(
+export async function installReconciledArtifact(
   artifact: FireArtifactV1,
   permit: DispatchPermit,
   sink: ArtifactInstaller,
-): ArtifactInstallResult {
+): Promise<ArtifactInstallResult> {
   reconcileArtifactToPermit(artifact, permit);
-  return sink.install(artifact);
+  return await sink.install(artifact);
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +431,12 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
   };
 
   const artifact = buildFireArtifact(envelope, ctx);
-  const installed = installReconciledArtifact(artifact, permit, capturedInstaller);
-  return { kind: 'Installed', permit, artifact, install: installed };
+  const installed = await installReconciledArtifact(artifact, permit, capturedInstaller);
+  // Only after the artifact is durably installed does this run settle the claim exactly once. A settle
+  // refusal or throw NEVER discards the persisted artifact: it folds to a typed `unsettled` completion
+  // (the claim stays pending and its reservation conservatively consumed) for an activation consumer to
+  // escalate. Install throwing/rejecting propagates BEFORE this line, so settlement never runs for a
+  // fire whose evidence did not persist.
+  const completion = await settleCompletedFire(permit);
+  return { kind: 'Installed', permit, artifact, install: installed, completion };
 }

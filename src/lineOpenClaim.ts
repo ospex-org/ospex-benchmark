@@ -5,6 +5,7 @@ import type {
   AdmitResult,
   AtomicStore,
   ClaimKey,
+  CompleteResult,
   Lease,
   ReleaseResult,
   RepairLeaseResult,
@@ -117,6 +118,56 @@ export function leaseAuthorityForPermit(permit: DispatchPermit): AdmissionLeaseA
     throw new Error('no lease authority is mapped to this permit');
   }
   return authority;
+}
+
+// ---------------------------------------------------------------------------
+// The same-admission completion capability
+// ---------------------------------------------------------------------------
+
+/**
+ * The opaque, SETTLE-ONLY completion capability of ONE admission. It closes over the exact
+ * `AtomicStore` and the captured `cohortId` / `fireId` / `expectedSchemaVersion`, and its single
+ * `complete()` settles this fire's claim through the durable store. It carries no owner and no
+ * actuals: the settle omits both `actualCalls` — the store settles calls to its own persisted
+ * attempts-started floor — and `actualSpendUsdMicros` — the fixed-attempt reservation is a
+ * conservative administrative ceiling the store cannot resolve to exact provider spend — so the
+ * request has exactly those three own keys.
+ *
+ * Minted together with the permit and paired to it privately, so a consumer resolves it from the
+ * permit (`completionForPermit`) rather than trusting a supplied value. It is never carried on the
+ * lease authority or the authorized dispatch, so the attempt lifecycle is not handed a way to settle a
+ * fire before its evidence is durably installed. Holding the permit and calling the exported resolver
+ * is a latent capability under the trusted single-process model (the same posture as
+ * `leaseAuthorityForPermit`), not a structural impossibility.
+ */
+export interface ClaimCompletionCapability {
+  complete(): Promise<CompleteResult>;
+}
+
+const completionCapabilities = new WeakSet<ClaimCompletionCapability>();
+/** The completion capability minted WITH each permit — resolved from the permit, never supplied. */
+const completionOfPermit = new WeakMap<DispatchPermit, ClaimCompletionCapability>();
+
+/** Throw unless `capability` was minted by a genuine store admission (forged or substituted). */
+export function assertClaimCompletionCapability(capability: ClaimCompletionCapability): void {
+  if (!completionCapabilities.has(capability)) {
+    throw new Error('claim completion capability was not minted by a store admission (forged or substituted)');
+  }
+}
+
+/**
+ * The completion capability minted WITH `permit` — resolved from the permit itself, never taken from a
+ * caller-supplied value, exactly like `leaseAuthorityForPermit`. The permit brand is asserted first, so
+ * a forged or substituted permit throws here (the assertion propagates) before any settle is attempted.
+ */
+export function completionForPermit(permit: DispatchPermit): ClaimCompletionCapability {
+  assertDispatchPermit(permit);
+  const capability = completionOfPermit.get(permit);
+  if (capability === undefined) {
+    // Unreachable for a genuine permit — the mint records the pairing before returning it.
+    throw new Error('no completion capability is mapped to this permit');
+  }
+  return capability;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +346,21 @@ function mintAdmission(
   });
   leaseAuthorities.add(leaseAuthority);
   authorityOfPermit.set(permit, leaseAuthority); // the pairing this admission authorizes
+
+  // The same-admission completion capability: settle-only, closed over the exact store + captured
+  // identity, paired privately to the permit. Built here (the sole store×captured meeting point) but
+  // NOT returned onto the authorized outcome — the spine resolves it from the permit after install.
+  // The request has exactly three own keys; both actuals are omitted (never an explicit `undefined`).
+  const completion: ClaimCompletionCapability = Object.freeze({
+    complete: (): Promise<CompleteResult> =>
+      store.completeClaim({
+        cohortId: captured.cohortId,
+        fireId: captured.fireId,
+        expectedSchemaVersion: captured.expectedSchemaVersion,
+      }),
+  });
+  completionCapabilities.add(completion);
+  completionOfPermit.set(permit, completion);
 
   return { permit, leaseAuthority };
 }

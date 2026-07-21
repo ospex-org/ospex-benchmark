@@ -19,7 +19,7 @@ import {
   reconcileArtifactToPermit,
   runOneFire,
 } from './lineOpenSpine.js';
-import type { ArtifactInstaller, LineOpenAdmissionParameters, LineOpenRunOptions } from './lineOpenSpine.js';
+import type { ArtifactInstaller, ArtifactInstallResult, LineOpenAdmissionParameters, LineOpenRunOptions } from './lineOpenSpine.js';
 import { assertFireArtifact, buildFireArtifact } from './fireArtifactProducer.js';
 import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import { FireArtifactSink, nodeArtifactFs } from './fireArtifactSink.js';
@@ -286,8 +286,13 @@ class ScriptedStore implements AtomicStore {
     this.calls.push({ op: 'release', leaseId: req.leaseId, ownerId: req.ownerId });
     return this.onRelease(req);
   }
-  completeClaim(_r: CompleteClaimRequest): Promise<CompleteResult> {
-    throw new Error('completeClaim must never be called by S4');
+  /** Recorded + scriptable: the spine now settles exactly once, strictly after a durable install, so
+   *  the throwing "never call" stub is replaced. Every pre-install path still asserts zero calls. */
+  readonly completeCalls: CompleteClaimRequest[] = [];
+  onComplete: (req: CompleteClaimRequest) => Promise<CompleteResult> = () => Promise.resolve({ outcome: 'completed' });
+  completeClaim(req: CompleteClaimRequest): Promise<CompleteResult> {
+    this.completeCalls.push(req);
+    return this.onComplete(req);
   }
 }
 
@@ -374,6 +379,34 @@ function countingSink(real: ArtifactInstaller): ArtifactInstaller & { calls: Arr
       return result;
     },
   };
+}
+
+/** An installer whose `install` returns a caller-controlled pending promise and signals when reached —
+ *  so a test can observe that settlement does not run while the install is still in flight. */
+function deferredInstaller(): {
+  installer: ArtifactInstaller;
+  reached: Promise<void>;
+  resolve: (r: ArtifactInstallResult) => void;
+  reject: (e: unknown) => void;
+  installCalls: () => number;
+} {
+  let signalReached!: () => void;
+  const reached = new Promise<void>((res) => { signalReached = res; });
+  let resolveFn!: (r: ArtifactInstallResult) => void;
+  let rejectFn!: (e: unknown) => void;
+  let installCalls = 0;
+  const installer: ArtifactInstaller = {
+    install() {
+      installCalls += 1;
+      const pending = new Promise<ArtifactInstallResult>((res, rej) => {
+        resolveFn = res;
+        rejectFn = rej;
+      });
+      signalReached();
+      return pending;
+    },
+  };
+  return { installer, reached, resolve: (r) => resolveFn(r), reject: (e) => rejectFn(e), installCalls: () => installCalls };
 }
 
 /** The full happy-path harness for one fire, over an injected in-memory filesystem. */
@@ -489,6 +522,10 @@ test('one fire runs admit->authorize->dispatch->produce->reconcile->install exac
   assert.strictEqual(outcome.artifact, sink.calls[0]!.arg, 'installed artifact is the produced object');
   assert.strictEqual(outcome.install, sink.calls[0]!.result, 'returned install is the sink result');
   assert.doesNotThrow(() => assertFireArtifact(outcome.artifact));
+
+  // The claim is settled exactly once, AFTER the install, and reports settled.
+  assert.equal(store.completeCalls.length, 1, 'exactly one settle on the installed path');
+  assert.deepEqual(outcome.completion, { status: 'settled' }, 'a completed store settle reports settled');
 });
 
 // ===========================================================================
@@ -756,6 +793,7 @@ test('an admitted narrowed scope propagates the refusal and releases every lease
   assert.equal(new Set(releaseIds(store)).size, expectedLeaseIds.length, 'distinct lease IDs');
   assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0, 'no adapter called');
   assert.equal(sink.calls.length, 0, 'nothing installed');
+  assert.equal(store.completeCalls.length, 0, 'a fire that never installed is never settled');
 });
 
 test('a narrowed scope whose cleanup also fails surfaces the cleanup error, installs nothing', async () => {
@@ -790,6 +828,7 @@ test('a narrowed scope whose cleanup also fails surfaces the cleanup error, inst
     },
   );
   assert.equal(sink.calls.length, 0);
+  assert.equal(store.completeCalls.length, 0, 'a fire that never installed is never settled');
 });
 
 // ===========================================================================
@@ -824,6 +863,7 @@ test('a dispatch fault propagates and installs nothing', async () => {
     },
   );
   assert.equal(sink.calls.length, 0, 'a fire that could not dispatch leaves no record');
+  assert.equal(store.completeCalls.length, 0, 'a dispatch fault never settles');
   // Every launched arm settled and every expected initial-lease release was attempted exactly once.
   const dispatchLeaseIds = snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`).sort();
   assert.deepEqual([...releaseIds(store)].sort(), dispatchLeaseIds, 'every arm attempted its release');
@@ -847,6 +887,7 @@ test('a producer failure after dispatch leaves leases settled and installs nothi
   );
   assert.deepEqual([...releaseIds(store)].sort(), snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`).sort(), 'all leases already released');
   assert.equal(sink.calls.length, 0, 'no install after a producer failure');
+  assert.equal(store.completeCalls.length, 0, 'a producer failure before install never settles');
 });
 
 // ===========================================================================
@@ -1003,24 +1044,35 @@ test('installReconciledArtifact installs nothing on a mismatch and the exact art
   const diffGame = await installedFire({ gameId: GAME_ID2 });
   const spy = { calls: [] as FireArtifactV1[], install(a: FireArtifactV1) { this.calls.push(a); return { path: '/sentinel', created: true } as const; } };
 
-  assert.throws(() => installReconciledArtifact(base.artifact, diffGame.permit, spy), FireReconciliationError);
+  // Reconciliation throws synchronously; the async wrapper surfaces it as a rejection.
+  await assert.rejects(() => installReconciledArtifact(base.artifact, diffGame.permit, spy), FireReconciliationError);
   assert.equal(spy.calls.length, 0, 'no install on a mismatch');
 
-  const result = installReconciledArtifact(base.artifact, base.permit, spy);
+  const result = await installReconciledArtifact(base.artifact, base.permit, spy);
   assert.equal(spy.calls.length, 1, 'exactly one install on a match');
   assert.strictEqual(spy.calls[0], base.artifact, 'the exact artifact object is installed');
-  assert.strictEqual(result, spy.calls.length === 1 ? result : result, 'result returned'); // identity checked below
+  assert.deepEqual(result, { path: '/sentinel', created: true }, 'the exact sink result is returned');
 });
 
-test('installReconciledArtifact returns the exact sink result and propagates a sink throw', async () => {
+test('installReconciledArtifact returns the exact sink result, awaits an async sink, and propagates a sink throw', async () => {
   const { artifact, permit } = await installedFire();
   const sentinelResult = { path: '/x', created: false } as const;
   const okSink = { install: () => sentinelResult };
-  assert.strictEqual(installReconciledArtifact(artifact, permit, okSink), sentinelResult);
+  assert.strictEqual(await installReconciledArtifact(artifact, permit, okSink), sentinelResult);
+
+  // An asynchronous installer is awaited; its resolved value is returned by identity.
+  const asyncResult = { path: '/async', created: true } as const;
+  const asyncSink = { install: () => Promise.resolve(asyncResult) };
+  assert.strictEqual(await installReconciledArtifact(artifact, permit, asyncSink), asyncResult);
 
   const boom = new Error('sink exploded');
   const throwing = { install: () => { throw boom; } };
-  assert.throws(() => installReconciledArtifact(artifact, permit, throwing), (e) => e === boom);
+  await assert.rejects(() => installReconciledArtifact(artifact, permit, throwing), (e) => e === boom);
+
+  // An asynchronous installer REJECTION propagates unchanged (never swallowed).
+  const asyncBoom = new Error('async sink exploded');
+  const asyncThrowing = { install: () => Promise.reject(asyncBoom) };
+  await assert.rejects(() => installReconciledArtifact(artifact, permit, asyncThrowing), (e) => e === asyncBoom);
 });
 
 // ===========================================================================
@@ -1031,9 +1083,9 @@ test('a second install of the same genuine artifact returns created:false, byte-
   const { artifact, permit } = await installedFire();
   const fs = new MemoryFs();
   const sink = new FireArtifactSink('/base', fs);
-  const first = installReconciledArtifact(artifact, permit, sink);
+  const first = await installReconciledArtifact(artifact, permit, sink);
   assert.equal(first.created, true);
-  const second = installReconciledArtifact(artifact, permit, sink);
+  const second = await installReconciledArtifact(artifact, permit, sink);
   assert.equal(second.created, false);
   assert.equal(second.path, first.path);
   assert.ok(fs.readFile(first.path).equals(Buffer.from(serializeFireArtifactV1(artifact), 'utf8')));
@@ -1041,14 +1093,105 @@ test('a second install of the same genuine artifact returns created:false, byte-
 });
 
 // ===========================================================================
+// settle-once completion
+// ===========================================================================
+
+test('a store completion refusal folds to unsettled and NEVER discards the installed artifact', async () => {
+  for (const reason of ['version_mismatch', 'invariant_breach', 'invalid_input'] as const) {
+    const store = new ScriptedStore(CODE_ARMS.length);
+    store.onComplete = () => Promise.resolve({ outcome: 'refused', reason });
+    const { outcome, sink } = await fireOf({ store });
+    assert.equal(outcome.kind, 'Installed', `${reason}: the durably-installed fire is preserved`);
+    if (outcome.kind !== 'Installed') return;
+    assert.deepEqual(outcome.completion, { status: 'unsettled', reason }, `${reason}: exact typed unsettled reason`);
+    assert.equal(outcome.install.created, true, `${reason}: the artifact was durably installed`);
+    assert.equal(sink.calls.length, 1, `${reason}: installed exactly once`);
+    assert.equal(store.completeCalls.length, 1, `${reason}: settle attempted once`);
+  }
+});
+
+test('a store completion throw folds to unsettled/store_complete_failed, keeps the artifact, and never reads the value', async () => {
+  const store = new ScriptedStore(CODE_ARMS.length);
+  let touched = false;
+  const hostile = new Proxy(
+    {},
+    {
+      get() {
+        touched = true;
+        throw new Error('the thrown completion value must never be read');
+      },
+    },
+  );
+  store.onComplete = () => Promise.reject(hostile);
+  const { outcome, sink } = await fireOf({ store });
+  assert.equal(outcome.kind, 'Installed');
+  if (outcome.kind !== 'Installed') return;
+  assert.deepEqual(outcome.completion, { status: 'unsettled', reason: 'store_complete_failed' });
+  assert.equal(outcome.install.created, true, 'the artifact was durably installed');
+  assert.equal(sink.calls.length, 1);
+  assert.equal(touched, false, 'the thrown completion value was never read or formatted');
+});
+
+test('settlement runs exactly once, strictly after the install resolves; a pending or rejected install never settles', async () => {
+  // Resolve path: while the install promise is pending there is no settle; after it resolves, exactly one.
+  {
+    const snapshot = sealed();
+    const cohortId = snapshot.booted.cohortId;
+    const game = scopedGame(GAME_ID, BOTH);
+    const { map } = validAdapters(snapshot, cohortId, game);
+    const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+    const d = deferredInstaller();
+    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION });
+    await d.reached;
+    assert.equal(d.installCalls(), 1, 'install reached exactly once');
+    assert.equal(store.completeCalls.length, 0, 'no settle while the install promise is pending');
+    d.resolve({ path: '/base/installed', created: true });
+    const outcome = await p;
+    assert.equal(outcome.kind, 'Installed');
+    assert.equal(store.completeCalls.length, 1, 'exactly one settle after the install resolves');
+  }
+  // Reject path: a rejected install propagates unchanged and never settles.
+  {
+    const snapshot = sealed();
+    const cohortId = snapshot.booted.cohortId;
+    const game = scopedGame(GAME_ID, BOTH);
+    const { map } = validAdapters(snapshot, cohortId, game);
+    const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+    const d = deferredInstaller();
+    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION });
+    await d.reached;
+    assert.equal(store.completeCalls.length, 0, 'no settle before the install resolves');
+    const boom = new Error('durable sink unreachable');
+    d.reject(boom);
+    await assert.rejects(p, (e) => e === boom);
+    assert.equal(store.completeCalls.length, 0, 'a rejected install never settles');
+  }
+});
+
+test('a second full-spine fire over the same filesystem installs created:false and is still settled', async () => {
+  const fs = new MemoryFs();
+  const first = await fireOf({ fs });
+  assert.equal(first.outcome.kind, 'Installed');
+  const second = await fireOf({ fs });
+  assert.equal(second.outcome.kind, 'Installed');
+  if (second.outcome.kind !== 'Installed') return;
+  assert.equal(second.outcome.install.created, false, 'the byte-identical artifact already existed');
+  assert.equal(second.store.completeCalls.length, 1, 'a created:false install is still eligible for settlement');
+  assert.deepEqual(second.outcome.completion, { status: 'settled' });
+});
+
+// ===========================================================================
 // source / ownership gate
 // ===========================================================================
 
-test('the spine imports no runtime store/authority, calls no completion, and orders its stages', () => {
+test('the spine imports no runtime store, settles only via the permit-resolved capability, and orders its stages', () => {
   const spine = join(dirname(fileURLToPath(import.meta.url)), 'lineOpenSpine.ts');
   const src = readFileSync(spine, 'utf8');
   for (const forbidden of [
-    'completeClaim',
+    // A DIRECT store completion in-spine is forbidden — the spine settles ONLY through the
+    // permit-resolved `settleCompletedFire` indirection (a stale gate that merely forbade the
+    // `completeClaim` literal would stay green while the spine settled through the helper).
+    '.completeClaim(',
     'runSlate',
     'atomicStore',
     "from './providers",
@@ -1064,15 +1207,25 @@ test('the spine imports no runtime store/authority, calls no completion, and ord
   // Only a type-only import from the store contract is allowed.
   assert.ok(/import type \{[^}]*\} from '\.\/store\/contract\.js'/.test(src), 'store/contract is type-only');
   assert.ok(!/^import \{[^}]*\} from '\.\/store\//m.test(src), 'no runtime store import');
+  // Settlement is the permit-resolved capability, invoked through the settlement helper.
+  assert.ok(src.includes("from './fireSettlement.js'"), 'settlement goes through fireSettlement');
 
-  // Stage order inside runOneFire: dispatch is the first fallible op after authorization — no S4
+  // Stage order inside runOneFire: dispatch is the first fallible op after authorization — no
   // work (context mapping, production, install) may run between Authorized and dispatch (§4/R5).
   const body = src.slice(src.indexOf('export async function runOneFire'));
   assert.ok(body.indexOf('runAuthorizedDispatch(') < body.indexOf('const keyByMarket'), 'context mapping follows dispatch');
   assert.ok(body.indexOf('runAuthorizedDispatch(') < body.indexOf('buildFireArtifact('), 'dispatch precedes production');
   assert.ok(body.indexOf('buildFireArtifact(') < body.indexOf('installReconciledArtifact('), 'production precedes install');
+  // The install is AWAITED and settlement runs strictly AFTER it — never before a pending install
+  // promise resolves, and never for a fire whose install threw/rejected.
+  assert.ok(body.includes('await installReconciledArtifact('), 'the install is awaited');
+  assert.ok(body.includes('await settleCompletedFire('), 'the settle is awaited');
+  assert.ok(
+    body.indexOf('installReconciledArtifact(') < body.indexOf('settleCompletedFire('),
+    'settlement follows the durable install',
+  );
   // Inside the wrapper, reconcile precedes install.
-  const wrapper = src.slice(src.indexOf('export function installReconciledArtifact'), src.indexOf('export async function runOneFire'));
+  const wrapper = src.slice(src.indexOf('export async function installReconciledArtifact'), src.indexOf('export async function runOneFire'));
   assert.ok(wrapper.indexOf('reconcileArtifactToPermit(') < wrapper.indexOf('sink.install('), 'reconcile precedes install');
 
   // Each reconciliation dimension is present and reported — defense in depth alongside the

@@ -510,6 +510,40 @@ Canonical behavior:
 8. At every instant, the sum of active, unexpired lease slots across all workers is
    `≤ maxConcurrentProviderRequests`.
 
+### Settle-once completion (post-install)
+
+The claim is settled **after** the fire artifact is durably installed, never before — the
+persistence order above (claim/reserve → dispatch → persist artifact → settle) is load-bearing:
+
+- **Artifact persistence returns before completion begins.** A fire settles its claim exactly
+  once, and only after the reconciled artifact's durable install has returned. An install
+  failure or rejection performs **zero** completion — a fire whose evidence did not persist is
+  never settled, so its reservation is never released against a missing record.
+- **A `completed` settle means settled.** Completion omits both actuals: omitted `actualCalls`
+  settles calls to the store-known attempts-started floor (releasing the unused call
+  reservation), and omitted `actualSpendUsdMicros` deliberately retains the full conservative
+  fixed-attempt spend reservation — the store cannot resolve the administrative reservation to
+  exact provider spend, so the spend reservation stays a hard ceiling, not an estimate of exact
+  billing. Settlement therefore relieves the **call** reservation; the spend reservation stays
+  fully consumed by design.
+- **A settle failure preserves the artifact and returns `unsettled`.** A completion refusal, a
+  `complete()` throw, or an unrecognizable result never deletes, rewrites, or relabels the
+  installed artifact; it yields a typed `unsettled` status. An `unsettled` fire leaves its claim
+  `pending` and its reservation conservatively consumed (it can only over-hold budget, never
+  over-admit).
+- **No current automatic recovery.** Nothing re-settles an `unsettled` fire today: lease expiry
+  recovers only concurrency, and a re-detected fire replays without re-settling (a pending
+  replay carries release-only authority, never dispatch or completion authority). A later
+  recovery slice may re-settle an aged `pending` fire only against **durable exact-artifact
+  proof** (the settle carries no owner, so a genuinely crashed-before-install fire must never be
+  settled). Canonical activation must branch on the completion status and escalate `unsettled`.
+- **Canonical storage must survive the production host lifecycle.** The local filesystem sink is
+  no-clobber crash-consistent only on a **persistent POSIX filesystem**; it does not provide
+  cross-restart or cross-dyno persistence on an ephemeral dyno filesystem. Canonical activation
+  requires a separately reviewed durable external/mounted sink — dyno-local files are **not** the
+  canonical evidence root. The install boundary is awaitable so such a sink drops in without
+  reopening the completion ordering.
+
 ## 5. Per-fire entry verification and arm provenance
 
 ### Entry verification

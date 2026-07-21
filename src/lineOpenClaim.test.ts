@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  assertClaimCompletionCapability,
   assertDispatchPermit,
   assertLeaseAuthority,
   assertReplayReleaseCapability,
   captureAdmitRequest,
+  completionForPermit,
   RehearsalClaimPort,
   StoreClaimPort,
 } from './lineOpenClaim.js';
@@ -84,10 +86,13 @@ class ScriptedStore implements AtomicStore {
   readonly releaseCalls: ReleaseLeaseRequest[] = [];
   readonly repairCalls: AcquireRepairLeaseRequest[] = [];
 
+  readonly completeCalls: CompleteClaimRequest[] = [];
+
   onAdmit: (req: AdmitDispatchRequest) => Promise<AdmitResult> = () => Promise.resolve(admittedResult());
   onRelease: (req: ReleaseLeaseRequest) => Promise<ReleaseResult> = () => Promise.resolve({ outcome: 'released' });
   onRepair: (req: AcquireRepairLeaseRequest) => Promise<RepairLeaseResult> = () =>
     Promise.resolve({ outcome: 'refused', reason: 'concurrency', requestAuthorized: false });
+  onComplete: (req: CompleteClaimRequest) => Promise<CompleteResult> = () => Promise.resolve({ outcome: 'completed' });
 
   initCohortBudget(_req: InitCohortBudgetRequest): Promise<InitResult> {
     throw new Error('not used');
@@ -104,8 +109,9 @@ class ScriptedStore implements AtomicStore {
     this.releaseCalls.push(req);
     return this.onRelease(req);
   }
-  completeClaim(_req: CompleteClaimRequest): Promise<CompleteResult> {
-    throw new Error('not used');
+  completeClaim(req: CompleteClaimRequest): Promise<CompleteResult> {
+    this.completeCalls.push(req);
+    return this.onComplete(req);
   }
 }
 
@@ -461,4 +467,61 @@ test('the lease authority binds the captured store, owner, cohort, fire and sche
     { cohortId: COHORT, fireId: FIRE, ownerId: OWNER, armIndex: 2, repairOrdinal: 1, expectedSchemaVersion: SCHEMA },
   ]);
   // There is no argument through which a caller could supply a different owner or version.
+});
+
+// ===========================================================================
+// The same-admission completion capability
+// ===========================================================================
+
+test('the completion capability settles with exactly the captured identity and no actuals', async () => {
+  const store = new ScriptedStore();
+  const { permit } = await admitAuthorized(store);
+  const capability = completionForPermit(permit);
+  assert.doesNotThrow(() => assertClaimCompletionCapability(capability));
+
+  const result = await capability.complete();
+  assert.deepEqual(result, { outcome: 'completed' });
+  assert.equal(store.completeCalls.length, 1, 'exactly one settle');
+  const req = store.completeCalls[0]!;
+  // The request has EXACTLY the three captured-identity own keys — neither actual is present, and
+  // omission is never an explicit `undefined` own key (an added actual, incl. own `undefined`, reds this).
+  assert.deepEqual(Object.keys(req).sort(), ['cohortId', 'expectedSchemaVersion', 'fireId']);
+  assert.equal(req.cohortId, COHORT);
+  assert.equal(req.fireId, FIRE);
+  assert.equal(req.expectedSchemaVersion, SCHEMA);
+  assert.ok(!('actualCalls' in req), 'no actualCalls own key');
+  assert.ok(!('actualSpendUsdMicros' in req), 'no actualSpendUsdMicros own key');
+});
+
+test('the completion capability binds the captured identity — a later request mutation cannot redirect the settle', async () => {
+  const store = new ScriptedStore();
+  const req = request();
+  const { permit } = await admitAuthorized(store, req);
+  // Mutate the caller's request object AFTER admission captured it.
+  req.cohortId = 'OTHER-COHORT';
+  req.fireId = 'OTHER-FIRE';
+  req.expectedSchemaVersion = 999;
+  await completionForPermit(permit).complete();
+  // The settle uses the CAPTURED identity, not the mutated caller object.
+  assert.deepEqual(store.completeCalls, [{ cohortId: COHORT, fireId: FIRE, expectedSchemaVersion: SCHEMA }]);
+});
+
+test('the lease authority exposes no completion — only release and repair', async () => {
+  const store = new ScriptedStore();
+  const { leaseAuthority } = await admitAuthorized(store);
+  // Completion is NOT handed on the lease authority (which the lifecycle holds) — least authority.
+  assert.equal((leaseAuthority as unknown as Record<string, unknown>).complete, undefined, 'no complete on the lease authority');
+  assert.deepEqual(Object.keys(leaseAuthority).sort(), ['acquireRepairLease', 'releaseLease']);
+});
+
+test('completionForPermit resolves only from a genuine permit; a forged or copied permit throws', async () => {
+  const store = new ScriptedStore();
+  const { permit } = await admitAuthorized(store);
+  assert.doesNotThrow(() => completionForPermit(permit));
+  // A brand assertion failure PROPAGATES (it is never folded to a soft outcome).
+  assert.throws(() => completionForPermit({ ...permit }), /not minted by a store admission|forged|substituted/);
+  assert.throws(
+    () => completionForPermit(JSON.parse(JSON.stringify(permit)) as DispatchPermit),
+    /not minted by a store admission|forged|substituted/,
+  );
 });

@@ -861,6 +861,11 @@ test('a structural copy of a plan or an authorized dispatch never authenticates'
   assert.doesNotThrow(() => assertAuthorizedDispatch(result.dispatch));
   assert.throws(() => assertDispatchPlan({ ...result.dispatch.plan } as DispatchPlan), DispatchAuthorizationError);
   assert.throws(() => assertAuthorizedDispatch({ ...result.dispatch } as AuthorizedDispatch), DispatchAuthorizationError);
+  // Least authority: the authorized dispatch that flows to the lifecycle carries NO completion — the
+  // completion capability is resolved by the spine from the permit after install, never handed to the
+  // runner (which could otherwise settle a fire before its evidence is durably installed).
+  assert.equal((result.dispatch as unknown as Record<string, unknown>).completion, undefined, 'no completion on the authorized dispatch');
+  assert.deepEqual(Object.keys(result.dispatch).sort(), ['leaseAuthority', 'permit', 'plan', 'snapshot']);
   // A hand-assembled tuple of the genuine pieces is still not an authorized dispatch.
   const raw = {
     permit: result.dispatch.permit,
