@@ -13,12 +13,13 @@ import { AuthorizedDispatchFaultError } from './runner.js';
 import { LifecycleFaultError } from './lineOpenLifecycle.js';
 import {
   buildFullScopeAdmitRequest,
+  deriveSpendReservationUsdMicros,
   FireReconciliationError,
   installReconciledArtifact,
   reconcileArtifactToPermit,
   runOneFire,
 } from './lineOpenSpine.js';
-import type { ArtifactInstaller, LineOpenRunOptions } from './lineOpenSpine.js';
+import type { ArtifactInstaller, LineOpenAdmissionParameters, LineOpenRunOptions } from './lineOpenSpine.js';
 import { assertFireArtifact, buildFireArtifact } from './fireArtifactProducer.js';
 import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import { FireArtifactSink, nodeArtifactFs } from './fireArtifactSink.js';
@@ -26,6 +27,8 @@ import type { ArtifactFs } from './fireArtifactSink.js';
 import { parseFireArtifactV1, serializeFireArtifactV1, verifyFireArtifactReplay } from './fireArtifactWriter.js';
 import { MARKET_ORDINAL } from './fireArtifact.js';
 import { checkPublication } from './manifestPublication.js';
+import type { CohortManifestV1 } from './manifest.js';
+import { deriveFireSpendReservationUsdMicros } from './spendReservationPolicy.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
 import { sealPreparedFire } from './preparedFire.js';
@@ -355,7 +358,7 @@ function runOpts(over: Partial<LineOpenRunOptions> = {}): LineOpenRunOptions {
   };
 }
 
-const ADMISSION = { ownerId: OWNER, expectedSchemaVersion: SCHEMA, spendReservationUsdMicros: 1000 } as const;
+const ADMISSION = { ownerId: OWNER, expectedSchemaVersion: SCHEMA } as const;
 
 const releaseIds = (store: ScriptedStore): string[] =>
   store.calls.filter((c): c is Extract<StoreCall, { op: 'release' }> => c.op === 'release').map((c) => c.leaseId);
@@ -492,7 +495,7 @@ test('one fire runs admit->authorize->dispatch->produce->reconcile->install exac
 // derivation, brand, and option capture
 // ===========================================================================
 
-test('the admission request is derived from the snapshot, plus only the three admission fields', async () => {
+test('the admission request is derived from the snapshot, plus only the two admission fields', () => {
   const snapshot = sealed();
   const request = buildFullScopeAdmitRequest(snapshot, ADMISSION);
   assert.equal(request.cohortId, snapshot.booted.cohortId);
@@ -504,7 +507,98 @@ test('the admission request is derived from the snapshot, plus only the three ad
   const key = scopeKeyOf(snapshot.proposedMarkets);
   assert.deepEqual(Object.keys(request.scopeReservations), [key]);
   assert.equal(request.scopeReservations[key]!.preparedBytesDigest, snapshot.prepared.requestSha256);
-  assert.equal(request.scopeReservations[key]!.spendReservationUsdMicros, 1000);
+  // The spend reservation is DERIVED from the booted manifest, never the caller. For the 4-arm,
+  // one-repair, $100/attempt cohort that is exactly $800 = 4 × (1 + 1) × 100_000_000 — and it is not
+  // a hardcoded literal: it equals the policy derivation over the manifest's own roster/repair/version.
+  const derived = deriveFireSpendReservationUsdMicros({
+    rosterSize: CODE_ARMS.length,
+    maxRepairsPerArm: 1,
+    version: 'fixed-attempt-v1',
+  });
+  assert.equal(request.scopeReservations[key]!.spendReservationUsdMicros, 800_000_000);
+  assert.equal(request.scopeReservations[key]!.spendReservationUsdMicros, derived);
+});
+
+test('the caller cannot supply or override the spend reservation (runtime-extra is ignored)', () => {
+  const snapshot = sealed();
+  const key = scopeKeyOf(snapshot.proposedMarkets);
+  // A runtime-extra spend field — the pre-derivation caller authority — is ignored; the derived value wins.
+  const withExtra = { ...ADMISSION, spendReservationUsdMicros: 1 } as LineOpenAdmissionParameters;
+  assert.equal(
+    buildFullScopeAdmitRequest(snapshot, withExtra).scopeReservations[key]!.spendReservationUsdMicros,
+    800_000_000,
+  );
+  // A hostile getter that WOULD leak a caller value if the builder ever read a caller spend field:
+  // it must never be read, and cannot alter the derived value even after capture.
+  let touched = false;
+  const hostile = new Proxy({ ownerId: OWNER, expectedSchemaVersion: SCHEMA } as LineOpenAdmissionParameters, {
+    get(target, prop, recv) {
+      if (prop === 'spendReservationUsdMicros') {
+        touched = true;
+        return 1;
+      }
+      return Reflect.get(target, prop, recv);
+    },
+  });
+  assert.equal(
+    buildFullScopeAdmitRequest(snapshot, hostile).scopeReservations[key]!.spendReservationUsdMicros,
+    800_000_000,
+  );
+  assert.equal(touched, false, 'the builder never reads a caller-supplied spend field');
+});
+
+test('the derived reservation varies exactly with roster and repair cap (per-attempt is the versioned policy constant)', () => {
+  const manifest = (
+    roster: number,
+    maxRepairs: number,
+    perAttempt = 100_000_000,
+    version = 'fixed-attempt-v1',
+  ): CohortManifestV1 =>
+    ({
+      spendReservationPolicyVersion: version,
+      expectedArmRoster: new Array(roster).fill({
+        participantId: 'x',
+        provider: 'x',
+        requestedModelId: 'x',
+        approvedReportedModelIds: ['x'],
+      }),
+      constants: { providerAttemptReservationUsdMicros: perAttempt, maxRepairAttemptsPerArm: maxRepairs },
+    }) as unknown as CohortManifestV1;
+  assert.equal(deriveSpendReservationUsdMicros(manifest(4, 1)), 800_000_000); // current cohort
+  assert.equal(deriveSpendReservationUsdMicros(manifest(3, 1)), 600_000_000); // fewer arms
+  assert.equal(deriveSpendReservationUsdMicros(manifest(4, 0)), 400_000_000); // no repair
+  assert.equal(deriveSpendReservationUsdMicros(manifest(4, 2)), 1_200_000_000); // two repairs
+  assert.equal(deriveSpendReservationUsdMicros(manifest(1, 0)), 100_000_000); // single attempt
+});
+
+test('an unknown or amount-mismatched spend policy fails closed before any request is built', () => {
+  // The derivation is the FIRST thing buildFullScopeAdmitRequest does after the brand check, and
+  // runOneFire calls that builder before it admits or dispatches — so either throw yields zero
+  // admission and zero adapter calls (the reservation is unbuildable).
+  const roster = new Array(4).fill({
+    participantId: 'x',
+    provider: 'x',
+    requestedModelId: 'x',
+    approvedReportedModelIds: ['x'],
+  });
+  assert.throws(
+    () =>
+      deriveSpendReservationUsdMicros({
+        spendReservationPolicyVersion: 'fixed-attempt-v2',
+        expectedArmRoster: roster,
+        constants: { providerAttemptReservationUsdMicros: 100_000_000, maxRepairAttemptsPerArm: 1 },
+      } as unknown as CohortManifestV1),
+    /unknown spend reservation policy version/,
+  );
+  assert.throws(
+    () =>
+      deriveSpendReservationUsdMicros({
+        spendReservationPolicyVersion: 'fixed-attempt-v1',
+        expectedArmRoster: roster,
+        constants: { providerAttemptReservationUsdMicros: 99_999_999, maxRepairAttemptsPerArm: 1 },
+      } as unknown as CohortManifestV1),
+    /does not match spend-reservation policy/,
+  );
 });
 
 test('a hand-built snapshot is rejected by the brand before any field is read', () => {

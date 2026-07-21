@@ -10,6 +10,8 @@ import { assertFireArtifact, buildFireArtifact } from './fireArtifactProducer.js
 import type { FireArtifactV1, FireContext, MarketFireContextV1 } from './fireArtifactProducer.js';
 import { MARKET_ORDINAL } from './fireArtifact.js';
 import { FireArtifactSink } from './fireArtifactSink.js';
+import { deriveFireSpendReservationUsdMicros, spendReservationPolicyForVersion } from './spendReservationPolicy.js';
+import type { CohortManifestV1 } from './manifest.js';
 import type { MarketKey, ProviderAdapter } from './types.js';
 import type { AdmitDispatchRequest, ClaimKey } from './store/contract.js';
 
@@ -34,11 +36,11 @@ import type { AdmitDispatchRequest, ClaimKey } from './store/contract.js';
 // Public surface
 // ---------------------------------------------------------------------------
 
-/** The pricing/config inputs the caller supplies; everything else is derived from the snapshot. */
+/** The config inputs the caller supplies; the spend reservation and everything else are derived
+ *  from authenticated boot state, never accepted from the caller. */
 export interface LineOpenAdmissionParameters {
   readonly ownerId: string;
   readonly expectedSchemaVersion: number;
-  readonly spendReservationUsdMicros: number;
 }
 
 /** Run options WITHOUT `cohortId`: the spine derives the cohort from the admitted permit, so a
@@ -113,11 +115,39 @@ export interface RunOneFireInput {
 // ---------------------------------------------------------------------------
 
 /**
+ * The per-fire spend reservation, DERIVED from authenticated boot state — never accepted from the
+ * caller. It is `roster × (1 + maxRepairs) × providerAttemptReservationUsdMicros` for the manifest's
+ * pinned spend-reservation policy, so it varies automatically with the roster, the repair cap, and
+ * the (versioned) per-attempt amount — no magic constant lives here. The manifest's pinned
+ * per-attempt amount is re-verified against the code-owned policy value even though canonical boot
+ * already did, so the directly-exported builder is fail-closed on its own: an unknown policy version
+ * or a mismatched amount throws BEFORE any request is built, so no claim or dispatch can begin.
+ */
+export function deriveSpendReservationUsdMicros(manifest: CohortManifestV1): number {
+  const version = manifest.spendReservationPolicyVersion;
+  const policy = spendReservationPolicyForVersion(version); // unknown version throws
+  if (
+    manifest.constants.providerAttemptReservationUsdMicros !== policy.providerAttemptReservationUsdMicros
+  ) {
+    throw new Error(
+      `manifest providerAttemptReservationUsdMicros (${manifest.constants.providerAttemptReservationUsdMicros}) ` +
+        `does not match spend-reservation policy "${version}" (${policy.providerAttemptReservationUsdMicros})`,
+    );
+  }
+  return deriveFireSpendReservationUsdMicros({
+    rosterSize: manifest.expectedArmRoster.length,
+    maxRepairsPerArm: manifest.constants.maxRepairAttemptsPerArm,
+    version,
+  });
+}
+
+/**
  * Derive the admission request for the WHOLE proposed scope from the sealed snapshot. The
  * snapshot is authenticated before any field is read, and every identity/scope/digest field comes
- * from it — only the owner, schema version, and spend estimate are caller-supplied (pricing is a
- * later slice's). The one reservation is keyed by the full-scope key: S4 is the full-scope fixture
- * path, and the store refuses (post-admission, releasing every lease) any narrower retained scope.
+ * from it — only the owner and schema version are caller-supplied; the spend reservation is derived
+ * from authenticated boot state (never accepted). The one reservation is keyed by the full-scope
+ * key: this is the full-scope fixture path, and the store refuses (post-admission, releasing every
+ * lease) any narrower retained scope.
  */
 export function buildFullScopeAdmitRequest(
   snapshot: PreparedFireSnapshot,
@@ -127,7 +157,10 @@ export function buildFullScopeAdmitRequest(
   // Capture the caller's admission fields exactly once.
   const ownerId = admission.ownerId;
   const expectedSchemaVersion = admission.expectedSchemaVersion;
-  const spendReservationUsdMicros = admission.spendReservationUsdMicros;
+  // The spend reservation is DERIVED from authenticated boot state — never accepted from the
+  // caller — so a caller can neither under-reserve past the cap nor pin a different amount. Any
+  // runtime-extra spend field on `admission` is therefore ignored.
+  const spendReservationUsdMicros = deriveSpendReservationUsdMicros(snapshot.booted.manifest);
   // Every remaining field is DERIVED from the authenticated snapshot.
   const proposedMarkets = [...snapshot.proposedMarkets];
   const scopeKey = scopeKeyOf(snapshot.proposedMarkets);
@@ -283,7 +316,6 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
   const runOptions = input.runOptions;
   const ownerId = input.admission.ownerId;
   const expectedSchemaVersion = input.admission.expectedSchemaVersion;
-  const spendReservationUsdMicros = input.admission.spendReservationUsdMicros;
 
   // (3) Capture each run-option field into a fresh plain object, explicitly OMITTING any
   //     runtime-extra `cohortId` a hostile caller may have stuck on the options object.
@@ -307,7 +339,6 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
   const request = buildFullScopeAdmitRequest(snapshot, {
     ownerId,
     expectedSchemaVersion,
-    spendReservationUsdMicros,
   });
 
   // (6) S2 captures the adapter plan (from the caller's map) before it takes the claim.
