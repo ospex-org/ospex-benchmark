@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { cohortBoot } from './cohortBoot.js';
 import { runCohortTick } from './cohortRunner.js';
 import { discover } from './lineOpenRead.js';
-import { RehearsalClaimPort, StoreClaimPort } from './lineOpenClaim.js';
+import { assertReplayPendingRecovery, RehearsalClaimPort, replayReleaseCapabilityForRecovery, StoreClaimPort } from './lineOpenClaim.js';
 import { FireArtifactSink } from './fireArtifactSink.js';
 import { checkPublication } from './manifestPublication.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
@@ -16,9 +16,9 @@ import { REPAIR_POLICY_VERSION } from './repairPolicy.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 import { STORE_SCHEMA_VERSION } from './store/constants.js';
 import type { BootedCohort } from './cohortBoot.js';
-import type { CohortTickInput, FireOutcomeSummary } from './cohortRunner.js';
+import type { CohortTickInput, CohortTickResult, FireOutcomeSummary } from './cohortRunner.js';
 import type { DiscoverFn, DiscoveryReads, MarketEvidenceRead, ReadMarketEvidenceFn } from './lineOpenRead.js';
-import type { ClaimPort } from './lineOpenClaim.js';
+import type { ClaimOutcome, ClaimPort } from './lineOpenClaim.js';
 import type { ArtifactInstaller, LineOpenRunOptions } from './lineOpenSpine.js';
 import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import type { ArtifactFs } from './fireArtifactSink.js';
@@ -242,6 +242,11 @@ class ScriptedStore implements AtomicStore {
   readonly releaseCalls: ReleaseLeaseRequest[] = [];
   readonly completeCalls: CompleteClaimRequest[] = [];
   private admits = 0;
+  /** When set, the store returns THIS admit result (built from the captured request + freshly-minted
+   *  roster leases) instead of the default full-scope admit — used to drive a genuine replayed/pending. */
+  admitOutcome?: (req: AdmitDispatchRequest, leases: Lease[]) => AdmitResult;
+  /** The completion result the store returns; default a clean `completed`, overridable to a refusal. */
+  completeOutcome: CompleteResult = { outcome: 'completed' };
 
   constructor(private readonly rosterSize: number) {}
 
@@ -250,7 +255,6 @@ class ScriptedStore implements AtomicStore {
   }
   admitDispatch(req: AdmitDispatchRequest): Promise<AdmitResult> {
     this.admitCalls.push(req);
-    const reservation = Object.values(req.scopeReservations)[0]!;
     // Per-admit lease-id prefix so two admissions in one tick never collide on lease ids.
     const prefix = `a${(this.admits += 1)}-`;
     const initialLeases: Lease[] = Array.from({ length: this.rosterSize }, (_, armIndex) => ({
@@ -259,6 +263,8 @@ class ScriptedStore implements AtomicStore {
       expiresAt: '2026-07-18T12:10:00.000Z',
       state: 'live' as const,
     }));
+    if (this.admitOutcome) return Promise.resolve(this.admitOutcome(req, initialLeases));
+    const reservation = Object.values(req.scopeReservations)[0]!;
     return Promise.resolve({
       outcome: 'admitted',
       claimedKeys: req.proposedMarkets.map((market) => ({ gameId: req.gameId, market })),
@@ -280,7 +286,7 @@ class ScriptedStore implements AtomicStore {
   }
   completeClaim(req: CompleteClaimRequest): Promise<CompleteResult> {
     this.completeCalls.push(req);
-    return Promise.resolve({ outcome: 'completed' });
+    return Promise.resolve(this.completeOutcome);
   }
 }
 
@@ -464,7 +470,10 @@ test('one accepted candidate discovers, projects, dispatches, and installs exact
   assert.deepEqual(result.dispositions.map((d) => ({ ...d })), [{ gameId: 'g1', market: 'moneyline', outcome: 'prepared' }]);
   assert.equal(result.admittedCount, 1);
   assert.equal(result.fireOutcomes.length, 1);
-  assert.equal(result.fireOutcomes[0]!.kind, 'Installed');
+  const installed = result.fireOutcomes[0]!.outcome;
+  assert.equal(installed.kind, 'Installed');
+  // The full typed outcome survives — a completed store settle is confirmed `settled`.
+  if (installed.kind === 'Installed') assert.deepEqual(installed.completion, { status: 'settled' });
   assert.equal(result.fireOutcomes[0]!.gameId, 'g1');
   assert.equal(result.fireOutcomes[0]!.market, 'moneyline');
   // The fire's artifact install seam was invoked exactly once, and the claim settled once.
@@ -496,7 +505,7 @@ test('a rehearsal claim port admits nothing, installs nothing, and reports every
   assert.equal(result.dispositions.length, 2);
   assert.ok(result.dispositions.every((d) => d.outcome === 'prepared'), 'both candidates prepared');
   assert.equal(result.fireOutcomes.length, 2, 'every prepared fire is reported');
-  assert.ok(result.fireOutcomes.every((f) => f.kind === 'NotAdmitted'), 'every fire is NotAdmitted');
+  assert.ok(result.fireOutcomes.every((f) => f.outcome.kind === 'NotAdmitted'), 'every fire is NotAdmitted');
   assert.equal(result.admittedCount, 0);
   assert.equal(sink.calls.length, 0, 'a rehearsal installs nothing');
 });
@@ -521,7 +530,7 @@ test('maxDispatchesPerTick stops the loop after the budget of admitted fires is 
   assert.equal(result.dispositions.length, 2);
   assert.equal(result.admittedCount, 1);
   assert.equal(result.fireOutcomes.length, 1, 'only the first fire was attempted');
-  assert.equal(result.fireOutcomes[0]!.kind, 'Installed');
+  assert.equal(result.fireOutcomes[0]!.outcome.kind, 'Installed');
   assert.equal(result.fireOutcomes[0]!.gameId, 'g1', 'g1 sorts first and is the one dispatched');
   assert.equal(store.admitCalls.length, 1, 'the store was asked to admit exactly once — the loop stopped');
   assert.equal(sink.calls.length, 1);
@@ -544,9 +553,12 @@ test('a leading all_claimed fire does not burn the dispatch budget; a later admi
 
   assert.equal(result.fireOutcomes.length, 2, 'both fires attempted — all_claimed did not consume the budget');
   assert.equal(result.fireOutcomes[0]!.gameId, 'g1');
-  assert.equal(result.fireOutcomes[0]!.kind, 'NotAdmitted', 'g1 is all_claimed');
+  const g1Outcome = result.fireOutcomes[0]!.outcome;
+  assert.equal(g1Outcome.kind, 'NotAdmitted', 'g1 is all_claimed');
+  // The all_claimed Skip reason is reachable through the tick result.
+  if (g1Outcome.kind === 'NotAdmitted') assert.equal(g1Outcome.outcome.kind === 'Skip' ? g1Outcome.outcome.reason : null, 'all_claimed');
   assert.equal(result.fireOutcomes[1]!.gameId, 'g2');
-  assert.equal(result.fireOutcomes[1]!.kind, 'Installed', 'g2 still admits under cap 1');
+  assert.equal(result.fireOutcomes[1]!.outcome.kind, 'Installed', 'g2 still admits under cap 1');
   assert.equal(result.admittedCount, 1);
   assert.equal(sink.calls.length, 1, 'only g2 installed');
 });
@@ -615,4 +627,114 @@ test('the runner module imports no real fetcher/store/filesystem/ambient clock',
   assert.ok(!/atomicStore/.test(src), 'no atomic store import');
   assert.ok(!/from 'node:fs'|from 'node:net'|from 'node:http/.test(src), 'no filesystem/network import');
   assert.ok(!/Date\.now/.test(src), 'no ambient clock — the tick clock is injected');
+});
+
+// ===========================================================================
+// typed terminal outcomes survive the tick boundary (not collapsed to a kind)
+// ===========================================================================
+
+test('a retryable Defer stays distinguishable from a terminal Skip and a loud Fault through the tick result', async () => {
+  const json = manifestJson();
+  const games = [makeGame({ gameId: 'g1' })];
+  const odds = [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' })];
+
+  // Each fake claim port yields a distinct non-authorizing ClaimOutcome; runOneFire forwards it as
+  // NotAdmitted, and the tick must preserve the FULL outcome (kind + reason), not just `kind`.
+  const runWith = (claimPort: ClaimPort): Promise<CohortTickResult> =>
+    runCohortTick(tickInput(json, games, odds, { claimPort, sink: countingSink(new FireArtifactSink('/base', new MemoryFs())) }).input);
+
+  const deferResult = await runWith({ admit: () => Promise.resolve({ kind: 'Defer', reason: 'concurrency' }) });
+  const skipResult = await runWith({ admit: () => Promise.resolve({ kind: 'Skip', reason: 'all_claimed' }) });
+  const faultResult = await runWith({ admit: () => Promise.resolve({ kind: 'Fault', reason: 'store_admit_failed' }) });
+
+  const claimOf = (r: CohortTickResult): Exclude<ClaimOutcome, { kind: 'Authorized' }> => {
+    const outcome = r.fireOutcomes[0]!.outcome;
+    assert.equal(outcome.kind, 'NotAdmitted');
+    if (outcome.kind !== 'NotAdmitted') throw new Error('unreachable');
+    return outcome.outcome;
+  };
+  const deferClaim = claimOf(deferResult);
+  const skipClaim = claimOf(skipResult);
+  const faultClaim = claimOf(faultResult);
+
+  // The retryable Defer's reason is reachable...
+  assert.equal(deferClaim.kind, 'Defer');
+  assert.equal(deferClaim.kind === 'Defer' ? deferClaim.reason : null, 'concurrency');
+  // ...and a terminal Skip / loud Fault CANNOT collapse into that Defer — distinct kinds + reasons.
+  assert.equal(skipClaim.kind, 'Skip');
+  assert.equal(faultClaim.kind, 'Fault');
+  assert.notEqual(skipClaim.kind, deferClaim.kind);
+  assert.notEqual(faultClaim.kind, deferClaim.kind);
+  // None consumed the dispatch budget (only an Installed fire does).
+  for (const r of [deferResult, skipResult, faultResult]) assert.equal(r.admittedCount, 0);
+});
+
+test('a replayed_pending Skip carries its branded recovery capability through to the tick result', async () => {
+  const json = manifestJson();
+  const store = new ScriptedStore(CODE_ARMS.length);
+  // The store idempotently replays an already-committed, still-pending admission: StoreClaimPort
+  // mints a genuine branded ReplayPendingRecovery with its release-only cleanup capability.
+  store.admitOutcome = (req, leases) => ({
+    outcome: 'replayed',
+    fireStatus: 'pending',
+    claimedKeys: req.proposedMarkets.map((market) => ({ gameId: req.gameId, market })),
+    initialLeases: leases,
+    dispatchAuthorized: false,
+  });
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  const { input } = tickInput(json, [makeGame({ gameId: 'g1' })], [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' })], {
+    claimPort: new StoreClaimPort(store),
+    sink,
+  });
+
+  const result = await runCohortTick(input);
+
+  assert.equal(result.admittedCount, 0, 'a replay authorizes no dispatch');
+  assert.equal(sink.calls.length, 0, 'a replay installs nothing');
+  const outcome = result.fireOutcomes[0]!.outcome;
+  assert.equal(outcome.kind, 'NotAdmitted');
+  if (outcome.kind !== 'NotAdmitted') return;
+  const claim = outcome.outcome;
+  assert.ok(claim.kind === 'Skip' && claim.reason === 'replayed_pending', 'a replayed_pending Skip');
+  if (claim.kind !== 'Skip' || claim.reason !== 'replayed_pending') return;
+  // The detached recovery — and its branded release-only cleanup capability — was NOT discarded or
+  // copied away: it is reachable by reference and still authenticates against its own brand (a
+  // deep-freeze / structural copy at the tick boundary would break the brand or the closure).
+  assert.doesNotThrow(() => assertReplayPendingRecovery(claim.recovery));
+  assert.doesNotThrow(() => replayReleaseCapabilityForRecovery(claim.recovery));
+  assert.equal(claim.recovery.fireId, result.fireOutcomes[0]!.fireId, 'the recovery identifies this fire');
+});
+
+test('an installed fire whose settle is refused stays Installed with an unsettled reason, distinct from settled', async () => {
+  const json = manifestJson();
+  const games = [makeGame({ gameId: 'g1' })];
+  const odds = [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' })];
+
+  // Baseline: a clean store completion → settled.
+  const settledStore = new ScriptedStore(CODE_ARMS.length);
+  const settled = await runCohortTick(
+    tickInput(json, games, odds, { claimPort: new StoreClaimPort(settledStore), sink: countingSink(new FireArtifactSink('/base', new MemoryFs())) }).input,
+  );
+
+  // The store REFUSES the post-install settle with version_mismatch; fireSettlement classifies it
+  // as unsettled/version_mismatch. The artifact is still durably installed (kind Installed).
+  const unsettledStore = new ScriptedStore(CODE_ARMS.length);
+  unsettledStore.completeOutcome = { outcome: 'refused', reason: 'version_mismatch' };
+  const unsettledSink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  const unsettledResult = await runCohortTick(
+    tickInput(json, games, odds, { claimPort: new StoreClaimPort(unsettledStore), sink: unsettledSink }).input,
+  );
+
+  const settledOutcome = settled.fireOutcomes[0]!.outcome;
+  const unsettledOutcome = unsettledResult.fireOutcomes[0]!.outcome;
+  assert.equal(settledOutcome.kind, 'Installed');
+  assert.equal(unsettledOutcome.kind, 'Installed');
+  if (settledOutcome.kind !== 'Installed' || unsettledOutcome.kind !== 'Installed') return;
+  // Both installed and both consumed the budget — but the completion confirmation is preserved and
+  // distinct, so an activation consumer can escalate the unsettled one.
+  assert.equal(unsettledResult.admittedCount, 1, 'an unsettled install still counts as admitted');
+  assert.equal(unsettledSink.calls.length, 1, 'the artifact is durably installed despite the settle refusal');
+  assert.deepEqual(settledOutcome.completion, { status: 'settled' });
+  assert.deepEqual(unsettledOutcome.completion, { status: 'unsettled', reason: 'version_mismatch' });
+  assert.notDeepEqual(unsettledOutcome.completion, settledOutcome.completion);
 });

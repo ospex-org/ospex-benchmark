@@ -1,5 +1,4 @@
 import { assertBootedCohort } from './cohortBoot.js';
-import { deepFreeze } from './freeze.js';
 import { projectPreparedFires } from './lineOpenProject.js';
 import { runOneFire } from './lineOpenSpine.js';
 import type { BootedCohort } from './cohortBoot.js';
@@ -58,12 +57,22 @@ export interface CohortTickInput {
   readonly onStatus?: (line: string) => void;
 }
 
-/** One attempted fire's terminal shape for the tick: its identity plus the spine's outcome kind. */
+/**
+ * One attempted fire's terminal outcome for the tick: its identity plus the FULL typed outcome
+ * the composition spine returned. The whole `LineOpenFireOutcome` is retained (not just its
+ * `kind`) so nothing load-bearing is erased at this boundary: a `NotAdmitted.outcome` still
+ * distinguishes a retryable `Defer(reason)` from a terminal `Skip(reason)` from a loud
+ * `Fault(reason)` from a rehearsal `WouldAdmit`, and still carries a `Skip(replayed_pending)`'s
+ * detached recovery capability; an `Installed.completion` still distinguishes `settled` from
+ * `unsettled(reason)` (which an activation consumer must escalate). The outcome is kept BY
+ * REFERENCE — it is already produced and frozen/branded by the spine's own owners, and is never
+ * re-frozen into its branded graph here.
+ */
 export interface FireOutcomeSummary {
   readonly fireId: string;
   readonly gameId: string;
   readonly market: MarketKey;
-  readonly kind: LineOpenFireOutcome['kind'];
+  readonly outcome: LineOpenFireOutcome;
 }
 
 /**
@@ -77,6 +86,18 @@ export interface CohortTickResult {
   readonly dispositions: readonly CandidateOutcome[];
   readonly fireOutcomes: readonly FireOutcomeSummary[];
   readonly admittedCount: number;
+}
+
+/** A one-line observability description carrying the discriminating outcome info — the outcome
+ *  kind plus a `NotAdmitted` claim reason or an `Installed` completion status — not just `kind`. */
+function describeOutcome(outcome: LineOpenFireOutcome): string {
+  if (outcome.kind === 'Installed') {
+    return outcome.completion.status === 'settled'
+      ? 'Installed/settled'
+      : `Installed/unsettled(${outcome.completion.reason})`;
+  }
+  const claim = outcome.outcome;
+  return 'reason' in claim ? `NotAdmitted/${claim.kind}(${claim.reason})` : `NotAdmitted/${claim.kind}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,22 +165,28 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
   for (const fire of fires) {
     if (admittedCount >= maxDispatchesPerTick) break;
     const outcome = await runOneFire({ snapshot: fire, adapters, claimPort, sink, runOptions, admission });
-    // Single-market fires: the fire's sole proposed market is `proposedMarkets[0]`.
-    const summary: FireOutcomeSummary = {
+    // Single-market fires: the fire's sole proposed market is `proposedMarkets[0]`. The full typed
+    // outcome is retained by reference and the summary is only SHALLOW-frozen — `deepFreeze` would
+    // re-traverse the spine's already-frozen/branded outcome graph (artifact / permit / any
+    // pending-replay recovery capability), which this boundary must not touch.
+    const summary: FireOutcomeSummary = Object.freeze({
       fireId: fire.fireId,
       gameId: fire.prepared.gameId,
       market: fire.proposedMarkets[0]!,
-      kind: outcome.kind,
-    };
+      outcome,
+    });
     fireOutcomes.push(summary);
     if (outcome.kind === 'Installed') admittedCount += 1;
-    onStatus?.(`fire ${summary.fireId} (${summary.gameId} ${summary.market}): ${outcome.kind}`);
+    onStatus?.(`fire ${summary.fireId} (${summary.gameId} ${summary.market}): ${describeOutcome(outcome)}`);
   }
 
-  return deepFreeze({
+  // Shallow-freeze only: each summary is already frozen above, `dispositions` is already deep-frozen
+  // by `projectPreparedFires`, and every retained `outcome` stays frozen/branded by its own owner —
+  // so the wrapper never re-traverses those graphs.
+  return Object.freeze({
     discoveredCount: discovery.candidates.length,
     dispositions,
-    fireOutcomes,
+    fireOutcomes: Object.freeze(fireOutcomes),
     admittedCount,
   });
 }
