@@ -1,11 +1,29 @@
 import type { CohortManifestV1 } from './manifest.js';
 import { isMarketPolicyVersion, marketPolicyDigest } from './marketPolicy.js';
+import { SOURCE_QUERY_VERSION, isSourceQueryVersion } from './oddsHistory.js';
 import { isModelPriceTableVersion, modelPriceTableDigest } from './modelPriceTable.js';
 import { CODE_MAX_REPAIRS_PER_ARM, isRepairPolicyVersion } from './repairPolicy.js';
 import { isSpendReservationPolicyVersion, spendReservationPolicyForVersion } from './spendReservationPolicy.js';
 import { isBaselinePolicyVersion, supportsScopedInput } from './baselines.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
+
+/**
+ * The sports this benchmark's read / discovery / scoring path supports —
+ * RUNTIME-frozen (`Object.freeze`), not merely `readonly` / `as const`, because
+ * it is an exported load-bearing boot registry the sport-allow-list check reads:
+ * a compile-time-only `readonly` could be mutated at runtime through an `as`
+ * cast, drifting which sports boot admits. The dimension is `sport` (the stable
+ * `games.sport` slug), never the nullable `league`.
+ */
+export const SUPPORTED_SPORTS: readonly string[] = Object.freeze(['mlb']);
+
+/** Exact ordered-sequence equality (length + element-by-element). Unlike a Set
+ *  compare, it treats `['mlb','mlb']` and `['mlb','nfl']` as distinct from
+ *  `['mlb']` — duplicates and supersets both fail. */
+function orderedArrayEqual(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
 
 /**
  * Semantic validation of a strictly-parsed `CohortManifestV1` against the
@@ -21,13 +39,35 @@ import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
  * than running a cohort whose declared policy differs from what executes.
  *
  * Deliberately NOT checked (no code module exists yet — validated when their
- * module lands): `sourceQueryVersion` (its finalizer/history predicate is a
- * later PR), `toolInferenceConfigSha256`, and `uncertaintyPolicyVersion`.
+ * module lands): `toolInferenceConfigSha256` and `uncertaintyPolicyVersion`.
  * Credential presence is a live/boot concern
  * (network), not this pure check.
  */
 export function validateManifestAgainstCode(manifest: CohortManifestV1): string[] {
   const violations: string[] = [];
+
+  // Sport allow-list: this benchmark's read/discovery/scoring path supports
+  // exactly `SUPPORTED_SPORTS`, checked by EXACT ordered-array equality — a
+  // duplicate (`['mlb','mlb']`) or a superset (`['mlb','nfl']`) fails, because
+  // the market policy, discovery reads, and scorer are enumerated for one sport
+  // only. The dimension is `sport` (the stable `games.sport` slug), never the
+  // nullable `league`. An empty list is already refused by the manifest schema
+  // (`.min(1)`), so it never reaches here.
+  if (!orderedArrayEqual(manifest.sportAllowList, SUPPORTED_SPORTS)) {
+    violations.push(
+      `sportAllowList [${manifest.sportAllowList.join(', ')}] is not the supported set ` +
+        `[${SUPPORTED_SPORTS.join(', ')}] (exact ordered equality; only 'mlb' is supported)`,
+    );
+  }
+
+  // Source query version: known-version equality against the read-model version
+  // the running `odds_history` predicate + as-of query actually implement. A
+  // manifest pinning a version the code cannot honor fails closed.
+  if (!isSourceQueryVersion(manifest.sourceQueryVersion)) {
+    violations.push(
+      `unknown sourceQueryVersion "${manifest.sourceQueryVersion}" (code implements "${SOURCE_QUERY_VERSION}")`,
+    );
+  }
 
   // Market policy: known version, then recomputed digest must match.
   if (!isMarketPolicyVersion(manifest.marketPolicyVersion)) {

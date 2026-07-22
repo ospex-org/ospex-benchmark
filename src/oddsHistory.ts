@@ -28,6 +28,14 @@ export { instantMs } from './time.js';
  *  versions `validTwoSidedHistoryRowV1` (below) and the as-of query. */
 export const SOURCE_QUERY_VERSION = 'source-query-v1';
 
+/** Known-version equality for `sourceQueryVersion` (no digest — the version alone
+ *  pins the valid-row predicate + as-of query). Sugar mirroring
+ *  `isMarketPolicyVersion`, so boot can flag a manifest that pins a read-model
+ *  version the running code does not implement. */
+export function isSourceQueryVersion(value: string): value is typeof SOURCE_QUERY_VERSION {
+  return value === SOURCE_QUERY_VERSION;
+}
+
 // American odds: present, a safe non-zero integer (the DB column is an integer;
 // null/absent, zero, or a fractional value is not a valid two-sided price).
 const americanOddsSchema = z
