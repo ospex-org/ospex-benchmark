@@ -374,8 +374,11 @@ const HISTORY_PAGE_SIZE = 1000;
  *
  * ONE aggregate deadline bounds the WHOLE read (not each page): the elapsed
  * budget is measured from before the first page, and each page fetch receives
- * only the time remaining, so a multi-page read aborts at
- * `deadlineMs` overall rather than `pages × per-page-timeout`.
+ * only the time remaining, so a multi-page read aborts at `deadlineMs` overall
+ * rather than `pages × per-page-timeout`. The absolute deadline is rechecked
+ * AFTER each awaited response/raw parse and AFTER the final semantic parse, so a
+ * fetch or parse that starts within budget but finishes past it is rejected — the
+ * bound holds even if the transport ignores its per-call timeout.
  */
 export async function fetchFullHistoryRows(options: {
   supabaseUrl: string;
@@ -390,24 +393,39 @@ export async function fetchFullHistoryRows(options: {
   const http = options.http ?? getJson;
   const headers = { apikey: options.anonKey, Authorization: `Bearer ${options.anonKey}` };
   const start = now();
+  const deadlineExceeded = (): Error =>
+    new Error(
+      `odds_history read for (${options.gameId}, ${options.market}) exceeded its ` +
+        `aggregate deadline of ${options.deadlineMs}ms`,
+    );
   const rawRows = await keysetWalk({
     fetchPage: async (afterId) => {
       const remaining = options.deadlineMs - (now() - start);
       if (remaining <= 0) {
-        throw new Error(
-          `odds_history read for (${options.gameId}, ${options.market}) exceeded its ` +
-            `aggregate deadline of ${options.deadlineMs}ms`,
-        );
+        throw deadlineExceeded();
       }
       const url =
         `${options.supabaseUrl}/rest/v1/odds_history?select=${HISTORY_FULL_SELECT}` +
         `&jsonodds_id=eq.${encodeURIComponent(options.gameId)}&market=eq.${options.market}&source=eq.jsonodds` +
         `&id=gt.${afterId}&order=id.asc&limit=${HISTORY_PAGE_SIZE}`;
-      return parseRawHistoryPage(await http(url, headers, remaining));
+      const page = parseRawHistoryPage(await http(url, headers, remaining));
+      // The pre-fetch guard only proves the page STARTED within budget; a fetch +
+      // raw parse that FINISHES past the aggregate deadline must also be rejected,
+      // so the read is bounded even if the transport ignores `remaining`.
+      if (now() - start > options.deadlineMs) {
+        throw deadlineExceeded();
+      }
+      return page;
     },
     idOf: (row) => row.id,
   });
-  return parseTwoSidedHistoryRows(rawRows);
+  const parsed = parseTwoSidedHistoryRows(rawRows);
+  // The final semantic parse is unbounded work over the accumulated rows; recheck
+  // the aggregate deadline after it, so a slow parse cannot push the read past budget.
+  if (now() - start > options.deadlineMs) {
+    throw deadlineExceeded();
+  }
+  return parsed;
 }
 
 export async function fetchLiveInputs(options: {

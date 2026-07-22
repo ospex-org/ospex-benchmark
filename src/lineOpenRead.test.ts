@@ -520,6 +520,62 @@ test('historyReadHonorsAggregateDeadline', async () => {
   assert.equal(clock, deadlineMs, 'aborted at the aggregate deadline, not N × per-page latency');
 });
 
+test('historyReadRejectsLateEmptyPage', async () => {
+  // A page that STARTS within budget but whose fetch COMPLETES past the aggregate
+  // deadline must be rejected — the pre-fetch guard alone accepts it. An empty page is
+  // no exception: the terminating fetch still consumed time.
+  const deadlineMs = 1000;
+  let clock = 0;
+  const http: HttpGet = async () => {
+    clock = 1001; // the fetch completes 1ms past the deadline
+    return [];
+  };
+  await assert.rejects(
+    fetchFullHistoryRows({ supabaseUrl: 'http://db', anonKey: 'k', gameId: 'hg', market: 'moneyline', deadlineMs, now: () => clock, http }),
+    /deadline/i,
+  );
+});
+
+test('historyReadRejectsDelayedProcessing', async () => {
+  // A response whose fetch/processing completes past the deadline is rejected even
+  // though the fetch started within budget. The response is empty so the walk
+  // TERMINATES here (no next page whose pre-fetch guard would catch the overrun) —
+  // only the post-completion recheck can reject it.
+  const deadlineMs = 10;
+  let clock = 0;
+  const http: HttpGet = async () => {
+    clock = 52; // fetch + processing completes ~52ms in, past the 10ms deadline
+    return [];
+  };
+  await assert.rejects(
+    fetchFullHistoryRows({ supabaseUrl: 'http://db', anonKey: 'k', gameId: 'hg', market: 'moneyline', deadlineMs, now: () => clock, http }),
+    /deadline/i,
+  );
+});
+
+test('historyReadRejectsSlowSemanticParse', async () => {
+  // The final semantic parse is unbounded work; the post-parse recheck rejects a read
+  // whose fetches all stayed within budget but whose total elapsed exceeds the deadline.
+  // A clock that advances on EACH read makes only the post-parse check trip (calibrated
+  // to the read's clock reads: start + pre/post per page + the final post-parse check).
+  let calls = 0;
+  const now = (): number => {
+    const t = calls * 3;
+    calls += 1;
+    return t;
+  };
+  let served = false;
+  const http: HttpGet = async () => {
+    if (served) return [];
+    served = true;
+    return [{ id: 1 }];
+  };
+  await assert.rejects(
+    fetchFullHistoryRows({ supabaseUrl: 'http://db', anonKey: 'k', gameId: 'hg', market: 'moneyline', deadlineMs: 13, now, http }),
+    /deadline/i,
+  );
+});
+
 test('emptyHistoryIsCompletedNotFault', async () => {
   const booted = bootMlbCohort();
   const deps = historyDeps(async () => ({ rows: [], dropped: 0 }));
@@ -685,6 +741,48 @@ test('discoverSeamReturnsFrozenBrandedBuildableSnapshot', async () => {
   // prepared-fire brand rejects it.
   assert.ok(!('fireId' in snap) && !('runId' in snap) && !('prepared' in snap));
   assert.throws(() => assertPreparedFireSnapshot(snap as never), /forged or substituted/);
+});
+
+test('retainedSnapshotRowsMatchSourceExactly', async () => {
+  // The snapshot must carry the EXACT retained source rows (every field) — both the odds
+  // row and the game row — not merely their (gameId, market): a key-preserving payload
+  // substitution (e.g. home := away, which keeps cardinality and buildability, or a
+  // corrupted team) must be caught. away != home so the odds substitution is detectable.
+  const sourceOdds = makeOdds({ jsonodds_id: 'ex1', market: 'moneyline', away_odds_american: -133, home_odds_american: 121 });
+  const sourceGame = makeGame({ gameId: 'ex1' });
+  const { deps } = fakeDiscoveryReads([sourceGame], [sourceOdds]);
+  const snap = await discover(bootMlbCohort(), deps);
+  assert.equal(snap.oddsRows.length, 1);
+  assert.deepEqual(snap.oddsRows[0], sourceOdds);
+  assert.equal(snap.games.length, 1);
+  assert.deepEqual(snap.games[0], sourceGame);
+});
+
+test('discoverySnapshotIsRecursivelyFrozen', async () => {
+  // Recursive immutability: not only the outer snapshot + arrays, but every NESTED node
+  // (rows, games, nested game objects, candidates) is frozen. Freezing only the outer
+  // containers is caught. A nested write may throw OR silently no-op by mode, so also
+  // prove independently that the canonical value is unchanged.
+  const { deps } = fakeDiscoveryReads(
+    [makeGame({ gameId: 'rf1' })],
+    [makeOdds({ jsonodds_id: 'rf1', home_odds_american: 121 })],
+  );
+  const snap = await discover(bootMlbCohort(), deps);
+  const nested: unknown[] = [
+    snap.oddsRows[0],
+    snap.games[0],
+    snap.games[0]!.homeTeam,
+    snap.games[0]!.externalIds,
+    snap.candidates[0],
+  ];
+  for (const node of nested) assert.ok(Object.isFrozen(node), 'a nested snapshot node is not frozen');
+  const before = snap.oddsRows[0]!.home_odds_american;
+  try {
+    (snap.oddsRows[0] as CurrentOddsRow).home_odds_american = -999;
+  } catch {
+    /* frozen assignment throws in strict mode */
+  }
+  assert.equal(snap.oddsRows[0]!.home_odds_american, before, 'a nested value was mutable');
 });
 
 test('readSeamReturnsFullRowsWatermarkAndCompletion', async () => {
