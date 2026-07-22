@@ -79,6 +79,54 @@ export function parseGamesBody(body: unknown): {
   return { games: parsed.games as GamesEndpointRow[], hasMore: parsed.pagination.hasMore };
 }
 
+/**
+ * The `/v1/games` body WITH its query echo. The endpoint reflects the requested
+ * `sport` (lowercased, or `null` when omitted), `windowHours`, and `availableOnly`
+ * back at the top level, plus the pagination `limit`/`offset`, so a caller can
+ * assert the server answered the query it actually asked — a returned page that
+ * quietly widened the window or dropped the sport filter is caught rather than
+ * trusted. Extra fields are tolerated (passthrough).
+ */
+export const gamesEndpointEchoBodySchema = z
+  .object({
+    sport: z.string().nullable(),
+    windowHours: z.number(),
+    availableOnly: z.boolean(),
+    games: z.array(gamesEndpointRowSchema),
+    pagination: z
+      .object({
+        limit: z.number(),
+        offset: z.number(),
+        total: z.number(),
+        hasMore: z.boolean(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+export interface GamesEndpointEchoBody {
+  sport: string | null;
+  windowHours: number;
+  availableOnly: boolean;
+  games: GamesEndpointRow[];
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+export function parseGamesEndpointEchoBody(body: unknown): GamesEndpointEchoBody {
+  const parsed = gamesEndpointEchoBodySchema.parse(body);
+  return {
+    sport: parsed.sport,
+    windowHours: parsed.windowHours,
+    availableOnly: parsed.availableOnly,
+    games: parsed.games as GamesEndpointRow[],
+    limit: parsed.pagination.limit,
+    offset: parsed.pagination.offset,
+    hasMore: parsed.pagination.hasMore,
+  };
+}
+
 export function parseCurrentOddsRows(body: unknown): CurrentOddsRow[] {
   return z.array(currentOddsRowSchema).parse(body) as CurrentOddsRow[];
 }
