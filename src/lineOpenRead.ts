@@ -81,6 +81,11 @@ export interface DiscoverySnapshot {
  * a nonnegative safe integer when frozen), and the instant the whole read completed.
  */
 export interface MarketEvidenceRead {
+  /** The requested game id — carried so an empty (`historyRows: []`) read is still
+   *  self-describing about which pair it answered. */
+  readonly gameId: string;
+  /** The requested market — carried alongside `gameId` for the same reason. */
+  readonly market: MarketKey;
   readonly historyRows: readonly TwoSidedHistoryRow[];
   readonly historyWatermark: number | null;
   readonly readCompletedAt: string;
@@ -133,6 +138,12 @@ export interface HistoryReadDeps {
 
 const discoverySnapshots = new WeakSet<DiscoverySnapshot>();
 
+// The producing cohort id of each snapshot `discover` seals. A brand proves a
+// snapshot came through discovery, but NOT which cohort produced it; recording the
+// cohort id here lets `assertDiscoverySnapshotFor` reject a genuine snapshot from a
+// DIFFERENT cohort being paired with the wrong booted cohort at a later stage.
+const discoverySnapshotCohort = new WeakMap<DiscoverySnapshot, string>();
+
 /** Throw unless `snapshot` was produced by `discover`. A stage that trusts the
  *  discovery result calls this; a forged or structurally-copied value is rejected
  *  even though the TypeScript type would let one through. */
@@ -140,6 +151,25 @@ export function assertDiscoverySnapshot(snapshot: DiscoverySnapshot): void {
   if (!discoverySnapshots.has(snapshot)) {
     throw new LineOpenReadError(
       'discovery snapshot was not produced by discover (forged or substituted)',
+    );
+  }
+}
+
+/**
+ * Throw unless `snapshot` was produced by `discover` FOR this exact booted cohort.
+ * Brands prove origin, not cross-root coherence — a genuine snapshot and a genuine
+ * cohort can still belong to different cohorts. This binds them: it authenticates
+ * `booted` itself (so the exported helper has a closed direct-call domain), then
+ * requires the snapshot to be a genuine discovery result whose producing cohort id
+ * equals `booted.cohortId`. A consumer that composes discovery with a cohort's
+ * manifest calls this to reject a crossed pairing.
+ */
+export function assertDiscoverySnapshotFor(snapshot: DiscoverySnapshot, booted: BootedCohort): void {
+  assertBootedCohort(booted);
+  assertDiscoverySnapshot(snapshot);
+  if (discoverySnapshotCohort.get(snapshot) !== booted.cohortId) {
+    throw new LineOpenReadError(
+      'discovery snapshot was produced for a different cohort than the one supplied',
     );
   }
 }
@@ -277,6 +307,7 @@ export async function discover(
     fetchCompletedAt,
   });
   discoverySnapshots.add(snapshot);
+  discoverySnapshotCohort.set(snapshot, booted.cohortId);
   return snapshot;
 }
 
@@ -321,7 +352,7 @@ export async function readMarketEvidence(
   }
 
   const readCompletedAt = new Date(deps.now()).toISOString();
-  return { historyRows: rows, historyWatermark: null, readCompletedAt };
+  return { gameId, market, historyRows: rows, historyWatermark: null, readCompletedAt };
 }
 
 // ---------------------------------------------------------------------------

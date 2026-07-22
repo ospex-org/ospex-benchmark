@@ -7,6 +7,7 @@ import { cohortBoot } from './cohortBoot.js';
 import { fetchFullHistoryRows, fetchGamesForSport, fetchGamesForWindow, fetchLiveInputs } from './fetchers.js';
 import {
   assertDiscoverySnapshot,
+  assertDiscoverySnapshotFor,
   collectGames,
   createDiscoverFn,
   createReadMarketEvidenceFn,
@@ -756,6 +757,52 @@ test('retainedSnapshotRowsMatchSourceExactly', async () => {
   assert.deepEqual(snap.oddsRows[0], sourceOdds);
   assert.equal(snap.games.length, 1);
   assert.deepEqual(snap.games[0], sourceGame);
+});
+
+// ===========================================================================
+// discovery ↔ producing-cohort association + evidence pair fields
+// ===========================================================================
+
+test('a discovery snapshot is bound to its producing cohort', async () => {
+  const bootedA = cohortBoot({ live: false, manifestBytes: JSON.stringify(manifestRaw({ network: 'polygon' })) });
+  const bootedB = cohortBoot({ live: false, manifestBytes: JSON.stringify(manifestRaw({ network: 'polygon-amoy' })) });
+  assert.notEqual(bootedA.cohortId, bootedB.cohortId, 'the two cohorts have distinct identities');
+  const { deps } = fakeDiscoveryReads([makeGame({ gameId: 'cb1' })], [makeOdds({ jsonodds_id: 'cb1' })]);
+  const snap = await discover(bootedA, deps);
+
+  // Same producing cohort authenticates; a different genuine cohort is rejected.
+  assert.doesNotThrow(() => assertDiscoverySnapshotFor(snap, bootedA));
+  assert.throws(() => assertDiscoverySnapshotFor(snap, bootedB), /different cohort/);
+
+  // A forged (structurally-copied) snapshot is rejected even with the right cohort.
+  assert.throws(() => assertDiscoverySnapshotFor({ ...snap } as DiscoverySnapshot, bootedA), /forged or substituted/);
+
+  // A forged cohort is rejected up front — the helper authenticates booted itself.
+  const forgedCohort: BootedCohort = { cohortId: bootedA.cohortId, manifest: bootedA.manifest };
+  assert.throws(() => assertDiscoverySnapshotFor(snap, forgedCohort), /not produced by cohortBoot/);
+});
+
+test('market evidence carries and self-describes its requested pair', async () => {
+  const booted = bootMlbCohort();
+  // A non-empty read binds its rows and echoes the requested pair.
+  const full = await readMarketEvidence(
+    booted,
+    'hg',
+    'moneyline',
+    historyDeps(async () => ({ rows: [parsedRow(1, 'hg', 'moneyline')], dropped: 0 })),
+  );
+  assert.equal(full.gameId, 'hg');
+  assert.equal(full.market, 'moneyline');
+  // An EMPTY successful read is still self-describing about which pair it answered.
+  const empty = await readMarketEvidence(
+    booted,
+    'eg',
+    'total',
+    historyDeps(async () => ({ rows: [], dropped: 0 })),
+  );
+  assert.deepEqual(empty.historyRows, []);
+  assert.equal(empty.gameId, 'eg');
+  assert.equal(empty.market, 'total');
 });
 
 test('discoverySnapshotIsRecursivelyFrozen', async () => {
