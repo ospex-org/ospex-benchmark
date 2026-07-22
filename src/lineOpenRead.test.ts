@@ -278,7 +278,7 @@ function pagedGamesHttp(pages: Array<Record<string, unknown>>): { http: HttpGet;
 }
 
 // ===========================================================================
-// Group 1 — candidate enumeration + exact row retention
+// candidate enumeration + exact row retention
 // ===========================================================================
 
 test('candidateKeySetEqualsRetainedBuildableRows', async () => {
@@ -322,7 +322,7 @@ test('discoveryReadsCurrentOddsOnceNoSecondRead', async () => {
 });
 
 // ===========================================================================
-// Group 2 — complete shared singleton buildability
+// complete shared singleton buildability
 // ===========================================================================
 
 test('sharedBuildabilityFilterRejectsEveryClass', async () => {
@@ -362,12 +362,12 @@ test('dedupAndBindingRunBeforeBuildabilityFilter', async () => {
 });
 
 // ===========================================================================
-// Group 3 — per-sport games reads + echo validation + pagination
+// per-sport games reads + echo validation + pagination
 // ===========================================================================
 
 test('gamesFetchIteratesAllowListWithSportAndWindow', async () => {
   // (a) fetcher level: the passed sport + window are used verbatim; availableOnly=false;
-  //     no `network` query param (M5 would hard-code sport=mlb / a fixed window).
+  //     no `network` query param (a regression hard-coding sport=mlb / a fixed window would slip past this).
   const nflGame = makeGame({ gameId: 'nf1', sport: 'nfl' });
   const { http, urls } = pagedGamesHttp([gamesEcho({ sport: 'nfl', windowHours: 168, games: [nflGame] })]);
   const rows = await fetchGamesForSport('http://api', 'nfl', 168, http);
@@ -405,6 +405,16 @@ test('gamesResponseEchoIsValidated', async () => {
   await assert.rejects(
     fetchGamesForSport('http://api', 'mlb', 168, pagedGamesHttp([gamesEcho({ availableOnly: true, games: [g] })]).http),
     /echoed availableOnly/,
+  );
+  // Wrong echoed pagination.limit.
+  await assert.rejects(
+    fetchGamesForSport('http://api', 'mlb', 168, pagedGamesHttp([gamesEcho({ limit: 50, games: [g] })]).http),
+    /echoed pagination\.limit/,
+  );
+  // Wrong echoed pagination.offset.
+  await assert.rejects(
+    fetchGamesForSport('http://api', 'mlb', 168, pagedGamesHttp([gamesEcho({ offset: 999, games: [g] })]).http),
+    /echoed pagination\.offset/,
   );
   // A returned row carrying the wrong sport.
   await assert.rejects(
@@ -447,7 +457,7 @@ test('legacyWatchStillCompiles', () => {
 });
 
 // ===========================================================================
-// Group 4 — history read + raw-id keyset walk + timeout + fault vs empty
+// history read + raw-id keyset walk + timeout + fault vs empty
 // ===========================================================================
 
 test('historyQueryIsFullColumnOrderedKeyset', async () => {
@@ -560,7 +570,7 @@ test('historyRowsBindToRequestedPair', async () => {
 });
 
 // ===========================================================================
-// Group 5 — boot checks
+// boot checks
 // ===========================================================================
 
 test('bootRejectsNonMlbSportAllowList', () => {
@@ -592,7 +602,7 @@ test('sourceQueryVersionViolationOnMismatch', () => {
 });
 
 // ===========================================================================
-// Group 6 — duplicate / identity / source binding
+// duplicate / identity / source binding
 // ===========================================================================
 
 test('duplicateMarketRowFailsClosed', async () => {
@@ -607,8 +617,12 @@ test('duplicateMarketRowFailsClosed', async () => {
 
 test('duplicateGameRowCanonicalDedupOrFail', async () => {
   const base = makeGame({ gameId: 'cg1' });
-  // A canonical-equal repeat deduplicates to one row.
-  const deduped = await collectGames(['mlb'], 168, async () => [base, structuredClone(base)]);
+  // A canonical-equal repeat deduplicates to one row. The repeat is KEY-REORDERED
+  // (identical values, different key order), so only a key-sorting canonical compare
+  // dedups it — a byte / JSON.stringify compare would see a different order and wrongly
+  // fault it as a conflicting duplicate, which is what distinguishes the two.
+  const keyReordered = Object.fromEntries(Object.entries(base).reverse()) as unknown as GamesEndpointRow;
+  const deduped = await collectGames(['mlb'], 168, async () => [base, keyReordered]);
   assert.equal(deduped.length, 1);
   // A conflicting repeat (same id, different content) faults.
   await assert.rejects(
@@ -637,7 +651,7 @@ test('currentOddsRowsBindToNetworkAndGameSet', async () => {
 });
 
 // ===========================================================================
-// Group 7 — branded discovery snapshot + real read seams
+// branded discovery snapshot + real read seams
 // ===========================================================================
 
 test('discoverSeamReturnsFrozenBrandedBuildableSnapshot', async () => {
@@ -704,7 +718,7 @@ test('discoveryRefusesUnbootedCohort', async () => {
 });
 
 // ===========================================================================
-// Group 8 — compatibility + non-activation
+// compatibility + non-activation
 // ===========================================================================
 
 test('discoveryAndReadSeamsRemainNonActivating', () => {

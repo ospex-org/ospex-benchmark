@@ -33,9 +33,16 @@ import type { CurrentOddsRow, GamesEndpointRow, MarketKey } from './types.js';
  * disagree on which `(gameId, market)` is buildable.
  */
 
-/** A source-integrity fault raised by discovery / the opener read: a duplicate,
- *  an identity/binding violation, or an evidence-erasing malformed history row.
- *  Distinct from a benign empty read (which completes with no rows). */
+/**
+ * A source-integrity fault raised by the SEMANTIC checks in discovery / the opener read:
+ * a duplicate row, a game/network/requested-pair identity-binding violation, or a dropped
+ * (evidence-erasing) history row. It does NOT encompass the lower-level faults, which
+ * propagate RAW from the fetcher layer: a malformed body (a `ZodError`), a non-increasing /
+ * unsafe raw id or a blown aggregate read deadline, and a games echo / offset-ceiling
+ * violation. Error TYPE is therefore not yet a load-bearing classification contract — a later
+ * stage mapping faults to retry-vs-stop must not switch on `instanceof` alone. Distinct from a
+ * benign empty read (which completes with no rows).
+ */
 export class LineOpenReadError extends Error {
   constructor(message: string) {
     super(message);

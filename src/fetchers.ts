@@ -145,6 +145,8 @@ export async function fetchGamesForSport(
     }
     rows.push(...echo.games);
     if (!echo.hasMore) break;
+    // Advance by the requested page limit (not echo.games.length): PostgREST returns
+    // exactly `limit` rows per non-final page, and the echo above asserts limit === 200.
     offset += GAMES_PAGE_LIMIT;
     if (offset > GAMES_OFFSET_CEILING) {
       throw new Error(
@@ -399,7 +401,7 @@ export async function fetchFullHistoryRows(options: {
       }
       const url =
         `${options.supabaseUrl}/rest/v1/odds_history?select=${HISTORY_FULL_SELECT}` +
-        `&jsonodds_id=eq.${options.gameId}&market=eq.${options.market}&source=eq.jsonodds` +
+        `&jsonodds_id=eq.${encodeURIComponent(options.gameId)}&market=eq.${options.market}&source=eq.jsonodds` +
         `&id=gt.${afterId}&order=id.asc&limit=${HISTORY_PAGE_SIZE}`;
       return parseRawHistoryPage(await http(url, headers, remaining));
     },
