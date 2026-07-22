@@ -699,6 +699,75 @@ test('readSeamReturnsFullRowsWatermarkAndCompletion', async () => {
   assert.equal(opener?.id, 1);
 });
 
+// Manifest value-source + completion-ordering teeth: the seams must read the discovery
+// window / history timeout FROM the booted manifest (proven with NON-default values so a
+// hard-coded default cannot pass), and stamp each completion instant AFTER its reads
+// (proven with advancing clocks so a pre-read stamp cannot pass).
+
+test('discoveryWindowComesFromManifest', async () => {
+  // 417 is deliberately non-default (the fixture default is 168), so a hard-coded window
+  // would satisfy the value-agnostic games-fetch tooth yet fail here.
+  const { deps, gamesCalls } = fakeDiscoveryReads([makeGame({ gameId: 'wm1' })], [makeOdds({ jsonodds_id: 'wm1' })]);
+  await discover(bootMlbCohort({ gameDiscoveryWindowHours: 417 }), deps);
+  assert.ok(gamesCalls.length > 0, 'discovery read games');
+  assert.ok(gamesCalls.every((c) => c.windowHours === 417), 'the manifest window (417) reached every readGames call');
+});
+
+test('historyReadTimeoutComesFromManifest', async () => {
+  // 1_234 is deliberately non-default (the fixture default is 30_000), so a hard-coded
+  // deadline would satisfy the aggregate-deadline tooth yet fail here.
+  let seenDeadline = -1;
+  const deps: HistoryReadDeps = {
+    fetchHistory: async (_gameId, _market, deadlineMs) => {
+      seenDeadline = deadlineMs;
+      return { rows: [], dropped: 0 };
+    },
+    now: () => NOW_MS,
+  };
+  await readMarketEvidence(bootMlbCohort({ historyReadTimeoutMs: 1_234 }), 'hg', 'moneyline', deps);
+  assert.equal(seenDeadline, 1_234, 'the manifest timeout (1234) reached fetchHistory');
+});
+
+test('discoveryCompletionIsStampedAfterReads', async () => {
+  // An advancing clock: fetchCompletedAt must be the post-read instant, not the start —
+  // moving the stamp before the reads would capture `start` and fail here.
+  const start = NOW_MS;
+  const afterReads = NOW_MS + 2_000;
+  let clock = start;
+  const deps: DiscoveryReads = {
+    readGames: async (sport) => {
+      clock = NOW_MS + 1_000;
+      return [makeGame({ gameId: 'ac1' })].filter((g) => g.sport === sport);
+    },
+    readCurrentOdds: async () => {
+      clock = afterReads;
+      return [makeOdds({ jsonodds_id: 'ac1' })];
+    },
+    now: () => clock,
+  };
+  const snap = await discover(bootMlbCohort(), deps);
+  assert.equal(snap.fetchCompletedAt, new Date(afterReads).toISOString(), 'stamped after the reads, not at start');
+  assert.notEqual(snap.fetchCompletedAt, new Date(start).toISOString());
+});
+
+test('historyCompletionIsStampedAfterRead', async () => {
+  // An advancing clock: readCompletedAt must be the post-read instant, not before —
+  // moving the stamp before the fetch would capture `start` and fail here.
+  const start = NOW_MS;
+  const afterRead = NOW_MS + 3_000;
+  let clock = start;
+  const deps: HistoryReadDeps = {
+    fetchHistory: async () => {
+      clock = afterRead;
+      return { rows: [], dropped: 0 };
+    },
+    now: () => clock,
+  };
+  const result = await readMarketEvidence(bootMlbCohort(), 'hg', 'moneyline', deps);
+  assert.equal(result.readCompletedAt, new Date(afterRead).toISOString(), 'stamped after the read, not before');
+  assert.notEqual(result.readCompletedAt, new Date(start).toISOString());
+});
+
 test('discoveryRefusesUnbootedCohort', async () => {
   const forged: BootedCohort = { cohortId: 'forged', manifest: parseManifest(manifestRaw()) };
   const { deps, gamesCalls, oddsCalls } = fakeDiscoveryReads([makeGame()], [makeOdds()]);
