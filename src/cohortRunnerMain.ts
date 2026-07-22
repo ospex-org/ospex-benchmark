@@ -113,21 +113,36 @@ const REHEARSAL_PUBLICATION_DESCRIPTOR = Object.freeze({
 });
 
 /**
- * Self-resolve the manifest's public-Git precommitment WITHOUT a GitHub resolver: the
- * "published" blob IS the local manifest bytes, and the committer timestamp is derived
- * to be strictly before `windowStart`. `checkPublication` is pure (no network) and still
- * enforces byte-equality, cohortId equality, and the committer-before-windowStart rule,
- * so it returns a genuine branded `PublicationVerified`. Honest for a rehearsal that
- * issues zero provider requests; a real GitHub precommitment is a live-path requirement.
+ * Fatal UTF-8 decode: an invalid byte sequence THROWS rather than being silently
+ * replaced with U+FFFD. The manifest bytes ARE the cohort identity AND the publication
+ * precommitment blob, so a corrupted manifest must fail loudly — never be normalized
+ * (rewriting `0xff` into the 3-byte U+FFFD) and then booted under a rewritten identity.
  */
-export function selfResolvePublication(manifestBytes: string): PublicationVerified {
-  const localManifestBytes = new TextEncoder().encode(manifestBytes);
-  const manifest = parseManifest(JSON.parse(manifestBytes) as unknown);
+const utf8Fatal = new TextDecoder('utf-8', { fatal: true });
+
+/** Decode raw manifest bytes to text, throwing on any invalid UTF-8. */
+export function decodeManifestText(rawBytes: Uint8Array): string {
+  return utf8Fatal.decode(rawBytes);
+}
+
+/**
+ * Self-resolve the manifest's public-Git precommitment WITHOUT a GitHub resolver: the
+ * "published" blob IS the RAW local manifest bytes (never a re-encoded string), and the
+ * committer timestamp is derived to be strictly before `windowStart`. The bytes are
+ * fatal-decoded + parsed ONLY to read `windowStart`; the raw bytes themselves are what
+ * the check binds as both the local manifest and the blob. `checkPublication` is pure (no
+ * network) and enforces byte-equality, cohortId equality, and the committer-before-
+ * windowStart rule, so it returns a genuine branded `PublicationVerified`. Honest for a
+ * rehearsal that issues zero provider requests; a real GitHub precommitment is a live-path
+ * requirement. Throws on invalid-UTF-8 bytes (the fatal decode below).
+ */
+export function selfResolvePublication(manifestBytes: Uint8Array): PublicationVerified {
+  const manifest = parseManifest(JSON.parse(decodeManifestText(manifestBytes)) as unknown);
   const committerTimestamp = new Date(Date.parse(manifest.windowStart) - 1000).toISOString();
   return checkPublication({
-    localManifestBytes,
+    localManifestBytes: manifestBytes,
     publication: { ...REHEARSAL_PUBLICATION_DESCRIPTOR },
-    resolved: { blobBytes: localManifestBytes, committerTimestamp },
+    resolved: { blobBytes: manifestBytes, committerTimestamp },
   });
 }
 
@@ -155,8 +170,9 @@ const NO_OP_SINK: ArtifactInstaller = {
 };
 
 export interface RehearsalTickParams {
-  /** The manifest bytes — the SAME bytes fed to boot and to publication verification. */
-  readonly manifestBytes: string;
+  /** The RAW manifest bytes — the single source fed (fatal-decoded) to boot and (as raw
+   *  bytes) to publication verification, so a byte-corrupted manifest fails loudly. */
+  readonly manifestBytes: Uint8Array;
   /** The real read-only seam config (core-api + PostgREST). */
   readonly config: LineOpenReadConfig;
   /** The tick clock (wall clock in production; injected in tests). */
@@ -166,12 +182,15 @@ export interface RehearsalTickParams {
 }
 
 /**
- * Assemble a rehearsal `CohortTickInput` from the manifest bytes + read config. Booting
- * and publication verification happen here (pure, no network); the discovery/opener seams
- * are the REAL factories over `config` but are not invoked until `runCohortTick` runs.
+ * Assemble a rehearsal `CohortTickInput` from the RAW manifest bytes + read config. The
+ * bytes are fatal-decoded once (throwing on invalid UTF-8) and the decoded string boots
+ * the cohort, while the raw bytes verify the publication precommitment — so boot identity
+ * and precommitment blob are the exact same bytes. Booting + verification are pure (no
+ * network); the discovery/opener seams are the REAL factories over `config` but are not
+ * invoked until `runCohortTick` runs.
  */
 export function buildRehearsalTickInput(params: RehearsalTickParams): CohortTickInput {
-  const booted = cohortBoot({ live: false, manifestBytes: params.manifestBytes });
+  const booted = cohortBoot({ live: false, manifestBytes: decodeManifestText(params.manifestBytes) });
   const publication = selfResolvePublication(params.manifestBytes);
   return {
     booted,
@@ -239,22 +258,29 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  // Read or generate the manifest bytes ONCE — the same bytes drive both cohortBoot
-  // (string-decoded) and publication verification (as raw bytes).
+  // Obtain the manifest as RAW bytes ONCE — a supplied file is read as raw bytes (NO
+  // 'utf8', so Node cannot silently replace invalid UTF-8), and the generated default is
+  // encoded from its canonical string. These exact raw bytes ARE the cohort identity + the
+  // publication precommitment blob.
   const now = (): number => Date.now();
-  let manifestBytes: string;
+  let rawBytes: Uint8Array;
   if (options.manifestPath !== null) {
-    manifestBytes = readFileSync(options.manifestPath, 'utf8');
-    printLine(`manifest: read ${manifestBytes.length} byte(s) from ${options.manifestPath}`);
+    rawBytes = readFileSync(options.manifestPath);
+    printLine(`manifest: read ${rawBytes.length} byte(s) from ${options.manifestPath}`);
   } else {
-    manifestBytes = buildRehearsalManifest(now()).bytes;
+    rawBytes = new TextEncoder().encode(buildRehearsalManifest(now()).bytes);
     printLine('manifest: generated in-process (code-consistent, now-relative observation window)');
   }
+
+  // Fatal-decode the raw bytes EARLY — an invalid-UTF-8 manifest throws HERE (flowing to
+  // main's catch → nonzero exit) before any boot, emit, or read work. cohortBoot consumes
+  // this decoded string; publication verification consumes the raw bytes.
+  const manifestText = decodeManifestText(rawBytes);
 
   // `--live` is routed into cohortBoot, which hard-disables it. Surface the refusal.
   if (options.live) {
     try {
-      cohortBoot({ live: true, manifestBytes });
+      cohortBoot({ live: true, manifestBytes: manifestText });
     } catch (error) {
       if (error instanceof CohortBootError) {
         printError(`--live rejected by cohortBoot: ${error.message}`);
@@ -268,16 +294,16 @@ async function main(): Promise<number> {
   }
 
   // --emit-manifest: prove the manifest boots and its publication self-resolves, then
-  // write it and exit — NO network I/O.
+  // write the EXACT accepted raw bytes and exit — NO network I/O.
   if (options.emitManifestPath !== null) {
-    const booted = cohortBoot({ live: false, manifestBytes });
-    selfResolvePublication(manifestBytes);
-    writeFileSync(options.emitManifestPath, manifestBytes);
+    const booted = cohortBoot({ live: false, manifestBytes: manifestText });
+    selfResolvePublication(rawBytes);
+    writeFileSync(options.emitManifestPath, rawBytes);
     printLine(`[rehearsal] cohort booted: cohortId ${booted.cohortId}`);
     printLine(
       '[rehearsal] publication self-resolved (blob == local manifest); real GitHub precommitment deferred to the live path',
     );
-    printLine(`manifest written to ${options.emitManifestPath} (${manifestBytes.length} bytes) — no network I/O`);
+    printLine(`manifest written to ${options.emitManifestPath} (${rawBytes.length} bytes) — no network I/O`);
     return 0;
   }
 
@@ -297,7 +323,7 @@ async function main(): Promise<number> {
   const config: LineOpenReadConfig = { apiUrl, supabaseUrl, anonKey, now };
 
   const ownerId = `${hostname()}-${process.pid}-${randomUUID()}`;
-  const input = buildRehearsalTickInput({ manifestBytes, config, now, ownerId });
+  const input = buildRehearsalTickInput({ manifestBytes: rawBytes, config, now, ownerId });
   printLine(`[rehearsal] cohort booted: cohortId ${input.booted.cohortId}`);
   printLine(
     '[rehearsal] publication self-resolved (blob == local manifest); real GitHub precommitment deferred to the live path',
