@@ -901,50 +901,63 @@ test('B3-R3 (3): a non-null start on a zero-attempt credential_missing arm fails
 });
 
 /**
- * The send-time-gate set that OWNS the presence half of the bidirectional zero-attempt relation,
- * derived from an exhaustive `Record` so a NEW `ArmOutcome` member forces a compile error here (and
- * an explicit classification), never silently defaulting into or out of the gate set.
+ * The zero-attempt feasibility of EVERY `ArmOutcome`, from an exhaustive `Record` so a NEW member
+ * forces a compile error here (and an explicit classification), never silently defaulting:
+ *   - `gate-refusal` {cutoff_missed, dispatch_lag_exceeded}: never sent, MUST carry the compared
+ *     reading (presence half);
+ *   - `pre-clock` {credential_missing}: never took a reading, MUST NOT carry one (absence half);
+ *   - `sent-only` {valid, invalid_schema, timeout, rate_limited, provider_error}: SENT per Tier-0, so
+ *     a zero-attempt form is structurally impossible / forged and MUST be rejected — never blessed
+ *     replay-clean regardless of the start.
  */
-const SEND_TIME_GATE_REFUSAL: Record<ArmOutcome, boolean> = {
-  valid: false,
-  invalid_schema: false,
-  timeout: false,
-  credential_missing: false,
-  rate_limited: false,
-  provider_error: false,
-  cutoff_missed: true,
-  dispatch_lag_exceeded: true,
+const ZERO_ATTEMPT_KIND: Record<ArmOutcome, 'gate-refusal' | 'pre-clock' | 'sent-only'> = {
+  valid: 'sent-only',
+  invalid_schema: 'sent-only',
+  timeout: 'sent-only',
+  rate_limited: 'sent-only',
+  provider_error: 'sent-only',
+  credential_missing: 'pre-clock',
+  cutoff_missed: 'gate-refusal',
+  dispatch_lag_exceeded: 'gate-refusal',
 };
 
-test('B3-R3 (4): the bidirectional zero-attempt relation is enum-EXHAUSTIVE — every ArmOutcome, both directions', async () => {
-  // Today only credential_missing exercises the absence half. This walks ALL eight ArmOutcome
-  // members through the REAL install → replay over a ZERO-ATTEMPT arm, both directions:
-  //   send-time gate refusals {cutoff_missed, dispatch_lag_exceeded}: a non-null start replays clean,
-  //     a null start yields the "null initialRequestStartedAt" (presence) violation;
-  //   every other zero-attempt outcome: a null start replays clean, a spurious non-null start yields
-  //     the "not a send-time gate refusal but a non-null initialRequestStartedAt" (absence) violation.
-  // `valid` is EXCLUDED: a zero-attempt valid arm trips the distinct accepted-count digest rule, not
-  // the zero-attempt start relation this tooth pins.
+test('B3-R3 (4): the zero-attempt relation is enum-EXHAUSTIVE — gate refusals require the reading, pre-clock forbids it, sent outcomes cannot be zero-attempt', async () => {
+  // Walk ALL eight ArmOutcome members through the REAL install → replay over a ZERO-ATTEMPT arm.
+  // Only three outcomes can legitimately have zero attempts; a SENT outcome with zero attempts is
+  // structurally impossible per Tier-0 (its substantiating attempt must be retained) and is REJECTED,
+  // never required to replay clean.
   const { artifact, refused } = await producedMixedNeverSentFire();
   const parsed = parseFireArtifactV1(serializeFireArtifactV1(artifact));
   const baseIndex = parsed.arms.findIndex((a) => a.orderedAttempts.length === 0);
   assert.ok(baseIndex >= 0, 'fixture has a zero-attempt arm to patch');
 
-  // Inline exhaustiveness: the send-time-gate set is EXACTLY {cutoff_missed, dispatch_lag_exceeded},
-  // so adding/moving a member trips this assertion.
+  // Inline exhaustiveness: the three classes are EXACTLY these sets, so adding/moving a member trips this.
+  const byKind = (k: string): string[] =>
+    (Object.entries(ZERO_ATTEMPT_KIND) as Array<[string, string]>).filter(([, v]) => v === k).map(([o]) => o).sort();
+  assert.deepEqual(byKind('gate-refusal'), ['cutoff_missed', 'dispatch_lag_exceeded'], 'exactly two gate refusals');
+  assert.deepEqual(byKind('pre-clock'), ['credential_missing'], 'exactly one pre-clock refusal');
   assert.deepEqual(
-    Object.entries(SEND_TIME_GATE_REFUSAL)
-      .filter(([, isGate]) => isGate)
-      .map(([outcome]) => outcome)
-      .sort(),
-    ['cutoff_missed', 'dispatch_lag_exceeded'],
-    'exactly two outcomes own the presence half',
+    byKind('sent-only'),
+    ['invalid_schema', 'provider_error', 'rate_limited', 'timeout', 'valid'],
+    'exactly the five sent outcomes are rejected at zero attempts',
   );
 
-  for (const [outcome, isGate] of Object.entries(SEND_TIME_GATE_REFUSAL) as Array<[ArmOutcome, boolean]>) {
-    if (outcome === 'valid') continue; // excluded (trips the accepted-count digest rule, not this one)
-    const cleanStart = isGate ? refused : null; // gate refusal keeps the reading; the rest took none
-    const badStart = isGate ? null : refused; // gate refusal missing it = deletion; the rest spurious = fabrication
+  for (const [outcome, kind] of Object.entries(ZERO_ATTEMPT_KIND) as Array<[ArmOutcome, 'gate-refusal' | 'pre-clock' | 'sent-only']>) {
+    if (kind === 'sent-only') {
+      // A zero-attempt SENT outcome is forged evidence — rejected regardless of the start value.
+      for (const start of [null, refused] as Array<string | null>) {
+        const impossible = patchArmCoherent(parsed, baseIndex, { terminalOutcome: outcome, initialRequestStartedAt: start });
+        assert.ok(
+          hasViolation(verifyFireArtifactReplay(impossible), 'a sent outcome must retain its substantiating attempt'),
+          `${outcome}: a zero-attempt sent outcome is rejected (start=${start === null ? 'null' : 'set'})`,
+        );
+        assert.throws(() => installMutated(impossible), /fails replay/, `${outcome}: install refuses a zero-attempt sent outcome`);
+      }
+      continue;
+    }
+    const isGate = kind === 'gate-refusal';
+    const cleanStart = isGate ? refused : null; // gate refusal keeps the reading; pre-clock took none
+    const badStart = isGate ? null : refused; // gate refusal missing it = deletion; pre-clock spurious = fabrication
 
     const clean = patchArmCoherent(parsed, baseIndex, { terminalOutcome: outcome, initialRequestStartedAt: cleanStart });
     assert.deepEqual(verifyFireArtifactReplay(clean), [], `${outcome}: the correct zero-attempt shape replays clean`);

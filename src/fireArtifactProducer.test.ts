@@ -8,6 +8,7 @@ import {
   assertFireArtifact,
   buildFireArtifact,
   fireArtifactV1Schema,
+  resolveInitialRequestStartedAt,
 } from './fireArtifactProducer.js';
 import type { FireContext, MarketFireContextV1 } from './fireArtifactProducer.js';
 import { checkPublication } from './manifestPublication.js';
@@ -369,6 +370,23 @@ async function buildFire(
 }
 
 // --- happy path -------------------------------------------------------------
+
+test('B3: resolveInitialRequestStartedAt fails closed on a both-non-null (sent + refused) pair; else precedence', () => {
+  const SENT = '2026-07-18T20:00:00.000Z';
+  const REFUSED = '2026-07-18T19:59:59.000Z';
+  // A SENT initial uses its real request start; a never-sent refusal uses the carrier; a pre-clock
+  // refusal took no reading (null). These are the only reachable shapes.
+  assert.equal(resolveInitialRequestStartedAt('p', SENT, null), SENT, 'sent uses attempt.requestAt');
+  assert.equal(resolveInitialRequestStartedAt('p', null, REFUSED), REFUSED, 'never-sent uses the refusal carrier');
+  assert.equal(resolveInitialRequestStartedAt('p', null, null), null, 'a pre-clock refusal (credential_missing) is null');
+  // Fail-closed: a sent attempt can NEVER also carry a never-sent refusal reading — a both-non-null
+  // pair is a fabricated-provenance bug, not a precedence choice. Deleting the guard makes this red.
+  assert.throws(
+    () => resolveInitialRequestStartedAt('p', SENT, REFUSED),
+    /a sent attempt cannot also carry a never-sent refusal reading/,
+    'both-non-null throws (never silently orders the ?? re-source)',
+  );
+});
 
 test('builds a valid 2-market fire artifact with the expected shape', async () => {
   const { env, ctx, cohortId } = await buildFire();

@@ -283,20 +283,31 @@ export function verifyFireArtifactRelations(artifact: FireArtifactV1): string[] 
   for (const arm of artifact.arms) {
     const who = arm.expectedArmIdentity.participantId;
     if (arm.orderedAttempts.length === 0) {
-      // A never-sent arm: the zero-attempt rule is a BIDIRECTIONAL, outcome-aware contract keyed on
-      // the persisted terminalOutcome (B3). A send-time gate refusal (`cutoff_missed` via the
-      // initial-dispatch gate, or `dispatch_lag_exceeded`) discarded a real reading without sending,
-      // so `initialRequestStartedAt` MUST be present — a missing one is a silent deletion. Any other
-      // zero-attempt outcome (e.g. `credential_missing`) never took a reading, so it MUST be absent —
-      // a spurious one is a fabrication. This enforces presence AND shape both ways.
+      // A zero-attempt arm. Only THREE outcomes can legitimately have no sent attempt (B3), and the
+      // zero-attempt rule is a BIDIRECTIONAL, outcome-aware contract keyed on the persisted
+      // terminalOutcome:
+      //   - a send-time gate refusal (`cutoff_missed` via the initial-dispatch gate, or
+      //     `dispatch_lag_exceeded`) discarded a real reading without sending, so
+      //     `initialRequestStartedAt` MUST be present — a missing one is a silent deletion;
+      //   - a pre-clock `credential_missing` never took a reading, so it MUST be absent — a spurious
+      //     one is a fabrication.
+      // EVERY other outcome (`valid`, `invalid_schema`, `timeout`, `rate_limited`, `provider_error`)
+      // is a SENT outcome per Tier-0: it MUST retain its substantiating attempt, so a zero-attempt
+      // form is structurally-impossible / forged evidence — reject it (never replay-clean).
       const isSendTimeGateRefusal =
         arm.terminalOutcome === 'cutoff_missed' || arm.terminalOutcome === 'dispatch_lag_exceeded';
       if (isSendTimeGateRefusal) {
         if (arm.initialRequestStartedAt === null) {
           violations.push(`arm ${who} is a never-sent ${arm.terminalOutcome} but has a null initialRequestStartedAt`);
         }
-      } else if (arm.initialRequestStartedAt !== null) {
-        violations.push(`arm ${who} has no attempts and is not a send-time gate refusal but a non-null initialRequestStartedAt`);
+      } else if (arm.terminalOutcome === 'credential_missing') {
+        if (arm.initialRequestStartedAt !== null) {
+          violations.push(`arm ${who} has no attempts and is not a send-time gate refusal but a non-null initialRequestStartedAt`);
+        }
+      } else {
+        violations.push(
+          `arm ${who} has terminalOutcome ${arm.terminalOutcome} but no attempts — a sent outcome must retain its substantiating attempt`,
+        );
       }
       continue;
     }
