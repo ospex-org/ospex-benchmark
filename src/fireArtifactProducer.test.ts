@@ -3,10 +3,12 @@ import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
+import { armDigest } from './fireArtifact.js';
 import {
   assertFireArtifact,
   buildFireArtifact,
   fireArtifactV1Schema,
+  resolveInitialRequestStartedAt,
 } from './fireArtifactProducer.js';
 import type { FireContext, MarketFireContextV1 } from './fireArtifactProducer.js';
 import { checkPublication } from './manifestPublication.js';
@@ -369,6 +371,23 @@ async function buildFire(
 
 // --- happy path -------------------------------------------------------------
 
+test('B3: resolveInitialRequestStartedAt fails closed on a both-non-null (sent + refused) pair; else precedence', () => {
+  const SENT = '2026-07-18T20:00:00.000Z';
+  const REFUSED = '2026-07-18T19:59:59.000Z';
+  // A SENT initial uses its real request start; a never-sent refusal uses the carrier; a pre-clock
+  // refusal took no reading (null). These are the only reachable shapes.
+  assert.equal(resolveInitialRequestStartedAt('p', SENT, null), SENT, 'sent uses attempt.requestAt');
+  assert.equal(resolveInitialRequestStartedAt('p', null, REFUSED), REFUSED, 'never-sent uses the refusal carrier');
+  assert.equal(resolveInitialRequestStartedAt('p', null, null), null, 'a pre-clock refusal (credential_missing) is null');
+  // Fail-closed: a sent attempt can NEVER also carry a never-sent refusal reading — a both-non-null
+  // pair is a fabricated-provenance bug, not a precedence choice. Deleting the guard makes this red.
+  assert.throws(
+    () => resolveInitialRequestStartedAt('p', SENT, REFUSED),
+    /a sent attempt cannot also carry a never-sent refusal reading/,
+    'both-non-null throws (never silently orders the ?? re-source)',
+  );
+});
+
 test('builds a valid 2-market fire artifact with the expected shape', async () => {
   const { env, ctx, cohortId } = await buildFire();
   const artifact = buildFireArtifact(env, ctx);
@@ -485,6 +504,65 @@ test('a non-valid arm is retained with one terminal outcome and no accepted deci
   assert.equal(armT.orderedAttempts.length, 1);
   assert.equal(armT.orderedAttempts[0]?.transport, 'timeout');
   assert.match(armT.armDigest, /^[0-9a-f]{64}$/);
+});
+
+test('B3-R1 (producer): a never-sent (legacy-cutoff) fire persists the refused start with zero attempts and the never-sent digest', async () => {
+  const json = manifestJson();
+  const booted = bootFrom(json);
+  const publication = publicationFor(json);
+  const cohortId = booted.cohortId;
+  const request = scopedRequest(['moneyline', 'total']);
+  // A clock past first pitch (CUTOFF = 20:00) → every arm hits the legacy pre-dispatch cutoff and is
+  // never sent. Detection (12:00:30, in window) is independent of the dispatch clock, so the fire is
+  // still produced. The eight arms read the ONE constant clock, so each carries the same reading.
+  const LATE = Date.parse('2026-07-18T20:00:01.000Z');
+  const REFUSED = new Date(LATE).toISOString();
+  const adapters = new Map<string, ProviderAdapter>();
+  for (const arm of ARMS) {
+    // chat throws if reached — a legacy-cutoff initial must never send.
+    adapters.set(
+      arm.participantId,
+      stubAdapter(arm, [
+        () => {
+          throw new Error('a legacy-cutoff initial must not send');
+        },
+      ]),
+    );
+  }
+  const env = await runSlate([...ARMS], adapters, [request], {
+    cohortId,
+    timeoutMs: 600_000,
+    maxOutputTokens: 16_000,
+    executionPolicy: 'fixed-moneyline-total',
+    baselinePolicyVersion: 'baselines-v0.3.0',
+    nowMs: () => LATE,
+  });
+  assert.ok(env.results.every((r) => r.outcome === 'cutoff_missed'), 'every arm hit the legacy pre-dispatch cutoff');
+  assert.ok(env.results.every((r) => r.attempt.requestAt === null), 'no phantom attempt on the result');
+  assert.ok(env.results.every((r) => r.refusedInitialStartAt === REFUSED), 'the runner carries the ONE reading');
+
+  const ctx = makeCtx(cohortId, booted, publication, ['moneyline', 'total']);
+  const artifact = buildFireArtifact(env, ctx);
+  for (const arm of artifact.arms) {
+    assert.equal(arm.terminalOutcome, 'cutoff_missed');
+    assert.equal(arm.initialRequestStartedAt, REFUSED, 'the producer re-sources the refused start as initialRequestStartedAt');
+    assert.equal(arm.orderedAttempts.length, 0, 'zero attempts — no phantom sent attempt');
+    // armDigest equals the current never-sent digest: its ten-field domain excludes
+    // initialRequestStartedAt and orderedAttempts is empty, so the carrier does not touch the digest.
+    const neverSentDigest = armDigest({
+      cohortId: artifact.cohortId,
+      fireId: artifact.fireId,
+      runId: artifact.runId,
+      participantId: arm.expectedArmIdentity.participantId,
+      requestSha256: artifact.requestSha256,
+      expectedArmIdentity: arm.expectedArmIdentity,
+      orderedAttempts: [],
+      terminalOutcome: 'cutoff_missed',
+      acceptedResponseDigestOrNull: null,
+      acceptedDecisionFingerprintOrNull: null,
+    });
+    assert.equal(arm.armDigest, neverSentDigest, 'armDigest is the never-sent digest (the carrier is excluded from its domain)');
+  }
 });
 
 // --- adversarial: authority-input authentication ----------------------------

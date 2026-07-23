@@ -422,6 +422,26 @@ interface FireIdentity {
  * accepted attempt and one decision per scoped market; every other outcome has
  * zero accepted attempts and no decision.
  */
+/**
+ * Resolve one arm's persisted `initialRequestStartedAt` (B3), fail-closed — the narrow behavioral
+ * owner of the refusal-start resolution. A SENT initial sources it from its real `attempt.requestAt`;
+ * a never-sent gate/legacy-cutoff refusal sources it from the internal `refusedInitialStartAt`
+ * carrier. The two are mutually exclusive by the runner's construction — a sent path leaves the
+ * refusal carrier null, and a refusal never populates `attempt.requestAt` — so a both-non-null pair
+ * is a fabricated-provenance bug, never a silent precedence choice, and THROWS here. `null` only when
+ * no reading was ever taken (`credential_missing`).
+ */
+export function resolveInitialRequestStartedAt(
+  who: string,
+  sentRequestAt: string | null,
+  refusedInitialStartAt: string | null,
+): string | null {
+  if (sentRequestAt !== null && refusedInitialStartAt !== null) {
+    throw new Error(`arm ${who}: a sent attempt cannot also carry a never-sent refusal reading`);
+  }
+  return sentRequestAt ?? refusedInitialStartAt;
+}
+
 function buildArmEvidence(
   result: ArmGameResult,
   identity: ExpectedArmIdentityV1,
@@ -431,9 +451,17 @@ function buildArmEvidence(
     throw new Error(`arm ${identity.participantId} was dispatched on a different request than the fire`);
   }
   const orderedAttempts = toPersistedAttempts(result);
-  // The initial attempt's request-start is the SOLE V-lag operand, kept distinct
-  // from each attempt's own requestStartedAt; `null` when the initial was unsent.
-  const initialRequestStartedAt = result.attempt.requestAt;
+  // The initial send-boundary / request-start decision instant — the SOLE V-lag operand, kept
+  // distinct from each attempt's own requestStartedAt, resolved fail-closed (B3): a SENT initial uses
+  // its real `attempt.requestAt`; a never-sent gate/legacy-cutoff refusal uses the internal
+  // `refusedInitialStartAt` carrier — WITHOUT fabricating an attempt (`orderedAttempts` stays empty,
+  // `mapOne` reads only `attempt.requestAt`; `armDigest` unchanged). `null` only when no reading was
+  // ever taken (`credential_missing`). A both-non-null pair is rejected fail-closed by the owner.
+  const initialRequestStartedAt = resolveInitialRequestStartedAt(
+    identity.participantId,
+    result.attempt.requestAt,
+    result.refusedInitialStartAt,
+  );
   const acceptedAttempts = orderedAttempts.filter((a) => a.acceptedAt !== null);
   const isValid = result.outcome === 'valid';
   if (isValid) {

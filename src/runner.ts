@@ -494,6 +494,12 @@ async function dispatchArmCore(
     repairUsed: boolean,
     repairTransport: RepairTransport,
     validationErrors: string[],
+    // The never-sent initial-start carrier (B3): non-null ONLY for a refusal that discarded a real
+    // gate reading without sending — the legacy pre-dispatch cutoff and the send-time gate. Every
+    // sent path keeps it null (the real start is on `attempt.requestAt`), as does the pre-clock
+    // `credential_missing` refusal. It never populates `attempt.requestAt`, so `orderedAttempts`
+    // stays empty for a never-sent arm (§5 — an unsent attempt is OMITTED, never a fake attempt).
+    refusedInitialStartAt: string | null = null,
   ): ArmGameResult => ({
     ...base,
     outcome,
@@ -503,6 +509,7 @@ async function dispatchArmCore(
     repairTransport,
     parsed: null,
     validationErrors,
+    refusedInitialStartAt,
   });
 
   if (!target.hasCredential()) {
@@ -518,21 +525,10 @@ async function dispatchArmCore(
     );
   }
 
-  // Clock check BEFORE initial dispatch: a request whose decision window has
-  // already closed is never sent.
-  const remainingAtDispatch = cutoffMs - nowMs();
-  if (remainingAtDispatch <= 0) {
-    await releaseInitial(); // skipped without a call
-    return failed(
-      'cutoff_missed',
-      { ...emptyAttempt(), errorDetail: 'decision cutoff had already passed at dispatch' },
-      null,
-      false,
-      null,
-      [],
-    );
-  }
-
+  // Build the request turns (pure, no spend) BEFORE taking the clock reading, so the ONE reading
+  // below is the last thing that happens before the send — "V-lag measured immediately before the
+  // send, after message-building" — and both never-sent refusals compare the SAME reading they
+  // carry back as evidence (B3).
   const userMessage = buildUserMessage({
     cohortId: options.cohortId,
     participantId: arm.participantId,
@@ -545,19 +541,39 @@ async function dispatchArmCore(
     { role: 'user', content: userMessage },
   ];
 
-  // ONE clock reading, taken immediately before the send and after message-building, is the
-  // single source of both the send-time gate operand AND the persisted `requestAt`: V-lag
-  // "measured at the provider HTTP boundary" is approximated by this reading, which must precede
-  // the send and equal the persisted start. When a gate is present (the authorized path), refuse
-  // to send a doomed initial — first pitch / windowEnd reached, or the V-lag bound exceeded — and
-  // emit the correct valid-negative with the never-sent shape, without spending a provider call.
+  // ONE clock reading, taken immediately before the send and after message-building, is the single
+  // source of the legacy pre-dispatch cutoff, the send-time gate operand, AND the persisted
+  // `requestAt` — so the enforcement decision and the recorded start can never disagree, and a
+  // refusal carries back the EXACT reading it compared on `refusedInitialStartAt` (never on
+  // `attempt.requestAt`, which stays null for an unsent attempt).
   const initialStartMs = nowMs();
+  const refusedInitialStartAt = new Date(initialStartMs).toISOString();
+
+  // Clock check BEFORE initial dispatch: a request whose decision window has already closed is
+  // never sent. The discarded reading is carried on the never-sent carrier (B3).
+  const remainingAtDispatch = cutoffMs - initialStartMs;
+  if (remainingAtDispatch <= 0) {
+    await releaseInitial(); // skipped without a call
+    return failed(
+      'cutoff_missed',
+      { ...emptyAttempt(), errorDetail: 'decision cutoff had already passed at dispatch' },
+      null,
+      false,
+      null,
+      [],
+      refusedInitialStartAt,
+    );
+  }
+
+  // When a gate is present (the authorized path), refuse to send a doomed initial — first pitch /
+  // windowEnd reached, or the V-lag bound exceeded — and emit the correct valid-negative with the
+  // never-sent shape, carrying the compared reading, without spending a provider call.
   if (gate !== null) {
     const verdict = initialDispatchGate({
       detectedAt: gate.detectedAt,
       windowEnd: gate.windowEnd,
       scheduledAtAtFire: request.cutoffAt,
-      initialRequestStartedAt: new Date(initialStartMs).toISOString(),
+      initialRequestStartedAt: refusedInitialStartAt,
       maxDispatchLagMs: gate.maxDispatchLagMs,
     });
     if (!verdict.ok) {
@@ -566,7 +582,7 @@ async function dispatchArmCore(
         verdict.outcome === 'cutoff_missed'
           ? 'initial request start reached windowEnd/first pitch before send'
           : 'initial request would start too late after detection (V-lag)';
-      return failed(verdict.outcome, { ...emptyAttempt(), errorDetail }, null, false, null, []);
+      return failed(verdict.outcome, { ...emptyAttempt(), errorDetail }, null, false, null, [], refusedInitialStartAt);
     }
   }
 
@@ -625,6 +641,9 @@ async function dispatchArmCore(
       repairTransport: null,
       parsed: firstValidation.parsed,
       validationErrors: [],
+      // A sent, accepted initial: the real start is on attempt.requestAt, so the never-sent
+      // carrier stays null (B3).
+      refusedInitialStartAt: null,
     };
   }
 
@@ -790,6 +809,9 @@ async function dispatchArmCore(
       repairTransport: 'ok',
       parsed: repairValidation.parsed,
       validationErrors: [],
+      // A sent, accepted repair: the initial's real start is on attempt.requestAt, so the
+      // never-sent carrier stays null (B3).
+      refusedInitialStartAt: null,
     };
   }
 

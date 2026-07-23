@@ -88,6 +88,7 @@ function armResult(over: Partial<ArmGameResult> = {}): ArmGameResult {
     repairTransport: null,
     parsed: null,
     validationErrors: [],
+    refusedInitialStartAt: null,
     ...over,
   };
 }

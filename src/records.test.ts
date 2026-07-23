@@ -389,6 +389,7 @@ test('unidentifiedResponsesByArm counts successful responses lacking a model ID,
     repairTransport: null,
     parsed: null,
     validationErrors: [],
+    refusedInitialStartAt: null,
   };
   const results: ArmGameResult[] = [
     // successful response, no reported ID → counts

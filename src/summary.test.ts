@@ -55,6 +55,7 @@ function armResult(arm: ArmSpec, gameId: string, parsed: BenchmarkResponse): Arm
     repairTransport: null,
     parsed,
     validationErrors: [],
+    refusedInitialStartAt: null,
   };
 }
 
