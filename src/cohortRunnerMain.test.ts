@@ -12,8 +12,10 @@ import {
   classifyStoreFireResult,
   decodeManifestText,
   formatTickResult,
+  runStoreBackedFire,
   selfResolvePublication,
 } from './cohortRunnerMain.js';
+import type { StoreFireDeps } from './cohortRunnerMain.js';
 import { DEMO_PROVIDER_CALL_TIMEOUT_MS, buildDemoFixture } from './demoFixture.js';
 import { RehearsalClaimPort } from './lineOpenClaim.js';
 import { discover } from './lineOpenRead.js';
@@ -22,6 +24,7 @@ import { assertPublicationVerified } from './manifestPublication.js';
 import { buildRehearsalManifest } from './rehearsalManifest.js';
 import { defaultExpectedArms } from './scoring.js';
 import { STORE_SCHEMA_VERSION } from './store/constants.js';
+import type { AtomicStore } from './store/contract.js';
 import type { CohortTickInput, CohortTickResult, FireOutcomeSummary } from './cohortRunner.js';
 import type { DiscoverFn, DiscoveryReads, ReadMarketEvidenceFn } from './lineOpenRead.js';
 import type { LineOpenReadConfig } from './lineOpenRead.js';
@@ -359,6 +362,69 @@ test('classifyStoreFireResult rejects zero fires and any non-unit fire/path card
     fireSummary('f2', installedSettledOutcome('/out/cohort/fire-b.json')),
   ]);
   assert.equal(classifyStoreFireResult(twoInstalled).ok, false);
+});
+
+// ---------------------------------------------------------------------------
+// Owner-level: `runStoreBackedFire` USES the classifier verdict for its exit code.
+// The pure classifier tests above prove the VERDICT; these drive the REAL owner
+// function (no DB) with injected seams so the classifier call is actually EXERCISED
+// on the exit path — bypassing it (an unconditional `return 0`) turns the two
+// non-ok cases red. `openStore` yields a fake initialized store (so the real boot +
+// `assertCohortBudgetInitialized` pass) and nothing else is touched, since `runTick`
+// is faked — the claim port / sink / adapters are constructed but never exercised.
+// ---------------------------------------------------------------------------
+
+/** A fake `AtomicStore` whose `initCohortBudget` reports `initialized` (so `assertCohortBudgetInitialized`
+ *  passes); every other method throws, because the faked `runTick` never reaches the claim / lease /
+ *  completion calls. */
+function fakeInitializedStore(): AtomicStore {
+  const unreached = (): never => {
+    throw new Error('the faked runTick never exercises the store beyond initCohortBudget');
+  };
+  return {
+    initCohortBudget: async () => ({ outcome: 'initialized' as const }),
+    admitDispatch: unreached,
+    acquireRepairLease: unreached,
+    releaseLease: unreached,
+    completeClaim: unreached,
+  };
+}
+
+/** Store-fire deps that open the fake store (no DB) and return `result` from the (never-DB) tick. */
+function fakeStoreFireDeps(result: CohortTickResult): StoreFireDeps {
+  return {
+    openStore: async () => ({ store: fakeInitializedStore(), close: async () => {} }),
+    runTick: async () => result,
+  };
+}
+
+/** The fixture CLI options the store-backed fire consumes: `--fixture` is required (else it exits 2
+ *  before the tick), and an explicit `outDir` keeps the never-installing sink off the repo default. */
+const FIRE_OPTIONS = {
+  manifestPath: null,
+  emitManifestPath: null,
+  store: 'postgres',
+  fixture: true,
+  outDir: join(tmpdir(), 'runner-fire-owner-never-written'),
+  live: false,
+};
+
+test('runStoreBackedFire returns 0 for exactly one Installed/settled fire with one artifact path', async () => {
+  const result = tickResultOf([fireSummary('f1', installedSettledOutcome('/out/cohort/fire-a.json'))]);
+  const code = await runStoreBackedFire(FIRE_OPTIONS, fakeStoreFireDeps(result));
+  assert.equal(code, 0, 'a completed demo (one Installed/settled fire, one path) exits 0');
+});
+
+test('runStoreBackedFire returns nonzero for a NotAdmitted / no-artifact tick (classifier is wired to the exit)', async () => {
+  const result = tickResultOf([fireSummary('f1', notAdmittedOutcome())]);
+  const code = await runStoreBackedFire(FIRE_OPTIONS, fakeStoreFireDeps(result));
+  assert.notEqual(code, 0, 'nothing installed must not report success — bypassing the classifier call turns this red');
+});
+
+test('runStoreBackedFire returns nonzero for an Installed but unsettled tick (classifier is wired to the exit)', async () => {
+  const result = tickResultOf([fireSummary('f1', installedUnsettledOutcome('/out/cohort/fire-a.json'))]);
+  const code = await runStoreBackedFire(FIRE_OPTIONS, fakeStoreFireDeps(result));
+  assert.notEqual(code, 0, 'an unsettled completion must not report success — bypassing the classifier call turns this red');
 });
 
 test('the spawned CLI hard-disables --live before any DB work under --store=postgres --fixture', () => {

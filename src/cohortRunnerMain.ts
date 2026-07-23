@@ -21,6 +21,7 @@ import { SqlAtomicStore, pgStoreQuery } from './store/atomicStore.js';
 import { STORE_SCHEMA_VERSION } from './store/constants.js';
 import type { CohortManifestV1 } from './manifest.js';
 import type { CohortTickInput, CohortTickResult } from './cohortRunner.js';
+import type { AtomicStore } from './store/contract.js';
 import type { LineOpenReadConfig } from './lineOpenRead.js';
 import type { PublicationVerified } from './manifestPublication.js';
 import type { ArtifactInstaller, LineOpenFireOutcome, LineOpenRunOptions } from './lineOpenSpine.js';
@@ -339,13 +340,60 @@ async function applyStoreSchema(pool: Pool): Promise<void> {
 }
 
 /**
+ * The DB-bound seams of the store-backed fire, injected so the owner-level flow — the up-front
+ * option refusal, boot, budget init, the tick, the result classification, and the exit code — is
+ * drivable WITHOUT a database. `openStore` provisions the durable store; `runTick` runs ONE cohort
+ * tick. The production default (below) is the live `runner:fire` behavior, unchanged.
+ */
+export interface StoreFireDeps {
+  /** Open the durable store for `databaseUrl`, returning it plus an idempotent close. */
+  readonly openStore: (databaseUrl: string) => Promise<{ store: AtomicStore; close: () => Promise<void> }>;
+  /** Run ONE cohort tick over the assembled input. */
+  readonly runTick: (input: CohortTickInput) => Promise<CohortTickResult>;
+}
+
+/**
+ * The production store-fire seams. `openStore` imports `pg` DYNAMICALLY — so the rehearsal path and
+ * the importable pure helpers never pull a database driver — builds the Pool, applies the idempotent
+ * schema (closing the Pool if that fails, so the driver is never leaked, matching the original inline
+ * `finally`), then wraps it as the atomic store. `runTick` runs the real cohort tick, echoing each
+ * fire's status line — byte-identical to the previous inline call.
+ */
+const PRODUCTION_STORE_FIRE_DEPS: StoreFireDeps = {
+  openStore: async (databaseUrl) => {
+    // `pg` is imported dynamically so the rehearsal path (and the importable pure helpers) never
+    // pull a database driver; only the store-backed branch constructs a Pool.
+    const { Pool } = await import('pg');
+    const pool: Pool = new Pool({ connectionString: databaseUrl });
+    try {
+      // Make the store self-contained: apply the idempotent DDL (no drop) before wrapping it.
+      await applyStoreSchema(pool);
+    } catch (error) {
+      // A schema-apply failure must not leak the Pool — close it before propagating (the original
+      // inline path closed the Pool in its `finally` on this same failure).
+      await pool.end();
+      throw error;
+    }
+    return { store: new SqlAtomicStore(pgStoreQuery(pool)), close: () => pool.end() };
+  },
+  runTick: (input) => runCohortTick({ ...input, onStatus: (line) => printLine(`  ${line}`) }),
+};
+
+/**
  * Run the store-backed fixture fire: apply + initialize the atomic store, boot the now-relative
  * synthetic cohort, then run ONE tick with a genuine `StoreClaimPort` (real admission), mock
  * adapters (zero provider spend), and a durable `FireArtifactSink`. On an admitted candidate this
  * dispatches the roster, produces + installs one artifact, and settles the claim. Returns the
- * process exit code; the pool is always closed.
+ * process exit code; the store is always closed.
+ *
+ * The DB-bound seams (`openStore`, `runTick`) are injected with a production default so the whole
+ * owner-level flow is drivable without a database; the default path is the live `runner:fire`
+ * behavior, unchanged.
  */
-async function runStoreBackedFire(options: CliOptions): Promise<number> {
+export async function runStoreBackedFire(
+  options: CliOptions,
+  deps: StoreFireDeps = PRODUCTION_STORE_FIRE_DEPS,
+): Promise<number> {
   if (!options.fixture) {
     printError(
       '--store=postgres requires --fixture: real MLB discovery at line-open is always ' +
@@ -356,15 +404,11 @@ async function runStoreBackedFire(options: CliOptions): Promise<number> {
   const databaseUrl = envValue('STORE_DATABASE_URL') ?? DEFAULT_STORE_DATABASE_URL;
   const outDir = options.outDir ?? envValue('FIRE_ARTIFACTS_DIR') ?? DEFAULT_FIRE_ARTIFACTS_DIR;
 
-  // `pg` is imported dynamically so the rehearsal path (and the importable pure helpers) never
-  // pull a database driver; only the store-backed branch constructs a Pool.
-  const { Pool } = await import('pg');
-  const pool: Pool = new Pool({ connectionString: databaseUrl });
+  // (1) Open the durable store (production: a pg Pool + idempotent DDL, no drop); the seam is
+  //     injectable so the owner-level flow is drivable without a database. Always closed below.
+  const { store, close } = await deps.openStore(databaseUrl);
   try {
-    // (1) Make the store self-contained: apply the idempotent DDL (no drop), then wrap it.
-    await applyStoreSchema(pool);
     printLine('store schema + functions applied idempotently (no destructive drop)');
-    const store = new SqlAtomicStore(pgStoreQuery(pool));
 
     // (2) Anchor the synthetic candidate at NOW, boot the cohort, and self-resolve publication.
     const anchorMs = Date.now();
@@ -397,7 +441,7 @@ async function runStoreBackedFire(options: CliOptions): Promise<number> {
     };
     printLine(`dispatching the synthetic fire (mock adapters, artifacts → ${outDir}) ...`);
 
-    const result = await runCohortTick({ ...input, onStatus: (line) => printLine(`  ${line}`) });
+    const result = await deps.runTick(input);
 
     printLine('');
     for (const line of formatTickResult(result)) printLine(line);
@@ -422,7 +466,7 @@ async function runStoreBackedFire(options: CliOptions): Promise<number> {
     }
     return 0;
   } finally {
-    await pool.end();
+    await close();
   }
 }
 
