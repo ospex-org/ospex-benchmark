@@ -1,4 +1,5 @@
 import { instantMs } from './time.js';
+import type { ArmOutcome } from './types.js';
 
 /**
  * Per-attempt timing provenance and its integrity checks
@@ -246,6 +247,48 @@ export function initialDispatchGate(input: {
   return { ok: true };
 }
 
+/** The persisted operands a scorer independently re-derives the SEND-TIME initial-gate verdict from
+ *  (B3): three from the fire artifact (`detectedAt`, `initialRequestStartedAt`, `scheduledAtAtFire`)
+ *  and two from the cohortId-bound published manifest (`windowEnd`, `maxDispatchLagMs`). The record's
+ *  claimed terminal is carried for CONTEXT only — it must never enter the re-derivation. */
+export interface InitialGateRecomputeInput {
+  readonly detectedAt: string;
+  readonly initialRequestStartedAt: string;
+  readonly scheduledAtAtFire: string;
+  readonly windowEnd: string;
+  readonly maxDispatchLagMs: number;
+  /**
+   * The record's CLAIMED terminal outcome — carried for context ONLY, so this stays a drop-in for
+   * the scorer's recompute-and-compare. It is DELIBERATELY not read: a scorer that trusted it would
+   * mis-read a SENT `cutoff_missed` (crossed at LATER acceptance timing, non-empty attempts) as an
+   * initial-gate refusal. The verdict is re-derived PURELY from the timing operands above.
+   */
+  readonly recordedTerminalOutcome: ArmOutcome;
+}
+
+/**
+ * Independently RE-DERIVE the send-time initial-dispatch gate verdict from the persisted operands
+ * ALONE (B3), for the scorer's verification. It reuses `initialDispatchGate` on the timing operands
+ * and NEVER reads `recordedTerminalOutcome`.
+ *
+ * The load-bearing semantics: for a SENT arm the persisted `initialRequestStartedAt` is the real
+ * send time, so this returns `ok` EVEN when the arm's terminal outcome is `cutoff_missed` — that
+ * terminal came from LATER response/accept timing, not an initial refusal. A never-sent gate refusal
+ * (`cutoff_missed` via the initial gate, or `dispatch_lag_exceeded`) instead carries the refused
+ * reading as `initialRequestStartedAt`, so this re-derives the same non-`ok` verdict. It therefore
+ * never equates a terminal `cutoff_missed` with an initial gate refusal. Throws (fail-closed) on a
+ * malformed operand or cap, exactly like `initialDispatchGate`.
+ */
+export function recomputeInitialDispatchGate(input: InitialGateRecomputeInput): InitialDispatchGateVerdict {
+  return initialDispatchGate({
+    detectedAt: input.detectedAt,
+    windowEnd: input.windowEnd,
+    scheduledAtAtFire: input.scheduledAtAtFire,
+    initialRequestStartedAt: input.initialRequestStartedAt,
+    maxDispatchLagMs: input.maxDispatchLagMs,
+  });
+}
+
 /**
  * The cutoff race (§5, case 26). Returns violations (each => `cutoff_missed`):
  * - the INITIAL request must start strictly before `windowEnd` (a repair may cross
@@ -258,8 +301,10 @@ export function initialDispatchGate(input: {
  *   before first pitch is fine, but a receipt at/after first pitch is a crossing even
  *   when `acceptedAt` is null (the runtime correctly refused to accept it).
  *
- * `initialRequestStartedAt` is null when the initial was never sent (its lateness is
- * a `dispatch_lag_exceeded`, handled by `dispatchLagVerdict`, not here).
+ * `initialRequestStartedAt` is null only for a PRE-CLOCK refusal that never took a reading (e.g.
+ * `credential_missing`). A never-sent SEND-TIME gate refusal instead carries the exact reading it
+ * compared (B3), so its persisted `initialRequestStartedAt` is NON-null and — for a windowEnd
+ * crossing — is legitimately flagged here (its V-lag lateness stays `dispatchLagVerdict`'s domain).
  */
 export function cutoffViolations(input: {
   windowEnd: string;

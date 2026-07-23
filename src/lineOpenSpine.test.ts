@@ -1266,16 +1266,20 @@ test('the spine imports no runtime store, settles only via the permit-resolved c
 // snapshot-derived V-lag gate rejects every initial send.
 const LATE_NOW = Date.parse('2026-07-18T12:00:45.000Z');
 
-test('a gate-violating fire installs a writer-clean artifact — every arm null-start, zero attempts', async () => {
+test('a gate-violating fire installs a writer-clean artifact — every arm carries the refused start, zero attempts (B3)', async () => {
   const { outcome, store, scripts } = await fireOf({ now: () => LATE_NOW });
   assert.equal(outcome.kind, 'Installed', 'the fire produces a durable artifact even when every arm is gated out');
   if (outcome.kind !== 'Installed') return;
   assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0, 'no arm was sent — the snapshot-derived gate rejected each initial');
   for (const arm of outcome.artifact.arms) {
     assert.equal(arm.terminalOutcome, 'dispatch_lag_exceeded', 'per violating arm: dispatch_lag_exceeded');
-    assert.equal(arm.initialRequestStartedAt, null, 'per violating arm: initialRequestStartedAt null');
-    assert.equal(arm.orderedAttempts.length, 0, 'per violating arm: zero orderedAttempts');
+    // B3: the never-sent gate refusal carries the EXACT reading it compared (the ONE dispatch clock,
+    // LATE_NOW) on initialRequestStartedAt — NON-null, without fabricating an attempt.
+    assert.equal(arm.initialRequestStartedAt, new Date(LATE_NOW).toISOString(), 'per violating arm: the refused start is the gate reading');
+    assert.equal(arm.orderedAttempts.length, 0, 'per violating arm: zero orderedAttempts (no phantom attempt)');
   }
+  // The bidirectional writer relation now REQUIRES this non-null start for a zero-attempt
+  // dispatch_lag_exceeded arm, so the produced artifact replays writer-clean (B3-R3).
   assert.deepEqual(verifyFireArtifactReplay(outcome.artifact), [], 'the produced artifact replays writer-clean');
   assert.deepEqual(
     [...releaseIds(store)].sort(),

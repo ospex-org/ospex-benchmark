@@ -122,11 +122,11 @@ test('a valid repair stamps acceptedAt on the repair; the un-accepted initial st
 
 test('received in time but accepted after cutoff: cutoff_missed, acceptedAt unset', async () => {
   // The receipt cutoff check passes, but the acceptance instant — rechecked
-  // after validation — has crossed first pitch. nowMs read order: dispatch
-  // check, request start, response stamp, receipt check (in time), acceptance
-  // recheck (crossed).
+  // after validation — has crossed first pitch. nowMs read order (ONE dispatch
+  // reading feeds both the pre-dispatch cutoff and the request start): request
+  // start, response stamp, receipt check (in time), acceptance recheck (crossed).
   const request = prepareGameRequest(makeRequest(CUTOFF));
-  const reads = [CUTOFF_MS - 60_000, CUTOFF_MS - 60_000, CUTOFF_MS - 2, CUTOFF_MS - 1, CUTOFF_MS + 1];
+  const reads = [CUTOFF_MS - 60_000, CUTOFF_MS - 2, CUTOFF_MS - 1, CUTOFF_MS + 1];
   let index = 0;
   const nowMs = (): number => reads[Math.min(index++, reads.length - 1)] as number;
   const adapter = stubAdapter([async () => stubResponse(JSON.stringify(makeValidResponse(request)))]);
@@ -419,4 +419,36 @@ test('the legacy path passes gate=null — ungated for V-lag/windowEnd, first-pi
   const runnerSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'runner.ts'), 'utf8');
   assert.ok(runnerSrc.includes('dispatchArm(target, request, options, null, null, 0)'), 'runSlate passes gate=null');
   assert.ok(/options,\s*\n\s*null,\s*\n\s*null,\s*\n\s*0,/.test(runnerSrc), 'runOneArmGame passes gate=null');
+});
+
+test('B3-R1 (legacy): a pre-dispatch cutoff carries the ONE reading on refusedInitialStartAt; credential_missing keeps it null', async () => {
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  // A SPARSE SEQUENCED clock — a constant clock would hide a second/extra read. The FIRST reading is
+  // AT/after first pitch, so the (single, collapsed) dispatch reading trips the pre-dispatch cutoff.
+  const reads = [CUTOFF_MS + 5, CUTOFF_MS + 999];
+  let calls = 0;
+  const nowMs = (): number => reads[Math.min(calls++, reads.length - 1)]!;
+  const adapter = stubAdapter([]); // no chat handler → throws if (wrongly) sent
+  const result = await runOneArmGame(TEST_ARM, adapter, request, baseOptions(nowMs));
+  assert.equal(result.outcome, 'cutoff_missed');
+  assert.equal(result.attempt.requestAt, null, 'never-sent: the discarded start is NOT written onto attempt.requestAt (no phantom attempt)');
+  assert.equal(
+    result.refusedInitialStartAt,
+    new Date(CUTOFF_MS + 5).toISOString(),
+    'the EXACT ONE reading is carried on the never-sent refusedInitialStartAt carrier',
+  );
+  assert.equal(calls, 1, 'exactly ONE clock reading was taken (the collapsed dispatch+start read)');
+  assert.equal(adapter.calls.length, 0, 'no provider call');
+
+  // credential_missing is a PRE-CLOCK refusal — no reading is taken, so the carrier stays null.
+  let credCalls = 0;
+  const credClock = (): number => {
+    credCalls += 1;
+    return CUTOFF_MS - 60_000;
+  };
+  const noCred: ProviderAdapter = { ...stubAdapter([]), hasCredential: () => false };
+  const credResult = await runOneArmGame(TEST_ARM, noCred, request, baseOptions(credClock));
+  assert.equal(credResult.outcome, 'credential_missing');
+  assert.equal(credResult.refusedInitialStartAt, null, 'credential_missing took no reading — carrier null');
+  assert.equal(credCalls, 0, 'the clock was never read before the pre-clock credential refusal');
 });

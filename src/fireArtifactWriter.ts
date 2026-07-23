@@ -283,7 +283,21 @@ export function verifyFireArtifactRelations(artifact: FireArtifactV1): string[] 
   for (const arm of artifact.arms) {
     const who = arm.expectedArmIdentity.participantId;
     if (arm.orderedAttempts.length === 0) {
-      if (arm.initialRequestStartedAt !== null) violations.push(`arm ${who} has no attempts but a non-null initialRequestStartedAt`);
+      // A never-sent arm: the zero-attempt rule is a BIDIRECTIONAL, outcome-aware contract keyed on
+      // the persisted terminalOutcome (B3). A send-time gate refusal (`cutoff_missed` via the
+      // initial-dispatch gate, or `dispatch_lag_exceeded`) discarded a real reading without sending,
+      // so `initialRequestStartedAt` MUST be present — a missing one is a silent deletion. Any other
+      // zero-attempt outcome (e.g. `credential_missing`) never took a reading, so it MUST be absent —
+      // a spurious one is a fabrication. This enforces presence AND shape both ways.
+      const isSendTimeGateRefusal =
+        arm.terminalOutcome === 'cutoff_missed' || arm.terminalOutcome === 'dispatch_lag_exceeded';
+      if (isSendTimeGateRefusal) {
+        if (arm.initialRequestStartedAt === null) {
+          violations.push(`arm ${who} is a never-sent ${arm.terminalOutcome} but has a null initialRequestStartedAt`);
+        }
+      } else if (arm.initialRequestStartedAt !== null) {
+        violations.push(`arm ${who} has no attempts and is not a send-time gate refusal but a non-null initialRequestStartedAt`);
+      }
       continue;
     }
     if (arm.initialRequestStartedAt === null) {

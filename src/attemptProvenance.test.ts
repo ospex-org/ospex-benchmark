@@ -4,6 +4,7 @@ import {
   cutoffViolations,
   dispatchLagVerdict,
   initialDispatchGate,
+  recomputeInitialDispatchGate,
   verifyAttemptOrdering,
 } from './attemptProvenance.js';
 import type { AttemptTiming } from './attemptProvenance.js';
@@ -469,5 +470,82 @@ test('initialDispatchGate: a malformed lower-precedence operand is NOT hidden by
   const nearWindow = '2026-07-16T00:00:03.000Z';
   assert.throws(() =>
     gate({ windowEnd: nearWindow, initialRequestStartedAt: '2026-07-16T00:00:04.000Z', detectedAt: bad, scheduledAtAtFire: G_PITCH_FAR }),
+  );
+});
+
+// --- recomputeInitialDispatchGate (B3-R2: scorer-side independent re-derivation) ---
+
+test('B3-R2: recomputeInitialDispatchGate re-derives the gate verdict from operands alone — never the recorded terminal', () => {
+  // Manifest-derived bounds (windowEnd < first pitch); the two V-lag bounds pinned wide by default.
+  const detectedAt = '2026-07-16T00:00:00.000Z';
+  const windowEnd = '2026-07-16T00:02:00.000Z';
+  const firstPitch = '2026-07-16T01:00:00.000Z';
+  const maxDispatchLagMs = 10_000;
+
+  // 1. A never-sent cutoff_missed (windowEnd crossing): start >= windowEnd, < first pitch → cutoff_missed.
+  assert.deepEqual(
+    recomputeInitialDispatchGate({
+      detectedAt,
+      initialRequestStartedAt: '2026-07-16T00:02:05.000Z',
+      scheduledAtAtFire: firstPitch,
+      windowEnd,
+      maxDispatchLagMs,
+      recordedTerminalOutcome: 'cutoff_missed',
+    }),
+    { ok: false, outcome: 'cutoff_missed' },
+  );
+
+  // 2a. A never-sent dispatch_lag_exceeded (over the cap): lag == max + 1ms.
+  assert.deepEqual(
+    recomputeInitialDispatchGate({
+      detectedAt,
+      initialRequestStartedAt: '2026-07-16T00:00:10.001Z',
+      scheduledAtAtFire: firstPitch,
+      windowEnd,
+      maxDispatchLagMs,
+      recordedTerminalOutcome: 'dispatch_lag_exceeded',
+    }),
+    { ok: false, outcome: 'dispatch_lag_exceeded' },
+  );
+  // 2b. A never-sent dispatch_lag_exceeded (two-sided/backdated): initialRequestStartedAt < detectedAt.
+  assert.deepEqual(
+    recomputeInitialDispatchGate({
+      detectedAt,
+      initialRequestStartedAt: '2026-07-15T23:59:59.000Z',
+      scheduledAtAtFire: firstPitch,
+      windowEnd,
+      maxDispatchLagMs,
+      recordedTerminalOutcome: 'dispatch_lag_exceeded',
+    }),
+    { ok: false, outcome: 'dispatch_lag_exceeded' },
+  );
+
+  // 3. THE DISCRIMINATOR — a SENT cutoff_missed: the initial started IN TIME (before windowEnd/first
+  //    pitch, within V-lag), so the initial gate returns ok; the terminal cutoff_missed came from
+  //    LATER acceptance timing (non-empty attempts elsewhere), NOT an initial refusal. The helper
+  //    must return ok and NEVER equate the recorded terminal with an initial gate refusal.
+  assert.deepEqual(
+    recomputeInitialDispatchGate({
+      detectedAt,
+      initialRequestStartedAt: '2026-07-16T00:00:05.000Z',
+      scheduledAtAtFire: firstPitch,
+      windowEnd,
+      maxDispatchLagMs,
+      recordedTerminalOutcome: 'cutoff_missed',
+    }),
+    { ok: true },
+  );
+
+  // 4. A sent, valid arm: in time → ok.
+  assert.deepEqual(
+    recomputeInitialDispatchGate({
+      detectedAt,
+      initialRequestStartedAt: '2026-07-16T00:00:05.000Z',
+      scheduledAtAtFire: firstPitch,
+      windowEnd,
+      maxDispatchLagMs,
+      recordedTerminalOutcome: 'valid',
+    }),
+    { ok: true },
   );
 });

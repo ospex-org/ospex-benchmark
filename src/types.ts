@@ -328,6 +328,17 @@ export interface ArmGameResult {
   /** Parsed + validated response (present only when outcome === 'valid'). */
   parsed: BenchmarkResponse | null;
   validationErrors: string[];
+  /**
+   * The never-sent initial send-boundary / request-start decision instant (offset ISO): the ONE
+   * clock reading a send-time gate refusal (`cutoff_missed` via the initial-dispatch gate, or
+   * `dispatch_lag_exceeded`) or the legacy pre-dispatch cutoff (`cutoff_missed`) compared, when no
+   * initial request was ever sent. Kept DISTINCT from `attempt.requestAt` — which stays `null` for
+   * an unsent attempt so `orderedAttempts` never fabricates a phantom sent attempt (§5) — and read
+   * by the producer as the persisted `initialRequestStartedAt` when the initial was never sent.
+   * `null` on every SENT path (the real start lives on `attempt.requestAt`) and on any structurally
+   * pre-clock refusal (`credential_missing`), which never took a reading. (B3)
+   */
+  refusedInitialStartAt: string | null;
 }
 
 // ---------------------------------------------------------------------------

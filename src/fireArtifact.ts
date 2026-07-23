@@ -216,8 +216,11 @@ export const persistedAttemptSchemaV1 = z
 /**
  * Map an arm result's initial + optional repair `AttemptRecord`s to the ordered
  * persisted attempts (SPEC §5). An UNSENT attempt (`requestAt === null`:
- * credential_missing, pre-dispatch cutoff, or an unsent initial) is OMITTED — never
- * a fake attempt (so an expected arm may legitimately have zero sent attempts).
+ * credential_missing, pre-dispatch cutoff, or a gate-refused initial) is OMITTED — never
+ * a fake attempt (so an expected arm may legitimately have zero sent attempts). A never-sent
+ * gate/cutoff refusal's request-start reading is NOT lost: the producer carries it on the arm's
+ * `initialRequestStartedAt` from the result's internal `refusedInitialStartAt`, distinct from this
+ * (empty) attempt list (B3).
  * Receipt is derived truthfully: a response body OR an HTTP status means the
  * response was received (`requestReceivedAt = responseAt`); a timeout/transport
  * settle with neither means no receipt (`null`). The response digest follows the
@@ -325,9 +328,13 @@ export function armDigest(input: ArmDigestInputV1): string {
 export interface ArmEvidenceV1 {
   expectedArmIdentity: ExpectedArmIdentityV1;
   terminalOutcome: ArmOutcome;
-  /** The initial attempt's request-start instant — the SOLE V-lag operand, kept
-   *  distinct from `orderedAttempts` so the scorer never applies the initial V-lag
-   *  to a repair; `null` when the initial was never sent. */
+  /** The initial send-boundary / request-start decision instant — the SOLE V-lag operand, equal to
+   *  attempt 1's request start when sent, kept distinct from `orderedAttempts` so the scorer never
+   *  applies the initial V-lag to a repair. It is NON-null even when the initial was never sent but
+   *  a send-time gate refused it (`cutoff_missed` via the initial gate, or `dispatch_lag_exceeded`):
+   *  the refused reading is carried so the operand cannot be silently deleted (B3). An empty
+   *  `orderedAttempts` entry is NEVER a sent request. `null` only for a pre-clock refusal that took
+   *  no reading (`credential_missing`). */
   initialRequestStartedAt: string | null;
   orderedAttempts: readonly PersistedAttemptV1[];
   acceptedResponseDigest: string | null;

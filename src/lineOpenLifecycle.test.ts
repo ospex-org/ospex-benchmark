@@ -1090,6 +1090,35 @@ test('an initial past the V-lag cap or backdated is dispatch_lag_exceeded, never
   }
 });
 
+test('B3-R1 (gate): a send-time gate refusal carries the sole reader’s ONE reading on refusedInitialStartAt; a credential-less sibling keeps it null', async () => {
+  const scriptsHolder: Scripted[] = [];
+  const { dispatch, snapshot } = await authorize((s) => {
+    const r = soloReader(s, s.booted.cohortId, () => {
+      throw new Error('a gated-out initial must not send');
+    });
+    scriptsHolder.push(...r.scripts);
+    return r.map;
+  });
+  // Arm 0 is the SOLE clock reader; a SPARSE SEQUENCED clock proves the persisted carrier is the
+  // exact ONE reading it took (a constant could hide an extra read). R0 is well before first pitch
+  // and windowEnd, but its V-lag exceeds the cap → dispatch_lag_exceeded, never sent.
+  const R0 = CUTOFF_MS - 100_000;
+  const clock = queueClock([R0, R0 + 500, R0 + 999]);
+  const gate = gateOf({ detectedAt: new Date(R0 - 50_000).toISOString(), maxDispatchLagMs: 10_000 }); // lag 50s > cap
+  const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
+  const arm0 = armAt(env, dispatch, 0);
+  assert.equal(arm0.outcome, 'dispatch_lag_exceeded');
+  assert.equal(arm0.attempt.requestAt, null, 'never-sent: the discarded start is NOT on attempt.requestAt (no phantom attempt)');
+  assert.equal(arm0.refusedInitialStartAt, new Date(R0).toISOString(), 'the sole reader carries its EXACT ONE gate reading');
+  assert.equal(scriptsHolder[0]!.calls, 0, 'the gated-out initial was never sent');
+  // The credential-less siblings are a PRE-CLOCK refusal — the carrier stays null.
+  for (let i = 1; i < dispatch.plan.arms.length; i += 1) {
+    const sibling = armAt(env, dispatch, i);
+    assert.equal(sibling.outcome, 'credential_missing');
+    assert.equal(sibling.refusedInitialStartAt, null, 'a credential_missing sibling took no reading — carrier null');
+  }
+});
+
 test('an initial at/after windowEnd is cutoff_missed, never sent — windowEnd is exclusive', async () => {
   const cases: Array<[string, InitialDispatchGate]> = [
     ['start after windowEnd', gateOf({ windowEnd: new Date(NOW_MS - 1_000).toISOString(), detectedAt: new Date(NOW_MS - 5_000).toISOString(), maxDispatchLagMs: 10_000 })],
@@ -1124,7 +1153,7 @@ test('first pitch already reached at the pre-dispatch fast-fail is cutoff_missed
   assert.equal(scriptsHolder.reduce((n, s) => n + s.calls, 0), 0, 'the fast-fail returns before any send');
 });
 
-test('reading #1 before first pitch but the persisted start reaches first pitch is cutoff_missed via the gate', async () => {
+test('a single dispatch reading at first pitch is cutoff_missed — the persisted start IS the fast-fail reading', async () => {
   const scriptsHolder: Scripted[] = [];
   const { dispatch, snapshot } = await authorize((s) => {
     const r = soloReader(s, s.booted.cohortId, () => {
@@ -1133,12 +1162,13 @@ test('reading #1 before first pitch but the persisted start reaches first pitch 
     scriptsHolder.push(...r.scripts);
     return r.map;
   });
-  // read #1 (dispatch fast-fail) sees a time < first pitch; read #2 (the persisted start) reaches it.
-  const clock = queueClock([CUTOFF_MS - 1_000, CUTOFF_MS]);
+  // B3 collapses the pre-dispatch cutoff read and the persisted-start read into ONE reading, so a
+  // single reading AT first pitch is caught by the pre-dispatch fast-fail (that reading IS the
+  // would-be persisted start) — cutoff_missed, never sent.
   const gate = gateOf({ detectedAt: new Date(CUTOFF_MS).toISOString(), maxDispatchLagMs: 1_000_000_000 });
-  const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
+  const env = await runAuthorizedDispatch(dispatch, options(() => CUTOFF_MS, snapshot.booted.cohortId), gate);
   assert.equal(armAt(env, dispatch, 0).outcome, 'cutoff_missed');
-  assert.equal(scriptsHolder[0]!.calls, 0, 'the sole clock reader was never sent — its persisted start reached first pitch');
+  assert.equal(scriptsHolder[0]!.calls, 0, 'the sole clock reader was never sent — its single dispatch reading reached first pitch');
 });
 
 test('an initial violating BOTH windowEnd and V-lag is cutoff_missed (windowEnd outranks V-lag)', async () => {
@@ -1156,7 +1186,7 @@ test('an initial violating BOTH windowEnd and V-lag is cutoff_missed (windowEnd 
   assert.deepEqual([...releaseIds(store)].sort(), leaseIdsSorted(dispatch));
 });
 
-test('an initial violating BOTH first pitch and V-lag is cutoff_missed (first pitch outranks V-lag)', async () => {
+test('a single reading at first pitch AND violating V-lag is cutoff_missed (the fast-fail precedes the gate)', async () => {
   const scriptsHolder: Scripted[] = [];
   const { dispatch, snapshot } = await authorize((s) => {
     const r = soloReader(s, s.booted.cohortId, () => {
@@ -1165,10 +1195,12 @@ test('an initial violating BOTH first pitch and V-lag is cutoff_missed (first pi
     scriptsHolder.push(...r.scripts);
     return r.map;
   });
-  // read #1 < first pitch (fast-fail passes); persisted start (read #2) == first pitch AND lag > max.
-  const clock = queueClock([CUTOFF_MS - 1_000, CUTOFF_MS]);
+  // The single dispatch reading == first pitch AND lag > max. B3 collapses the two reads into one,
+  // so the pre-dispatch cutoff fast-fail (which uses first pitch) catches it BEFORE the gate — the
+  // outcome is cutoff_missed, never dispatch_lag_exceeded (first-pitch precedence is unit-tested on
+  // initialDispatchGate directly).
   const gate = gateOf({ detectedAt: new Date(CUTOFF_MS - 1_000_000).toISOString(), maxDispatchLagMs: 10_000 });
-  const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
+  const env = await runAuthorizedDispatch(dispatch, options(() => CUTOFF_MS, snapshot.booted.cohortId), gate);
   assert.equal(armAt(env, dispatch, 0).outcome, 'cutoff_missed', 'first pitch wins — not dispatch_lag_exceeded');
   assert.equal(scriptsHolder[0]!.calls, 0);
 });
@@ -1357,9 +1389,10 @@ test('the persisted requestAt, latency, and acceptedAt all derive from the ONE g
     scriptsHolder.push(...r.scripts);
     return r.map;
   });
-  // reads: #1 dispatch-check (T), #2 initialStart (T+1) — the gate operand AND the persisted start,
-  // #3 response stamp (T+2), #4 receipt (T+3), #5 accept (T+4).
-  const clock = queueClock([T, T + 1, T + 2, T + 3, T + 4, T + 5]);
+  // reads (B3 collapses the pre-dispatch cutoff read and the start read into ONE): #1 initialStart
+  // (T+1) — the gate operand AND the persisted start, #2 response stamp (T+2), #3 receipt (T+3),
+  // #4 accept (T+4).
+  const clock = queueClock([T + 1, T + 2, T + 3, T + 4]);
   const gate = gateOf({ detectedAt: new Date(T).toISOString(), maxDispatchLagMs: 1_000_000_000 });
   const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
   const arm0 = armAt(env, dispatch, 0);
@@ -1383,8 +1416,8 @@ test('a transport failure keeps the gated start on both classifications (timeout
       scriptsHolder.push(...r.scripts);
       return r.map;
     });
-    // reads: #1 dispatch-check (T), #2 initialStart (T+1) → gate ok → send → throw → #3 respondedAt (T+2).
-    const clock = queueClock([T, T + 1, T + 2, T + 3]);
+    // reads (ONE dispatch reading): #1 initialStart (T+1) → gate ok → send → throw → #2 respondedAt (T+2).
+    const clock = queueClock([T + 1, T + 2, T + 3]);
     const gate = gateOf({ detectedAt: new Date(T).toISOString(), maxDispatchLagMs: 1_000_000_000 });
     const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
     const arm0 = armAt(env, dispatch, 0);
@@ -1403,10 +1436,11 @@ test('a shared detectedAt with per-arm dispatch timing — the on-time arm sends
     scriptsHolder.push(...r.scripts);
     return r.map;
   });
-  // Each arm's synchronous prefix (dispatch-check + initialStart) runs before the next arm's, so
-  // arm 0 reads base+1 (lag 1), arm k reads base+(2k+1). With a 2ms cap only arm 0 is on-time.
+  // Each arm's synchronous prefix takes ONE dispatch reading (B3 collapse) and runs before the next
+  // arm's, so arm 0 reads base (lag 0), arm k reads base+k (lag k). With a 0ms cap only arm 0 is
+  // on-time; every later arm is dispatch_lag_exceeded.
   const clock = queueClock(Array.from({ length: 40 }, (_, i) => base + i));
-  const gate = gateOf({ detectedAt: new Date(base).toISOString(), maxDispatchLagMs: 2 });
+  const gate = gateOf({ detectedAt: new Date(base).toISOString(), maxDispatchLagMs: 0 });
   const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
   assert.equal(armAt(env, dispatch, 0).outcome, 'valid', 'the on-time arm sent + validated');
   assert.equal(scriptsHolder[0]!.calls, 1, 'the on-time arm was sent');

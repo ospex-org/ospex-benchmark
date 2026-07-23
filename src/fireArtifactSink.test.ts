@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
-import { MARKET_ORDINAL } from './fireArtifact.js';
+import { armDigest, MARKET_ORDINAL } from './fireArtifact.js';
 import { buildFireArtifact } from './fireArtifactProducer.js';
 import type { FireContext, MarketFireContextV1 } from './fireArtifactProducer.js';
 import { FireArtifactSink, nodeArtifactFs } from './fireArtifactSink.js';
@@ -773,4 +773,128 @@ test('the sink imports no permit/store/runtime authority, one owner, no legacy w
   assert.ok(src.includes('serializeFireArtifactV1') && src.includes('parseFireArtifactV1') && src.includes('verifyFireArtifactReplay'));
   // exactly one base64url path encoder.
   assert.equal((src.match(/\.toString\('base64url'\)/g) ?? []).length, 1);
+});
+
+// ===========================================================================
+// B3-R3: the bidirectional never-sent-start relation through install → replay
+// ===========================================================================
+
+/**
+ * A produced fire where every initial is NEVER sent: arm 0 has no credential (a PRE-CLOCK
+ * `credential_missing`, null start), and every other arm hits the legacy pre-dispatch cutoff (a
+ * `cutoff_missed`, non-null start = the discarded reading). One artifact carries both zero-attempt
+ * shapes the bidirectional relation must key on.
+ */
+async function producedMixedNeverSentFire(): Promise<{ artifact: FireArtifactV1; refused: string }> {
+  const json = manifestJson();
+  const booted: BootedCohort = cohortBoot({ live: false, manifestBytes: json });
+  const publication = publicationFor(json);
+  const cohortId = booted.cohortId;
+  const request = scopedRequest(['moneyline', 'total']);
+  const LATE = Date.parse('2026-07-18T20:00:01.000Z'); // past CUTOFF (20:00) → legacy pre-dispatch cutoff
+  const refused = new Date(LATE).toISOString();
+  const adapters = new Map<string, ProviderAdapter>();
+  ARMS.forEach((arm, i) => {
+    adapters.set(arm.participantId, {
+      provider: arm.provider,
+      requestedModelId: arm.requestedModelId,
+      credentialEnvVar: arm.credentialEnvVar,
+      hasCredential: () => i !== 0, // arm 0 → credential_missing (null start); the rest → cutoff_missed (non-null)
+      async chat(): Promise<ProviderResponse> {
+        throw new Error('a never-sent fire must not send');
+      },
+    });
+  });
+  const env: RunEnvelope = await runSlate([...ARMS], adapters, [request], {
+    cohortId,
+    timeoutMs: 600_000,
+    maxOutputTokens: 16_000,
+    executionPolicy: 'fixed-moneyline-total',
+    baselinePolicyVersion: 'baselines-v0.3.0',
+    nowMs: () => LATE,
+  });
+  const ctx: FireContext = {
+    booted,
+    fireId: FIRE_ID,
+    runId: RUN_ID,
+    publication,
+    bundleBuiltAt: BUNDLE_BUILT_AT,
+    perMarket: (['moneyline', 'total'] as const).map((m) => marketCtx(m, cohortId, FIRE_ID)),
+  };
+  return { artifact: buildFireArtifact(env, ctx), refused };
+}
+
+/** Patch arm `index` and RECOMPUTE its armDigest so a targeted tamper stays digest-coherent — the
+ *  bidirectional relation must catch it alone, never masked by a stale digest. */
+function patchArmCoherent(artifact: FireArtifactV1, index: number, patch: Partial<FireArtifactV1['arms'][number]>): FireArtifactV1 {
+  const arm = { ...artifact.arms[index]!, ...patch };
+  arm.armDigest = armDigest({
+    cohortId: artifact.cohortId,
+    fireId: artifact.fireId,
+    runId: artifact.runId,
+    participantId: arm.expectedArmIdentity.participantId,
+    requestSha256: artifact.requestSha256,
+    expectedArmIdentity: arm.expectedArmIdentity,
+    orderedAttempts: arm.orderedAttempts,
+    terminalOutcome: arm.terminalOutcome,
+    acceptedResponseDigestOrNull: arm.acceptedResponseDigest,
+    acceptedDecisionFingerprintOrNull: arm.acceptedDecisionFingerprint,
+  });
+  return { ...artifact, arms: artifact.arms.map((a, i) => (i === index ? arm : a)) };
+}
+
+const hasViolation = (violations: string[], needle: string): boolean => violations.some((v) => v.includes(needle));
+
+/** Drive the sink's install path over a MUTATED (unbranded) artifact by injecting its bytes through
+ *  the serialize owner, so the sink's real strict-parse + full replay run on them (a genuine
+ *  produced artifact always replays clean, so injection is the only way to reach the refusal). */
+function installMutated(mutated: FireArtifactV1): void {
+  const owners: SinkOwners = {
+    serialize: () => canonicalize(mutated),
+    parse: parseFireArtifactV1,
+    replay: verifyFireArtifactReplay,
+  };
+  new FireArtifactSink('/base', new FakeFs(), owners).install(mutated);
+}
+
+test('B3-R3 (1): a never-sent fire (credential_missing null + cutoff_missed non-null) installs and replays writer-clean', async () => {
+  const { artifact, refused } = await producedMixedNeverSentFire();
+  // Both zero-attempt shapes are present and correct.
+  const cred = artifact.arms.find((a) => a.terminalOutcome === 'credential_missing')!;
+  const cut = artifact.arms.find((a) => a.terminalOutcome === 'cutoff_missed')!;
+  assert.equal(cred.orderedAttempts.length, 0);
+  assert.equal(cred.initialRequestStartedAt, null, 'credential_missing keeps a null start');
+  assert.equal(cut.orderedAttempts.length, 0);
+  assert.equal(cut.initialRequestStartedAt, refused, 'cutoff_missed carries the exact refused reading');
+  // Replays clean, and installs through the in-memory sink.
+  assert.deepEqual(verifyFireArtifactReplay(parseFireArtifactV1(serializeFireArtifactV1(artifact))), []);
+  const r = new FireArtifactSink('/base', new FakeFs()).install(artifact);
+  assert.equal(r.created, true, 'the never-sent fire installs');
+});
+
+test('B3-R3 (2): nulling the refused start on a cutoff_missed / dispatch_lag_exceeded arm fails replay and install', async () => {
+  const { artifact } = await producedMixedNeverSentFire();
+  const parsed = parseFireArtifactV1(serializeFireArtifactV1(artifact));
+  const cutIndex = parsed.arms.findIndex((a) => a.terminalOutcome === 'cutoff_missed');
+  assert.ok(cutIndex >= 0, 'fixture has a cutoff_missed arm');
+  // (a) cutoff_missed with a nulled start → the presence half of the bidirectional relation fires.
+  const nulledCut = patchArmCoherent(parsed, cutIndex, { initialRequestStartedAt: null });
+  assert.ok(hasViolation(verifyFireArtifactReplay(nulledCut), 'null initialRequestStartedAt'), 'replay rejects a nulled cutoff_missed start');
+  assert.throws(() => installMutated(nulledCut), /fails replay/, 'install refuses a nulled cutoff_missed start');
+  // (b) the same for a dispatch_lag_exceeded terminal (digest recomputed over the new terminal).
+  const nulledLag = patchArmCoherent(parsed, cutIndex, { terminalOutcome: 'dispatch_lag_exceeded', initialRequestStartedAt: null });
+  assert.ok(hasViolation(verifyFireArtifactReplay(nulledLag), 'null initialRequestStartedAt'), 'replay rejects a nulled dispatch_lag_exceeded start');
+});
+
+test('B3-R3 (3): a non-null start on a zero-attempt credential_missing arm fails replay and install', async () => {
+  const { artifact, refused } = await producedMixedNeverSentFire();
+  const parsed = parseFireArtifactV1(serializeFireArtifactV1(artifact));
+  const credIndex = parsed.arms.findIndex((a) => a.terminalOutcome === 'credential_missing');
+  assert.ok(credIndex >= 0, 'fixture has a credential_missing arm');
+  const spurious = patchArmCoherent(parsed, credIndex, { initialRequestStartedAt: refused });
+  assert.ok(
+    hasViolation(verifyFireArtifactReplay(spurious), 'not a send-time gate refusal but a non-null initialRequestStartedAt'),
+    'replay rejects a spurious start on credential_missing',
+  );
+  assert.throws(() => installMutated(spurious), /fails replay/, 'install refuses a spurious credential_missing start');
 });

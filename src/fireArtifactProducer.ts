@@ -431,9 +431,14 @@ function buildArmEvidence(
     throw new Error(`arm ${identity.participantId} was dispatched on a different request than the fire`);
   }
   const orderedAttempts = toPersistedAttempts(result);
-  // The initial attempt's request-start is the SOLE V-lag operand, kept distinct
-  // from each attempt's own requestStartedAt; `null` when the initial was unsent.
-  const initialRequestStartedAt = result.attempt.requestAt;
+  // The initial send-boundary / request-start decision instant — the SOLE V-lag operand, kept
+  // distinct from each attempt's own requestStartedAt. A SENT initial sources it from its real
+  // `attempt.requestAt`; a never-sent gate/legacy-cutoff refusal sources it from the internal
+  // `refusedInitialStartAt` carrier (B3), so the operand the gate compared is preserved WITHOUT
+  // fabricating an attempt — `orderedAttempts` stays empty (mapOne reads only `attempt.requestAt`)
+  // and `armDigest` is unchanged (its ten-field domain excludes `initialRequestStartedAt`). It is
+  // `null` only when no reading was ever taken (`credential_missing`).
+  const initialRequestStartedAt = result.attempt.requestAt ?? result.refusedInitialStartAt;
   const acceptedAttempts = orderedAttempts.filter((a) => a.acceptedAt !== null);
   const isValid = result.outcome === 'valid';
   if (isValid) {
