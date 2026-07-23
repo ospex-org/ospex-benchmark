@@ -6,6 +6,7 @@
 # Run output — never commit results
 out/
 results/
+.fire-artifacts/
 
 # Node
 node_modules/
