@@ -189,8 +189,10 @@ export function selfResolvePublication(manifestBytes: Uint8Array): PublicationVe
 
 /** The run options, derived from the booted manifest constants. In a rehearsal every field is
  *  consumed only at a dispatch the report-only claim never reaches; in the store-backed fire
- *  they drive the real mock dispatch. Shared by both paths so the shape is single-sourced. */
-function deriveRunOptions(manifest: CohortManifestV1, now: () => number): LineOpenRunOptions {
+ *  they drive the real mock dispatch. Shared by both paths so the shape is single-sourced. The
+ *  dispatch clock is NOT carried here — it is the one tick clock threaded via `CohortTickInput.now`
+ *  (see `LineOpenRunOptions`, which omits `nowMs`). */
+function deriveRunOptions(manifest: CohortManifestV1): LineOpenRunOptions {
   const baselinePolicyVersion = isBaselinePolicyVersion(manifest.baselinePolicyVersion)
     ? manifest.baselinePolicyVersion
     : undefined;
@@ -199,7 +201,6 @@ function deriveRunOptions(manifest: CohortManifestV1, now: () => number): LineOp
     maxOutputTokens: manifest.constants.maxOutputTokens,
     executionPolicy: 'fixed-moneyline-total',
     baselinePolicyVersion,
-    nowMs: now,
   };
 }
 
@@ -242,7 +243,7 @@ export function buildRehearsalTickInput(params: RehearsalTickParams): CohortTick
     claimPort: new RehearsalClaimPort(),
     adapters: createMockAdapters({ simulateCollision: false }),
     sink: NO_OP_SINK,
-    runOptions: deriveRunOptions(booted.manifest, params.now),
+    runOptions: deriveRunOptions(booted.manifest),
     admission: { ownerId: params.ownerId, expectedSchemaVersion: STORE_SCHEMA_VERSION },
     now: params.now,
   };
@@ -435,7 +436,7 @@ export async function runStoreBackedFire(
       claimPort: new StoreClaimPort(store),
       adapters: createMockAdapters({ simulateCollision: false }),
       sink: new FireArtifactSink(outDir),
-      runOptions: deriveRunOptions(booted.manifest, now),
+      runOptions: deriveRunOptions(booted.manifest),
       admission: { ownerId, expectedSchemaVersion: STORE_SCHEMA_VERSION },
       now,
     };

@@ -16,7 +16,7 @@ import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPric
 import { sealPreparedFire } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
 import { promptScaffoldSha256 } from './prompt.js';
-import { AuthorizedDispatchFaultError, runAuthorizedDispatch } from './runner.js';
+import { AuthorizedDispatchFaultError, ClockRequiredError, runAuthorizedDispatch } from './runner.js';
 import { initialDispatchGate } from './attemptProvenance.js';
 import type { InitialDispatchGate } from './runner.js';
 import type { SlateRunOptions } from './runner.js';
@@ -1442,6 +1442,67 @@ test('a malformed gate after admission throws inside the cleanup backstop — ze
   assert.equal(scriptsHolder.reduce((n, s) => n + s.calls, 0), 0, 'no adapter was called — the gate threw before any send');
   assert.deepEqual([...releaseIds(store)].sort(), leaseIdsSorted(dispatch), 'each initial lease got exactly one release attempt');
   assert.equal(new Set(releaseIds(store)).size, dispatch.permit.initialLeases.length, 'each lease released once');
+});
+
+test('B2-R1: an omitted dispatch clock fails closed on the authorized path — no send, no ambient clock, every lease released once', async () => {
+  const scripts: Scripted[] = [];
+  const { dispatch, store } = await authorize((s) => {
+    const r = validAdapters(s, s.booted.cohortId);
+    scripts.push(...r.scripts);
+    return r.map;
+  });
+
+  // The authorized options WITHOUT a clock: the shared dispatch guard must fail closed. `SlateRunOptions`
+  // keeps `nowMs` optional (the legacy runSlate path), so this compiles — the guard is a RUNTIME tooth.
+  const noClockOptions: SlateRunOptions = {
+    cohortId: dispatch.permit.cohortId,
+    timeoutMs: 600_000,
+    maxOutputTokens: 16_000,
+    executionPolicy: 'fixed-moneyline-total',
+    baselinePolicyVersion: 'baselines-v0.3.0',
+    // nowMs deliberately OMITTED — there is no ambient wall-clock fallback.
+  };
+
+  // Prove NO ambient wall clock is read during the authorized dispatch: any Date.now touch is counted.
+  const realDateNow = Date.now;
+  let dateNowReads = 0;
+  Date.now = (): number => {
+    dateNowReads += 1;
+    return realDateNow();
+  };
+  let fault: unknown;
+  try {
+    fault = await runAuthorizedDispatch(dispatch, noClockOptions, PERMISSIVE_GATE).then(
+      () => null,
+      (e: unknown) => e,
+    );
+  } finally {
+    Date.now = realDateNow;
+  }
+
+  assert.ok(fault !== null, 'the authorized dispatch REJECTED — it did not fall back to a wall clock and send');
+  // The typed clock fault is preserved — directly or inside the canonical aggregate.
+  const clockFaults =
+    fault instanceof ClockRequiredError
+      ? [fault]
+      : fault instanceof AuthorizedDispatchFaultError
+        ? fault.failures.filter((f): f is ClockRequiredError => f instanceof ClockRequiredError)
+        : [];
+  assert.ok(clockFaults.length > 0, 'a typed ClockRequiredError is preserved (directly or in the AuthorizedDispatchFaultError aggregate)');
+  if (fault instanceof AuthorizedDispatchFaultError) {
+    assert.equal(clockFaults.length, fault.failures.length, 'EVERY arm failed with the clock-required fault');
+  }
+  // No credential/provider callback reached a model-call boundary — zero chat calls.
+  assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0, 'no provider chat was ever sent');
+  // No ambient wall clock was read.
+  assert.equal(dateNowReads, 0, 'no ambient Date.now was read — the clock is a required injected capability');
+  // Every authorized initial lease was released EXACTLY once (the cleanup backstop freed each slot).
+  assert.deepEqual(
+    [...releaseIds(store)].sort(),
+    dispatch.permit.initialLeases.map((l) => l.leaseId).sort(),
+    'every initial lease released once — no capacity left held',
+  );
+  assert.equal(new Set(releaseIds(store)).size, dispatch.permit.initialLeases.length, 'each lease released exactly once');
 });
 
 test('the initial-dispatch gate is a REQUIRED typed parameter of runAuthorizedDispatch (positive capability)', () => {

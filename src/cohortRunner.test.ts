@@ -69,12 +69,11 @@ const DETECT_MS = DISCO_MS + 5_000;
 const OPENER_AT = '2026-07-18T11:59:05.000Z';
 const QUOTE_AT = '2026-07-18T11:59:00+00:00';
 const MATCH_TIME = '2026-07-18T20:00:00+00:00';
-// The runner clock is coherent with the detection clock: an initial send at NOW_MS lands
-// 5s after the fire's detection instant (DETECT_MS), within the 10s dispatch-lag bound, so the
-// spine's send-time V-lag gate admits every fire. (A single coherent benchmark-host clock for
-// detection and dispatch is a separate hardening concern; the fixture keeps its two injected
-// clocks consistent so the gate exercises the send path rather than gating every fire out.)
-const NOW_MS = DETECT_MS + 5_000;
+// ONE coherent benchmark-host clock now drives BOTH detection and dispatch (B2): the tick's injected
+// `now` (see `tickClock`) stamps `detectedAt` in the projector AND the send-time V-lag start in the
+// spine, so the two clocks can never silently diverge. The fixture clock advances only a few ms
+// across a tick — well inside the 10s dispatch-lag bound — so every fire admits and exercises the
+// send path rather than gating every fire out.
 const OWNER = 'owner-host-1234-abc';
 
 const CODE_ARMS = defaultExpectedArms();
@@ -417,7 +416,6 @@ function runOpts(): LineOpenRunOptions {
     maxOutputTokens: 16_000,
     executionPolicy: 'fixed-moneyline-total',
     baselinePolicyVersion: 'baselines-v0.3.0',
-    nowMs: () => NOW_MS,
   };
 }
 
@@ -632,6 +630,67 @@ test('the runner module imports no real fetcher/store/filesystem/ambient clock',
   assert.ok(!/atomicStore/.test(src), 'no atomic store import');
   assert.ok(!/from 'node:fs'|from 'node:net'|from 'node:http/.test(src), 'no filesystem/network import');
   assert.ok(!/Date\.now/.test(src), 'no ambient clock — the tick clock is injected');
+});
+
+// ===========================================================================
+// B2-R2 — one coherent detection→dispatch clock threaded through the tick
+// ===========================================================================
+
+test('B2-R2: one injected tick clock sources BOTH detectedAt and the persisted V-lag start — the operand is the real elapsed ticks', async () => {
+  const json = manifestJson();
+  const store = new ScriptedStore(CODE_ARMS.length);
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  // ONE clock, threaded through the tick: it advances by exactly 1ms per read and RECORDS every
+  // value it returns. `detectedAt` (stamped by the projector) and each arm's `initialRequestStartedAt`
+  // (stamped at the send) must BOTH be values THIS clock produced — so the persisted V-lag operand
+  // `initialRequestStartedAt − detectedAt` equals the number of clock advances between them (the real
+  // elapsed ticks), and can never be an artifact of two divergent clocks. Under the B2-R2 mutation
+  // (dispatch clock re-sourced from a separate `runOptions.nowMs`), the persisted start would NOT be
+  // a reading of this recorded tick clock → `seen.includes(startMs)` fails → red.
+  const seen: number[] = [];
+  let n = 0;
+  const now = (): number => {
+    const v = DETECT_MS + n;
+    n += 1;
+    seen.push(v);
+    return v;
+  };
+  const { input } = tickInput(json, [makeGame({ gameId: 'g1' })], [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' })], {
+    claimPort: new StoreClaimPort(store),
+    sink,
+    now,
+  });
+
+  const result = await runCohortTick(input);
+  assert.equal(result.admittedCount, 1, 'the fire admits under the single coherent clock');
+  const artifact = sink.calls[0]!;
+  const detectedMs = Date.parse(artifact.detectedAt);
+  assert.ok(seen.includes(detectedMs), 'detectedAt is a reading of the injected tick clock');
+  const sentArms = artifact.arms.filter((a) => a.initialRequestStartedAt !== null);
+  assert.ok(sentArms.length > 0, 'at least one arm sent its initial');
+  for (const arm of sentArms) {
+    const startMs = Date.parse(arm.initialRequestStartedAt!);
+    assert.ok(seen.includes(startMs), 'the persisted initial start is a reading of the SAME injected clock, not a divergent one');
+    assert.ok(startMs >= detectedMs, 'dispatch never precedes detection under one clock');
+    // step = 1ms with no gaps, so the count of clock advances in (detectedMs, startMs] IS the numeric
+    // gap: the V-lag operand equals the real elapsed ticks on the single coherent clock.
+    const elapsedTicks = seen.filter((v) => v > detectedMs && v <= startMs).length;
+    assert.equal(startMs - detectedMs, elapsedTicks, 'the V-lag operand equals the real elapsed ticks on the one clock');
+  }
+});
+
+test('B2-R2 structural: LineOpenRunOptions omits nowMs; the clock is threaded via RunOneFireInput.now', () => {
+  const spineSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'lineOpenSpine.ts'), 'utf8');
+  assert.ok(
+    /export type LineOpenRunOptions = Omit<\s*SlateRunOptions,\s*'cohortId'\s*\|\s*'nowMs'\s*>/.test(spineSrc),
+    "LineOpenRunOptions = Omit<SlateRunOptions, 'cohortId' | 'nowMs'> (the dispatch clock is no longer a run-option field)",
+  );
+  assert.ok(/readonly now:\s*\(\)\s*=>\s*number/.test(spineSrc), 'RunOneFireInput carries the required tick clock `now`');
+  // The spine sources the dispatch clock from the threaded tick clock, never a caller run-option field.
+  const body = spineSrc.slice(spineSrc.indexOf('export async function runOneFire'));
+  assert.ok(/const now = input\.now;/.test(body), 'the tick clock is captured from input.now before the first await');
+  assert.ok(/nowMs: now,/.test(body), 'runnerOptions.nowMs is the captured tick clock');
+  assert.ok(!/nowMs: (?:runOptions|capturedOptions)\.nowMs/.test(body), 'the dispatch clock is never re-read from runOptions');
 });
 
 // ===========================================================================

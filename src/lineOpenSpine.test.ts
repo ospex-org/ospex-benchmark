@@ -19,7 +19,7 @@ import {
   reconcileArtifactToPermit,
   runOneFire,
 } from './lineOpenSpine.js';
-import type { ArtifactInstaller, ArtifactInstallResult, LineOpenAdmissionParameters, LineOpenRunOptions } from './lineOpenSpine.js';
+import type { ArtifactInstaller, ArtifactInstallResult, LineOpenAdmissionParameters, LineOpenRunOptions, RunOneFireInput } from './lineOpenSpine.js';
 import { assertFireArtifact, buildFireArtifact } from './fireArtifactProducer.js';
 import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import { FireArtifactSink, nodeArtifactFs } from './fireArtifactSink.js';
@@ -358,7 +358,6 @@ function runOpts(over: Partial<LineOpenRunOptions> = {}): LineOpenRunOptions {
     maxOutputTokens: 16_000,
     executionPolicy: 'fixed-moneyline-total',
     baselinePolicyVersion: 'baselines-v0.3.0',
-    nowMs: () => NOW_MS,
     ...over,
   };
 }
@@ -409,8 +408,11 @@ function deferredInstaller(): {
   return { installer, reached, resolve: (r) => resolveFn(r), reject: (e) => rejectFn(e), installCalls: () => installCalls };
 }
 
-/** The full happy-path harness for one fire, over an injected in-memory filesystem. */
-async function fireOf(opts: SealOpts & { store?: ScriptedStore; runOptions?: LineOpenRunOptions; fs?: ArtifactFs } = {}): Promise<{
+/** The full happy-path harness for one fire, over an injected in-memory filesystem. The tick clock
+ *  is injected via `now` (default `() => NOW_MS`, the boundary-safe reading whose V-lag against the
+ *  fixture `detectedAt` equals `maxDispatchLagMs`, so the gate admits); a late clock drives the
+ *  gate-refusal rows. */
+async function fireOf(opts: SealOpts & { store?: ScriptedStore; runOptions?: LineOpenRunOptions; fs?: ArtifactFs; now?: () => number } = {}): Promise<{
   outcome: Awaited<ReturnType<typeof runOneFire>>;
   store: ScriptedStore;
   snapshot: PreparedFireSnapshot;
@@ -430,6 +432,7 @@ async function fireOf(opts: SealOpts & { store?: ScriptedStore; runOptions?: Lin
     sink,
     runOptions: opts.runOptions ?? runOpts(),
     admission: ADMISSION,
+    now: opts.now ?? (() => NOW_MS),
   });
   return { outcome, store, snapshot, scripts, sink };
 }
@@ -666,7 +669,9 @@ test('each run-option field is read once, before admission, and a later mutation
   const reads: Record<string, number> = {};
   const backing = runOpts();
   const counting = {} as LineOpenRunOptions;
-  for (const field of ['timeoutMs', 'maxOutputTokens', 'executionPolicy', 'baselinePolicyVersion', 'nowMs', 'onGameComplete'] as const) {
+  // `nowMs` is no longer a run-option field (B2 — the dispatch clock is the tick clock threaded via
+  // RunOneFireInput.now); the remaining five run-option fields must each be read exactly once.
+  for (const field of ['timeoutMs', 'maxOutputTokens', 'executionPolicy', 'baselinePolicyVersion', 'onGameComplete'] as const) {
     Object.defineProperty(counting, field, {
       enumerable: true,
       get() {
@@ -677,10 +682,10 @@ test('each run-option field is read once, before admission, and a later mutation
   }
   const { outcome } = await fireOf({ runOptions: counting });
   assert.equal(outcome.kind, 'Installed');
-  // All SIX run-option fields — onGameComplete included — are read exactly once, before admission;
+  // All FIVE run-option fields — onGameComplete included — are read exactly once, before admission;
   // a post-admission re-read of any of them (e.g. `onGameComplete: input.runOptions.onGameComplete`)
   // reads its getter twice and turns this red.
-  for (const field of ['timeoutMs', 'maxOutputTokens', 'executionPolicy', 'baselinePolicyVersion', 'nowMs', 'onGameComplete'] as const) {
+  for (const field of ['timeoutMs', 'maxOutputTokens', 'executionPolicy', 'baselinePolicyVersion', 'onGameComplete'] as const) {
     assert.equal(reads[field], 1, `${field} read exactly once`);
   }
 });
@@ -692,26 +697,30 @@ test('mutating the caller inputs while the claim is pending does not redirect th
   const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
   const { map } = validAdapters(snapshot, cohortId, game);
   const realSink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
-  const input = {
+  const port = new StoreClaimPort(store);
+  // The EXACT input object the spine reads. Its claim-port wrapper, fired mid-admission (while the
+  // claim is pending), swaps the sink's install AND the tick clock ON THIS OBJECT — the spine must
+  // use the references it captured BEFORE the first await, not these later swaps.
+  const fireInput: RunOneFireInput = {
     snapshot,
     adapters: map,
-    claimPort: new StoreClaimPort(store),
+    claimPort: {
+      admit(req: AdmitDispatchRequest) {
+        (realSink as { install: unknown }).install = () => {
+          throw new Error('swapped install must never run');
+        };
+        // Swap the tick clock to one 10,000,000ms late: a re-read of input.now after the await would
+        // put every initial's V-lag far past maxDispatchLagMs and gate out the whole fire.
+        (fireInput as { now: () => number }).now = () => NOW_MS + 10_000_000;
+        return port.admit(req);
+      },
+    },
     sink: realSink,
     runOptions: runOpts(),
     admission: { ...ADMISSION },
+    now: () => NOW_MS,
   };
-  // A claim port wrapper that, mid-admission, swaps the sink's install and corrupts run options.
-  const port = input.claimPort;
-  const wrapped = {
-    admit(req: AdmitDispatchRequest) {
-      (realSink as { install: unknown }).install = () => {
-        throw new Error('swapped install must never run');
-      };
-      (input.runOptions as { nowMs: () => number }).nowMs = () => NOW_MS + 10_000_000;
-      return port.admit(req);
-    },
-  };
-  const outcome = await runOneFire({ ...input, claimPort: wrapped });
+  const outcome = await runOneFire(fireInput);
   assert.equal(outcome.kind, 'Installed', 'the fire used the captured install + clock, not the swapped ones');
 });
 
@@ -739,6 +748,7 @@ test('every ordinary NotAdmitted outcome is returned by identity with zero side 
       sink,
       runOptions: runOpts(),
       admission: ADMISSION,
+      now: () => NOW_MS,
     });
     assert.equal(outcome.kind, 'NotAdmitted');
     if (outcome.kind === 'NotAdmitted') assert.strictEqual(outcome.outcome, claimOutcome, `${claimOutcome.kind} returned by identity`);
@@ -767,6 +777,7 @@ test('a claim-port throw propagates unchanged with zero side effects', async () 
         sink,
         runOptions: runOpts(),
         admission: ADMISSION,
+        now: () => NOW_MS,
       }),
     (e) => e === sentinel,
   );
@@ -783,7 +794,7 @@ test('an admitted narrowed scope propagates the refusal and releases every lease
   const { map, scripts } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION }),
+    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS }),
     /retained_scope_not_supported|does not|narrower/,
   );
   // Exactly the distinct initial-lease IDs are released once each — compared to the expected set,
@@ -809,7 +820,7 @@ test('a narrowed scope whose cleanup also fails surfaces the cleanup error, inst
   // of the failures (or attempts) is caught here rather than normalized away by a sort.
   const expectedLeaseIds = snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`);
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION }),
+    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS }),
     (error: unknown) => {
       // The typed cleanup error is propagated UNCHANGED — its structured, ORDERED evidence must
       // survive, so a re-wrap that reverses the retained failures is a regression this catches.
@@ -844,7 +855,7 @@ test('a dispatch fault propagates and installs nothing', async () => {
   const { map } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION }),
+    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS }),
     (error: unknown) => {
       // The typed dispatch fault is propagated UNCHANGED — every retained arm cause must survive in
       // roster order, so a re-wrap that reverses the causes is caught here.
@@ -882,7 +893,7 @@ test('a producer failure after dispatch leaves leases settled and installs nothi
   const { map } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: options, admission: ADMISSION }),
+    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: options, admission: ADMISSION, now: () => NOW_MS }),
     /baseline/i,
   );
   assert.deepEqual([...releaseIds(store)].sort(), snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`).sort(), 'all leases already released');
@@ -1141,7 +1152,7 @@ test('settlement runs exactly once, strictly after the install resolves; a pendi
     const { map } = validAdapters(snapshot, cohortId, game);
     const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
     const d = deferredInstaller();
-    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION });
+    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS });
     await d.reached;
     assert.equal(d.installCalls(), 1, 'install reached exactly once');
     assert.equal(store.completeCalls.length, 0, 'no settle while the install promise is pending');
@@ -1158,7 +1169,7 @@ test('settlement runs exactly once, strictly after the install resolves; a pendi
     const { map } = validAdapters(snapshot, cohortId, game);
     const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
     const d = deferredInstaller();
-    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION });
+    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS });
     await d.reached;
     assert.equal(store.completeCalls.length, 0, 'no settle before the install resolves');
     const boom = new Error('durable sink unreachable');
@@ -1250,7 +1261,7 @@ test('the spine imports no runtime store, settles only via the permit-resolved c
 const LATE_NOW = Date.parse('2026-07-18T12:00:45.000Z');
 
 test('a gate-violating fire installs a writer-clean artifact — every arm null-start, zero attempts', async () => {
-  const { outcome, store, scripts } = await fireOf({ runOptions: runOpts({ nowMs: () => LATE_NOW }) });
+  const { outcome, store, scripts } = await fireOf({ now: () => LATE_NOW });
   assert.equal(outcome.kind, 'Installed', 'the fire produces a durable artifact even when every arm is gated out');
   if (outcome.kind !== 'Installed') return;
   assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0, 'no arm was sent — the snapshot-derived gate rejected each initial');
@@ -1274,9 +1285,11 @@ test('the snapshot-derived gate wins over hostile permissive runOptions mutated 
   const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
   const { map, scripts } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
-  // runOptions carries hostile runtime-extra gate operands that WOULD admit every initial if read.
+  // runOptions carries hostile runtime-extra gate operands (detectedAt / windowEnd / maxDispatchLagMs)
+  // that WOULD admit every initial if the gate read them — but the gate sources those operands from
+  // the authenticated snapshot, never from runOptions. The clock is the injected LATE tick clock.
   const runOptions = {
-    ...runOpts({ nowMs: () => LATE_NOW }),
+    ...runOpts(),
     detectedAt: new Date(LATE_NOW).toISOString(),
     windowEnd: '2999-01-01T00:00:00.000Z',
     maxDispatchLagMs: 1_000_000_000,
@@ -1290,7 +1303,7 @@ test('the snapshot-derived gate wins over hostile permissive runOptions mutated 
       return port.admit(req);
     },
   };
-  const outcome = await runOneFire({ snapshot, adapters: map, claimPort: wrapped, sink, runOptions, admission: ADMISSION });
+  const outcome = await runOneFire({ snapshot, adapters: map, claimPort: wrapped, sink, runOptions, admission: ADMISSION, now: () => LATE_NOW });
   assert.equal(outcome.kind, 'Installed', 'the fire runs — every initial gated out by the snapshot operands');
   assert.equal(
     scripts.reduce((n, s) => n + s.calls, 0),
