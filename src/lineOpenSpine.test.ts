@@ -16,10 +16,12 @@ import {
   deriveSpendReservationUsdMicros,
   FireReconciliationError,
   installReconciledArtifact,
+  PreClaimClockError,
   reconcileArtifactToPermit,
   runOneFire,
 } from './lineOpenSpine.js';
-import type { ArtifactInstaller, ArtifactInstallResult, LineOpenAdmissionParameters, LineOpenRunOptions, RunOneFireInput } from './lineOpenSpine.js';
+import type { ArtifactInstaller, ArtifactInstallResult, CoverageMissReason, LineOpenAdmissionParameters, LineOpenRunOptions, RunOneFireInput } from './lineOpenSpine.js';
+import type { DeferReason, RejectReason } from './lineOpenProject.js';
 import { assertFireArtifact, buildFireArtifact } from './fireArtifactProducer.js';
 import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import { FireArtifactSink, nodeArtifactFs } from './fireArtifactSink.js';
@@ -53,6 +55,7 @@ import type {
   RepairLeaseResult,
 } from './store/contract.js';
 import type {
+  ArmOutcome,
   BenchmarkResponse,
   ChatTurn,
   GameBundle,
@@ -173,7 +176,7 @@ function historyRow(gameId: string, market: MarketKey): TwoSidedHistoryRow {
   return { id: 1, jsonodds_id: gameId, market, source: 'jsonodds', ...quote, captured_at: OPENER_AT, captured_at_ms: Date.parse(OPENER_AT) };
 }
 
-function candidateInput(gameId: string, market: MarketKey): CandidateInput {
+function candidateInput(gameId: string, market: MarketKey, windowEnd: string = WINDOW_END): CandidateInput {
   return {
     gameId,
     sport: 'mlb',
@@ -183,7 +186,7 @@ function candidateInput(gameId: string, market: MarketKey): CandidateInput {
     opener: historyRow(gameId, market),
     detectedAt: DETECTED_AT,
     windowStart: WINDOW_START,
-    windowEnd: WINDOW_END,
+    windowEnd,
     cleanEntryWindowMs: W,
     maxClockSkewMs: SKEW,
   };
@@ -200,6 +203,9 @@ function sealed(opts: SealOpts = {}): PreparedFireSnapshot {
   const markets = opts.markets ?? BOTH;
   const json = manifestJson(opts.manifestExtra);
   const bytes = new TextEncoder().encode(json);
+  // The candidate must carry the SAME windowEnd as the (possibly-overridden) manifest, or
+  // reconcileCandidate rejects a built artifact on the admit path; derive it from the override.
+  const candWindowEnd = (opts.manifestExtra?.['windowEnd'] as string | undefined) ?? WINDOW_END;
   return sealPreparedFire({
     game: scopedGame(gameId, markets),
     slug: `mil-pit-${gameId.slice(-4)}`,
@@ -215,8 +221,8 @@ function sealed(opts: SealOpts = {}): PreparedFireSnapshot {
     bundleBuiltAt: BUNDLE_BUILT_AT,
     proposedMarkets: markets,
     perMarket: markets.map((m) => ({
-      candidateInput: candidateInput(gameId, m),
-      verdict: evaluateCandidate(candidateInput(gameId, m)),
+      candidateInput: candidateInput(gameId, m, candWindowEnd),
+      verdict: evaluateCandidate(candidateInput(gameId, m, candWindowEnd)),
       historyRows: [historyRow(gameId, m)],
       historyWatermark: null,
     })),
@@ -1337,4 +1343,229 @@ test('the dispatch gate is captured from the sealed snapshot, after admission-re
     body.indexOf('const gate: InitialDispatchGate') < body.indexOf('authorizePreparedDispatch('),
     'gate captured before authorization',
   );
+});
+
+// ===========================================================================
+// B1 — the PRE-CLAIM canonical-window gate (SPEC-line-open-evidence-model.md §3/§5)
+// ===========================================================================
+
+// Fixture geometry (from the shared constants above): first pitch (cutoffAt) CUTOFF = 20:00,
+// windowEnd WINDOW_END = 2026-07-19T00:00 (a day AFTER first pitch), detectedAt 12:00:30. A pre-claim
+// reading is compared to first pitch (snapshot.prepared.cutoffAt) and windowEnd
+// (snapshot.booted.manifest.windowEnd), first-pitch precedence when both have passed.
+const AT_FIRST_PITCH = Date.parse(CUTOFF); // == snapshot.prepared.cutoffAt
+const AFTER_FIRST_PITCH = Date.parse('2026-07-18T21:00:00.000Z'); // > first pitch, < windowEnd
+const AT_OR_AFTER_WINDOW_END = Date.parse(WINDOW_END); // >= windowEnd AND >= first pitch (both passed)
+
+/** The complete arm-outcome enum (compile-exhaustive: a new `ArmOutcome` forces an entry here). */
+const ARM_OUTCOME_SET: Record<ArmOutcome, true> = {
+  valid: true,
+  invalid_schema: true,
+  timeout: true,
+  credential_missing: true,
+  rate_limited: true,
+  provider_error: true,
+  cutoff_missed: true,
+  dispatch_lag_exceeded: true,
+};
+
+/** The complete projector reason unions (compile-exhaustive: a new reason forces an entry here). */
+const PROJECTOR_REASON_SET: Record<DeferReason | RejectReason, true> = {
+  opener_not_visible: true,
+  detected_before_window: true,
+  clock_skew_defer: true,
+  quote_moved: true,
+  snapshot_stale: true,
+  not_enabled: true,
+  detected_after_window: true,
+  opener_before_window: true,
+  opener_after_window: true,
+  clock_skew_fault: true,
+  stale_entry: true,
+};
+
+// --- B1-R1 — a pre-claim first-pitch OR windowEnd impossibility takes no claim, no artifact ------
+
+test('B1-R1(a): a pre-claim reading at/after first pitch is a CoverageMiss — admit/install/provider never invoked', async () => {
+  const { outcome, store, sink, scripts } = await fireOf({ now: () => AT_FIRST_PITCH });
+  assert.equal(outcome.kind, 'CoverageMiss', 'a first-pitch-passed reading takes no claim');
+  if (outcome.kind === 'CoverageMiss') assert.equal(outcome.reason, 'first_pitch_before_claim');
+  // The claim port, the sink, and every provider adapter are NEVER reached (spies stay at zero).
+  assert.equal(store.admitCalls.length, 0, 'claimPort.admit never called — no claim was taken');
+  assert.equal(sink.calls.length, 0, 'sink.install never called — no artifact produced');
+  assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0, 'no provider was called');
+});
+
+test('B1-R1(b): a pre-claim reading in [windowEnd, firstPitch) is a CoverageMiss with reason window_end_before_claim', async () => {
+  // windowEnd BEFORE first pitch (via the manifest), then a reading between them: windowEnd passed,
+  // first pitch not yet. The gate reads windowEnd from snapshot.booted.manifest.windowEnd.
+  const WINDOW_END_EARLY = '2026-07-18T14:00:00.000Z'; // < first pitch (20:00)
+  const READING = Date.parse('2026-07-18T15:00:00.000Z'); // >= windowEnd (14:00), < first pitch (20:00)
+  const { outcome, store, sink, scripts } = await fireOf({
+    manifestExtra: { windowEnd: WINDOW_END_EARLY },
+    now: () => READING,
+  });
+  assert.equal(outcome.kind, 'CoverageMiss');
+  if (outcome.kind !== 'CoverageMiss') return;
+  assert.equal(outcome.reason, 'window_end_before_claim', 'windowEnd passed but first pitch has not');
+  assert.equal(store.admitCalls.length, 0);
+  assert.equal(sink.calls.length, 0);
+  assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0);
+});
+
+test('B1-R1(b-boundary): a pre-claim reading EXACTLY at windowEnd is a CoverageMiss (end-exclusive); one ms earlier admits', async () => {
+  // The canonical window is END-EXCLUSIVE (`initialRequestStartedAt < windowEnd`), so a reading EXACTLY
+  // at windowEnd is already too late → window_end_before_claim. windowEnd is set BEFORE first pitch so this
+  // is unambiguously the windowEnd branch. Weakening the gate `>=` to `>` admits at the boundary → reds this.
+  const WINDOW_END_EARLY = '2026-07-18T14:00:00.000Z'; // < first pitch (20:00)
+  const AT_WINDOW_END = Date.parse(WINDOW_END_EARLY);
+  const missed = await fireOf({ manifestExtra: { windowEnd: WINDOW_END_EARLY }, now: () => AT_WINDOW_END });
+  assert.equal(missed.outcome.kind, 'CoverageMiss', 'a reading exactly at windowEnd takes no claim');
+  if (missed.outcome.kind === 'CoverageMiss') assert.equal(missed.outcome.reason, 'window_end_before_claim');
+  assert.equal(missed.store.admitCalls.length, 0, 'no claim at exactly windowEnd (end-exclusive)');
+  assert.equal(missed.sink.calls.length, 0);
+  assert.equal(missed.scripts.reduce((n, s) => n + s.calls, 0), 0);
+  // The passing side: one millisecond earlier is INSIDE the window — the gate does not coverage-miss.
+  const admitted = await fireOf({ manifestExtra: { windowEnd: WINDOW_END_EARLY }, now: () => AT_WINDOW_END - 1 });
+  assert.notEqual(admitted.outcome.kind, 'CoverageMiss', 'windowEnd - 1ms is inside the window — not a coverage miss');
+  assert.equal(admitted.store.admitCalls.length, 1, 'windowEnd - 1ms takes a claim');
+});
+
+test('B1-R1(c): when BOTH boundaries have passed, first pitch takes precedence', async () => {
+  const { outcome } = await fireOf({ now: () => AT_OR_AFTER_WINDOW_END });
+  assert.equal(outcome.kind, 'CoverageMiss');
+  if (outcome.kind !== 'CoverageMiss') return;
+  assert.equal(outcome.reason, 'first_pitch_before_claim', 'first-pitch precedence when both passed');
+});
+
+test('B1-R1(d): a forged/unsealed snapshot fails the brand BEFORE the gate — throws, never a CoverageMiss, never admits', async () => {
+  const genuine = sealed();
+  const store = new ScriptedStore(genuine.expectedArmIdentities.length);
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  // A structural copy is not in the seal WeakSet; the clock is late (would be a CoverageMiss if the
+  // gate were reached) — proving the brand rejection fires first, at buildFullScopeAdmitRequest.
+  await assert.rejects(
+    () =>
+      runOneFire({
+        snapshot: { ...genuine } as PreparedFireSnapshot,
+        adapters: new Map(),
+        claimPort: new StoreClaimPort(store),
+        sink,
+        runOptions: runOpts(),
+        admission: ADMISSION,
+        now: () => AT_FIRST_PITCH,
+      }),
+    /was not produced/,
+  );
+  assert.equal(store.admitCalls.length, 0, 'the brand rejected before any admission');
+  assert.equal(sink.calls.length, 0);
+});
+
+test('B1-R1(e): EVERY non-finite reading (NaN, +Infinity, -Infinity) fails CLOSED — throws PreClaimClockError, never admits', async () => {
+  // A broken clock cannot be evaluated; the gate must reject ALL non-finite readings, not just NaN. In
+  // particular -Infinity would pass BOTH `>=` comparisons (−∞ ≥ x is false) and reach admission if the
+  // guard were weakened from `!Number.isFinite` to `Number.isNaN`, and +Infinity would mis-route to a
+  // CoverageMiss instead of failing closed — so both must throw here.
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    const snapshot = sealed();
+    const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+    const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+    await assert.rejects(
+      () =>
+        runOneFire({
+          snapshot,
+          adapters: new Map(),
+          claimPort: new StoreClaimPort(store),
+          sink,
+          runOptions: runOpts(),
+          admission: ADMISSION,
+          now: () => bad,
+        }),
+      (e) => e instanceof PreClaimClockError,
+      `${bad} must fail closed with PreClaimClockError`,
+    );
+    assert.equal(store.admitCalls.length, 0, `${bad}: a broken clock never admits`);
+    assert.equal(sink.calls.length, 0, `${bad}: never installs`);
+  }
+});
+
+// --- B1-R2 — distinct reason type; a post-claim crossing stays cutoff_missed, never CoverageMiss ---
+
+test('B1-R2: each CoverageMissReason is disjoint from the arm-outcome enum and the projector reason unions', async () => {
+  const reasons: readonly CoverageMissReason[] = ['first_pitch_before_claim', 'window_end_before_claim'];
+  // Static: neither literal appears among the arm outcomes or projector reasons.
+  for (const r of reasons) {
+    assert.ok(!(r in ARM_OUTCOME_SET), `${r} must not be an arm outcome`);
+    assert.ok(!(r in PROJECTOR_REASON_SET), `${r} must not be a projector defer/reject reason`);
+  }
+  // Runtime binding: the reason a PRODUCED CoverageMiss carries is likewise not an arm outcome — so
+  // relabelling the pre-claim miss to `cutoff_missed` (an arm outcome) turns this red.
+  const { outcome } = await fireOf({ now: () => AT_FIRST_PITCH });
+  assert.equal(outcome.kind, 'CoverageMiss');
+  if (outcome.kind !== 'CoverageMiss') return;
+  assert.ok(!(outcome.reason in ARM_OUTCOME_SET), 'the produced CoverageMiss reason is not an arm outcome');
+  assert.ok(!(outcome.reason in PROJECTOR_REASON_SET), 'the produced CoverageMiss reason is not a projector reason');
+});
+
+test('B1-R2: a boundary crossing AFTER the claim stays an arm-level cutoff_missed (Installed), never a CoverageMiss', async () => {
+  // A clock whose FIRST read (the pre-claim gate) is before both boundaries — so the fire is admitted —
+  // but whose later reads (the send-time dispatch) are at/after first pitch, so each initial is refused
+  // with the arm-level `cutoff_missed`. This is the already-claimed case, NOT a pre-claim CoverageMiss.
+  let calls = 0;
+  const now = (): number => {
+    calls += 1;
+    return calls === 1 ? NOW_MS : AT_FIRST_PITCH; // pre-claim before; every dispatch read at first pitch
+  };
+  const { outcome, store, scripts } = await fireOf({ now });
+  assert.equal(outcome.kind, 'Installed', 'the fire WAS claimed — a post-claim crossing does not un-claim it');
+  if (outcome.kind !== 'Installed') return;
+  assert.ok(store.admitCalls.length === 1, 'the fire was admitted (a claim was taken)');
+  assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0, 'no arm was sent — each initial hit the send-time cutoff');
+  assert.ok(
+    outcome.artifact.arms.every((a) => a.terminalOutcome === 'cutoff_missed'),
+    'every arm is the already-claimed cutoff_missed, not a CoverageMiss',
+  );
+});
+
+// --- B1-R5 — B1 owns the complete CoverageMiss record (reason + four operands, frozen) ------------
+
+test('B1-R5: the CoverageMiss record binds each operand to the EXACT snapshot value the gate used; reason is a separate field; frozen', async () => {
+  // A sparse SEQUENCED clock: the FIRST read triggers the miss (AFTER_FIRST_PITCH); any SECOND read returns
+  // a DISTINCT valid value. The gate must read the clock EXACTLY once and persist THAT reading — so replacing
+  // the persisted `readingMs` with a second `now()` (a distinct value) reds the call-count AND the identity.
+  const seq = [AFTER_FIRST_PITCH, AFTER_FIRST_PITCH + 3_600_000];
+  let clockReads = 0;
+  const now = (): number => {
+    const v = seq[Math.min(clockReads, seq.length - 1)]!;
+    clockReads += 1;
+    return v;
+  };
+  const { outcome, snapshot } = await fireOf({ now });
+  assert.equal(outcome.kind, 'CoverageMiss');
+  if (outcome.kind !== 'CoverageMiss') return;
+  assert.equal(clockReads, 1, 'the pre-claim gate read the clock EXACTLY once (single-read evidence identity)');
+  // Structural separation: `reason` is a distinct scalar field; the four operands live on `operands`,
+  // NOT spread onto the outcome (collapsing reason+operands into one field turns this red).
+  assert.equal(typeof outcome.reason, 'string');
+  assert.equal(typeof outcome.operands, 'object');
+  assert.ok(!('preClaimReadingAt' in outcome), 'operands are NOT spread onto the outcome alongside reason');
+  assert.deepEqual(
+    Object.keys(outcome.operands).sort(),
+    ['detectedAt', 'preClaimReadingAt', 'scheduledAtAtFire', 'windowEnd'],
+    'exactly the four operands are present',
+  );
+  // Identity binding: each operand equals the EXACT value the gate compared — the single injected
+  // reading, and first pitch / windowEnd / detectedAt straight from the authenticated snapshot.
+  assert.equal(outcome.operands.preClaimReadingAt, new Date(AFTER_FIRST_PITCH).toISOString());
+  assert.equal(outcome.operands.scheduledAtAtFire, snapshot.prepared.cutoffAt);
+  assert.equal(outcome.operands.windowEnd, snapshot.booted.manifest.windowEnd);
+  assert.equal(outcome.operands.detectedAt, snapshot.detectedAt);
+  // All four are typed ISO-8601 strings.
+  for (const v of Object.values(outcome.operands)) {
+    assert.equal(typeof v, 'string');
+    assert.ok(!Number.isNaN(Date.parse(v)), `${v} is a parseable instant`);
+  }
+  // The record is frozen (operands + outcome) BEFORE it can reach the tick's shallow-frozen summary.
+  assert.ok(Object.isFrozen(outcome), 'the CoverageMiss outcome is frozen');
+  assert.ok(Object.isFrozen(outcome.operands), 'the operands object is frozen');
 });
