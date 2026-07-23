@@ -717,6 +717,59 @@ test('B2-R2 structural: LineOpenRunOptions omits nowMs; the clock is threaded vi
 });
 
 // ===========================================================================
+// B1-R3 — a pre-claim CoverageMiss consumes no dispatch budget
+// ===========================================================================
+
+test('B1-R3: coverage-missed candidates ahead of admittable fires consume no budget — all M admittable are attempted', async () => {
+  // Budget M = 2. Four candidates in projection order (tie on opener → gameId): g1, g2 have a first
+  // pitch (matchTime) ALREADY in the past at the tick clock, so the pre-claim gate coverage-misses each
+  // WITHOUT a claim; g3, g4 have a future first pitch and admit. A miss that consumed budget would
+  // strand an admittable fire under the cap of 2.
+  const json = manifestJson({ maxDispatchesPerTick: 2 });
+  const store = new ScriptedStore(CODE_ARMS.length);
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  const PAST_FIRST_PITCH = '2026-07-18T12:00:00.000Z'; // < the tick clock's pre-claim reads (DETECT_MS + 4s)
+  const games = [
+    makeGame({ gameId: 'g1', matchTime: PAST_FIRST_PITCH }),
+    makeGame({ gameId: 'g2', matchTime: PAST_FIRST_PITCH }),
+    makeGame({ gameId: 'g3', matchTime: MATCH_TIME }),
+    makeGame({ gameId: 'g4', matchTime: MATCH_TIME }),
+  ];
+  const odds = ['g1', 'g2', 'g3', 'g4'].map((id) => makeOdds({ jsonodds_id: id, market: 'moneyline' }));
+  // Detection at DETECT_MS; every later read (bundle-built + each pre-claim gate + dispatch) clamps to
+  // DETECT_MS + 4s — after the past first pitch, before the future one, inside the V-lag bound.
+  const status: string[] = [];
+  const { input } = tickInput(json, games, odds, {
+    claimPort: new StoreClaimPort(store),
+    sink,
+    now: tickClock([DETECT_MS, DETECT_MS + 4_000]),
+    onStatus: (line) => status.push(line),
+  });
+
+  const result = await runCohortTick(input);
+
+  // The runner's own describeOutcome renders each CoverageMiss without throwing (a B1-R4 consumer).
+  assert.equal(status.filter((l) => /CoverageMiss\/first_pitch_before_claim/.test(l)).length, 2);
+
+  // All four candidates were reached and reported, in projection order.
+  assert.equal(result.discoveredCount, 4);
+  assert.equal(result.fireOutcomes.length, 4, 'every reached fire is reported (the two misses included)');
+  assert.deepEqual(
+    result.fireOutcomes.map((f) => f.gameId),
+    ['g1', 'g2', 'g3', 'g4'],
+  );
+  // The two coverage-missed candidates took NO claim and are reported as CoverageMiss.
+  assert.equal(result.fireOutcomes[0]!.outcome.kind, 'CoverageMiss');
+  assert.equal(result.fireOutcomes[1]!.outcome.kind, 'CoverageMiss');
+  // Exactly the two admittable fires installed — the budget was spent on THEM, not the misses.
+  assert.equal(result.fireOutcomes[2]!.outcome.kind, 'Installed', 'g3 admitted');
+  assert.equal(result.fireOutcomes[3]!.outcome.kind, 'Installed', 'g4 admitted');
+  assert.equal(result.admittedCount, 2, 'admittedCount is exactly M — the misses did not count');
+  assert.equal(sink.calls.length, 2, 'both admittable fires installed — neither was stranded by a miss');
+  assert.equal(store.admitCalls.length, 2, 'only the two admittable fires were ever admitted');
+});
+
+// ===========================================================================
 // typed terminal outcomes survive the tick boundary (not collapsed to a kind)
 // ===========================================================================
 

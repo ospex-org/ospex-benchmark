@@ -113,13 +113,57 @@ export class FireReconciliationError extends Error {
   }
 }
 
+/**
+ * Why a PRE-CLAIM canonical-window gate refused a fire before any claim (B1 / D7). The gate reads the
+ * ONE authenticated pre-claim clock and compares it to the two canonical boundaries the sealed snapshot
+ * carries: `first_pitch_before_claim` when the reading is already at/after first pitch
+ * (`snapshot.prepared.cutoffAt`); `window_end_before_claim` when it is at/after the observation window
+ * end (`snapshot.booted.manifest.windowEnd`). First pitch takes precedence when both have passed. These
+ * are ADVISORY runner reasons on a DEDICATED type — deliberately disjoint from the arm-outcome enum
+ * (`ArmOutcome`) and the projector `DeferReason` / `RejectReason`: a pre-claim coverage miss is a NEW
+ * classification, never an already-claimed arm-level `cutoff_missed`.
+ */
+export type CoverageMissReason = 'first_pitch_before_claim' | 'window_end_before_claim';
+
+/** The EXACT operand set the pre-claim gate compared, kept structurally SEPARATE from the advisory
+ *  `reason` (B1-R5): the single pre-claim clock reading (the sole source of both the comparison and
+ *  this persisted value), and — from the authenticated snapshot — first pitch, the observation window
+ *  end, and the detection instant. All four are ISO-8601 strings (the artifact timestamp convention). */
+export interface CoverageMissOperands {
+  readonly preClaimReadingAt: string;
+  readonly scheduledAtAtFire: string;
+  readonly windowEnd: string;
+  readonly detectedAt: string;
+}
+
+/**
+ * The PRE-CLAIM canonical-window gate reads the ONE tick clock BEFORE deciding whether a timely initial
+ * is still possible; a non-finite reading (`NaN` / `±Infinity`) is a broken clock the gate cannot
+ * evaluate. It fails CLOSED — throwing this typed fault rather than letting `NaN >= x` evaluate false and
+ * fall through to admission — so a bad clock can never silently admit a fire the gate should have refused.
+ */
+export class PreClaimClockError extends Error {
+  constructor() {
+    super('the pre-claim canonical-window gate requires a finite clock reading — a non-finite reading fails closed');
+    this.name = 'PreClaimClockError';
+  }
+}
+
 /** A non-authorizing admission is returned by identity; a successful fire returns its narrow Installed
  *  result — the durable artifact plus the completion status. `kind: 'Installed'` describes durable
  *  artifact presence; `completion.status` independently reports completion CONFIRMATION (`settled`, or
  *  `unsettled` with a reason whose store-state confidence a consumer reads), not omniscient canonical
- *  state. No envelope, pricing actual, or raw model response. */
+ *  state. No envelope, pricing actual, or raw model response. A `CoverageMiss` is the PRE-CLAIM gate's
+ *  distinct outcome (B1): a timely initial was already impossible at the authenticated pre-claim clock
+ *  reading, so NO claim was taken, NO artifact produced, and NO budget consumed — the candidate becomes
+ *  a coverage miss through a later independent finalizer (never routed here). */
 export type LineOpenFireOutcome =
   | Extract<AuthorizePreparedDispatchResult, { kind: 'NotAdmitted' }>
+  | {
+      readonly kind: 'CoverageMiss';
+      readonly reason: CoverageMissReason;
+      readonly operands: CoverageMissOperands;
+    }
   | {
       readonly kind: 'Installed';
       readonly permit: DispatchPermit;
@@ -328,6 +372,33 @@ export async function installReconciledArtifact(
 }
 
 // ---------------------------------------------------------------------------
+// The pre-claim canonical-window gate (B1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the FROZEN `CoverageMiss` outcome for a pre-claim canonical-window refusal (B1). The four
+ * operands are the EXACT values the gate compared: the single pre-claim reading (`preClaimReadingAt`,
+ * derived from the SAME `readingMs` the gate branched on — single-source, never a second clock read),
+ * and, from the AUTHENTICATED snapshot, first pitch (`scheduledAtAtFire`), the observation window end
+ * (`windowEnd`), and the detection instant (`detectedAt`). Both the operand object AND the outcome are
+ * frozen HERE, before the value can reach the tick's shallow-frozen summary — the tick retains outcomes
+ * BY REFERENCE and must never re-traverse them, so the record must arrive already immutable.
+ */
+function coverageMiss(
+  reason: CoverageMissReason,
+  readingMs: number,
+  snapshot: PreparedFireSnapshot,
+): Extract<LineOpenFireOutcome, { kind: 'CoverageMiss' }> {
+  const operands: CoverageMissOperands = Object.freeze({
+    preClaimReadingAt: new Date(readingMs).toISOString(),
+    scheduledAtAtFire: snapshot.prepared.cutoffAt,
+    windowEnd: snapshot.booted.manifest.windowEnd,
+    detectedAt: snapshot.detectedAt,
+  });
+  return Object.freeze({ kind: 'CoverageMiss' as const, reason, operands });
+}
+
+// ---------------------------------------------------------------------------
 // The spine
 // ---------------------------------------------------------------------------
 
@@ -390,6 +461,27 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
     windowEnd: snapshot.booted.manifest.windowEnd,
     maxDispatchLagMs: snapshot.booted.manifest.constants.maxDispatchLagMs,
   };
+
+  // (5c) The PRE-CLAIM canonical-window gate (B1; SPEC-line-open-evidence-model.md §3/§5). Read the ONE
+  //      coherent tick clock (the SAME `now` that drives the send-time V-lag) EXACTLY ONCE, and — from
+  //      the AUTHENTICATED snapshot only — compare it to the two canonical boundaries. If the reading is
+  //      already at/after first pitch (`snapshot.prepared.cutoffAt`) OR at/after the observation window
+  //      end (`snapshot.booted.manifest.windowEnd`), a timely INITIAL request is already impossible; per
+  //      §3 the runner must then NOT claim or dispatch. So the gate runs AFTER (5) authenticated the
+  //      snapshot and BEFORE (6) admission: on a miss it never calls `claimPort.admit`, never calls a
+  //      provider or the sink, produces no artifact, and consumes no budget — it returns a `CoverageMiss`
+  //      (the candidate becomes a §6 coverage miss only through a later independent finalizer, never
+  //      here). This is DISTINCT from the send-time `cutoff_missed`: that classifies an already-CLAIMED
+  //      arm whose boundary crossed AFTER admission (the unchanged `initialDispatchGate`, below). The one
+  //      reading is the sole source of BOTH the comparison and the persisted `preClaimReadingAt` operand.
+  //      A non-finite reading fails CLOSED (throws) rather than letting `NaN >= x` be false and admitting.
+  const readingMs = now();
+  if (!Number.isFinite(readingMs)) throw new PreClaimClockError();
+  const firstPitchMs = Date.parse(snapshot.prepared.cutoffAt);
+  const windowEndMs = Date.parse(snapshot.booted.manifest.windowEnd);
+  // First-pitch precedence when BOTH boundaries have passed (§5 / D7): first pitch is checked first.
+  if (readingMs >= firstPitchMs) return coverageMiss('first_pitch_before_claim', readingMs, snapshot);
+  if (readingMs >= windowEndMs) return coverageMiss('window_end_before_claim', readingMs, snapshot);
 
   // (6) S2 captures the adapter plan (from the caller's map) before it takes the claim.
   const result = await authorizePreparedDispatch({

@@ -58,13 +58,15 @@ export interface CohortTickInput {
 }
 
 /**
- * One attempted fire's terminal outcome for the tick: its identity plus the FULL typed outcome
+ * One EVALUATED fire's terminal outcome for the tick: its identity plus the FULL typed outcome
  * the composition spine returned. The whole `LineOpenFireOutcome` is retained (not just its
  * `kind`) so nothing load-bearing is erased at this boundary: a `NotAdmitted.outcome` still
  * distinguishes a retryable `Defer(reason)` from a terminal `Skip(reason)` from a loud
  * `Fault(reason)` from a rehearsal `WouldAdmit`, and still carries a `Skip(replayed_pending)`'s
  * detached recovery capability; an `Installed.completion` still distinguishes `settled` from
- * `unsettled(reason)` (which an activation consumer must escalate). The outcome is kept BY
+ * `unsettled(reason)` (which an activation consumer must escalate); a `CoverageMiss` carries its
+ * pre-claim `reason` + operands. Note "evaluated", not "dispatched": a pre-claim `CoverageMiss` is
+ * reported here but took NO claim and is NOT an attempted/claimed fire. The outcome is kept BY
  * REFERENCE — it is already produced and frozen/branded by the spine's own owners, and is never
  * re-frozen into its branded graph here.
  */
@@ -77,9 +79,11 @@ export interface FireOutcomeSummary {
 
 /**
  * The frozen result of one tick: how many candidates discovery found, the per-candidate
- * dispositions passed through from the projector (one per discovered candidate), the
- * per-fire outcome summaries for exactly the fires that were ATTEMPTED (never the ones the
- * dispatch budget stopped short of), and the count of newly-admitted (`Installed`) fires.
+ * dispositions passed through from the projector (one per discovered candidate), the per-fire
+ * outcome summaries for exactly the fires the loop REACHED and EVALUATED (never the ones the
+ * dispatch budget stopped short of), and the count of newly-admitted (`Installed`) fires. A
+ * `fireOutcomes` entry is an evaluated fire, NOT necessarily an attempted/claimed one: a pre-claim
+ * `CoverageMiss` is evaluated and reported here but takes no claim and consumes none of the budget.
  */
 export interface CohortTickResult {
   readonly discoveredCount: number;
@@ -89,15 +93,26 @@ export interface CohortTickResult {
 }
 
 /** A one-line observability description carrying the discriminating outcome info — the outcome
- *  kind plus a `NotAdmitted` claim reason or an `Installed` completion status — not just `kind`. */
+ *  kind plus a `NotAdmitted` claim reason, an `Installed` completion status, or a `CoverageMiss`
+ *  pre-claim reason — not just `kind`. An exhaustive switch with a `never` default so a new outcome
+ *  member is a COMPILE error here, never a silent fall-through. */
 function describeOutcome(outcome: LineOpenFireOutcome): string {
-  if (outcome.kind === 'Installed') {
-    return outcome.completion.status === 'settled'
-      ? 'Installed/settled'
-      : `Installed/unsettled(${outcome.completion.reason})`;
+  switch (outcome.kind) {
+    case 'Installed':
+      return outcome.completion.status === 'settled'
+        ? 'Installed/settled'
+        : `Installed/unsettled(${outcome.completion.reason})`;
+    case 'CoverageMiss':
+      return `CoverageMiss/${outcome.reason}`;
+    case 'NotAdmitted': {
+      const claim = outcome.outcome;
+      return 'reason' in claim ? `NotAdmitted/${claim.kind}(${claim.reason})` : `NotAdmitted/${claim.kind}`;
+    }
+    default: {
+      const _exhaustive: never = outcome;
+      return _exhaustive;
+    }
   }
-  const claim = outcome.outcome;
-  return 'reason' in claim ? `NotAdmitted/${claim.kind}(${claim.reason})` : `NotAdmitted/${claim.kind}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +173,9 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
   // (5) Serial, admit-counted dispatch loop. Iterate fires in projection order; stop once
   //     the manifest's per-tick budget of newly-admitted dispatches is reached. Only an
   //     `Installed` outcome consumes the budget — a `NotAdmitted` (all_claimed / defer /
-  //     refused / rehearsal) is recorded but never counted, so a leading all_claimed fire
-  //     does not strand a later admittable one under the cap.
+  //     refused / rehearsal) or a pre-claim `CoverageMiss` (first pitch / windowEnd already
+  //     passed, so no claim was taken) is recorded but never counted, so a leading
+  //     coverage-missed or all_claimed fire does not strand a later admittable one under the cap.
   const maxDispatchesPerTick = booted.manifest.constants.maxDispatchesPerTick;
   const fireOutcomes: FireOutcomeSummary[] = [];
   let admittedCount = 0;

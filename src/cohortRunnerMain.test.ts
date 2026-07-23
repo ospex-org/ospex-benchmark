@@ -12,6 +12,7 @@ import {
   classifyStoreFireResult,
   decodeManifestText,
   formatTickResult,
+  installedArtifactPaths,
   runStoreBackedFire,
   selfResolvePublication,
 } from './cohortRunnerMain.js';
@@ -362,6 +363,52 @@ test('classifyStoreFireResult rejects zero fires and any non-unit fire/path card
     fireSummary('f2', installedSettledOutcome('/out/cohort/fire-b.json')),
   ]);
   assert.equal(classifyStoreFireResult(twoInstalled).ok, false);
+});
+
+// ---------------------------------------------------------------------------
+// B1-R4 — every LineOpenFireOutcome consumer handles CoverageMiss fail-closed.
+// A CoverageMiss has NO `.outcome` field, so the legacy `'reason' in outcome.outcome`
+// path in describeOutcome would throw on it; the dedicated CoverageMiss case must be
+// handled first. Deleting that case turns the formatTickResult / classifier tests red.
+// ---------------------------------------------------------------------------
+
+/** Synthesize a pre-claim `CoverageMiss` outcome. The consumers read only `outcome.kind` and (via
+ *  describeOutcome) `outcome.reason`, so a shape-minimal cast drives them without the spine. */
+const coverageMissOutcome = (reason = 'first_pitch_before_claim'): LineOpenFireOutcome =>
+  ({
+    kind: 'CoverageMiss',
+    reason,
+    operands: {
+      preClaimReadingAt: '2026-07-18T20:00:00.000Z',
+      scheduledAtAtFire: '2026-07-18T20:00:00.000Z',
+      windowEnd: '2026-07-19T00:00:00.000Z',
+      detectedAt: '2026-07-18T12:00:30.000Z',
+    },
+  }) as unknown as LineOpenFireOutcome;
+
+test('B1-R4: classifyStoreFireResult treats a CoverageMiss as a non-installed non-success (no throw)', () => {
+  const result = tickResultOf([fireSummary('f1', coverageMissOutcome('first_pitch_before_claim'))]);
+  assert.equal(classifyStoreFireResult(result).ok, false, 'a coverage miss installed no artifact');
+});
+
+test('B1-R4: formatTickResult renders a CoverageMiss line without throwing', () => {
+  const result = tickResultOf([fireSummary('f1', coverageMissOutcome('window_end_before_claim'))]);
+  const lines = formatTickResult(result); // must not throw (describeOutcome CoverageMiss case)
+  assert.ok(
+    lines.some((l) => /CoverageMiss\/window_end_before_claim/.test(l)),
+    'the CoverageMiss reason renders on the fire-outcome line',
+  );
+});
+
+test('B1-R4: installedArtifactPaths ignores a CoverageMiss (it installed no artifact)', () => {
+  const result = tickResultOf([fireSummary('f1', coverageMissOutcome())]);
+  assert.deepEqual(installedArtifactPaths(result), []);
+});
+
+test('B1-R4: runStoreBackedFire exits nonzero for a CoverageMiss tick (classifier wired to the exit)', async () => {
+  const result = tickResultOf([fireSummary('f1', coverageMissOutcome())]);
+  const code = await runStoreBackedFire(FIRE_OPTIONS, fakeStoreFireDeps(result));
+  assert.notEqual(code, 0, 'a coverage miss must not report the demo as complete');
 });
 
 // ---------------------------------------------------------------------------

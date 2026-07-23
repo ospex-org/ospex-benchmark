@@ -250,15 +250,27 @@ export function buildRehearsalTickInput(params: RehearsalTickParams): CohortTick
 }
 
 /** A one-line description of a fire outcome carrying its discriminating info (mirrors the
- *  runner's private `describeOutcome`): the kind plus a claim reason or completion status. */
+ *  runner's private `describeOutcome`): the kind plus a claim reason, completion status, or
+ *  pre-claim `CoverageMiss` reason. Exhaustive switch with a `never` default — the `CoverageMiss`
+ *  case is handled BEFORE any `outcome.outcome` read (a `CoverageMiss` has no `.outcome`, so the
+ *  legacy `'reason' in claim` path would throw on it). */
 function describeOutcome(outcome: LineOpenFireOutcome): string {
-  if (outcome.kind === 'Installed') {
-    return outcome.completion.status === 'settled'
-      ? 'Installed/settled'
-      : `Installed/unsettled(${outcome.completion.reason})`;
+  switch (outcome.kind) {
+    case 'Installed':
+      return outcome.completion.status === 'settled'
+        ? 'Installed/settled'
+        : `Installed/unsettled(${outcome.completion.reason})`;
+    case 'CoverageMiss':
+      return `CoverageMiss/${outcome.reason}`;
+    case 'NotAdmitted': {
+      const claim = outcome.outcome;
+      return 'reason' in claim ? `NotAdmitted/${claim.kind}(${claim.reason})` : `NotAdmitted/${claim.kind}`;
+    }
+    default: {
+      const _exhaustive: never = outcome;
+      return _exhaustive;
+    }
   }
-  const claim = outcome.outcome;
-  return 'reason' in claim ? `NotAdmitted/${claim.kind}(${claim.reason})` : `NotAdmitted/${claim.kind}`;
 }
 
 /** Render a `CohortTickResult` into human-readable lines: discovery count, one line per
