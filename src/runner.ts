@@ -256,8 +256,13 @@ export interface SlateRunOptions {
    * Injected clock (epoch ms) used BOTH for cutoff enforcement (checked
    * before initial dispatch, before repair, and on response acceptance) AND
    * for every recorded timestamp (requestAt/responseAt/latency), so records
-   * and enforcement can never disagree temporally. Defaults to the wall
-   * clock; the dry run injects a synthetic clock anchored to the fixture.
+   * and enforcement can never disagree temporally. REQUIRED at dispatch:
+   * `dispatchArmCore` throws a typed `ClockRequiredError` when it is absent —
+   * there is no ambient wall-clock fallback, because a default clock would
+   * silently decouple the send-time V-lag gate from the recorded evidence.
+   * The field stays optional on the TYPE because the authorized spine threads
+   * the one tick clock in for its callers; every real caller injects a clock
+   * (the dry run a synthetic clock anchored to the fixture).
    */
   nowMs?: (() => number) | undefined;
   /** Called after each game's four arms have all settled (sealed per game). */
@@ -277,6 +282,22 @@ export interface InitialDispatchGate {
   readonly detectedAt: string;
   readonly windowEnd: string;
   readonly maxDispatchLagMs: number;
+}
+
+/**
+ * The injected dispatch clock (`SlateRunOptions.nowMs`) is a REQUIRED capability at dispatch time:
+ * the send-time V-lag gate operand and every persisted timestamp both derive from it, so there is no
+ * safe ambient fallback — a wall-clock default would silently decouple enforcement from the recorded
+ * evidence. `dispatchArmCore` throws this typed fault when the clock is absent, fail-closed and BEFORE
+ * any credential check or provider call. On the authorized path the per-arm throw is aggregated into
+ * an `AuthorizedDispatchFaultError` (releasing every initial lease exactly once via the dispatch
+ * cleanup backstop); the legacy path surfaces it directly. Every real caller injects a clock.
+ */
+export class ClockRequiredError extends Error {
+  constructor() {
+    super('a dispatch clock (options.nowMs) is required — there is no ambient wall-clock fallback');
+    this.name = 'ClockRequiredError';
+  }
 }
 
 function emptyAttempt(): AttemptRecord {
@@ -454,7 +475,11 @@ async function dispatchArmCore(
   releaseInitial: () => Promise<void>,
 ): Promise<ArmGameResult> {
   const arm = target.arm;
-  const nowMs = options.nowMs ?? Date.now;
+  // The dispatch clock is a REQUIRED capability — fail closed if it is absent, BEFORE any credential
+  // check or provider call. There is no `?? Date.now` fallback: a wall-clock default would decouple
+  // the V-lag gate from the persisted `requestAt`. Every real caller injects `options.nowMs`.
+  if (options.nowMs === undefined) throw new ClockRequiredError();
+  const nowMs = options.nowMs;
   const cutoffMs = Date.parse(request.cutoffAt);
   const base = {
     arm,

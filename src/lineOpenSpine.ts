@@ -52,9 +52,11 @@ export interface LineOpenAdmissionParameters {
   readonly expectedSchemaVersion: number;
 }
 
-/** Run options WITHOUT `cohortId`: the spine derives the cohort from the admitted permit, so a
- *  caller can never point the runner at a cohort other than the one the store authorized. */
-export type LineOpenRunOptions = Omit<SlateRunOptions, 'cohortId'>;
+/** Run options WITHOUT `cohortId` or `nowMs`: the spine derives the cohort from the admitted permit,
+ *  and threads the ONE tick clock (`RunOneFireInput.now`) into the dispatch itself — so a caller can
+ *  neither point the runner at a cohort other than the one the store authorized, nor supply a dispatch
+ *  clock that diverges from the detection clock. */
+export type LineOpenRunOptions = Omit<SlateRunOptions, 'cohortId' | 'nowMs'>;
 
 /** The resolved outcome of one durable install: the canonical path and whether THIS call created it. */
 export type ArtifactInstallResult = ReturnType<FireArtifactSink['install']>;
@@ -133,6 +135,11 @@ export interface RunOneFireInput {
   readonly sink: ArtifactInstaller;
   readonly runOptions: LineOpenRunOptions;
   readonly admission: LineOpenAdmissionParameters;
+  /** The ONE tick clock (from `CohortTickInput.now`): the SOLE source of BOTH the projection
+   *  `detectedAt` (stamped upstream by `projectPreparedFires`) and the dispatch `runnerOptions.nowMs`,
+   *  so detection and the send-time V-lag gate compare against a single coherent benchmark-host clock.
+   *  Captured before the first await, like every other caller input. */
+  readonly now: () => number;
 }
 
 // ---------------------------------------------------------------------------
@@ -341,15 +348,20 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
   const runOptions = input.runOptions;
   const ownerId = input.admission.ownerId;
   const expectedSchemaVersion = input.admission.expectedSchemaVersion;
+  // The ONE tick clock, captured (like every other caller input) BEFORE the first await so a later
+  // swap of `input.now` cannot redirect the dispatch. It is the sole source of the dispatch's
+  // `runnerOptions.nowMs` — the SAME clock that stamped the snapshot's `detectedAt` upstream — so the
+  // send-time V-lag gate and detection share one coherent benchmark-host clock.
+  const now = input.now;
 
   // (3) Capture each run-option field into a fresh plain object, explicitly OMITTING any
-  //     runtime-extra `cohortId` a hostile caller may have stuck on the options object.
+  //     runtime-extra `cohortId` a hostile caller may have stuck on the options object. The clock
+  //     is NOT among these fields — it is the threaded tick clock captured above, not a caller field.
   const capturedOptions = {
     timeoutMs: runOptions.timeoutMs,
     maxOutputTokens: runOptions.maxOutputTokens,
     executionPolicy: runOptions.executionPolicy,
     baselinePolicyVersion: runOptions.baselinePolicyVersion,
-    nowMs: runOptions.nowMs,
     onGameComplete: runOptions.onGameComplete,
   };
 
@@ -397,13 +409,15 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
 
   // Dispatch is the FIRST fallible post-admission operation: no S4 check runs between a successful
   // authorization and this call. The cohort is derived from the permit and written last onto a
-  // fresh options object; no caller `runOptions` object is spread or re-read after admission.
+  // fresh options object; no caller `runOptions` object is spread or re-read after admission. The
+  // clock is the tick clock captured before the first await (B2): the SAME source that stamped the
+  // snapshot's `detectedAt`, so the send-time V-lag operands cannot silently come from two clocks.
   const runnerOptions: SlateRunOptions = {
     timeoutMs: capturedOptions.timeoutMs,
     maxOutputTokens: capturedOptions.maxOutputTokens,
     executionPolicy: capturedOptions.executionPolicy,
     baselinePolicyVersion: capturedOptions.baselinePolicyVersion,
-    nowMs: capturedOptions.nowMs,
+    nowMs: now,
     onGameComplete: capturedOptions.onGameComplete,
     cohortId: permit.cohortId,
   };

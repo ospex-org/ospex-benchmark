@@ -53,13 +53,12 @@ function tickClock(): () => number {
   return () => values[Math.min(i++, values.length - 1)]!;
 }
 
-function runOpts(now: () => number): LineOpenRunOptions {
+function runOpts(): LineOpenRunOptions {
   return {
     timeoutMs: 1_000,
     maxOutputTokens: 16_000,
     executionPolicy: 'fixed-moneyline-total',
     baselinePolicyVersion: 'baselines-v0.3.0',
-    nowMs: now,
   };
 }
 
@@ -175,7 +174,7 @@ function tickInput(over: { claimPort: ClaimPort; sink?: CohortTickInput['sink'];
     claimPort: over.claimPort,
     adapters: createMockAdapters({ simulateCollision: false }),
     sink: over.sink ?? new FireArtifactSink('/base', new MemoryFs()),
-    runOptions: runOpts(now),
+    runOptions: runOpts(),
     admission: { ownerId: 'demo-owner', expectedSchemaVersion: STORE_SCHEMA_VERSION },
     now,
   };

@@ -69,12 +69,11 @@ const DETECT_MS = DISCO_MS + 5_000;
 const OPENER_AT = '2026-07-18T11:59:05.000Z';
 const QUOTE_AT = '2026-07-18T11:59:00+00:00';
 const MATCH_TIME = '2026-07-18T20:00:00+00:00';
-// The runner clock is coherent with the detection clock: an initial send at NOW_MS lands
-// 5s after the fire's detection instant (DETECT_MS), within the 10s dispatch-lag bound, so the
-// spine's send-time V-lag gate admits every fire. (A single coherent benchmark-host clock for
-// detection and dispatch is a separate hardening concern; the fixture keeps its two injected
-// clocks consistent so the gate exercises the send path rather than gating every fire out.)
-const NOW_MS = DETECT_MS + 5_000;
+// ONE coherent benchmark-host clock now drives BOTH detection and dispatch (B2): the tick's injected
+// `now` (see `tickClock`) stamps `detectedAt` in the projector AND the send-time V-lag start in the
+// spine, so the two clocks can never silently diverge. The fixture clock advances only a few ms
+// across a tick — well inside the 10s dispatch-lag bound — so every fire admits and exercises the
+// send path rather than gating every fire out.
 const OWNER = 'owner-host-1234-abc';
 
 const CODE_ARMS = defaultExpectedArms();
@@ -417,7 +416,6 @@ function runOpts(): LineOpenRunOptions {
     maxOutputTokens: 16_000,
     executionPolicy: 'fixed-moneyline-total',
     baselinePolicyVersion: 'baselines-v0.3.0',
-    nowMs: () => NOW_MS,
   };
 }
 
@@ -632,6 +630,90 @@ test('the runner module imports no real fetcher/store/filesystem/ambient clock',
   assert.ok(!/atomicStore/.test(src), 'no atomic store import');
   assert.ok(!/from 'node:fs'|from 'node:net'|from 'node:http/.test(src), 'no filesystem/network import');
   assert.ok(!/Date\.now/.test(src), 'no ambient clock — the tick clock is injected');
+});
+
+// ===========================================================================
+// B2-R2 — one coherent detection→dispatch clock threaded through the tick
+// ===========================================================================
+
+test('B2-R2: the persisted dispatch start is the EXACT tick-clock value read at that arm send — one coherent source, not a skewed or divergent read', async () => {
+  const json = manifestJson();
+  const store = new ScriptedStore(CODE_ARMS.length);
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  // ONE clock, threaded through the tick, with SPARSE (100ms) non-unit readings so a 1ms dispatch
+  // skew can never land on a legitimate adjacent value, and every emission recorded IN ORDER.
+  const emissions: number[] = [];
+  let calls = 0;
+  const now = (): number => {
+    const v = DETECT_MS + calls * 100;
+    calls += 1;
+    emissions.push(v);
+    return v;
+  };
+  // Recording adapters: each arm's `chat` captures the clock's LAST emission at the instant it is
+  // invoked. `dispatchArmCore` reads `initialStartMs = nowMs()` synchronously immediately before it
+  // calls `adapter.chat(...)` (no intervening clock read), so the last emission at chat-time IS this
+  // arm's dispatch-start reading of the ONE source clock. This binds the persisted start ONE-TO-ONE
+  // to the exact source value the dispatch actually read — identity, NOT global set membership.
+  const dispatchStarts: number[] = [];
+  const adapters = new Map<string, ProviderAdapter>();
+  for (const arm of CODE_ARMS) {
+    adapters.set(arm.participantId, {
+      provider: arm.provider as ProviderName,
+      requestedModelId: arm.requestedModelId,
+      credentialEnvVar: `${arm.participantId.replace(/[^a-z0-9]/gi, '_').toUpperCase()}_KEY`,
+      hasCredential: () => true,
+      async chat(turns: ChatTurn[], _ms: number): Promise<ProviderResponse> {
+        dispatchStarts.push(emissions[emissions.length - 1]!);
+        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {} };
+      },
+    });
+  }
+  const { input } = tickInput(json, [makeGame({ gameId: 'g1' })], [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' })], {
+    claimPort: new StoreClaimPort(store),
+    sink,
+    adapters,
+    now,
+  });
+
+  const result = await runCohortTick(input);
+  assert.equal(result.admittedCount, 1, 'the fire admits under the single coherent clock');
+  const artifact = sink.calls[0]!;
+  const detectedMs = Date.parse(artifact.detectedAt);
+  assert.ok(emissions.includes(detectedMs), 'detectedAt is a reading of the one injected tick clock');
+  const sentStarts = artifact.arms
+    .filter((a) => a.initialRequestStartedAt !== null)
+    .map((a) => Date.parse(a.initialRequestStartedAt!));
+  assert.ok(sentStarts.length > 0, 'at least one arm sent its initial');
+  assert.equal(dispatchStarts.length, sentStarts.length, 'one recorded dispatch-start clock read per sent arm');
+  // ONE-TO-ONE (concurrency-tolerant multiset, NOT launch order): every persisted initial start is the
+  // EXACT tick-clock value the dispatch read at that arm's send. A skewed dispatch clock (e.g. the
+  // reviewer control `const nowMs = () => sourceNowMs() + 1` in runner.ts) makes each persisted start
+  // differ from the recorded raw emission by the skew → this multiset equality FAILS → the named test
+  // emits `not ok`. Global set membership on 1ms-spaced values could not detect that skew.
+  assert.deepEqual(
+    [...sentStarts].sort((a, b) => a - b),
+    [...dispatchStarts].sort((a, b) => a - b),
+    'each persisted dispatch start equals the exact source-clock value read at that arm send (not a skewed/divergent read)',
+  );
+  for (const s of sentStarts) {
+    assert.ok(emissions.includes(s), 'each persisted start is a genuine reading of the one clock (sparse: a +1 skew is not a legitimate value)');
+    assert.ok(s > detectedMs, 'dispatch never precedes detection under one clock');
+  }
+});
+
+test('B2-R2 structural: LineOpenRunOptions omits nowMs; the clock is threaded via RunOneFireInput.now', () => {
+  const spineSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'lineOpenSpine.ts'), 'utf8');
+  assert.ok(
+    /export type LineOpenRunOptions = Omit<\s*SlateRunOptions,\s*'cohortId'\s*\|\s*'nowMs'\s*>/.test(spineSrc),
+    "LineOpenRunOptions = Omit<SlateRunOptions, 'cohortId' | 'nowMs'> (the dispatch clock is no longer a run-option field)",
+  );
+  assert.ok(/readonly now:\s*\(\)\s*=>\s*number/.test(spineSrc), 'RunOneFireInput carries the required tick clock `now`');
+  // The spine sources the dispatch clock from the threaded tick clock, never a caller run-option field.
+  const body = spineSrc.slice(spineSrc.indexOf('export async function runOneFire'));
+  assert.ok(/const now = input\.now;/.test(body), 'the tick clock is captured from input.now before the first await');
+  assert.ok(/nowMs: now,/.test(body), 'runnerOptions.nowMs is the captured tick clock');
+  assert.ok(!/nowMs: (?:runOptions|capturedOptions)\.nowMs/.test(body), 'the dispatch clock is never re-read from runOptions');
 });
 
 // ===========================================================================

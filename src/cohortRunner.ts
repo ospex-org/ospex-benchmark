@@ -165,7 +165,7 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
   let admittedCount = 0;
   for (const fire of fires) {
     if (admittedCount >= maxDispatchesPerTick) break;
-    const outcome = await runOneFire({ snapshot: fire, adapters, claimPort, sink, runOptions, admission });
+    const outcome = await runOneFire({ snapshot: fire, adapters, claimPort, sink, runOptions, admission, now });
     // Single-market fires: the fire's sole proposed market is `proposedMarkets[0]`. The full typed
     // outcome is retained by reference and the summary is only SHALLOW-frozen — `deepFreeze` would
     // re-traverse the spine's already-frozen/branded outcome graph (artifact / permit / any
