@@ -287,6 +287,40 @@ export function installedArtifactPaths(result: CohortTickResult): string[] {
   return paths;
 }
 
+/**
+ * Classify a store-backed fire's tick result for the `runner:fire` exit code. The promised demo
+ * COMPLETED — and the process may exit 0 — ONLY when the tick attempted exactly ONE fire, that fire
+ * durably installed (`outcome.kind === 'Installed'`) AND confirmed settlement
+ * (`completion.status === 'settled'`), and it left exactly ONE installed artifact path. Every other
+ * shape is a demo that did NOT complete: zero fire outcomes, any `NotAdmitted` (all-claimed / defer /
+ * refused / rehearsal `WouldAdmit`), an `Installed` that could not settle (`unsettled`), or a
+ * fire/artifact-path count other than exactly one. Pure — it reads only the frozen result, so the
+ * caller prints the outcomes first and lets this decide the exit code.
+ */
+export function classifyStoreFireResult(
+  result: CohortTickResult,
+): { ok: true } | { ok: false; reason: string } {
+  const outcomes = result.fireOutcomes;
+  if (outcomes.length === 0) {
+    return { ok: false, reason: 'no fire was attempted this tick (zero fire outcomes)' };
+  }
+  if (outcomes.length !== 1) {
+    return { ok: false, reason: `expected exactly one fire, got ${outcomes.length}` };
+  }
+  const only = outcomes[0]!;
+  if (only.outcome.kind !== 'Installed') {
+    return { ok: false, reason: `the fire installed no artifact: ${describeOutcome(only.outcome)}` };
+  }
+  if (only.outcome.completion.status !== 'settled') {
+    return { ok: false, reason: `the fire installed but did not settle: ${describeOutcome(only.outcome)}` };
+  }
+  const paths = installedArtifactPaths(result);
+  if (paths.length !== 1) {
+    return { ok: false, reason: `expected exactly one installed artifact path, got ${paths.length}` };
+  }
+  return { ok: true };
+}
+
 // ---------------------------------------------------------------------------
 // Store-backed "see it fire" path (--store=postgres --fixture)
 // ---------------------------------------------------------------------------
@@ -376,6 +410,16 @@ async function runStoreBackedFire(options: CliOptions): Promise<number> {
       printLine('');
       printLine('no artifact installed — the candidate did not admit a fire (see dispositions above)');
     }
+
+    // The promised "see it fire" demo only succeeds when EXACTLY ONE fire installed AND settled with
+    // exactly one artifact path; anything else (nothing admitted, an unsettled completion, or a
+    // non-unit cardinality) exits NONZERO so `runner:fire` cannot report success on a fire that did
+    // not actually complete. The outcomes + paths are already printed above; this only decides the code.
+    const classification = classifyStoreFireResult(result);
+    if (!classification.ok) {
+      printError(`store-backed fire did not complete the promised demo: ${classification.reason}`);
+      return 1;
+    }
     return 0;
   } finally {
     await pool.end();
@@ -393,6 +437,25 @@ async function main(): Promise<number> {
   if (options.store !== 'rehearsal' && options.store !== 'postgres') {
     printError(
       `--store=${options.store} is not supported — use 'rehearsal' (default) or 'postgres' (the store-backed fixture fire).`,
+    );
+    return 2;
+  }
+
+  // Reject incompatible option combinations UP FRONT — before the dynamic `pg` import, any DB /
+  // artifact work, the store-backed branch, or the emit branch. `--emit-manifest` proves + writes a
+  // manifest performing NO network/DB I/O, so it can never combine with the store-backed fire (a live
+  // database path). `--fixture` is meaningful ONLY for that store-backed fire — real discovery at
+  // line-open is always stale-rejected — so it is refused in any other mode. Both are usage errors (2).
+  if (options.emitManifestPath !== null && options.store === 'postgres') {
+    printError(
+      '--emit-manifest cannot combine with --store=postgres: --emit-manifest performs no network/DB I/O, ' +
+        'while the store-backed fire is a live database path. Run one or the other.',
+    );
+    return 2;
+  }
+  if (options.fixture && options.store !== 'postgres') {
+    printError(
+      `--fixture is only valid with --store=postgres (the store-backed fixture fire); --store=${options.store} does not use it.`,
     );
     return 2;
   }
