@@ -187,14 +187,19 @@ function buildValidResponse(payload: RequestPayload): BenchmarkResponse {
     requestedModelId: payload.requestedModelId,
     bundleSha256: payload.bundleSha256,
     executionPolicy: payload.executionPolicy,
-    games: payload.bundle.games.map((game) => ({
-      gameId: game.gameId,
-      forecasts: [
-        buildForecast(game, 'moneyline'),
-        buildForecast(game, 'spread'),
-        buildForecast(game, 'total'),
-      ],
-    })),
+    // Forecast ONLY the markets the bundle actually carries, in the fixed
+    // moneyline → runline → total order. The full-board dry run has all three
+    // present, so its output is byte-identical to the pre-scoped builder; a
+    // SCOPED bundle (the single-market line-open fire) forecasts only its one
+    // supplied market, so the validator's supplied-market gate is satisfied and
+    // no absent market is dereferenced.
+    games: payload.bundle.games.map((game) => {
+      const forecasts: ForecastOutput[] = [];
+      if (game.markets.moneyline) forecasts.push(buildForecast(game, 'moneyline'));
+      if (game.markets.runLine) forecasts.push(buildForecast(game, 'spread'));
+      if (game.markets.total) forecasts.push(buildForecast(game, 'total'));
+      return { gameId: game.gameId, forecasts };
+    }),
   };
 }
 

@@ -36,6 +36,13 @@ export interface RehearsalManifestOptions {
   readonly gameDiscoveryWindowHours?: number;
   /** How far past `now` the observation window extends. Default 6 hours. */
   readonly windowForwardMs?: number;
+  /**
+   * Per-provider-HTTP-attempt timeout (ms). Default 300000 (the production rehearsal value).
+   * A store-backed FIXTURE fire that dispatches the mock roster needs a SMALL value so the
+   * always-timing-out mock arm settles in seconds rather than ~5 minutes; overriding it here
+   * changes only this generated manifest's pinned constant, never any production default.
+   */
+  readonly providerCallTimeoutMs?: number;
 }
 
 export interface RehearsalManifest {
@@ -54,6 +61,7 @@ export interface RehearsalManifest {
 export function buildRehearsalManifest(now: number, opts: RehearsalManifestOptions = {}): RehearsalManifest {
   const gameDiscoveryWindowHours = opts.gameDiscoveryWindowHours ?? 168;
   const windowForwardMs = opts.windowForwardMs ?? 6 * HOUR_MS;
+  const providerCallTimeoutMs = opts.providerCallTimeoutMs ?? 300_000;
   const arms = defaultExpectedArms();
 
   const windowStart = new Date(now - gameDiscoveryWindowHours * HOUR_MS).toISOString();
@@ -97,7 +105,7 @@ export function buildRehearsalManifest(now: number, opts: RehearsalManifestOptio
       freshFireMs: 30_000,
       maxDispatchLagMs: 10_000,
       historyReadTimeoutMs: 30_000,
-      providerCallTimeoutMs: 300_000,
+      providerCallTimeoutMs,
       maxOutputTokens: 16_000,
       maxRepairAttemptsPerArm: CODE_MAX_REPAIRS_PER_ARM,
       providerAttemptReservationUsdMicros: PROVIDER_ATTEMPT_RESERVATION_USD_MICROS,
