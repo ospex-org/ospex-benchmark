@@ -7,7 +7,7 @@ import type { CompletionStatus } from './fireSettlement.js';
 import { authorizePreparedDispatch, scopeKeyOf } from './lineOpenDispatch.js';
 import type { AuthorizePreparedDispatchResult } from './lineOpenDispatch.js';
 import { runAuthorizedDispatch } from './runner.js';
-import type { SlateRunOptions } from './runner.js';
+import type { InitialDispatchGate, SlateRunOptions } from './runner.js';
 import { assertFireArtifact, buildFireArtifact } from './fireArtifactProducer.js';
 import type { FireArtifactV1, FireContext, MarketFireContextV1 } from './fireArtifactProducer.js';
 import { MARKET_ORDINAL } from './fireArtifact.js';
@@ -366,6 +366,19 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
     expectedSchemaVersion,
   });
 
+  // (5b) Capture the send-time initial-dispatch gate operands from the AUTHENTICATED sealed
+  //      snapshot — the detection instant, the observation window end, and the max dispatch lag —
+  //      now that (5) authenticated the snapshot, and BEFORE admission. These three are ALWAYS
+  //      sourced from the snapshot, never from caller-owned `runOptions`; sourcing them from the
+  //      authenticated evidence is what makes the gate authoritative. This is a pure field capture
+  //      (no fallible operation), so it does not displace `runAuthorizedDispatch` as the first
+  //      fallible post-admission op while leases are held.
+  const gate: InitialDispatchGate = {
+    detectedAt: snapshot.detectedAt,
+    windowEnd: snapshot.booted.manifest.windowEnd,
+    maxDispatchLagMs: snapshot.booted.manifest.constants.maxDispatchLagMs,
+  };
+
   // (6) S2 captures the adapter plan (from the caller's map) before it takes the claim.
   const result = await authorizePreparedDispatch({
     snapshot,
@@ -395,8 +408,10 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
     cohortId: permit.cohortId,
   };
   // A dispatch rejection propagates unchanged with its retained causes; no producer/reconcile/
-  // install stage runs, so a fire that could not complete leaves no durable record.
-  const envelope = await runAuthorizedDispatch(dispatch, runnerOptions);
+  // install stage runs, so a fire that could not complete leaves no durable record. The gate
+  // captured in (5b) from the sealed snapshot is passed as required positive capability — the
+  // snapshot-derived operands, never `runOptions`, decide whether each initial may send.
+  const envelope = await runAuthorizedDispatch(dispatch, runnerOptions, gate);
 
   // Only now — every lease settled — assemble the fire context. Its evidence comes from the sealed
   // snapshot; each claim is built from the PERMIT (cohort/fire from the permit, game/market from

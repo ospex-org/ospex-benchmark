@@ -69,7 +69,12 @@ const DETECT_MS = DISCO_MS + 5_000;
 const OPENER_AT = '2026-07-18T11:59:05.000Z';
 const QUOTE_AT = '2026-07-18T11:59:00+00:00';
 const MATCH_TIME = '2026-07-18T20:00:00+00:00';
-const NOW_MS = Date.parse('2026-07-18T12:00:40.000Z');
+// The runner clock is coherent with the detection clock: an initial send at NOW_MS lands
+// 5s after the fire's detection instant (DETECT_MS), within the 10s dispatch-lag bound, so the
+// spine's send-time V-lag gate admits every fire. (A single coherent benchmark-host clock for
+// detection and dispatch is a separate hardening concern; the fixture keeps its two injected
+// clocks consistent so the gate exercises the send path rather than gating every fire out.)
+const NOW_MS = DETECT_MS + 5_000;
 const OWNER = 'owner-host-1234-abc';
 
 const CODE_ARMS = defaultExpectedArms();

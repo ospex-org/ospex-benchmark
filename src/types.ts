@@ -19,9 +19,9 @@ export type ProviderName = 'openai' | 'anthropic' | 'google' | 'xai';
  * model failure), `provider_error` (other transport/HTTP failures),
  * `cutoff_missed` (the decision window closed before an acceptable response
  * existed — never emits decision records), and `dispatch_lag_exceeded` (the
- * initial request would start more than `maxDispatchLagMs` after detection, so it
- * is not sent — a valid negative, §5). None of the non-`valid` outcomes emit
- * decision records.
+ * initial request start is BEFORE `detectedAt` OR more than `maxDispatchLagMs`
+ * after it — the two-sided V-lag — so it is not sent; a valid negative, §5).
+ * None of the non-`valid` outcomes emit decision records.
  */
 export type ArmOutcome =
   | 'valid'

@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   cutoffViolations,
   dispatchLagVerdict,
+  initialDispatchGate,
   verifyAttemptOrdering,
 } from './attemptProvenance.js';
 import type { AttemptTiming } from './attemptProvenance.js';
@@ -341,5 +342,132 @@ test('cutoff bounds are inclusive at the EXACT instant (>=)', () => {
     cutoffViolations({ windowEnd: WINDOW_END, scheduledAtAtFire: FIRST_PITCH, initialRequestStartedAt: WINDOW_END, attempts: [atWindowEnd] }).some((x) =>
       /initial request started at\/after windowEnd/.test(x),
     ),
+  );
+});
+
+// --- initialDispatchGate (the send-time gate; §5; frozen precedence first-pitch > windowEnd > V-lag) ---
+
+const G_DETECTED = '2026-07-16T00:00:00.000Z';
+const G_MAX = 10_000;
+const G_WINDOW_FAR = '2026-07-16T02:00:00.000Z';
+const G_PITCH_FAR = '2026-07-16T03:00:00.000Z';
+
+type GateInput = Parameters<typeof initialDispatchGate>[0];
+/** All non-target bounds pinned CLEAN by default (windowEnd + first pitch far, V-lag within). */
+function gate(over: Partial<GateInput> = {}): ReturnType<typeof initialDispatchGate> {
+  return initialDispatchGate({
+    detectedAt: G_DETECTED,
+    windowEnd: G_WINDOW_FAR,
+    scheduledAtAtFire: G_PITCH_FAR,
+    initialRequestStartedAt: '2026-07-16T00:00:05.000Z',
+    maxDispatchLagMs: G_MAX,
+    ...over,
+  });
+}
+
+test('initialDispatchGate: a clean initial start (all bounds satisfied) is ok', () => {
+  assert.deepEqual(gate(), { ok: true });
+});
+
+test('initialDispatchGate: V-lag boundaries are inclusive at both ends', () => {
+  // start == detectedAt + maxDispatchLagMs exactly (upper inclusive) -> ok.
+  assert.deepEqual(gate({ initialRequestStartedAt: '2026-07-16T00:00:10.000Z' }), { ok: true });
+  // start == detectedAt (lag 0, lower inclusive) -> ok.
+  assert.deepEqual(gate({ initialRequestStartedAt: G_DETECTED }), { ok: true });
+});
+
+test('initialDispatchGate: V-lag over the cap or backdated is dispatch_lag_exceeded (windowEnd + first pitch clean)', () => {
+  // start == detectedAt + max + 1ms -> exceeded.
+  assert.deepEqual(gate({ initialRequestStartedAt: '2026-07-16T00:00:10.001Z' }), {
+    ok: false,
+    outcome: 'dispatch_lag_exceeded',
+  });
+  // start < detectedAt (backdated) -> exceeded (two-sided).
+  assert.deepEqual(gate({ initialRequestStartedAt: '2026-07-15T23:59:59.000Z' }), {
+    ok: false,
+    outcome: 'dispatch_lag_exceeded',
+  });
+});
+
+test('initialDispatchGate: windowEnd is a strict (exclusive) bound -> cutoff_missed at/after (V-lag + first pitch clean)', () => {
+  // A near windowEnd inside the V-lag window so V-lag stays clean and windowEnd is isolated.
+  const windowEnd = '2026-07-16T00:00:05.000Z';
+  // start == windowEnd exactly -> cutoff_missed.
+  assert.deepEqual(gate({ windowEnd, initialRequestStartedAt: windowEnd }), { ok: false, outcome: 'cutoff_missed' });
+  // start 1ms before windowEnd -> ok.
+  assert.deepEqual(gate({ windowEnd, initialRequestStartedAt: '2026-07-16T00:00:04.999Z' }), { ok: true });
+});
+
+test('initialDispatchGate: first pitch is a strict (exclusive) bound -> cutoff_missed at/after (windowEnd + V-lag clean)', () => {
+  const scheduledAtAtFire = '2026-07-16T00:00:03.000Z';
+  // start == first pitch exactly -> cutoff_missed.
+  assert.deepEqual(gate({ scheduledAtAtFire, initialRequestStartedAt: scheduledAtAtFire }), {
+    ok: false,
+    outcome: 'cutoff_missed',
+  });
+  // start 1ms before first pitch -> ok.
+  assert.deepEqual(gate({ scheduledAtAtFire, initialRequestStartedAt: '2026-07-16T00:00:02.999Z' }), { ok: true });
+});
+
+test('initialDispatchGate: windowEnd OUTRANKS V-lag — a start violating BOTH is cutoff_missed (first pitch clean)', () => {
+  // detectedAt = windowEnd - max - 1ms, start = windowEnd: lag = max + 1 (V-lag violated) AND start
+  // >= windowEnd (windowEnd violated) on one reading. Frozen precedence returns cutoff_missed.
+  const windowEnd = '2026-07-16T00:00:05.000Z';
+  const detectedAt = '2026-07-15T23:59:54.999Z'; // windowEnd - 10.001s
+  assert.deepEqual(
+    gate({ detectedAt, windowEnd, initialRequestStartedAt: windowEnd, scheduledAtAtFire: G_PITCH_FAR }),
+    { ok: false, outcome: 'cutoff_missed' },
+  );
+});
+
+test('initialDispatchGate: first pitch OUTRANKS V-lag — a start violating BOTH is cutoff_missed (windowEnd clean)', () => {
+  // detectedAt = firstPitch - max - 1ms, start = firstPitch: lag = max + 1 (V-lag violated) AND
+  // start >= first pitch (first-pitch violated); windowEnd far. Precedence returns cutoff_missed.
+  const scheduledAtAtFire = '2026-07-16T00:00:05.000Z';
+  const detectedAt = '2026-07-15T23:59:54.999Z';
+  assert.deepEqual(
+    gate({ detectedAt, scheduledAtAtFire, initialRequestStartedAt: scheduledAtAtFire, windowEnd: G_WINDOW_FAR }),
+    { ok: false, outcome: 'cutoff_missed' },
+  );
+});
+
+test('initialDispatchGate: first pitch and windowEnd both violated is cutoff_missed', () => {
+  const windowEnd = '2026-07-16T00:00:04.000Z';
+  const scheduledAtAtFire = '2026-07-16T00:00:05.000Z';
+  assert.deepEqual(
+    gate({ windowEnd, scheduledAtAtFire, initialRequestStartedAt: '2026-07-16T00:00:06.000Z' }),
+    { ok: false, outcome: 'cutoff_missed' },
+  );
+});
+
+test('initialDispatchGate: every operand is parsed up front — a malformed field throws', () => {
+  const bad = '2026-07-16T00:00:00'; // offset-less: instantMs rejects it
+  // Each timing operand malformed in isolation (other bounds clean) -> throws.
+  assert.throws(() => gate({ detectedAt: bad }));
+  assert.throws(() => gate({ windowEnd: bad }));
+  assert.throws(() => gate({ scheduledAtAtFire: bad }));
+  assert.throws(() => gate({ initialRequestStartedAt: bad }));
+  // A non-safe / negative cap -> throws.
+  for (const cap of [NaN, Infinity, -1, 1.5, 9007199254740992]) {
+    assert.throws(() => gate({ maxDispatchLagMs: cap as number }), String(cap));
+  }
+});
+
+test('initialDispatchGate: a malformed lower-precedence operand is NOT hidden by a higher-precedence timing violation', () => {
+  const bad = '2026-07-16T00:00:00'; // offset-less
+  const nearPitch = '2026-07-16T00:00:03.000Z';
+  const afterPitch = '2026-07-16T00:00:05.000Z'; // >= first pitch: a first-pitch violation ALSO holds
+  // First pitch is violated (would return cutoff_missed), yet a malformed windowEnd still throws.
+  assert.throws(() =>
+    gate({ scheduledAtAtFire: nearPitch, initialRequestStartedAt: afterPitch, windowEnd: bad }),
+  );
+  // First pitch violated, yet a malformed detectedAt (consumed by the V-lag verdict) still throws.
+  assert.throws(() =>
+    gate({ scheduledAtAtFire: nearPitch, initialRequestStartedAt: afterPitch, detectedAt: bad }),
+  );
+  // windowEnd violated (first pitch clean), yet a malformed detectedAt still throws.
+  const nearWindow = '2026-07-16T00:00:03.000Z';
+  assert.throws(() =>
+    gate({ windowEnd: nearWindow, initialRequestStartedAt: '2026-07-16T00:00:04.000Z', detectedAt: bad, scheduledAtAtFire: G_PITCH_FAR }),
   );
 });

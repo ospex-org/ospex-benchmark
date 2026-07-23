@@ -112,9 +112,10 @@ function describeOutcome(outcome: LineOpenFireOutcome): string {
  * awaiting the prior fire's model batch, and the invariant that a slow first fire must not
  * strand a second capacity-authorized fire — is DELIBERATELY DEFERRED to a separate later
  * hardening slice; it is a live-scale concern, and the serial loop is correct for a
- * single-process dry run with mock adapters. Dispatch-time V-lag / windowEnd gates are
- * likewise a separate later hardening slice (`runOneFire` already enforces the first-pitch
- * cutoff via `cutoffAt`); this loop adds neither.
+ * single-process dry run with mock adapters. Send-time V-lag / windowEnd gates on the initial
+ * request are now enforced at the spine — `runOneFire` gates each initial send on first pitch /
+ * windowEnd / V-lag, in addition to the first-pitch cutoff via `cutoffAt` — so this loop adds no
+ * dispatch gate of its own.
  */
 export async function runCohortTick(input: CohortTickInput): Promise<CohortTickResult> {
   const {

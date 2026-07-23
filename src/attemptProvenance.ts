@@ -197,6 +197,55 @@ export function dispatchLagVerdict(input: {
   return lag < 0 || lag > maxDispatchLagMs ? 'dispatch_lag_exceeded' : 'ok';
 }
 
+export type InitialDispatchGateVerdict =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly outcome: 'cutoff_missed' | 'dispatch_lag_exceeded' };
+
+/**
+ * The SEND-TIME gate on the INITIAL request only (§5): given the reading captured immediately
+ * before the initial send (`initialRequestStartedAt`), decide whether that request may be sent
+ * or must be refused with a valid-negative outcome. It composes the three timing bounds a
+ * doomed initial can violate, in the FROZEN precedence:
+ *
+ *   first-pitch  ≻  windowEnd  ≻  V-lag
+ *
+ * - first-pitch (§5): the request must start strictly before `scheduledAtAtFire`; at/after is
+ *   `cutoff_missed` (this bound binds every request, so it is checked first);
+ * - windowEnd (§5): the INITIAL request must start strictly before `windowEnd`; at/after is
+ *   `cutoff_missed` (an already-claimed initial unsent at/after windowEnd is `cutoff_missed`, not
+ *   `dispatch_lag_exceeded`, so windowEnd outranks V-lag);
+ * - V-lag (§5): `0 <= initialRequestStartedAt - detectedAt <= maxDispatchLagMs`, two-sided
+ *   (a backdated start `< detectedAt` MUST fail); a violation is `dispatch_lag_exceeded`.
+ *
+ * Every operand is parsed/validated UP FRONT — before any branch — so a malformed lower-precedence
+ * field (or a non-safe/negative cap) throws rather than being hidden by a higher-precedence branch
+ * short-circuiting. `instantMs`/`dispatchLagVerdict` fail closed on a malformed instant or cap.
+ * Start-only: this gates the INITIAL request; a repair is never tested against it.
+ */
+export function initialDispatchGate(input: {
+  detectedAt: string;
+  windowEnd: string;
+  scheduledAtAtFire: string;
+  initialRequestStartedAt: string;
+  maxDispatchLagMs: number;
+}): InitialDispatchGateVerdict {
+  // Parse/capture EVERY operand up front — a malformed lower-precedence field must NOT be hidden
+  // by a higher-precedence branch short-circuiting (any throws here fail closed before branching).
+  const startMs = instantMs(input.initialRequestStartedAt);
+  const firstPitchMs = instantMs(input.scheduledAtAtFire);
+  const windowEndMs = instantMs(input.windowEnd);
+  const lagVerdict = dispatchLagVerdict({
+    detectedAt: input.detectedAt,
+    initialRequestStartedAt: input.initialRequestStartedAt,
+    maxDispatchLagMs: input.maxDispatchLagMs,
+  });
+  // Frozen precedence: first-pitch > windowEnd > V-lag. The first two both yield cutoff_missed.
+  if (startMs >= firstPitchMs) return { ok: false, outcome: 'cutoff_missed' };
+  if (startMs >= windowEndMs) return { ok: false, outcome: 'cutoff_missed' };
+  if (lagVerdict === 'dispatch_lag_exceeded') return { ok: false, outcome: 'dispatch_lag_exceeded' };
+  return { ok: true };
+}
+
 /**
  * The cutoff race (§5, case 26). Returns violations (each => `cutoff_missed`):
  * - the INITIAL request must start strictly before `windowEnd` (a repair may cross
