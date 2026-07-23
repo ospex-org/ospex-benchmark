@@ -694,12 +694,22 @@ async function dispatchArmCore(
 
   async function sendRepair(remainingMs: number): Promise<ArmGameResult> {
   // The repair takes its OWN fresh start reading — it is never gated by the initial dispatch gate
-  // and never inherits `initialStartMs`; only its own first-pitch checks bound it.
+  // and never inherits `initialStartMs`. Every request, including a repair, must START before first
+  // pitch: this fresh reading is the persisted start, the no-send authority, AND the timeout bound.
+  // The post-acquire check ran on an earlier reading; if the clock crossed the cutoff since then,
+  // the repair must NOT be sent — the provider call boundary is never reached at/after first pitch.
   const repairStartMs = nowMs();
+  const remainingAtRepairStart = cutoffMs - repairStartMs;
+  if (remainingAtRepairStart <= 0) {
+    return failed('cutoff_missed', attemptRecord, null, false, null, [
+      ...firstValidation.errors,
+      'repair not dispatched: decision cutoff passed at repair start',
+    ]);
+  }
   const repair = await timedChat(
     target,
     repairTurns,
-    Math.min(options.timeoutMs, remainingMs),
+    Math.min(options.timeoutMs, remainingMs, remainingAtRepairStart),
     options.maxOutputTokens,
     nowMs,
     repairStartMs,
