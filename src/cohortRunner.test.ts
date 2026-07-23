@@ -636,28 +636,43 @@ test('the runner module imports no real fetcher/store/filesystem/ambient clock',
 // B2-R2 — one coherent detection→dispatch clock threaded through the tick
 // ===========================================================================
 
-test('B2-R2: one injected tick clock sources BOTH detectedAt and the persisted V-lag start — the operand is the real elapsed ticks', async () => {
+test('B2-R2: the persisted dispatch start is the EXACT tick-clock value read at that arm send — one coherent source, not a skewed or divergent read', async () => {
   const json = manifestJson();
   const store = new ScriptedStore(CODE_ARMS.length);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
-  // ONE clock, threaded through the tick: it advances by exactly 1ms per read and RECORDS every
-  // value it returns. `detectedAt` (stamped by the projector) and each arm's `initialRequestStartedAt`
-  // (stamped at the send) must BOTH be values THIS clock produced — so the persisted V-lag operand
-  // `initialRequestStartedAt − detectedAt` equals the number of clock advances between them (the real
-  // elapsed ticks), and can never be an artifact of two divergent clocks. Under the B2-R2 mutation
-  // (dispatch clock re-sourced from a separate `runOptions.nowMs`), the persisted start would NOT be
-  // a reading of this recorded tick clock → `seen.includes(startMs)` fails → red.
-  const seen: number[] = [];
-  let n = 0;
+  // ONE clock, threaded through the tick, with SPARSE (100ms) non-unit readings so a 1ms dispatch
+  // skew can never land on a legitimate adjacent value, and every emission recorded IN ORDER.
+  const emissions: number[] = [];
+  let calls = 0;
   const now = (): number => {
-    const v = DETECT_MS + n;
-    n += 1;
-    seen.push(v);
+    const v = DETECT_MS + calls * 100;
+    calls += 1;
+    emissions.push(v);
     return v;
   };
+  // Recording adapters: each arm's `chat` captures the clock's LAST emission at the instant it is
+  // invoked. `dispatchArmCore` reads `initialStartMs = nowMs()` synchronously immediately before it
+  // calls `adapter.chat(...)` (no intervening clock read), so the last emission at chat-time IS this
+  // arm's dispatch-start reading of the ONE source clock. This binds the persisted start ONE-TO-ONE
+  // to the exact source value the dispatch actually read — identity, NOT global set membership.
+  const dispatchStarts: number[] = [];
+  const adapters = new Map<string, ProviderAdapter>();
+  for (const arm of CODE_ARMS) {
+    adapters.set(arm.participantId, {
+      provider: arm.provider as ProviderName,
+      requestedModelId: arm.requestedModelId,
+      credentialEnvVar: `${arm.participantId.replace(/[^a-z0-9]/gi, '_').toUpperCase()}_KEY`,
+      hasCredential: () => true,
+      async chat(turns: ChatTurn[], _ms: number): Promise<ProviderResponse> {
+        dispatchStarts.push(emissions[emissions.length - 1]!);
+        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {} };
+      },
+    });
+  }
   const { input } = tickInput(json, [makeGame({ gameId: 'g1' })], [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' })], {
     claimPort: new StoreClaimPort(store),
     sink,
+    adapters,
     now,
   });
 
@@ -665,17 +680,25 @@ test('B2-R2: one injected tick clock sources BOTH detectedAt and the persisted V
   assert.equal(result.admittedCount, 1, 'the fire admits under the single coherent clock');
   const artifact = sink.calls[0]!;
   const detectedMs = Date.parse(artifact.detectedAt);
-  assert.ok(seen.includes(detectedMs), 'detectedAt is a reading of the injected tick clock');
-  const sentArms = artifact.arms.filter((a) => a.initialRequestStartedAt !== null);
-  assert.ok(sentArms.length > 0, 'at least one arm sent its initial');
-  for (const arm of sentArms) {
-    const startMs = Date.parse(arm.initialRequestStartedAt!);
-    assert.ok(seen.includes(startMs), 'the persisted initial start is a reading of the SAME injected clock, not a divergent one');
-    assert.ok(startMs >= detectedMs, 'dispatch never precedes detection under one clock');
-    // step = 1ms with no gaps, so the count of clock advances in (detectedMs, startMs] IS the numeric
-    // gap: the V-lag operand equals the real elapsed ticks on the single coherent clock.
-    const elapsedTicks = seen.filter((v) => v > detectedMs && v <= startMs).length;
-    assert.equal(startMs - detectedMs, elapsedTicks, 'the V-lag operand equals the real elapsed ticks on the one clock');
+  assert.ok(emissions.includes(detectedMs), 'detectedAt is a reading of the one injected tick clock');
+  const sentStarts = artifact.arms
+    .filter((a) => a.initialRequestStartedAt !== null)
+    .map((a) => Date.parse(a.initialRequestStartedAt!));
+  assert.ok(sentStarts.length > 0, 'at least one arm sent its initial');
+  assert.equal(dispatchStarts.length, sentStarts.length, 'one recorded dispatch-start clock read per sent arm');
+  // ONE-TO-ONE (concurrency-tolerant multiset, NOT launch order): every persisted initial start is the
+  // EXACT tick-clock value the dispatch read at that arm's send. A skewed dispatch clock (e.g. the
+  // reviewer control `const nowMs = () => sourceNowMs() + 1` in runner.ts) makes each persisted start
+  // differ from the recorded raw emission by the skew → this multiset equality FAILS → the named test
+  // emits `not ok`. Global set membership on 1ms-spaced values could not detect that skew.
+  assert.deepEqual(
+    [...sentStarts].sort((a, b) => a - b),
+    [...dispatchStarts].sort((a, b) => a - b),
+    'each persisted dispatch start equals the exact source-clock value read at that arm send (not a skewed/divergent read)',
+  );
+  for (const s of sentStarts) {
+    assert.ok(emissions.includes(s), 'each persisted start is a genuine reading of the one clock (sparse: a +1 skew is not a legitimate value)');
+    assert.ok(s > detectedMs, 'dispatch never precedes detection under one clock');
   }
 });
 
