@@ -1207,6 +1207,148 @@ test('a repair reaching first pitch is refused by the existing repair checkpoint
   assert.equal(arm0.repair, null, 'the repair was refused by the first-pitch checkpoint before sending');
 });
 
+// ===========================================================================
+// The repair fresh-start guard: a repair whose OWN fresh start reaches first pitch is never sent
+// ===========================================================================
+
+test('a repair whose fresh start reading reaches first pitch is refused before the send', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  // A repair reserves its slot, then takes its OWN fresh start reading immediately before the HTTP
+  // call. The post-acquire recheck can still see slack while that fresh reading has already reached
+  // first pitch — only the fresh-start guard can catch it. Two cases: the fresh start lands exactly
+  // ON first pitch, and strictly PAST it.
+  const cases: Array<[string, number]> = [
+    ['fresh start == first pitch', CUTOFF_MS],
+    ['fresh start > first pitch', CUTOFF_MS + 5],
+  ];
+  for (const [label, freshStart] of cases) {
+    // A phase-flipping clock. Every initial-path reading and the PRE-acquire repair check read the
+    // EARLY time NOW_MS (well before first pitch): the initial is timely and the repair window is
+    // open when the slot is acquired. Acquiring the slot flips the clock into its post-acquire
+    // phase, whose FIRST reading (the post-acquire recheck) still shows a millisecond of slack
+    // (cutoff - 1) — so the SECOND reading (the repair's own fresh start, == or > first pitch) is
+    // the sole reading that can refuse the send.
+    let postPhase = false;
+    let i = 0;
+    const postReadings = [CUTOFF_MS - 1, freshStart];
+    const clock = (): number => (postPhase ? postReadings[Math.min(i++, postReadings.length - 1)]! : NOW_MS);
+
+    // Only arm 0 holds a credential, so it is the sole clock reader; it answers with a
+    // schema-invalid (but fingerprint-preservable) body first, so it reaches the repair path.
+    const scripts: Scripted[] = [];
+    const { dispatch, store } = await authorize((s) => {
+      const map = new Map<string, ProviderAdapter>();
+      s.expectedArmIdentities.forEach((id, idx) => {
+        const script = scriptedAdapter(
+          id,
+          (call) =>
+            call === 1
+              ? wrongEcho(validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256))
+              : validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256),
+          { hasCredential: idx === 0 },
+        );
+        scripts.push(script);
+        map.set(id.participantId, script.adapter);
+      });
+      return map;
+    });
+    // Flip the phase at the acquisition itself — AFTER the pre-acquire cutoff check has already
+    // passed on the EARLY reading — preserving the store's default acquired lease (`repair-0-1`).
+    const acquire = store.onRepair;
+    store.onRepair = (req): Promise<RepairLeaseResult> => {
+      postPhase = true;
+      return acquire(req);
+    };
+
+    const env = await runAuthorizedDispatch(dispatch, options(clock, cohortId), PERMISSIVE_GATE);
+    const arm0 = armAt(env, dispatch, 0);
+    assert.equal(arm0.outcome, 'cutoff_missed', `${label}: the doomed repair is a missed cutoff`);
+    assert.equal(arm0.repair, null, `${label}: no repair was recorded — it was never sent`);
+    assert.equal(scripts[0]!.calls, 1, `${label}: only the initial was sent; the repair adapter was never called`);
+    // The repair slot WAS acquired (the pre-acquire window was open), so it must come back — once —
+    // alongside every arm's initial lease.
+    assert.equal(store.calls.filter((c) => c.op === 'repair').length, 1, `${label}: exactly one repair slot acquired`);
+    assert.deepEqual(
+      [...releaseIds(store)].sort(),
+      [...dispatch.permit.initialLeases.map((l) => l.leaseId), 'repair-0-1'].sort(),
+      `${label}: every initial lease and the acquired repair slot released exactly once`,
+    );
+  }
+});
+
+// ===========================================================================
+// Concurrent launch: a slow early arm never blocks a ready later arm
+// ===========================================================================
+
+test('a slow early arm does not block a ready later arm — the roster launches concurrently', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  // Arm 0 (early) is held in flight by a controlled adapter whose chat resolves only when
+  // signalled; every later arm answers normally. Under a concurrent launch a ready later arm must
+  // enter its chat and finish while arm 0 is still pending.
+  let signalArm0!: () => void;
+  const arm0Gate = new Promise<void>((resolve) => {
+    signalArm0 = resolve;
+  });
+  const scripts: Scripted[] = [];
+  const { dispatch, store, snapshot } = await authorize((s) => {
+    const map = new Map<string, ProviderAdapter>();
+    s.expectedArmIdentities.forEach((id, idx) => {
+      const script =
+        idx === 0
+          ? scriptedAdapter(id, async () => {
+              await arm0Gate; // pend until signalled
+              return validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256);
+            })
+          : scriptedAdapter(id, () => validBody(id.participantId, id.requestedModelId, cohortId, s.prepared.requestSha256));
+      scripts.push(script);
+      map.set(id.participantId, script.adapter);
+    });
+    return map;
+  });
+  void snapshot;
+
+  // Launch WITHOUT awaiting, then flush microtasks/timers so the concurrent launch enters every
+  // arm's chat and lets the ready later arms run to completion.
+  let settled = false;
+  let env: RunEnv | undefined;
+  const run = runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId), PERMISSIVE_GATE).then(
+    (e) => {
+      settled = true;
+      env = e;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await new Promise((r) => setTimeout(r, 20));
+
+  // While arm 0 is still pending: the run cannot have settled, yet the later arm has entered chat …
+  assert.equal(settled, false, 'the run cannot settle while the early arm is still in flight');
+  assert.equal(scripts[1]!.calls, 1, 'the later arm entered adapter.chat while the early arm pends');
+  // … and — the scripted store lets it progress — it finished and released its own initial lease,
+  // while the still-pending early arm has released nothing.
+  const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
+  const arm1Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 1)!.leaseId;
+  assert.ok(
+    releaseIds(store).includes(arm1Lease),
+    'the ready later arm released its initial lease without waiting for the slow arm',
+  );
+  assert.ok(!releaseIds(store).includes(arm0Lease), 'the still-pending early arm has not released its lease');
+
+  // Signal the slow arm; the whole run then settles with the usual all-settled semantics.
+  signalArm0();
+  await run;
+  assert.equal(settled, true, 'the run settles once every arm has settled');
+  assert.ok(env, 'the run produced an envelope');
+  assert.equal(env.results.length, dispatch.permit.initialLeases.length, 'every arm reported an outcome');
+  assert.ok(env.results.every((r) => r.outcome === 'valid'), 'every arm is valid once the slow arm answers');
+  assert.deepEqual(
+    [...releaseIds(store)].sort(),
+    dispatch.permit.initialLeases.map((l) => l.leaseId).sort(),
+    'every initial lease released exactly once',
+  );
+});
+
 test('the persisted requestAt, latency, and acceptedAt all derive from the ONE gated reading', async () => {
   const T = CUTOFF_MS - 100_000;
   const scriptsHolder: Scripted[] = [];
