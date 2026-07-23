@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { prepareGameRequest } from './preparedRequest.js';
@@ -400,4 +403,20 @@ test('the legacy path keeps its rejection timing: a fast failure never waits for
     'the base rejection identity is unchanged',
   );
   assert.equal(finishedBeforeRejection, false, 'the slow sibling had not settled when the run rejected');
+});
+
+test('the legacy path passes gate=null — ungated for V-lag/windowEnd, first-pitch retained', async () => {
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  // The legacy runOneArmGame has no detectedAt/windowEnd in scope: it is structurally ungated for
+  // the new V-lag/windowEnd capability, so a well-before-cutoff dispatch sends and validates.
+  const okAdapter = stubAdapter([async () => stubResponse(JSON.stringify(makeValidResponse(request)))]);
+  const sent = await runOneArmGame(TEST_ARM, okAdapter, request, baseOptions(() => CUTOFF_MS - 60_000));
+  assert.equal(sent.outcome, 'valid', 'ungated for the new capability');
+  // The existing first-pitch cutoff check remains in force on the legacy path.
+  const late = await runOneArmGame(TEST_ARM, stubAdapter([]), request, baseOptions(() => CUTOFF_MS + 1));
+  assert.equal(late.outcome, 'cutoff_missed', 'first-pitch check retained');
+  // Source: the legacy dispatch entries pass an explicit null gate (sibling of the null lifecycle).
+  const runnerSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'runner.ts'), 'utf8');
+  assert.ok(runnerSrc.includes('dispatchArm(target, request, options, null, null, 0)'), 'runSlate passes gate=null');
+  assert.ok(/options,\s*\n\s*null,\s*\n\s*null,\s*\n\s*0,/.test(runnerSrc), 'runOneArmGame passes gate=null');
 });

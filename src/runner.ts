@@ -12,6 +12,7 @@ import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines
 import { canonicalize, sha256Hex } from './canonical.js';
 import { deepFreeze } from './freeze.js';
 import { instantMs } from './time.js';
+import { initialDispatchGate } from './attemptProvenance.js';
 import type { GameRequest } from './bundle.js';
 import { assertAuthorizedDispatch, PreDispatchCleanupError } from './lineOpenDispatch.js';
 import type { AuthorizedDispatch } from './lineOpenDispatch.js';
@@ -263,6 +264,21 @@ export interface SlateRunOptions {
   onGameComplete?: ((line: string) => void) | undefined;
 }
 
+/**
+ * The send-time dispatch-gate operands for the INITIAL request, captured from the authenticated
+ * sealed snapshot at the composition spine (`detectedAt`, the observation `windowEnd`, and the
+ * `maxDispatchLagMs` bound) and threaded to the arm dispatch as positive capability. It is a
+ * REQUIRED argument of `runAuthorizedDispatch` (there is no ungated authorized path); the legacy
+ * `runSlate` / `runOneArmGame` pass `null` — structurally ungated for this new V-lag/windowEnd
+ * capability, while their existing first-pitch checks remain in force. `scheduledAtAtFire` is not
+ * carried here: it is the arm request's own `cutoffAt` (first pitch).
+ */
+export interface InitialDispatchGate {
+  readonly detectedAt: string;
+  readonly windowEnd: string;
+  readonly maxDispatchLagMs: number;
+}
+
 function emptyAttempt(): AttemptRecord {
   return {
     rawText: null,
@@ -305,13 +321,18 @@ async function timedChat(
   timeoutMs: number,
   maxOutputTokens: number,
   nowMs: () => number,
+  startMs: number,
 ): Promise<
   AttemptRecord & {
     response: ProviderResponse | null;
     failure: 'timeout' | 'rate_limited' | 'provider_error' | null;
   }
 > {
-  const startedAt = nowMs();
+  // The start reading is passed in (captured by the caller before the send), NOT re-read here:
+  // the persisted `requestAt` AND `latencyMs` both derive from this one value, on success and
+  // failure, so the initial's persisted start is byte-identical to the reading its send-time gate
+  // evaluated.
+  const startedAt = startMs;
   const requestAt = new Date(startedAt).toISOString();
   try {
     const response = await adapter.chat(turns, timeoutMs, { maxOutputTokens });
@@ -371,6 +392,7 @@ export async function runOneArmGame(
     request,
     options,
     null,
+    null,
     0,
   );
 }
@@ -393,6 +415,7 @@ async function dispatchArm(
   request: PreparedGameRequest,
   options: SlateRunOptions,
   lifecycle: AttemptLifecyclePort | null,
+  gate: InitialDispatchGate | null,
   armIndex: number,
 ): Promise<ArmGameResult> {
   assertPrepared(request);
@@ -403,7 +426,7 @@ async function dispatchArm(
     await lifecycle.releaseInitial(armIndex);
   };
   try {
-    return await dispatchArmCore(target, request, options, lifecycle, armIndex, releaseInitial);
+    return await dispatchArmCore(target, request, options, lifecycle, gate, armIndex, releaseInitial);
   } catch (error) {
     // Backstop for a throw before the settle-time release (e.g. a synchronous pre-call
     // failure): free the slot exactly once, never retried. If that release ALSO fails, BOTH
@@ -426,6 +449,7 @@ async function dispatchArmCore(
   request: PreparedGameRequest,
   options: SlateRunOptions,
   lifecycle: AttemptLifecyclePort | null,
+  gate: InitialDispatchGate | null,
   armIndex: number,
   releaseInitial: () => Promise<void>,
 ): Promise<ArmGameResult> {
@@ -496,13 +520,40 @@ async function dispatchArmCore(
     { role: 'user', content: userMessage },
   ];
 
-  // Each request is bounded by the remaining time to cutoff.
+  // ONE clock reading, taken immediately before the send and after message-building, is the
+  // single source of both the send-time gate operand AND the persisted `requestAt`: V-lag
+  // "measured at the provider HTTP boundary" is approximated by this reading, which must precede
+  // the send and equal the persisted start. When a gate is present (the authorized path), refuse
+  // to send a doomed initial — first pitch / windowEnd reached, or the V-lag bound exceeded — and
+  // emit the correct valid-negative with the never-sent shape, without spending a provider call.
+  const initialStartMs = nowMs();
+  if (gate !== null) {
+    const verdict = initialDispatchGate({
+      detectedAt: gate.detectedAt,
+      windowEnd: gate.windowEnd,
+      scheduledAtAtFire: request.cutoffAt,
+      initialRequestStartedAt: new Date(initialStartMs).toISOString(),
+      maxDispatchLagMs: gate.maxDispatchLagMs,
+    });
+    if (!verdict.ok) {
+      await releaseInitial(); // skipped without a call
+      const errorDetail =
+        verdict.outcome === 'cutoff_missed'
+          ? 'initial request start reached windowEnd/first pitch before send'
+          : 'initial request would start too late after detection (V-lag)';
+      return failed(verdict.outcome, { ...emptyAttempt(), errorDetail }, null, false, null, []);
+    }
+  }
+
+  // Each request is bounded by the remaining time to cutoff. The persisted `requestAt` IS the
+  // gated reading (`initialStartMs`), so the gate decision and the recorded start never disagree.
   const attempt = await timedChat(
     target,
     baseTurns,
     Math.min(options.timeoutMs, remainingAtDispatch),
     options.maxOutputTokens,
     nowMs,
+    initialStartMs,
   );
   // The initial request has SETTLED (by response, timeout, or transport failure): free its
   // slot now — before any validation, fingerprint, or repair work — so capacity is never held
@@ -642,12 +693,16 @@ async function dispatchArmCore(
   }
 
   async function sendRepair(remainingMs: number): Promise<ArmGameResult> {
+  // The repair takes its OWN fresh start reading — it is never gated by the initial dispatch gate
+  // and never inherits `initialStartMs`; only its own first-pitch checks bound it.
+  const repairStartMs = nowMs();
   const repair = await timedChat(
     target,
     repairTurns,
     Math.min(options.timeoutMs, remainingMs),
     options.maxOutputTokens,
     nowMs,
+    repairStartMs,
   );
   const { response: repairResponse, failure: repairFailure, ...repairRecord } = repair;
   if (repairFailure !== null || repairResponse === null) {
@@ -853,7 +908,7 @@ export async function runSlate(
     // canonical helper to share code would silently make a legacy caller wait for a slow
     // sibling and change the error it sees.
     const results = await Promise.all(
-      targets.map((target) => dispatchArm(target, request, options, null, 0)),
+      targets.map((target) => dispatchArm(target, request, options, null, null, 0)),
     );
     all.push(...results);
     if (options.onGameComplete) {
@@ -902,10 +957,17 @@ export async function runSlate(
  *
  * It produces the same branded `RunEnvelope` the legacy path produces; artifact production,
  * installation, and claim completion remain their own owners'.
+ *
+ * The send-time initial-dispatch `gate` is a REQUIRED argument (positive capability): the
+ * authorized path is never structurally ungated for the V-lag / windowEnd bounds. Its operands
+ * are captured by the spine from the authenticated sealed snapshot; here they are threaded to
+ * each arm and evaluated inside `dispatchArm`'s initial-lease cleanup backstop, so a malformed
+ * operand that throws still releases every initial lease exactly once.
  */
 export async function runAuthorizedDispatch(
   dispatch: AuthorizedDispatch,
   options: SlateRunOptions,
+  gate: InitialDispatchGate,
 ): Promise<RunEnvelope> {
   assertAuthorizedDispatch(dispatch);
   const lifecycle = createAttemptLifecycle(dispatch);
@@ -972,7 +1034,7 @@ export async function runAuthorizedDispatch(
   // sibling, every launched arm is awaited before this settles, and every arm failure is
   // reported rather than only the first.
   const results = await settleAllArms(
-    targets.map((target, armIndex) => dispatchArm(target, prepared, options, lifecycle, armIndex)),
+    targets.map((target, armIndex) => dispatchArm(target, prepared, options, lifecycle, gate, armIndex)),
   );
   assertCompleteGrid(results, expectedArms, [prepared]);
 

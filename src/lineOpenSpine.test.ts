@@ -1240,3 +1240,88 @@ test('the spine imports no runtime store, settles only via the permit-resolved c
   const dispatchSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'lineOpenDispatch.ts'), 'utf8');
   assert.ok(dispatchSrc.includes('export function scopeKeyOf'), 'scopeKeyOf is additively exported');
 });
+
+// ===========================================================================
+// The send-time initial-dispatch gate at the spine (SPEC §5)
+// ===========================================================================
+
+// 15s after the fixture detectedAt (12:00:30) — beyond maxDispatchLagMs (10s), so the
+// snapshot-derived V-lag gate rejects every initial send.
+const LATE_NOW = Date.parse('2026-07-18T12:00:45.000Z');
+
+test('a gate-violating fire installs a writer-clean artifact — every arm null-start, zero attempts', async () => {
+  const { outcome, store, scripts } = await fireOf({ runOptions: runOpts({ nowMs: () => LATE_NOW }) });
+  assert.equal(outcome.kind, 'Installed', 'the fire produces a durable artifact even when every arm is gated out');
+  if (outcome.kind !== 'Installed') return;
+  assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0, 'no arm was sent — the snapshot-derived gate rejected each initial');
+  for (const arm of outcome.artifact.arms) {
+    assert.equal(arm.terminalOutcome, 'dispatch_lag_exceeded', 'per violating arm: dispatch_lag_exceeded');
+    assert.equal(arm.initialRequestStartedAt, null, 'per violating arm: initialRequestStartedAt null');
+    assert.equal(arm.orderedAttempts.length, 0, 'per violating arm: zero orderedAttempts');
+  }
+  assert.deepEqual(verifyFireArtifactReplay(outcome.artifact), [], 'the produced artifact replays writer-clean');
+  assert.deepEqual(
+    [...releaseIds(store)].sort(),
+    outcome.permit.initialLeases.map((l) => l.leaseId).sort(),
+    'each skipped initial lease released once',
+  );
+});
+
+test('the snapshot-derived gate wins over hostile permissive runOptions mutated during admission', async () => {
+  const snapshot = sealed();
+  const cohortId = snapshot.booted.cohortId;
+  const game = scopedGame(GAME_ID, BOTH);
+  const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+  const { map, scripts } = validAdapters(snapshot, cohortId, game);
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  // runOptions carries hostile runtime-extra gate operands that WOULD admit every initial if read.
+  const runOptions = {
+    ...runOpts({ nowMs: () => LATE_NOW }),
+    detectedAt: new Date(LATE_NOW).toISOString(),
+    windowEnd: '2999-01-01T00:00:00.000Z',
+    maxDispatchLagMs: 1_000_000_000,
+  } as unknown as LineOpenRunOptions;
+  const port = new StoreClaimPort(store);
+  const wrapped = {
+    admit(req: AdmitDispatchRequest) {
+      // Mutate the hostile permissive operands WHILE admission is pending.
+      (runOptions as Record<string, unknown>).detectedAt = new Date(LATE_NOW).toISOString();
+      (runOptions as Record<string, unknown>).maxDispatchLagMs = 5_000_000_000;
+      return port.admit(req);
+    },
+  };
+  const outcome = await runOneFire({ snapshot, adapters: map, claimPort: wrapped, sink, runOptions, admission: ADMISSION });
+  assert.equal(outcome.kind, 'Installed', 'the fire runs — every initial gated out by the snapshot operands');
+  assert.equal(
+    scripts.reduce((n, s) => n + s.calls, 0),
+    0,
+    'ZERO adapter calls — the snapshot-derived gate rejected each initial, never the permissive runOptions',
+  );
+  if (outcome.kind !== 'Installed') return;
+  assert.ok(outcome.artifact.arms.every((a) => a.terminalOutcome === 'dispatch_lag_exceeded'), 'every arm gated out by the snapshot V-lag');
+  assert.deepEqual(
+    [...releaseIds(store)].sort(),
+    outcome.permit.initialLeases.map((l) => l.leaseId).sort(),
+    'each skipped initial lease released once',
+  );
+});
+
+test('the dispatch gate is captured from the sealed snapshot, after admission-request derivation and before authorization', () => {
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'lineOpenSpine.ts'), 'utf8');
+  const body = src.slice(src.indexOf('export async function runOneFire'));
+  // Every gate operand is sourced from the AUTHENTICATED snapshot, never from runOptions.
+  assert.ok(
+    /const gate: InitialDispatchGate = \{[\s\S]*?detectedAt: snapshot\.detectedAt,[\s\S]*?windowEnd: snapshot\.booted\.manifest\.windowEnd,[\s\S]*?maxDispatchLagMs: snapshot\.booted\.manifest\.constants\.maxDispatchLagMs,/.test(body),
+    'the gate operands come from the snapshot',
+  );
+  assert.ok(!/runOptions\.(detectedAt|windowEnd|maxDispatchLagMs)/.test(body), 'no gate operand is read from runOptions');
+  // Ordering: buildFullScopeAdmitRequest -> gate capture -> authorizePreparedDispatch.
+  assert.ok(
+    body.indexOf('buildFullScopeAdmitRequest(') < body.indexOf('const gate: InitialDispatchGate'),
+    'gate captured after the admission request is derived (snapshot authenticated)',
+  );
+  assert.ok(
+    body.indexOf('const gate: InitialDispatchGate') < body.indexOf('authorizePreparedDispatch('),
+    'gate captured before authorization',
+  );
+});

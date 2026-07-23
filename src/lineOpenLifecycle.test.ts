@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
@@ -14,6 +17,8 @@ import { sealPreparedFire } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { AuthorizedDispatchFaultError, runAuthorizedDispatch } from './runner.js';
+import { initialDispatchGate } from './attemptProvenance.js';
+import type { InitialDispatchGate } from './runner.js';
 import type { SlateRunOptions } from './runner.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 import { SMOKE_LABEL } from './types.js';
@@ -297,6 +302,16 @@ function options(nowMs: () => number = () => NOW_MS, cohortId?: string): SlateRu
   };
 }
 
+// A boundary-safe PERMISSIVE gate: detectedAt == the injected clock (so an initial send at NOW_MS
+// has V-lag 0), windowEnd far in the future, and a large lag bound — so every migrated fixture's
+// existing outcome is unchanged (the gate always admits). The rows/teeth below drive their own
+// non-permissive gates.
+const PERMISSIVE_GATE: InitialDispatchGate = {
+  detectedAt: new Date(NOW_MS).toISOString(),
+  windowEnd: '2999-01-01T00:00:00.000Z',
+  maxDispatchLagMs: 1_000_000_000,
+};
+
 /** Authorize one fire; returns the branded dispatch plus its store and adapters. */
 async function authorize(
   build: (snapshot: PreparedFireSnapshot) => Map<string, ProviderAdapter>,
@@ -468,7 +483,7 @@ test('the authorized path releases every arm initial lease exactly once and prod
   const snapshot0 = sealedSnapshot();
   const cohortId = snapshot0.booted.cohortId;
   const { dispatch, store } = await authorize((s) => validAdapters(s, cohortId).map);
-  const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId));
+  const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId), PERMISSIVE_GATE);
 
   assert.equal(env.results.length, dispatch.permit.initialLeases.length);
   assert.ok(env.results.every((r) => r.outcome === 'valid'));
@@ -491,7 +506,7 @@ test('a skipped arm (missing credential) still releases its initial lease exactl
     });
     return map;
   });
-  const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId));
+  const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId), PERMISSIVE_GATE);
   assert.equal(env.results.find((r) => r.outcome === 'credential_missing') !== undefined, true);
   assert.deepEqual(
     [...releaseIds(store)].sort(),
@@ -509,7 +524,7 @@ test('a preflight failure after authorization frees every unstarted lease and di
     return r.map;
   });
   // A cohortId that disagrees with the permit is a synchronous preflight failure.
-  await assert.rejects(() => runAuthorizedDispatch(dispatch, options(() => NOW_MS, 'a-different-cohort')));
+  await assert.rejects(() => runAuthorizedDispatch(dispatch, options(() => NOW_MS, 'a-different-cohort'), PERMISSIVE_GATE));
   assert.deepEqual(
     [...releaseIds(store)].sort(),
     dispatch.permit.initialLeases.map((l) => l.leaseId).sort(),
@@ -521,7 +536,7 @@ test('a raw structural copy of an authorized dispatch is refused by the canonica
   const snapshot0 = sealedSnapshot();
   const cohortId = snapshot0.booted.cohortId;
   const { dispatch } = await authorize((s) => validAdapters(s, cohortId).map);
-  await assert.rejects(() => runAuthorizedDispatch({ ...dispatch }, options(() => NOW_MS, cohortId)));
+  await assert.rejects(() => runAuthorizedDispatch({ ...dispatch }, options(() => NOW_MS, cohortId), PERMISSIVE_GATE));
 });
 
 test('a repair acquires, rechecks the cutoff after the acquire, and releases the slot', async () => {
@@ -540,7 +555,7 @@ test('a repair acquires, rechecks the cutoff after the acquire, and releases the
     });
     return map;
   });
-  const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId));
+  const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId), PERMISSIVE_GATE);
   const repairs = store.calls.filter((c) => c.op === 'repair');
   assert.equal(repairs.length, 1, 'exactly one repair slot was acquired');
   // Its slot was released too: initial leases + the repair lease.
@@ -572,7 +587,7 @@ test('a cutoff that passes while the repair slot is acquired sends no repair and
     now = CUTOFF_MS + 1;
     return Promise.resolve({ outcome: 'acquired', lease: { leaseId: `repair-${req.armIndex}-${req.repairOrdinal}`, armIndex: req.armIndex, expiresAt: 'x', state: 'live' }, requestAuthorized: true });
   };
-  const env = await runAuthorizedDispatch(dispatch, options(() => now, cohortId));
+  const env = await runAuthorizedDispatch(dispatch, options(() => now, cohortId), PERMISSIVE_GATE);
   const arm0 = env.results.find((r) => r.arm.participantId === dispatch.plan.arms[0]!.participantId)!;
   assert.equal(arm0.outcome, 'cutoff_missed');
   assert.equal(scripts[0]!.calls, 1, 'the repair request was never sent');
@@ -614,7 +629,7 @@ function repairingAdapters(s: PreparedFireSnapshot, cohortId: string): Map<strin
 test('an authorized repair drives releaseInitial then acquireRepair then releaseRepair, never holding both', async () => {
   const cohortId = sealedSnapshot().booted.cohortId;
   const { dispatch, store } = await authorize((s) => repairingAdapters(s, cohortId));
-  await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId));
+  await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId), PERMISSIVE_GATE);
   const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
   // The initial slot is freed BEFORE the repair slot is taken: the two are never held at once.
   assert.deepEqual(armLog(store, arm0Lease, 0), ['releaseInitial', 'acquireRepair', 'releaseRepair']);
@@ -624,7 +639,7 @@ test('a denied repair ends the arm log at the acquire — nothing is released fo
   const cohortId = sealedSnapshot().booted.cohortId;
   const { dispatch, store } = await authorize((s) => repairingAdapters(s, cohortId));
   store.onRepair = () => Promise.resolve({ outcome: 'refused', reason: 'concurrency', requestAuthorized: false });
-  await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId));
+  await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId), PERMISSIVE_GATE);
   const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
   assert.deepEqual(armLog(store, arm0Lease, 0), ['releaseInitial', 'acquireRepair']);
 });
@@ -663,7 +678,7 @@ test('a lifecycle fault in one arm waits for every sibling to settle and release
       : Promise.resolve({ outcome: 'released' });
 
   let settled = false;
-  const run = runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId)).then(
+  const run = runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId), PERMISSIVE_GATE).then(
     () => {
       settled = true;
     },
@@ -719,7 +734,7 @@ test('every no-repair exit releases the arm initial lease exactly once', async (
     });
     const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
     // A throwing hasCredential propagates as an arm failure; the rest resolve to outcomes.
-    await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId)).catch(() => undefined);
+    await runAuthorizedDispatch(dispatch, options(() => NOW_MS, cohortId), PERMISSIVE_GATE).catch(() => undefined);
     assert.deepEqual(
       releaseIds(store).filter((id) => id === arm0Lease),
       [arm0Lease],
@@ -734,7 +749,7 @@ test('every no-repair exit releases the arm initial lease exactly once', async (
 
 /** Run one authorized dispatch and return what it threw (or `null` when it resolved). */
 async function faultOf(dispatch: AuthorizedDispatch, opts: SlateRunOptions): Promise<unknown> {
-  return runAuthorizedDispatch(dispatch, opts).then(
+  return runAuthorizedDispatch(dispatch, opts, PERMISSIVE_GATE).then(
     () => null,
     (error: unknown) => error,
   );
@@ -905,7 +920,7 @@ test('a partly-failing pre-launch cleanup exposes the COMPLETE attempt log, fail
         : Promise.resolve({ outcome: 'released' });
 
   await assert.rejects(
-    () => runAuthorizedDispatch(dispatch, options(() => NOW_MS, 'a-different-cohort')),
+    () => runAuthorizedDispatch(dispatch, options(() => NOW_MS, 'a-different-cohort'), PERMISSIVE_GATE),
     (error) => {
       assert.ok(error instanceof PreDispatchCleanupError, 'the cleanup failure is reported');
       assert.deepEqual(error.attempts.map((a) => a.leaseId), ids, 'every lease was attempted, in permit order');
@@ -955,7 +970,7 @@ test('a pre-launch cleanup failure is reported with the preflight cause and the 
   store.onRelease = () => Promise.resolve({ outcome: 'refused', reason: 'not_owner' });
   // A cohort that disagrees with the permit fails preflight; every release then refuses.
   await assert.rejects(
-    () => runAuthorizedDispatch(dispatch, options(() => NOW_MS, 'a-different-cohort')),
+    () => runAuthorizedDispatch(dispatch, options(() => NOW_MS, 'a-different-cohort'), PERMISSIVE_GATE),
     (error) => {
       assert.ok(error instanceof PreDispatchCleanupError, 'the cleanup failure must not be swallowed');
       assert.ok(/does not equal the authorized cohort/.test(error.primary.message), 'the preflight cause is retained');
@@ -967,4 +982,332 @@ test('a pre-launch cleanup failure is reported with the preflight cause and the 
       return true;
     },
   );
+});
+
+// ===========================================================================
+// The send-time initial-dispatch gate (SPEC §5)
+// ===========================================================================
+
+/** A gate with all bounds PERMISSIVE by default (detectedAt == the injected clock so V-lag 0,
+ *  windowEnd far, lag bound huge); each row overrides exactly the bound it exercises. */
+function gateOf(over: Partial<InitialDispatchGate> = {}): InitialDispatchGate {
+  return {
+    detectedAt: new Date(NOW_MS).toISOString(),
+    windowEnd: '2999-01-01T00:00:00.000Z',
+    maxDispatchLagMs: 1_000_000_000,
+    ...over,
+  };
+}
+
+/** A strictly-sequenced injected clock: returns each value in turn, clamping to the last. */
+function queueClock(values: readonly number[]): () => number {
+  let i = 0;
+  return () => values[Math.min(i++, values.length - 1)]!;
+}
+
+/** Every arm's `chat` THROWS if reached — a gated-out initial must never call it. */
+function throwingAdapters(snapshot: PreparedFireSnapshot): { map: Map<string, ProviderAdapter>; scripts: Scripted[] } {
+  const scripts: Scripted[] = [];
+  const map = new Map<string, ProviderAdapter>();
+  for (const id of snapshot.expectedArmIdentities) {
+    const s = scriptedAdapter(id, () => {
+      throw new Error('adapter chat must not be called for a gated-out initial');
+    });
+    scripts.push(s);
+    map.set(id.participantId, s.adapter);
+  }
+  return { map, scripts };
+}
+
+/** Only arm 0 holds a credential, so it is the SOLE clock reader (its reads are sequential); the
+ *  siblings return `credential_missing` before touching the clock. `arm0` scripts arm 0's body. */
+function soloReader(
+  snapshot: PreparedFireSnapshot,
+  cohortId: string,
+  arm0: (id: { participantId: string; requestedModelId: string }, call: number) => string | Promise<string>,
+): { map: Map<string, ProviderAdapter>; scripts: Scripted[] } {
+  const scripts: Scripted[] = [];
+  const map = new Map<string, ProviderAdapter>();
+  snapshot.expectedArmIdentities.forEach((id, i) => {
+    const s = scriptedAdapter(
+      id,
+      i === 0
+        ? (call) => arm0(id, call)
+        : () => validBody(id.participantId, id.requestedModelId, cohortId, snapshot.prepared.requestSha256),
+      { hasCredential: i === 0 },
+    );
+    scripts.push(s);
+    map.set(id.participantId, s.adapter);
+  });
+  return { map, scripts };
+}
+
+const leaseIdsSorted = (dispatch: AuthorizedDispatch): string[] => dispatch.permit.initialLeases.map((l) => l.leaseId).sort();
+type RunEnv = Awaited<ReturnType<typeof runAuthorizedDispatch>>;
+const armAt = (env: RunEnv, dispatch: AuthorizedDispatch, i: number): RunEnv['results'][number] =>
+  env.results.find((r) => r.arm.participantId === dispatch.plan.arms[i]!.participantId)!;
+
+test('an initial within the V-lag bounds sends and validates (upper/lower inclusive, mid-window)', async () => {
+  const cases: Array<[string, InitialDispatchGate]> = [
+    ['upper bound inclusive (lag == max)', gateOf({ detectedAt: new Date(NOW_MS - 10_000).toISOString(), maxDispatchLagMs: 10_000 })],
+    ['lower bound inclusive (lag == 0)', gateOf({ detectedAt: new Date(NOW_MS).toISOString(), maxDispatchLagMs: 10_000 })],
+    ['mid-window', gateOf({ detectedAt: new Date(NOW_MS - 1_000).toISOString(), maxDispatchLagMs: 10_000 })],
+  ];
+  for (const [label, gate] of cases) {
+    const scriptsHolder: Scripted[] = [];
+    const { dispatch, snapshot } = await authorize((s) => {
+      const r = validAdapters(s, s.booted.cohortId);
+      scriptsHolder.push(...r.scripts);
+      return r.map;
+    });
+    const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, snapshot.booted.cohortId), gate);
+    assert.ok(env.results.every((r) => r.outcome === 'valid'), `${label}: sent + valid`);
+    // requestAt is stamped from the send; that it is the SINGLE gated reading (not a second clock
+    // read) is proven byte-exactly under a strictly-sequenced clock by the dedicated test below.
+    assert.ok(env.results.every((r) => r.attempt.requestAt === new Date(NOW_MS).toISOString()), `${label}: requestAt stamped`);
+    assert.ok(scriptsHolder.every((s) => s.calls === 1), `${label}: each arm sent exactly once`);
+  }
+});
+
+test('an initial past the V-lag cap or backdated is dispatch_lag_exceeded, never sent', async () => {
+  const cases: Array<[string, InitialDispatchGate]> = [
+    ['lag == max + 1ms', gateOf({ detectedAt: new Date(NOW_MS - 10_001).toISOString(), maxDispatchLagMs: 10_000 })],
+    ['backdated (start < detectedAt)', gateOf({ detectedAt: new Date(NOW_MS + 1_000).toISOString(), maxDispatchLagMs: 10_000 })],
+  ];
+  for (const [label, gate] of cases) {
+    const scriptsHolder: Scripted[] = [];
+    const { dispatch, store, snapshot } = await authorize((s) => {
+      const r = throwingAdapters(s);
+      scriptsHolder.push(...r.scripts);
+      return r.map;
+    });
+    const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, snapshot.booted.cohortId), gate);
+    assert.ok(env.results.every((r) => r.outcome === 'dispatch_lag_exceeded'), `${label}: outcome`);
+    assert.ok(env.results.every((r) => r.attempt.requestAt === null), `${label}: never-sent shape (requestAt null)`);
+    assert.ok(env.results.every((r) => /V-lag|too late/.test(r.attempt.errorDetail ?? '')), `${label}: errorDetail present`);
+    assert.equal(scriptsHolder.reduce((n, s) => n + s.calls, 0), 0, `${label}: adapter never called`);
+    assert.deepEqual([...releaseIds(store)].sort(), leaseIdsSorted(dispatch), `${label}: each initial lease released once`);
+  }
+});
+
+test('an initial at/after windowEnd is cutoff_missed, never sent — windowEnd is exclusive', async () => {
+  const cases: Array<[string, InitialDispatchGate]> = [
+    ['start after windowEnd', gateOf({ windowEnd: new Date(NOW_MS - 1_000).toISOString(), detectedAt: new Date(NOW_MS - 5_000).toISOString(), maxDispatchLagMs: 10_000 })],
+    ['start == windowEnd exactly', gateOf({ windowEnd: new Date(NOW_MS).toISOString(), detectedAt: new Date(NOW_MS - 5_000).toISOString(), maxDispatchLagMs: 10_000 })],
+  ];
+  for (const [label, gate] of cases) {
+    const scriptsHolder: Scripted[] = [];
+    const { dispatch, store, snapshot } = await authorize((s) => {
+      const r = throwingAdapters(s);
+      scriptsHolder.push(...r.scripts);
+      return r.map;
+    });
+    const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, snapshot.booted.cohortId), gate);
+    assert.ok(env.results.every((r) => r.outcome === 'cutoff_missed'), `${label}: outcome`);
+    assert.ok(env.results.every((r) => r.attempt.requestAt === null), `${label}: never-sent shape`);
+    assert.ok(env.results.every((r) => /windowEnd|first pitch/.test(r.attempt.errorDetail ?? '')), `${label}: errorDetail present`);
+    assert.equal(scriptsHolder.reduce((n, s) => n + s.calls, 0), 0, `${label}: adapter never called`);
+    assert.deepEqual([...releaseIds(store)].sort(), leaseIdsSorted(dispatch), `${label}: each initial lease released once`);
+  }
+});
+
+test('first pitch already reached at the pre-dispatch fast-fail is cutoff_missed (before the gate)', async () => {
+  const scriptsHolder: Scripted[] = [];
+  const { dispatch, snapshot } = await authorize((s) => {
+    const r = throwingAdapters(s);
+    scriptsHolder.push(...r.scripts);
+    return r.map;
+  });
+  const env = await runAuthorizedDispatch(dispatch, options(() => CUTOFF_MS, snapshot.booted.cohortId), PERMISSIVE_GATE);
+  assert.ok(env.results.every((r) => r.outcome === 'cutoff_missed'));
+  assert.ok(env.results.every((r) => /cutoff had already passed at dispatch/.test(r.attempt.errorDetail ?? '')));
+  assert.equal(scriptsHolder.reduce((n, s) => n + s.calls, 0), 0, 'the fast-fail returns before any send');
+});
+
+test('reading #1 before first pitch but the persisted start reaches first pitch is cutoff_missed via the gate', async () => {
+  const scriptsHolder: Scripted[] = [];
+  const { dispatch, snapshot } = await authorize((s) => {
+    const r = soloReader(s, s.booted.cohortId, () => {
+      throw new Error('a gated-out initial must not send');
+    });
+    scriptsHolder.push(...r.scripts);
+    return r.map;
+  });
+  // read #1 (dispatch fast-fail) sees a time < first pitch; read #2 (the persisted start) reaches it.
+  const clock = queueClock([CUTOFF_MS - 1_000, CUTOFF_MS]);
+  const gate = gateOf({ detectedAt: new Date(CUTOFF_MS).toISOString(), maxDispatchLagMs: 1_000_000_000 });
+  const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
+  assert.equal(armAt(env, dispatch, 0).outcome, 'cutoff_missed');
+  assert.equal(scriptsHolder[0]!.calls, 0, 'the sole clock reader was never sent — its persisted start reached first pitch');
+});
+
+test('an initial violating BOTH windowEnd and V-lag is cutoff_missed (windowEnd outranks V-lag)', async () => {
+  const scriptsHolder: Scripted[] = [];
+  const { dispatch, store, snapshot } = await authorize((s) => {
+    const r = throwingAdapters(s);
+    scriptsHolder.push(...r.scripts);
+    return r.map;
+  });
+  // start == windowEnd (violated) AND lag == max + 1 (V-lag violated) on one reading; first pitch clean.
+  const gate = gateOf({ windowEnd: new Date(NOW_MS).toISOString(), detectedAt: new Date(NOW_MS - 10_001).toISOString(), maxDispatchLagMs: 10_000 });
+  const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, snapshot.booted.cohortId), gate);
+  assert.ok(env.results.every((r) => r.outcome === 'cutoff_missed'), 'windowEnd wins — cutoff_missed, not dispatch_lag_exceeded');
+  assert.equal(scriptsHolder.reduce((n, s) => n + s.calls, 0), 0);
+  assert.deepEqual([...releaseIds(store)].sort(), leaseIdsSorted(dispatch));
+});
+
+test('an initial violating BOTH first pitch and V-lag is cutoff_missed (first pitch outranks V-lag)', async () => {
+  const scriptsHolder: Scripted[] = [];
+  const { dispatch, snapshot } = await authorize((s) => {
+    const r = soloReader(s, s.booted.cohortId, () => {
+      throw new Error('a gated-out initial must not send');
+    });
+    scriptsHolder.push(...r.scripts);
+    return r.map;
+  });
+  // read #1 < first pitch (fast-fail passes); persisted start (read #2) == first pitch AND lag > max.
+  const clock = queueClock([CUTOFF_MS - 1_000, CUTOFF_MS]);
+  const gate = gateOf({ detectedAt: new Date(CUTOFF_MS - 1_000_000).toISOString(), maxDispatchLagMs: 10_000 });
+  const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
+  assert.equal(armAt(env, dispatch, 0).outcome, 'cutoff_missed', 'first pitch wins — not dispatch_lag_exceeded');
+  assert.equal(scriptsHolder[0]!.calls, 0);
+});
+
+test('a repair whose start crosses windowEnd is never gated — it proceeds with its own fresh start', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  let now = NOW_MS;
+  const { dispatch, store } = await authorize((s) => soloClockReaderAdapters(s, cohortId));
+  // The repair-slot acquisition advances the clock PAST the gate's windowEnd, but before first pitch.
+  store.onRepair = (req) => {
+    now = NOW_MS + 30_000; // after gate.windowEnd (NOW_MS + 20s), before first pitch (CUTOFF)
+    return Promise.resolve({ outcome: 'acquired', lease: { leaseId: `repair-${req.armIndex}-${req.repairOrdinal}`, armIndex: req.armIndex, expiresAt: 'x', state: 'live' }, requestAuthorized: true });
+  };
+  const gate = gateOf({ detectedAt: new Date(NOW_MS).toISOString(), windowEnd: new Date(NOW_MS + 20_000).toISOString(), maxDispatchLagMs: 1_000_000_000 });
+  const env = await runAuthorizedDispatch(dispatch, options(() => now, cohortId), gate);
+  const arm0 = armAt(env, dispatch, 0);
+  assert.equal(arm0.outcome, 'valid', 'the repair after windowEnd proceeded and validated (initial-only gate)');
+  assert.equal(arm0.repairUsed, true);
+  // The repair took its OWN fresh reading (after windowEnd), never the initial gated start.
+  assert.equal(arm0.repair?.requestAt, new Date(NOW_MS + 30_000).toISOString(), 'repair requestAt is fresh');
+  assert.notEqual(arm0.repair?.requestAt, arm0.attempt.requestAt);
+});
+
+test('a repair reaching first pitch is refused by the existing repair checkpoint, not the initial gate', async () => {
+  const cohortId = sealedSnapshot().booted.cohortId;
+  let now = NOW_MS;
+  const { dispatch, store } = await authorize((s) => soloClockReaderAdapters(s, cohortId));
+  store.onRepair = (req) => {
+    now = CUTOFF_MS + 1; // the acquire pushes the clock past first pitch
+    return Promise.resolve({ outcome: 'acquired', lease: { leaseId: `repair-${req.armIndex}-${req.repairOrdinal}`, armIndex: req.armIndex, expiresAt: 'x', state: 'live' }, requestAuthorized: true });
+  };
+  const gate = gateOf({ detectedAt: new Date(NOW_MS).toISOString(), maxDispatchLagMs: 1_000_000_000 });
+  const env = await runAuthorizedDispatch(dispatch, options(() => now, cohortId), gate);
+  const arm0 = armAt(env, dispatch, 0);
+  assert.equal(arm0.outcome, 'cutoff_missed');
+  assert.equal(arm0.repair, null, 'the repair was refused by the first-pitch checkpoint before sending');
+});
+
+test('the persisted requestAt, latency, and acceptedAt all derive from the ONE gated reading', async () => {
+  const T = CUTOFF_MS - 100_000;
+  const scriptsHolder: Scripted[] = [];
+  const { dispatch, snapshot } = await authorize((s) => {
+    const r = soloReader(s, s.booted.cohortId, (id) => validBody(id.participantId, id.requestedModelId, s.booted.cohortId, s.prepared.requestSha256));
+    scriptsHolder.push(...r.scripts);
+    return r.map;
+  });
+  // reads: #1 dispatch-check (T), #2 initialStart (T+1) — the gate operand AND the persisted start,
+  // #3 response stamp (T+2), #4 receipt (T+3), #5 accept (T+4).
+  const clock = queueClock([T, T + 1, T + 2, T + 3, T + 4, T + 5]);
+  const gate = gateOf({ detectedAt: new Date(T).toISOString(), maxDispatchLagMs: 1_000_000_000 });
+  const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
+  const arm0 = armAt(env, dispatch, 0);
+  assert.equal(arm0.outcome, 'valid');
+  assert.equal(arm0.attempt.requestAt, new Date(T + 1).toISOString(), 'requestAt is the gated reading (one read), not a separate clock read');
+  assert.equal(arm0.attempt.responseAt, new Date(T + 2).toISOString());
+  assert.equal(arm0.attempt.latencyMs, 1, 'latency = responseAt - the same gated start');
+  assert.equal(arm0.attempt.acceptedAt, new Date(T + 4).toISOString());
+});
+
+test('a transport failure keeps the gated start on both classifications (timeout + generic)', async () => {
+  const cases: Array<[string, () => never, 'timeout' | 'provider_error']> = [
+    ['ProviderTimeoutError', () => { throw new ProviderTimeoutError('openai', 1); }, 'timeout'],
+    ['generic transport error', () => { throw new Error('transport exploded'); }, 'provider_error'],
+  ];
+  for (const [label, thrower, expected] of cases) {
+    const T = CUTOFF_MS - 100_000;
+    const scriptsHolder: Scripted[] = [];
+    const { dispatch, snapshot } = await authorize((s) => {
+      const r = soloReader(s, s.booted.cohortId, () => thrower());
+      scriptsHolder.push(...r.scripts);
+      return r.map;
+    });
+    // reads: #1 dispatch-check (T), #2 initialStart (T+1) → gate ok → send → throw → #3 respondedAt (T+2).
+    const clock = queueClock([T, T + 1, T + 2, T + 3]);
+    const gate = gateOf({ detectedAt: new Date(T).toISOString(), maxDispatchLagMs: 1_000_000_000 });
+    const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
+    const arm0 = armAt(env, dispatch, 0);
+    assert.equal(arm0.outcome, expected, label);
+    assert.equal(scriptsHolder[0]!.calls, 1, `${label}: the initial WAS sent, then failed`);
+    assert.equal(arm0.attempt.requestAt, new Date(T + 1).toISOString(), `${label}: requestAt is the gated start on the FAILURE branch`);
+    assert.equal(arm0.attempt.latencyMs, 1, `${label}: latency from the same start`);
+  }
+});
+
+test('a shared detectedAt with per-arm dispatch timing — the on-time arm sends, later arms are dispatch_lag_exceeded', async () => {
+  const base = CUTOFF_MS - 100_000;
+  const scriptsHolder: Scripted[] = [];
+  const { dispatch, snapshot } = await authorize((s) => {
+    const r = validAdapters(s, s.booted.cohortId);
+    scriptsHolder.push(...r.scripts);
+    return r.map;
+  });
+  // Each arm's synchronous prefix (dispatch-check + initialStart) runs before the next arm's, so
+  // arm 0 reads base+1 (lag 1), arm k reads base+(2k+1). With a 2ms cap only arm 0 is on-time.
+  const clock = queueClock(Array.from({ length: 40 }, (_, i) => base + i));
+  const gate = gateOf({ detectedAt: new Date(base).toISOString(), maxDispatchLagMs: 2 });
+  const env = await runAuthorizedDispatch(dispatch, options(clock, snapshot.booted.cohortId), gate);
+  assert.equal(armAt(env, dispatch, 0).outcome, 'valid', 'the on-time arm sent + validated');
+  assert.equal(scriptsHolder[0]!.calls, 1, 'the on-time arm was sent');
+  for (const i of [1, 2, 3]) {
+    assert.equal(armAt(env, dispatch, i).outcome, 'dispatch_lag_exceeded', `arm ${i} is late (per-arm gate, shared detectedAt)`);
+    assert.equal(scriptsHolder[i]!.calls, 0, `arm ${i} was never sent`);
+  }
+});
+
+test('a malformed gate after admission throws inside the cleanup backstop — zero calls, one release per lease, causes compose', async () => {
+  const scriptsHolder: Scripted[] = [];
+  const { dispatch, store, snapshot } = await authorize((s) => {
+    const r = validAdapters(s, s.booted.cohortId);
+    scriptsHolder.push(...r.scripts);
+    return r.map;
+  });
+  const arm0Lease = dispatch.permit.initialLeases.find((l) => l.armIndex === 0)!.leaseId;
+  // Only arm 0's release refuses, so its gate-throw COMPOSES with a cleanup fault.
+  store.onRelease = (req): Promise<ReleaseResult> =>
+    req.leaseId === arm0Lease ? Promise.resolve({ outcome: 'refused', reason: 'not_owner' }) : Promise.resolve({ outcome: 'released' });
+  // A malformed (offset-less) detectedAt makes initialDispatchGate THROW per arm, after a genuine
+  // admission — the throw must stay inside dispatchArm's initial-lease cleanup backstop.
+  const gate: InitialDispatchGate = { detectedAt: '2026-07-18T12:00:30', windowEnd: WINDOW_END, maxDispatchLagMs: 10_000 };
+  const fault = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, snapshot.booted.cohortId), gate).then(
+    () => null,
+    (e: unknown) => e,
+  );
+  assert.ok(fault instanceof AuthorizedDispatchFaultError, 'the gate throw is aggregated across arms');
+  const composite = fault.failures.find((f): f is AttemptCleanupFaultError => f instanceof AttemptCleanupFaultError);
+  assert.ok(composite, 'the arm whose cleanup failed composes both causes');
+  assert.ok(composite.primary instanceof Error && /offset|instant/.test(composite.primary.message), 'the gate throw is the primary cause');
+  assert.ok(composite.cleanup instanceof LifecycleFaultError, 'the cleanup fault is retained, not discarded');
+  assert.equal(scriptsHolder.reduce((n, s) => n + s.calls, 0), 0, 'no adapter was called — the gate threw before any send');
+  assert.deepEqual([...releaseIds(store)].sort(), leaseIdsSorted(dispatch), 'each initial lease got exactly one release attempt');
+  assert.equal(new Set(releaseIds(store)).size, dispatch.permit.initialLeases.length, 'each lease released once');
+});
+
+test('the initial-dispatch gate is a REQUIRED typed parameter of runAuthorizedDispatch (positive capability)', () => {
+  const runnerSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'runner.ts'), 'utf8');
+  assert.ok(
+    /export async function runAuthorizedDispatch\([\s\S]*?gate: InitialDispatchGate,\s*\): Promise<RunEnvelope>/.test(runnerSrc),
+    'runAuthorizedDispatch takes a required gate: InitialDispatchGate',
+  );
+  assert.ok(!/gate\?: InitialDispatchGate/.test(runnerSrc), 'the gate is never optional (no runtime fail-open path)');
+  assert.ok(/gate: InitialDispatchGate \| null/.test(runnerSrc), 'threaded as a nullable sibling of the lifecycle through the arm dispatch');
 });

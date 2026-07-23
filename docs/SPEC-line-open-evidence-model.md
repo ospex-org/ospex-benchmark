@@ -631,7 +631,7 @@ violation (there is no free absence marker):
 | `rate_limited` | sent (429) | valid negative — a throttle must never read as a model failure |
 | `provider_error` | sent | valid negative — provider/transport refusal with **no body** |
 | `cutoff_missed` | an arm in an already-claimed fire where the **initial** request is unsent at/after `windowEnd` or `scheduledAtAtFire`, **or** a **repair** request/response crosses `scheduledAtAtFire` (first pitch), or any response is accepted at/after first pitch → no request sent / no decision accepted. Crossing `windowEnd` **after** a timely initial request is **not** by itself `cutoff_missed`. | valid negative; **no** decision records |
-| `dispatch_lag_exceeded` | **not sent** — the **initial** request would start `> maxDispatchLagMs` after `detectedAt` (**V-lag**, initial-only, measured at the provider HTTP boundary; both operands benchmark-host, no skew) | valid negative |
+| `dispatch_lag_exceeded` | **not sent** — the **initial** request start is **before** `detectedAt` **or** more than `maxDispatchLagMs` after it (**V-lag**, two-sided, initial-only, measured at the provider HTTP boundary; both operands benchmark-host, no skew) | valid negative |
 | `credential_missing` | not sent (should be blocked at boot) | structural — a required arm makes the fire fail integrity |
 
 "Failures never leave the denominator" — a *partial* fire still scores its sent arms;
