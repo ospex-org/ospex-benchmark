@@ -17,6 +17,9 @@ import { sealPreparedFire } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { AuthorizedDispatchFaultError, ClockRequiredError, runAuthorizedDispatch } from './runner.js';
+import { buildFireArtifact } from './fireArtifactProducer.js';
+import type { FireContext } from './fireArtifactProducer.js';
+import { verifyFireArtifactReplay } from './fireArtifactWriter.js';
 import { initialDispatchGate } from './attemptProvenance.js';
 import type { InitialDispatchGate } from './runner.js';
 import type { SlateRunOptions } from './runner.js';
@@ -1135,9 +1138,59 @@ test('an initial at/after windowEnd is cutoff_missed, never sent — windowEnd i
     assert.ok(env.results.every((r) => r.outcome === 'cutoff_missed'), `${label}: outcome`);
     assert.ok(env.results.every((r) => r.attempt.requestAt === null), `${label}: never-sent shape`);
     assert.ok(env.results.every((r) => /windowEnd|first pitch/.test(r.attempt.errorDetail ?? '')), `${label}: errorDetail present`);
+    // B3: the gate-site cutoff_missed (windowEnd crossing) carries the exact discarded reading too —
+    // NOT only dispatch_lag_exceeded. Every arm read NOW_MS, so every refused reading is that instant.
+    assert.ok(
+      env.results.every((r) => r.refusedInitialStartAt === new Date(NOW_MS).toISOString()),
+      `${label}: every cutoff_missed carries the refused reading`,
+    );
     assert.equal(scriptsHolder.reduce((n, s) => n + s.calls, 0), 0, `${label}: adapter never called`);
     assert.deepEqual([...releaseIds(store)].sort(), leaseIdsSorted(dispatch), `${label}: each initial lease released once`);
   }
+});
+
+test('B3: a gate-site cutoff_missed (clock between windowEnd and first pitch) produces a writer-clean fire carrying the reading', async () => {
+  // The stronger closure of the writer PRESENCE half against a GATE-produced cutoff_missed (the
+  // legacy-cutoff variant is covered in the sink tests): a windowEnd-crossing gate refusal is not only
+  // recorded on the arm result — it flows through the PRODUCER into a fire whose persisted
+  // `initialRequestStartedAt` IS the discarded reading, whose `orderedAttempts` stay empty, and which
+  // the writer replay accepts. If runner.ts stopped carrying the reading on a cutoff_missed gate
+  // refusal, the produced arm would have a null start and the replay would reject it.
+  const scriptsHolder: Scripted[] = [];
+  const { dispatch, snapshot } = await authorize((s) => {
+    const r = throwingAdapters(s);
+    scriptsHolder.push(...r.scripts);
+    return r.map;
+  });
+  // The clock reads NOW_MS, strictly between windowEnd (NOW_MS - 1s) and first pitch (CUTOFF): every
+  // arm is refused at the gate as cutoff_missed, never sent.
+  const gate = gateOf({ windowEnd: new Date(NOW_MS - 1_000).toISOString(), detectedAt: new Date(NOW_MS - 5_000).toISOString(), maxDispatchLagMs: 10_000 });
+  const env = await runAuthorizedDispatch(dispatch, options(() => NOW_MS, snapshot.booted.cohortId), gate);
+  assert.ok(env.results.every((r) => r.outcome === 'cutoff_missed'), 'every arm is a gate-site cutoff_missed');
+  assert.equal(scriptsHolder.reduce((n, s) => n + s.calls, 0), 0, 'nothing was sent');
+
+  const ctx: FireContext = {
+    booted: snapshot.booted,
+    fireId: snapshot.fireId,
+    runId: 'run-gate-cutoff-fire',
+    publication: snapshot.publication,
+    bundleBuiltAt: BUNDLE_BUILT_AT,
+    perMarket: MARKETS.map((m) => ({
+      candidateInput: candidateInput(m),
+      verdict: evaluateCandidate(candidateInput(m)),
+      historyRows: [historyRow(m)],
+      historyWatermark: null,
+      claim: { cohortId: snapshot.booted.cohortId, fireId: snapshot.fireId, gameId: GAME_ID, market: m },
+    })),
+  };
+  const artifact = buildFireArtifact(env, ctx);
+  const reading = new Date(NOW_MS).toISOString();
+  for (const arm of artifact.arms) {
+    assert.equal(arm.terminalOutcome, 'cutoff_missed', 'gate-produced cutoff_missed');
+    assert.equal(arm.initialRequestStartedAt, reading, 'the persisted start IS the discarded gate reading');
+    assert.equal(arm.orderedAttempts.length, 0, 'no attempt was fabricated for a never-sent arm');
+  }
+  assert.deepEqual(verifyFireArtifactReplay(artifact), [], 'the gate-produced never-sent fire replays writer-clean');
 });
 
 test('first pitch already reached at the pre-dispatch fast-fail is cutoff_missed (before the gate)', async () => {

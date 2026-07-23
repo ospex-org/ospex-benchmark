@@ -431,6 +431,17 @@ function buildArmEvidence(
     throw new Error(`arm ${identity.participantId} was dispatched on a different request than the fire`);
   }
   const orderedAttempts = toPersistedAttempts(result);
+  // A SENT attempt (non-null `attempt.requestAt`) and a never-sent refusal reading
+  // (`refusedInitialStartAt`) are mutually exclusive by the runner's construction — a sent path
+  // leaves the refusal carrier null, and a refusal never populates `attempt.requestAt`. Enforce that
+  // invariant fail-closed here so the `??` re-source below has no ambiguous both-non-null case to
+  // silently order: any future path that produced both would be a fabricated-provenance bug, not a
+  // precedence choice.
+  if (result.attempt.requestAt !== null && result.refusedInitialStartAt !== null) {
+    throw new Error(
+      `arm ${identity.participantId}: a sent attempt cannot also carry a never-sent refusal reading`,
+    );
+  }
   // The initial send-boundary / request-start decision instant — the SOLE V-lag operand, kept
   // distinct from each attempt's own requestStartedAt. A SENT initial sources it from its real
   // `attempt.requestAt`; a never-sent gate/legacy-cutoff refusal sources it from the internal

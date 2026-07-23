@@ -8,12 +8,31 @@ import {
   verifyAttemptOrdering,
 } from './attemptProvenance.js';
 import type { AttemptTiming } from './attemptProvenance.js';
+import type { ArmOutcome } from './types.js';
 
 /**
  * §5 per-attempt timing provenance: causal ordering (case 48), the initial-only
  * V-lag (dispatch_lag_exceeded), and the windowEnd / first-pitch cutoff race
  * (case 26). Every fixture instant is offset-qualified; the checks fail closed.
  */
+
+/**
+ * Every `ArmOutcome`, derived from an exhaustive `Record` so a NEW union member forces
+ * a compile error here (and must be added below) — the B3 recompute teeth cycle the
+ * recorded terminal through this whole set to prove the verdict follows the OPERANDS,
+ * never the recorded label.
+ */
+const ARM_OUTCOME_PRESENCE: Record<ArmOutcome, true> = {
+  valid: true,
+  invalid_schema: true,
+  timeout: true,
+  credential_missing: true,
+  rate_limited: true,
+  provider_error: true,
+  cutoff_missed: true,
+  dispatch_lag_exceeded: true,
+};
+const ALL_ARM_OUTCOMES = Object.keys(ARM_OUTCOME_PRESENCE) as ArmOutcome[];
 
 const INITIAL_START = '2026-07-16T00:00:05.000Z';
 const WINDOW_END = '2026-07-16T00:02:00.000Z';
@@ -223,6 +242,51 @@ test('dispatchLagVerdict throws on a malformed cap or instant (fail-closed)', ()
     assert.throws(() => dispatchLagVerdict({ detectedAt, initialRequestStartedAt: started, maxDispatchLagMs: bad as number }), String(bad));
   }
   assert.throws(() => dispatchLagVerdict({ detectedAt: '2026-07-16T00:00:00', initialRequestStartedAt: started, maxDispatchLagMs: 10000 }));
+});
+
+test('the V-lag negative bound is HARD zero: lag=-1ms is exceeded while lag=0 is ok (no negative tolerance)', () => {
+  // Pinning lag=0 -> ok AND lag=-1ms -> exceeded leaves no room for any negative tolerance
+  // band: the lower bound is exactly zero, not "a little before detection is fine".
+  const detectedAt = '2026-07-16T00:00:00.000Z';
+  const backOneMs = '2026-07-15T23:59:59.999Z'; // detectedAt - 1ms → lag = -1
+  const maxDispatchLagMs = 10_000;
+
+  // (a) dispatchLagVerdict directly.
+  assert.equal(dispatchLagVerdict({ detectedAt, initialRequestStartedAt: detectedAt, maxDispatchLagMs }), 'ok'); // lag 0
+  assert.equal(
+    dispatchLagVerdict({ detectedAt, initialRequestStartedAt: backOneMs, maxDispatchLagMs }),
+    'dispatch_lag_exceeded',
+  ); // lag -1ms
+
+  // (b) through initialDispatchGate (windowEnd + first pitch far so V-lag is isolated).
+  assert.deepEqual(gate({ detectedAt, initialRequestStartedAt: detectedAt }), { ok: true }); // lag 0
+  assert.deepEqual(gate({ detectedAt, initialRequestStartedAt: backOneMs }), {
+    ok: false,
+    outcome: 'dispatch_lag_exceeded',
+  }); // lag -1ms
+
+  // (c) through the scorer-side recompute (bounds far so V-lag is the sole crossing).
+  const far = { windowEnd: '2026-07-16T00:02:00.000Z', scheduledAtAtFire: '2026-07-16T01:00:00.000Z' };
+  assert.deepEqual(
+    recomputeInitialDispatchGate({
+      detectedAt,
+      initialRequestStartedAt: detectedAt,
+      ...far,
+      maxDispatchLagMs,
+      recordedTerminalOutcome: 'valid',
+    }),
+    { ok: true },
+  ); // lag 0
+  assert.deepEqual(
+    recomputeInitialDispatchGate({
+      detectedAt,
+      initialRequestStartedAt: backOneMs,
+      ...far,
+      maxDispatchLagMs,
+      recordedTerminalOutcome: 'dispatch_lag_exceeded',
+    }),
+    { ok: false, outcome: 'dispatch_lag_exceeded' },
+  ); // lag -1ms
 });
 
 // --- cutoffViolations (case 26) ---
@@ -548,4 +612,58 @@ test('B3-R2: recomputeInitialDispatchGate re-derives the gate verdict from opera
     }),
     { ok: true },
   );
+});
+
+test('B3-R2: recompute follows the OPERANDS over the WHOLE enum — the recorded terminal never moves the verdict', () => {
+  // FIXED operands, `recordedTerminalOutcome` cycled through EVERY ArmOutcome. The recorded label is
+  // carried for context only and must NEVER enter the re-derivation, in EITHER direction:
+  //   (a) an in-time (ok) operand set stays { ok: true } for all eight recorded labels — even a
+  //       recorded 'dispatch_lag_exceeded' / 'cutoff_missed' cannot force a non-ok verdict;
+  //   (b) a windowEnd-CROSSING operand set (true verdict cutoff_missed) stays cutoff_missed for all
+  //       eight — even a recorded 'dispatch_lag_exceeded' cannot rewrite the outcome, and a recorded
+  //       'valid' cannot force ok.
+  const detectedAt = '2026-07-16T00:00:00.000Z';
+  const windowEnd = '2026-07-16T00:02:00.000Z';
+  const scheduledAtAtFire = '2026-07-16T01:00:00.000Z';
+  const maxDispatchLagMs = 10_000;
+  const okStart = '2026-07-16T00:00:05.000Z'; // before windowEnd/first pitch, within V-lag → ok
+  const crossStart = '2026-07-16T00:02:05.000Z'; // >= windowEnd, < first pitch → cutoff_missed
+
+  assert.equal(ALL_ARM_OUTCOMES.length, 8, 'the enum is walked in full');
+  for (const recordedTerminalOutcome of ALL_ARM_OUTCOMES) {
+    assert.deepEqual(
+      recomputeInitialDispatchGate({ detectedAt, initialRequestStartedAt: okStart, scheduledAtAtFire, windowEnd, maxDispatchLagMs, recordedTerminalOutcome }),
+      { ok: true },
+      `ok operands must stay ok regardless of recorded terminal ${recordedTerminalOutcome}`,
+    );
+    assert.deepEqual(
+      recomputeInitialDispatchGate({ detectedAt, initialRequestStartedAt: crossStart, scheduledAtAtFire, windowEnd, maxDispatchLagMs, recordedTerminalOutcome }),
+      { ok: false, outcome: 'cutoff_missed' },
+      `windowEnd-crossing operands must stay cutoff_missed regardless of recorded terminal ${recordedTerminalOutcome}`,
+    );
+  }
+});
+
+test('B3-R2: recomputeInitialDispatchGate is fail-CLOSED — it PROPAGATES the throw, never degrades to a verdict', () => {
+  // The recompute entry point must throw exactly like initialDispatchGate on a malformed operand or
+  // cap; degrading a malformed refusal to a silent `{ ok: true }` would let unverifiable evidence
+  // pass. (Asserted through the recompute entry point specifically, not only initialDispatchGate.)
+  const okOperands = {
+    detectedAt: '2026-07-16T00:00:00.000Z',
+    scheduledAtAtFire: '2026-07-16T01:00:00.000Z',
+    windowEnd: '2026-07-16T00:02:00.000Z',
+    maxDispatchLagMs: 10_000,
+    recordedTerminalOutcome: 'valid' as ArmOutcome,
+  };
+  // A malformed (offset-less) initialRequestStartedAt → instantMs rejects → throws.
+  assert.throws(() =>
+    recomputeInitialDispatchGate({ ...okOperands, initialRequestStartedAt: '2026-07-16T00:00:00' }),
+  );
+  // A non-safe / negative cap → throws.
+  for (const cap of [Number.NaN, -1]) {
+    assert.throws(() =>
+      recomputeInitialDispatchGate({ ...okOperands, initialRequestStartedAt: '2026-07-16T00:00:05.000Z', maxDispatchLagMs: cap }),
+      String(cap),
+    );
+  }
 });

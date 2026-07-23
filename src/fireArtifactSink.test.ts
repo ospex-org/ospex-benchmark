@@ -28,6 +28,7 @@ import type { TwoSidedHistoryRow } from './oddsHistory.js';
 import type { RunEnvelope } from './runner.js';
 import type { GameRequest } from './bundle.js';
 import type {
+  ArmOutcome,
   ArmSpec,
   BenchmarkResponse,
   ForecastOutput,
@@ -897,4 +898,61 @@ test('B3-R3 (3): a non-null start on a zero-attempt credential_missing arm fails
     'replay rejects a spurious start on credential_missing',
   );
   assert.throws(() => installMutated(spurious), /fails replay/, 'install refuses a spurious credential_missing start');
+});
+
+/**
+ * The send-time-gate set that OWNS the presence half of the bidirectional zero-attempt relation,
+ * derived from an exhaustive `Record` so a NEW `ArmOutcome` member forces a compile error here (and
+ * an explicit classification), never silently defaulting into or out of the gate set.
+ */
+const SEND_TIME_GATE_REFUSAL: Record<ArmOutcome, boolean> = {
+  valid: false,
+  invalid_schema: false,
+  timeout: false,
+  credential_missing: false,
+  rate_limited: false,
+  provider_error: false,
+  cutoff_missed: true,
+  dispatch_lag_exceeded: true,
+};
+
+test('B3-R3 (4): the bidirectional zero-attempt relation is enum-EXHAUSTIVE — every ArmOutcome, both directions', async () => {
+  // Today only credential_missing exercises the absence half. This walks ALL eight ArmOutcome
+  // members through the REAL install → replay over a ZERO-ATTEMPT arm, both directions:
+  //   send-time gate refusals {cutoff_missed, dispatch_lag_exceeded}: a non-null start replays clean,
+  //     a null start yields the "null initialRequestStartedAt" (presence) violation;
+  //   every other zero-attempt outcome: a null start replays clean, a spurious non-null start yields
+  //     the "not a send-time gate refusal but a non-null initialRequestStartedAt" (absence) violation.
+  // `valid` is EXCLUDED: a zero-attempt valid arm trips the distinct accepted-count digest rule, not
+  // the zero-attempt start relation this tooth pins.
+  const { artifact, refused } = await producedMixedNeverSentFire();
+  const parsed = parseFireArtifactV1(serializeFireArtifactV1(artifact));
+  const baseIndex = parsed.arms.findIndex((a) => a.orderedAttempts.length === 0);
+  assert.ok(baseIndex >= 0, 'fixture has a zero-attempt arm to patch');
+
+  // Inline exhaustiveness: the send-time-gate set is EXACTLY {cutoff_missed, dispatch_lag_exceeded},
+  // so adding/moving a member trips this assertion.
+  assert.deepEqual(
+    Object.entries(SEND_TIME_GATE_REFUSAL)
+      .filter(([, isGate]) => isGate)
+      .map(([outcome]) => outcome)
+      .sort(),
+    ['cutoff_missed', 'dispatch_lag_exceeded'],
+    'exactly two outcomes own the presence half',
+  );
+
+  for (const [outcome, isGate] of Object.entries(SEND_TIME_GATE_REFUSAL) as Array<[ArmOutcome, boolean]>) {
+    if (outcome === 'valid') continue; // excluded (trips the accepted-count digest rule, not this one)
+    const cleanStart = isGate ? refused : null; // gate refusal keeps the reading; the rest took none
+    const badStart = isGate ? null : refused; // gate refusal missing it = deletion; the rest spurious = fabrication
+
+    const clean = patchArmCoherent(parsed, baseIndex, { terminalOutcome: outcome, initialRequestStartedAt: cleanStart });
+    assert.deepEqual(verifyFireArtifactReplay(clean), [], `${outcome}: the correct zero-attempt shape replays clean`);
+    assert.doesNotThrow(() => installMutated(clean), `${outcome}: the correct zero-attempt shape installs`);
+
+    const bad = patchArmCoherent(parsed, baseIndex, { terminalOutcome: outcome, initialRequestStartedAt: badStart });
+    const needle = isGate ? 'null initialRequestStartedAt' : 'not a send-time gate refusal but a non-null initialRequestStartedAt';
+    assert.ok(hasViolation(verifyFireArtifactReplay(bad), needle), `${outcome}: the wrong zero-attempt shape fails replay (${needle})`);
+    assert.throws(() => installMutated(bad), /fails replay/, `${outcome}: install refuses the wrong zero-attempt shape`);
+  }
 });

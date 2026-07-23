@@ -73,6 +73,19 @@ test('already past cutoff at dispatch: cutoff_missed, no provider call', async (
   assert.equal(adapter.calls.length, 0);
 });
 
+test('legacy pre-dispatch cutoff is inclusive at the EXACT first pitch (remaining=0): cutoff_missed, no call, carries the reading', async () => {
+  // runOneArmGame is the legacy path (gate=null). A dispatch reading landing EXACTLY on first pitch
+  // leaves zero remaining, which the `<= 0` boundary must refuse BEFORE any send — a `< 0` boundary
+  // would let this doomed request through. The discarded reading is carried on refusedInitialStartAt
+  // (B3), and no provider call is made.
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  const adapter = stubAdapter([]);
+  const result = await runOneArmGame(TEST_ARM, adapter, request, baseOptions(() => CUTOFF_MS));
+  assert.equal(result.outcome, 'cutoff_missed');
+  assert.equal(adapter.calls.length, 0);
+  assert.equal(result.refusedInitialStartAt, new Date(CUTOFF_MS).toISOString());
+});
+
 test('valid response crossing the cutoff: cutoff_missed, no decisions', async () => {
   const request = prepareGameRequest(makeRequest(CUTOFF));
   let now = CUTOFF_MS - 60_000;
