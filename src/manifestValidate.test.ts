@@ -97,7 +97,8 @@ test('a code-consistent manifest has no modelPriceTable violation', () => {
 });
 
 test('unknown modelPriceTableVersion is flagged, and does not also produce a digest mismatch', () => {
-  const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), modelPriceTableVersion: 'prices-v2' }));
+  // prices-v3 is genuinely unregistered (prices-v1 + prices-v2 are the known versions).
+  const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), modelPriceTableVersion: 'prices-v3' }));
   assert.ok(v.some((s) => /unknown modelPriceTableVersion/.test(s)), v.join('; '));
   assert.ok(!v.some((s) => /modelPriceTableDigest mismatch/.test(s)), v.join('; '));
 });
