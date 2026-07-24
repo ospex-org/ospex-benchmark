@@ -24,6 +24,13 @@ import { APPROVED_REPORTED_MODEL_IDS, ARMS } from './providers/index.js';
 /** Canonical digest of prices-v1's rate table, pinned as a golden. */
 const PINNED_DIGEST = 'bbd49df2721e6cf654fc9dd9760d4cc45f53d4d25cb8c81e5f6e08128ceaf39e';
 
+/**
+ * Canonical digest of prices-v2's rate table, pinned as an INDEPENDENT golden: a silent rate edit
+ * that ALSO moves the EXPECTED_TABLE_V2 literal in the same change still breaks this. Re-pin
+ * consciously whenever a v2 rate changes (a manifest that pins prices-v2 binds this digest).
+ */
+const PINNED_DIGEST_V2 = '3d6d47a2427d21429e59094fd9cb9235473206a07b19b62b3292cde605e118c5';
+
 /** The exact prices-v1 rates, as a literal, to re-derive the digest independently. */
 const EXPECTED_TABLE = {
   'gpt-5.6-sol': { inputUsdMicrosPerMillionTokens: 5_000_000, outputUsdMicrosPerMillionTokens: 30_000_000 },
@@ -34,7 +41,7 @@ const EXPECTED_TABLE = {
 
 /** The exact prices-v2 (conservative upper-tier) rates, as a literal, to re-derive independently. */
 const EXPECTED_TABLE_V2 = {
-  'gpt-5.6-sol': { inputUsdMicrosPerMillionTokens: 10_000_000, outputUsdMicrosPerMillionTokens: 45_000_000 },
+  'gpt-5.6-sol': { inputUsdMicrosPerMillionTokens: 12_500_000, outputUsdMicrosPerMillionTokens: 60_000_000 },
   'claude-fable-5': { inputUsdMicrosPerMillionTokens: 10_000_000, outputUsdMicrosPerMillionTokens: 50_000_000 },
   'gemini-3.1-pro-preview': { inputUsdMicrosPerMillionTokens: 4_000_000, outputUsdMicrosPerMillionTokens: 18_000_000 },
   'grok-4.5': { inputUsdMicrosPerMillionTokens: 4_000_000, outputUsdMicrosPerMillionTokens: 12_000_000 },
@@ -195,11 +202,12 @@ test('prices-v2 is conservative: every rate >= the prices-v1 rate for the same m
   }
 });
 
-test('prices-v2 digest: deterministic, 64-hex, re-derivable from the literal, distinct from v1', () => {
+test('prices-v2 digest: deterministic, 64-hex, pinned golden, re-derivable from the literal, distinct from v1', () => {
   const d = modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION);
   assert.equal(d, modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION)); // deterministic
   assert.match(d, /^[0-9a-f]{64}$/);
-  assert.equal(d, sha256Hex(canonicalize(EXPECTED_TABLE_V2))); // re-derived from the literal — a silent module edit breaks this
+  assert.equal(d, PINNED_DIGEST_V2); // INDEPENDENT golden — a silent rate edit breaks this even if EXPECTED_TABLE_V2 moves too
+  assert.equal(d, sha256Hex(canonicalize(EXPECTED_TABLE_V2))); // and re-derives from the rate literal
   assert.notEqual(d, modelPriceTableDigest(MODEL_PRICE_TABLE_VERSION)); // v2 digest != v1 digest
 });
 
@@ -215,5 +223,5 @@ test('prices-v2 rows are runtime-immutable (deep-frozen registry)', () => {
   assert.throws(() => {
     (row as { inputUsdMicrosPerMillionTokens: number }).inputUsdMicrosPerMillionTokens = 1;
   });
-  assert.equal(table['gpt-5.6-sol']!.outputUsdMicrosPerMillionTokens, 45_000_000);
+  assert.equal(table['gpt-5.6-sol']!.outputUsdMicrosPerMillionTokens, 60_000_000);
 });

@@ -69,7 +69,12 @@ const MODEL_PRICE_TABLE_V1: ModelPriceTable = {
  * published tier (snapshot observed 2026-07-23, reconcile again immediately before any paid
  * crossing). A max-context prompt escalates the WHOLE request to the upper tier for the
  * two-tier models, so a table whose only job is to OVER-estimate defaults to that upper tier:
- *   - `gpt-5.6-sol` ........... OpenAI, >272K tier (2×/1.5× on the full request): $10 / $45
+ *   - `gpt-5.6-sol` ........... OpenAI: $12.50 / $60. OUTPUT $60 = Priority Processing (a project can
+ *       default requests that omit `service_tier` to Priority, and the adapter omits it — so Priority
+ *       is reachable). INPUT $12.50 = a conservative long-context prompt-cache write: the pricing page
+ *       states cache-write at 1.25× the STANDARD input ($6.25) but does not bound it in the >272K
+ *       regime, so we use 1.25× the $10 long-context input; this also over-covers the $10 long-context
+ *       and Priority input rates.
  *   - `claude-fable-5` ........ Anthropic, single tier (no long-context premium): $10 / $50
  *   - `gemini-3.1-pro-preview`  Google, >200K tier: $4 / $18
  *   - `grok-4.5` .............. xAI, ≥200K tier (higher rate on all tokens): $4 / $12
@@ -78,7 +83,7 @@ const MODEL_PRICE_TABLE_V1: ModelPriceTable = {
  * rates and does no arithmetic.
  */
 const MODEL_PRICE_TABLE_V2: ModelPriceTable = {
-  'gpt-5.6-sol': { inputUsdMicrosPerMillionTokens: 10_000_000, outputUsdMicrosPerMillionTokens: 45_000_000 },
+  'gpt-5.6-sol': { inputUsdMicrosPerMillionTokens: 12_500_000, outputUsdMicrosPerMillionTokens: 60_000_000 },
   'claude-fable-5': { inputUsdMicrosPerMillionTokens: 10_000_000, outputUsdMicrosPerMillionTokens: 50_000_000 },
   'gemini-3.1-pro-preview': { inputUsdMicrosPerMillionTokens: 4_000_000, outputUsdMicrosPerMillionTokens: 18_000_000 },
   'grok-4.5': { inputUsdMicrosPerMillionTokens: 4_000_000, outputUsdMicrosPerMillionTokens: 12_000_000 },

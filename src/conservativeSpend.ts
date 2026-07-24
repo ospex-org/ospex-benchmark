@@ -41,6 +41,19 @@ export class ConservativeSpendUnknownError extends Error {
   }
 }
 
+/**
+ * Canonical model → provider registry, frozen. The arithmetic uses `provider` to pick usage
+ * SEMANTICS and `requestedModelId` to pick PRICES; an incoherent pair would price the wrong
+ * (often cheaper) cross-provider row. This registry rejects such a pair before pricing. A test
+ * cross-checks it against the authenticated arm roster (`ARMS`) so it cannot drift.
+ */
+export const PROVIDER_BY_MODEL: Readonly<Record<string, ProviderName>> = Object.freeze({
+  'gpt-5.6-sol': 'openai',
+  'claude-fable-5': 'anthropic',
+  'gemini-3.1-pro-preview': 'google',
+  'grok-4.5': 'xai',
+});
+
 /** Tokens split into those billed at the input rate vs the output rate for one attempt. */
 interface RateBuckets {
   readonly inputRateTokens: bigint;
@@ -63,6 +76,18 @@ export function deriveConservativeActualUsdMicros(input: {
 }): number {
   const { provider, requestedModelId, priceVersion, usageRaw } = input;
   const who = `${provider}:${requestedModelId}`;
+
+  // Fail closed on a provider/model mismatch BEFORE pricing — the provider selects usage
+  // semantics while an independent model id selects prices, so an incoherent pair would price a
+  // wrong (often cheaper) cross-provider row rather than the model actually dispatched.
+  const expectedProvider = Object.hasOwn(PROVIDER_BY_MODEL, requestedModelId)
+    ? PROVIDER_BY_MODEL[requestedModelId]
+    : undefined;
+  if (expectedProvider !== provider) {
+    throw new ConservativeSpendUnknownError(
+      `${who}: provider/model mismatch — "${requestedModelId}" is not a ${provider} model`,
+    );
+  }
 
   let price: ModelPrice;
   try {
@@ -108,8 +133,12 @@ function extractRateBuckets(provider: ProviderName, usage: Record<string, unknow
       const prompt = readRequiredCount(usage, 'prompt_tokens', who);
       const completion = readRequiredCount(usage, 'completion_tokens', who);
       const details = readNestedRecord(usage, 'completion_tokens_details', who);
+      const reasoningPresent = Object.hasOwn(details, 'reasoning_tokens');
       const reasoning = readOptionalCount(details, 'reasoning_tokens', `${who}.completion_tokens_details`);
-      // reasoning is ADDITIVE for xAI: total = prompt + completion + reasoning.
+      // reasoning is ADDITIVE for xAI (total = prompt + completion + reasoning) and cost-dominant.
+      // If it is not reported, a corroborating total MUST prove it was zero; with neither, we cannot
+      // distinguish a genuine non-thinking response from a truncated one — so it is UNKNOWN, not zero.
+      requireAdditiveCorroboration(reasoningPresent, usage, 'total_tokens', 'reasoning_tokens', who);
       assertTotalConsistency(usage, 'total_tokens', prompt + completion + reasoning, who);
       return { inputRateTokens: prompt, outputRateTokens: completion + reasoning };
     }
@@ -126,7 +155,11 @@ function extractRateBuckets(provider: ProviderName, usage: Record<string, unknow
     case 'google': {
       const prompt = readRequiredCount(usage, 'promptTokenCount', who);
       const candidates = readRequiredCount(usage, 'candidatesTokenCount', who);
+      const thoughtsPresent = Object.hasOwn(usage, 'thoughtsTokenCount');
       const thoughts = readOptionalCount(usage, 'thoughtsTokenCount', who); // ADDITIVE, at output rate
+      // thoughtsTokenCount is additive and cost-dominant; if unreported, a corroborating total MUST
+      // prove it zero. With neither the field nor a total, cost is UNKNOWN — never assumed zero.
+      requireAdditiveCorroboration(thoughtsPresent, usage, 'totalTokenCount', 'thoughtsTokenCount', who);
       // cachedContentTokenCount ⊆ prompt, already priced at the full input rate (conservative) — ignored.
       assertTotalConsistency(usage, 'totalTokenCount', prompt + candidates + thoughts, who);
       return { inputRateTokens: prompt, outputRateTokens: candidates + thoughts };
@@ -151,6 +184,26 @@ function assertTotalConsistency(
   if (total !== expected) {
     throw new ConservativeSpendUnknownError(
       `${who}: ${totalField} ${total} != reconstructed ${expected} (token accounting inconsistent)`,
+    );
+  }
+}
+
+/**
+ * For a provider whose reasoning/thinking bucket is ADDITIVE and cost-dominant: if the additive
+ * field is absent, a corroborating total MUST be present (its value is checked by
+ * {@link assertTotalConsistency}, which then proves the additive bucket was zero). With NEITHER
+ * the field nor a total, the cost cannot be confirmed — a typed UNKNOWN, never an assumed zero.
+ */
+function requireAdditiveCorroboration(
+  additivePresent: boolean,
+  usage: Record<string, unknown>,
+  totalField: string,
+  additiveField: string,
+  who: string,
+): void {
+  if (!additivePresent && !Object.hasOwn(usage, totalField)) {
+    throw new ConservativeSpendUnknownError(
+      `${who}: ${additiveField} absent and no ${totalField} to corroborate zero — cannot confirm cost (UNKNOWN, not zero)`,
     );
   }
 }
