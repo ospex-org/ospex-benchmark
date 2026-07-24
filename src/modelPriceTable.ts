@@ -27,11 +27,22 @@ import { deepFreeze } from './freeze.js';
  * These are a dated baseline, not a claim of continuous freshness or exact final
  * billing. Price drift is a conscious `prices-vN` edit plus a manifest re-pin.
  */
-export const MODEL_PRICE_TABLE_VERSIONS = Object.freeze(['prices-v1'] as const);
+export const MODEL_PRICE_TABLE_VERSIONS = Object.freeze(['prices-v1', 'prices-v2'] as const);
 export type ModelPriceTableVersion = (typeof MODEL_PRICE_TABLE_VERSIONS)[number];
 
 /** The price-table version the harness stamps on NEW runs. */
 export const MODEL_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v1';
+
+/**
+ * The CONSERVATIVE table the runtime spend guard prices against, and the version a
+ * billable crossing manifest MUST pin. `prices-v2` uses each model's HIGHEST
+ * conservatively-reachable published tier (the "price at the highest rate reachable"
+ * option), so the derived-actual guard can only ever OVER-estimate real cost — the
+ * one safe direction for a per-attempt hard-stop. `prices-v1` (the base/short-context
+ * tier) is retained unchanged for historical replay/validation; the default stamped
+ * version stays `prices-v1` so existing manifests/cohortIds do not churn.
+ */
+export const SPEND_GUARD_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v2';
 
 export function isModelPriceTableVersion(value: string): value is ModelPriceTableVersion {
   return (MODEL_PRICE_TABLE_VERSIONS as readonly string[]).includes(value);
@@ -54,6 +65,26 @@ const MODEL_PRICE_TABLE_V1: ModelPriceTable = {
 };
 
 /**
+ * `prices-v2` — the conservative guard table: each model's HIGHEST conservatively-reachable
+ * published tier (snapshot observed 2026-07-23, reconcile again immediately before any paid
+ * crossing). A max-context prompt escalates the WHOLE request to the upper tier for the
+ * two-tier models, so a table whose only job is to OVER-estimate defaults to that upper tier:
+ *   - `gpt-5.6-sol` ........... OpenAI, >272K tier (2×/1.5× on the full request): $10 / $45
+ *   - `claude-fable-5` ........ Anthropic, single tier (no long-context premium): $10 / $50
+ *   - `gemini-3.1-pro-preview`  Google, >200K tier: $4 / $18
+ *   - `grok-4.5` .............. xAI, ≥200K tier (higher rate on all tokens): $4 / $12
+ * Reasoning/thinking bill at the OUTPUT rate; the per-provider derived-actual (a later slice)
+ * multiplies the right token buckets by these input/output rates — this module holds only the
+ * rates and does no arithmetic.
+ */
+const MODEL_PRICE_TABLE_V2: ModelPriceTable = {
+  'gpt-5.6-sol': { inputUsdMicrosPerMillionTokens: 10_000_000, outputUsdMicrosPerMillionTokens: 45_000_000 },
+  'claude-fable-5': { inputUsdMicrosPerMillionTokens: 10_000_000, outputUsdMicrosPerMillionTokens: 50_000_000 },
+  'gemini-3.1-pro-preview': { inputUsdMicrosPerMillionTokens: 4_000_000, outputUsdMicrosPerMillionTokens: 18_000_000 },
+  'grok-4.5': { inputUsdMicrosPerMillionTokens: 4_000_000, outputUsdMicrosPerMillionTokens: 12_000_000 },
+};
+
+/**
  * The version→table registry, **deep-frozen** so neither the registry, the price
  * tables, nor their rate rows can be mutated at runtime. `prices-v1` therefore
  * denotes exactly one immutable table, and its digest can never go stale relative
@@ -61,6 +92,7 @@ const MODEL_PRICE_TABLE_V1: ModelPriceTable = {
  */
 const PRICE_TABLES: Readonly<Record<ModelPriceTableVersion, ModelPriceTable>> = deepFreeze({
   'prices-v1': MODEL_PRICE_TABLE_V1,
+  'prices-v2': MODEL_PRICE_TABLE_V2,
 });
 
 /** The price table for a KNOWN version; throws on an unknown version. */
