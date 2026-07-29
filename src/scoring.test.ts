@@ -6,6 +6,7 @@ import { buildScorecardMarkdown } from './scorecard.js';
 import type { BaselinePolicyVersion } from './baselines.js';
 import {
   aggregateByParticipant,
+  closeQuoteFromRow,
   inPrimaryStratum,
   isScheduleChanged,
   parseRunRecords,
@@ -1875,6 +1876,38 @@ test('R1: a zero-known-market bundle is rejected with a direct cardinality error
 // Close timing: the schedule-change stratum and the post-start refusal
 // (SPEC-line-open-evidence-model.md §7; acceptance case 32)
 // ---------------------------------------------------------------------------
+
+test('closeQuoteFromRow carries the capture timestamps into the metric — it must not narrow them away', () => {
+  // This narrowing is the ONE hop that used to drop them: fetch, types,
+  // wire validation and record emission all carried them, and the quote
+  // handed to the metric did not, which is what made timing unjudgeable.
+  const row = closeRow(GAME_A, 'total', {
+    lock_time: '2026-07-12T16:15:00+00:00',
+    value_captured_at: '2026-07-12T16:14:40+00:00',
+    last_polled_at: '2026-07-12T16:20:05+00:00',
+    poll_gap_seconds: -305,
+  });
+  const quote = closeQuoteFromRow(row);
+  assert.equal(quote.lockTime, row.lock_time);
+  assert.equal(quote.valueCapturedAt, row.value_captured_at);
+  assert.equal(quote.lastPolledAt, row.last_polled_at);
+  assert.equal(quote.pollGapSeconds, row.poll_gap_seconds);
+  // The prices are unchanged by the widening.
+  assert.equal(quote.line, row.line);
+  assert.equal(quote.awayPNovig, row.away_p_novig);
+  assert.equal(quote.confidence, row.confidence);
+  // Nulls pass through as nulls, never as fabricated values.
+  const sparse = closeQuoteFromRow(
+    closeRow(GAME_A, 'moneyline', {
+      value_captured_at: null,
+      last_polled_at: null,
+      poll_gap_seconds: null,
+    }),
+  );
+  assert.equal(sparse.valueCapturedAt, null);
+  assert.equal(sparse.lastPolledAt, null);
+  assert.equal(sparse.pollGapSeconds, null);
+});
 
 test('the schedule-change tolerance is pinned to its literal value', () => {
   // The cohort runner takes this from its hashed manifest; the scoring CLI
