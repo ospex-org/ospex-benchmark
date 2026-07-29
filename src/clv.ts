@@ -39,6 +39,27 @@ import {
  * - Only `fresh`-confidence closes feed the metrics (the market was still
  *   being polled at lock); stale or missing closes are unscored with
  *   stable reason codes.
+ * - Close TIMING is gated from the row's own capture evidence. The recorded
+ *   lock is the game's scheduled start as the schedule was known when the
+ *   close was captured — a PREDICTION of first pitch, never ground truth.
+ *   `close_after_start` refuses a close whose market was still being quoted
+ *   by the feed AFTER that lock (a negative poll gap): the feed's own
+ *   behaviour contradicts the recorded cutoff, so the row's pre-game status
+ *   is not established and it is not evidence for any metric. This is the
+ *   negative-side bound on the same poll-gap quantity whose positive side
+ *   the upstream freshness classification already bounds (that
+ *   classification is one-sided and stamps arbitrarily negative gaps
+ *   `fresh`, so this gate is the only thing that sees them).
+ *
+ * KNOWN LIMITATION, published rather than smoothed over: none of these
+ * gates detects a start that moved EARLIER without the upstream capture
+ * noticing. In that case the recorded lock, the schedule row it was copied
+ * from, and the frozen bundle's scheduled start are all the SAME wrong
+ * instant, so no comparison available to this module can separate them —
+ * there is no second opinion in the data it reads. Closing that gap needs
+ * an independent start-time source (the on-chain contest start served by
+ * the public API, or a league schedule feed). Until one is wired, a close
+ * passing these gates is not evidence that the game had not started.
  *
  * This is a SINGLE-source reference close, so the metrics are always
  * labeled reference-closing CLV, not a universal market consensus.
@@ -46,13 +67,41 @@ import {
 
 export type SelectedSide = 'away' | 'home';
 
-export type UnscoredReason =
-  | 'close_missing'
-  | 'close_not_captured'
-  | 'close_stale'
-  | 'close_inconsistent'
-  | 'line_moved'
-  | 'push_capable_line';
+/**
+ * CLOSE-QUALITY refusals, in gate order: properties of the captured close
+ * alone, independent of which side or participant is being scored. Every
+ * one of these refuses the exact-line metrics AND the totals ladder with
+ * the SAME reason — ladder coverage can never diverge from exact-line
+ * coverage on close quality.
+ *
+ * This array is the SINGLE SOURCE for that family: `UnscoredReason` is
+ * derived from it, and the ladder builds both its own reason union and its
+ * shared-gate membership from it. Adding a close-quality reason here wires
+ * every consumer at once; adding one anywhere else is a compile error.
+ * (Before this was derived, the membership was a hand-maintained runtime
+ * Set laundered through an `as` cast — the compiler could not see a missed
+ * entry, and the ladder would have scored a close the exact-line scorer had
+ * just refused.)
+ */
+export const CLOSE_QUALITY_REASONS = [
+  'close_missing',
+  'close_not_captured',
+  'close_stale',
+  'close_after_start',
+  'close_inconsistent',
+] as const;
+
+/** Refusals that depend on the SELECTED contract, not on close quality. */
+export const SELECTION_REASONS = ['line_moved', 'push_capable_line'] as const;
+
+export type CloseQualityReason = (typeof CLOSE_QUALITY_REASONS)[number];
+
+export type UnscoredReason = CloseQualityReason | (typeof SELECTION_REASONS)[number];
+
+/** Runtime membership test for the shared close-quality family. */
+export function isCloseQualityReason(reason: UnscoredReason): reason is CloseQualityReason {
+  return (CLOSE_QUALITY_REASONS as readonly string[]).includes(reason);
+}
 
 export interface CloseQuote {
   /** Closing line value (home handicap for spreads, total for totals; null for moneyline). */
@@ -63,6 +112,23 @@ export interface CloseQuote {
   awayPNovig: number | null;
   homePNovig: number | null;
   confidence: 'fresh' | 'stale' | 'missing';
+  /**
+   * The capture cutoff this row represents — upstream, the game's scheduled
+   * start as known at capture time. A prediction of first pitch, not ground
+   * truth; carried so timing is judged from evidence rather than assumed.
+   */
+  lockTime: string;
+  /** Instant of the quote the values came from (at or before `lockTime`). */
+  valueCapturedAt: string | null;
+  /** Last time the feed listed this market at all. */
+  lastPolledAt: string | null;
+  /**
+   * `lockTime - lastPolledAt` in seconds. POSITIVE means the last sighting
+   * preceded lock (the normal case; how far back is the upstream freshness
+   * question). NEGATIVE means the feed was still quoting the market after
+   * the recorded lock — see `closeAfterStart`.
+   */
+  pollGapSeconds: number | null;
 }
 
 export interface AuxDiagnostics {
@@ -126,6 +192,29 @@ function selectedValues(
   if (pNovig === null) return null;
   const decimal = side === 'away' ? close.awayDecimal : close.homeDecimal;
   return { pNovig, decimal };
+}
+
+/**
+ * The feed was still quoting this market AFTER the row's own recorded lock
+ * (`pollGapSeconds < 0`) — SELECTION-INDEPENDENT, like every other
+ * close-quality gate.
+ *
+ * The gap is `lockTime - lastPolledAt`, so a negative value is a direct
+ * observation that the odds feed did not treat `lockTime` as the moment the
+ * market closed. Exactly one of two things is true, and this module cannot
+ * tell which: the game had not started (the recorded start is early, and the
+ * captured value is a genuine pre-game price), or the feed quotes in-play
+ * (and a value captured at that lock may be an in-play price). Because the
+ * row's pre-game status is not established either way, it is refused rather
+ * than scored — the same posture `closeQuoteInconsistent` takes toward a
+ * close whose two representations disagree.
+ *
+ * A null gap is NOT a refusal here: it means the market was never seen in
+ * the snapshot at all, which the upstream freshness classification already
+ * downgrades (`close_stale`).
+ */
+export function closeAfterStart(close: CloseQuote): boolean {
+  return close.pollGapSeconds !== null && close.pollGapSeconds < 0;
 }
 
 /**
@@ -261,6 +350,12 @@ export function scoreDecision(
   if (close === null) return unscored('close_missing', entryExtras);
   if (close.confidence === 'missing') return unscored('close_not_captured', entryExtras);
   if (close.confidence === 'stale') return unscored('close_stale', entryExtras);
+  // Adjacent to close_stale on purpose: both bound the SAME poll-gap
+  // quantity, and the upstream classification bounds only its positive
+  // side. Ordered ahead of the price-representation check because a row
+  // whose cutoff semantics are unestablished is not a close whose prices
+  // are worth cross-validating.
+  if (closeAfterStart(close)) return unscored('close_after_start', entryExtras);
 
   // Whole-close validation runs BEFORE side selection: a corrupt close is
   // not evidence for any metric, for any participant, on either side.

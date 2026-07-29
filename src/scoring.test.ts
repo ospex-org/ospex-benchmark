@@ -6,7 +6,11 @@ import { buildScorecardMarkdown } from './scorecard.js';
 import type { BaselinePolicyVersion } from './baselines.js';
 import {
   aggregateByParticipant,
+  inPrimaryStratum,
+  isScheduleChanged,
   parseRunRecords,
+  SCHEDULE_CHANGE_TOLERANCE_MS,
+  scheduleDriftMs,
   SCORING_POLICY_VERSION,
   scoredRecords,
   scoreRun,
@@ -311,11 +315,25 @@ function fixtureRun(options?: {
  */
 const NOVIG_ONLY = { away_odds_decimal: null, home_odds_decimal: null };
 
+/**
+ * The frozen bundle start of each fixture game (`makeRequest`'s cutoffAt is
+ * the game's scheduledStartUtc). A healthy close locks at its own game's
+ * start, so the default fixture is SAME-SCHEDULE and its last feed sighting
+ * precedes the lock — schedule drift and post-start gates are exercised by
+ * explicit overrides, never by accident.
+ */
+const FIXTURE_START_UTC: Record<string, string> = {
+  [GAME_A]: '2026-07-12T16:15:00+00:00',
+  [GAME_B]: '2026-07-12T20:10:00+00:00',
+};
+
 function closeRow(
   gameId: string,
   market: 'moneyline' | 'spread' | 'total',
   overrides: Partial<ClosingLineRow> = {},
 ): ClosingLineRow {
+  const lock = FIXTURE_START_UTC[gameId] ?? '2026-07-12T16:15:00+00:00';
+  const lockMs = Date.parse(lock);
   return {
     network: 'polygon',
     jsonodds_id: gameId,
@@ -325,10 +343,10 @@ function closeRow(
     home_odds_decimal: 2.0,
     away_p_novig: 0.5,
     home_p_novig: 0.5,
-    value_captured_at: '2026-07-12T16:14:40+00:00',
-    last_polled_at: '2026-07-12T16:15:05+00:00',
-    lock_time: '2026-07-12T16:15:00+00:00',
-    poll_gap_seconds: -5,
+    value_captured_at: new Date(lockMs - 20_000).toISOString(),
+    last_polled_at: new Date(lockMs - 15_000).toISOString(),
+    lock_time: lock,
+    poll_gap_seconds: 15,
     confidence: 'fresh',
     source: 'reference',
     ...overrides,
@@ -978,7 +996,7 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
 test('the scoring policy version is pinned to its literal value', () => {
   // A bump must be a conscious edit HERE too. 'scoring-v0.1.0' is reserved
   // for pre-stamp output by definition and must never be emitted.
-  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.5.0');
+  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.6.0');
 });
 
 test('every scored record type is stamped with the scoring policy version', () => {
@@ -1124,8 +1142,15 @@ test('byMarket reports game-clustered stats and per-market unscored reasons, nev
   assert.notEqual(model.gameLevel.meanClvPct, ml.gameLevel.meanClvPct);
 });
 
-function syntheticScored(gameId: string, primaryClvPct: number | null): ScoredPick {
+function syntheticScored(
+  gameId: string,
+  primaryClvPct: number | null,
+  scheduleOverrides: Partial<Pick<ScoredPick, 'scheduleChanged' | 'scheduleDriftMs'>> = {},
+): ScoredPick {
   return {
+    scheduleDriftMs: 0,
+    scheduleChanged: false,
+    ...scheduleOverrides,
     kind: 'baseline',
     participantId: 'synthetic-policy',
     gameId,
@@ -1844,4 +1869,326 @@ test('R1: an unknown market key in the recorded bundle is rejected (coherent art
 test('R1: a zero-known-market bundle is rejected with a direct cardinality error', () => {
   const { lines } = scopedRun([]);
   assert.throws(() => parseRunRecords(lines), /at least one known market block/);
+});
+
+// ---------------------------------------------------------------------------
+// Close timing: the schedule-change stratum and the post-start refusal
+// (SPEC-line-open-evidence-model.md §7; acceptance case 32)
+// ---------------------------------------------------------------------------
+
+test('the schedule-change tolerance is pinned to its literal value', () => {
+  // The cohort runner takes this from its hashed manifest; the scoring CLI
+  // has no manifest, so the two are kept equal by this pin plus the
+  // manifest fixtures. A change here is a scoring-policy change.
+  assert.equal(SCHEDULE_CHANGE_TOLERANCE_MS, 60_000);
+});
+
+test('scheduleDriftMs is signed and reports undeterminable as null, never as zero', () => {
+  const base = '2026-07-12T16:15:00+00:00';
+  assert.equal(scheduleDriftMs(base, base), 0);
+  // Lock EARLIER than the frozen start = the schedule moved up after freeze.
+  assert.equal(scheduleDriftMs('2026-07-12T15:15:00+00:00', base), -3_600_000);
+  assert.equal(scheduleDriftMs('2026-07-12T17:15:00+00:00', base), 3_600_000);
+  assert.equal(scheduleDriftMs('not-a-time', base), null);
+  assert.equal(scheduleDriftMs(base, 'not-a-time'), null);
+  assert.equal(scheduleDriftMs('', ''), null);
+});
+
+test('acceptance 32: schedule drift below, AT, and above the tolerance classifies deterministically', () => {
+  const tol = SCHEDULE_CHANGE_TOLERANCE_MS;
+  // Swept over BOTH directions and both sides of the boundary rather than
+  // sampled: the classifier is abs() plus a >= comparison, so the whole
+  // space is {sign} x {below, at, above} plus the undeterminable case.
+  for (const sign of [1, -1]) {
+    assert.equal(isScheduleChanged(sign * (tol - 1)), false, `below (${sign})`);
+    assert.equal(isScheduleChanged(sign * tol), true, `at (${sign}) — the boundary is INCLUSIVE`);
+    assert.equal(isScheduleChanged(sign * (tol + 1)), true, `above (${sign})`);
+  }
+  assert.equal(isScheduleChanged(0), false);
+  // Undeterminable propagates; it is never collapsed into "unchanged".
+  assert.equal(isScheduleChanged(null), null);
+  // An explicit tolerance is honored (the cohort path supplies its own).
+  assert.equal(isScheduleChanged(30_000, 60_000), false);
+  assert.equal(isScheduleChanged(30_000, 30_000), true);
+  assert.equal(isScheduleChanged(30_000, 0), true, 'a zero tolerance tags every drift');
+});
+
+/** A close for GAME_A whose lock is shifted off the frozen bundle start. */
+function driftedClose(market: 'moneyline' | 'spread' | 'total', driftMs: number): ClosingLineRow {
+  const lockMs = Date.parse(FIXTURE_START_UTC[GAME_A] as string) + driftMs;
+  return closeRow(GAME_A, market, {
+    lock_time: new Date(lockMs).toISOString(),
+    value_captured_at: new Date(lockMs - 20_000).toISOString(),
+    last_polled_at: new Date(lockMs - 15_000).toISOString(),
+    poll_gap_seconds: 15,
+  });
+}
+
+test('acceptance 32 end to end: a drifted close is TAGGED and its CLV is still computed', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const tol = SCHEDULE_CHANGE_TOLERANCE_MS;
+  for (const [label, driftMs, expected] of [
+    ['below', -(tol - 1), false],
+    ['at', -tol, true],
+    ['above', -(tol + 1), true],
+    ['below (later)', tol - 1, false],
+    ['at (later)', tol, true],
+    ['above (later)', tol + 1, true],
+  ] as const) {
+    const scored = scoreRun(run, [driftedClose('moneyline', driftMs)], TEST_LADDER);
+    const pick = scored.find((p) => p.gameId === GAME_A && p.market === 'moneyline');
+    assert.ok(pick, label);
+    assert.equal(pick.scheduleDriftMs, driftMs, label);
+    assert.equal(pick.scheduleChanged, expected, label);
+    // A TAG, NOT A REFUSAL: the CLV is computed either way, and both
+    // variants are present together.
+    assert.equal(pick.result.unscoredReason, null, label);
+    assert.ok(pick.result.primaryClvPct !== null, label);
+    assert.ok(pick.result.marginAdjustedClvPct !== null, label);
+  }
+});
+
+test('a tagged pick leaves the PRIMARY estimate but stays in every denominator', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const sameSchedule = scoreRun(run, [closeRow(GAME_A, 'moneyline')], TEST_LADDER);
+  const rescheduled = scoreRun(run, [driftedClose('moneyline', -3_600_000)], TEST_LADDER);
+
+  const baseStats = aggregateByParticipant(sameSchedule, run, TEST_LADDER);
+  const tagStats = aggregateByParticipant(rescheduled, run, TEST_LADDER);
+  const base = baseStats.find((s) => s.participantId === 'model-arm');
+  const tagged = tagStats.find((s) => s.participantId === 'model-arm');
+  assert.ok(base && tagged);
+
+  // Premise: the same-schedule run really does score this pick.
+  assert.equal(base.primaryScoreable, 1);
+  assert.ok(base.gameLevel.meanClvPct !== null);
+  assert.equal(base.scheduleChangedExcluded, 0);
+
+  // The tagged run withholds the VALUE...
+  assert.equal(tagged.primaryScoreable, 0);
+  assert.equal(tagged.marginAdjustedScoreable, 0);
+  assert.equal(tagged.gamesScoreable, 0);
+  assert.equal(tagged.gameLevel.meanClvPct, null);
+  assert.equal(tagged.gameLevelMarginAdjusted.meanClvPct, null);
+  assert.equal(tagged.perPick.meanClvPct, null);
+  // ...and discloses exactly how many rows that was.
+  assert.equal(tagged.scheduleChangedExcluded, 1);
+  assert.equal(tagged.byMarket['moneyline']?.scheduleChangedExcluded, 1);
+  assert.equal(tagged.byMarket['moneyline']?.scoreable, 0);
+
+  // ...while every DENOMINATOR is untouched: a reschedule shrinks the
+  // sample, it never hides the pick.
+  assert.equal(tagged.games, base.games);
+  assert.equal(tagged.eligibleMarkets, base.eligibleMarkets);
+  assert.equal(tagged.validDecisions, base.validDecisions);
+  assert.equal(tagged.byMarket['moneyline']?.picks, base.byMarket['moneyline']?.picks);
+  assert.equal(tagged.byMarket['moneyline']?.eligible, base.byMarket['moneyline']?.eligible);
+  // And it is NOT laundered into the unscored histogram — it was scored.
+  assert.deepEqual(tagged.unscoredByReason, base.unscoredByReason);
+});
+
+test('the paired de-vig sensitivity readout excludes tagged picks from BOTH sides', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const tagged = aggregateByParticipant(
+    scoreRun(run, [driftedClose('moneyline', -3_600_000)], TEST_LADDER),
+    run,
+    TEST_LADDER,
+  ).find((s) => s.participantId === 'model-arm');
+  assert.ok(tagged);
+  // If the tag were enforced inside clusterByGame only, the disclosed
+  // paired COUNT would still include the tagged row while neither summary
+  // did — the count would describe a different set than the numbers.
+  assert.equal(tagged.sensitivity.pairedPicksEconomic, 0);
+  assert.equal(tagged.sensitivity.pairedPicksMarginAdjusted, 0);
+  assert.equal(tagged.sensitivity.economic.proportional.meanClvPct, null);
+  assert.equal(tagged.sensitivity.economic.shin.meanClvPct, null);
+
+  // NEGATIVE CONTROL: the same run without the drift keeps the pairing.
+  const clean = aggregateByParticipant(
+    scoreRun(run, [closeRow(GAME_A, 'moneyline')], TEST_LADDER),
+    run,
+    TEST_LADDER,
+  ).find((s) => s.participantId === 'model-arm');
+  assert.ok(clean);
+  assert.equal(clean.sensitivity.pairedPicksEconomic, 1);
+  assert.ok(clean.sensitivity.economic.shin.meanClvPct !== null);
+});
+
+test('a tagged totals pick leaves the ladder aggregates AND the mean signed movement', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const clean = aggregateByParticipant(
+    scoreRun(run, [closeRow(GAME_A, 'total', { line: 9.5 })], TEST_LADDER),
+    run,
+    TEST_LADDER,
+  ).find((s) => s.participantId === 'model-arm');
+  assert.ok(clean?.totalsLadder);
+  // Premise: a moved line is ladder-scored and contributes movement.
+  assert.equal(clean.totalsLadder.ladderScoreable, 1);
+  assert.ok(clean.totalsLadder.meanSignedMovement !== null);
+
+  const tagged = aggregateByParticipant(
+    scoreRun(run, [{ ...driftedClose('total', -3_600_000), line: 9.5 }], TEST_LADDER),
+    run,
+    TEST_LADDER,
+  ).find((s) => s.participantId === 'model-arm');
+  assert.ok(tagged?.totalsLadder);
+  assert.equal(tagged.totalsLadder.ladderScoreable, 0);
+  // Movement is documented as an average over the LADDER-SCORED picks, so
+  // it has to leave with them or the two numbers describe different sets.
+  assert.equal(tagged.totalsLadder.meanSignedMovement, null);
+  // Totals picks themselves stay in the denominator.
+  assert.equal(tagged.totalsLadder.totalsPicks, clean.totalsLadder.totalsPicks);
+});
+
+test('a post-start close is refused end to end, and the ladder honors the same verdict', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [closeRow(GAME_A, 'total', { poll_gap_seconds: -292 })], TEST_LADDER);
+  const pick = scored.find((p) => p.participantId === 'model-arm' && p.market === 'total');
+  assert.ok(pick);
+  assert.equal(pick.result.unscoredReason, 'close_after_start');
+  assert.equal(pick.result.primaryClvPct, null);
+  assert.equal(pick.result.marginAdjustedClvPct, null);
+  assert.equal(pick.ladder?.unscoredReason, 'close_after_start');
+  assert.equal(pick.ladder?.economicClvPct, null);
+  // It is an UNSCORED reason, not a stratum tag — the two mechanisms are
+  // reported through different channels and must not be confused.
+  assert.equal(pick.scheduleChanged, false);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model);
+  assert.equal(model.unscoredByReason['close_after_start'], 1);
+  assert.equal(model.scheduleChangedExcluded, 0);
+
+  // NEGATIVE CONTROL: the same close with a healthy gap scores.
+  const okScored = scoreRun(run, [closeRow(GAME_A, 'total')], TEST_LADDER);
+  const okPick = okScored.find((p) => p.participantId === 'model-arm' && p.market === 'total');
+  assert.ok(okPick);
+  assert.equal(okPick.result.unscoredReason, null);
+  assert.ok(okPick.ladder?.economicClvPct !== null);
+});
+
+test('a pick with no close has an undeterminable schedule verdict and STAYS in the primary stratum', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [], TEST_LADDER);
+  assert.ok(scored.length > 0);
+  for (const pick of scored) {
+    assert.equal(pick.close, null);
+    assert.equal(pick.scheduleChanged, null, 'no close -> no comparison');
+    assert.equal(pick.scheduleDriftMs, null);
+    assert.equal(inPrimaryStratum(pick), true, 'null is not an exclusion');
+    assert.equal(pick.result.unscoredReason, 'close_missing');
+  }
+});
+
+test('scored records carry the capture timestamps, the drift, and the stratum verdict', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const drifted = driftedClose('moneyline', -3_600_000);
+  const scored = scoreRun(run, [drifted], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const records = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
+
+  const decision = records.find(
+    (r) =>
+      r['recordType'] === 'scored_decision' &&
+      r['participantId'] === 'model-arm' &&
+      r['market'] === 'moneyline' &&
+      r['gameId'] === GAME_A,
+  );
+  assert.ok(decision);
+  const closing = decision['closing'] as Record<string, unknown>;
+  // All four capture timestamps survive onto the record — the narrowing
+  // into the metric used to drop them, which is what made timing unjudgeable.
+  assert.equal(closing['lockTime'], drifted.lock_time);
+  assert.equal(closing['valueCapturedAt'], drifted.value_captured_at);
+  assert.equal(closing['lastPolledAt'], drifted.last_polled_at);
+  assert.equal(closing['pollGapSeconds'], drifted.poll_gap_seconds);
+  assert.equal(decision['scheduledStartUtc'], FIXTURE_START_UTC[GAME_A]);
+  assert.equal(decision['scheduleDriftMs'], -3_600_000);
+  assert.equal(decision['scheduleChanged'], true);
+  assert.equal(decision['inPrimaryStratum'], false);
+  // The CLV itself is still on the record — tagged, not discarded.
+  assert.ok(decision['primaryClvPct'] !== null);
+  assert.ok(decision['marginAdjustedClvPct'] !== null);
+
+  const meta = records.find((r) => r['recordType'] === 'scored_run_meta');
+  assert.ok(meta);
+  // Every participant with a moneyline pick on this game joins the SAME
+  // close row, so the count is derived from the picks rather than guessed.
+  const taggedPicks = scored.filter((p) => p.scheduleChanged === true).length;
+  assert.ok(taggedPicks > 1, 'fixture premise: several participants share the drifted close');
+  assert.equal(meta['scheduleChangedExcluded'], taggedPicks);
+  assert.equal(meta['primaryScoreable'], 0, 'meta agrees with the participant aggregates');
+  assert.equal(meta['marginAdjustedScoreable'], 0);
+  assert.equal(meta['closeAfterStartRefused'], 0);
+  const policy = meta['closePolicy'] as Record<string, unknown>;
+  assert.equal(policy['scheduleChangeToleranceMs'], SCHEDULE_CHANGE_TOLERANCE_MS);
+  assert.ok(String(policy['closeAfterStart']).includes('close_after_start'));
+  assert.ok(String(policy['scheduleChanged']).includes('STRATUM TAG'));
+  // The limitation is preregistered in the machine-readable policy, not only
+  // in prose a reader might skip.
+  assert.ok(
+    String(policy['startTimeLimitation']).includes('EARLIER'),
+    'the undetectable case is stated in the scored output itself',
+  );
+});
+
+test('run_meta counts the post-start refusals it actually emitted', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(
+    run,
+    [closeRow(GAME_A, 'moneyline', { poll_gap_seconds: -292 })],
+    TEST_LADDER,
+  );
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const meta = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER).find(
+    (r) => r['recordType'] === 'scored_run_meta',
+  );
+  assert.ok(meta);
+  const expected = scored.filter((p) => p.result.unscoredReason === 'close_after_start').length;
+  assert.ok(expected > 0, 'fixture premise');
+  assert.equal(meta['closeAfterStartRefused'], expected);
+  assert.equal(meta['scheduleChangedExcluded'], 0);
+});
+
+test('the scorecard states both close-timing rules and discloses the held-out count', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [driftedClose('moneyline', -3_600_000)], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const markdown = buildScorecardMarkdown(
+    run,
+    scored,
+    stats,
+    '2026-07-12T21:00:00.000Z',
+    TEST_LADDER,
+  );
+  assert.ok(markdown.includes('close_after_start'), 'the refusal is named');
+  assert.ok(markdown.includes('scheduleChanged'), 'the tag is named');
+  assert.ok(markdown.includes('Schedule-changed (held out)'), 'the coverage column exists');
+  assert.ok(
+    markdown.includes(String(SCHEDULE_CHANGE_TOLERANCE_MS)),
+    'the tolerance is a published number, not an unstated constant',
+  );
+  // The undetectable case is in the published prose, not only the PR body.
+  assert.ok(markdown.includes('EARLIER'));
+  assert.ok(markdown.includes('not evidence that the game had not started'));
+  // Header and divider still line up after the added column.
+  const allLines = markdown.split('\n');
+  const headerIndex = allLines.findIndex((l) => l.startsWith('| Participant | Games |'));
+  assert.ok(headerIndex >= 0);
+  const header = allLines[headerIndex] as string;
+  const divider = allLines[headerIndex + 1] as string;
+  assert.equal(
+    (header.match(/\|/g) ?? []).length,
+    (divider.match(/\|/g) ?? []).length,
+    'coverage table header and divider have the same column count',
+  );
 });

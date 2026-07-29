@@ -1,6 +1,6 @@
 import { PROPORTIONAL_DEVIG_METHOD, SHIN_DEVIG_METHOD } from './clv.js';
 import { LADDER_VERSION, MAX_LADDER_LINE } from './ladder.js';
-import { MARKETS, SCORING_POLICY_VERSION } from './scoring.js';
+import { MARKETS, SCHEDULE_CHANGE_TOLERANCE_MS, SCORING_POLICY_VERSION } from './scoring.js';
 import type { LadderParams } from './ladder.js';
 import type { MarketStats, ParticipantStats, ScoredPick, SourceRun } from './scoring.js';
 import type { MarketKey } from './types.js';
@@ -42,7 +42,8 @@ function reasons(counts: Record<string, number>): string {
 function coverageRow(stat: ParticipantStats): string {
   return (
     `| ${stat.participantId} | ${stat.games} | ${outcomes(stat)} | ${stat.eligibleMarkets} | ` +
-    `${stat.validDecisions} | ${stat.primaryScoreable} | ${stat.conditionalOnly} | ${reasons(stat.unscoredByReason)} |`
+    `${stat.validDecisions} | ${stat.primaryScoreable} | ${stat.conditionalOnly} | ` +
+    `${stat.scheduleChangedExcluded} | ${reasons(stat.unscoredByReason)} |`
   );
 }
 
@@ -135,6 +136,12 @@ export function buildScorecardMarkdown(
     '- Policy: `fresh`-confidence closes only; a close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (`close_inconsistent`); price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable lines report separately-labeled conditional variants of BOTH metrics, never pooled into primary.',
   );
   lines.push(
+    `- Close timing: a close whose market the odds feed was still quoting AFTER the row's own recorded lock (a negative poll gap) is refused outright (\`close_after_start\`) — the feed's behaviour contradicts the recorded cutoff, so the row's pre-game status is not established, and it is refused for every participant and side alike (the totals ladder honors the same verdict). Separately, a close whose lock differs from the frozen bundle's scheduled start by at least ${SCHEDULE_CHANGE_TOLERANCE_MS} ms is TAGGED \`scheduleChanged\`: its CLV is still computed and recorded in full and it stays in every coverage denominator, but it is held out of the primary same-schedule estimate and disclosed in the Schedule-changed column below.`,
+  );
+  lines.push(
+    "- Known limitation, stated rather than smoothed over: the recorded lock is the scheduled start as it was known when the close was captured — a PREDICTION of first pitch, never ground truth. Neither check above detects a start that moved EARLIER without the upstream capture noticing; in that case the lock, the schedule row it came from, and the frozen bundle start are the SAME wrong instant, and no comparison available to this scorer can separate them. Detecting that needs an independent start-time source (the on-chain contest start served by the public API, or a league schedule feed). A close passing these gates is therefore not evidence that the game had not started.",
+  );
+  lines.push(
     `- Totals ladder: \`${LADDER_VERSION}\` is the preregistered CANDIDATE line-value method (dispersion parameter \`${ladderParams.parameterVersion}\`, k = ${ladderParams.k}) — its independent alternate-ladder validation is pending, so ladder columns are sensitivity output: separately labeled, never pooled into the primary columns. Line movement alone never disqualifies a totals pick; the shared close-quality gates and the method domain (MLB, half-step lines up to ${MAX_LADDER_LINE}, solvable closes) still can, each disclosed with a typed reason. Known approximation: the smooth model's push probability runs roughly 1-2 percentage points HIGH at even integer lines and LOW at odd ones (parity oscillation; see docs/TOTALS_DISPERSION.md).`,
   );
   lines.push('');
@@ -142,9 +149,13 @@ export function buildScorecardMarkdown(
   lines.push('## Coverage (failures stay in the denominators)');
   lines.push('');
   lines.push(
-    '| Participant | Games | Arm outcomes | Eligible markets | Valid decisions | Primary-scoreable | Conditional-only | Unscored (reason) |',
+    'Schedule-changed picks are scored and recorded in full — they are held out of the primary same-schedule estimate, not dropped, and they remain in Eligible markets and Valid decisions.',
   );
-  lines.push('|---|---|---|---|---|---|---|---|');
+  lines.push('');
+  lines.push(
+    '| Participant | Games | Arm outcomes | Eligible markets | Valid decisions | Primary-scoreable | Conditional-only | Schedule-changed (held out) | Unscored (reason) |',
+  );
+  lines.push('|---|---|---|---|---|---|---|---|---|');
   for (const stat of models) lines.push(coverageRow(stat));
   for (const stat of baselines) lines.push(coverageRow(stat));
   lines.push('');

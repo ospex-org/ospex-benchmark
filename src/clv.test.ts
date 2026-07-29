@@ -1,9 +1,19 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { favorableLineMovement, scoreDecision } from './clv.js';
+import {
+  closeAfterStart,
+  CLOSE_QUALITY_REASONS,
+  favorableLineMovement,
+  isCloseQualityReason,
+  scoreDecision,
+  SELECTION_REASONS,
+} from './clv.js';
 import { proportionalTwoWay, shinTwoWay } from './devig.js';
 import type { CloseQuote } from './clv.js';
 
+// A HEALTHY close by default: the last feed sighting precedes the recorded
+// lock (positive poll gap), so timing gates pass and every pre-existing
+// price assertion below is unaffected by them.
 function close(overrides: Partial<CloseQuote> = {}): CloseQuote {
   return {
     line: null,
@@ -12,6 +22,10 @@ function close(overrides: Partial<CloseQuote> = {}): CloseQuote {
     awayPNovig: 0.5,
     homePNovig: 0.5,
     confidence: 'fresh',
+    lockTime: '2026-07-12T16:15:00+00:00',
+    valueCapturedAt: '2026-07-12T16:14:40+00:00',
+    lastPolledAt: '2026-07-12T16:14:45+00:00',
+    pollGapSeconds: 15,
     ...overrides,
   };
 }
@@ -118,6 +132,148 @@ test('missing/uncaptured/stale closes are unscored with distinct reasons; entry 
   assert.equal(stale.unscoredReason, 'close_stale');
   assert.equal(stale.primaryClvPct, null);
   assert.equal(stale.sensitivity, null);
+});
+
+// ---------------------------------------------------------------------------
+// close_after_start — the negative-side bound on the poll gap
+// ---------------------------------------------------------------------------
+
+test('a close the feed was still quoting AFTER its own lock is refused (close_after_start)', () => {
+  const refused = scoreDecision(
+    'moneyline',
+    'away',
+    'away',
+    2.1,
+    1.8,
+    null,
+    close({ pollGapSeconds: -292 }),
+  );
+  assert.equal(refused.unscoredReason, 'close_after_start');
+  // BOTH metrics are withheld together — the two variants share every
+  // availability gate and are never gated independently.
+  assert.equal(refused.primaryClvPct, null);
+  assert.equal(refused.marginAdjustedClvPct, null);
+  assert.equal(refused.conditionalClvPct, null);
+  assert.equal(refused.marginAdjustedConditionalClvPct, null);
+  assert.equal(refused.sensitivity, null);
+  assert.equal(refused.aux, null);
+  // The entry de-vig depends only on the frozen bundle and is still recorded.
+  assert.equal(refused.entryPNovigSelected, 0.4615);
+
+  // NEGATIVE CONTROL: the identical close with the gap's SIGN flipped scores.
+  const accepted = scoreDecision(
+    'moneyline',
+    'away',
+    'away',
+    2.1,
+    1.8,
+    null,
+    close({ pollGapSeconds: 292 }),
+  );
+  assert.equal(accepted.unscoredReason, null);
+  assert.equal(accepted.primaryClvPct, 5.0);
+  assert.ok(accepted.marginAdjustedClvPct !== null);
+});
+
+test('close_after_start sweeps the sign boundary and leaves a null gap to the freshness gate', () => {
+  // The predicate is the SIGN of the gap, so the whole boundary is -1/0/+1.
+  const at = (pollGapSeconds: number | null): string | null =>
+    scoreDecision('moneyline', 'away', 'away', 2.1, 1.8, null, close({ pollGapSeconds }))
+      .unscoredReason;
+  assert.equal(at(-1), 'close_after_start', 'one second past lock is past lock');
+  assert.equal(at(0), null, 'a gap of exactly zero is not AFTER the lock');
+  assert.equal(at(1), null);
+  assert.equal(at(-9700), 'close_after_start', 'the largest negative gap in the live corpus');
+  assert.equal(at(89416), null, 'a hugely POSITIVE gap is the freshness gate’s business, not this one');
+  // A null gap means the market was never seen in the snapshot at all —
+  // upstream downgrades that to `stale`, and this gate must not claim it.
+  assert.equal(at(null), null);
+  assert.equal(
+    scoreDecision(
+      'moneyline',
+      'away',
+      'away',
+      2.1,
+      1.8,
+      null,
+      close({ pollGapSeconds: null, confidence: 'stale' }),
+    ).unscoredReason,
+    'close_stale',
+  );
+});
+
+test('close-quality gate precedence is pinned: stale > after_start > inconsistent', () => {
+  // A row can trip several gates at once; which reason it reports must be
+  // deterministic, or the unscored histograms shift under refactors.
+  const staleAndPostStart = close({ confidence: 'stale', pollGapSeconds: -300 });
+  assert.equal(
+    scoreDecision('moneyline', 'away', 'away', 2.1, 1.8, null, staleAndPostStart).unscoredReason,
+    'close_stale',
+  );
+  // Post-start AND price-inconsistent (stored pair does not sum to 1):
+  // the timing verdict wins — a row whose cutoff semantics are unestablished
+  // is not a close whose prices are worth cross-validating.
+  const postStartAndInconsistent = close({
+    pollGapSeconds: -300,
+    awayPNovig: 0.4,
+    homePNovig: 0.4,
+    awayDecimal: null,
+    homeDecimal: null,
+  });
+  assert.equal(
+    scoreDecision('moneyline', 'away', 'away', 2.1, 1.8, null, postStartAndInconsistent)
+      .unscoredReason,
+    'close_after_start',
+  );
+  // NEGATIVE CONTROL: with the gap made healthy, the SAME row falls through
+  // to the price check — so the assertion above is about precedence, not
+  // about close_inconsistent having stopped working.
+  assert.equal(
+    scoreDecision('moneyline', 'away', 'away', 2.1, 1.8, null, {
+      ...postStartAndInconsistent,
+      pollGapSeconds: 15,
+    }).unscoredReason,
+    'close_inconsistent',
+  );
+});
+
+test('close_after_start is selection-independent: the same close is refused on both sides', () => {
+  const row = close({ pollGapSeconds: -600, awayPNovig: 0.6, homePNovig: 0.4, awayDecimal: null, homeDecimal: null });
+  for (const side of ['away', 'home'] as const) {
+    const result = scoreDecision('moneyline', side, side, 2.1, 1.8, null, row);
+    assert.equal(result.unscoredReason, 'close_after_start', `side ${side}`);
+  }
+  // ...and it outranks the SELECTION-dependent refusals, so a moved line on
+  // a post-start close still reports the close-quality reason.
+  const movedAndPostStart = scoreDecision('total', 'away', 'over', 1.9, 1.9, 8.5, {
+    ...row,
+    line: 9.5,
+    awayPNovig: 0.5,
+    homePNovig: 0.5,
+  });
+  assert.equal(movedAndPostStart.unscoredReason, 'close_after_start');
+  assert.equal(movedAndPostStart.lineMovementFavorable, null);
+});
+
+test('the close-quality family is the declared list, in gate order, and excludes selection reasons', () => {
+  assert.deepEqual(
+    [...CLOSE_QUALITY_REASONS],
+    ['close_missing', 'close_not_captured', 'close_stale', 'close_after_start', 'close_inconsistent'],
+  );
+  assert.deepEqual([...SELECTION_REASONS], ['line_moved', 'push_capable_line']);
+  for (const reason of CLOSE_QUALITY_REASONS) {
+    assert.equal(isCloseQualityReason(reason), true, reason);
+  }
+  for (const reason of SELECTION_REASONS) {
+    assert.equal(isCloseQualityReason(reason), false, reason);
+  }
+});
+
+test('closeAfterStart is exactly the negative-gap predicate, exported so consumers cannot re-derive it', () => {
+  assert.equal(closeAfterStart(close({ pollGapSeconds: -1 })), true);
+  assert.equal(closeAfterStart(close({ pollGapSeconds: 0 })), false);
+  assert.equal(closeAfterStart(close({ pollGapSeconds: 1 })), false);
+  assert.equal(closeAfterStart(close({ pollGapSeconds: null })), false);
 });
 
 test('a missing opposite-side entry price disables margin-adjusted output but never the economic metric', () => {

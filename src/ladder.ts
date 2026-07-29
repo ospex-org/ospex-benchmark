@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { nbPmf, totalsDispersionArtifactSchema } from './dispersion.js';
+import { isCloseQualityReason } from './clv.js';
 import { proportionalTwoWay } from './devig.js';
-import type { CloseQuote, UnscoredReason } from './clv.js';
+import type { CloseQualityReason, CloseQuote, UnscoredReason } from './clv.js';
 
 /**
  * TOTALS_V1 totals ladder — pure math, no I/O except the artifact loader.
@@ -12,8 +13,8 @@ import type { CloseQuote, UnscoredReason } from './clv.js';
  * disqualifies a totals pick: a pick whose line moved gets a ladder CLV
  * instead of silence. What still can refuse a pick, each with a typed
  * reason: the close-quality gates (SHARED with the exact-line metrics — a
- * missing/stale/inconsistent close refuses the ladder with the same reason
- * it refuses everything else with), the METHOD DOMAIN (MLB only — the
+ * missing/stale/post-start/inconsistent close refuses the ladder with the
+ * same reason it refuses everything else with), the METHOD DOMAIN (MLB only — the
  * dispersion parameter is fit on MLB finals; half-step lines within the
  * finite rail below), and SOLVABILITY (a close whose implied mean falls
  * outside the solver bounds refuses rather than extrapolates).
@@ -184,20 +185,22 @@ export function solveCloseImpliedMean(closeLine: number, qOver: number, k: numbe
  * availability gates are SHARED with the exact-line metrics: the gate
  * verdict is taken from the exact-line scorer's result, never re-derived.
  */
+/**
+ * Ladder refusals: the SHARED close-quality family, taken verbatim from the
+ * exact-line scorer's own list, plus the two the ladder owns.
+ *
+ * Derived, not restated. A hand-maintained copy of the close-quality family
+ * (which this once was, as a runtime Set plus an `as` cast) can silently
+ * fall behind the exact-line scorer, and the compiler cannot see it — the
+ * ladder would then score a totals CLV for a close the exact-line scorer
+ * had just refused, breaking the coverage guarantee `scoreTotalsLadder`
+ * documents below. Deriving both the union and the membership from
+ * `CLOSE_QUALITY_REASONS` makes that divergence impossible to express.
+ */
 export type LadderUnscoredReason =
-  | 'close_missing'
-  | 'close_not_captured'
-  | 'close_stale'
-  | 'close_inconsistent'
+  | CloseQualityReason
   | 'outside_method_domain'
   | 'ladder_unsolvable';
-
-const SHARED_GATE_REASONS: ReadonlySet<UnscoredReason> = new Set([
-  'close_missing',
-  'close_not_captured',
-  'close_stale',
-  'close_inconsistent',
-]);
 
 export interface TotalsLadderResult {
   ladderVersion: typeof LADDER_VERSION;
@@ -238,7 +241,7 @@ function ladderUnscored(
 /**
  * Score one totals pick through the ladder. `gateReason` is the exact-line
  * scorer's verdict for the same pick — the shared availability gates
- * (missing/stale/inconsistent closes) are honored from it directly so ladder
+ * (missing/stale/post-start/inconsistent closes) are honored from it directly so ladder
  * coverage can never diverge from exact-line coverage on close quality;
  * `line_moved` and `push_capable_line` are precisely what the ladder exists
  * to price, and a null reason (scored half-line) is priced for the identity
@@ -266,10 +269,13 @@ export function scoreTotalsLadder(options: {
     gateReason,
     params,
   } = options;
-  if (gateReason !== null && SHARED_GATE_REASONS.has(gateReason)) {
-    return ladderUnscored(params, gateReason as LadderUnscoredReason);
+  // No cast: `isCloseQualityReason` narrows to the shared family, which is
+  // a subset of LadderUnscoredReason by construction.
+  if (gateReason !== null && isCloseQualityReason(gateReason)) {
+    return ladderUnscored(params, gateReason);
   }
-  // Past the shared gates the close exists, is fresh, validated consistent,
+  // Past the shared gates the close exists, is fresh, was not still being
+  // quoted after its own lock, is validated consistent,
   // and (for totals) carries a line — anything else here is a defect.
   if (close === null || close.line === null || close.awayPNovig === null) {
     return ladderUnscored(params, 'close_not_captured');

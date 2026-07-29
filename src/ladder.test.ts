@@ -12,6 +12,7 @@ import {
   solveCloseImpliedMean,
   tailProbabilities,
 } from './ladder.js';
+import { CLOSE_QUALITY_REASONS, SELECTION_REASONS } from './clv.js';
 import type { CloseQuote } from './clv.js';
 
 /**
@@ -26,6 +27,8 @@ const MU_G2 = 9.551675689313;
 // G3: half-line close 10.5 with de-vigged over 0.45.
 const MU_G3 = 10.486281324642;
 
+// Healthy timing by default (positive poll gap) — the ladder's shared close
+// gates must not fire on any fixture that is not deliberately testing them.
 function close(overrides: Partial<CloseQuote> = {}): CloseQuote {
   return {
     line: 8.5,
@@ -34,6 +37,10 @@ function close(overrides: Partial<CloseQuote> = {}): CloseQuote {
     awayPNovig: 0.52,
     homePNovig: 0.48,
     confidence: 'fresh',
+    lockTime: '2026-07-12T16:15:00+00:00',
+    valueCapturedAt: '2026-07-12T16:14:40+00:00',
+    lastPolledAt: '2026-07-12T16:14:45+00:00',
+    pollGapSeconds: 15,
     ...overrides,
   };
 }
@@ -198,27 +205,85 @@ test('integer same-line ladder equals the conditional CLV shrunk by the push mas
   );
 });
 
-test('shared availability gates are honored verbatim, with version stamps riding along', () => {
-  for (const reason of [
-    'close_missing',
-    'close_not_captured',
-    'close_stale',
-    'close_inconsistent',
-  ] as const) {
+test('EVERY close-quality gate is honored verbatim, with version stamps riding along', () => {
+  // Swept from CLOSE_QUALITY_REASONS itself, never a hand-copied list: a
+  // close-quality reason added to the exact-line scorer is covered here the
+  // moment it exists. A hardcoded list would silently stop covering the
+  // newest reason — which is exactly how the ladder could come to score a
+  // close the exact-line scorer had just refused.
+  assert.ok(CLOSE_QUALITY_REASONS.length >= 5, 'the family is non-trivial');
+  for (const reason of CLOSE_QUALITY_REASONS) {
     const result = scoreTotalsLadder({
       league: 'mlb',
       selection: 'over',
       entryDecimal: 1.95,
       entryOppositeDecimal: 1.95,
       entryLine: 8.5,
+      // Every gate must be honored from the VERDICT alone: the close handed
+      // in below is perfectly scoreable, so anything the ladder returns
+      // other than the shared reason means it re-derived the gate itself.
       close: reason === 'close_missing' ? null : close(),
       gateReason: reason,
       params: PARAMS,
     });
     assert.equal(result.unscoredReason, reason, reason);
     assert.equal(result.economicClvPct, null, reason);
+    assert.equal(result.marginAdjustedClvPct, null, reason);
     assert.equal(result.ladderVersion, LADDER_VERSION, reason);
     assert.equal(result.parameterVersion, 'TOTALS_V1_PROVISIONAL', reason);
+  }
+});
+
+test('close_after_start specifically refuses the ladder — coverage cannot diverge from exact-line', () => {
+  // Called out on its own, not only through the sweep: this reason is the
+  // one whose omission from the shared family would be invisible to the
+  // compiler if the membership were ever hand-maintained again.
+  const scoreable = close();
+  const refused = scoreTotalsLadder({
+    league: 'mlb',
+    selection: 'over',
+    entryDecimal: 1.95,
+    entryOppositeDecimal: 1.95,
+    entryLine: 8.5,
+    close: scoreable,
+    gateReason: 'close_after_start',
+    params: PARAMS,
+  });
+  assert.equal(refused.unscoredReason, 'close_after_start');
+  assert.equal(refused.economicClvPct, null);
+  assert.equal(refused.marginAdjustedClvPct, null);
+
+  // NEGATIVE CONTROL 1: the identical close with NO gate reason scores, so
+  // the refusal above is the gate and not an unscoreable fixture.
+  const scored = scoreTotalsLadder({
+    league: 'mlb',
+    selection: 'over',
+    entryDecimal: 1.95,
+    entryOppositeDecimal: 1.95,
+    entryLine: 8.5,
+    close: scoreable,
+    gateReason: null,
+    params: PARAMS,
+  });
+  assert.equal(scored.unscoredReason, null);
+  assert.ok(scored.economicClvPct !== null);
+
+  // NEGATIVE CONTROL 2: the SELECTION-dependent reasons are precisely what
+  // the ladder exists to price and must still be scored — the shared family
+  // must not have widened to swallow them.
+  for (const reason of SELECTION_REASONS) {
+    const stillScored = scoreTotalsLadder({
+      league: 'mlb',
+      selection: 'over',
+      entryDecimal: 1.95,
+      entryOppositeDecimal: 1.95,
+      entryLine: 8.5,
+      close: scoreable,
+      gateReason: reason,
+      params: PARAMS,
+    });
+    assert.equal(stillScored.unscoredReason, null, reason);
+    assert.ok(stillScored.economicClvPct !== null, reason);
   }
 });
 

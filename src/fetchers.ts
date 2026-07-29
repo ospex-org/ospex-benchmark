@@ -259,21 +259,29 @@ export async function keysetWalk<T>(options: {
 }
 
 /**
- * EVERY totals closing line on a network, enumerated directly from the
- * source table the snapshot claims to cover (not via a pre-enumerated game
- * list, which would silently hide closes whose games row is missing or
- * unexpected). Keyset-paginated on the identity PK.
+ * EVERY closing line on a network — optionally narrowed to ONE market —
+ * enumerated directly from the source table the snapshot claims to cover
+ * (not via a pre-enumerated game list, which would silently hide closes
+ * whose games row is missing or unexpected). Keyset-paginated on the
+ * identity PK.
+ *
+ * `market: null` means no market filter: all three markets in one walk.
+ * The filter is the ONLY difference between the totals snapshot and a
+ * whole-corpus audit, so both go through this one walker rather than a
+ * second copy that could drift from it.
  */
-export async function fetchTotalsClosingLines(
+export async function fetchClosingLinesByMarket(
   supabaseUrl: string,
   anonKey: string,
   network: string,
+  market: MarketKey | null,
 ): Promise<ClosingLineRowWithId[]> {
   const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
   const select =
     'id,network,jsonodds_id,market,line,away_odds_decimal,home_odds_decimal,' +
     'away_p_novig,home_p_novig,value_captured_at,last_polled_at,lock_time,' +
     'poll_gap_seconds,confidence,source';
+  const marketFilter = market === null ? '' : `&market=eq.${market}`;
   // The requested page size is a hint to the server, not a contract the
   // walker relies on — termination is the empty final page.
   const pageSize = 1000;
@@ -281,12 +289,21 @@ export async function fetchTotalsClosingLines(
     fetchPage: async (afterId) => {
       const url =
         `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
-        `&network=eq.${network}&market=eq.total&id=gt.${afterId}` +
+        `&network=eq.${network}${marketFilter}&id=gt.${afterId}` +
         `&order=id.asc&limit=${pageSize}`;
       return parseClosingLineRowsWithId(await getJson(url, headers));
     },
     idOf: (row) => row.id,
   });
+}
+
+/** Every totals closing line on a network — the dispersion snapshot's source. */
+export async function fetchTotalsClosingLines(
+  supabaseUrl: string,
+  anonKey: string,
+  network: string,
+): Promise<ClosingLineRowWithId[]> {
+  return fetchClosingLinesByMarket(supabaseUrl, anonKey, network, 'total');
 }
 
 /**
