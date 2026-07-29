@@ -45,6 +45,15 @@ import type { ClosingLineRow, GamesTableRow } from './types.js';
  * by pinned ids. Every close seen is accounted for by an EXCLUSIVE verdict,
  * a close with no games row or an unclassifiable timestamp refuses the
  * whole snapshot, and the reader re-checks that arithmetic on every load.
+ *
+ * THE LIMIT OF THAT ARITHMETIC, stated because it is easy to over-read: the
+ * reader's checks prove the file is internally consistent and untruncated,
+ * NOT that the enumeration covered the table. `closesSeen` comes from the
+ * same fetch the records do, so a walk that silently narrowed its filter
+ * would produce a smaller, perfectly self-verifying snapshot. Two things
+ * cover that instead — the walker's own market-filter behaviour is unit
+ * tested, and the `markets` histogram is published so a narrowed walk is
+ * visible in the artifact (a whole-corpus audit reports all three markets).
  */
 
 export class ScheduleAuditError extends Error {}
@@ -115,6 +124,14 @@ export const closeScheduleAuditMetaSchema = z
     lockEarlierThanMatchTime: z.number().int().nonnegative(),
     lockLaterThanMatchTime: z.number().int().nonnegative(),
     confidence: z.record(z.string(), z.number().int().nonnegative()),
+    /**
+     * Rows per market. Published because it is the one field in which an
+     * incomplete ENUMERATION is visible to a reader: every other count is
+     * derived from the same fetch, so a walk that silently narrowed to one
+     * market would self-verify. A whole-corpus audit reports all three
+     * markets; a single key here means the walk was filtered.
+     */
+    markets: z.record(z.string(), z.number().int().nonnegative()),
     /** Sports of the games carrying a post-start-poll close. */
     postStartPollBySport: z.record(z.string(), z.number().int().nonnegative()),
     postStartPollGames: z.number().int().nonnegative(),
@@ -219,6 +236,17 @@ export function rederivedAuditConfidence(
   return counts;
 }
 
+/** Rows per market, re-derived from the records themselves. */
+export function rederivedAuditMarkets(
+  records: readonly CloseScheduleAuditRecord[],
+): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const record of records) {
+    counts[record.market] = (counts[record.market] ?? 0) + 1;
+  }
+  return counts;
+}
+
 /** Sports carrying a post-start-poll close, re-derived from the records. */
 export function rederivedPostStartBySport(
   records: readonly CloseScheduleAuditRecord[],
@@ -299,6 +327,14 @@ export function parseCloseScheduleAuditDataset(text: string): CloseScheduleAudit
       );
     }
   }
+  const markets = rederivedAuditMarkets(records);
+  for (const key of new Set([...Object.keys(markets), ...Object.keys(meta.markets)])) {
+    if ((markets[key] ?? 0) !== (meta.markets[key] ?? 0)) {
+      throw new ScheduleAuditError(
+        `meta market histogram disagrees with the records at "${key}" — truncated or edited?`,
+      );
+    }
+  }
   const bySport = rederivedPostStartBySport(records);
   for (const key of new Set([...Object.keys(bySport), ...Object.keys(meta.postStartPollBySport)])) {
     if ((bySport[key] ?? 0) !== (meta.postStartPollBySport[key] ?? 0)) {
@@ -359,6 +395,77 @@ export function parseCloseScheduleAuditDataset(text: string): CloseScheduleAudit
 }
 
 /**
+ * Assemble a whole audit snapshot from the two fetched row sets — the pure
+ * core of `yarn audit:closes`, kept out of the CLI so its REFUSALS are
+ * reachable from tests rather than only from a live run.
+ *
+ * Three refusals, all of them "rather than publish a number that is a
+ * guess":
+ *
+ * - duplicate `(game, market)` closes — `(network, jsonodds_id, market)` is
+ *   unique upstream, so a duplicate means the source is not what this audit
+ *   thinks it is enumerating;
+ * - a close with no `games` row — it has no reference time at all, so every
+ *   schedule count below it would be invented;
+ * - an unparseable timestamp — refused inside `closeScheduleAuditRecord`.
+ *
+ * JOIN KEY: `(network, jsonodds_id)`. Callers pass rows already scoped to
+ * one network, and `games` is keyed on that pair, so the lookup cannot fan
+ * out. `contest_id` is never read on either side: it carries residue from an
+ * earlier deployment epoch, and grouping on it would silently mix two
+ * different contest-id spaces.
+ */
+export function buildCloseScheduleAudit(options: {
+  network: string;
+  toleranceMs: number;
+  closes: readonly ClosingLineRow[];
+  games: readonly GamesTableRow[];
+  generatedAt: string;
+}): CloseScheduleAuditDataset {
+  const { closes, games } = options;
+  const keys = new Set(closes.map((close) => `${close.jsonodds_id}:${close.market}`));
+  if (keys.size !== closes.length) {
+    throw new ScheduleAuditError(
+      'duplicate closing-line rows for one (game, market) — refusing the snapshot',
+    );
+  }
+  const gameById = new Map(games.map((game) => [game.jsonodds_id, game]));
+  const orphans = closes.filter((close) => !gameById.has(close.jsonodds_id));
+  if (orphans.length > 0) {
+    throw new ScheduleAuditError(
+      `${orphans.length} closing line(s) have no games row ` +
+        `(first: ${orphans[0]?.jsonodds_id ?? ''}) — refusing an unclassifiable snapshot`,
+    );
+  }
+
+  const records: CloseScheduleAuditRecord[] = [];
+  for (const close of closes) {
+    const game = gameById.get(close.jsonodds_id);
+    if (game === undefined) {
+      throw new ScheduleAuditError('unreachable: orphan closes were refused above');
+    }
+    records.push(closeScheduleAuditRecord(close, game, options.toleranceMs));
+  }
+  records.sort((a, b) =>
+    a.lockTime === b.lockTime
+      ? `${a.gameId}:${a.market}`.localeCompare(`${b.gameId}:${b.market}`)
+      : a.lockTime.localeCompare(b.lockTime),
+  );
+
+  const meta = closeScheduleAuditMeta({
+    network: options.network,
+    toleranceMs: options.toleranceMs,
+    // Derived from the SAME array the records came from: `closesSeen` is the
+    // enumeration's own claim, and the reader checks it against `records`.
+    closesSeen: closes.length,
+    gamesJoined: games.length,
+    records,
+    generatedAt: options.generatedAt,
+  });
+  return { meta, records };
+}
+
+/**
  * Build the meta record from the records, using the SAME helpers the reader
  * re-derives with — writer and integrity check cannot drift.
  */
@@ -388,6 +495,7 @@ export function closeScheduleAuditMeta(options: {
     lockEarlierThanMatchTime: records.filter((r) => r.matchTimeDriftMs < 0).length,
     lockLaterThanMatchTime: records.filter((r) => r.matchTimeDriftMs > 0).length,
     confidence: rederivedAuditConfidence(records),
+    markets: rederivedAuditMarkets(records),
     postStartPollBySport: rederivedPostStartBySport(records),
     postStartPollGames: new Set(records.filter((r) => r.closeAfterStart).map((r) => r.gameId)).size,
     lockTimeRange: rederivedAuditLockTimeRange(records),

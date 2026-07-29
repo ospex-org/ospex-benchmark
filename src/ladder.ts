@@ -195,7 +195,13 @@ export function solveCloseImpliedMean(closeLine: number, qOver: number, k: numbe
  * ladder would then score a totals CLV for a close the exact-line scorer
  * had just refused, breaking the coverage guarantee `scoreTotalsLadder`
  * documents below. Deriving both the union and the membership from
- * `CLOSE_QUALITY_REASONS` makes that divergence impossible to express.
+ * `CLOSE_QUALITY_REASONS` removes the omission failure mode: there is one
+ * list, so nothing can be added to it and missed here.
+ *
+ * It does NOT make every divergence impossible — reclassifying a reason out
+ * of `CLOSE_QUALITY_REASONS` still type-checks. That case is caught by the
+ * tests, which sweep the whole reason vocabulary through this function and
+ * assert which side of the shared gate each member lands on.
  */
 export type LadderUnscoredReason =
   | CloseQualityReason

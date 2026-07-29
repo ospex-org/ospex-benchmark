@@ -3,13 +3,8 @@ import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
 import { fetchClosingLinesByMarket, fetchGamesRowsByIds } from './fetchers.js';
 import { writeNdjson } from './records.js';
-import {
-  closeScheduleAuditMeta,
-  closeScheduleAuditRecord,
-  ScheduleAuditError,
-} from './scheduleAudit.js';
+import { buildCloseScheduleAudit, ScheduleAuditError } from './scheduleAudit.js';
 import { SCHEDULE_CHANGE_TOLERANCE_MS } from './scoring.js';
-import type { CloseScheduleAuditRecord } from './scheduleAudit.js';
 
 /**
  * ospex-benchmark close-schedule audit — measures the WHOLE captured
@@ -143,14 +138,6 @@ async function main(): Promise<number> {
     null,
   );
   printLine(`closing lines: ${closes.length} rows (all markets, keyset-complete)`);
-  const keys = new Set(closes.map((close) => `${close.jsonodds_id}:${close.market}`));
-  if (keys.size !== closes.length) {
-    // (network, jsonodds_id, market) is unique upstream; a duplicate means
-    // the source is not what we think it is.
-    throw new Error(
-      'duplicate closing-line rows for one (game, market) — refusing the snapshot',
-    );
-  }
 
   const gameIds = [...new Set(closes.map((close) => close.jsonodds_id))];
   const games = await fetchGamesRowsByIds(
@@ -159,36 +146,15 @@ async function main(): Promise<number> {
     options.network,
     gameIds,
   );
-  const gameById = new Map(games.map((game) => [game.jsonodds_id, game]));
-  const orphans = closes.filter((close) => !gameById.has(close.jsonodds_id));
-  if (orphans.length > 0) {
-    // A close with no schedule row has no reference time at all; every
-    // count below would be a guess.
-    throw new Error(
-      `${orphans.length} closing line(s) have no games row ` +
-        `(first: ${orphans[0]?.jsonodds_id ?? ''}) — refusing an unclassifiable snapshot`,
-    );
-  }
   printLine(`games rows joined: ${games.length} for ${gameIds.length} distinct games`);
 
-  const records: CloseScheduleAuditRecord[] = [];
-  for (const close of closes) {
-    const game = gameById.get(close.jsonodds_id);
-    if (game === undefined) throw new Error('unreachable: orphan closes were refused above');
-    records.push(closeScheduleAuditRecord(close, game, options.toleranceMs));
-  }
-  records.sort((a, b) =>
-    a.lockTime === b.lockTime
-      ? `${a.gameId}:${a.market}`.localeCompare(`${b.gameId}:${b.market}`)
-      : a.lockTime.localeCompare(b.lockTime),
-  );
-
-  const meta = closeScheduleAuditMeta({
+  // Every refusal (duplicate keys, orphan closes, unclassifiable timestamps)
+  // lives in the pure builder, so the CLI is I/O plus rendering only.
+  const { meta, records } = buildCloseScheduleAudit({
     network: options.network,
     toleranceMs: options.toleranceMs,
-    closesSeen: closes.length,
-    gamesJoined: games.length,
-    records,
+    closes,
+    games,
     generatedAt: new Date().toISOString(),
   });
 
@@ -216,6 +182,10 @@ async function main(): Promise<number> {
       `(${meta.lockEarlierThanMatchTime} lock-earlier, ${meta.lockLaterThanMatchTime} lock-later)`,
   );
   printLine(`  confidence: ${JSON.stringify(meta.confidence)}`);
+  // A whole-corpus walk reports all three markets. One key here means the
+  // enumeration was narrowed — the one incompleteness the meta arithmetic
+  // cannot catch, since every count derives from the same fetch.
+  printLine(`  markets (all three = an unfiltered walk): ${JSON.stringify(meta.markets)}`);
   printLine(`  poll_gap_seconds null: ${meta.pollGapNull}`);
   printLine(
     `  value_captured_at after lock_time: ${meta.valueCapturedAfterLockAny}; ` +

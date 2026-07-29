@@ -211,8 +211,9 @@ test('EVERY close-quality gate is honored verbatim, with version stamps riding a
   // moment it exists. A hardcoded list would silently stop covering the
   // newest reason — which is exactly how the ladder could come to score a
   // close the exact-line scorer had just refused.
-  assert.ok(CLOSE_QUALITY_REASONS.length >= 5, 'the family is non-trivial');
+  const swept: string[] = [];
   for (const reason of CLOSE_QUALITY_REASONS) {
+    swept.push(reason);
     const result = scoreTotalsLadder({
       league: 'mlb',
       selection: 'over',
@@ -232,6 +233,10 @@ test('EVERY close-quality gate is honored verbatim, with version stamps riding a
     assert.equal(result.ladderVersion, LADDER_VERSION, reason);
     assert.equal(result.parameterVersion, 'TOTALS_V1_PROVISIONAL', reason);
   }
+  // The loop body really ran for every declared member — a sweep over an
+  // empty or partial source would otherwise pass silently.
+  assert.deepEqual(swept, [...CLOSE_QUALITY_REASONS]);
+  assert.ok(swept.includes('close_after_start'), 'including the newest member');
 });
 
 test('close_after_start specifically refuses the ladder — coverage cannot diverge from exact-line', () => {

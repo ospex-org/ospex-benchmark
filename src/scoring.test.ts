@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
+import { CLOSE_QUALITY_REASONS } from './clv.js';
 import { buildScorecardMarkdown } from './scorecard.js';
 import type { BaselinePolicyVersion } from './baselines.js';
 import {
@@ -1331,7 +1332,7 @@ test('a fully-failed arm keeps 0/N rows in every rendered per-market table', () 
   const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
   const byMarketAt = markdown.indexOf('## By market');
   assert.ok(byMarketAt > 0);
-  const failedRows = [...markdown.matchAll(/\| timeout-arm \| 0 \| 0\/2 \| 0 \| — \| — \| — \| — \| — \| — \| — \|/g)];
+  const failedRows = [...markdown.matchAll(/\| timeout-arm \| 0 \| 0\/2 \| 0 \| — \| — \| — \| — \| — \| — \| 0 \| — \|/g)];
   assert.equal(failedRows.length, 3, 'the failed arm must appear in all three per-market tables');
   assert.ok(failedRows.every((m) => (m.index ?? -1) > byMarketAt));
 });
@@ -1490,7 +1491,7 @@ test('the scorecard renders the ladder table, policy bullet, and moved-line ladd
   // ladder-scored pick, GAME_B's totals close missing.
   assert.ok(
     markdown.includes(
-      '| model-arm | 2 | 1 | 3.9993 | 3.9993 | 8.9517 | 8.9517 | — (0) | 0.5 | close_missing 1 |',
+      '| model-arm | 2 | 1 | 3.9993 | 3.9993 | 8.9517 | 8.9517 | — (0) | 0.5 | 0 | close_missing 1 |',
     ),
     'model-arm full ladder row',
   );
@@ -1498,14 +1499,14 @@ test('the scorecard renders the ladder table, policy bullet, and moved-line ladd
   // MA -8.9517, movement -0.5).
   assert.ok(
     markdown.includes(
-      '| baseline-under-total | 2 | 1 | -13.0903 | -13.0903 | -8.9517 | -8.9517 | — (0) | -0.5 | close_missing 1 |',
+      '| baseline-under-total | 2 | 1 | -13.0903 | -13.0903 | -8.9517 | -8.9517 | — (0) | -0.5 | 0 | close_missing 1 |',
     ),
     'baseline-under-total full ladder row',
   );
   // Survivor-bias rule: a fully-failed model arm keeps a zero row in the
   // ladder table — it must never vanish from the new surface.
   assert.ok(
-    markdown.includes('| timeout-arm | 0 | 0 | — | — | — | — | — (0) | — | — |'),
+    markdown.includes('| timeout-arm | 0 | 0 | — | — | — | — | — (0) | — | 0 | — |'),
     'failed arm keeps a zero ladder row',
   );
   // Own-column ranking, nulls last: the over side (+3.9993) above the under
@@ -1563,7 +1564,7 @@ test('a gate-passing pick the ladder cannot solve is typed and DISCLOSED in the 
   assert.equal(over.ladder?.economicClvPct, null);
   const stats = aggregateByParticipant(scored, run, TEST_LADDER);
   const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER);
-  assert.match(markdown, /\| model-arm \| 2 \| 0 \| — \| — \| — \| — \| .* \| — \| ladder_unsolvable 1, close_missing 1 \|/);
+  assert.match(markdown, /\| model-arm \| 2 \| 0 \| — \| — \| — \| — \| .* \| — \| 0 \| ladder_unsolvable 1, close_missing 1 \|/);
 });
 
 test('ladder participant aggregates are value-pinned: MA summaries, movement, unscored reasons', () => {
@@ -2161,8 +2162,14 @@ test('scored records carry the capture timestamps, the drift, and the stratum ve
   assert.equal(meta['marginAdjustedScoreable'], 0);
   assert.equal(meta['closeAfterStartRefused'], 0);
   const policy = meta['closePolicy'] as Record<string, unknown>;
+  // The tolerance the tag was actually computed at is the one preregistered
+  // on the record — not a second, independently-typed number.
   assert.equal(policy['scheduleChangeToleranceMs'], SCHEDULE_CHANGE_TOLERANCE_MS);
-  assert.ok(String(policy['closeAfterStart']).includes('close_after_start'));
+  assert.equal(
+    isScheduleChanged(decision['scheduleDriftMs'] as number, policy['scheduleChangeToleranceMs'] as number),
+    decision['scheduleChanged'],
+    'the published tolerance reproduces the published verdict',
+  );
   assert.ok(String(policy['scheduleChanged']).includes('STRATUM TAG'));
   // The limitation is preregistered in the machine-readable policy, not only
   // in prose a reader might skip.
@@ -2223,5 +2230,498 @@ test('the scorecard states both close-timing rules and discloses the held-out co
     (header.match(/\|/g) ?? []).length,
     (divider.match(/\|/g) ?? []).length,
     'coverage table header and divider have the same column count',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Coverage accounting and the rendered artifact — the numbers a reader sums
+// ---------------------------------------------------------------------------
+
+/**
+ * Every markdown table in a rendered scorecard: the header line, its
+ * divider, and every data row until the table ends. Asserting on the ARTIFACT
+ * rather than on the row-building functions is the point — a column added to
+ * one header and not to its rows renders a table every markdown viewer
+ * mis-aligns, and no per-function test sees it.
+ */
+function markdownTables(
+  markdown: string,
+): Array<{ header: string; divider: string; rows: string[] }> {
+  const lines = markdown.split('\n');
+  const tables: Array<{ header: string; divider: string; rows: string[] }> = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const header = lines[i] ?? '';
+    const divider = lines[i + 1] ?? '';
+    if (!header.startsWith('|') || !/^\|(?:-+\|)+$/.test(divider)) continue;
+    const rows: string[] = [];
+    let j = i + 2;
+    while ((lines[j] ?? '').startsWith('|')) {
+      rows.push(lines[j] as string);
+      j += 1;
+    }
+    tables.push({ header, divider, rows });
+    i = j - 1;
+  }
+  return tables;
+}
+
+const pipes = (line: string): number => (line.match(/\|/g) ?? []).length;
+
+/** A drifted close whose confidence/gap/line can be pushed off the happy path. */
+function driftedRow(
+  market: 'moneyline' | 'spread' | 'total',
+  driftMs: number,
+  overrides: Partial<ClosingLineRow> = {},
+): ClosingLineRow {
+  return { ...driftedClose(market, driftMs), ...overrides };
+}
+
+/**
+ * Close sets that between them exercise every coverage bucket: nothing
+ * captured, healthy, tagged-and-scored, tagged-but-already-refused (both
+ * refusal families), tagged-and-line-moved, tagged-at-an-integer-line.
+ */
+function coverageScenarios(): Array<{ label: string; closes: ClosingLineRow[] }> {
+  const tol = SCHEDULE_CHANGE_TOLERANCE_MS;
+  return [
+    { label: 'no closes at all', closes: [] },
+    {
+      label: 'healthy same-schedule closes',
+      closes: [closeRow(GAME_A, 'moneyline'), closeRow(GAME_A, 'total')],
+    },
+    { label: 'tagged and scoreable', closes: [driftedRow('moneyline', -3_600_000)] },
+    { label: 'tagged AT the tolerance', closes: [driftedRow('moneyline', -tol)] },
+    {
+      label: 'tagged but already stale',
+      closes: [driftedRow('moneyline', -3_600_000, { confidence: 'stale' })],
+    },
+    {
+      label: 'tagged but already post-start',
+      closes: [driftedRow('moneyline', -3_600_000, { poll_gap_seconds: -292 })],
+    },
+    { label: 'tagged and line-moved', closes: [driftedRow('total', -3_600_000, { line: 9.5 })] },
+    { label: 'tagged at an integer line', closes: [driftedRow('total', -3_600_000, { line: 9 })] },
+    {
+      label: 'mixed: one tagged-scored, one tagged-stale, one healthy',
+      closes: [
+        driftedRow('moneyline', -3_600_000),
+        driftedRow('total', -3_600_000, { confidence: 'stale' }),
+        closeRow(GAME_B, 'moneyline'),
+      ],
+    },
+  ];
+}
+
+test('coverage arithmetic holds in every bucket: valid = primary-scoreable + held out + unscored', () => {
+  // The published contract, swept rather than sampled. It is exactly what a
+  // held-out count taken as "every tagged pick" breaks: a tagged pick some
+  // earlier gate had already refused would be counted twice (once under its
+  // reason, once as held out) and the columns would sum past the denominator.
+  const { lines } = fixtureRun({
+    secondModelArm: true,
+    extraArm: { participantId: 'timeout-arm', outcome: 'timeout' },
+  });
+  const run = parseRunRecords(lines);
+  let sawHeldOut = 0;
+  let sawTaggedButRefused = 0;
+  for (const { label, closes } of coverageScenarios()) {
+    const scored = scoreRun(run, closes, TEST_LADDER);
+    const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+    for (const stat of stats) {
+      const unscored = Object.values(stat.unscoredByReason).reduce((a, b) => a + b, 0);
+      assert.equal(
+        stat.primaryScoreable + stat.scheduleChangedExcluded + unscored,
+        stat.validDecisions,
+        `${label} / ${stat.participantId}: participant coverage must sum to validDecisions`,
+      );
+      assert.ok(
+        stat.scheduleChangedExcluded <= stat.scheduleChangedTagged,
+        `${label} / ${stat.participantId}: held out cannot exceed tagged`,
+      );
+      sawHeldOut += stat.scheduleChangedExcluded;
+      sawTaggedButRefused += stat.scheduleChangedTagged - stat.scheduleChangedExcluded;
+      for (const [market, marketStat] of Object.entries(stat.byMarket)) {
+        const marketUnscored = Object.values(marketStat.unscoredByReason).reduce((a, b) => a + b, 0);
+        assert.equal(
+          marketStat.scoreable + marketStat.scheduleChangedExcluded + marketUnscored,
+          marketStat.picks,
+          `${label} / ${stat.participantId} / ${market}: per-market coverage must sum to picks`,
+        );
+      }
+    }
+  }
+  // The sweep is not vacuous: it really did produce both a held-out row and
+  // a tagged-but-already-refused row, which are the two sides of the fix.
+  assert.ok(sawHeldOut > 0, 'the sweep exercised the held-out case');
+  assert.ok(sawTaggedButRefused > 0, 'the sweep exercised the tagged-but-already-refused case');
+});
+
+test('a tagged pick an earlier gate already refused is disclosed ONCE, under that gate', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  for (const [label, overrides, reason] of [
+    ['stale', { confidence: 'stale' as const }, 'close_stale'],
+    ['post-start', { poll_gap_seconds: -292 }, 'close_after_start'],
+  ] as const) {
+    const scored = scoreRun(run, [driftedRow('moneyline', -3_600_000, overrides)], TEST_LADDER);
+    const stat = aggregateByParticipant(scored, run, TEST_LADDER).find(
+      (s) => s.participantId === 'model-arm',
+    );
+    assert.ok(stat, label);
+    assert.equal(stat.unscoredByReason[reason], 1, `${label}: disclosed under its own reason`);
+    // TAGGED (the schedule really did move) but nothing was withheld: there
+    // was no value to withhold, so it is not a coverage line item.
+    assert.equal(stat.scheduleChangedTagged, 1, label);
+    assert.equal(stat.scheduleChangedExcluded, 0, label);
+    assert.equal(stat.byMarket['moneyline']?.scheduleChangedExcluded, 0, label);
+    // ...and the sensitivity stratum has nothing to publish for it either.
+    assert.equal(stat.scheduleChangedStratum.picks, 1, label);
+    assert.equal(stat.scheduleChangedStratum.scoreable, 0, label);
+    assert.equal(stat.scheduleChangedStratum.gameLevel.meanClvPct, null, label);
+  }
+
+  // NEGATIVE CONTROL: the same drift on a HEALTHY close does count as held
+  // out — so the zeroes above are about the earlier refusal, not about the
+  // counter having stopped working.
+  const healthy = aggregateByParticipant(
+    scoreRun(run, [driftedRow('moneyline', -3_600_000)], TEST_LADDER),
+    run,
+    TEST_LADDER,
+  ).find((s) => s.participantId === 'model-arm');
+  assert.ok(healthy);
+  assert.equal(healthy.scheduleChangedTagged, 1);
+  assert.equal(healthy.scheduleChangedExcluded, 1);
+});
+
+test('every rendered table has data rows with its header column count', () => {
+  // The artifact-level check. A column added to a header without its row
+  // builder (or removed from a row builder without its header) shifts every
+  // later cell one column left in any markdown renderer — including the
+  // held-out count the whole disclosure argument rests on.
+  const { lines } = fixtureRun({
+    secondModelArm: true,
+    extraArm: { participantId: 'timeout-arm', outcome: 'timeout' },
+  });
+  const run = parseRunRecords(lines);
+  let tablesChecked = 0;
+  let rowsChecked = 0;
+  for (const { label, closes } of coverageScenarios()) {
+    const scored = scoreRun(run, closes, TEST_LADDER);
+    const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+    const markdown = buildScorecardMarkdown(
+      run,
+      scored,
+      stats,
+      '2026-07-12T21:00:00.000Z',
+      TEST_LADDER,
+    );
+    const tables = markdownTables(markdown);
+    assert.ok(tables.length >= 4, `${label}: the scorecard renders its tables`);
+    for (const table of tables) {
+      tablesChecked += 1;
+      assert.equal(pipes(table.divider), pipes(table.header), `${label}: divider width`);
+      assert.ok(
+        table.rows.length > 0,
+        `${label}: table "${table.header.slice(0, 40)}" has data rows`,
+      );
+      for (const row of table.rows) {
+        rowsChecked += 1;
+        assert.equal(
+          pipes(row),
+          pipes(table.header),
+          `${label}: data row column count\nheader: ${table.header}\nrow:    ${row}`,
+        );
+      }
+    }
+  }
+  assert.ok(tablesChecked > 30 && rowsChecked > 100, 'the sweep really rendered tables and rows');
+});
+
+test('the coverage table names the held-out column and shows both counts when they differ', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  // model-arm gets TWO tagged picks: one scoreable (held out) and one the
+  // freshness gate had already refused (tagged, nothing withheld).
+  const scored = scoreRun(
+    run,
+    [driftedRow('moneyline', -3_600_000), driftedRow('total', -3_600_000, { confidence: 'stale' })],
+    TEST_LADDER,
+  );
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model);
+  assert.equal(model.scheduleChangedTagged, 2, 'fixture premise');
+  assert.equal(model.scheduleChangedExcluded, 1, 'fixture premise');
+  const markdown = buildScorecardMarkdown(
+    run,
+    scored,
+    stats,
+    '2026-07-12T21:00:00.000Z',
+    TEST_LADDER,
+  );
+  assert.ok(
+    markdown.includes('| 1 (of 2 tagged) |'),
+    'the cell distinguishes what was withheld from what was tagged',
+  );
+  // The prose above the table says exactly this, and is published — not a
+  // code comment a reader never sees.
+  assert.ok(markdown.includes('A schedule-changed pick is never dropped'));
+  assert.ok(markdown.includes('counts the tagged picks that CARRIED a value'));
+  assert.ok(markdown.includes('disclosed under their own reason'));
+  // Per-market disclosure too — the README claims per participant AND per
+  // market, so the per-market table has to carry the column.
+  const byMarketAt = markdown.indexOf('## By market');
+  assert.ok(byMarketAt > 0);
+  const marketHeaderAt = markdown.indexOf(
+    '| Participant | Picks | Scoreable/eligible |',
+    byMarketAt,
+  );
+  assert.ok(marketHeaderAt > byMarketAt);
+  assert.ok(
+    (markdown.slice(marketHeaderAt).split('\n')[0] ?? '').includes('Schedule-changed (held out)'),
+    'the per-market table discloses the held-out count',
+  );
+
+  // NEGATIVE CONTROL: with a single tagged-and-scoreable pick the cell is a
+  // bare number — the parenthetical appears only when the counts differ.
+  const single = scoreRun(run, [driftedRow('moneyline', -3_600_000)], TEST_LADDER);
+  const singleMd = buildScorecardMarkdown(
+    run,
+    single,
+    aggregateByParticipant(single, run, TEST_LADDER),
+    '2026-07-12T21:00:00.000Z',
+    TEST_LADDER,
+  );
+  assert.ok(!singleMd.includes('tagged)'), 'no parenthetical when tagged === held out');
+});
+
+test('the reschedule-sensitivity stratum republishes exactly the values the tag withheld', () => {
+  // SPEC-line-open-evidence-model.md §7 asks for both halves: exclude from
+  // the primary same-schedule estimate AND show in a separate stratum. The
+  // exclusion without the readout would leave the withheld numbers visible
+  // only inside per-pick NDJSON.
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const clean = aggregateByParticipant(
+    scoreRun(run, [closeRow(GAME_A, 'moneyline')], TEST_LADDER),
+    run,
+    TEST_LADDER,
+  ).find((s) => s.participantId === 'model-arm');
+  const tagged = scoreRun(run, [driftedRow('moneyline', -3_600_000)], TEST_LADDER);
+  const taggedStats = aggregateByParticipant(tagged, run, TEST_LADDER);
+  const model = taggedStats.find((s) => s.participantId === 'model-arm');
+  assert.ok(clean && model);
+  assert.ok(clean.gameLevel.meanClvPct !== null, 'fixture premise: the clean run scores it');
+
+  // Primary is empty...
+  assert.equal(model.primaryScoreable, 0);
+  assert.equal(model.gameLevel.meanClvPct, null);
+  // ...and the stratum carries the identical number the primary would have.
+  assert.equal(model.scheduleChangedStratum.picks, 1);
+  assert.equal(model.scheduleChangedStratum.scoreable, 1);
+  assert.equal(model.scheduleChangedStratum.gamesScoreable, 1);
+  assert.equal(model.scheduleChangedStratum.gameLevel.meanClvPct, clean.gameLevel.meanClvPct);
+  assert.equal(model.scheduleChangedStratum.perPick.meanClvPct, clean.perPick.meanClvPct);
+  assert.equal(
+    model.scheduleChangedStratum.gameLevelMarginAdjusted.meanClvPct,
+    clean.gameLevelMarginAdjusted.meanClvPct,
+  );
+
+  const markdown = buildScorecardMarkdown(
+    run,
+    tagged,
+    taggedStats,
+    '2026-07-12T21:00:00.000Z',
+    TEST_LADDER,
+  );
+  assert.ok(markdown.includes('## Reschedule-sensitivity stratum'), 'the stratum table is rendered');
+  assert.ok(markdown.includes('| Participant | Tagged picks | Scoreable | Games scoreable |'));
+  assert.ok(
+    markdown.includes(`| model-arm | 1 | 1 | 1 | ${clean.gameLevel.meanClvPct} |`),
+    'the withheld value is printed, not merely counted',
+  );
+
+  // NEGATIVE CONTROL: a same-schedule run renders NO stratum table — the
+  // section is evidence that something was held out, never boilerplate.
+  const cleanScored = scoreRun(run, [closeRow(GAME_A, 'moneyline')], TEST_LADDER);
+  const cleanMd = buildScorecardMarkdown(
+    run,
+    cleanScored,
+    aggregateByParticipant(cleanScored, run, TEST_LADDER),
+    '2026-07-12T21:00:00.000Z',
+    TEST_LADDER,
+  );
+  assert.ok(!cleanMd.includes('## Reschedule-sensitivity stratum'));
+});
+
+test('the ladder table discloses its OWN held-out count', () => {
+  // A tagged totals pick leaves ladderScoreable via clusterByGame but carries
+  // no ladder.unscoredReason, so without this column the ladder table shows a
+  // shortfall with no explanation anywhere in the row.
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(run, [driftedRow('total', -3_600_000, { line: 9.5 })], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const model = stats.find((s) => s.participantId === 'model-arm');
+  assert.ok(model?.totalsLadder);
+  assert.equal(model.totalsLadder.ladderScoreable, 0);
+  assert.equal(model.totalsLadder.scheduleChangedExcluded, 1);
+  const markdown = buildScorecardMarkdown(
+    run,
+    scored,
+    stats,
+    '2026-07-12T21:00:00.000Z',
+    TEST_LADDER,
+  );
+  const ladderAt = markdown.indexOf('## Totals ladder');
+  assert.ok(ladderAt > 0);
+  const ladderHeader = markdown
+    .slice(ladderAt)
+    .split('\n')
+    .find((l) => l.startsWith('| Participant |'));
+  assert.ok(ladderHeader?.includes('Schedule-changed (held out)'), 'ladder table discloses it');
+
+  // NEGATIVE CONTROL: the same close without the drift is ladder-scored and
+  // the held-out count is zero.
+  const cleanStats = aggregateByParticipant(
+    scoreRun(run, [closeRow(GAME_A, 'total', { line: 9.5 })], TEST_LADDER),
+    run,
+    TEST_LADDER,
+  ).find((s) => s.participantId === 'model-arm');
+  assert.ok(cleanStats?.totalsLadder);
+  assert.equal(cleanStats.totalsLadder.ladderScoreable, 1);
+  assert.equal(cleanStats.totalsLadder.scheduleChangedExcluded, 0);
+});
+
+test('run_meta ladder and schedule counters agree with the participant aggregates', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const cases: Array<{
+    label: string;
+    closes: ClosingLineRow[];
+    expectLadder: 'zero' | 'positive';
+  }> = [
+    {
+      label: 'same-schedule totals',
+      closes: [closeRow(GAME_A, 'total', { line: 9.5 })],
+      expectLadder: 'positive',
+    },
+    {
+      label: 'tagged totals',
+      closes: [driftedRow('total', -3_600_000, { line: 9.5 })],
+      expectLadder: 'zero',
+    },
+  ];
+  for (const { label, closes, expectLadder } of cases) {
+    const scored = scoreRun(run, closes, TEST_LADDER);
+    const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+    const meta = scoredRecords(run, scored, stats, '2026-07-12T21:00:00.000Z', TEST_LADDER).find(
+      (r) => r['recordType'] === 'scored_run_meta',
+    );
+    assert.ok(meta, label);
+    const ladderSum = stats.reduce((sum, s) => sum + (s.totalsLadder?.ladderScoreable ?? 0), 0);
+    assert.equal(meta['totalsLadderScoreable'], ladderSum, `${label}: meta ladder count`);
+    if (expectLadder === 'positive') {
+      assert.ok(ladderSum > 0, `${label}: fixture premise — something was ladder-scored`);
+    } else {
+      assert.equal(ladderSum, 0, `${label}: fixture premise — the tag withheld it`);
+    }
+    assert.equal(
+      meta['primaryScoreable'],
+      stats.reduce((sum, s) => sum + s.primaryScoreable, 0),
+      `${label}: meta primary count`,
+    );
+    assert.equal(
+      meta['scheduleChangedExcluded'],
+      stats.reduce((sum, s) => sum + s.scheduleChangedExcluded, 0),
+      `${label}: meta held-out count`,
+    );
+    assert.equal(
+      meta['scheduleChangedTagged'],
+      stats.reduce((sum, s) => sum + s.scheduleChangedTagged, 0),
+      `${label}: meta tagged count`,
+    );
+  }
+});
+
+test('run_meta scheduleUndetermined counts the picks with no determinable comparison', () => {
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  // No closes at all: every pick's schedule verdict is undeterminable, and
+  // that is DISTINCT from "unchanged" — the counter exists to keep the two
+  // apart in the published meta.
+  const none = scoreRun(run, [], TEST_LADDER);
+  const noneMeta = scoredRecords(
+    run,
+    none,
+    aggregateByParticipant(none, run, TEST_LADDER),
+    '2026-07-12T21:00:00.000Z',
+    TEST_LADDER,
+  ).find((r) => r['recordType'] === 'scored_run_meta');
+  assert.ok(noneMeta);
+  assert.ok(none.length > 0, 'fixture premise');
+  assert.equal(noneMeta['scheduleUndetermined'], none.length, 'every pick is undetermined');
+  assert.equal(noneMeta['scheduleChangedTagged'], 0);
+
+  // A run where SOME picks have a close: the counter must drop by exactly
+  // the picks that got one, not to zero and not stay at the total.
+  const some = scoreRun(run, [closeRow(GAME_A, 'moneyline')], TEST_LADDER);
+  const someMeta = scoredRecords(
+    run,
+    some,
+    aggregateByParticipant(some, run, TEST_LADDER),
+    '2026-07-12T21:00:00.000Z',
+    TEST_LADDER,
+  ).find((r) => r['recordType'] === 'scored_run_meta');
+  assert.ok(someMeta);
+  const withClose = some.filter((p) => p.close !== null).length;
+  assert.ok(withClose > 0 && withClose < some.length, 'fixture premise: a partial join');
+  assert.equal(someMeta['scheduleUndetermined'], some.length - withClose);
+});
+
+test('every close-quality reason a run actually emits is preregistered in closePolicy', () => {
+  // Cross-artifact, not a source string compared with itself: the reasons
+  // come from the scored picks, the text from the published policy block.
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  const scored = scoreRun(
+    run,
+    [
+      closeRow(GAME_A, 'moneyline', { poll_gap_seconds: -292 }),
+      closeRow(GAME_A, 'total', { confidence: 'stale' }),
+    ],
+    TEST_LADDER,
+  );
+  const meta = scoredRecords(
+    run,
+    scored,
+    aggregateByParticipant(scored, run, TEST_LADDER),
+    '2026-07-12T21:00:00.000Z',
+    TEST_LADDER,
+  ).find((r) => r['recordType'] === 'scored_run_meta');
+  assert.ok(meta);
+  const policyText = JSON.stringify(meta['closePolicy']);
+  const emitted = new Set(
+    scored
+      .map((p) => p.result.unscoredReason)
+      .filter((r): r is (typeof CLOSE_QUALITY_REASONS)[number] =>
+        (CLOSE_QUALITY_REASONS as readonly (string | null)[]).includes(r),
+      ),
+  );
+  assert.ok(emitted.has('close_after_start'), 'fixture premise');
+  assert.ok(emitted.has('close_stale'), 'fixture premise');
+  assert.ok(emitted.has('close_missing'), 'fixture premise');
+  // Stronger than "the reasons this run happened to emit": EVERY reason the
+  // scorer can emit must be declared, so a code a reader meets in the records
+  // is never one the preregistered policy failed to mention.
+  for (const reason of CLOSE_QUALITY_REASONS) {
+    assert.ok(policyText.includes(reason), `closePolicy preregisters ${reason}`);
+  }
+  for (const reason of emitted) {
+    assert.ok(policyText.includes(reason), `closePolicy names the emitted reason ${reason}`);
+  }
+  assert.ok(
+    policyText.includes('CONSERVATIVE refusal'),
+    'the post-start gate publishes that its evidence is ambiguous, not conclusive',
   );
 });

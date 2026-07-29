@@ -256,6 +256,13 @@ test('close_after_start is selection-independent: the same close is refused on b
 });
 
 test('the close-quality family is the declared list, in gate order, and excludes selection reasons', () => {
+  // A PIN, not a guard: it makes a change to the vocabulary a conscious
+  // edit. What actually enforces the classification is behavioural and
+  // lives next door — the gate-precedence test above (order) and
+  // ladder.test.ts (membership: every close-quality reason refuses the
+  // ladder, every selection reason is still scored by it). The compiler
+  // checks neither: `UnscoredReason` is the union of both arrays, so moving
+  // a member between them type-checks cleanly.
   assert.deepEqual(
     [...CLOSE_QUALITY_REASONS],
     ['close_missing', 'close_not_captured', 'close_stale', 'close_after_start', 'close_inconsistent'],

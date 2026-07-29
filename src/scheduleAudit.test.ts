@@ -1,17 +1,19 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  buildCloseScheduleAudit,
   CLOSE_AUDIT_VERDICTS,
   closeScheduleAuditMeta,
   closeScheduleAuditRecord,
   parseCloseScheduleAuditDataset,
   rederivedAuditConfidence,
+  rederivedAuditMarkets,
   rederivedPostStartBySport,
   rederivedVerdicts,
   ScheduleAuditError,
 } from './scheduleAudit.js';
 import { SCHEDULE_CHANGE_TOLERANCE_MS } from './scoring.js';
-import type { CloseScheduleAuditRecord } from './scheduleAudit.js';
+import type { CloseScheduleAuditDataset, CloseScheduleAuditRecord } from './scheduleAudit.js';
 import type { ClosingLineRow, GamesTableRow } from './types.js';
 
 // Fixtures mirror the REAL wire shapes as the live anon read path returns
@@ -269,4 +271,145 @@ test('an unknown record field is rejected — the schema is strict', () => {
   const record = JSON.parse(lines[1] as string) as Record<string, unknown>;
   const withExtra = [lines[0], JSON.stringify({ ...record, surprise: 1 }), ...lines.slice(2)].join('\n');
   assert.throws(() => parseCloseScheduleAuditDataset(withExtra));
+});
+
+// ---------------------------------------------------------------------------
+// snapshot assembly — the refusals, and what the meta can and cannot prove
+// ---------------------------------------------------------------------------
+
+const GAME_2 = 'c0a2f8f0-0000-0000-0000-000000000002';
+
+function build(
+  closes: ClosingLineRow[],
+  games: GamesTableRow[],
+  toleranceMs = SCHEDULE_CHANGE_TOLERANCE_MS,
+): CloseScheduleAuditDataset {
+  return buildCloseScheduleAudit({
+    network: 'polygon',
+    toleranceMs,
+    closes,
+    games,
+    generatedAt: '2026-07-29T00:00:00.000Z',
+  });
+}
+
+test('a duplicate (game, market) close REFUSES the whole snapshot', () => {
+  // (network, jsonodds_id, market) is unique upstream, so a duplicate means
+  // the enumeration is not reading what this audit thinks it is.
+  assert.throws(
+    () => build([closeRow(), closeRow()], [gameRow()]),
+    /duplicate closing-line rows/,
+  );
+  // NEGATIVE CONTROL: the same game with two DIFFERENT markets is normal.
+  assert.doesNotThrow(() => build([closeRow(), closeRow({ market: 'moneyline' })], [gameRow()]));
+});
+
+test('a close with no games row REFUSES the whole snapshot rather than dropping it', () => {
+  // Dropping it would shrink every denominator silently; there is no
+  // reference time for it, so every schedule count would be invented.
+  assert.throws(
+    () => build([closeRow(), closeRow({ jsonodds_id: GAME_2, market: 'moneyline' })], [gameRow()]),
+    /have no games row/,
+  );
+  // NEGATIVE CONTROL: supply the missing schedule row and it builds.
+  const ok = build(
+    [closeRow(), closeRow({ jsonodds_id: GAME_2, market: 'moneyline' })],
+    [gameRow(), gameRow({ jsonodds_id: GAME_2 })],
+  );
+  assert.equal(ok.records.length, 2);
+  assert.equal(ok.meta.closesSeen, 2);
+});
+
+test('an unclassifiable timestamp REFUSES the whole snapshot from inside the builder', () => {
+  assert.throws(
+    () => build([closeRow({ lock_time: 'not-a-time' })], [gameRow()]),
+    ScheduleAuditError,
+  );
+});
+
+test('an assembled snapshot round-trips through the reader unchanged', () => {
+  const built = build(
+    [
+      closeRow(),
+      closeRow({ market: 'moneyline', poll_gap_seconds: -292 }),
+      closeRow({ jsonodds_id: GAME_2, market: 'spread' }),
+    ],
+    [gameRow(), gameRow({ jsonodds_id: GAME_2, sport: 'nhl' })],
+  );
+  const text = [built.meta, ...built.records].map((r) => JSON.stringify(r)).join('\n');
+  const parsed = parseCloseScheduleAuditDataset(text);
+  assert.deepEqual(parsed.meta, built.meta);
+  assert.deepEqual(parsed.records, built.records);
+  // Records are ordered by lock time then (game, market) so two runs over the
+  // same corpus produce byte-identical files.
+  assert.deepEqual(
+    built.records.map((r) => `${r.gameId}:${r.market}`),
+    [...built.records].map((r) => `${r.gameId}:${r.market}`),
+  );
+});
+
+test('postStartPollGames counts distinct GAMES, not post-start rows', () => {
+  // Two post-start closes on ONE game: the row count and the game count must
+  // differ, or a per-sport/per-game reading of the audit is wrong by a factor
+  // of the market count.
+  const built = build(
+    [
+      closeRow({ market: 'total', poll_gap_seconds: -292 }),
+      closeRow({ market: 'moneyline', poll_gap_seconds: -120 }),
+      closeRow({ jsonodds_id: GAME_2, market: 'total', poll_gap_seconds: -60 }),
+    ],
+    [gameRow(), gameRow({ jsonodds_id: GAME_2, sport: 'nhl' })],
+  );
+  assert.equal(built.meta.closeAfterStartAny, 3, 'three post-start ROWS');
+  assert.equal(built.meta.postStartPollGames, 2, 'across two distinct GAMES');
+  assert.deepEqual(built.meta.postStartPollBySport, { mlb: 2, nhl: 1 });
+  // The reader re-derives the distinct-game count too, so a meta that counted
+  // rows there refuses to load.
+  const text = [{ ...built.meta, postStartPollGames: 3 }, ...built.records]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+  assert.throws(() => parseCloseScheduleAuditDataset(text), /postStartPollGames/);
+});
+
+test('the market histogram is published so a NARROWED enumeration is visible', () => {
+  // The one incompleteness the meta arithmetic cannot catch: `closesSeen`
+  // comes from the same fetch the records do, so a walk filtered to one
+  // market self-verifies. Publishing the per-market counts is what makes it
+  // legible to a reader — a whole-corpus audit shows all three.
+  const whole = build(
+    [closeRow(), closeRow({ market: 'moneyline' }), closeRow({ market: 'spread' })],
+    [gameRow()],
+  );
+  assert.deepEqual(whole.meta.markets, { total: 1, moneyline: 1, spread: 1 });
+  assert.deepEqual(rederivedAuditMarkets(whole.records), whole.meta.markets);
+
+  const narrowed = build([closeRow()], [gameRow()]);
+  assert.deepEqual(narrowed.meta.markets, { total: 1 }, 'a single key means a filtered walk');
+
+  // ...and it is re-derived on load, so it cannot be faked in the meta.
+  const text = [{ ...whole.meta, markets: { total: 3 } }, ...whole.records]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+  assert.throws(() => parseCloseScheduleAuditDataset(text), /market histogram/);
+});
+
+test('the audit meta proves internal consistency, NOT that the enumeration was complete', () => {
+  // Stated as a test because the committed doc-comment states it: a strict
+  // subset of a corpus produces a dataset that passes every integrity check.
+  // Nothing here is broken — this pins the LIMIT of what a green load means.
+  const full = build(
+    [closeRow(), closeRow({ market: 'moneyline' }), closeRow({ market: 'spread' })],
+    [gameRow()],
+  );
+  const subset = build([closeRow()], [gameRow()]);
+  const render = (d: CloseScheduleAuditDataset): string =>
+    [d.meta, ...d.records].map((r) => JSON.stringify(r)).join('\n');
+  assert.doesNotThrow(() => parseCloseScheduleAuditDataset(render(full)));
+  assert.doesNotThrow(() => parseCloseScheduleAuditDataset(render(subset)));
+  assert.equal(parseCloseScheduleAuditDataset(render(subset)).meta.closesSeen, 1);
+  assert.equal(parseCloseScheduleAuditDataset(render(full)).meta.closesSeen, 3);
+  // The difference is legible only in the market histogram, which is why it
+  // is published.
+  assert.equal(Object.keys(parseCloseScheduleAuditDataset(render(subset)).meta.markets).length, 1);
+  assert.equal(Object.keys(parseCloseScheduleAuditDataset(render(full)).meta.markets).length, 3);
 });

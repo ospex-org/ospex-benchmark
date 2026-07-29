@@ -45,11 +45,14 @@ import {
  *   `close_after_start` refuses a close whose market was still being quoted
  *   by the feed AFTER that lock (a negative poll gap): the feed's own
  *   behaviour contradicts the recorded cutoff, so the row's pre-game status
- *   is not established and it is not evidence for any metric. This is the
- *   negative-side bound on the same poll-gap quantity whose positive side
- *   the upstream freshness classification already bounds (that
- *   classification is one-sided and stamps arbitrarily negative gaps
- *   `fresh`, so this gate is the only thing that sees them).
+ *   is not established and it is not evidence for any metric. It is a
+ *   conservative refusal on ambiguous evidence rather than a finding of
+ *   contamination — see `closeAfterStart` for the readings it cannot
+ *   separate and the corpus counter-evidence. This is the negative-side
+ *   bound on the same poll-gap quantity whose positive side the upstream
+ *   freshness classification already bounds (that classification is
+ *   one-sided and stamps arbitrarily negative gaps `fresh`, so this gate is
+ *   the only thing that sees them).
  *
  * KNOWN LIMITATION, published rather than smoothed over: none of these
  * gates detects a start that moved EARLIER without the upstream capture
@@ -77,11 +80,17 @@ export type SelectedSide = 'away' | 'home';
  * This array is the SINGLE SOURCE for that family: `UnscoredReason` is
  * derived from it, and the ladder builds both its own reason union and its
  * shared-gate membership from it. Adding a close-quality reason here wires
- * every consumer at once; adding one anywhere else is a compile error.
- * (Before this was derived, the membership was a hand-maintained runtime
- * Set laundered through an `as` cast — the compiler could not see a missed
- * entry, and the ladder would have scored a close the exact-line scorer had
- * just refused.)
+ * every consumer in one edit, with no hand-maintained copy left to fall
+ * behind. (Before this was derived, the membership was a hand-maintained
+ * runtime Set laundered through an `as` cast — a missed entry meant the
+ * ladder scored a close the exact-line scorer had just refused.)
+ *
+ * What the compiler does NOT check is CLASSIFICATION. Moving a reason
+ * between this array and `SELECTION_REASONS` type-checks cleanly and
+ * silently changes whether the ladder honors it, because `UnscoredReason`
+ * is the union of both. That is covered behaviourally instead: the tests
+ * sweep every member of both arrays through `scoreTotalsLadder` and assert
+ * which side of the shared gate it lands on.
  */
 export const CLOSE_QUALITY_REASONS = [
   'close_missing',
@@ -200,14 +209,24 @@ function selectedValues(
  * close-quality gate.
  *
  * The gap is `lockTime - lastPolledAt`, so a negative value is a direct
- * observation that the odds feed did not treat `lockTime` as the moment the
- * market closed. Exactly one of two things is true, and this module cannot
- * tell which: the game had not started (the recorded start is early, and the
- * captured value is a genuine pre-game price), or the feed quotes in-play
- * (and a value captured at that lock may be an in-play price). Because the
- * row's pre-game status is not established either way, it is refused rather
- * than scored — the same posture `closeQuoteInconsistent` takes toward a
- * close whose two representations disagree.
+ * observation that the odds feed still listed this market after `lockTime`.
+ * At least three readings fit that observation, and the row does not
+ * distinguish them: the game had not started (the recorded start is early
+ * and the captured value is a genuine pre-game price); the feed quotes
+ * in-play (so a value captured at that lock may be an in-play price); or the
+ * feed simply had not yet dropped the game from its live snapshot (feed
+ * hygiene, telling us nothing about the price at all).
+ *
+ * This is therefore a CONSERVATIVE refusal on ambiguous evidence, NOT a
+ * finding that the row is contaminated — and the corpus carries real
+ * counter-evidence: `yarn audit:closes` measures zero rows whose
+ * `value_captured_at` post-dates their own lock, so on the captured corpus
+ * every refused row's price was recorded at or before its cutoff. The
+ * refusal is nonetheless the posture `closeQuoteInconsistent` already takes
+ * toward a close whose two representations disagree: what is unestablished
+ * is not scored, and the cost is published (`closeAfterStartRefused` on
+ * every run, and the whole-corpus rate from the audit) rather than absorbed
+ * silently.
  *
  * A null gap is NOT a refusal here: it means the market was never seen in
  * the snapshot at all, which the upstream freshness classification already

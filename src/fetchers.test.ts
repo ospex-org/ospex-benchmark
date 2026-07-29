@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { keysetWalk } from './fetchers.js';
+import { fetchClosingLinesByMarket, fetchTotalsClosingLines, keysetWalk } from './fetchers.js';
 
 /**
  * Keyset-pagination invariants. The fake below emulates PostgREST semantics
@@ -129,4 +129,139 @@ test('maxRows is enforced on EVERY page, including a short final one', async () 
     }),
     /unbounded walk/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// closing_lines enumeration — the market filter IS the completeness contract
+// ---------------------------------------------------------------------------
+
+/**
+ * The whole-corpus audit and the totals dispersion snapshot share ONE walker,
+ * and the only difference between them is this filter. That makes the filter
+ * a completeness contract rather than a convenience: a whole-corpus walk that
+ * silently narrowed to one market would still produce a perfectly
+ * self-verifying dataset, because every count in the meta is derived from the
+ * same fetch. The arithmetic cannot catch it — only this does.
+ */
+function stubFetch(pages: Record<string, unknown[][]>): {
+  urls: string[];
+  restore: () => void;
+} {
+  const urls: string[] = [];
+  const original = globalThis.fetch;
+  const counters = new Map<string, number>();
+  type FetchInput = Parameters<typeof globalThis.fetch>[0];
+  type FetchResponse = Awaited<ReturnType<typeof globalThis.fetch>>;
+  globalThis.fetch = (async (input: FetchInput): Promise<FetchResponse> => {
+    const url = String(input);
+    urls.push(url);
+    const key = Object.keys(pages).find((k) => url.includes(k)) ?? '';
+    const list = pages[key] ?? [[]];
+    const index = counters.get(key) ?? 0;
+    counters.set(key, index + 1);
+    const body = list[index] ?? [];
+    return {
+      ok: true,
+      status: 200,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    } as unknown as FetchResponse;
+  }) as typeof globalThis.fetch;
+  return { urls, restore: () => { globalThis.fetch = original; } };
+}
+
+function closingWireRow(id: number, market: 'moneyline' | 'spread' | 'total'): Record<string, unknown> {
+  return {
+    id,
+    network: 'polygon',
+    jsonodds_id: `00000000-0000-4000-8000-00000000${String(id).padStart(4, '0')}`,
+    market,
+    line: market === 'moneyline' ? null : 8.5,
+    away_odds_decimal: 1.9,
+    home_odds_decimal: 1.9,
+    away_p_novig: 0.5,
+    home_p_novig: 0.5,
+    value_captured_at: '2026-07-12T20:09:41+00:00',
+    last_polled_at: '2026-07-12T20:09:41+00:00',
+    lock_time: '2026-07-12T20:10:00+00:00',
+    poll_gap_seconds: 19,
+    confidence: 'fresh',
+    source: 'jsonodds',
+  };
+}
+
+test('fetchClosingLinesByMarket(null) issues NO market filter — the whole-corpus walk', async () => {
+  const stub = stubFetch({
+    closing_lines: [
+      [closingWireRow(1, 'moneyline'), closingWireRow(2, 'spread'), closingWireRow(3, 'total')],
+      [],
+    ],
+  });
+  try {
+    const rows = await fetchClosingLinesByMarket('https://db.example', 'anon-key', 'polygon', null);
+    assert.equal(rows.length, 3, 'all three markets came back in one walk');
+    assert.deepEqual(
+      [...new Set(rows.map((r) => r.market))].sort(),
+      ['moneyline', 'spread', 'total'],
+    );
+    assert.ok(stub.urls.length >= 1);
+    for (const url of stub.urls) {
+      assert.ok(!url.includes('market=eq.'), `no market filter in ${url}`);
+      assert.ok(url.includes('network=eq.polygon'), 'the network filter is still applied');
+      assert.ok(url.includes('order=id.asc'), 'keyset ordering on the identity PK');
+      assert.ok(url.includes('lock_time'), 'the capture timestamps are selected');
+      assert.ok(url.includes('poll_gap_seconds'), 'the poll gap is selected');
+    }
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fetchClosingLinesByMarket narrows to exactly one market when asked', async () => {
+  // NEGATIVE CONTROL for the test above: the filter is emitted when — and
+  // only when — a market is supplied, for every market.
+  for (const market of ['moneyline', 'spread', 'total'] as const) {
+    const stub = stubFetch({ closing_lines: [[closingWireRow(1, market)], []] });
+    try {
+      const rows = await fetchClosingLinesByMarket('https://db.example', 'anon-key', 'polygon', market);
+      assert.equal(rows.length, 1, market);
+      for (const url of stub.urls) {
+        assert.ok(url.includes(`&market=eq.${market}`), `${market}: filter present in ${url}`);
+      }
+    } finally {
+      stub.restore();
+    }
+  }
+});
+
+test('fetchTotalsClosingLines is the totals-filtered case of the same walker', async () => {
+  // The dispersion snapshot must keep its narrowing even though the walker
+  // it now delegates to defaults to nothing.
+  const stub = stubFetch({ closing_lines: [[closingWireRow(1, 'total')], []] });
+  try {
+    const rows = await fetchTotalsClosingLines('https://db.example', 'anon-key', 'polygon');
+    assert.equal(rows.length, 1);
+    assert.ok(stub.urls.every((url) => url.includes('&market=eq.total')));
+  } finally {
+    stub.restore();
+  }
+});
+
+test('the closing-line walk continues past a short page — a whole-corpus audit cannot truncate', async () => {
+  const stub = stubFetch({
+    closing_lines: [
+      [closingWireRow(1, 'total'), closingWireRow(2, 'moneyline')],
+      [closingWireRow(3, 'spread')],
+      [],
+    ],
+  });
+  try {
+    const rows = await fetchClosingLinesByMarket('https://db.example', 'anon-key', 'polygon', null);
+    assert.equal(rows.length, 3, 'a short page is never end-of-data');
+    assert.equal(stub.urls.length, 3, 'the walk ran to the empty page');
+    assert.ok(stub.urls[1]?.includes('id=gt.2'), 'the second page resumes from the last id');
+    assert.ok(stub.urls[2]?.includes('id=gt.3'));
+  } finally {
+    stub.restore();
+  }
 });

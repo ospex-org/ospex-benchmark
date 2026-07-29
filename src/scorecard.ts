@@ -39,11 +39,24 @@ function reasons(counts: Record<string, number>): string {
   return entries.map(([reason, count]) => `${reason} ${count}`).join(', ');
 }
 
+/**
+ * The held-out cell. Two numbers, because they answer different questions
+ * and only the first explains the scoreable gap: how many tagged picks
+ * carried a value the tag withheld, and — when it differs — how many picks
+ * the tag touched at all (the remainder were already refused by an earlier
+ * gate and are disclosed under that gate's reason).
+ */
+function heldOut(stat: { scheduleChangedExcluded: number; scheduleChangedTagged: number }): string {
+  return stat.scheduleChangedTagged === stat.scheduleChangedExcluded
+    ? `${stat.scheduleChangedExcluded}`
+    : `${stat.scheduleChangedExcluded} (of ${stat.scheduleChangedTagged} tagged)`;
+}
+
 function coverageRow(stat: ParticipantStats): string {
   return (
     `| ${stat.participantId} | ${stat.games} | ${outcomes(stat)} | ${stat.eligibleMarkets} | ` +
     `${stat.validDecisions} | ${stat.primaryScoreable} | ${stat.conditionalOnly} | ` +
-    `${stat.scheduleChangedExcluded} | ${reasons(stat.unscoredByReason)} |`
+    `${heldOut(stat)} | ${reasons(stat.unscoredByReason)} |`
   );
 }
 
@@ -64,7 +77,7 @@ function marketRow(stat: ParticipantStats, market: MarketStats): string {
     `${fmt(market.gameLevel.meanClvPct)} | ${fmt(market.gameLevel.medianClvPct)} | ` +
     `${fmt(market.gameLevel.beatClosePct, '%')} | ${fmt(market.gameLevelMarginAdjusted.meanClvPct)} | ` +
     `${fmt(market.gameLevelMarginAdjusted.medianClvPct)} | ${fmt(market.gameLevelMarginAdjusted.beatClosePct, '%')} | ` +
-    `${reasons(market.unscoredByReason)} |`
+    `${heldOut(market)} | ${reasons(market.unscoredByReason)} |`
   );
 }
 
@@ -77,7 +90,22 @@ function ladderRow(stat: ParticipantStats): string {
     `${fmt(ladder.gameLevel.meanClvPct)} | ${fmt(ladder.gameLevel.medianClvPct)} | ` +
     `${fmt(ladder.gameLevelMarginAdjusted.meanClvPct)} | ${fmt(ladder.gameLevelMarginAdjusted.medianClvPct)} | ` +
     `${exact === undefined ? '—' : `${fmt(exact.gameLevel.meanClvPct)} (${exact.scoreable})`} | ` +
-    `${fmt(ladder.meanSignedMovement)} | ${reasons(ladder.unscoredByReason)} |`
+    `${fmt(ladder.meanSignedMovement)} | ${ladder.scheduleChangedExcluded} | ` +
+    `${reasons(ladder.unscoredByReason)} |`
+  );
+}
+
+/**
+ * Reschedule-sensitivity stratum row (SPEC-line-open-evidence-model.md §7):
+ * the primary aggregates recomputed over the picks the schedule tag held
+ * out. Published so the exclusion is inspectable rather than merely counted.
+ */
+function stratumRow(stat: ParticipantStats): string {
+  const s = stat.scheduleChangedStratum;
+  return (
+    `| ${stat.participantId} | ${s.picks} | ${s.scoreable} | ${s.gamesScoreable} | ` +
+    `${fmt(s.gameLevel.meanClvPct)} | ${fmt(s.gameLevel.medianClvPct)} | ` +
+    `${fmt(s.gameLevelMarginAdjusted.meanClvPct)} | ${fmt(s.gameLevelMarginAdjusted.medianClvPct)} |`
   );
 }
 
@@ -133,10 +161,10 @@ export function buildScorecardMarkdown(
     '- Comparison rule: **never pool CLV across markets when comparing participants with different market exposure** — vig differs by market (a moneyline-only baseline and a three-market model are not on the same footing). Pooled tables are context; cross-participant comparison belongs in the per-market section.',
   );
   lines.push(
-    '- Policy: `fresh`-confidence closes only; a close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (`close_inconsistent`); price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable lines report separately-labeled conditional variants of BOTH metrics, never pooled into primary.',
+    '- Policy (price representation and line matching; close TIMING is a separate policy, stated in the next line): `fresh`-confidence closes only; a close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (`close_inconsistent`); price CLV only at the unchanged line (moved lines report signed favorable movement instead); integer push-capable lines report separately-labeled conditional variants of BOTH metrics, never pooled into primary.',
   );
   lines.push(
-    `- Close timing: a close whose market the odds feed was still quoting AFTER the row's own recorded lock (a negative poll gap) is refused outright (\`close_after_start\`) — the feed's behaviour contradicts the recorded cutoff, so the row's pre-game status is not established, and it is refused for every participant and side alike (the totals ladder honors the same verdict). Separately, a close whose lock differs from the frozen bundle's scheduled start by at least ${SCHEDULE_CHANGE_TOLERANCE_MS} ms is TAGGED \`scheduleChanged\`: its CLV is still computed and recorded in full and it stays in every coverage denominator, but it is held out of the primary same-schedule estimate and disclosed in the Schedule-changed column below.`,
+    `- Close timing: a close whose market the odds feed was still quoting AFTER the row's own recorded lock (a negative poll gap) is refused outright (\`close_after_start\`) — the feed's behaviour contradicts the recorded cutoff, so the row's pre-game status is not established, and it is refused for every participant and side alike (the totals ladder honors the same verdict). This is a CONSERVATIVE refusal on ambiguous evidence, not a proof of contamination: a negative gap fits at least three readings — the recorded start was early and the captured value is a genuine pre-game price, the feed quotes in-play, or the feed had simply not yet dropped the game from its live snapshot — and the row alone cannot separate them. Separately, a close whose lock differs from the frozen bundle's scheduled start by at least ${SCHEDULE_CHANGE_TOLERANCE_MS} ms is TAGGED \`scheduleChanged\`: its CLV is still computed and recorded in full and it stays in every coverage denominator, but it is held out of the primary same-schedule estimate, disclosed in the Schedule-changed column below, and republished in its own reschedule-sensitivity table.`,
   );
   lines.push(
     "- Known limitation, stated rather than smoothed over: the recorded lock is the scheduled start as it was known when the close was captured — a PREDICTION of first pitch, never ground truth. Neither check above detects a start that moved EARLIER without the upstream capture noticing; in that case the lock, the schedule row it came from, and the frozen bundle start are the SAME wrong instant, and no comparison available to this scorer can separate them. Detecting that needs an independent start-time source (the on-chain contest start served by the public API, or a league schedule feed). A close passing these gates is therefore not evidence that the game had not started.",
@@ -149,7 +177,7 @@ export function buildScorecardMarkdown(
   lines.push('## Coverage (failures stay in the denominators)');
   lines.push('');
   lines.push(
-    'Schedule-changed picks are scored and recorded in full — they are held out of the primary same-schedule estimate, not dropped, and they remain in Eligible markets and Valid decisions.',
+    'A schedule-changed pick is never dropped: it keeps its place in Eligible markets and Valid decisions, its CLV is computed and recorded on its own scored record whenever the close-quality gates allow, and only its membership in the primary same-schedule estimate is withheld — the withheld values are republished in the reschedule-sensitivity table below. The Schedule-changed column counts the tagged picks that CARRIED a value, which is exactly what the tag removed from Primary-scoreable; when the tag also touched picks an earlier gate had already refused, that larger count is shown in parentheses and those picks are disclosed under their own reason.',
   );
   lines.push('');
   lines.push(
@@ -204,9 +232,9 @@ export function buildScorecardMarkdown(
     lines.push(`### ${MARKET_LABEL[marketKey]}`);
     lines.push('');
     lines.push(
-      '| Participant | Picks | Scoreable/eligible | Games scoreable | Econ mean | Econ median | Econ beat close | Margin-adj mean | Margin-adj median | Margin-adj beat close | Unscored (reason) |',
+      '| Participant | Picks | Scoreable/eligible | Games scoreable | Econ mean | Econ median | Econ beat close | Margin-adj mean | Margin-adj median | Margin-adj beat close | Schedule-changed (held out) | Unscored (reason) |',
     );
-    lines.push('|---|---|---|---|---|---|---|---|---|---|---|');
+    lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|');
     for (const { stat, market } of active) lines.push(marketRow(stat, market));
     lines.push('');
   }
@@ -230,10 +258,28 @@ export function buildScorecardMarkdown(
     );
     lines.push('');
     lines.push(
-      '| Participant | Totals picks | Ladder-scored | Ladder econ mean | Ladder econ median | Ladder margin-adj mean | Ladder margin-adj median | Exact-line econ mean (n) | Mean signed movement | Unscored (reason) |',
+      '| Participant | Totals picks | Ladder-scored | Ladder econ mean | Ladder econ median | Ladder margin-adj mean | Ladder margin-adj median | Exact-line econ mean (n) | Mean signed movement | Schedule-changed (held out) | Unscored (reason) |',
     );
-    lines.push('|---|---|---|---|---|---|---|---|---|---|');
+    lines.push('|---|---|---|---|---|---|---|---|---|---|---|');
     for (const stat of withLadder) lines.push(ladderRow(stat));
+    lines.push('');
+  }
+
+  // Reschedule-sensitivity stratum — rendered only when the tag touched
+  // something, so a same-schedule slate is not padded with an empty table.
+  const tagged = stats.filter((stat) => stat.scheduleChangedStratum.picks > 0);
+  if (tagged.length > 0) {
+    lines.push('## Reschedule-sensitivity stratum (held out of primary — shown, not discarded)');
+    lines.push('');
+    lines.push(
+      `The picks whose close locked at least ${SCHEDULE_CHANGE_TOLERANCE_MS} ms away from the frozen bundle start, aggregated exactly like the primary columns but over that set alone. Their values are withheld from the primary same-schedule estimate, never from publication — the point of the stratum is that a reader can see whether the rescheduled picks behaved differently rather than take the exclusion on trust. Small-n by construction; never pooled with primary.`,
+    );
+    lines.push('');
+    lines.push(
+      '| Participant | Tagged picks | Scoreable | Games scoreable | Econ mean | Econ median | Margin-adj mean | Margin-adj median |',
+    );
+    lines.push('|---|---|---|---|---|---|---|---|');
+    for (const stat of tagged) lines.push(stratumRow(stat));
     lines.push('');
   }
 
