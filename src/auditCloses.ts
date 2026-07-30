@@ -3,6 +3,7 @@ import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
 import { fetchClosingLinesByMarket, fetchGamesRowsByIds } from './fetchers.js';
 import { writeNdjson } from './records.js';
+import { CLOSE_SOURCE } from './closeSource.js';
 import { buildCloseScheduleAudit, ScheduleAuditError } from './scheduleAudit.js';
 import { SCHEDULE_CHANGE_TOLERANCE_MS } from './scoring.js';
 
@@ -137,7 +138,23 @@ async function main(): Promise<number> {
     options.network,
     null,
   );
-  printLine(`closing lines: ${closes.length} rows (all markets, keyset-complete)`);
+  // FAIL CLOSED on an empty corpus. "0 closes, 0 problems" is the most
+  // dangerous possible clean bill of health: a zero-row walk is
+  // indistinguishable from one whose filter silently narrowed to nothing. The
+  // reader refuses a records-less dataset for the same reason, so the CLI can
+  // no longer emit an artifact its own verifier rejects.
+  if (closes.length === 0) {
+    throw new ScheduleAuditError(
+      `no closing lines found on network "${options.network}" from source "${CLOSE_SOURCE}" — ` +
+        'refusing to certify an empty corpus. Check the network and source filters and that the ' +
+        'public read path is reachable',
+    );
+  }
+  // NOT "keyset-complete". The walk enumerates by identity key, which rules
+  // out the offset-pagination failure (a concurrent insert shifting page
+  // boundaries) but does NOT prove the enumeration saw every committed row —
+  // see the completeness note printed at the end of this run.
+  printLine(`closing lines: ${closes.length} rows (all markets, one keyset walk over the id)`);
 
   const gameIds = [...new Set(closes.map((close) => close.jsonodds_id))];
   const games = await fetchGamesRowsByIds(
@@ -198,6 +215,18 @@ async function main(): Promise<number> {
       'frozen bundle start, and lock_time is copied from games.match_time at capture — a ' +
       'start that moved earlier unnoticed reads as ZERO drift here. Only the ' +
       'close_after_start count is sourced from feed behaviour rather than the schedule record.',
+  );
+  printLine('');
+  printLine(
+    'COMPLETENESS: the rows above are what ONE keyset walk over closing_lines.id observed. ' +
+      'Paging by identity key rules out the offset-pagination failure — a concurrent insert ' +
+      'shifting page boundaries so one row duplicates and another drops — and the walk refuses ' +
+      'a non-increasing id. It does NOT prove the enumeration saw every committed row: identity ' +
+      'is allocated before commit, so a transaction holding a LOW id can commit after the ' +
+      'cursor has already passed it, and that row is missed. Reading this over the public anon ' +
+      'REST path there is no transaction, no repeatable-read snapshot and no visibility cursor ' +
+      'to close that gap, so the guarantee is stated rather than claimed away. Treat these ' +
+      'counts as a lower bound on the corpus, and re-run if a figure is load-bearing.',
   );
   printLine(`dataset: ${outPath}`);
   return 0;

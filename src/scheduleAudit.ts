@@ -1,5 +1,12 @@
 import { z } from 'zod';
-import { closeAfterStart } from './clv.js';
+import {
+  closeAfterStart,
+  closeTiming,
+  closeValueAfterLock,
+  POLL_GAP_COHERENCE_TOLERANCE_MS,
+} from './closeTiming.js';
+import { CLOSE_SOURCE } from './closeSource.js';
+import { instantMs } from './time.js';
 import { isScheduleChanged, scheduleDriftMs, SCHEDULE_CHANGE_TOLERANCE_MS } from './scoring.js';
 import { closeQuoteFromRow } from './scoring.js';
 import type { ClosingLineRow, GamesTableRow } from './types.js';
@@ -83,6 +90,15 @@ export type CloseAuditVerdict = (typeof CLOSE_AUDIT_VERDICTS)[number];
 export const closeScheduleAuditRecordSchema = z
   .object({
     recordType: z.literal('close_schedule_audit'),
+    /**
+     * Provenance, carried per record so the artifact can be checked against
+     * the corpus it claims to describe. Previously the network lived only in
+     * meta, where it was whatever the CALLER asked for — an audit run as
+     * "polygon" over another network's rows produced a clean-looking artifact
+     * stamped polygon. The reader re-checks both against meta.
+     */
+    network: z.string().min(1),
+    source: z.string().min(1),
     gameId: z.string().min(1),
     market: z.enum(['moneyline', 'spread', 'total']),
     sport: z.string().min(1),
@@ -107,6 +123,9 @@ export const closeScheduleAuditMetaSchema = z
   .object({
     recordType: z.literal('close_schedule_audit_meta'),
     network: z.string().min(1),
+    /** The one feed every close in this corpus came from; every record must
+     *  agree with it, so a mixed-source blend cannot hide behind an average. */
+    closeSource: z.string().min(1),
     scheduleChangeToleranceMs: z.number().int().nonnegative(),
     /** Every closing line seen on the network, all markets. */
     closesSeen: z.number().int().nonnegative(),
@@ -143,12 +162,30 @@ export const closeScheduleAuditMetaSchema = z
 export type CloseScheduleAuditRecord = z.infer<typeof closeScheduleAuditRecordSchema>;
 export type CloseScheduleAuditMeta = z.infer<typeof closeScheduleAuditMetaSchema>;
 
-function afterStrict(a: string | null, b: string): boolean {
+/**
+ * Strictly ordered comparison between two instants, at the shared
+ * second-granularity tolerance.
+ *
+ * Both sides go through the repo's canonical `instantMs`, which REJECTS a
+ * timestamp carrying no explicit offset. The previous version used bare
+ * `Date.parse` and returned `false` when either side failed to parse — so a row
+ * whose timestamps could not be read was published as "not after", i.e. clean,
+ * and an unclassifiable row was certified. An unreadable comparison is now a
+ * refusal, matching every other unclassifiable case in this builder.
+ */
+function afterStrict(label: string, a: string | null, b: string): boolean {
   if (a === null) return false;
-  const left = Date.parse(a);
-  const right = Date.parse(b);
-  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
-  return left > right;
+  let left: number;
+  let right: number;
+  try {
+    left = instantMs(a);
+    right = instantMs(b);
+  } catch (err) {
+    throw new ScheduleAuditError(
+      `${label}: cannot compare "${a}" against "${b}" — ${(err as Error).message}`,
+    );
+  }
+  return left - right > POLL_GAP_COHERENCE_TOLERANCE_MS;
 }
 
 /**
@@ -164,54 +201,139 @@ function afterStrict(a: string | null, b: string): boolean {
  * re-derivations of them — the audit can only measure what the scorer does
  * if it asks the scorer.
  */
-export function closeScheduleAuditRecord(
-  close: ClosingLineRow,
-  game: GamesTableRow,
-  toleranceMs: number = SCHEDULE_CHANGE_TOLERANCE_MS,
-): CloseScheduleAuditRecord {
-  const driftMs = scheduleDriftMs(close.lock_time, game.match_time);
+/**
+ * The RAW, unjudged half of an audit record — the evidence. Every other field
+ * is a pure function of these, which is what lets the reader recompute a
+ * record instead of trusting it.
+ */
+export interface CloseScheduleAuditEvidence {
+  gameId: string;
+  market: 'moneyline' | 'spread' | 'total';
+  confidence: 'fresh' | 'stale' | 'missing';
+  lockTime: string;
+  valueCapturedAt: string | null;
+  lastPolledAt: string | null;
+  pollGapSeconds: number | null;
+  gameMatchTime: string;
+}
+
+/** The JUDGED half. Field-for-field what {@link deriveCloseScheduleAuditFields} returns. */
+export interface CloseScheduleAuditDerived {
+  matchTimeDriftMs: number;
+  scheduleChangedVsMatchTime: boolean;
+  closeAfterStart: boolean;
+  valueCapturedAfterLock: boolean;
+  valueCapturedAfterMatchTime: boolean;
+  verdict: CloseAuditVerdict;
+}
+
+/** The derived keys, listed once so the reader's re-check is exhaustive by
+ *  construction — adding a derived field without verifying it becomes a type
+ *  error rather than a silent gap in the verification. */
+export const CLOSE_SCHEDULE_AUDIT_DERIVED_KEYS = [
+  'matchTimeDriftMs',
+  'scheduleChangedVsMatchTime',
+  'closeAfterStart',
+  'valueCapturedAfterLock',
+  'valueCapturedAfterMatchTime',
+  'verdict',
+] as const satisfies ReadonlyArray<keyof CloseScheduleAuditDerived>;
+
+/**
+ * Derive every judged field of an audit record from its raw evidence.
+ *
+ * ONE implementation, used by the writer AND the reader — that is the whole
+ * point. The reader recomputes each record from the record's own timestamps
+ * and refuses on any disagreement, so an artifact edited to say
+ * `valueCapturedAfterLock: false` while its `valueCapturedAt` says otherwise
+ * no longer parses. Two separate implementations could drift, and the
+ * verification would then be checking a copy of the bug.
+ */
+export function deriveCloseScheduleAuditFields(
+  evidence: CloseScheduleAuditEvidence,
+  toleranceMs: number,
+): CloseScheduleAuditDerived {
+  const where = `close ${evidence.gameId}:${evidence.market}`;
+  const driftMs = scheduleDriftMs(evidence.lockTime, evidence.gameMatchTime);
   if (driftMs === null) {
     throw new ScheduleAuditError(
-      `close ${close.jsonodds_id}:${close.market} has an unparseable lock_time ` +
-        `("${close.lock_time}") or games.match_time ("${game.match_time}") — ` +
-        'refusing an unclassifiable snapshot',
+      `${where} has an unparseable lock_time ("${evidence.lockTime}") or ` +
+        `games.match_time ("${evidence.gameMatchTime}") — refusing an unclassifiable snapshot`,
     );
   }
   const changed = isScheduleChanged(driftMs, toleranceMs);
   if (changed === null) {
     throw new ScheduleAuditError(
-      `close ${close.jsonodds_id}:${close.market} produced an undeterminable schedule ` +
-        'verdict — refusing an unclassifiable snapshot',
+      `${where} produced an undeterminable schedule verdict — refusing an unclassifiable snapshot`,
     );
   }
-  const postStart = closeAfterStart(closeQuoteFromRow(close));
-  const notFresh = close.confidence !== 'fresh';
-  const verdict: CloseAuditVerdict = notFresh
-    ? 'not_fresh'
-    : postStart
-      ? 'post_start_poll'
-      : changed
-        ? 'schedule_changed'
-        : 'clean';
+  // Timing evidence is validated before any timing verdict is derived from it.
+  // Same posture as the two refusals above — an unclassifiable row aborts the
+  // audit rather than being published with a verdict nothing established.
+  // `afterStrict` used to answer this by turning an unparseable instant into
+  // `false`, so a row we could not read was reported clean.
+  const timing = closeTiming({
+    lockTime: evidence.lockTime,
+    valueCapturedAt: evidence.valueCapturedAt,
+    lastPolledAt: evidence.lastPolledAt,
+    pollGapSeconds: evidence.pollGapSeconds,
+  });
+  if (timing.kind === 'unusable') {
+    throw new ScheduleAuditError(
+      `${where} has unusable timing evidence (${timing.violations.join('; ')}) — ` +
+        'refusing an unclassifiable snapshot',
+    );
+  }
+  const postStart = closeAfterStart(timing);
+  const notFresh = evidence.confidence !== 'fresh';
   return {
-    recordType: 'close_schedule_audit',
+    matchTimeDriftMs: driftMs,
+    scheduleChangedVsMatchTime: changed,
+    closeAfterStart: postStart,
+    valueCapturedAfterLock: closeValueAfterLock(timing),
+    valueCapturedAfterMatchTime: afterStrict(
+      `${where} value_captured_at vs games.match_time`,
+      evidence.valueCapturedAt,
+      evidence.gameMatchTime,
+    ),
+    verdict: notFresh
+      ? 'not_fresh'
+      : postStart
+        ? 'post_start_poll'
+        : changed
+          ? 'schedule_changed'
+          : 'clean',
+  };
+}
+
+export function closeScheduleAuditRecord(
+  close: ClosingLineRow,
+  game: GamesTableRow,
+  toleranceMs: number = SCHEDULE_CHANGE_TOLERANCE_MS,
+): CloseScheduleAuditRecord {
+  const evidence: CloseScheduleAuditEvidence = {
     gameId: close.jsonodds_id,
     market: close.market,
-    sport: game.sport,
     confidence: close.confidence,
     lockTime: close.lock_time,
     valueCapturedAt: close.value_captured_at,
     lastPolledAt: close.last_polled_at,
     pollGapSeconds: close.poll_gap_seconds,
     gameMatchTime: game.match_time,
-    matchTimeDriftMs: driftMs,
-    scheduleChangedVsMatchTime: changed,
-    closeAfterStart: postStart,
-    valueCapturedAfterLock: afterStrict(close.value_captured_at, close.lock_time),
-    valueCapturedAfterMatchTime: afterStrict(close.value_captured_at, game.match_time),
-    verdict,
+  };
+  return {
+    recordType: 'close_schedule_audit',
+    // Provenance travels WITH the record. Without it the artifact cannot be
+    // checked against the corpus it claims to describe — meta carried a
+    // caller-supplied network and the records carried no identity at all.
+    network: close.network,
+    source: close.source,
+    sport: game.sport,
+    ...evidence,
+    ...deriveCloseScheduleAuditFields(evidence, toleranceMs),
   };
 }
+
 
 /** Verdict partition re-derived from the records themselves. */
 export function rederivedVerdicts(
@@ -288,6 +410,19 @@ export interface CloseScheduleAuditDataset {
 export function parseCloseScheduleAuditDataset(text: string): CloseScheduleAuditDataset {
   const lines = text.split(/\r?\n/).filter((line) => line.trim() !== '');
   if (lines.length === 0) throw new ScheduleAuditError('audit dataset is empty');
+  // A META-ONLY dataset is empty too, and that was the dangerous case: the
+  // previous check caught only a zero-byte string, so an artifact reporting
+  // `closesSeen: 0` with no records parsed clean and read as "audited the
+  // corpus, found nothing wrong". A zero-row walk is indistinguishable from a
+  // walk whose filter silently narrowed to nothing, so it certifies nothing.
+  // The CLI refuses the same condition before writing, which is what stops it
+  // emitting an artifact its own verifier would reject.
+  if (lines.length === 1) {
+    throw new ScheduleAuditError(
+      'audit dataset carries meta but no records — an empty corpus certifies nothing ' +
+        'and must not be read as a clean one',
+    );
+  }
   const meta = closeScheduleAuditMetaSchema.parse(JSON.parse(lines[0] ?? ''));
   const records = lines
     .slice(1)
@@ -303,6 +438,41 @@ export function parseCloseScheduleAuditDataset(text: string): CloseScheduleAudit
     throw new ScheduleAuditError(
       `meta coverage arithmetic fails: ${meta.closesSeen} closes seen != ${meta.records} records`,
     );
+  }
+  // RECOMPUTE, do not trust. Every judged field of every record is re-derived
+  // from that record's OWN raw timestamps and compared.
+  //
+  // Without this the reader only checked that the aggregates agreed with the
+  // records — so editing one record's `valueCapturedAfterLock` to `false` and
+  // leaving its timestamps untouched produced a file that verified perfectly,
+  // because the aggregates were themselves recomputed from the edited flag.
+  // The evidence and the verdict are now cross-checked against each other, by
+  // the same function that wrote them.
+  //
+  // Identity is re-checked here too: a record from another network or another
+  // feed cannot sit inside an artifact that claims this one.
+  for (const record of records) {
+    if (record.network !== meta.network) {
+      throw new ScheduleAuditError(
+        `record ${record.gameId}:${record.market} is on network "${record.network}" but the ` +
+          `dataset claims "${meta.network}" — truncated or edited?`,
+      );
+    }
+    if (record.source !== meta.closeSource) {
+      throw new ScheduleAuditError(
+        `record ${record.gameId}:${record.market} came from source "${record.source}" but the ` +
+          `dataset claims "${meta.closeSource}" — truncated or edited?`,
+      );
+    }
+    const derived = deriveCloseScheduleAuditFields(record, meta.scheduleChangeToleranceMs);
+    for (const key of CLOSE_SCHEDULE_AUDIT_DERIVED_KEYS) {
+      if (record[key] !== derived[key]) {
+        throw new ScheduleAuditError(
+          `record ${record.gameId}:${record.market} says ${key}=${JSON.stringify(record[key])} ` +
+            `but its own evidence derives ${JSON.stringify(derived[key])} — truncated or edited?`,
+        );
+      }
+    }
   }
   const verdicts = rederivedVerdicts(records);
   const verdictTotal = Object.values(verdicts).reduce((a, b) => a + b, 0);
@@ -423,14 +593,57 @@ export function buildCloseScheduleAudit(options: {
   generatedAt: string;
 }): CloseScheduleAuditDataset {
   const { closes, games } = options;
+
+  // IDENTITY BINDING, asserted before anything is measured.
+  //
+  // The fetcher filters on network and source server-side, but the artifact is
+  // built HERE — and this is where a hand-assembled, replayed, or
+  // cross-network dataset enters. Without these checks the builder accepts
+  // rows from another network or another feed and then stamps the CALLER's
+  // requested network into the artifact's meta, so the audit certifies a
+  // corpus it never examined. The network is a property of the ROWS; the
+  // caller's request is only a request until the rows agree with it.
+  const foreignClose = closes.find((close) => close.network !== options.network);
+  if (foreignClose !== undefined) {
+    throw new ScheduleAuditError(
+      `closing line ${foreignClose.jsonodds_id}:${foreignClose.market} is on network ` +
+        `"${foreignClose.network}" but the audit was requested for "${options.network}" — ` +
+        'refusing a cross-network snapshot',
+    );
+  }
+  const foreignSource = closes.find((close) => close.source !== CLOSE_SOURCE);
+  if (foreignSource !== undefined) {
+    throw new ScheduleAuditError(
+      `closing line ${foreignSource.jsonodds_id}:${foreignSource.market} came from source ` +
+        `"${foreignSource.source}" but the canonical close source is "${CLOSE_SOURCE}" — ` +
+        'refusing a mixed-source snapshot',
+    );
+  }
+  const foreignGame = games.find((game) => game.network !== options.network);
+  if (foreignGame !== undefined) {
+    throw new ScheduleAuditError(
+      `games row ${foreignGame.jsonodds_id} is on network "${foreignGame.network}" but the ` +
+        `audit was requested for "${options.network}" — refusing a cross-network snapshot`,
+    );
+  }
+
   const keys = new Set(closes.map((close) => `${close.jsonodds_id}:${close.market}`));
   if (keys.size !== closes.length) {
     throw new ScheduleAuditError(
       'duplicate closing-line rows for one (game, market) — refusing the snapshot',
     );
   }
-  const gameById = new Map(games.map((game) => [game.jsonodds_id, game]));
-  const orphans = closes.filter((close) => !gameById.has(close.jsonodds_id));
+  // Joined on (network, jsonodds_id), never on jsonodds_id alone and never on
+  // contest_id — the same rule the rest of the protocol follows, because a
+  // deployment epoch reset makes contest ids ambiguous and a bare game id can
+  // collide across networks. The binding assertions above already force one
+  // network, so this is the join being explicit about its own key rather than
+  // relying on an invariant established elsewhere.
+  const gameKey = (network: string, jsonoddsId: string): string => `${network}::${jsonoddsId}`;
+  const gameById = new Map(games.map((game) => [gameKey(game.network, game.jsonodds_id), game]));
+  const orphans = closes.filter(
+    (close) => !gameById.has(gameKey(close.network, close.jsonodds_id)),
+  );
   if (orphans.length > 0) {
     throw new ScheduleAuditError(
       `${orphans.length} closing line(s) have no games row ` +
@@ -440,7 +653,7 @@ export function buildCloseScheduleAudit(options: {
 
   const records: CloseScheduleAuditRecord[] = [];
   for (const close of closes) {
-    const game = gameById.get(close.jsonodds_id);
+    const game = gameById.get(gameKey(close.network, close.jsonodds_id));
     if (game === undefined) {
       throw new ScheduleAuditError('unreachable: orphan closes were refused above');
     }
@@ -481,6 +694,7 @@ export function closeScheduleAuditMeta(options: {
   return {
     recordType: 'close_schedule_audit_meta',
     network: options.network,
+    closeSource: CLOSE_SOURCE,
     scheduleChangeToleranceMs: options.toleranceMs,
     closesSeen: options.closesSeen,
     records: records.length,

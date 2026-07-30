@@ -8,6 +8,7 @@ import type { BaselinePolicyVersion } from './baselines.js';
 import {
   aggregateByParticipant,
   closeQuoteFromRow,
+  closesByKey,
   inPrimaryStratum,
   isScheduleChanged,
   parseRunRecords,
@@ -336,7 +337,11 @@ function closeRow(
 ): ClosingLineRow {
   const lock = FIXTURE_START_UTC[gameId] ?? '2026-07-12T16:15:00+00:00';
   const lockMs = Date.parse(lock);
-  return {
+  // `poll_gap_seconds` is the knob; `last_polled_at` is DERIVED from it so a
+  // gap-only override still describes a COHERENT row. The scorer now refuses a
+  // row whose stored gap contradicts its own instants, so a fixture that moved
+  // only the gap would trip that refusal instead of the gate under test.
+  const base = {
     network: 'polygon',
     jsonodds_id: gameId,
     market,
@@ -346,12 +351,23 @@ function closeRow(
     away_p_novig: 0.5,
     home_p_novig: 0.5,
     value_captured_at: new Date(lockMs - 20_000).toISOString(),
-    last_polled_at: new Date(lockMs - 15_000).toISOString(),
     lock_time: lock,
-    poll_gap_seconds: 15,
-    confidence: 'fresh',
+    poll_gap_seconds: 15 as number | null,
+    confidence: 'fresh' as 'fresh' | 'stale' | 'missing',
     source: 'reference',
     ...overrides,
+  };
+  // Tolerates a deliberately unparseable `lock_time` — some cases supply one to
+  // prove the scorer refuses it, and the fixture must not die first.
+  const baseLockMs = Date.parse(base.lock_time);
+  const derivedLastPolled =
+    base.poll_gap_seconds === null || !Number.isFinite(baseLockMs)
+      ? null
+      : new Date(baseLockMs - base.poll_gap_seconds * 1000).toISOString();
+  return {
+    ...base,
+    last_polled_at:
+      'last_polled_at' in overrides ? (overrides.last_polled_at ?? null) : derivedLastPolled,
   };
 }
 
@@ -2273,7 +2289,21 @@ function driftedRow(
   driftMs: number,
   overrides: Partial<ClosingLineRow> = {},
 ): ClosingLineRow {
-  return { ...driftedClose(market, driftMs), ...overrides };
+  const merged = { ...driftedClose(market, driftMs), ...overrides };
+  // Keep the row COHERENT: `last_polled_at` must follow the (possibly drifted)
+  // lock and the (possibly overridden) gap. Spreading alone would leave it
+  // describing the PRE-drift lock, and the scorer now refuses a row whose
+  // stored gap contradicts its own instants — so a case meaning "post-start"
+  // would land on `close_timing_unusable` instead.
+  if ('last_polled_at' in overrides) return merged;
+  const lockMs = Date.parse(merged.lock_time);
+  return {
+    ...merged,
+    last_polled_at:
+      merged.poll_gap_seconds === null || !Number.isFinite(lockMs)
+        ? null
+        : new Date(lockMs - merged.poll_gap_seconds * 1000).toISOString(),
+  };
 }
 
 /**
@@ -2724,4 +2754,34 @@ test('every close-quality reason a run actually emits is preregistered in closeP
     policyText.includes('CONSERVATIVE refusal'),
     'the post-start gate publishes that its evidence is ambiguous, not conclusive',
   );
+});
+
+test('scheduleDriftMs REFUSES an offset-less instant instead of reading it as host-local time', () => {
+  // The original defect: bare `Date.parse` reads an offset-less ISO string as
+  // LOCAL time, so this exact pair produced 0 on a UTC host and 14400000 on a
+  // US-Eastern one — and `isScheduleChanged` flipped false -> true with it. A
+  // verdict that depends on the scoring machine's timezone is not a
+  // measurement. Refusing the input is what makes it one.
+  assert.equal(scheduleDriftMs('2026-07-30T19:00:00', '2026-07-30T19:00:00Z'), null);
+  assert.equal(scheduleDriftMs('2026-07-30T19:00:00Z', '2026-07-30T19:00:00'), null);
+  assert.equal(isScheduleChanged(scheduleDriftMs('2026-07-30T19:00:00', '2026-07-30T19:00:00Z')), null);
+
+  // NEGATIVE CONTROLS: offset-qualified pairs still compute, signed, and an
+  // explicit non-UTC offset is honoured rather than ignored.
+  assert.equal(scheduleDriftMs('2026-07-30T19:00:00Z', '2026-07-30T19:00:00Z'), 0);
+  assert.equal(scheduleDriftMs('2026-07-30T18:00:00Z', '2026-07-30T19:00:00Z'), -3_600_000);
+  assert.equal(scheduleDriftMs('2026-07-30T19:00:00-04:00', '2026-07-30T23:00:00Z'), 0);
+});
+
+test('closesByKey REFUSES a duplicate rather than silently keeping the last row seen', () => {
+  // `new Map(rows.map(...))` kept whichever row arrived last, so two rows
+  // differing only by network or feed collapsed into one and the scorer priced
+  // against an arbitrary winner with nothing published to say a choice was made.
+  const a = closeRow(GAME_A, 'total');
+  assert.throws(
+    () => closesByKey([a, { ...a, source: 'rundown' }]),
+    /refusing to score against an ambiguous close/,
+  );
+  // NEGATIVE CONTROL: distinct (game, market) pairs still index.
+  assert.equal(closesByKey([a, closeRow(GAME_A, 'moneyline')]).size, 2);
 });

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   closeAfterStart,
+  closeTimingOf,
   CLOSE_QUALITY_REASONS,
   favorableLineMovement,
   isCloseQualityReason,
@@ -14,19 +15,39 @@ import type { CloseQuote } from './clv.js';
 // A HEALTHY close by default: the last feed sighting precedes the recorded
 // lock (positive poll gap), so timing gates pass and every pre-existing
 // price assertion below is unaffected by them.
+/**
+ * A COHERENT close. `pollGapSeconds` is the knob and `lastPolledAt` is DERIVED
+ * from it (`lock - gap`), so a gap-only override still describes a row whose
+ * stored gap agrees with its own instants — which is what the scorer now
+ * requires before it will read a timing verdict off either.
+ *
+ * Passing `lastPolledAt` explicitly wins over the derivation; that is how the
+ * incoherence tests build a self-contradicting row on purpose. The defaults
+ * reproduce the previous literals exactly (lock 16:15:00, gap 15 → 16:14:45).
+ */
 function close(overrides: Partial<CloseQuote> = {}): CloseQuote {
-  return {
+  const base = {
     line: null,
     awayDecimal: 2.0,
     homeDecimal: 2.0,
     awayPNovig: 0.5,
     homePNovig: 0.5,
-    confidence: 'fresh',
+    confidence: 'fresh' as const,
     lockTime: '2026-07-12T16:15:00+00:00',
     valueCapturedAt: '2026-07-12T16:14:40+00:00',
-    lastPolledAt: '2026-07-12T16:14:45+00:00',
     pollGapSeconds: 15,
     ...overrides,
+  };
+  // Tolerates a deliberately unparseable `lockTime` — the timing-evidence cases
+  // supply one to prove the scorer refuses it, and the fixture must not die first.
+  const lockMs = Date.parse(base.lockTime);
+  const derivedLastPolled =
+    base.pollGapSeconds === null || !Number.isFinite(lockMs)
+      ? null
+      : new Date(lockMs - base.pollGapSeconds * 1000).toISOString();
+  return {
+    ...base,
+    lastPolledAt: 'lastPolledAt' in overrides ? (overrides.lastPolledAt ?? null) : derivedLastPolled,
   };
 }
 
@@ -227,12 +248,21 @@ test('close-quality gate precedence is pinned: stale > after_start > inconsisten
   );
   // NEGATIVE CONTROL: with the gap made healthy, the SAME row falls through
   // to the price check — so the assertion above is about precedence, not
-  // about close_inconsistent having stopped working.
+  // about close_inconsistent having stopped working. Rebuilt through the
+  // fixture rather than spread-and-overridden: moving the gap alone would
+  // leave `lastPolledAt` describing the OLD gap, and that contradiction is now
+  // itself a refusal (`close_timing_unusable`), which would make this control
+  // pass for the wrong reason.
   assert.equal(
-    scoreDecision('moneyline', 'away', 'away', 2.1, 1.8, null, {
-      ...postStartAndInconsistent,
-      pollGapSeconds: 15,
-    }).unscoredReason,
+    scoreDecision(
+      'moneyline',
+      'away',
+      'away',
+      2.1,
+      1.8,
+      null,
+      close({ pollGapSeconds: 15, awayPNovig: 0.4, homePNovig: 0.4, awayDecimal: null, homeDecimal: null }),
+    ).unscoredReason,
     'close_inconsistent',
   );
 });
@@ -265,7 +295,15 @@ test('the close-quality family is the declared list, in gate order, and excludes
   // a member between them type-checks cleanly.
   assert.deepEqual(
     [...CLOSE_QUALITY_REASONS],
-    ['close_missing', 'close_not_captured', 'close_stale', 'close_after_start', 'close_inconsistent'],
+    [
+      'close_missing',
+      'close_not_captured',
+      'close_stale',
+      'close_timing_unusable',
+      'close_after_start',
+      'close_value_after_lock',
+      'close_inconsistent',
+    ],
   );
   assert.deepEqual([...SELECTION_REASONS], ['line_moved', 'push_capable_line']);
   for (const reason of CLOSE_QUALITY_REASONS) {
@@ -276,11 +314,28 @@ test('the close-quality family is the declared list, in gate order, and excludes
   }
 });
 
-test('closeAfterStart is exactly the negative-gap predicate, exported so consumers cannot re-derive it', () => {
-  assert.equal(closeAfterStart(close({ pollGapSeconds: -1 })), true);
-  assert.equal(closeAfterStart(close({ pollGapSeconds: 0 })), false);
-  assert.equal(closeAfterStart(close({ pollGapSeconds: 1 })), false);
-  assert.equal(closeAfterStart(close({ pollGapSeconds: null })), false);
+test('closeAfterStart is derived from the raw instants, exported so consumers cannot re-derive it', () => {
+  const timing = (o: Partial<CloseQuote> = {}) => closeTimingOf(close(o));
+  // The boundary is unchanged from the legacy `gap < 0` predicate: a full
+  // second past lock is past lock.
+  assert.equal(closeAfterStart(timing({ pollGapSeconds: -1 })), true);
+  assert.equal(closeAfterStart(timing({ pollGapSeconds: 0 })), false);
+  assert.equal(closeAfterStart(timing({ pollGapSeconds: 1 })), false);
+  assert.equal(closeAfterStart(timing({ pollGapSeconds: null })), false);
+
+  // The point of the change: the verdict follows the INSTANTS, not the stored
+  // gap. A row whose gap claims the poll preceded lock while `last_polled_at`
+  // says otherwise is not evidence — it is refused as unusable, and asking for
+  // a verdict anyway throws rather than answering `false`.
+  const forged = timing({ pollGapSeconds: 3600, lastPolledAt: '2026-07-12T18:15:00+00:00' });
+  assert.equal(forged.kind, 'unusable');
+  assert.throws(() => closeAfterStart(forged), /classify close_timing_unusable first/);
+
+  // NEGATIVE CONTROL: the same contradiction removed — gap agrees with the
+  // instants — is usable and refused on its merits, not on its unreadability.
+  const honest = timing({ pollGapSeconds: -7200, lastPolledAt: '2026-07-12T18:15:00+00:00' });
+  assert.equal(honest.kind, 'usable');
+  assert.equal(closeAfterStart(honest), true);
 });
 
 test('a missing opposite-side entry price disables margin-adjusted output but never the economic metric', () => {
@@ -439,4 +494,34 @@ test('favorableLineMovement unit cases', () => {
   assert.equal(favorableLineMovement('spread', 'away', 1.5, 2.5), 1.0);
   assert.equal(favorableLineMovement('total', 'over', 8.5, 9.5), 1.0);
   assert.equal(favorableLineMovement('total', 'under', 8.5, 9.5), -1.0);
+});
+
+test('a close whose timing evidence is unusable is REFUSED, never scored on a verdict nothing established', () => {
+  // A row whose stored gap claims the poll preceded lock while its own
+  // `lastPolledAt` says it came two hours after. Previously this scored: the
+  // gate read the gap alone, saw a positive value, and passed the row through
+  // to a full CLV.
+  const forged = close({ pollGapSeconds: 3600, lastPolledAt: '2026-07-12T18:15:00+00:00' });
+  const result = scoreDecision('moneyline', 'away', 'away', 2.1, 1.8, null, forged);
+  assert.equal(result.unscoredReason, 'close_timing_unusable');
+  assert.equal(result.primaryClvPct, null);
+  assert.equal(result.marginAdjustedClvPct, null);
+
+  // NEGATIVE CONTROL: remove the contradiction and the same row scores, so
+  // the assertion above is about the contradiction and not about the gate
+  // having broken scoring outright.
+  const honest = close({ pollGapSeconds: 15 });
+  assert.equal(scoreDecision('moneyline', 'away', 'away', 2.1, 1.8, null, honest).unscoredReason, null);
+});
+
+test('a close whose VALUE post-dates its own lock is refused under its own reason', () => {
+  const late = close({ valueCapturedAt: '2026-07-12T16:16:00+00:00' }); // lock is 16:15
+  const result = scoreDecision('moneyline', 'away', 'away', 2.1, 1.8, null, late);
+  assert.equal(result.unscoredReason, 'close_value_after_lock');
+  assert.equal(result.primaryClvPct, null);
+  // NEGATIVE CONTROL: captured before the lock is the normal case.
+  assert.equal(
+    scoreDecision('moneyline', 'away', 'away', 2.1, 1.8, null, close()).unscoredReason,
+    null,
+  );
 });

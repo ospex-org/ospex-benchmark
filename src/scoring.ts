@@ -4,6 +4,7 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { PROPORTIONAL_DEVIG_METHOD, scoreDecision, SHIN_DEVIG_METHOD } from './clv.js';
 import { favorableLineMovement } from './clv.js';
 import { LADDER_VERSION, scoreTotalsLadder } from './ladder.js';
+import { instantMs } from './time.js';
 import { checkProviderCollision } from './providers/family.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
@@ -1402,9 +1403,21 @@ export function closeQuoteFromRow(row: ClosingLineRow): CloseQuote {
  * distinct answer from "no drift" and must never be collapsed into it.
  */
 export function scheduleDriftMs(lockTime: string, referenceStartUtc: string): number | null {
-  const lock = Date.parse(lockTime);
-  const reference = Date.parse(referenceStartUtc);
-  if (!Number.isFinite(lock) || !Number.isFinite(reference)) return null;
+  // STRICT parsing on both sides. `Date.parse` reads an ISO string carrying no
+  // explicit offset as HOST-LOCAL time, so the identical pair of timestamps
+  // produced a drift of 0 on a UTC host and 14400000 on a US-Eastern one, and
+  // `isScheduleChanged` flipped false -> true with it. A verdict that depends
+  // on the scoring machine's timezone is not a measurement. `instantMs`
+  // rejects an offset-less instant outright, which lands here as `null` —
+  // "not determinable", the answer both callers already refuse on.
+  let lock: number;
+  let reference: number;
+  try {
+    lock = instantMs(lockTime);
+    reference = instantMs(referenceStartUtc);
+  } catch {
+    return null;
+  }
   return lock - reference;
 }
 
@@ -1454,8 +1467,37 @@ export function heldOutOfPrimary(picks: readonly ScoredPick[]): number {
   return picks.filter((p) => !inPrimaryStratum(p) && p.result.primaryClvPct !== null).length;
 }
 
+/**
+ * Index captured closes by `(game, market)` for the scorer's join.
+ *
+ * A duplicate key now REFUSES. `new Map(rows.map(...))` silently kept the LAST
+ * row seen, so two rows sharing a game and market — differing only by network
+ * or by feed — collapsed into one and the scorer priced against whichever
+ * happened to arrive last, with nothing published to say a choice was made.
+ *
+ * The key deliberately does not carry network or source: the lookup site has a
+ * pick, not a row, and cannot supply them. The identity is constrained one
+ * level up instead — `fetchClosingLines` filters network and source
+ * server-side and asserts the rows that come back honour both — so within one
+ * scoring run every row already shares an identity and a collision here means
+ * a genuine duplicate. Refusing is what makes that an upstream invariant
+ * whose violation is observable rather than one silently relied upon.
+ */
 export function closesByKey(rows: ClosingLineRow[]): Map<string, ClosingLineRow> {
-  return new Map(rows.map((row) => [`${row.jsonodds_id}:${row.market}`, row]));
+  const map = new Map<string, ClosingLineRow>();
+  for (const row of rows) {
+    const key = `${row.jsonodds_id}:${row.market}`;
+    if (map.has(key)) {
+      const kept = map.get(key);
+      throw new Error(
+        `duplicate closing line for ${key}: rows from ` +
+          `${kept?.network ?? '?'}/${kept?.source ?? '?'} and ${row.network}/${row.source} — ` +
+          'refusing to score against an ambiguous close',
+      );
+    }
+    map.set(key, row);
+  }
+  return map;
 }
 
 export interface ScoredPick extends SourcePick {
@@ -2132,8 +2174,12 @@ export function scoredRecords(
         'only a `fresh`-confidence close feeds the metrics; a stale one is unscored (close_stale). A close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (close_inconsistent), before side selection, for every participant and side alike',
       integerLinePrimary:
         'unavailable (push-excluded conditional CLV separately labeled, both metrics); the TOTALS_V1 candidate ladder reports the generalized push-aware value as separately labeled sensitivity output, pending validation',
+      timingEvidenceRequired:
+        'refused (close_timing_unusable): every timing verdict below is derived from the row’s own instants, parsed strictly — a timestamp carrying no explicit UTC offset is REJECTED rather than read as host-local time. A row whose stored poll_gap_seconds contradicts its own lock_time and last_polled_at by more than the second-granularity tolerance, or whose instants cannot be parsed, establishes nothing and is refused as a named, counted close-quality reason rather than being scored on a verdict nothing supports. Shared with the totals ladder',
       closeAfterStart:
-        'refused (close_after_start): a close whose market the feed was still quoting AFTER the row’s own recorded lock (negative poll gap) has an unestablished pre-game status and is not evidence for any metric, on either side, for any participant. Shared with the totals ladder. This is a CONSERVATIVE refusal on ambiguous evidence, not a proof of contamination: at least three readings fit a negative gap (the recorded start was early and the value is a genuine pre-game price; the feed quotes in-play; or the feed had simply not yet dropped the finished/started game from its live snapshot), and the row alone cannot separate them',
+        'refused (close_after_start): a close whose market the feed was still quoting AFTER the row’s own recorded lock has an unestablished pre-game status and is not evidence for any metric, on either side, for any participant. Derived from last_polled_at vs lock_time — NOT from the stored gap, which is a derived value a corrupt row can contradict. Shared with the totals ladder. This is a CONSERVATIVE refusal on ambiguous evidence, not a proof of contamination: at least three readings fit a post-lock poll (the recorded start was early and the value is a genuine pre-game price; the feed quotes in-play; or the feed had simply not yet dropped the finished/started game from its live snapshot), and the row alone cannot separate them',
+      closeValueAfterLock:
+        'refused (close_value_after_lock): the quoted VALUE was recorded past the row’s own cutoff. Distinct from close_after_start, which asks whether the feed was still LISTING the market. Measured at 0 of 3609 rows on the captured corpus, so this gate is expected to be inert — it exists so the claim stays measured rather than assumed',
       scheduleChangeToleranceMs: SCHEDULE_CHANGE_TOLERANCE_MS,
       scheduleChanged:
         'STRATUM TAG, not a refusal: abs(close lock_time − frozen bundle scheduledStartUtc) >= scheduleChangeToleranceMs. CLV is computed and recorded in full, and the pick stays in every coverage denominator, but it is held out of the primary same-schedule estimate, republished as its own reschedule-sensitivity stratum, and counted as scheduleChangedTagged (every tagged pick) and scheduleChangedExcluded (the tagged picks that carried a value, i.e. what the tag actually removed from the estimate)',

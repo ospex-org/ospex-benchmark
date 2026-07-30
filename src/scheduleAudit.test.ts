@@ -24,23 +24,44 @@ import type { ClosingLineRow, GamesTableRow } from './types.js';
 const GAME = 'c0a2f8f0-0000-0000-0000-000000000001';
 const MATCH_TIME = '2026-07-12T20:10:00+00:00';
 
+/**
+ * A COHERENT closing-line row. `poll_gap_seconds` is the knob and
+ * `last_polled_at` is DERIVED from it (`lock - gap`), so a gap-only override
+ * still describes a row whose stored gap agrees with its own instants — which
+ * the audit builder now requires before it will derive a timing verdict.
+ *
+ * Passing `last_polled_at` explicitly wins over the derivation; that is how the
+ * incoherence cases build a self-contradicting row on purpose. The defaults
+ * reproduce the previous literals exactly (lock 20:10:00, gap 19 → 20:09:41).
+ */
 function closeRow(overrides: Partial<ClosingLineRow> = {}): ClosingLineRow {
-  return {
+  const base = {
     network: 'polygon',
     jsonodds_id: GAME,
-    market: 'total',
+    market: 'total' as const,
     line: 8.5,
     away_odds_decimal: 1.90476,
     home_odds_decimal: 1.90476,
     away_p_novig: 0.5,
     home_p_novig: 0.5,
     value_captured_at: '2026-07-12T20:09:41+00:00',
-    last_polled_at: '2026-07-12T20:09:41+00:00',
     lock_time: MATCH_TIME,
-    poll_gap_seconds: 19,
-    confidence: 'fresh',
+    poll_gap_seconds: 19 as number | null,
+    confidence: 'fresh' as const,
     source: 'jsonodds',
     ...overrides,
+  };
+  // Tolerates a deliberately unparseable `lock_time` — several cases supply one
+  // to prove the builder refuses it, and the fixture must not die first.
+  const lockMs = Date.parse(base.lock_time);
+  const derivedLastPolled =
+    base.poll_gap_seconds === null || !Number.isFinite(lockMs)
+      ? null
+      : new Date(lockMs - base.poll_gap_seconds * 1000).toISOString();
+  return {
+    ...base,
+    last_polled_at:
+      'last_polled_at' in overrides ? (overrides.last_polled_at ?? null) : derivedLastPolled,
   };
 }
 
@@ -412,4 +433,110 @@ test('the audit meta proves internal consistency, NOT that the enumeration was c
   // is published.
   assert.equal(Object.keys(parseCloseScheduleAuditDataset(render(subset)).meta.markets).length, 1);
   assert.equal(Object.keys(parseCloseScheduleAuditDataset(render(full)).meta.markets).length, 3);
+});
+
+// ── B2: identity binding ─────────────────────────────────────────────────────
+
+test('a close row from ANOTHER NETWORK refuses the snapshot rather than being stamped with the requested one', () => {
+  // The reported defect: an audit requested as "polygon" accepted amoy rows
+  // and emitted a clean record under meta.network = "polygon". The network is
+  // a property of the ROWS; the caller's request is only a request until the
+  // rows agree with it.
+  assert.throws(
+    () => build([closeRow(), closeRow({ market: 'moneyline', network: 'amoy' })], [gameRow()]),
+    /is on network "amoy" but the audit was requested for "polygon"/,
+  );
+  // NEGATIVE CONTROL: the same pair on the requested network builds.
+  assert.doesNotThrow(() =>
+    build([closeRow(), closeRow({ market: 'moneyline' })], [gameRow()]),
+  );
+});
+
+test('a close row from ANOTHER FEED refuses the snapshot', () => {
+  // Comparability rests on one book at one cutoff semantics; a blend is a
+  // different measurement wearing the same name.
+  assert.throws(
+    () => build([closeRow({ source: 'rundown' })], [gameRow()]),
+    /came from source "rundown" but the canonical close source is "jsonodds"/,
+  );
+});
+
+test('a games row from another network refuses the snapshot', () => {
+  assert.throws(
+    () => build([closeRow()], [gameRow({ network: 'amoy' })]),
+    /is on network "amoy" but the audit was requested for "polygon"/,
+  );
+});
+
+test('provenance travels WITH each record, and meta names the feed', () => {
+  const built = build([closeRow()], [gameRow()]);
+  assert.equal(built.records[0]?.network, 'polygon');
+  assert.equal(built.records[0]?.source, 'jsonodds');
+  assert.equal(built.meta.closeSource, 'jsonodds');
+});
+
+test('the reader refuses a record whose provenance disagrees with the meta it sits under', () => {
+  for (const [field, value, pattern] of [
+    ['network', 'amoy', /is on network "amoy" but the dataset claims "polygon"/],
+    ['source', 'rundown', /came from source "rundown" but the dataset claims "jsonodds"/],
+  ] as const) {
+    const mutated = SAMPLE.map((r, i) => (i === 1 ? { ...r, [field]: value } : r));
+    assert.throws(() => parseCloseScheduleAuditDataset(dataset(mutated)), pattern, field);
+  }
+});
+
+test('the reader RECOMPUTES every judged field and refuses one that contradicts its own evidence', () => {
+  // The reported defect: editing a serialized record so its flag disagreed
+  // with its own timestamps was ACCEPTED, because the reader only checked
+  // that the aggregates matched the records — and the aggregates were
+  // themselves recomputed from the edited flag.
+  //
+  // Each case below regenerates meta FROM the mutated records, so every
+  // aggregate agrees and the pre-existing histogram checks cannot fire. Only
+  // the evidence-vs-verdict cross-check can refuse, which is what isolates
+  // the new behaviour.
+  assert.doesNotThrow(
+    () => parseCloseScheduleAuditDataset(dataset(SAMPLE)),
+    'NEGATIVE CONTROL: an untampered dataset still parses',
+  );
+
+  const flips: Array<[string, (r: CloseScheduleAuditRecord) => CloseScheduleAuditRecord]> = [
+    ['matchTimeDriftMs', (r) => ({ ...r, matchTimeDriftMs: r.matchTimeDriftMs + 999_999 })],
+    [
+      'scheduleChangedVsMatchTime',
+      (r) => ({ ...r, scheduleChangedVsMatchTime: !r.scheduleChangedVsMatchTime }),
+    ],
+    ['closeAfterStart', (r) => ({ ...r, closeAfterStart: !r.closeAfterStart })],
+    ['valueCapturedAfterLock', (r) => ({ ...r, valueCapturedAfterLock: !r.valueCapturedAfterLock })],
+    [
+      'valueCapturedAfterMatchTime',
+      (r) => ({ ...r, valueCapturedAfterMatchTime: !r.valueCapturedAfterMatchTime }),
+    ],
+    ['verdict', (r) => ({ ...r, verdict: r.verdict === 'clean' ? 'not_fresh' : 'clean' })],
+  ];
+
+  for (const [key, flip] of flips) {
+    const mutated = SAMPLE.map((r, i) => (i === 1 ? flip(r) : r));
+    assert.throws(
+      () => parseCloseScheduleAuditDataset(dataset(mutated)),
+      new RegExp(`${key}=`),
+      `${key} was accepted despite contradicting its own evidence`,
+    );
+  }
+});
+
+// ── B3: an empty corpus certifies nothing ────────────────────────────────────
+
+test('a META-ONLY dataset refuses rather than reading as a clean corpus', () => {
+  // "0 closes, 0 problems" is the most dangerous possible clean bill of
+  // health: a zero-row walk is indistinguishable from one whose filter
+  // silently narrowed to nothing. The previous check caught only a zero-byte
+  // string, so the meta-only artifact the CLI actually wrote parsed clean.
+  assert.throws(
+    () => parseCloseScheduleAuditDataset(dataset([])),
+    /empty corpus certifies nothing/,
+  );
+  assert.throws(() => parseCloseScheduleAuditDataset(''), /empty/);
+  // NEGATIVE CONTROL: one record is a corpus.
+  assert.doesNotThrow(() => parseCloseScheduleAuditDataset(dataset([SAMPLE[0]!])));
 });

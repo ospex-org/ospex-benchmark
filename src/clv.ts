@@ -1,3 +1,4 @@
+import { closeAfterStart, closeTiming, closeValueAfterLock, type CloseTiming } from './closeTiming.js';
 import {
   PROPORTIONAL_DEVIG_METHOD,
   proportionalTwoWay,
@@ -96,7 +97,9 @@ export const CLOSE_QUALITY_REASONS = [
   'close_missing',
   'close_not_captured',
   'close_stale',
+  'close_timing_unusable',
   'close_after_start',
+  'close_value_after_lock',
   'close_inconsistent',
 ] as const;
 
@@ -204,12 +207,22 @@ function selectedValues(
 }
 
 /**
- * The feed was still quoting this market AFTER the row's own recorded lock
- * (`pollGapSeconds < 0`) — SELECTION-INDEPENDENT, like every other
- * close-quality gate.
+ * THE `close_after_start` POLICY — the rationale behind the gate, which is
+ * implemented in `closeTiming.ts` and re-exported at the bottom of this
+ * module. Kept here because this is where the scorer applies it and where the
+ * preregistered close policy points.
  *
- * The gap is `lockTime - lastPolledAt`, so a negative value is a direct
- * observation that the odds feed still listed this market after `lockTime`.
+ * The feed was still quoting this market AFTER the row's own recorded lock —
+ * SELECTION-INDEPENDENT, like every other close-quality gate.
+ *
+ * The verdict is derived from the raw instants — `lastPolledAt` at or past
+ * `lockTime` — and NOT from the stored `pollGapSeconds`, which is a derived
+ * column a corrupt or forged row can contradict. A row whose gap disagrees
+ * with its own instants is refused upstream as `close_timing_unusable`
+ * rather than being judged on either.
+ *
+ * A last poll after the lock is a direct observation that the odds feed still
+ * listed this market past its recorded cutoff.
  * At least three readings fit that observation, and the row does not
  * distinguish them: the game had not started (the recorded start is early
  * and the captured value is a genuine pre-game price); the feed quotes
@@ -219,22 +232,37 @@ function selectedValues(
  *
  * This is therefore a CONSERVATIVE refusal on ambiguous evidence, NOT a
  * finding that the row is contaminated — and the corpus carries real
- * counter-evidence: `yarn audit:closes` measures zero rows whose
- * `value_captured_at` post-dates their own lock, so on the captured corpus
- * every refused row's price was recorded at or before its cutoff. The
- * refusal is nonetheless the posture `closeQuoteInconsistent` already takes
- * toward a close whose two representations disagree: what is unestablished
- * is not scored, and the cost is published (`closeAfterStartRefused` on
- * every run, and the whole-corpus rate from the audit) rather than absorbed
+ * counter-evidence: across every close `yarn audit:closes` enumerated, zero
+ * rows have a `value_captured_at` post-dating their own lock, so on the rows
+ * measured every refused row's price was recorded at or before its cutoff.
+ * That audit's counts are a LOWER BOUND, not a census — it walks by identity
+ * key, which cannot prove it observed every committed row. The refusal is
+ * nonetheless the posture `closeQuoteInconsistent` already takes toward a
+ * close whose two representations disagree: what is unestablished is not
+ * scored, and the cost is published (`closeAfterStartRefused` on every run,
+ * and the audit's rate over the closes it enumerated) rather than absorbed
  * silently.
  *
  * A null gap is NOT a refusal here: it means the market was never seen in
  * the snapshot at all, which the upstream freshness classification already
  * downgrades (`close_stale`).
  */
-export function closeAfterStart(close: CloseQuote): boolean {
-  return close.pollGapSeconds !== null && close.pollGapSeconds < 0;
+/**
+ * Adapt a {@link CloseQuote} to the raw four-field shape the shared timing
+ * validator takes. Exported so a caller can classify a close's timing
+ * evidence once and pass the RESULT to the verdicts, rather than each verdict
+ * re-parsing the same instants and possibly disagreeing.
+ */
+export function closeTimingOf(close: CloseQuote): CloseTiming {
+  return closeTiming({
+    lockTime: close.lockTime,
+    valueCapturedAt: close.valueCapturedAt,
+    lastPolledAt: close.lastPolledAt,
+    pollGapSeconds: close.pollGapSeconds,
+  });
 }
+
+export { closeAfterStart, closeValueAfterLock } from './closeTiming.js';
 
 /**
  * Whole-close consistency validation — SELECTION-INDEPENDENT by design: the
@@ -374,7 +402,19 @@ export function scoreDecision(
   // side. Ordered ahead of the price-representation check because a row
   // whose cutoff semantics are unestablished is not a close whose prices
   // are worth cross-validating.
-  if (closeAfterStart(close)) return unscored('close_after_start', entryExtras);
+  // Timing evidence is VALIDATED before any timing verdict is read off it. A
+  // row whose stored `poll_gap_seconds` contradicts its own instants, or whose
+  // instants carry no explicit offset, establishes nothing — so it becomes a
+  // typed, counted refusal rather than a `false` that reads as "fine". Both
+  // verdicts below throw on unusable evidence, so this ordering is enforced by
+  // the primitive and not merely by convention.
+  const timing = closeTimingOf(close);
+  if (timing.kind === 'unusable') return unscored('close_timing_unusable', entryExtras);
+  if (closeAfterStart(timing)) return unscored('close_after_start', entryExtras);
+  // The price we would score was recorded past the row's own cutoff. Distinct
+  // from the gate above: that one asks whether the FEED was still listing the
+  // market, this asks whether the VALUE post-dates the lock.
+  if (closeValueAfterLock(timing)) return unscored('close_value_after_lock', entryExtras);
 
   // Whole-close validation runs BEFORE side selection: a corrupt close is
   // not evidence for any metric, for any participant, on either side.

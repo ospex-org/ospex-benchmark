@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CLOSE_SOURCE } from './closeSource.js';
 import { redactAndTruncate } from './config.js';
 import { parseTwoSidedHistoryRows } from './oddsHistory.js';
 import {
@@ -184,6 +185,35 @@ export async function fetchCurrentOdds(
  * Captured reference closes for a set of games — the read side of the
  * scoring join. Same public anon read path as the reference-odds snapshot.
  */
+/**
+ * Assert that rows the server returned actually carry the identity we asked
+ * for. The queries below already filter on `network` and `source` server-side,
+ * so this can only fire if a filter is dropped in a refactor, a URL is
+ * mis-assembled, or the server honours a predicate differently than assumed —
+ * exactly the cases a silent wrong-corpus measurement would come from. Cheap,
+ * and it fails loudly instead of scoring another network's book.
+ */
+function assertCanonicalCloses(
+  rows: readonly ClosingLineRow[],
+  network: string,
+  where: string,
+): void {
+  const wrongNetwork = rows.find((row) => row.network !== network);
+  if (wrongNetwork !== undefined) {
+    throw new Error(
+      `${where}: server returned a closing line on network "${wrongNetwork.network}" ` +
+        `for a query filtered to "${network}" (game ${wrongNetwork.jsonodds_id})`,
+    );
+  }
+  const wrongSource = rows.find((row) => row.source !== CLOSE_SOURCE);
+  if (wrongSource !== undefined) {
+    throw new Error(
+      `${where}: server returned a closing line from source "${wrongSource.source}" ` +
+        `for a query filtered to "${CLOSE_SOURCE}" (game ${wrongSource.jsonodds_id})`,
+    );
+  }
+}
+
 export async function fetchClosingLines(
   supabaseUrl: string,
   anonKey: string,
@@ -201,8 +231,11 @@ export async function fetchClosingLines(
       'poll_gap_seconds,confidence,source';
     const url =
       `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
-      `&network=eq.${network}&jsonodds_id=in.(${batch.join(',')})`;
-    rows.push(...parseClosingLineRows(await getJson(url, headers)));
+      `&network=eq.${network}&source=eq.${CLOSE_SOURCE}` +
+      `&jsonodds_id=in.(${batch.join(',')})`;
+    const page = parseClosingLineRows(await getJson(url, headers));
+    assertCanonicalCloses(page, network, 'fetchClosingLines');
+    rows.push(...page);
   }
   return rows;
 }
@@ -213,8 +246,25 @@ export async function fetchClosingLines(
  * pagination — a concurrent insert can never shift page boundaries and
  * duplicate one row while dropping another. The identity walk asserts
  * strictly increasing ids across the whole result (uniqueness + order), and
- * refuses anything else. Correctness assumes the key is append-only
- * monotone (a GENERATED IDENTITY column), which closing_lines.id is.
+ * refuses anything else.
+ *
+ * WHAT THIS DOES NOT PROVE — stated because the difference is easy to
+ * over-read. Identity is allocated by a sequence BEFORE the inserting
+ * transaction commits, and allocation order is not commit order. A
+ * transaction can take id 50, stay uncommitted while 51..200 commit and
+ * become visible, then commit after the cursor has already advanced past 50 —
+ * and that row is never returned by any page. So the walk is complete with
+ * respect to ORDERING (no shifted boundary, no duplicate, no drop from
+ * repagination) but NOT with respect to a SNAPSHOT: it observes rows visible
+ * at the moment each page is served, not a consistent instant.
+ *
+ * Nothing available on this read path closes that gap. It is the public anon
+ * REST surface: no transaction, no repeatable-read snapshot, no visibility
+ * cursor. Gaps in the id sequence are also endemic here and cannot be used as
+ * a signal — an upserting writer burns identity values on every conflict — so
+ * hole-probing would report constant false alarms. Callers that publish a
+ * count from this walk should present it as a LOWER BOUND and say so, which
+ * is what the close-schedule audit does.
  *
  * Termination is an EMPTY page only. A short page must not be trusted as
  * end-of-data: a server-side row cap below the requested limit would make
@@ -289,9 +339,11 @@ export async function fetchClosingLinesByMarket(
     fetchPage: async (afterId) => {
       const url =
         `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
-        `&network=eq.${network}${marketFilter}&id=gt.${afterId}` +
+        `&network=eq.${network}&source=eq.${CLOSE_SOURCE}${marketFilter}&id=gt.${afterId}` +
         `&order=id.asc&limit=${pageSize}`;
-      return parseClosingLineRowsWithId(await getJson(url, headers));
+      const page = parseClosingLineRowsWithId(await getJson(url, headers));
+      assertCanonicalCloses(page, network, 'fetchClosingLinesByMarket');
+      return page;
     },
     idOf: (row) => row.id,
   });
