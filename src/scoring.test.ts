@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
@@ -9,9 +12,13 @@ import {
   aggregateByParticipant,
   closeQuoteFromRow,
   closesByKey,
+  emptyPrimaryEstimateNote,
+  heldOutOfPrimary,
   inPrimaryStratum,
   isScheduleChanged,
   parseRunRecords,
+  primaryScoreableCount,
+  summariseEmptyPrimaryEstimate,
   SCHEDULE_CHANGE_TOLERANCE_MS,
   scheduleDriftMs,
   SCORING_POLICY_VERSION,
@@ -20,8 +27,10 @@ import {
   sideForSelection,
   verifyRunIntegrity,
 } from './scoring.js';
+import { runScoreCli } from './scoreRun.js';
 import { makeGameBundle, makeRequest } from './testFactories.js';
 import type { GameRequest } from './bundle.js';
+import type { UnscoredReason } from './clv.js';
 import type { MarketStats, ScoredPick } from './scoring.js';
 import type { ClosingLineRow, GameBundle, SlateBundle } from './types.js';
 
@@ -2827,4 +2836,298 @@ test('a SCORED pick whose schedule comparison is undeterminable cannot enter the
   // NEGATIVE CONTROLS: the ordinary strata are unchanged.
   assert.equal(inPrimaryStratum(syntheticScored(GAME_A, 4.2, { scheduleChanged: false })), true);
   assert.equal(inPrimaryStratum(syntheticScored(GAME_A, 4.2, { scheduleChanged: true })), false);
+});
+
+test('primary-scoreable requires BOTH conjuncts, so a fully schedule-tagged run counts zero', () => {
+  // The exact shape from the defect report: every scored pick is
+  // schedule-tagged, so it is held out of the primary same-schedule estimate
+  // while still carrying a CLV value.
+  const allTagged = [
+    syntheticScored(GAME_A, 4.2, { scheduleChanged: true }),
+    syntheticScored(GAME_B, -1.5, { scheduleChanged: true }),
+  ];
+
+  // THE FIXTURE PREMISE, asserted rather than assumed: the LOOSE predicate —
+  // "carries a value", which is what the scorer CLI used to count — is
+  // non-zero here. Without this the test below would pass against a corpus
+  // that is empty for an unrelated reason, and the bug it pins would be
+  // invisible.
+  assert.equal(
+    allTagged.filter((p) => p.result.primaryClvPct !== null).length,
+    2,
+    'fixture premise: the loose predicate counts these, which is why the two readouts disagreed',
+  );
+
+  assert.equal(primaryScoreableCount(allTagged), 0, 'in-stratum AND valued — neither pick is in-stratum');
+  assert.equal(heldOutOfPrimary(allTagged), 2, 'both were scored and both were removed by the tag');
+
+  // NEGATIVE CONTROLS — the count must not be trivially zero.
+  assert.equal(
+    primaryScoreableCount([syntheticScored(GAME_A, 4.2, { scheduleChanged: false })]),
+    1,
+    'an untagged, valued pick IS primary-scoreable',
+  );
+  // Untagged but unscored: in the stratum, no value. Counting it would make
+  // `scoreable N/M` claim coverage the estimate never received.
+  assert.equal(
+    primaryScoreableCount([syntheticScored(GAME_A, null, { scheduleChanged: false })]),
+    0,
+    'an untagged pick with no close is not scoreable either',
+  );
+  assert.equal(
+    heldOutOfPrimary([syntheticScored(GAME_A, null, { scheduleChanged: true })]),
+    0,
+    'a tagged pick that carried NO value had nothing to withhold',
+  );
+
+  // The mixed case is what the CLI note branches on: some scoreable, so the
+  // note does not fire at all.
+  const mixed = [...allTagged, syntheticScored(GAME_A, 0.5, { scheduleChanged: false })];
+  assert.equal(primaryScoreableCount(mixed), 1);
+  assert.equal(heldOutOfPrimary(mixed), 2);
+});
+
+test('the empty-primary-estimate note names WHICH cause, and stays silent when there is none', () => {
+  const allTagged = [
+    syntheticScored(GAME_A, 4.2, { scheduleChanged: true }),
+    syntheticScored(GAME_B, -1.5, { scheduleChanged: true }),
+  ];
+
+  // Schedule-tagged: the picks WERE scored, so telling the operator to re-run
+  // after the slate locks would be actively wrong. This is the branch that did
+  // not exist before — the note simply never fired on this input.
+  const tagged = emptyPrimaryEstimateNote(allTagged);
+  assert.ok(tagged !== null, 'a fully-tagged run must produce a note');
+  assert.match(tagged, /0 of 2 pick\(s\)/);
+  assert.match(tagged, /2 scored but HELD OUT/);
+  assert.match(tagged, /Re-running will NOT change those/);
+  assert.doesNotMatch(
+    tagged,
+    /not scored at all/,
+    'with nothing refused, the note must not invent a refusal bullet',
+  );
+  assert.doesNotMatch(
+    tagged,
+    /slate has not locked yet/,
+    'the held-out branch must NOT tell the operator to re-run — that is the other cause',
+  );
+
+  // Refusal-only: no closes at all. Keeps the re-run hint, attached to the
+  // refused subset rather than offered as run-level advice.
+  const noCloses = emptyPrimaryEstimateNote([
+    syntheticScored(GAME_A, null, { scheduleChanged: false }),
+    syntheticScored(GAME_B, null, { scheduleChanged: false }),
+  ]);
+  assert.ok(noCloses !== null);
+  assert.match(noCloses, /2 not scored at all: close_missing 2/);
+  assert.match(noCloses, /slate has not locked yet/);
+  assert.doesNotMatch(noCloses, /HELD OUT/);
+
+  // NEGATIVE CONTROL — the note must not fire when anything IS scoreable.
+  // Without this the function could return a string unconditionally and every
+  // assertion above would still pass.
+  assert.equal(
+    emptyPrimaryEstimateNote([syntheticScored(GAME_A, 0.5, { scheduleChanged: false })]),
+    null,
+    'one scoreable pick is enough to suppress the note entirely',
+  );
+  assert.equal(
+    emptyPrimaryEstimateNote([...allTagged, syntheticScored(GAME_A, 0.5, { scheduleChanged: false })]),
+    null,
+    'tagged picks alongside a scoreable one still suppress it',
+  );
+});
+
+/** Restamp a pick's refusal reason — `syntheticScored` only ever emits
+ *  `close_missing`, and the note must enumerate whatever reasons a run mixes. */
+function refusedFor(pick: ScoredPick, reason: UnscoredReason | null): ScoredPick {
+  return { ...pick, result: { ...pick.result, unscoredReason: reason } };
+}
+
+test('B2: a MIXED zero reports each subset separately and never gives run-level advice', () => {
+  // The reviewer's exact counterexample: one valued pick held out by a schedule
+  // change, one close_missing pick, primary-scoreable 0. The old wording said
+  // "1 pick(s) WERE scored ... Re-running will not change this" — true of the
+  // held-out pick, and WRONG for the missing close, where a later re-run may
+  // well fill it.
+  const mixedZero = [
+    syntheticScored(GAME_A, 4.2, { scheduleChanged: true }), // scored, held out
+    syntheticScored(GAME_B, null, { scheduleChanged: false }), // close_missing
+  ];
+  assert.equal(primaryScoreableCount(mixedZero), 0, 'premise: the estimate really is empty');
+
+  const note = emptyPrimaryEstimateNote(mixedZero);
+  assert.ok(note !== null);
+  // BOTH subsets are named, with their own remedy.
+  assert.match(note, /1 scored but HELD OUT/);
+  assert.match(note, /Re-running will NOT change those/);
+  assert.match(note, /1 not scored at all: close_missing 1/);
+  assert.match(note, /slate has not locked yet/);
+  // THE REGRESSION GUARD: the held-out remedy must be scoped to "those", never
+  // stated as a fact about the run.
+  assert.doesNotMatch(
+    note,
+    /Re-running will not change this\b/,
+    'run-level advice would mis-describe the close_missing pick sitting beside it',
+  );
+
+  // The partition is EXHAUSTIVE — that is what lets the note report subsets
+  // instead of asserting one cause.
+  const s = summariseEmptyPrimaryEstimate(mixedZero);
+  assert.equal(s.heldOut + s.unscored + s.unexplained, s.picks);
+  assert.deepEqual(s, {
+    picks: 2,
+    heldOut: 1,
+    unscored: 1,
+    unscoredByReason: { close_missing: 1 },
+    unexplained: 0,
+  });
+  assert.equal(s.heldOut, heldOutOfPrimary(mixedZero), 'agrees with the shared held-out counter');
+
+  // Several distinct reasons are enumerated rather than generalised.
+  const twoReasons = [
+    syntheticScored(GAME_A, 4.2, { scheduleChanged: true }),
+    syntheticScored(GAME_B, null),
+    refusedFor(syntheticScored(GAME_A, null), 'close_stale'),
+  ];
+  const multi = emptyPrimaryEstimateNote(twoReasons);
+  assert.ok(multi !== null);
+  assert.match(multi, /2 not scored at all: close_missing 1, close_stale 1/);
+
+  // A pick with no value AND no recorded reason is its own bucket — never
+  // silently folded into either remedy.
+  const unexplained = [refusedFor(syntheticScored(GAME_A, null), null)];
+  const note3 = emptyPrimaryEstimateNote(unexplained);
+  assert.ok(note3 !== null);
+  assert.match(note3, /1 produced no primary value and recorded no refusal reason/);
+  assert.doesNotMatch(note3, /not scored at all/);
+  assert.deepEqual(summariseEmptyPrimaryEstimate(unexplained), {
+    picks: 1,
+    heldOut: 0,
+    unscored: 0,
+    unscoredByReason: {},
+    unexplained: 1,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B1: the PRODUCTION CLI call site, not a rehearsal of it
+// ---------------------------------------------------------------------------
+
+/**
+ * THE GAP THIS CLOSES, stated exactly. Every test above exercises the pure
+ * helpers. A reviewer reverted ONLY `scoreRun.ts` — back to the loose
+ * `primaryClvPct !== null` count, with the `emptyPrimaryEstimateNote` call
+ * removed — left the well-tested helpers untouched, and the whole suite still
+ * passed 1139/1139. Helper coverage cannot see the bug return at the call site.
+ *
+ * So this drives the REAL `runScoreCli` end to end. Four things are injected —
+ * the network read, the two output sinks, and WHICH frozen arm manifest
+ * integrity verifies against (never whether it verifies; production keeps
+ * `defaultExpectedArms()`). Argument parsing, the run-file read, integrity
+ * verification itself, the ladder load, scoring, aggregation, the artifact
+ * writes and the summary block are all the production code paths.
+ *
+ * SCOPE, stated because a neighbouring comment was once too strong: this
+ * exercises `runScoreCli`, NOT the process entry point. That the entrypoint
+ * still self-executes at all is a separate child-process test in
+ * `cli.integration.test.ts` — an always-false entry guard is invisible here.
+ *
+ * The fixture is chosen so the two predicates DISAGREE — every pick that
+ * carries a CLV is schedule-tagged, so the strict count is 0 while the loose
+ * count is not. That is what makes the revert observable in stdout.
+ */
+test('B1: the CLI summary goes through the shared predicate — a loose count at the call site is caught', async () => {
+  // Importing `./scoreRun.js` must NOT run a scoring pass. If the entry guard
+  // were wrong, the module would have executed against the test runner's argv,
+  // thrown UsageError ("--run is required") and set exitCode 2 at import time.
+  assert.equal(process.exitCode ?? 0, 0, 'importing the CLI module must not run it');
+
+  const { lines } = fixtureRun();
+  const dir = mkdtempSync(join(tmpdir(), 'ospex-score-cli-'));
+  const runPath = join(dir, 'run.ndjson');
+  writeFileSync(runPath, lines.join('\n'), 'utf8');
+
+  const priorUrl = process.env['SUPABASE_URL'];
+  const priorKey = process.env['SUPABASE_ANON_KEY'];
+  process.env['SUPABASE_URL'] = 'https://scorecli.invalid';
+  process.env['SUPABASE_ANON_KEY'] = 'anon-key-not-used-fetch-is-injected';
+
+  const out: string[] = [];
+  const TWO_HOURS = 2 * 60 * 60 * 1000;
+  try {
+    const code = await runScoreCli(['--run', runPath, '--out', dir], {
+      // Every close is shifted two hours off the frozen bundle start, so each
+      // pick it reaches is SCORED (a CLV is computed) and simultaneously
+      // schedule-TAGGED. No network is touched.
+      fetchCloses: async () => [
+        driftedClose('moneyline', -TWO_HOURS),
+        driftedClose('spread', -TWO_HOURS),
+        driftedClose('total', -TWO_HOURS),
+      ],
+      printLine: (line) => out.push(line),
+      printError: (line) => out.push(line),
+      expectedArms: FIXTURE_ARMS,
+    });
+    assert.equal(code, 0, `the run itself must succeed, else this asserts nothing. CLI said:\n${out.join('\n')}`);
+
+    const text = out.join('\n');
+
+    // FIXTURE PREMISE, asserted rather than assumed. Without a pick that the
+    // LOOSE predicate would have counted, the note would fire under both the
+    // fixed and the reverted code and this test would prove nothing.
+    assert.match(
+      text,
+      /scoreable 0\//,
+      'premise: the per-participant lines report a zero, which is the disagreement being pinned',
+    );
+
+    // THE ASSERTION THAT DIES ON THE REVERT.
+    assert.match(text, /nothing was primary-scoreable/, 'the CLI printed the note');
+    assert.match(text, /HELD OUT of the primary same-schedule estimate/);
+    assert.match(text, /Re-running will NOT change those/);
+  } finally {
+    if (priorUrl === undefined) delete process.env['SUPABASE_URL'];
+    else process.env['SUPABASE_URL'] = priorUrl;
+    if (priorKey === undefined) delete process.env['SUPABASE_ANON_KEY'];
+    else process.env['SUPABASE_ANON_KEY'] = priorKey;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('B1 NEGATIVE CONTROL: with an untagged scoreable pick the CLI prints NO note', async () => {
+  // The other half. Without this, a `runScoreCli` that printed the note
+  // unconditionally would satisfy the test above.
+  const { lines } = fixtureRun();
+  const dir = mkdtempSync(join(tmpdir(), 'ospex-score-cli-ok-'));
+  const runPath = join(dir, 'run.ndjson');
+  writeFileSync(runPath, lines.join('\n'), 'utf8');
+
+  const priorUrl = process.env['SUPABASE_URL'];
+  const priorKey = process.env['SUPABASE_ANON_KEY'];
+  process.env['SUPABASE_URL'] = 'https://scorecli.invalid';
+  process.env['SUPABASE_ANON_KEY'] = 'anon-key-not-used-fetch-is-injected';
+
+  const out: string[] = [];
+  try {
+    const code = await runScoreCli(['--run', runPath, '--out', dir], {
+      // On-schedule closes: scored AND in the primary stratum.
+      fetchCloses: async () => [
+        driftedClose('moneyline', 0),
+        driftedClose('spread', 0),
+        driftedClose('total', 0),
+      ],
+      printLine: (line) => out.push(line),
+      printError: (line) => out.push(line),
+      expectedArms: FIXTURE_ARMS,
+    });
+    assert.equal(code, 0, `CLI said:\n${out.join('\n')}`);
+    assert.doesNotMatch(out.join('\n'), /nothing was primary-scoreable/);
+  } finally {
+    if (priorUrl === undefined) delete process.env['SUPABASE_URL'];
+    else process.env['SUPABASE_URL'] = priorUrl;
+    if (priorKey === undefined) delete process.env['SUPABASE_ANON_KEY'];
+    else process.env['SUPABASE_ANON_KEY'] = priorKey;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
