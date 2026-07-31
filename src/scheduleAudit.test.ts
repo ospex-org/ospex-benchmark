@@ -615,7 +615,19 @@ test('the public completeness disclosure says lower bound and non-snapshot, and 
   assert.match(text, /lower bound/i);
   assert.match(text, /non-snapshot/i);
   assert.match(text, /commit/i, 'names the mechanism, not just the conclusion');
+  // The load-bearing disclaimer itself, pinned verbatim. Asserting only that
+  // the text CONTAINS the right phrases is too weak: a rewrite that keeps the
+  // tail while asserting completeness up front satisfied every phrase check
+  // and still published the opposite claim.
+  assert.match(text, /does NOT prove the enumeration saw every committed row/);
+  // ...and it must never assert the opposite anywhere. `census` and `complete`
+  // both appear legitimately in NEGATED form ("rather than a census"), so ban
+  // the affirmative constructions rather than the words.
   assert.doesNotMatch(text, /keyset-complete/);
+  assert.doesNotMatch(
+    text,
+    /enumeration is complete|walk is complete|is a census|proves? completeness/i,
+  );
   assert.ok(
     text.includes(AUDIT_ENUMERATION_SEMANTICS),
     'the console disclosure and the artifact field name the same semantics',
