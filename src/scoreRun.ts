@@ -10,6 +10,7 @@ import { writeNdjson, writeText } from './records.js';
 import { buildScorecardMarkdown } from './scorecard.js';
 import {
   aggregateByParticipant,
+  emptyPrimaryEstimateNote,
   parseRunRecords,
   SCORING_POLICY_VERSION,
   scoredRecords,
@@ -171,12 +172,16 @@ async function main(): Promise<number> {
   printLine(`scored records: ${ndjsonPath}`);
   printLine(`scorecard: ${scorecardPath}`);
 
-  const totalScoreable = scored.filter((p) => p.result.primaryClvPct !== null).length;
-  if (totalScoreable === 0) {
+  // BOTH THE PREDICATE AND THE WORDING LIVE IN scoring.ts, next to the
+  // definitions they depend on. Counting only "carries a value" here made this
+  // note disagree with the per-participant lines printed a few rows earlier: in
+  // a run where every scored pick is schedule-tagged, those lines read
+  // `scoreable 0/N` while the note explaining a zero never fired, because the
+  // tagged picks still carried values. null means there is nothing to explain.
+  const note = emptyPrimaryEstimateNote(scored);
+  if (note !== null) {
     printLine('');
-    printLine(
-      'note: nothing was primary-scoreable — if the games have not locked yet, closes do not exist; re-run after the slate locks.',
-    );
+    printLine(note);
   }
   return 0;
 }

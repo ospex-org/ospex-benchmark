@@ -9,9 +9,12 @@ import {
   aggregateByParticipant,
   closeQuoteFromRow,
   closesByKey,
+  emptyPrimaryEstimateNote,
+  heldOutOfPrimary,
   inPrimaryStratum,
   isScheduleChanged,
   parseRunRecords,
+  primaryScoreableCount,
   SCHEDULE_CHANGE_TOLERANCE_MS,
   scheduleDriftMs,
   SCORING_POLICY_VERSION,
@@ -2827,4 +2830,96 @@ test('a SCORED pick whose schedule comparison is undeterminable cannot enter the
   // NEGATIVE CONTROLS: the ordinary strata are unchanged.
   assert.equal(inPrimaryStratum(syntheticScored(GAME_A, 4.2, { scheduleChanged: false })), true);
   assert.equal(inPrimaryStratum(syntheticScored(GAME_A, 4.2, { scheduleChanged: true })), false);
+});
+
+test('primary-scoreable requires BOTH conjuncts, so a fully schedule-tagged run counts zero', () => {
+  // The exact shape from the defect report: every scored pick is
+  // schedule-tagged, so it is held out of the primary same-schedule estimate
+  // while still carrying a CLV value.
+  const allTagged = [
+    syntheticScored(GAME_A, 4.2, { scheduleChanged: true }),
+    syntheticScored(GAME_B, -1.5, { scheduleChanged: true }),
+  ];
+
+  // THE FIXTURE PREMISE, asserted rather than assumed: the LOOSE predicate —
+  // "carries a value", which is what the scorer CLI used to count — is
+  // non-zero here. Without this the test below would pass against a corpus
+  // that is empty for an unrelated reason, and the bug it pins would be
+  // invisible.
+  assert.equal(
+    allTagged.filter((p) => p.result.primaryClvPct !== null).length,
+    2,
+    'fixture premise: the loose predicate counts these, which is why the two readouts disagreed',
+  );
+
+  assert.equal(primaryScoreableCount(allTagged), 0, 'in-stratum AND valued — neither pick is in-stratum');
+  assert.equal(heldOutOfPrimary(allTagged), 2, 'both were scored and both were removed by the tag');
+
+  // NEGATIVE CONTROLS — the count must not be trivially zero.
+  assert.equal(
+    primaryScoreableCount([syntheticScored(GAME_A, 4.2, { scheduleChanged: false })]),
+    1,
+    'an untagged, valued pick IS primary-scoreable',
+  );
+  // Untagged but unscored: in the stratum, no value. Counting it would make
+  // `scoreable N/M` claim coverage the estimate never received.
+  assert.equal(
+    primaryScoreableCount([syntheticScored(GAME_A, null, { scheduleChanged: false })]),
+    0,
+    'an untagged pick with no close is not scoreable either',
+  );
+  assert.equal(
+    heldOutOfPrimary([syntheticScored(GAME_A, null, { scheduleChanged: true })]),
+    0,
+    'a tagged pick that carried NO value had nothing to withhold',
+  );
+
+  // The mixed case is what the CLI note branches on: some scoreable, so the
+  // note does not fire at all.
+  const mixed = [...allTagged, syntheticScored(GAME_A, 0.5, { scheduleChanged: false })];
+  assert.equal(primaryScoreableCount(mixed), 1);
+  assert.equal(heldOutOfPrimary(mixed), 2);
+});
+
+test('the empty-primary-estimate note names WHICH cause, and stays silent when there is none', () => {
+  const allTagged = [
+    syntheticScored(GAME_A, 4.2, { scheduleChanged: true }),
+    syntheticScored(GAME_B, -1.5, { scheduleChanged: true }),
+  ];
+
+  // Schedule-tagged: the picks WERE scored, so telling the operator to re-run
+  // after the slate locks would be actively wrong. This is the branch that did
+  // not exist before — the note simply never fired on this input.
+  const tagged = emptyPrimaryEstimateNote(allTagged);
+  assert.ok(tagged !== null, 'a fully-tagged run must produce a note');
+  assert.match(tagged, /2 pick\(s\) WERE scored/);
+  assert.match(tagged, /Re-running will not change this/);
+  assert.doesNotMatch(
+    tagged,
+    /re-run after the slate locks/,
+    'the tagged branch must NOT tell the operator to re-run — that is the other cause',
+  );
+
+  // No closes at all: the original wording, still correct for its own case.
+  const noCloses = emptyPrimaryEstimateNote([
+    syntheticScored(GAME_A, null, { scheduleChanged: false }),
+    syntheticScored(GAME_B, null, { scheduleChanged: false }),
+  ]);
+  assert.ok(noCloses !== null);
+  assert.match(noCloses, /re-run after the slate locks/);
+  assert.doesNotMatch(noCloses, /WERE scored/);
+
+  // NEGATIVE CONTROL — the note must not fire when anything IS scoreable.
+  // Without this the function could return a string unconditionally and every
+  // assertion above would still pass.
+  assert.equal(
+    emptyPrimaryEstimateNote([syntheticScored(GAME_A, 0.5, { scheduleChanged: false })]),
+    null,
+    'one scoreable pick is enough to suppress the note entirely',
+  );
+  assert.equal(
+    emptyPrimaryEstimateNote([...allTagged, syntheticScored(GAME_A, 0.5, { scheduleChanged: false })]),
+    null,
+    'tagged picks alongside a scoreable one still suppress it',
+  );
 });

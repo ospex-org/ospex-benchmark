@@ -1494,6 +1494,59 @@ export function heldOutOfPrimary(picks: readonly ScoredPick[]): number {
 }
 
 /**
+ * How many picks are PRIMARY-SCOREABLE: in the primary stratum AND carrying a
+ * primary CLV value.
+ *
+ * ONE definition, deliberately. Both conjuncts are load-bearing and the pair
+ * had been written out by hand at each site, which is how they drifted: the
+ * scorer CLI counted only "carries a value" while `run_meta` and every
+ * per-participant `scoreable N/M` line counted the conjunction, so two readouts
+ * in the same output disagreed about what the word meant. Call this rather than
+ * re-inlining the filter.
+ *
+ * Note `ParticipantStat.primaryScoreable` reaches the same number by a
+ * different route (the length of the primary economic values, which are already
+ * stratum-filtered when collected) — that is a per-participant slice, not a
+ * second definition of the predicate.
+ */
+export function primaryScoreableCount(picks: readonly ScoredPick[]): number {
+  return picks.filter((p) => inPrimaryStratum(p) && p.result.primaryClvPct !== null).length;
+}
+
+/**
+ * The operator note explaining a zero primary-scoreable count — or null when
+ * there is nothing to explain.
+ *
+ * A pure function rather than an inline branch in the CLI because the message
+ * is the artifact here: the scorer's live path needs Supabase, so a
+ * process-level assertion on its stdout cannot run in CI. Returning null for
+ * the ordinary case makes "the note does NOT fire" testable too, which is the
+ * half a positive-only test would miss.
+ *
+ * TWO CAUSES, AND THEY WANT OPPOSITE ACTIONS. Closes that do not exist yet are
+ * fixed by re-running after the slate locks. Picks held out of the primary
+ * stratum by a schedule change are already fully scored, and re-running changes
+ * nothing — telling an operator to re-run would be a new untruth. The note has
+ * to say which one happened.
+ */
+export function emptyPrimaryEstimateNote(picks: readonly ScoredPick[]): string | null {
+  if (primaryScoreableCount(picks) > 0) return null;
+  const heldOut = heldOutOfPrimary(picks);
+  if (heldOut > 0) {
+    return (
+      `note: nothing was primary-scoreable — ${String(heldOut)} pick(s) WERE scored but are held ` +
+      'out of the primary same-schedule estimate because their start times moved beyond the ' +
+      'tolerance. Re-running will not change this. Their CLV is in the scored NDJSON and in the ' +
+      "scorecard's reschedule-sensitivity stratum."
+    );
+  }
+  return (
+    'note: nothing was primary-scoreable — if the games have not locked yet, closes do not ' +
+    'exist; re-run after the slate locks.'
+  );
+}
+
+/**
  * Index captured closes by `(game, market)` for the scorer's join.
  *
  * A duplicate key now REFUSES. `new Map(rows.map(...))` silently kept the LAST
@@ -2230,8 +2283,7 @@ export function scoredRecords(
     // Stratum-aware, to agree with the per-participant aggregates: a
     // rescheduled pick is not a member of the primary estimate even though
     // its CLV is present on its own record.
-    primaryScoreable: scored.filter((p) => inPrimaryStratum(p) && p.result.primaryClvPct !== null)
-      .length,
+    primaryScoreable: primaryScoreableCount(scored),
     marginAdjustedScoreable: scored.filter(
       (p) => inPrimaryStratum(p) && p.result.marginAdjustedClvPct !== null,
     ).length,
