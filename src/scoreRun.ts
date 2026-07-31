@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { ZodError } from 'zod';
 import { describeErrorWithStack, envValue } from './config.js';
-import { printError, printLine } from './console.js';
+import { printError as printErrorImpl, printLine as printLineImpl } from './console.js';
 import { loadDotEnv } from './env.js';
 import { fetchClosingLines } from './fetchers.js';
 import { LADDER_VERSION, loadLadderParams } from './ladder.js';
@@ -17,6 +18,7 @@ import {
   scoreRun,
   verifyRunIntegrity,
 } from './scoring.js';
+import type { ExpectedArm } from './scoring.js';
 
 /**
  * ospex-benchmark scorer — joins a shadow run's frozen decisions to the
@@ -43,7 +45,7 @@ interface CliOptions {
   outDir: string | null;
 }
 
-function parseArgs(argv: string[]): CliOptions {
+function parseArgs(argv: string[], printLine: (line: string) => void): CliOptions {
   let runPath: string | null = null;
   let outDir: string | null = null;
   for (let i = 0; i < argv.length; i += 1) {
@@ -74,9 +76,44 @@ function parseArgs(argv: string[]): CliOptions {
   return { runPath, outDir };
 }
 
-async function main(): Promise<number> {
+/**
+ * The seams a test needs to drive this CLI without network. Deliberately
+ * MINIMAL: only the network read and the two output sinks are injectable.
+ *
+ * Everything else — argument parsing, run-file read, integrity verification,
+ * ladder load, scoring, aggregation, artifact writes AND the summary block —
+ * stays real, because the point of the wiring test is to exercise THIS
+ * function's code rather than a cooperating rehearsal of it. Injecting the
+ * scorer or the summary helper would recreate exactly the gap the test exists
+ * to close: a fake above the defect cannot go red when the defect returns.
+ */
+export interface ScoreCliDeps {
+  fetchCloses: typeof fetchClosingLines;
+  printLine: (line: string) => void;
+  printError: (line: string) => void;
+  /**
+   * WHICH frozen arm manifest integrity verifies against — never WHETHER it
+   * verifies. Undefined (production) means `defaultExpectedArms()`, exactly as
+   * before. A test supplies its fixture's arms so the run reaches the summary
+   * block; `verifyRunIntegrity` still runs in full, and a fixture that fails it
+   * for any other reason still returns 1.
+   */
+  expectedArms?: ExpectedArm[];
+}
+
+const DEFAULT_DEPS: ScoreCliDeps = {
+  fetchCloses: fetchClosingLines,
+  printLine: printLineImpl,
+  printError: printErrorImpl,
+};
+
+export async function runScoreCli(
+  argv: string[],
+  deps: ScoreCliDeps = DEFAULT_DEPS,
+): Promise<number> {
+  const { fetchCloses, printLine, printError } = deps;
   const loaded = loadDotEnv();
-  const options = parseArgs(process.argv.slice(2));
+  const options = parseArgs(argv, printLine);
   printLine(
     `ospex-benchmark scorer — reference-closing CLV — ${SCORING_POLICY_VERSION} — label SMOKE_V0_NOT_A_COHORT`,
   );
@@ -118,7 +155,10 @@ async function main(): Promise<number> {
   // A scorecard is only as trustworthy as its input: recomputed hashes,
   // decision echoes, and decision-to-response linkage must all verify, and a
   // run that recorded a hard failure is not scoreable.
-  const violations = verifyRunIntegrity(run);
+  const violations = verifyRunIntegrity(
+    run,
+    deps.expectedArms === undefined ? undefined : { expectedArms: deps.expectedArms },
+  );
   if (violations.length > 0) {
     printError('');
     printError('!!! RUN INTEGRITY FAILURE — refusing to score !!!');
@@ -138,7 +178,7 @@ async function main(): Promise<number> {
 
   const gameIds = [...run.games.keys()];
   printLine(`fetching captured closes for ${gameIds.length} games ...`);
-  const closes = await fetchClosingLines(supabaseUrl, supabaseAnonKey, 'polygon', gameIds);
+  const closes = await fetchCloses(supabaseUrl, supabaseAnonKey, 'polygon', gameIds);
   printLine(`closes: ${closes.length} market rows found`);
 
   const scored = scoreRun(run, closes, ladderParams);
@@ -186,18 +226,31 @@ async function main(): Promise<number> {
   return 0;
 }
 
-main()
-  .then((code) => {
-    process.exitCode = code;
-  })
-  .catch((error: unknown) => {
-    if (error instanceof UsageError) {
-      printError(`error: ${error.message}`);
-      printError('');
-      printError(USAGE);
-      process.exitCode = 2;
-      return;
-    }
-    printError(describeErrorWithStack(error));
-    process.exitCode = 1;
-  });
+/**
+ * Self-execute ONLY when this file is the process entry point.
+ *
+ * Without the guard, importing the module to test `runScoreCli` would also run
+ * a real scoring pass on `process.argv` at import time. `yarn score` is
+ * unaffected — it invokes this file directly, so the comparison holds and the
+ * CLI still runs on import-as-entry exactly as before. `scoring.test.ts` pins
+ * both halves: that importing the module does NOT run a pass, and that
+ * `yarn score` still reaches the summary block.
+ */
+const entry = process.argv[1];
+if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {
+  runScoreCli(process.argv.slice(2))
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error: unknown) => {
+      if (error instanceof UsageError) {
+        printErrorImpl(`error: ${error.message}`);
+        printErrorImpl('');
+        printErrorImpl(USAGE);
+        process.exitCode = 2;
+        return;
+      }
+      printErrorImpl(describeErrorWithStack(error));
+      process.exitCode = 1;
+    });
+}

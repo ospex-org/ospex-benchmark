@@ -1514,36 +1514,100 @@ export function primaryScoreableCount(picks: readonly ScoredPick[]): number {
 }
 
 /**
+ * EXHAUSTIVE partition of a zero-primary-scoreable run, by WHY each pick is not
+ * in the estimate. `heldOut + unscored + unexplained === picks`, always.
+ */
+export interface EmptyPrimaryEstimate {
+  picks: number;
+  /** Scored, carries a CLV, but held out of the primary stratum by the schedule tag. */
+  heldOut: number;
+  /** Refused by a typed close-quality or selection gate; carries no CLV. */
+  unscored: number;
+  /** Per-reason counts behind `unscored`, so the note never generalises them. */
+  unscoredByReason: Record<string, number>;
+  /** In no stratum-or-refusal bucket: no value and no recorded reason. */
+  unexplained: number;
+}
+
+/**
+ * Partition the picks of a zero-primary-scoreable run by cause.
+ *
+ * Exhaustive by construction — every pick lands in exactly one bucket, which is
+ * what lets the note report subsets instead of asserting a single run-level
+ * cause.
+ */
+export function summariseEmptyPrimaryEstimate(
+  picks: readonly ScoredPick[],
+): EmptyPrimaryEstimate {
+  const unscoredByReason: Record<string, number> = {};
+  let heldOut = 0;
+  let unscored = 0;
+  let unexplained = 0;
+  for (const pick of picks) {
+    const tagged = !inPrimaryStratum(pick);
+    if (tagged && pick.result.primaryClvPct !== null) {
+      heldOut += 1;
+    } else if (pick.result.unscoredReason !== null) {
+      unscored += 1;
+      unscoredByReason[pick.result.unscoredReason] =
+        (unscoredByReason[pick.result.unscoredReason] ?? 0) + 1;
+    } else {
+      unexplained += 1;
+    }
+  }
+  return { picks: picks.length, heldOut, unscored, unscoredByReason, unexplained };
+}
+
+/**
  * The operator note explaining a zero primary-scoreable count — or null when
  * there is nothing to explain.
  *
- * A pure function rather than an inline branch in the CLI because the message
- * is the artifact here: the scorer's live path needs Supabase, so a
- * process-level assertion on its stdout cannot run in CI. Returning null for
- * the ordinary case makes "the note does NOT fire" testable too, which is the
- * half a positive-only test would miss.
+ * A pure function rather than an inline branch in the CLI so that "the note
+ * does NOT fire" is testable too, which is the half a positive-only test would
+ * miss. (The CLI's use of it is pinned separately, through `runScoreCli`.)
  *
- * TWO CAUSES, AND THEY WANT OPPOSITE ACTIONS. Closes that do not exist yet are
- * fixed by re-running after the slate locks. Picks held out of the primary
- * stratum by a schedule change are already fully scored, and re-running changes
- * nothing — telling an operator to re-run would be a new untruth. The note has
- * to say which one happened.
+ * ⚠ NEVER GIVE RUN-LEVEL ADVICE FOR A SUBSET CAUSE. A zero does not have one
+ * cause, and it does not have two — the scorer carries NINE typed unscored
+ * reasons (`CLOSE_QUALITY_REASONS` + `SELECTION_REASONS`) and a run can mix
+ * them freely with schedule-tagged picks. An earlier version of this note said
+ * "N pick(s) WERE scored … Re-running will not change this" whenever any pick
+ * was held out, which is correct for those picks and WRONG for a `close_missing`
+ * pick sitting beside them, where a later re-run may well fill the close.
+ *
+ * So the note reports the PARTITION and attaches each remedy to the subset it
+ * actually applies to. Held-out picks are already fully scored and re-running
+ * changes nothing for them; refusals are per-pick and want their reason
+ * inspected; the two must never be collapsed into one instruction.
  */
 export function emptyPrimaryEstimateNote(picks: readonly ScoredPick[]): string | null {
   if (primaryScoreableCount(picks) > 0) return null;
-  const heldOut = heldOutOfPrimary(picks);
-  if (heldOut > 0) {
-    return (
-      `note: nothing was primary-scoreable — ${String(heldOut)} pick(s) WERE scored but are held ` +
-      'out of the primary same-schedule estimate because their start times moved beyond the ' +
-      'tolerance. Re-running will not change this. Their CLV is in the scored NDJSON and in the ' +
-      "scorecard's reschedule-sensitivity stratum."
+  const s = summariseEmptyPrimaryEstimate(picks);
+  const lines = [`note: nothing was primary-scoreable (0 of ${String(s.picks)} pick(s)).`];
+
+  if (s.heldOut > 0) {
+    lines.push(
+      `  · ${String(s.heldOut)} scored but HELD OUT of the primary same-schedule estimate — ` +
+        'their start times moved beyond the tolerance. Re-running will NOT change those; their ' +
+        "CLV is in the scored NDJSON and in the scorecard's reschedule-sensitivity stratum.",
     );
   }
-  return (
-    'note: nothing was primary-scoreable — if the games have not locked yet, closes do not ' +
-    'exist; re-run after the slate locks.'
-  );
+  if (s.unscored > 0) {
+    const byReason = Object.entries(s.unscoredByReason)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([reason, n]) => `${reason} ${String(n)}`)
+      .join(', ');
+    lines.push(
+      `  · ${String(s.unscored)} not scored at all: ${byReason}. These are PER-PICK refusals — ` +
+        'inspect each reason separately. If the slate has not locked yet the closes do not exist ' +
+        'and a re-run after it locks may fill them.',
+    );
+  }
+  if (s.unexplained > 0) {
+    lines.push(
+      `  · ${String(s.unexplained)} produced no primary value and recorded no refusal reason.`,
+    );
+  }
+  return lines.join('\n');
 }
 
 /**
