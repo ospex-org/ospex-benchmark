@@ -1,0 +1,60 @@
+name: CI
+
+# Exact-head evidence on every PR: without this a reviewer has to either run
+# the suite locally or take an explicit no-CI exception, which is what happened
+# on #74.
+#
+# TESTS + TYPECHECK ONLY, DELIBERATELY. Per the project's advisory-tooling
+# rule, a linter / formatter / dependency auditor reports — it must never be
+# able to block a merge. Only tests, verifiers, and money-safety or
+# authorization gates may block. If one of those tools is added to this repo
+# later, it does not belong in this workflow as a failing step.
+#
+# NO NETWORK AND NO SECRETS. Every suite here is unit-only; none of them touch
+# Supabase. The live paths (`yarn audit:closes`, `yarn score`, `yarn smoke`,
+# the store conformance runners) need SUPABASE_URL / SUPABASE_ANON_KEY or a
+# database and are intentionally OUT of this gate.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # package.json declares engines.node >= 20.6; '20' resolves to the latest
+      # 20.x, which satisfies it.
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+
+      # --ignore-scripts: nothing in this dependency set needs an install-time
+      # lifecycle script (esbuild, which tsx uses, ships platform binaries as
+      # optional dependencies rather than a postinstall download), so running
+      # none of them costs nothing and removes the primary execution vector for
+      # a compromised transitive.
+      - name: Install
+        run: yarn install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck
+        run: yarn typecheck
+
+      # `yarn test` is an EXPLICIT no-glob file list in package.json, so a new
+      # *.test.ts that is not registered there silently never runs. CI does not
+      # change that — `src/testScriptRegistry.test.ts` is what guards it, and it
+      # runs as part of this list. Keep it in the gate rather than relying on
+      # test discovery, which this repo does not use.
+      #
+      # Timeout-bounded because a regression in the runner-loop or store suites
+      # could hang rather than assert; without a bound the job would sit until
+      # the runner-level limit. The full suite is ~40s locally.
+      - name: Test
+        run: yarn test
+        timeout-minutes: 10
