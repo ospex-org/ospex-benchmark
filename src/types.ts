@@ -199,6 +199,24 @@ export interface GamesTableRow {
   jsonodds_id: string;
   sport: string;
   match_time: string;
+  /**
+   * The CURRENT RETAINED SAFETY FLOOR on `match_time`, maintained DB-side by a
+   * trigger (ospex-indexer migration 070).
+   *
+   * ⚠ SCOPE — do not restate this as "the earliest start ever recorded" or as
+   * "it never rises". What 070 enforces is narrower: the trigger recomputes the
+   * floor from OLD on any statement whose SET list NAMES `match_time`, so
+   * ordinary feed writes cannot raise it. It deliberately leaves one way up —
+   * an explicit operator-remedy UPDATE naming `earliest_match_time` ALONE — and
+   * `earliest_match_time <= match_time` is **not** an enforced invariant.
+   * Exactly ONE value is retained, so this is not a history of previously
+   * recorded starts and cannot answer membership questions about them.
+   *
+   * Nullable: rows written before the floor existed, and any row whose floor
+   * has not been established, carry null. A consumer must treat null as "no
+   * floor known" rather than substituting `match_time`.
+   */
+  earliest_match_time: string | null;
   status: string;
   home_score: number | null;
   away_score: number | null;

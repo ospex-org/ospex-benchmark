@@ -37,16 +37,33 @@ import { SCHEDULE_CHANGE_TOLERANCE_MS } from './scoring.js';
  * join cannot fan out.
  *
  * REFERENCE-TIME CAVEAT, restated here because it is the whole point: this
- * audit compares a close's `lock_time` against the CURRENT schedule row
- * (`games.match_time`), which is the only reference reachable without a run
- * file. The scorer's own `scheduleChanged` compares against the FROZEN
- * bundle start the model saw. Same classifier and tolerance, different
- * reference — the two numbers are not interchangeable. And because
- * `lock_time` is copied from `games.match_time` at capture, a start that
- * moved earlier without the upstream capture noticing leaves BOTH sides
- * equal and reads as zero drift; the post-start-poll count is the only
- * signal here sourced from feed behaviour rather than from the schedule
- * record itself.
+ * audit has no run file, so it cannot use the scorer's reference (the FROZEN
+ * bundle start the model saw). It compares a close's `lock_time` against the
+ * two references that ARE reachable from the public read path, and publishes
+ * both because neither subsumes the other:
+ *
+ * - `games.match_time` — mutable in both directions. Asks whether the close
+ *   still agrees with the schedule row as it stands NOW, so a row that moved
+ *   after capture reads as a mismatch even when the close was captured
+ *   correctly against the value of the moment.
+ * - `games.earliest_match_time` — the CURRENT RETAINED SAFETY FLOOR. Asks the
+ *   narrower, mechanical question of whether the close agrees with that floor.
+ *   Ordinary feed writes cannot raise it, so a ROLLBACK of `match_time` does
+ *   not by itself move it. Nullable; a null propagates as null, never as zero
+ *   drift. ⚠ It does NOT establish that a close was correctly or incorrectly
+ *   anchored: one value is retained (not a history), an explicit operator
+ *   remedy can raise it, and `earliest_match_time <= match_time` is not
+ *   enforced.
+ *
+ * Same classifier and tolerance as the scorer, different references — none of
+ * these numbers are interchangeable with each other or with the scorer's.
+ *
+ * What NEITHER reference can see: `lock_time` is copied from
+ * `games.match_time` at capture, so a start that moved earlier without the
+ * upstream capture noticing leaves the lock, the schedule row and the floor on
+ * the same wrong instant, and both drifts read as zero. The post-start-poll
+ * count is the only signal here sourced from feed behaviour rather than from
+ * the schedule record itself.
  */
 
 class UsageError extends Error {}
@@ -198,6 +215,14 @@ async function main(): Promise<number> {
     `  schedule_changed vs games.match_time: ${meta.scheduleChangedVsMatchTimeAny} ` +
       `(${meta.lockEarlierThanMatchTime} lock-earlier, ${meta.lockLaterThanMatchTime} lock-later)`,
   );
+  printLine(
+    `  schedule_changed vs games.earliest_match_time (monotone floor): ` +
+      `${meta.scheduleChangedVsEarliestMatchTimeAny}` +
+      `${meta.earliestMatchTimeNull > 0 ? ` (${meta.earliestMatchTimeNull} rows have no floor — not established, not counted either way)` : ''}`,
+  );
+  printLine(
+    `  the two references DISAGREE on: ${meta.scheduleVerdictsDisagree} rows`,
+  );
   printLine(`  confidence: ${JSON.stringify(meta.confidence)}`);
   // An unnarrowed walk reports all three markets. One key here means the
   // enumeration was narrowed — the one incompleteness the meta arithmetic
@@ -211,10 +236,23 @@ async function main(): Promise<number> {
   printLine(`  lock_time range: ${JSON.stringify(meta.lockTimeRange)}`);
   printLine('');
   printLine(
-    'NOTE: this compares lock_time against the CURRENT games.match_time, not against a ' +
-      'frozen bundle start, and lock_time is copied from games.match_time at capture — a ' +
-      'start that moved earlier unnoticed reads as ZERO drift here. Only the ' +
-      'close_after_start count is sourced from feed behaviour rather than the schedule record.',
+    'NOTE: neither schedule comparison is against the frozen bundle start the model saw — ' +
+      'that reference only exists inside a run file. The games.match_time comparison asks ' +
+      'whether a close still agrees with the schedule row AS IT STANDS NOW, so a row that ' +
+      'moved after capture reads as a mismatch even when the close was captured correctly. ' +
+      'The games.earliest_match_time comparison asks the narrower, MECHANICAL question of ' +
+      'whether the close agrees with the CURRENT RETAINED floor; ordinary feed writes cannot ' +
+      'raise that floor, so a rollback does not by itself move it. A disagreement between the ' +
+      'two means the two CURRENT references CLASSIFY DIFFERENTLY — it does NOT prove ' +
+      'miscapture, does not attribute a cause, and does not say whether movement happened ' +
+      'before or after capture. Only one floor value is retained (it is not a history of ' +
+      'recorded starts), an explicit operator remedy can raise it, and ' +
+      'earliest_match_time <= match_time is not enforced. ' +
+      'Both are published because neither subsumes the other. What NEITHER can see: ' +
+      'lock_time is copied from games.match_time at capture, so a start that moved earlier ' +
+      'unnoticed leaves the lock, the row AND the floor on the same wrong instant and both ' +
+      'drifts read as ZERO. Only the close_after_start count is sourced from feed behaviour ' +
+      'rather than the schedule record.',
   );
   printLine('');
   printLine(AUDIT_COMPLETENESS_DISCLOSURE);

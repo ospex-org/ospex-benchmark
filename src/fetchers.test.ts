@@ -3,9 +3,12 @@ import { test } from 'node:test';
 import {
   fetchClosingLines,
   fetchClosingLinesByMarket,
+  fetchGamesRowsByIds,
   fetchTotalsClosingLines,
+  GAMES_TABLE_SELECT,
   keysetWalk,
 } from './fetchers.js';
+import { gamesTableRowSchema, parseGamesTableRows } from './wire.js';
 
 /**
  * Keyset-pagination invariants. The fake below emulates PostgREST semantics
@@ -401,4 +404,130 @@ test('a LOW id that commits after the cursor has passed it is MISSED — the wal
     [50, 51, 52, 53],
     'the delayed row is committed by the end of the walk',
   );
+});
+
+test('the games projection asks for exactly the columns the schema requires', () => {
+  // THE FIXTURE BLIND SPOT THIS CLOSES. Every games-row test in this repo
+  // constructs a `GamesTableRow` object directly, so none of them travel this
+  // wire — dropping a column from the select is invisible to all of them and
+  // would surface only as a production parse failure. Binding the projection
+  // to the schema's own required keys makes either side going stale a test
+  // failure here.
+  const required = Object.keys(gamesTableRowSchema.shape).sort();
+  const selected = GAMES_TABLE_SELECT.split(',').sort();
+  assert.deepEqual(
+    selected,
+    required,
+    'the PostgREST select and gamesTableRowSchema disagree about the games columns',
+  );
+
+  // Fail-closed, not fail-quiet: a row missing a required column is REFUSED at
+  // parse rather than yielding an object with an undefined field.
+  const { earliest_match_time: _dropped, ...withoutFloor } = {
+    network: 'polygon',
+    jsonodds_id: 'c0a2f8f0-0000-0000-0000-000000000001',
+    sport: 'mlb',
+    match_time: '2026-07-12T20:10:00+00:00',
+    earliest_match_time: '2026-07-12T20:10:00+00:00',
+    status: 'upcoming',
+    home_score: null,
+    away_score: null,
+    final_type: null,
+    score_captured: false,
+  };
+  assert.throws(() => parseGamesTableRows([withoutFloor]), /earliest_match_time/);
+  // NEGATIVE CONTROLS: the complete row parses, and an explicit null floor is
+  // a legitimate value rather than a missing one.
+  assert.doesNotThrow(() =>
+    parseGamesTableRows([{ ...withoutFloor, earliest_match_time: '2026-07-12T20:10:00+00:00' }]),
+  );
+  assert.doesNotThrow(() => parseGamesTableRows([{ ...withoutFloor, earliest_match_time: null }]));
+});
+
+/**
+ * A transport that HONOURS the projection, the way PostgREST does: it returns
+ * only the columns the caller asked for.
+ *
+ * That is the whole point. A stub that echoes a full row back regardless of
+ * `select` is a cooperating fake — it cannot see a narrowed projection, which
+ * is exactly how the previous version of this file left the production call
+ * site unprotected.
+ */
+function stubProjectingFetch(row: Record<string, unknown>): {
+  selects: string[];
+  restore: () => void;
+} {
+  const selects: string[] = [];
+  const original = globalThis.fetch;
+  type FetchInput = Parameters<typeof globalThis.fetch>[0];
+  type FetchResponse = Awaited<ReturnType<typeof globalThis.fetch>>;
+  globalThis.fetch = (async (input: FetchInput): Promise<FetchResponse> => {
+    const select = new URL(String(input)).searchParams.get('select') ?? '';
+    selects.push(select);
+    const projected: Record<string, unknown> = {};
+    for (const column of select.split(',').map((c) => c.trim()).filter((c) => c !== '')) {
+      if (column in row) projected[column] = row[column];
+    }
+    const body = [projected];
+    return {
+      ok: true,
+      status: 200,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    } as unknown as FetchResponse;
+  }) as typeof globalThis.fetch;
+  return { selects, restore: () => { globalThis.fetch = original; } };
+}
+
+test('REGRESSION: the PRODUCTION games fetch asks for the floor column, not just the exported constant', async () => {
+  // The test above pins the CONSTANT. It does not pin that production USES it.
+  // A reviewer mutated only the call site in `fetchGamesRowsByIds` back to the
+  // old hard-coded projection, left `GAMES_TABLE_SELECT` correct, and the whole
+  // suite stayed green at 1143/1143 while the real fetch omitted
+  // `earliest_match_time` and the decoder refused the response.
+  //
+  // So this drives `fetchGamesRowsByIds` itself through a projecting transport:
+  // the select it really emits is captured, and the row it gets back carries
+  // only the columns it really asked for.
+  const GID = 'c0a2f8f0-0000-0000-0000-000000000001';
+  const full: Record<string, unknown> = {
+    network: 'polygon',
+    jsonodds_id: GID,
+    sport: 'mlb',
+    match_time: '2026-07-12T20:10:00+00:00',
+    earliest_match_time: '2026-07-12T19:10:00+00:00',
+    status: 'upcoming',
+    home_score: null,
+    away_score: null,
+    final_type: null,
+    score_captured: false,
+  };
+  const stub = stubProjectingFetch(full);
+  let rows: Awaited<ReturnType<typeof fetchGamesRowsByIds>> | undefined;
+  let thrown: unknown;
+  try {
+    rows = await fetchGamesRowsByIds('https://db.example', 'anon-key', 'polygon', [GID]);
+  } catch (error) {
+    thrown = error;
+  } finally {
+    stub.restore();
+  }
+
+  // Asserted BEFORE the decode result so a narrowed projection reports itself
+  // plainly rather than as an opaque schema error.
+  assert.equal(stub.selects.length, 1, 'exactly one batched games request');
+  assert.deepEqual(
+    (stub.selects[0] ?? '').split(','),
+    GAMES_TABLE_SELECT.split(','),
+    'the production call site must emit GAMES_TABLE_SELECT — a hard-coded projection here is the regression this pins',
+  );
+  assert.ok(
+    (stub.selects[0] ?? '').split(',').includes('earliest_match_time'),
+    'the monotone-floor column must be requested from the server',
+  );
+
+  // And the projected response really decodes, floor included.
+  assert.equal(thrown, undefined, `the projected row must decode: ${String(thrown)}`);
+  assert.equal(rows?.length, 1);
+  assert.equal(rows?.[0]?.earliest_match_time, '2026-07-12T19:10:00+00:00');
 });
