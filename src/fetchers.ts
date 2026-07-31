@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CLOSE_SOURCE } from './closeSource.js';
 import { redactAndTruncate } from './config.js';
 import { parseTwoSidedHistoryRows } from './oddsHistory.js';
 import {
@@ -184,6 +185,35 @@ export async function fetchCurrentOdds(
  * Captured reference closes for a set of games — the read side of the
  * scoring join. Same public anon read path as the reference-odds snapshot.
  */
+/**
+ * Assert that rows the server returned actually carry the identity we asked
+ * for. The queries below already filter on `network` and `source` server-side,
+ * so this can only fire if a filter is dropped in a refactor, a URL is
+ * mis-assembled, or the server honours a predicate differently than assumed —
+ * exactly the cases a silent wrong-corpus measurement would come from. Cheap,
+ * and it fails loudly instead of scoring another network's book.
+ */
+function assertCanonicalCloses(
+  rows: readonly ClosingLineRow[],
+  network: string,
+  where: string,
+): void {
+  const wrongNetwork = rows.find((row) => row.network !== network);
+  if (wrongNetwork !== undefined) {
+    throw new Error(
+      `${where}: server returned a closing line on network "${wrongNetwork.network}" ` +
+        `for a query filtered to "${network}" (game ${wrongNetwork.jsonodds_id})`,
+    );
+  }
+  const wrongSource = rows.find((row) => row.source !== CLOSE_SOURCE);
+  if (wrongSource !== undefined) {
+    throw new Error(
+      `${where}: server returned a closing line from source "${wrongSource.source}" ` +
+        `for a query filtered to "${CLOSE_SOURCE}" (game ${wrongSource.jsonodds_id})`,
+    );
+  }
+}
+
 export async function fetchClosingLines(
   supabaseUrl: string,
   anonKey: string,
@@ -201,8 +231,11 @@ export async function fetchClosingLines(
       'poll_gap_seconds,confidence,source';
     const url =
       `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
-      `&network=eq.${network}&jsonodds_id=in.(${batch.join(',')})`;
-    rows.push(...parseClosingLineRows(await getJson(url, headers)));
+      `&network=eq.${network}&source=eq.${CLOSE_SOURCE}` +
+      `&jsonodds_id=in.(${batch.join(',')})`;
+    const page = parseClosingLineRows(await getJson(url, headers));
+    assertCanonicalCloses(page, network, 'fetchClosingLines');
+    rows.push(...page);
   }
   return rows;
 }
@@ -213,8 +246,25 @@ export async function fetchClosingLines(
  * pagination — a concurrent insert can never shift page boundaries and
  * duplicate one row while dropping another. The identity walk asserts
  * strictly increasing ids across the whole result (uniqueness + order), and
- * refuses anything else. Correctness assumes the key is append-only
- * monotone (a GENERATED IDENTITY column), which closing_lines.id is.
+ * refuses anything else.
+ *
+ * WHAT THIS DOES NOT PROVE — stated because the difference is easy to
+ * over-read. Identity is allocated by a sequence BEFORE the inserting
+ * transaction commits, and allocation order is not commit order. A
+ * transaction can take id 50, stay uncommitted while 51..200 commit and
+ * become visible, then commit after the cursor has already advanced past 50 —
+ * and that row is never returned by any page. So the walk is complete with
+ * respect to ORDERING (no shifted boundary, no duplicate, no drop from
+ * repagination) but NOT with respect to a SNAPSHOT: it observes rows visible
+ * at the moment each page is served, not a consistent instant.
+ *
+ * Nothing available on this read path closes that gap. It is the public anon
+ * REST surface: no transaction, no repeatable-read snapshot, no visibility
+ * cursor. Gaps in the id sequence are also endemic here and cannot be used as
+ * a signal — an upserting writer burns identity values on every conflict — so
+ * hole-probing would report constant false alarms. Callers that publish a
+ * count from this walk should present it as a LOWER BOUND and say so, which
+ * is what the close-schedule audit does.
  *
  * Termination is an EMPTY page only. A short page must not be trusted as
  * end-of-data: a server-side row cap below the requested limit would make
@@ -259,21 +309,30 @@ export async function keysetWalk<T>(options: {
 }
 
 /**
- * EVERY totals closing line on a network, enumerated directly from the
- * source table the snapshot claims to cover (not via a pre-enumerated game
- * list, which would silently hide closes whose games row is missing or
- * unexpected). Keyset-paginated on the identity PK.
+ * Closing lines on a network observed by ONE keyset walk — optionally
+ * narrowed to ONE market — a LOWER BOUND on the table, never a census —
+ * enumerated directly from the source table the snapshot claims to cover
+ * (not via a pre-enumerated game list, which would silently hide closes
+ * whose games row is missing or unexpected). Keyset-paginated on the
+ * identity PK.
+ *
+ * `market: null` means no market filter: all three markets in one walk.
+ * The filter is the ONLY difference between the totals snapshot and a
+ * close-schedule audit, so both go through this one walker rather than a
+ * second copy that could drift from it.
  */
-export async function fetchTotalsClosingLines(
+export async function fetchClosingLinesByMarket(
   supabaseUrl: string,
   anonKey: string,
   network: string,
+  market: MarketKey | null,
 ): Promise<ClosingLineRowWithId[]> {
   const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
   const select =
     'id,network,jsonodds_id,market,line,away_odds_decimal,home_odds_decimal,' +
     'away_p_novig,home_p_novig,value_captured_at,last_polled_at,lock_time,' +
     'poll_gap_seconds,confidence,source';
+  const marketFilter = market === null ? '' : `&market=eq.${market}`;
   // The requested page size is a hint to the server, not a contract the
   // walker relies on — termination is the empty final page.
   const pageSize = 1000;
@@ -281,12 +340,23 @@ export async function fetchTotalsClosingLines(
     fetchPage: async (afterId) => {
       const url =
         `${supabaseUrl}/rest/v1/closing_lines?select=${select}` +
-        `&network=eq.${network}&market=eq.total&id=gt.${afterId}` +
+        `&network=eq.${network}&source=eq.${CLOSE_SOURCE}${marketFilter}&id=gt.${afterId}` +
         `&order=id.asc&limit=${pageSize}`;
-      return parseClosingLineRowsWithId(await getJson(url, headers));
+      const page = parseClosingLineRowsWithId(await getJson(url, headers));
+      assertCanonicalCloses(page, network, 'fetchClosingLinesByMarket');
+      return page;
     },
     idOf: (row) => row.id,
   });
+}
+
+/** Every totals closing line on a network — the dispersion snapshot's source. */
+export async function fetchTotalsClosingLines(
+  supabaseUrl: string,
+  anonKey: string,
+  network: string,
+): Promise<ClosingLineRowWithId[]> {
+  return fetchClosingLinesByMarket(supabaseUrl, anonKey, network, 'total');
 }
 
 /**

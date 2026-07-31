@@ -6,7 +6,11 @@ import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPric
 import { SOURCE_QUERY_VERSION } from './oddsHistory.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { CODE_MAX_REPAIRS_PER_ARM, REPAIR_POLICY_VERSION } from './repairPolicy.js';
-import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
+import {
+  SCHEDULE_CHANGE_TOLERANCE_MS,
+  SCORING_POLICY_VERSION,
+  defaultExpectedArms,
+} from './scoring.js';
 import {
   PROVIDER_ATTEMPT_RESERVATION_USD_MICROS,
   SPEND_RESERVATION_POLICY_VERSION,
@@ -110,7 +114,11 @@ export function buildRehearsalManifest(now: number, opts: RehearsalManifestOptio
       maxRepairAttemptsPerArm: CODE_MAX_REPAIRS_PER_ARM,
       providerAttemptReservationUsdMicros: PROVIDER_ATTEMPT_RESERVATION_USD_MICROS,
       ingestionGraceMs: 900_000,
-      scheduleChangeToleranceMs: 60_000,
+      // IMPORTED, not restated: the cohort path tags schedule changes from
+      // its hashed manifest and `yarn score` from this same code constant.
+      // A literal here could drift, and the two paths would then tag at
+      // different thresholds under one policy version and one knob name.
+      scheduleChangeToleranceMs: SCHEDULE_CHANGE_TOLERANCE_MS,
       // The scheduler must be able to launch the whole roster concurrently.
       maxConcurrentProviderRequests: Math.max(8, arms.length),
       maxDispatchesPerTick: 8,

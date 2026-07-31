@@ -4,6 +4,7 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { PROPORTIONAL_DEVIG_METHOD, scoreDecision, SHIN_DEVIG_METHOD } from './clv.js';
 import { favorableLineMovement } from './clv.js';
 import { LADDER_VERSION, scoreTotalsLadder } from './ladder.js';
+import { instantMs, isParseableInstant } from './time.js';
 import { checkProviderCollision } from './providers/family.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
@@ -50,8 +51,32 @@ import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } fr
  * numeric/structural output is unchanged apart from this stamp — the new engine
  * accepts a wider artifact domain and emits different scoped aggregates, so it
  * must not share a methodology identity with the fixed-three-only v0.4.0.
+ * v0.6.0 makes close TIMING evidence-bearing rather than assumed. The capture
+ * timestamps stop being dropped on the way into the metric; a close still being
+ * quoted by the feed after its own recorded lock is refused (`close_after_start`,
+ * shared with the ladder); and a close whose lock disagrees with the frozen
+ * bundle's scheduled start by at least the schedule-change tolerance is TAGGED
+ * `scheduleChanged` and held out of the primary same-schedule estimate as a
+ * disclosed stratum (its CLV is still computed, recorded, and counted — nothing
+ * is discarded). Reason vocabulary, aggregation membership, and the
+ * scored-record/scorecard shape all change, so this must not share a
+ * methodology identity with v0.5.0.
  */
-export const SCORING_POLICY_VERSION = 'scoring-v0.5.0';
+export const SCORING_POLICY_VERSION = 'scoring-v0.6.0';
+
+/**
+ * Schedule-change tolerance for the `yarn score` path, in milliseconds.
+ *
+ * The cohort runner takes its tolerance from its hashed manifest
+ * (`constants.scheduleChangeToleranceMs`); the scoring CLI has no manifest,
+ * so the value is a code constant here. The generated rehearsal manifest
+ * IMPORTS this constant rather than restating the literal, so both paths tag
+ * at one threshold by construction, and a test asserts that equality (a
+ * literal in the manifest generator would let the two drift silently under
+ * one policy version and one knob name). Any change to the number is a
+ * scoring-policy change that bumps the version above.
+ */
+export const SCHEDULE_CHANGE_TOLERANCE_MS = 60_000;
 
 /** The scored markets, anchored to MarketKey so drift is a compile error. */
 export const MARKETS: ReadonlyArray<MarketKey> = ['moneyline', 'spread', 'total'];
@@ -109,7 +134,20 @@ const bundleGameSchema = z
         league: z.string().min(1),
         awayTeam: z.string().min(1),
         homeTeam: z.string().min(1),
-        scheduledStartUtc: z.string().min(1),
+        // The REFERENCE the scorer's schedule-drift comparison is taken
+        // against. Validated as an offset-qualified instant at parse, so an
+        // undeterminable drift can never originate here: a bare `Date.parse`
+        // would read an offset-less value as host-local time, and refusing it
+        // downstream instead would leave the pick in the primary stratum with
+        // `scheduleChanged === null` — fail-closed parsing followed by
+        // fail-open aggregation.
+        scheduledStartUtc: z
+          .string()
+          .min(1)
+          .refine(isParseableInstant, {
+            message:
+              'scheduledStartUtc must be an ISO-8601 instant with an explicit offset (Z or +/-hh:mm)',
+          }),
         markets: z
           .object({
             // A recorded bundle supplies 1-3 of the KNOWN markets (moneyline,
@@ -1346,6 +1384,13 @@ export function verifyRunIntegrity(
 // Join + score
 // ---------------------------------------------------------------------------
 
+/**
+ * Narrow a fetched close row to the quote the metric consumes. The four
+ * capture timestamps ride along: the CLV module gates on close TIMING as
+ * well as price representation, and the row is the only place that evidence
+ * exists. Dropping them here (as this function once did) is what made
+ * timing unjudgeable downstream.
+ */
 export function closeQuoteFromRow(row: ClosingLineRow): CloseQuote {
   return {
     line: row.line,
@@ -1354,11 +1399,131 @@ export function closeQuoteFromRow(row: ClosingLineRow): CloseQuote {
     awayPNovig: row.away_p_novig,
     homePNovig: row.home_p_novig,
     confidence: row.confidence,
+    lockTime: row.lock_time,
+    valueCapturedAt: row.value_captured_at,
+    lastPolledAt: row.last_polled_at,
+    pollGapSeconds: row.poll_gap_seconds,
   };
 }
 
+/**
+ * Signed drift between the close's own recorded lock and a reference
+ * scheduled start, in milliseconds: NEGATIVE means the lock is EARLIER than
+ * the reference (the schedule moved up between the reference being frozen
+ * and the close being captured), POSITIVE means later.
+ *
+ * `null` when either instant is unparseable — "not determinable" is a
+ * distinct answer from "no drift" and must never be collapsed into it.
+ */
+export function scheduleDriftMs(lockTime: string, referenceStartUtc: string): number | null {
+  // STRICT parsing on both sides. `Date.parse` reads an ISO string carrying no
+  // explicit offset as HOST-LOCAL time, so the identical pair of timestamps
+  // produced a drift of 0 on a UTC host and 14400000 on a US-Eastern one, and
+  // `isScheduleChanged` flipped false -> true with it. A verdict that depends
+  // on the scoring machine's timezone is not a measurement. `instantMs`
+  // rejects an offset-less instant outright, which lands here as `null` —
+  // "not determinable", the answer both callers already refuse on.
+  let lock: number;
+  let reference: number;
+  try {
+    lock = instantMs(lockTime);
+    reference = instantMs(referenceStartUtc);
+  } catch {
+    return null;
+  }
+  return lock - reference;
+}
+
+/**
+ * Whether a drift is a SCHEDULE CHANGE at the given tolerance:
+ * `abs(drift) >= toleranceMs`, inclusive at the boundary. `null` drift
+ * propagates as `null` — an undeterminable comparison is never reported as
+ * "unchanged".
+ *
+ * This is a stratum classifier, NOT a refusal: a tagged pick is still
+ * scored, still recorded with both CLV variants, and still counted in every
+ * coverage denominator. What it loses is membership in the primary
+ * same-schedule estimate (see `inPrimaryStratum`).
+ */
+export function isScheduleChanged(
+  driftMs: number | null,
+  toleranceMs: number = SCHEDULE_CHANGE_TOLERANCE_MS,
+): boolean | null {
+  if (driftMs === null) return null;
+  return Math.abs(driftMs) >= toleranceMs;
+}
+
+/**
+ * Primary-estimate membership — the same-schedule stratum.
+ *
+ * Only an affirmative `scheduleChanged === true` is held out. An
+ * undeterminable comparison (`null`) stays IN the primary estimate: it is
+ * the status quo for every close whose reference start cannot be parsed,
+ * and silently dropping those rows would be a coverage change disguised as
+ * a timing check.
+ */
+export function inPrimaryStratum(pick: ScoredPick): boolean {
+  if (pick.scheduleChanged === true) return false;
+  // A pick carrying a SCORE whose schedule comparison is undeterminable is
+  // held out too. `null` still means "no determinable comparison", and for a
+  // pick with no close that is the honest status quo — it contributes no value
+  // to the estimate either way, and counting it as tagged would misreport
+  // coverage. But a pick that produced a CLV while its schedule verdict is
+  // unknown would enter the same-schedule estimate on a comparison nobody
+  // established: fail-closed parsing followed by fail-open aggregation.
+  //
+  // With `scheduledStartUtc` validated at parse and an unparseable `lock_time`
+  // refused as `close_timing_unusable`, this state is unreachable — the guard
+  // exists so that reachability is enforced rather than assumed.
+  if (pick.scheduleChanged === null && pick.result.primaryClvPct !== null) return false;
+  return true;
+}
+
+/**
+ * How many picks the `scheduleChanged` tag actually REMOVED from the primary
+ * estimate: tagged AND carrying a primary CLV value.
+ *
+ * The two conjuncts are both load-bearing. Counting every tagged pick would
+ * include rows an earlier close-quality gate had already refused — rows with
+ * nothing to withhold, already disclosed under that gate's reason — and the
+ * coverage columns would then sum past the pick count while the published
+ * claim "these were scored and only held out" would be false for them.
+ */
+export function heldOutOfPrimary(picks: readonly ScoredPick[]): number {
+  return picks.filter((p) => !inPrimaryStratum(p) && p.result.primaryClvPct !== null).length;
+}
+
+/**
+ * Index captured closes by `(game, market)` for the scorer's join.
+ *
+ * A duplicate key now REFUSES. `new Map(rows.map(...))` silently kept the LAST
+ * row seen, so two rows sharing a game and market — differing only by network
+ * or by feed — collapsed into one and the scorer priced against whichever
+ * happened to arrive last, with nothing published to say a choice was made.
+ *
+ * The key deliberately does not carry network or source: the lookup site has a
+ * pick, not a row, and cannot supply them. The identity is constrained one
+ * level up instead — `fetchClosingLines` filters network and source
+ * server-side and asserts the rows that come back honour both — so within one
+ * scoring run every row already shares an identity and a collision here means
+ * a genuine duplicate. Refusing is what makes that an upstream invariant
+ * whose violation is observable rather than one silently relied upon.
+ */
 export function closesByKey(rows: ClosingLineRow[]): Map<string, ClosingLineRow> {
-  return new Map(rows.map((row) => [`${row.jsonodds_id}:${row.market}`, row]));
+  const map = new Map<string, ClosingLineRow>();
+  for (const row of rows) {
+    const key = `${row.jsonodds_id}:${row.market}`;
+    if (map.has(key)) {
+      const kept = map.get(key);
+      throw new Error(
+        `duplicate closing line for ${key}: rows from ` +
+          `${kept?.network ?? '?'}/${kept?.source ?? '?'} and ${row.network}/${row.source} — ` +
+          'refusing to score against an ambiguous close',
+      );
+    }
+    map.set(key, row);
+  }
+  return map;
 }
 
 export interface ScoredPick extends SourcePick {
@@ -1369,6 +1534,18 @@ export interface ScoredPick extends SourcePick {
   /** TOTALS_V1 ladder block — non-null on every totals pick, null elsewhere. */
   ladder: TotalsLadderResult | null;
   close: ClosingLineRow | null;
+  /**
+   * Signed `close.lock_time - game.startUtc` in ms; null when there is no
+   * close or either instant is unparseable. Recorded whether or not it
+   * crosses the tolerance — the magnitude and direction are the evidence.
+   */
+  scheduleDriftMs: number | null;
+  /**
+   * Schedule-change stratum tag (`abs(drift) >= SCHEDULE_CHANGE_TOLERANCE_MS`).
+   * `null` = not determinable. A `true` pick is scored and recorded in full
+   * but held out of the primary same-schedule estimate.
+   */
+  scheduleChanged: boolean | null;
 }
 
 /**
@@ -1444,7 +1621,34 @@ export function scoreRun(
         params: ladderParams,
       });
     }
-    return { ...pick, side, entryOppositeDecimal, result: exactLine, ladder, close };
+    // Schedule drift is measured against the FROZEN bundle start the model
+    // actually saw, not against any later reading — the question is whether
+    // the schedule moved between the decision and the close capture.
+    const drift = close === null ? null : scheduleDriftMs(close.lock_time, game.startUtc);
+    // An undeterminable drift on a pick that still SCORED would enter the
+    // same-schedule estimate on a comparison nothing established. Two inputs
+    // can make it undeterminable and both are already closed: the reference
+    // (`game.startUtc`) is validated as an offset-qualified instant at parse,
+    // and an unparseable `close.lock_time` is refused per-pick as
+    // `close_timing_unusable` — which is the graceful path, so it must NOT be
+    // escalated to a whole-run rejection here. What remains is the impossible
+    // combination, and it is asserted rather than assumed away.
+    if (drift === null && close !== null && exactLine.primaryClvPct !== null) {
+      throw new Error(
+        `pick ${pick.gameId}:${pick.market} scored with an undeterminable schedule comparison ` +
+          `(lock_time "${close.lock_time}" vs bundle start "${game.startUtc}") — refusing the run`,
+      );
+    }
+    return {
+      ...pick,
+      side,
+      entryOppositeDecimal,
+      result: exactLine,
+      ladder,
+      close,
+      scheduleDriftMs: drift,
+      scheduleChanged: close === null ? null : isScheduleChanged(drift),
+    };
   });
 }
 
@@ -1485,6 +1689,20 @@ export interface MarketStats {
   gameLevelMarginAdjusted: ClvSummary;
   perPickMarginAdjusted: ClvSummary;
   unscoredByReason: Record<string, number>;
+  /** Picks in this market carrying the `scheduleChanged` tag, scoreable or not. */
+  scheduleChangedTagged: number;
+  /**
+   * The TAGGED picks in this market that carried a primary CLV value — i.e.
+   * the ones whose sample membership the tag actually withheld. They remain
+   * in `picks` and `eligible`; this is the line item that explains the gap
+   * to `scoreable`.
+   *
+   * A tagged pick that some earlier gate had ALREADY refused is deliberately
+   * NOT counted here: it contributed nothing to withhold, and it is already
+   * disclosed under that gate's reason in `unscoredByReason`. Counting it in
+   * both places would make the coverage columns sum past `picks`.
+   */
+  scheduleChangedExcluded: number;
 }
 
 export interface ParticipantStats {
@@ -1532,6 +1750,37 @@ export interface ParticipantStats {
   };
   conditionalOnly: number;
   unscoredByReason: Record<string, number>;
+  /** Picks carrying the `scheduleChanged` tag, scoreable or not — the raw stratum size. */
+  scheduleChangedTagged: number;
+  /**
+   * The TAGGED picks that carried a primary CLV value — CLV computed and
+   * recorded, sample membership withheld. They stay in `validDecisions` /
+   * `eligibleMarkets`, so this count (not a silent shrink) is what explains
+   * a `primaryScoreable` below the number of otherwise-scoreable picks.
+   *
+   * A tagged pick that some earlier gate had ALREADY refused is deliberately
+   * NOT counted here — it had no value to withhold and is disclosed under
+   * that gate's reason instead. `scheduleChangedTagged` above is the count
+   * that includes it.
+   */
+  scheduleChangedExcluded: number;
+  /**
+   * The reschedule-sensitivity stratum (SPEC-line-open-evidence-model.md §7:
+   * "compute CLV but tag the row, exclude it from the primary same-schedule
+   * estimate, and show it only in a separate reschedule-sensitivity
+   * stratum"). These are the SAME aggregates as the primary ones, computed
+   * over the COMPLEMENT set — the tagged picks — so what the tag withheld is
+   * published rather than merely counted. Never pooled with primary.
+   */
+  scheduleChangedStratum: {
+    picks: number;
+    scoreable: number;
+    gamesScoreable: number;
+    gameLevel: ClvSummary;
+    perPick: ClvSummary;
+    gameLevelMarginAdjusted: ClvSummary;
+    perPickMarginAdjusted: ClvSummary;
+  };
   byMarket: Record<string, MarketStats>;
   /**
    * TOTALS_V1 candidate-ladder aggregates over this participant's totals
@@ -1554,6 +1803,14 @@ export interface ParticipantStats {
     /** Mean favorable signed line movement over ladder-scored picks (0 = unmoved). */
     meanSignedMovement: number | null;
     unscoredByReason: Record<string, number>;
+    /**
+     * Totals picks whose LADDER value the `scheduleChanged` tag withheld
+     * from `ladderScoreable`. Without it the ladder table would show a
+     * scoreable count below `totalsPicks` with no reason given: a tagged
+     * pick carries no `ladder.unscoredReason`, so it appears in neither the
+     * scored count nor the refusal histogram.
+     */
+    scheduleChangedExcluded: number;
   } | null;
 }
 
@@ -1591,16 +1848,35 @@ function summary(values: number[]): ClvSummary {
 /**
  * Equal-weight game-first clustering for one metric extractor: collect the
  * non-null values and the per-game means (average within each game first).
- * Every metric (economic, margin-adjusted, shin variants) aggregates through
- * this one path so the clustering can never diverge between metrics.
+ * Every metric (economic, margin-adjusted, shin variants, ladder, per-market)
+ * aggregates through this one path so the clustering can never diverge
+ * between metrics.
+ *
+ * `member` is the stratum this aggregate is computed over, defaulting to the
+ * primary same-schedule stratum — so a `scheduleChanged` pick contributes no
+ * VALUE to any aggregate computed with the default. It keeps its place in
+ * every denominator, because those are counted from the raw pick lists
+ * outside this function: a reschedule must shrink the estimate's sample,
+ * never hide the pick.
+ *
+ * This is the enforcement point for every aggregate computed THROUGH it, and
+ * it is not the only one in the file: the paired de-vig sensitivity SETS and
+ * the ladder's mean-signed-movement average filter the stratum at their own
+ * call sites, because their disclosed counts have to describe exactly the
+ * rows their numbers came from. Each of those sites has its own test — grep
+ * `inPrimaryStratum` before assuming a new aggregate inherits the filter.
+ * The one caller that passes the COMPLEMENT is the reschedule-sensitivity
+ * stratum readout, which exists to publish what the tag withheld.
  */
 function clusterByGame(
   picks: ScoredPick[],
   value: (pick: ScoredPick) => number | null,
+  member: (pick: ScoredPick) => boolean = inPrimaryStratum,
 ): { values: number[]; gameMeans: number[] } {
   const values: number[] = [];
   const byGame = new Map<string, number[]>();
   for (const pick of picks) {
+    if (!member(pick)) continue;
     const v = value(pick);
     if (v === null) continue;
     values.push(v);
@@ -1670,12 +1946,33 @@ export function aggregateByParticipant(
     const economic = clusterByGame(picks, (p) => p.result.primaryClvPct);
     const marginAdjusted = clusterByGame(picks, (p) => p.result.marginAdjustedClvPct);
 
+    // The reschedule-sensitivity stratum (SPEC §7): the SAME aggregates over
+    // the COMPLEMENT set. Computing them is the difference between "held out"
+    // and "held out and shown" — the tag withholds sample membership, not
+    // publication.
+    const taggedPicks = picks.filter((p) => !inPrimaryStratum(p));
+    const taggedEconomic = clusterByGame(
+      taggedPicks,
+      (p) => p.result.primaryClvPct,
+      () => true,
+    );
+    const taggedMarginAdjusted = clusterByGame(
+      taggedPicks,
+      (p) => p.result.marginAdjustedClvPct,
+      () => true,
+    );
+
     // The sensitivity comparison is PAIRED: restrict to picks where the
     // shin value exists, then aggregate BOTH methods over exactly that
     // subset — a delta can only ever reflect the method, never coverage.
-    const pairedEconomic = picks.filter((p) => p.result.sensitivity?.economicClvPct != null);
+    // The stratum filter is applied to the paired SETS as well, not only
+    // inside clusterByGame, so the disclosed paired-pick counts describe
+    // exactly the rows the paired summaries were computed from.
+    const pairedEconomic = picks.filter(
+      (p) => inPrimaryStratum(p) && p.result.sensitivity?.economicClvPct != null,
+    );
     const pairedMarginAdjusted = picks.filter(
-      (p) => p.result.sensitivity?.marginAdjustedClvPct != null,
+      (p) => inPrimaryStratum(p) && p.result.sensitivity?.marginAdjustedClvPct != null,
     );
     const pairedEconProportional = clusterByGame(pairedEconomic, (p) => p.result.primaryClvPct);
     const pairedEconShin = clusterByGame(
@@ -1729,6 +2026,8 @@ export function aggregateByParticipant(
         gameLevelMarginAdjusted: summary(marketMarginAdjusted.gameMeans),
         perPickMarginAdjusted: summary(marketMarginAdjusted.values),
         unscoredByReason: marketUnscored,
+        scheduleChangedTagged: marketPicks.filter((p) => !inPrimaryStratum(p)).length,
+        scheduleChangedExcluded: heldOutOfPrimary(marketPicks),
       };
     }
 
@@ -1748,7 +2047,16 @@ export function aggregateByParticipant(
       if (pick.ladder.unscoredReason !== null) {
         ladderUnscored[pick.ladder.unscoredReason] =
           (ladderUnscored[pick.ladder.unscoredReason] ?? 0) + 1;
-      } else if (pick.line !== null && pick.close !== null && pick.close.line !== null) {
+        // Mean signed movement is documented as an average over the
+        // LADDER-SCORED picks, and ladderScoreable comes from clusterByGame
+        // — so a rescheduled pick must leave this average too, or the two
+        // numbers would describe different sets.
+      } else if (
+        inPrimaryStratum(pick) &&
+        pick.line !== null &&
+        pick.close !== null &&
+        pick.close.line !== null
+      ) {
         movements.push(
           favorableLineMovement(
             'total',
@@ -1780,6 +2088,9 @@ export function aggregateByParticipant(
             perPickMarginAdjusted: summary(ladderMarginAdjusted.values),
             meanSignedMovement: mean(movements),
             unscoredByReason: ladderUnscored,
+            scheduleChangedExcluded: totalsPicks.filter(
+              (p) => !inPrimaryStratum(p) && p.ladder?.economicClvPct != null,
+            ).length,
           };
 
     stats.push({
@@ -1823,6 +2134,17 @@ export function aggregateByParticipant(
         (p) => p.result.conditionalClvPct !== null && p.result.primaryClvPct === null,
       ).length,
       unscoredByReason,
+      scheduleChangedTagged: taggedPicks.length,
+      scheduleChangedExcluded: heldOutOfPrimary(picks),
+      scheduleChangedStratum: {
+        picks: taggedPicks.length,
+        scoreable: taggedEconomic.values.length,
+        gamesScoreable: taggedEconomic.gameMeans.length,
+        gameLevel: summary(taggedEconomic.gameMeans),
+        perPick: summary(taggedEconomic.values),
+        gameLevelMarginAdjusted: summary(taggedMarginAdjusted.gameMeans),
+        perPickMarginAdjusted: summary(taggedMarginAdjusted.values),
+      },
       byMarket,
       totalsLadder,
     });
@@ -1883,13 +2205,46 @@ export function scoredRecords(
     closePolicy: {
       confidenceRequired: 'fresh',
       lineMatchRequired: true,
+      // Every close-quality reason the scorer can emit is named somewhere in
+      // this block — a reader should never meet a refusal code in the records
+      // that the preregistered policy did not declare. A test asserts it.
+      availabilityRequired:
+        'a pick with no captured close row is unscored (close_missing); a row carrying no usable stored no-vig probability is unscored (close_not_captured). Both refuse BOTH metrics together and are shared with the totals ladder',
+      freshnessRequired:
+        'only a `fresh`-confidence close feeds the metrics; a stale one is unscored (close_stale). A close whose stored no-vig probabilities disagree with its raw two-sided quotes is refused outright (close_inconsistent), before side selection, for every participant and side alike',
       integerLinePrimary:
         'unavailable (push-excluded conditional CLV separately labeled, both metrics); the TOTALS_V1 candidate ladder reports the generalized push-aware value as separately labeled sensitivity output, pending validation',
+      timingEvidenceRequired:
+        'refused (close_timing_unusable): every timing verdict below is derived from the row’s own instants, parsed strictly — a timestamp carrying no explicit UTC offset is REJECTED rather than read as host-local time. A row whose stored poll_gap_seconds contradicts its own lock_time and last_polled_at by more than the second-granularity tolerance, whose instants cannot be parsed, or which claims fresh confidence while missing any of value_captured_at / last_polled_at / poll_gap_seconds, establishes nothing and is refused as a named, counted close-quality reason rather than being scored on a verdict nothing supports. Shared with the totals ladder',
+      closeAfterStart:
+        'refused (close_after_start): a close whose market the feed was still quoting at least 1000ms AFTER the row’s own recorded lock (the tolerance absorbs the integer-second granularity of the stored gap and nothing more) has an unestablished pre-game status and is not evidence for any metric, on either side, for any participant. Derived from last_polled_at vs lock_time — NOT from the stored gap, which is a derived value a corrupt row can contradict. Shared with the totals ladder. This is a CONSERVATIVE refusal on ambiguous evidence, not a proof of contamination: at least three readings fit a post-lock poll (the recorded start was early and the value is a genuine pre-game price; the feed quotes in-play; or the feed had simply not yet dropped the finished/started game from its live snapshot), and the row alone cannot separate them',
+      closeValueAfterLock:
+        'refused (close_value_after_lock): the quoted VALUE was recorded past the row’s own cutoff. STRICT, with NO tolerance — value_captured_at is a direct timestamp, not an integer-second derived value, so exactly at the lock passes and one millisecond past it refuses. Distinct from close_after_start, which asks whether the feed was still LISTING the market. Measured at 0 of 3609 rows on the captured corpus, so this gate is expected to be inert — it exists so the claim stays measured rather than assumed',
+      scheduleChangeToleranceMs: SCHEDULE_CHANGE_TOLERANCE_MS,
+      scheduleChanged:
+        'STRATUM TAG, not a refusal: abs(close lock_time − frozen bundle scheduledStartUtc) >= scheduleChangeToleranceMs. CLV is computed and recorded in full, and the pick stays in every coverage denominator, but it is held out of the primary same-schedule estimate, republished as its own reschedule-sensitivity stratum, and counted as scheduleChangedTagged (every tagged pick) and scheduleChangedExcluded (the tagged picks that carried a value, i.e. what the tag actually removed from the estimate)',
+      startTimeLimitation:
+        'The recorded lock is the scheduled start as known at capture — a PREDICTION of first pitch, never ground truth. These gates do NOT detect a start that moved EARLIER without the upstream capture noticing: in that case the lock, the schedule row it was copied from, and the frozen bundle start are the SAME wrong instant, and no comparison available to this scorer can separate them. Detecting that needs an independent start-time source (the on-chain contest start served by the public API, or a league schedule feed)',
     },
     picks: scored.length,
-    primaryScoreable: scored.filter((p) => p.result.primaryClvPct !== null).length,
-    marginAdjustedScoreable: scored.filter((p) => p.result.marginAdjustedClvPct !== null).length,
-    totalsLadderScoreable: scored.filter((p) => p.ladder?.economicClvPct != null).length,
+    // Stratum-aware, to agree with the per-participant aggregates: a
+    // rescheduled pick is not a member of the primary estimate even though
+    // its CLV is present on its own record.
+    primaryScoreable: scored.filter((p) => inPrimaryStratum(p) && p.result.primaryClvPct !== null)
+      .length,
+    marginAdjustedScoreable: scored.filter(
+      (p) => inPrimaryStratum(p) && p.result.marginAdjustedClvPct !== null,
+    ).length,
+    totalsLadderScoreable: scored.filter((p) => inPrimaryStratum(p) && p.ladder?.economicClvPct != null)
+      .length,
+    // Two different questions, both published: how many rows the tag TOUCHED,
+    // and how many it actually removed from the estimate. They differ exactly
+    // by the tagged rows some earlier gate had already refused.
+    scheduleChangedTagged: scored.filter((p) => !inPrimaryStratum(p)).length,
+    scheduleChangedExcluded: heldOutOfPrimary(scored),
+    scheduleUndetermined: scored.filter((p) => p.scheduleChanged === null).length,
+    closeAfterStartRefused: scored.filter((p) => p.result.unscoredReason === 'close_after_start')
+      .length,
     armGameResponses: run.armResponses.length,
   });
   for (const pick of scored) {
@@ -1933,7 +2288,14 @@ export function scoredRecords(
               confidence: pick.close.confidence,
               valueCapturedAt: pick.close.value_captured_at,
               lockTime: pick.close.lock_time,
+              lastPolledAt: pick.close.last_polled_at,
+              pollGapSeconds: pick.close.poll_gap_seconds,
             },
+      /** Frozen bundle start this pick's drift was measured against. */
+      scheduledStartUtc: game?.startUtc ?? null,
+      scheduleDriftMs: pick.scheduleDriftMs,
+      scheduleChanged: pick.scheduleChanged,
+      inPrimaryStratum: inPrimaryStratum(pick),
       primaryClvPct: pick.result.primaryClvPct,
       unscoredReason: pick.result.unscoredReason,
       conditionalClvPct: pick.result.conditionalClvPct,

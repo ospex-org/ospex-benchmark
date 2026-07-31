@@ -86,7 +86,7 @@ async function main(): Promise<number> {
   }
 
   const closes = await fetchTotalsClosingLines(supabaseUrl, supabaseAnonKey, NETWORK);
-  printLine(`closing lines: ${closes.length} totals rows (all sports, keyset-complete)`);
+  printLine(`closing lines: ${closes.length} totals rows (all sports, one keyset walk over the id — a lower bound, not a census)`);
   const gameIds = [...new Set(closes.map((close) => close.jsonodds_id))];
   if (gameIds.length !== closes.length) {
     // One materialized totals row per (network, game) is the upstream
