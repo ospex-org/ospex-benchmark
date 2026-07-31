@@ -200,9 +200,17 @@ export interface GamesTableRow {
   sport: string;
   match_time: string;
   /**
-   * The MONOTONE FLOOR on `match_time` — the earliest start this game was ever
-   * recorded with. Maintained DB-side by a trigger; no write that names
-   * `match_time` can raise it, so unlike `match_time` it never moves later.
+   * The CURRENT RETAINED SAFETY FLOOR on `match_time`, maintained DB-side by a
+   * trigger (ospex-indexer migration 070).
+   *
+   * ⚠ SCOPE — do not restate this as "the earliest start ever recorded" or as
+   * "it never rises". What 070 enforces is narrower: the trigger recomputes the
+   * floor from OLD on any statement whose SET list NAMES `match_time`, so
+   * ordinary feed writes cannot raise it. It deliberately leaves one way up —
+   * an explicit operator-remedy UPDATE naming `earliest_match_time` ALONE — and
+   * `earliest_match_time <= match_time` is **not** an enforced invariant.
+   * Exactly ONE value is retained, so this is not a history of previously
+   * recorded starts and cannot answer membership questions about them.
    *
    * Nullable: rows written before the floor existed, and any row whose floor
    * has not been established, carry null. A consumer must treat null as "no

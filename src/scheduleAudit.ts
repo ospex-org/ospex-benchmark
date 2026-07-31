@@ -34,8 +34,8 @@ import type { ClosingLineRow, GamesTableRow } from './types.js';
  *   its own name, `scheduleChangedVsMatchTime`. Same classifier, same
  *   tolerance, DIFFERENT reference — the two numbers must never be read as
  *   the same measurement.
- * - It ALSO compares against `games.earliest_match_time`, the MONOTONE
- *   FLOOR, as `scheduleChangedVsEarliestMatchTime`.
+ * - It ALSO compares against `games.earliest_match_time`, the CURRENT
+ *   RETAINED SAFETY FLOOR, as `scheduleChangedVsEarliestMatchTime`.
  *
  * WHY BOTH, RATHER THAN REPLACING `match_time`. They answer different
  * questions and neither subsumes the other.
@@ -49,12 +49,23 @@ import type { ClosingLineRow, GamesTableRow } from './types.js';
  * start back up, and the close now disagrees with a row it matched exactly
  * when it was written.
  *
- * The floor never rises, so comparing against it asks "was this close
- * anchored to a start we ever actually believed?" — a rollback cannot turn
- * a correctly-captured close into an apparent mismatch. Where the two
- * verdicts disagree, `scheduleVerdictsDisagree` counts it, and that
- * population is exactly where the mutable reference and the stable one tell
- * different stories.
+ * Comparing against the floor asks a narrower, purely MECHANICAL question:
+ * does this close agree with the CURRENT RETAINED FLOOR? Ordinary feed
+ * writes cannot raise that floor, so a rollback of `match_time` does not by
+ * itself move it — which is why the two references can classify the same
+ * close differently. `scheduleVerdictsDisagree` counts that population.
+ *
+ * ⚠ WHAT NEITHER NUMBER PROVES. A disagreement means the two CURRENT
+ * references classify differently. It does NOT establish that the close was
+ * correctly or incorrectly anchored, does not attribute a cause, and does not
+ * say whether any movement happened before or after capture. Three reasons,
+ * all structural: only ONE floor value is retained (so nothing here can speak
+ * to the full history of recorded starts), an explicit operator remedy can
+ * raise the floor, and `earliest_match_time <= match_time` is not enforced.
+ * This audit's own opposite-direction fixture is the worked example — a close
+ * can equal the accepted `match_time` while an older floor sits below it,
+ * yielding `scheduleChangedVsMatchTime: false` beside
+ * `scheduleChangedVsEarliestMatchTime: true` with no miscapture whatsoever.
  *
  * The floor is NULLABLE and a null propagates as null, never as zero drift
  * or as "unchanged" — a missing floor means the comparison was never
@@ -196,7 +207,8 @@ export const closeScheduleAuditRecordSchema = z
     /** Signed `lockTime - gameMatchTime` in ms. */
     matchTimeDriftMs: z.number(),
     scheduleChangedVsMatchTime: z.boolean(),
-    /** The MONOTONE FLOOR, or null when the games row carries none. */
+    /** The CURRENT RETAINED SAFETY FLOOR, or null when the games row carries
+     *  none. One value, not a history — see the module header for its scope. */
     gameEarliestMatchTime: z.union([z.string().min(1), z.null()]),
     /** Signed `lockTime - gameEarliestMatchTime` in ms; null iff no floor. */
     earliestMatchTimeDriftMs: z.union([z.number(), z.null()]),
@@ -242,9 +254,9 @@ export const closeScheduleAuditMetaSchema = z
     /** Records whose games row carried NO floor, so the floor comparison was
      *  not established. The denominator for the count above. */
     earliestMatchTimeNull: z.number().int().nonnegative(),
-    /** Records where the two references DISAGREE about whether the schedule
-     *  changed — the population where a rollback or a post-capture move makes
-     *  the mutable reference tell a different story from the stable one. */
+    /** Records where the two CURRENT references CLASSIFY DIFFERENTLY.
+     *  ⚠ Mechanical only: this attributes no cause, proves no miscapture, and
+     *  says nothing about whether movement preceded or followed capture. */
     scheduleVerdictsDisagree: z.number().int().nonnegative(),
     confidence: z.record(z.string(), z.number().int().nonnegative()),
     /**
@@ -320,9 +332,11 @@ export interface CloseScheduleAuditEvidence {
   pollGapSeconds: number | null;
   gameMatchTime: string;
   /**
-   * `games.earliest_match_time` — the MONOTONE FLOOR, or null when the row
-   * carries none. See the "THIRD REFERENCE TIME" note in the module header for
-   * why it is reported ALONGSIDE `gameMatchTime` rather than replacing it.
+   * `games.earliest_match_time` — the CURRENT RETAINED SAFETY FLOOR, or null
+   * when the row carries none. Exactly one value is retained; it is not a
+   * history of recorded starts. See the "THIRD REFERENCE TIME" note in the
+   * module header for its scope and for why it is reported ALONGSIDE
+   * `gameMatchTime` rather than replacing it.
    */
   gameEarliestMatchTime: string | null;
 }
@@ -459,7 +473,11 @@ export function deriveCloseScheduleAuditFields(
 }
 
 /**
- * Do the two schedule references DISAGREE about this close?
+ * Do the two CURRENT schedule references CLASSIFY this close DIFFERENTLY?
+ *
+ * ⚠ Deliberately mechanical. A true result means the two references reach
+ * different verdicts today — NOT that the close was mis-anchored, and not that
+ * anything can be attributed about when or why the schedule moved.
  *
  * ONE definition, used by the writer's counter and the reader's re-check, for
  * the same reason `deriveCloseScheduleAuditFields` is shared: two copies could

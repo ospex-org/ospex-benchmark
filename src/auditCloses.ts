@@ -46,10 +46,14 @@ import { SCHEDULE_CHANGE_TOLERANCE_MS } from './scoring.js';
  *   still agrees with the schedule row as it stands NOW, so a row that moved
  *   after capture reads as a mismatch even when the close was captured
  *   correctly against the value of the moment.
- * - `games.earliest_match_time` — the MONOTONE FLOOR, which never rises. Asks
- *   whether the close was anchored to a start we ever actually believed, so a
- *   ROLLBACK cannot turn a correctly-captured close into an apparent mismatch.
- *   Nullable; a null propagates as null, never as zero drift.
+ * - `games.earliest_match_time` — the CURRENT RETAINED SAFETY FLOOR. Asks the
+ *   narrower, mechanical question of whether the close agrees with that floor.
+ *   Ordinary feed writes cannot raise it, so a ROLLBACK of `match_time` does
+ *   not by itself move it. Nullable; a null propagates as null, never as zero
+ *   drift. ⚠ It does NOT establish that a close was correctly or incorrectly
+ *   anchored: one value is retained (not a history), an explicit operator
+ *   remedy can raise it, and `earliest_match_time <= match_time` is not
+ *   enforced.
  *
  * Same classifier and tolerance as the scorer, different references — none of
  * these numbers are interchangeable with each other or with the scorer's.
@@ -236,8 +240,14 @@ async function main(): Promise<number> {
       'that reference only exists inside a run file. The games.match_time comparison asks ' +
       'whether a close still agrees with the schedule row AS IT STANDS NOW, so a row that ' +
       'moved after capture reads as a mismatch even when the close was captured correctly. ' +
-      'The games.earliest_match_time comparison asks whether it was anchored to a start we ' +
-      'ever believed; that floor never rises, so a rollback cannot manufacture a mismatch. ' +
+      'The games.earliest_match_time comparison asks the narrower, MECHANICAL question of ' +
+      'whether the close agrees with the CURRENT RETAINED floor; ordinary feed writes cannot ' +
+      'raise that floor, so a rollback does not by itself move it. A disagreement between the ' +
+      'two means the two CURRENT references CLASSIFY DIFFERENTLY — it does NOT prove ' +
+      'miscapture, does not attribute a cause, and does not say whether movement happened ' +
+      'before or after capture. Only one floor value is retained (it is not a history of ' +
+      'recorded starts), an explicit operator remedy can raise it, and ' +
+      'earliest_match_time <= match_time is not enforced. ' +
       'Both are published because neither subsumes the other. What NEITHER can see: ' +
       'lock_time is copied from games.match_time at capture, so a start that moved earlier ' +
       'unnoticed leaves the lock, the row AND the floor on the same wrong instant and both ' +
