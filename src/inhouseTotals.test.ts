@@ -39,6 +39,9 @@ function gameRow(overrides: Partial<GamesTableRow> = {}): GamesTableRow {
     jsonodds_id: 'c0a2f8f0-0000-0000-0000-000000000001',
     sport: 'mlb',
     match_time: '2026-07-12T20:10:00+00:00',
+    // Floor equal to match_time — the steady state on live production
+    // (1222 of 1223 rows). Cases that need a held earlier floor set it.
+    earliest_match_time: '2026-07-12T20:10:00+00:00',
     status: 'upcoming',
     home_score: 4,
     away_score: 3,

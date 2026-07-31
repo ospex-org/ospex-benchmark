@@ -360,6 +360,20 @@ export async function fetchTotalsClosingLines(
 }
 
 /**
+ * The projection `fetchGamesRowsByIds` asks PostgREST for.
+ *
+ * EXPORTED so a test can hold it against `gamesTableRowSchema`'s required
+ * keys. A column dropped here is invisible to every fixture-built test — the
+ * fixtures construct `GamesTableRow` objects directly and never travel this
+ * wire — so without that check, removing one silently produces a fetch that
+ * throws only in production. (`earliest_match_time` was added here for the
+ * monotone-floor comparison; the schema requires it, so a narrowed select
+ * fails closed at parse rather than yielding rows with a missing field.)
+ */
+export const GAMES_TABLE_SELECT =
+  'network,jsonodds_id,sport,match_time,earliest_match_time,status,home_score,away_score,final_type,score_captured';
+
+/**
  * `games` TABLE rows for a pinned set of game ids — batched `in.()` lookups
  * keyed by identity, so there is no pagination and nothing for a concurrent
  * write to shift. Duplicate rows for one key are refused.
@@ -371,8 +385,7 @@ export async function fetchGamesRowsByIds(
   gameIds: string[],
 ): Promise<GamesTableRow[]> {
   const headers = { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
-  const select =
-    'network,jsonodds_id,sport,match_time,status,home_score,away_score,final_type,score_captured';
+  const select = GAMES_TABLE_SELECT;
   const rows: GamesTableRow[] = [];
   const batchSize = 40;
   for (let i = 0; i < gameIds.length; i += batchSize) {

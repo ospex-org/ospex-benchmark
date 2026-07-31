@@ -169,6 +169,10 @@ export const gamesTableRowSchema = z
     jsonodds_id: z.string().min(1),
     sport: z.string().min(1),
     match_time: z.string().min(1),
+    // Nullable, and NOT defaulted to match_time — a substituted floor would be
+    // indistinguishable from an observed one, and every comparison downstream
+    // would then read as "the floor agrees" on rows where no floor exists.
+    earliest_match_time: z.string().min(1).nullable(),
     status: z.string().min(1),
     home_score: z.number().int().nullable(),
     away_score: z.number().int().nullable(),

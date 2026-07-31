@@ -24,7 +24,7 @@ import type { ClosingLineRow, GamesTableRow } from './types.js';
  * they were copied from; and how the first is distributed across sports and
  * confidence classes.
  *
- * TWO REFERENCE TIMES, deliberately kept distinct:
+ * THREE REFERENCE TIMES, deliberately kept distinct:
  *
  * - The SCORER's `scheduleChanged` compares a close's `lock_time` against
  *   the FROZEN BUNDLE start the model actually saw (`SourceGame.startUtc`).
@@ -34,17 +34,45 @@ import type { ClosingLineRow, GamesTableRow } from './types.js';
  *   its own name, `scheduleChangedVsMatchTime`. Same classifier, same
  *   tolerance, DIFFERENT reference — the two numbers must never be read as
  *   the same measurement.
+ * - It ALSO compares against `games.earliest_match_time`, the MONOTONE
+ *   FLOOR, as `scheduleChangedVsEarliestMatchTime`.
  *
- * WHAT THIS CANNOT SEE. `lock_time` is copied from `games.match_time` at
- * capture, so when a start moved earlier and the upstream capture never
- * noticed, both sides of the schedule comparison are the same wrong instant
- * and the drift reads as zero. The post-start-poll count is the only signal
- * here that does not come from the schedule record itself — it comes from
- * the feed's own behaviour — and even it cannot distinguish "the game had
- * not started" from "the feed quotes in-play". Establishing real first
- * pitch needs an independent source (the on-chain contest start served by
- * the public read API, or a league schedule feed); this audit measures what
- * is reachable from the public anon read path and says so.
+ * WHY BOTH, RATHER THAN REPLACING `match_time`. They answer different
+ * questions and neither subsumes the other.
+ *
+ * `match_time` is mutable in BOTH directions, and it is the value
+ * `lock_time` was copied from at capture — so comparing against it asks
+ * "does this close still agree with the schedule row as it stands now?".
+ * That is the right question for detecting that the row moved after
+ * capture, but it makes a correctly-captured close look wrong after a
+ * ROLLBACK: capture at an accepted earlier start, the feed later walks the
+ * start back up, and the close now disagrees with a row it matched exactly
+ * when it was written.
+ *
+ * The floor never rises, so comparing against it asks "was this close
+ * anchored to a start we ever actually believed?" — a rollback cannot turn
+ * a correctly-captured close into an apparent mismatch. Where the two
+ * verdicts disagree, `scheduleVerdictsDisagree` counts it, and that
+ * population is exactly where the mutable reference and the stable one tell
+ * different stories.
+ *
+ * The floor is NULLABLE and a null propagates as null, never as zero drift
+ * or as "unchanged" — a missing floor means the comparison was never
+ * established. `earliestMatchTimeNull` is its denominator.
+ *
+ * WHAT NEITHER REFERENCE CAN SEE. `lock_time` is copied from
+ * `games.match_time` at capture, so when a start moved earlier and the
+ * upstream capture never noticed, the lock, the schedule row, AND the floor
+ * are all the same wrong instant, and both drifts read as zero. The floor
+ * fixes the rollback blind spot; it does not fix this one, because the
+ * floor can only ever record starts the writer observed. The post-start-poll
+ * count is the only signal here that does not come from the schedule record
+ * itself — it comes from the feed's own behaviour — and even it cannot
+ * distinguish "the game had not started" from "the feed quotes in-play".
+ * Establishing real first pitch needs an independent source (the on-chain
+ * contest start served by the public read API, or a league schedule feed);
+ * this audit measures what is reachable from the public anon read path and
+ * says so.
  *
  * Completeness posture (identical to the totals extraction): the CLAIMED
  * source table is enumerated directly by keyset pagination on its identity
@@ -168,6 +196,11 @@ export const closeScheduleAuditRecordSchema = z
     /** Signed `lockTime - gameMatchTime` in ms. */
     matchTimeDriftMs: z.number(),
     scheduleChangedVsMatchTime: z.boolean(),
+    /** The MONOTONE FLOOR, or null when the games row carries none. */
+    gameEarliestMatchTime: z.union([z.string().min(1), z.null()]),
+    /** Signed `lockTime - gameEarliestMatchTime` in ms; null iff no floor. */
+    earliestMatchTimeDriftMs: z.union([z.number(), z.null()]),
+    scheduleChangedVsEarliestMatchTime: z.union([z.boolean(), z.null()]),
     closeAfterStart: z.boolean(),
     valueCapturedAfterLock: z.boolean(),
     valueCapturedAfterMatchTime: z.boolean(),
@@ -202,6 +235,17 @@ export const closeScheduleAuditMetaSchema = z
     valueCapturedAfterMatchTimeAny: z.number().int().nonnegative(),
     lockEarlierThanMatchTime: z.number().int().nonnegative(),
     lockLaterThanMatchTime: z.number().int().nonnegative(),
+    /** The same schedule-change count taken against the MONOTONE FLOOR instead
+     *  of the mutable `match_time`. Published beside, never instead of, the
+     *  `…VsMatchTime` figure — they answer different questions. */
+    scheduleChangedVsEarliestMatchTimeAny: z.number().int().nonnegative(),
+    /** Records whose games row carried NO floor, so the floor comparison was
+     *  not established. The denominator for the count above. */
+    earliestMatchTimeNull: z.number().int().nonnegative(),
+    /** Records where the two references DISAGREE about whether the schedule
+     *  changed — the population where a rollback or a post-capture move makes
+     *  the mutable reference tell a different story from the stable one. */
+    scheduleVerdictsDisagree: z.number().int().nonnegative(),
     confidence: z.record(z.string(), z.number().int().nonnegative()),
     /**
      * Rows per market. Published because it is the one field in which an
@@ -275,12 +319,27 @@ export interface CloseScheduleAuditEvidence {
   lastPolledAt: string | null;
   pollGapSeconds: number | null;
   gameMatchTime: string;
+  /**
+   * `games.earliest_match_time` — the MONOTONE FLOOR, or null when the row
+   * carries none. See the "THIRD REFERENCE TIME" note in the module header for
+   * why it is reported ALONGSIDE `gameMatchTime` rather than replacing it.
+   */
+  gameEarliestMatchTime: string | null;
 }
 
 /** The JUDGED half. Field-for-field what {@link deriveCloseScheduleAuditFields} returns. */
 export interface CloseScheduleAuditDerived {
   matchTimeDriftMs: number;
   scheduleChangedVsMatchTime: boolean;
+  /**
+   * Signed `lockTime - gameEarliestMatchTime` in ms, or null when the row has
+   * no floor. NULL IS NOT ZERO: a missing floor means the comparison was never
+   * established, and reporting it as zero drift would manufacture agreement.
+   */
+  earliestMatchTimeDriftMs: number | null;
+  /** Same classifier and tolerance as `scheduleChangedVsMatchTime`, against the
+   *  floor. Null exactly when `earliestMatchTimeDriftMs` is null. */
+  scheduleChangedVsEarliestMatchTime: boolean | null;
   closeAfterStart: boolean;
   valueCapturedAfterLock: boolean;
   valueCapturedAfterMatchTime: boolean;
@@ -293,6 +352,8 @@ export interface CloseScheduleAuditDerived {
 export const CLOSE_SCHEDULE_AUDIT_DERIVED_KEYS = [
   'matchTimeDriftMs',
   'scheduleChangedVsMatchTime',
+  'earliestMatchTimeDriftMs',
+  'scheduleChangedVsEarliestMatchTime',
   'closeAfterStart',
   'valueCapturedAfterLock',
   'valueCapturedAfterMatchTime',
@@ -345,11 +406,41 @@ export function deriveCloseScheduleAuditFields(
         'refusing an unclassifiable snapshot',
     );
   }
+  // THE FLOOR COMPARISON IS ADDITIVE — it does not touch driftMs, `changed`,
+  // or the verdict. Every existing number in this artifact keeps its exact
+  // meaning; the floor is published beside them, not in place of them.
+  //
+  // A null floor propagates as null rather than refusing the snapshot, which is
+  // the one place this differs from `gameMatchTime` above. `match_time` is
+  // NOT NULL and a close cannot exist without one, so an unparseable value
+  // there is corruption. The floor is legitimately nullable, so absence is an
+  // ordinary state and must not abort an otherwise-classifiable audit.
+  let earliestDriftMs: number | null = null;
+  let changedVsEarliest: boolean | null = null;
+  if (evidence.gameEarliestMatchTime !== null) {
+    earliestDriftMs = scheduleDriftMs(evidence.lockTime, evidence.gameEarliestMatchTime);
+    if (earliestDriftMs === null) {
+      throw new ScheduleAuditError(
+        `${where} has an unparseable games.earliest_match_time ` +
+          `("${evidence.gameEarliestMatchTime}") — refusing an unclassifiable snapshot`,
+      );
+    }
+    changedVsEarliest = isScheduleChanged(earliestDriftMs, toleranceMs);
+    if (changedVsEarliest === null) {
+      throw new ScheduleAuditError(
+        `${where} produced an undeterminable floor schedule verdict — ` +
+          'refusing an unclassifiable snapshot',
+      );
+    }
+  }
+
   const postStart = closeAfterStart(timing);
   const notFresh = evidence.confidence !== 'fresh';
   return {
     matchTimeDriftMs: driftMs,
     scheduleChangedVsMatchTime: changed,
+    earliestMatchTimeDriftMs: earliestDriftMs,
+    scheduleChangedVsEarliestMatchTime: changedVsEarliest,
     closeAfterStart: postStart,
     valueCapturedAfterLock: closeValueAfterLock(timing),
     valueCapturedAfterMatchTime: afterStrict(
@@ -367,6 +458,24 @@ export function deriveCloseScheduleAuditFields(
   };
 }
 
+/**
+ * Do the two schedule references DISAGREE about this close?
+ *
+ * ONE definition, used by the writer's counter and the reader's re-check, for
+ * the same reason `deriveCloseScheduleAuditFields` is shared: two copies could
+ * drift and the verification would then be checking a copy of the bug.
+ *
+ * A row with no floor is NOT a disagreement — nothing was established to
+ * disagree with.
+ */
+export function scheduleVerdictsDisagree(record: {
+  scheduleChangedVsMatchTime: boolean;
+  scheduleChangedVsEarliestMatchTime: boolean | null;
+}): boolean {
+  if (record.scheduleChangedVsEarliestMatchTime === null) return false;
+  return record.scheduleChangedVsMatchTime !== record.scheduleChangedVsEarliestMatchTime;
+}
+
 export function closeScheduleAuditRecord(
   close: ClosingLineRow,
   game: GamesTableRow,
@@ -381,6 +490,7 @@ export function closeScheduleAuditRecord(
     lastPolledAt: close.last_polled_at,
     pollGapSeconds: close.poll_gap_seconds,
     gameMatchTime: game.match_time,
+    gameEarliestMatchTime: game.earliest_match_time,
   };
   return {
     recordType: 'close_schedule_audit',
@@ -585,6 +695,27 @@ export function parseCloseScheduleAuditDataset(text: string): CloseScheduleAudit
       meta.scheduleChangedVsMatchTimeAny,
       records.filter((r) => r.scheduleChangedVsMatchTime).length,
     ],
+    [
+      'scheduleChangedVsEarliestMatchTimeAny',
+      meta.scheduleChangedVsEarliestMatchTimeAny,
+      // `=== true` states the intent: this counts ESTABLISHED changes, and a
+      // null is "not established" rather than "unchanged". For `boolean|null`
+      // a truthiness filter yields the same number, so this is explicitness
+      // rather than a behavioural guard — the guard that does carry weight is
+      // `earliestMatchTimeNull`, which publishes the denominator so the count
+      // cannot be read as if every row had been compared.
+      records.filter((r) => r.scheduleChangedVsEarliestMatchTime === true).length,
+    ],
+    [
+      'earliestMatchTimeNull',
+      meta.earliestMatchTimeNull,
+      records.filter((r) => r.gameEarliestMatchTime === null).length,
+    ],
+    [
+      'scheduleVerdictsDisagree',
+      meta.scheduleVerdictsDisagree,
+      records.filter(scheduleVerdictsDisagree).length,
+    ],
     ['notFreshAny', meta.notFreshAny, records.filter((r) => r.confidence !== 'fresh').length],
     ['pollGapNull', meta.pollGapNull, records.filter((r) => r.pollGapSeconds === null).length],
     [
@@ -774,6 +905,13 @@ export function closeScheduleAuditMeta(options: {
     valueCapturedAfterMatchTimeAny: records.filter((r) => r.valueCapturedAfterMatchTime).length,
     lockEarlierThanMatchTime: records.filter((r) => r.matchTimeDriftMs < 0).length,
     lockLaterThanMatchTime: records.filter((r) => r.matchTimeDriftMs > 0).length,
+    // `=== true` states the intent — established changes only. See the
+    // reader's matching re-check for why this is explicitness, not a guard.
+    scheduleChangedVsEarliestMatchTimeAny: records.filter(
+      (r) => r.scheduleChangedVsEarliestMatchTime === true,
+    ).length,
+    earliestMatchTimeNull: records.filter((r) => r.gameEarliestMatchTime === null).length,
+    scheduleVerdictsDisagree: records.filter(scheduleVerdictsDisagree).length,
     confidence: rederivedAuditConfidence(records),
     markets: rederivedAuditMarkets(records),
     postStartPollBySport: rederivedPostStartBySport(records),

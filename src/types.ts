@@ -199,6 +199,16 @@ export interface GamesTableRow {
   jsonodds_id: string;
   sport: string;
   match_time: string;
+  /**
+   * The MONOTONE FLOOR on `match_time` — the earliest start this game was ever
+   * recorded with. Maintained DB-side by a trigger; no write that names
+   * `match_time` can raise it, so unlike `match_time` it never moves later.
+   *
+   * Nullable: rows written before the floor existed, and any row whose floor
+   * has not been established, carry null. A consumer must treat null as "no
+   * floor known" rather than substituting `match_time`.
+   */
+  earliest_match_time: string | null;
   status: string;
   home_score: number | null;
   away_score: number | null;

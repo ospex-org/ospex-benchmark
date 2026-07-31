@@ -74,6 +74,10 @@ function gameRow(overrides: Partial<GamesTableRow> = {}): GamesTableRow {
     jsonodds_id: GAME,
     sport: 'mlb',
     match_time: MATCH_TIME,
+    // Floor equal to match_time — the steady state on live production
+    // (1222 of 1223 rows). Cases that need a held earlier floor, or none at
+    // all, override it explicitly.
+    earliest_match_time: MATCH_TIME,
     status: 'upcoming',
     home_score: 4,
     away_score: 3,
@@ -96,6 +100,128 @@ test('a healthy, same-schedule close classifies clean', () => {
   assert.equal(record.valueCapturedAfterLock, false);
   assert.equal(record.valueCapturedAfterMatchTime, false);
   assert.equal(record.sport, 'mlb');
+});
+
+// ── the monotone floor as a SECOND reference (ospex-indexer#62 section 2) ────
+
+test('the floor comparison is reported ALONGSIDE match_time, and agrees when nothing moved', () => {
+  const record = closeScheduleAuditRecord(closeRow(), gameRow());
+  assert.equal(record.gameEarliestMatchTime, MATCH_TIME);
+  assert.equal(record.earliestMatchTimeDriftMs, 0);
+  assert.equal(record.scheduleChangedVsEarliestMatchTime, false);
+  // ADDITIVE: the pre-existing fields keep their exact meaning.
+  assert.equal(record.matchTimeDriftMs, 0);
+  assert.equal(record.scheduleChangedVsMatchTime, false);
+  assert.equal(record.verdict, 'clean');
+});
+
+test('a ROLLBACK makes the two references disagree — that is the case the floor exists for', () => {
+  // The sequence the floor was added for. A close is captured while the feed
+  // says 19:10 (an accepted move-up), so lock_time is 19:10. The feed then
+  // walks the start back up to 20:10. `match_time` is mutable and follows;
+  // the floor cannot rise, so it holds 19:10.
+  const early = '2026-07-12T19:10:00+00:00';
+  const record = closeScheduleAuditRecord(
+    closeRow({ lock_time: early, value_captured_at: '2026-07-12T18:59:41+00:00', last_polled_at: '2026-07-12T19:09:41+00:00' }),
+    gameRow({ match_time: MATCH_TIME, earliest_match_time: early }),
+  );
+
+  // Against the MUTABLE row: an hour of apparent drift, so the close looks
+  // mis-anchored even though it matched exactly when it was written.
+  assert.equal(record.matchTimeDriftMs, -3_600_000);
+  assert.equal(record.scheduleChangedVsMatchTime, true);
+
+  // Against the FLOOR: zero drift. The close was anchored to a start we did
+  // actually believe, and a rollback cannot manufacture a mismatch.
+  assert.equal(record.earliestMatchTimeDriftMs, 0);
+  assert.equal(record.scheduleChangedVsEarliestMatchTime, false);
+
+  // NEGATIVE CONTROL — the two references are not always in conflict. A close
+  // anchored to the CURRENT row while the floor sits an hour earlier is a real
+  // mismatch against the floor and a clean match against the row: the
+  // disagreement points the other way, so neither reference is simply
+  // "stricter" than the other.
+  const opposite = closeScheduleAuditRecord(
+    closeRow(),
+    gameRow({ match_time: MATCH_TIME, earliest_match_time: early }),
+  );
+  assert.equal(opposite.scheduleChangedVsMatchTime, false);
+  assert.equal(opposite.scheduleChangedVsEarliestMatchTime, true);
+  assert.equal(opposite.earliestMatchTimeDriftMs, 3_600_000);
+});
+
+test('a NULL floor is not established, and is never read as zero drift or as agreement', () => {
+  const record = closeScheduleAuditRecord(closeRow(), gameRow({ earliest_match_time: null }));
+  assert.equal(record.gameEarliestMatchTime, null);
+  assert.equal(record.earliestMatchTimeDriftMs, null, 'null, NOT 0 — nothing was compared');
+  assert.equal(record.scheduleChangedVsEarliestMatchTime, null, 'null, NOT false');
+  // A missing floor must not abort the audit the way an unparseable
+  // match_time does: match_time is NOT NULL upstream so a bad value there is
+  // corruption, while the floor is legitimately nullable.
+  assert.equal(record.verdict, 'clean');
+  assert.equal(record.matchTimeDriftMs, 0);
+
+  const built = buildCloseScheduleAudit({
+    network: 'polygon',
+    toleranceMs: SCHEDULE_CHANGE_TOLERANCE_MS,
+    closes: [closeRow()],
+    games: [gameRow({ earliest_match_time: null })],
+    generatedAt: '2026-07-29T00:00:00.000Z',
+  });
+  assert.equal(built.meta.earliestMatchTimeNull, 1);
+  assert.equal(built.meta.scheduleChangedVsEarliestMatchTimeAny, 0);
+  assert.equal(
+    built.meta.scheduleVerdictsDisagree,
+    0,
+    'an unestablished comparison cannot disagree with anything',
+  );
+});
+
+test('the disagreement counter counts rows where the two references tell different stories', () => {
+  const early = '2026-07-12T19:10:00+00:00';
+  const built = buildCloseScheduleAudit({
+    network: 'polygon',
+    toleranceMs: SCHEDULE_CHANGE_TOLERANCE_MS,
+    closes: [
+      closeRow(),
+      closeRow({ market: 'moneyline', jsonodds_id: 'c0a2f8f0-0000-0000-0000-000000000002' }),
+      closeRow({ market: 'spread', jsonodds_id: 'c0a2f8f0-0000-0000-0000-000000000003' }),
+    ],
+    games: [
+      // agrees: floor tracks the row
+      gameRow(),
+      // disagrees: floor an hour below a row the lock matches
+      gameRow({ jsonodds_id: 'c0a2f8f0-0000-0000-0000-000000000002', earliest_match_time: early }),
+      // not established
+      gameRow({ jsonodds_id: 'c0a2f8f0-0000-0000-0000-000000000003', earliest_match_time: null }),
+    ],
+    generatedAt: '2026-07-29T00:00:00.000Z',
+  });
+  assert.equal(built.meta.records, 3);
+  assert.equal(built.meta.scheduleVerdictsDisagree, 1);
+  assert.equal(built.meta.scheduleChangedVsEarliestMatchTimeAny, 1);
+  assert.equal(built.meta.earliestMatchTimeNull, 1);
+  // The match_time figure is UNCHANGED by any of this — the floor is published
+  // beside it, not in place of it.
+  assert.equal(built.meta.scheduleChangedVsMatchTimeAny, 0);
+
+  // The reader recomputes all three from the records.
+  const text = [built.meta, ...built.records].map((r) => JSON.stringify(r)).join('\n');
+  assert.doesNotThrow(() => parseCloseScheduleAuditDataset(text));
+});
+
+test('an unparseable floor REFUSES the snapshot rather than degrading to "not established"', () => {
+  // Null means "no floor recorded". A floor that is PRESENT but unreadable is
+  // corruption, and silently treating it as null would let a broken value be
+  // published as an honest absence.
+  assert.throws(
+    () => closeScheduleAuditRecord(closeRow(), gameRow({ earliest_match_time: 'not-a-timestamp' })),
+    /unparseable games\.earliest_match_time/,
+  );
+  // NEGATIVE CONTROL: a genuine null is still accepted.
+  assert.doesNotThrow(() =>
+    closeScheduleAuditRecord(closeRow(), gameRow({ earliest_match_time: null })),
+  );
 });
 
 test('a negative poll gap classifies post_start_poll and carries the raw evidence', () => {
@@ -532,6 +658,17 @@ test('the reader RECOMPUTES every judged field and refuses one that contradicts 
     [
       'scheduleChangedVsMatchTime',
       (r) => ({ ...r, scheduleChangedVsMatchTime: !r.scheduleChangedVsMatchTime }),
+    ],
+    [
+      'earliestMatchTimeDriftMs',
+      (r) => ({ ...r, earliestMatchTimeDriftMs: (r.earliestMatchTimeDriftMs ?? 0) + 999_999 }),
+    ],
+    [
+      'scheduleChangedVsEarliestMatchTime',
+      (r) => ({
+        ...r,
+        scheduleChangedVsEarliestMatchTime: !(r.scheduleChangedVsEarliestMatchTime ?? false),
+      }),
     ],
     ['closeAfterStart', (r) => ({ ...r, closeAfterStart: !r.closeAfterStart })],
     ['valueCapturedAfterLock', (r) => ({ ...r, valueCapturedAfterLock: !r.valueCapturedAfterLock })],

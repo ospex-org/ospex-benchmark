@@ -4,8 +4,10 @@ import {
   fetchClosingLines,
   fetchClosingLinesByMarket,
   fetchTotalsClosingLines,
+  GAMES_TABLE_SELECT,
   keysetWalk,
 } from './fetchers.js';
+import { gamesTableRowSchema, parseGamesTableRows } from './wire.js';
 
 /**
  * Keyset-pagination invariants. The fake below emulates PostgREST semantics
@@ -401,4 +403,42 @@ test('a LOW id that commits after the cursor has passed it is MISSED — the wal
     [50, 51, 52, 53],
     'the delayed row is committed by the end of the walk',
   );
+});
+
+test('the games projection asks for exactly the columns the schema requires', () => {
+  // THE FIXTURE BLIND SPOT THIS CLOSES. Every games-row test in this repo
+  // constructs a `GamesTableRow` object directly, so none of them travel this
+  // wire — dropping a column from the select is invisible to all of them and
+  // would surface only as a production parse failure. Binding the projection
+  // to the schema's own required keys makes either side going stale a test
+  // failure here.
+  const required = Object.keys(gamesTableRowSchema.shape).sort();
+  const selected = GAMES_TABLE_SELECT.split(',').sort();
+  assert.deepEqual(
+    selected,
+    required,
+    'the PostgREST select and gamesTableRowSchema disagree about the games columns',
+  );
+
+  // Fail-closed, not fail-quiet: a row missing a required column is REFUSED at
+  // parse rather than yielding an object with an undefined field.
+  const { earliest_match_time: _dropped, ...withoutFloor } = {
+    network: 'polygon',
+    jsonodds_id: 'c0a2f8f0-0000-0000-0000-000000000001',
+    sport: 'mlb',
+    match_time: '2026-07-12T20:10:00+00:00',
+    earliest_match_time: '2026-07-12T20:10:00+00:00',
+    status: 'upcoming',
+    home_score: null,
+    away_score: null,
+    final_type: null,
+    score_captured: false,
+  };
+  assert.throws(() => parseGamesTableRows([withoutFloor]), /earliest_match_time/);
+  // NEGATIVE CONTROLS: the complete row parses, and an explicit null floor is
+  // a legitimate value rather than a missing one.
+  assert.doesNotThrow(() =>
+    parseGamesTableRows([{ ...withoutFloor, earliest_match_time: '2026-07-12T20:10:00+00:00' }]),
+  );
+  assert.doesNotThrow(() => parseGamesTableRows([{ ...withoutFloor, earliest_match_time: null }]));
 });
