@@ -232,9 +232,18 @@ export async function runScoreCli(
  * Without the guard, importing the module to test `runScoreCli` would also run
  * a real scoring pass on `process.argv` at import time. `yarn score` is
  * unaffected — it invokes this file directly, so the comparison holds and the
- * CLI still runs on import-as-entry exactly as before. `scoring.test.ts` pins
- * both halves: that importing the module does NOT run a pass, and that
- * `yarn score` still reaches the summary block.
+ * CLI still runs on import-as-entry exactly as before.
+ *
+ * BOTH FAILURE DIRECTIONS ARE PINNED, BY DIFFERENT INSTRUMENTS — they have to
+ * be, because neither test can see the other's case:
+ *   always TRUE  → `scoring.test.ts` asserts that importing this module sets no
+ *                  exit code, i.e. does not run a pass.
+ *   always FALSE → `cli.integration.test.ts` spawns the entrypoint named by
+ *                  package.json's `score` script and requires it to refuse with
+ *                  exit 2 plus usage. An in-process test CANNOT catch this: it
+ *                  calls the exported `runScoreCli` directly and never reaches
+ *                  the guard, so `if (false)` leaves the suite fully green while
+ *                  `yarn score` silently does nothing.
  */
 const entry = process.argv[1];
 if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {

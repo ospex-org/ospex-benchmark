@@ -3021,10 +3021,17 @@ test('B2: a MIXED zero reports each subset separately and never gives run-level 
  * removed — left the well-tested helpers untouched, and the whole suite still
  * passed 1139/1139. Helper coverage cannot see the bug return at the call site.
  *
- * So this drives the REAL `runScoreCli` end to end. Only the network read and
- * the two output sinks are injected; argument parsing, the run-file read,
- * integrity verification, the ladder load, scoring, aggregation, the artifact
+ * So this drives the REAL `runScoreCli` end to end. Four things are injected —
+ * the network read, the two output sinks, and WHICH frozen arm manifest
+ * integrity verifies against (never whether it verifies; production keeps
+ * `defaultExpectedArms()`). Argument parsing, the run-file read, integrity
+ * verification itself, the ladder load, scoring, aggregation, the artifact
  * writes and the summary block are all the production code paths.
+ *
+ * SCOPE, stated because a neighbouring comment was once too strong: this
+ * exercises `runScoreCli`, NOT the process entry point. That the entrypoint
+ * still self-executes at all is a separate child-process test in
+ * `cli.integration.test.ts` — an always-false entry guard is invisible here.
  *
  * The fixture is chosen so the two predicates DISAGREE — every pick that
  * carries a CLV is schedule-tagged, so the strict count is 0 while the loose
