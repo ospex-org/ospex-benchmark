@@ -2785,3 +2785,46 @@ test('closesByKey REFUSES a duplicate rather than silently keeping the last row 
   // NEGATIVE CONTROL: distinct (game, market) pairs still index.
   assert.equal(closesByKey([a, closeRow(GAME_A, 'moneyline')]).size, 2);
 });
+
+test('a bundle start with no explicit offset REJECTS the run at parse', () => {
+  // The reference the schedule-drift comparison is taken against. An
+  // offset-less value would be read as host-local by a bare `Date.parse`, and
+  // refusing it only downstream would leave the pick inside the primary
+  // stratum carrying `scheduleChanged === null` — fail-closed parsing followed
+  // by fail-open aggregation. It is refused where it enters instead.
+  const { lines } = fixtureRun();
+  // Target the JSON key, not the bare value: `cutoffAt` carries the same
+  // instant and appears first, so a value-only replace would edit that and
+  // leave the bundle field untouched — the test would then pass for no reason.
+  const broken = lines.map((line) =>
+    line.replace(
+      `"scheduledStartUtc":"${FIXTURE_START_UTC[GAME_A] as string}"`,
+      '"scheduledStartUtc":"2026-07-12T16:15:00"',
+    ),
+  );
+  assert.notDeepEqual(broken, lines, 'fixture premise: the bundle start appears in the run file');
+  assert.throws(() => parseRunRecords(broken), /scheduledStartUtc|offset/i);
+  // NEGATIVE CONTROL: the untouched fixture still parses.
+  assert.doesNotThrow(() => parseRunRecords(lines));
+});
+
+test('a SCORED pick whose schedule comparison is undeterminable cannot enter the primary stratum', () => {
+  // `null` still means "no determinable comparison". For a pick with no close
+  // that is the honest status quo and it stays in — it contributes no value to
+  // the estimate either way. But a pick that produced a CLV while its schedule
+  // verdict is unknown would join the same-schedule estimate on a comparison
+  // nobody established.
+  assert.equal(
+    inPrimaryStratum(syntheticScored(GAME_A, 4.2, { scheduleChanged: null, scheduleDriftMs: null })),
+    false,
+    'scored + undeterminable is held out',
+  );
+  assert.equal(
+    inPrimaryStratum(syntheticScored(GAME_A, null, { scheduleChanged: null, scheduleDriftMs: null })),
+    true,
+    'UNSCORED + undeterminable stays in — it withholds nothing',
+  );
+  // NEGATIVE CONTROLS: the ordinary strata are unchanged.
+  assert.equal(inPrimaryStratum(syntheticScored(GAME_A, 4.2, { scheduleChanged: false })), true);
+  assert.equal(inPrimaryStratum(syntheticScored(GAME_A, 4.2, { scheduleChanged: true })), false);
+});

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  assertNonEmptyCorpus,
+  AUDIT_COMPLETENESS_DISCLOSURE,
+  AUDIT_ENUMERATION_SEMANTICS,
   buildCloseScheduleAudit,
   CLOSE_AUDIT_VERDICTS,
   closeScheduleAuditMeta,
@@ -163,10 +166,30 @@ test('a value captured after the lock or after the schedule row is flagged, not 
   );
   assert.equal(late.valueCapturedAfterLock, true);
   assert.equal(late.valueCapturedAfterMatchTime, true);
-  // A null capture instant is not "after" anything.
-  const none = closeScheduleAuditRecord(closeRow({ value_captured_at: null }), gameRow());
+  // A null capture instant is not "after" anything — but it is only legitimate
+  // on a NON-fresh row now: a fresh close claiming no capture instant is
+  // refused as unusable rather than classified.
+  const none = closeScheduleAuditRecord(
+    closeRow({ value_captured_at: null, confidence: 'stale' }),
+    gameRow(),
+  );
   assert.equal(none.valueCapturedAfterLock, false);
   assert.equal(none.valueCapturedAfterMatchTime, false);
+  assert.throws(
+    () => closeScheduleAuditRecord(closeRow({ value_captured_at: null }), gameRow()),
+    /fresh close must carry complete timing evidence/,
+    'a FRESH row with no capture instant refuses the snapshot',
+  );
+
+  // STRICT boundary: the poll-gap rounding tolerance does not reach the
+  // value-capture comparison. One millisecond past the lock is past the lock.
+  const atLock = closeScheduleAuditRecord(closeRow({ value_captured_at: MATCH_TIME }), gameRow());
+  assert.equal(atLock.valueCapturedAfterLock, false, 'exactly at the lock is at the cutoff');
+  const oneMsPast = closeScheduleAuditRecord(
+    closeRow({ value_captured_at: new Date(Date.parse(MATCH_TIME) + 1).toISOString() }),
+    gameRow(),
+  );
+  assert.equal(oneMsPast.valueCapturedAfterLock, true, 'one millisecond past is refused');
 });
 
 test('an unparseable timestamp REFUSES the row rather than reading as zero drift', () => {
@@ -476,13 +499,17 @@ test('provenance travels WITH each record, and meta names the feed', () => {
 });
 
 test('the reader refuses a record whose provenance disagrees with the meta it sits under', () => {
-  for (const [field, value, pattern] of [
-    ['network', 'amoy', /is on network "amoy" but the dataset claims "polygon"/],
-    ['source', 'rundown', /came from source "rundown" but the dataset claims "jsonodds"/],
-  ] as const) {
-    const mutated = SAMPLE.map((r, i) => (i === 1 ? { ...r, [field]: value } : r));
-    assert.throws(() => parseCloseScheduleAuditDataset(dataset(mutated)), pattern, field);
-  }
+  // `network` is a free string bound only by record-vs-meta agreement, so the
+  // cross-check is what catches it and the message names both sides.
+  const wrongNetwork = SAMPLE.map((r, i) => (i === 1 ? { ...r, network: 'amoy' } : r));
+  assert.throws(
+    () => parseCloseScheduleAuditDataset(dataset(wrongNetwork)),
+    /is on network "amoy" but the dataset claims "polygon"/,
+  );
+  // `source` is bound to the canonical literal, so a single rebranded record
+  // is refused earlier still — at schema parse, before any cross-check.
+  const wrongSource = SAMPLE.map((r, i) => (i === 1 ? { ...r, source: 'rundown' } : r));
+  assert.throws(() => parseCloseScheduleAuditDataset(dataset(wrongSource as typeof SAMPLE)));
 });
 
 test('the reader RECOMPUTES every judged field and refuses one that contradicts its own evidence', () => {
@@ -539,4 +566,69 @@ test('a META-ONLY dataset refuses rather than reading as a clean corpus', () => 
   assert.throws(() => parseCloseScheduleAuditDataset(''), /empty/);
   // NEGATIVE CONTROL: one record is a corpus.
   assert.doesNotThrow(() => parseCloseScheduleAuditDataset(dataset([SAMPLE[0]!])));
+});
+
+test('a GLOBALLY rebranded artifact is rejected, not just a record that disagrees with its meta', () => {
+  // Record-vs-meta agreement alone was not enough: rewriting meta AND every
+  // record together to another feed produced an internally consistent artifact
+  // that validated cleanly and described a corpus the benchmark never scores.
+  // The format is bound to the canonical source, so the rewrite is unparseable.
+  const text = dataset(SAMPLE);
+  const rebranded = text
+    .split('\n')
+    .map((line) => line.replace(/"jsonodds"/g, '"rundown"'))
+    .join('\n');
+  assert.ok(rebranded.includes('"rundown"'), 'fixture premise: the rewrite applied');
+  assert.ok(!rebranded.includes('"jsonodds"'), 'fixture premise: no canonical value left');
+  // Refused at schema parse — the format itself is bound to the canonical
+  // source, so there is no internally-consistent rewrite that survives.
+  assert.throws(() => parseCloseScheduleAuditDataset(rebranded));
+  // NEGATIVE CONTROL: the canonical artifact still parses.
+  assert.doesNotThrow(() => parseCloseScheduleAuditDataset(text));
+});
+
+// ── B3: the enumeration describes itself, and an empty corpus refuses ─────────
+
+test('every artifact stamps its enumeration semantics, and the reader requires them', () => {
+  // A retained NDJSON is read without the console output that produced it, so
+  // the limitation has to travel IN the file. Without this a reader sees
+  // authoritative-looking counts and no indication the walk cannot prove it
+  // observed every committed row.
+  const built = build([closeRow()], [gameRow()]);
+  assert.equal(built.meta.enumerationSemantics, AUDIT_ENUMERATION_SEMANTICS);
+  assert.equal(built.meta.enumerationSemantics, 'keyset-lower-bound-non-snapshot-v1');
+  assert.doesNotThrow(() => parseCloseScheduleAuditDataset(dataset(SAMPLE)));
+
+  // Re-describing the corpus as complete makes the artifact unparseable.
+  for (const claim of ['keyset-complete', 'complete', 'census']) {
+    const rebranded = dataset(SAMPLE).replace(AUDIT_ENUMERATION_SEMANTICS, claim);
+    assert.ok(rebranded.includes(claim), `fixture premise: ${claim}`);
+    assert.throws(() => parseCloseScheduleAuditDataset(rebranded), Error, claim);
+  }
+});
+
+test('the public completeness disclosure says lower bound and non-snapshot, and never says complete', () => {
+  // Pins the operator-facing wording. Quietly reverting it to a completeness
+  // claim would otherwise be invisible: it is the only place a reader of the
+  // console output learns the counts are a bound.
+  const text = AUDIT_COMPLETENESS_DISCLOSURE;
+  assert.match(text, /lower bound/i);
+  assert.match(text, /non-snapshot/i);
+  assert.match(text, /commit/i, 'names the mechanism, not just the conclusion');
+  assert.doesNotMatch(text, /keyset-complete/);
+  assert.ok(
+    text.includes(AUDIT_ENUMERATION_SEMANTICS),
+    'the console disclosure and the artifact field name the same semantics',
+  );
+});
+
+test('an empty corpus refuses BEFORE anything is written', () => {
+  // The CLI guard, exported as a pure helper so it is testable without
+  // running the CLI (auditCloses.ts executes main() on import).
+  assert.throws(
+    () => assertNonEmptyCorpus(0, 'polygon'),
+    /refusing to certify an empty corpus/,
+  );
+  // NEGATIVE CONTROL: a corpus with rows proceeds.
+  assert.doesNotThrow(() => assertNonEmptyCorpus(1, 'polygon'));
 });

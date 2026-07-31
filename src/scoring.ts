@@ -4,7 +4,7 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { PROPORTIONAL_DEVIG_METHOD, scoreDecision, SHIN_DEVIG_METHOD } from './clv.js';
 import { favorableLineMovement } from './clv.js';
 import { LADDER_VERSION, scoreTotalsLadder } from './ladder.js';
-import { instantMs } from './time.js';
+import { instantMs, isParseableInstant } from './time.js';
 import { checkProviderCollision } from './providers/family.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
@@ -134,7 +134,20 @@ const bundleGameSchema = z
         league: z.string().min(1),
         awayTeam: z.string().min(1),
         homeTeam: z.string().min(1),
-        scheduledStartUtc: z.string().min(1),
+        // The REFERENCE the scorer's schedule-drift comparison is taken
+        // against. Validated as an offset-qualified instant at parse, so an
+        // undeterminable drift can never originate here: a bare `Date.parse`
+        // would read an offset-less value as host-local time, and refusing it
+        // downstream instead would leave the pick in the primary stratum with
+        // `scheduleChanged === null` — fail-closed parsing followed by
+        // fail-open aggregation.
+        scheduledStartUtc: z
+          .string()
+          .min(1)
+          .refine(isParseableInstant, {
+            message:
+              'scheduledStartUtc must be an ISO-8601 instant with an explicit offset (Z or +/-hh:mm)',
+          }),
         markets: z
           .object({
             // A recorded bundle supplies 1-3 of the KNOWN markets (moneyline,
@@ -1450,7 +1463,20 @@ export function isScheduleChanged(
  * a timing check.
  */
 export function inPrimaryStratum(pick: ScoredPick): boolean {
-  return pick.scheduleChanged !== true;
+  if (pick.scheduleChanged === true) return false;
+  // A pick carrying a SCORE whose schedule comparison is undeterminable is
+  // held out too. `null` still means "no determinable comparison", and for a
+  // pick with no close that is the honest status quo — it contributes no value
+  // to the estimate either way, and counting it as tagged would misreport
+  // coverage. But a pick that produced a CLV while its schedule verdict is
+  // unknown would enter the same-schedule estimate on a comparison nobody
+  // established: fail-closed parsing followed by fail-open aggregation.
+  //
+  // With `scheduledStartUtc` validated at parse and an unparseable `lock_time`
+  // refused as `close_timing_unusable`, this state is unreachable — the guard
+  // exists so that reachability is enforced rather than assumed.
+  if (pick.scheduleChanged === null && pick.result.primaryClvPct !== null) return false;
+  return true;
 }
 
 /**
@@ -1599,6 +1625,20 @@ export function scoreRun(
     // actually saw, not against any later reading — the question is whether
     // the schedule moved between the decision and the close capture.
     const drift = close === null ? null : scheduleDriftMs(close.lock_time, game.startUtc);
+    // An undeterminable drift on a pick that still SCORED would enter the
+    // same-schedule estimate on a comparison nothing established. Two inputs
+    // can make it undeterminable and both are already closed: the reference
+    // (`game.startUtc`) is validated as an offset-qualified instant at parse,
+    // and an unparseable `close.lock_time` is refused per-pick as
+    // `close_timing_unusable` — which is the graceful path, so it must NOT be
+    // escalated to a whole-run rejection here. What remains is the impossible
+    // combination, and it is asserted rather than assumed away.
+    if (drift === null && close !== null && exactLine.primaryClvPct !== null) {
+      throw new Error(
+        `pick ${pick.gameId}:${pick.market} scored with an undeterminable schedule comparison ` +
+          `(lock_time "${close.lock_time}" vs bundle start "${game.startUtc}") — refusing the run`,
+      );
+    }
     return {
       ...pick,
       side,
@@ -2175,11 +2215,11 @@ export function scoredRecords(
       integerLinePrimary:
         'unavailable (push-excluded conditional CLV separately labeled, both metrics); the TOTALS_V1 candidate ladder reports the generalized push-aware value as separately labeled sensitivity output, pending validation',
       timingEvidenceRequired:
-        'refused (close_timing_unusable): every timing verdict below is derived from the row’s own instants, parsed strictly — a timestamp carrying no explicit UTC offset is REJECTED rather than read as host-local time. A row whose stored poll_gap_seconds contradicts its own lock_time and last_polled_at by more than the second-granularity tolerance, or whose instants cannot be parsed, establishes nothing and is refused as a named, counted close-quality reason rather than being scored on a verdict nothing supports. Shared with the totals ladder',
+        'refused (close_timing_unusable): every timing verdict below is derived from the row’s own instants, parsed strictly — a timestamp carrying no explicit UTC offset is REJECTED rather than read as host-local time. A row whose stored poll_gap_seconds contradicts its own lock_time and last_polled_at by more than the second-granularity tolerance, whose instants cannot be parsed, or which claims fresh confidence while missing any of value_captured_at / last_polled_at / poll_gap_seconds, establishes nothing and is refused as a named, counted close-quality reason rather than being scored on a verdict nothing supports. Shared with the totals ladder',
       closeAfterStart:
-        'refused (close_after_start): a close whose market the feed was still quoting AFTER the row’s own recorded lock has an unestablished pre-game status and is not evidence for any metric, on either side, for any participant. Derived from last_polled_at vs lock_time — NOT from the stored gap, which is a derived value a corrupt row can contradict. Shared with the totals ladder. This is a CONSERVATIVE refusal on ambiguous evidence, not a proof of contamination: at least three readings fit a post-lock poll (the recorded start was early and the value is a genuine pre-game price; the feed quotes in-play; or the feed had simply not yet dropped the finished/started game from its live snapshot), and the row alone cannot separate them',
+        'refused (close_after_start): a close whose market the feed was still quoting at least 1000ms AFTER the row’s own recorded lock (the tolerance absorbs the integer-second granularity of the stored gap and nothing more) has an unestablished pre-game status and is not evidence for any metric, on either side, for any participant. Derived from last_polled_at vs lock_time — NOT from the stored gap, which is a derived value a corrupt row can contradict. Shared with the totals ladder. This is a CONSERVATIVE refusal on ambiguous evidence, not a proof of contamination: at least three readings fit a post-lock poll (the recorded start was early and the value is a genuine pre-game price; the feed quotes in-play; or the feed had simply not yet dropped the finished/started game from its live snapshot), and the row alone cannot separate them',
       closeValueAfterLock:
-        'refused (close_value_after_lock): the quoted VALUE was recorded past the row’s own cutoff. Distinct from close_after_start, which asks whether the feed was still LISTING the market. Measured at 0 of 3609 rows on the captured corpus, so this gate is expected to be inert — it exists so the claim stays measured rather than assumed',
+        'refused (close_value_after_lock): the quoted VALUE was recorded past the row’s own cutoff. STRICT, with NO tolerance — value_captured_at is a direct timestamp, not an integer-second derived value, so exactly at the lock passes and one millisecond past it refuses. Distinct from close_after_start, which asks whether the feed was still LISTING the market. Measured at 0 of 3609 rows on the captured corpus, so this gate is expected to be inert — it exists so the claim stays measured rather than assumed',
       scheduleChangeToleranceMs: SCHEDULE_CHANGE_TOLERANCE_MS,
       scheduleChanged:
         'STRATUM TAG, not a refusal: abs(close lock_time − frozen bundle scheduledStartUtc) >= scheduleChangeToleranceMs. CLV is computed and recorded in full, and the pick stays in every coverage denominator, but it is held out of the primary same-schedule estimate, republished as its own reschedule-sensitivity stratum, and counted as scheduleChangedTagged (every tagged pick) and scheduleChangedExcluded (the tagged picks that carried a value, i.e. what the tag actually removed from the estimate)',

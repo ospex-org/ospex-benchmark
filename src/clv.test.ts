@@ -206,9 +206,12 @@ test('close_after_start sweeps the sign boundary and leaves a null gap to the fr
   assert.equal(at(1), null);
   assert.equal(at(-9700), 'close_after_start', 'the largest negative gap in the live corpus');
   assert.equal(at(89416), null, 'a hugely POSITIVE gap is the freshness gate’s business, not this one');
-  // A null gap means the market was never seen in the snapshot at all —
-  // upstream downgrades that to `stale`, and this gate must not claim it.
-  assert.equal(at(null), null);
+  // A null gap on a FRESH close is now a refusal, not a pass. `fresh` claims
+  // the capture observed this market at a known instant, so a fresh row with
+  // no poll timing contradicts its own confidence — and this previously
+  // scored a full CLV with `unscoredReason: null` on the unverified
+  // assumption that upstream would have downgraded it to stale.
+  assert.equal(at(null), 'close_timing_unusable');
   assert.equal(
     scoreDecision(
       'moneyline',
@@ -321,7 +324,13 @@ test('closeAfterStart is derived from the raw instants, exported so consumers ca
   assert.equal(closeAfterStart(timing({ pollGapSeconds: -1 })), true);
   assert.equal(closeAfterStart(timing({ pollGapSeconds: 0 })), false);
   assert.equal(closeAfterStart(timing({ pollGapSeconds: 1 })), false);
-  assert.equal(closeAfterStart(timing({ pollGapSeconds: null })), false);
+  // A null gap is "market never seen" — legitimate only on a non-fresh row,
+  // which its own reason already refuses. On a fresh row it is now unusable.
+  assert.equal(
+    closeAfterStart(timing({ pollGapSeconds: null, confidence: 'stale' })),
+    false,
+  );
+  assert.equal(timing({ pollGapSeconds: null }).kind, 'unusable', 'fresh + null gap');
 
   // The point of the change: the verdict follows the INSTANTS, not the stored
   // gap. A row whose gap claims the poll preceded lock while `last_polled_at`

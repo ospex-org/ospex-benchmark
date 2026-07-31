@@ -3,7 +3,7 @@ import { instantMs } from './time.js';
 /**
  * Timing evidence for one captured close, parsed ONCE from the raw row and
  * shared by every consumer that judges it: the scorer (`clv.ts`), the
- * whole-corpus audit builder, and the audit artifact READER.
+ * close-schedule audit builder, and the audit artifact READER.
  *
  * Why a shared primitive rather than a comparison at each site: before this,
  * three call sites judged the same four fields three different ways — the
@@ -32,7 +32,12 @@ import { instantMs } from './time.js';
 
 /**
  * Slack allowed when corroborating the stored `poll_gap_seconds` against the
- * raw instants, and when deriving a verdict from those instants.
+ * raw instants, and when classifying a POST-LOCK POLL from them.
+ *
+ * Scope note: this tolerance applies ONLY to the two quantities derived from
+ * `poll_gap_seconds`. It deliberately does NOT apply to `value_captured_at`,
+ * which is a direct timestamp with no integer-second quantisation — see
+ * {@link closeValueAfterLock}, which is strict.
  *
  * Sized from the corpus, not guessed. `poll_gap_seconds` is stored at
  * INTEGER-SECOND granularity, so a poll a few hundred milliseconds after lock
@@ -51,12 +56,23 @@ import { instantMs } from './time.js';
  */
 export const POLL_GAP_COHERENCE_TOLERANCE_MS = 1000;
 
-/** The four raw timing fields as they arrive from `closing_lines`. */
+/**
+ * The raw timing fields as they arrive from `closing_lines`, plus the row's
+ * freshness class.
+ *
+ * `confidence` is here rather than in a wrapper because what counts as
+ * COMPLETE timing evidence depends on it, and the scorer and the audit must
+ * agree on that. A `fresh` row is one the capture claims to have observed at a
+ * known instant, so it must actually carry those instants; a `stale` or
+ * `missing` row is already refused upstream on its own reason and is not
+ * required to.
+ */
 export interface RawCloseTiming {
   lockTime: string;
   valueCapturedAt: string | null;
   lastPolledAt: string | null;
   pollGapSeconds: number | null;
+  confidence: 'fresh' | 'stale' | 'missing';
 }
 
 /**
@@ -106,13 +122,39 @@ function parseField(
  * - `pollGapSeconds` disagrees with `lockTime - lastPolledAt` by more than
  *   {@link POLL_GAP_COHERENCE_TOLERANCE_MS}.
  *
- * Deliberately NOT a violation: both `valueCapturedAt` and `lastPolledAt` null
- * with a null gap. That is a market never seen in the snapshot, which the
- * upstream freshness classification already downgrades to `close_stale`;
- * refusing it here would double-count an existing refusal under a new name.
+ * A `fresh` row must additionally carry ALL THREE of `valueCapturedAt`,
+ * `lastPolledAt` and `pollGapSeconds`. `fresh` is a claim that the capture
+ * observed this market at a known instant, so a fresh row missing the instants
+ * that claim rests on is not evidence of anything.
+ *
+ * This used to be permitted, on the reasoning that a row with no timing would
+ * be downgraded upstream to `close_stale` anyway. Nothing verified that
+ * assumption, and a fresh row with null poll timing scored a full CLV with
+ * `unscoredReason: null` — fail-open on exactly the evidence these gates exist
+ * to judge. A `stale` or `missing` row is still NOT required to carry them:
+ * it is already refused on its own reason, which runs first, and demanding
+ * them here would double-count one refusal under a second name.
  */
 export function closeTiming(raw: RawCloseTiming): CloseTiming {
   const violations: string[] = [];
+
+  if (raw.confidence === 'fresh') {
+    const absent = (
+      [
+        ['value_captured_at', raw.valueCapturedAt],
+        ['last_polled_at', raw.lastPolledAt],
+        ['poll_gap_seconds', raw.pollGapSeconds],
+      ] as const
+    )
+      .filter(([, value]) => value === null)
+      .map(([name]) => name);
+    if (absent.length > 0) {
+      violations.push(
+        `a fresh close must carry complete timing evidence, but ${absent.join(', ')} ` +
+          `${absent.length === 1 ? 'is' : 'are'} null`,
+      );
+    }
+  }
 
   const lockMs = parseField('lock_time', raw.lockTime, violations);
   const valueCapturedMs = parseField('value_captured_at', raw.valueCapturedAt, violations);
@@ -192,6 +234,14 @@ export function closeAfterStart(timing: CloseTiming): boolean {
  * {@link closeAfterStart}: that one asks whether the feed was still listing the
  * market, this asks whether the price we scored was recorded past the cutoff.
  *
+ * STRICTLY after, with no tolerance. The rounding allowance that
+ * {@link closeAfterStart} carries exists because `poll_gap_seconds` is stored
+ * at integer-second granularity; `value_captured_at` is a direct timestamp
+ * with no such quantisation, so borrowing that allowance here would silently
+ * accept a price captured up to 999ms past its own cutoff. The acceptance rule
+ * is `value_captured_at <= lock_time`: exact equality is at the cutoff and
+ * passes, one millisecond past it does not.
+ *
  * Measured at 0 of 3609 rows on the captured corpus — this guard is expected to
  * be dead on arrival, and is here so the claim stays measured rather than
  * assumed.
@@ -199,7 +249,5 @@ export function closeAfterStart(timing: CloseTiming): boolean {
 export function closeValueAfterLock(timing: CloseTiming): boolean {
   const t = requireUsable(timing, 'closeValueAfterLock');
   if (t.valueCapturedMs === null) return false;
-  // Same boundary rule as `closeAfterStart`; a value captured exactly AT lock
-  // is at the cutoff, not past it.
-  return t.valueCapturedMs - t.lockMs >= POLL_GAP_COHERENCE_TOLERANCE_MS;
+  return t.valueCapturedMs > t.lockMs;
 }

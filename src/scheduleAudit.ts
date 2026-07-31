@@ -15,7 +15,8 @@ import type { ClosingLineRow, GamesTableRow } from './types.js';
  * Close-schedule audit dataset contract
  * (out/close-schedule-audit-*.ndjson): what the production-captured closing
  * lines actually look like under the scorer's close-timing checks, measured
- * over the WHOLE captured corpus rather than over one run's picks.
+ * over an observed lower-bound enumeration of the captured corpus rather
+ * than over one run's picks.
  *
  * It answers three questions the scorer cannot answer from a single run:
  * how many captured closes the odds feed was still quoting after their own
@@ -60,10 +61,61 @@ import type { ClosingLineRow, GamesTableRow } from './types.js';
  * would produce a smaller, perfectly self-verifying snapshot. Two things
  * cover that instead — the walker's own market-filter behaviour is unit
  * tested, and the `markets` histogram is published so a narrowed walk is
- * visible in the artifact (a whole-corpus audit reports all three markets).
+ * visible in the artifact (an unnarrowed audit reports all three markets).
  */
 
+/**
+ * What the enumeration behind an artifact actually guarantees, carried IN the
+ * artifact so a retained NDJSON is self-describing.
+ *
+ * A reader who has only the file — not the console output that produced it —
+ * would otherwise see authoritative-looking counts with no indication that the
+ * walk cannot prove it observed every committed row. Identity is allocated
+ * before commit, so a transaction holding a low id can commit after the cursor
+ * has passed it; over the public anon REST path there is no snapshot to close
+ * that gap. The counts are a LOWER BOUND, and the file now says so in a field
+ * a machine can check.
+ */
+export const AUDIT_ENUMERATION_SEMANTICS = 'keyset-lower-bound-non-snapshot-v1';
+
 export class ScheduleAuditError extends Error {}
+
+/**
+ * The completeness disclosure the CLI prints and the artifact's
+ * `enumerationSemantics` field encodes. Exported so the wording itself is
+ * pinned by a test: it is the only place a reader of the console output learns
+ * that these counts are a lower bound, and quietly reverting it to a
+ * completeness claim would otherwise be invisible.
+ */
+export const AUDIT_COMPLETENESS_DISCLOSURE =
+  'COMPLETENESS: the rows above are what ONE keyset walk over closing_lines.id observed. ' +
+  'Paging by identity key rules out the offset-pagination failure — a concurrent insert ' +
+  'shifting page boundaries so one row duplicates and another drops — and the walk refuses ' +
+  'a non-increasing id. It does NOT prove the enumeration saw every committed row: identity ' +
+  'is allocated before commit, so a transaction holding a LOW id can commit after the ' +
+  'cursor has already passed it, and that row is missed. Reading this over the public anon ' +
+  'REST path there is no transaction, no repeatable-read snapshot and no visibility cursor ' +
+  'to close that gap, so the guarantee is a non-snapshot lower bound rather than a census. ' +
+  `Artifacts stamp this as enumerationSemantics=${AUDIT_ENUMERATION_SEMANTICS}. ` +
+  'Treat these counts as a lower bound on the corpus, and re-run if a figure is load-bearing.';
+
+/**
+ * Refuse an empty corpus BEFORE anything is written.
+ *
+ * "0 closes, 0 problems" is the most dangerous possible clean bill of health: a
+ * zero-row walk is indistinguishable from one whose filter silently narrowed to
+ * nothing. Pure and exported so the CLI's refusal is testable without running
+ * the CLI — `auditCloses.ts` executes `main()` on import, so the guard cannot
+ * be reached there.
+ */
+export function assertNonEmptyCorpus(closeCount: number, network: string): void {
+  if (closeCount > 0) return;
+  throw new ScheduleAuditError(
+    `no closing lines found on network "${network}" from source "${CLOSE_SOURCE}" — ` +
+      'refusing to certify an empty corpus. Check the network and source filters and that the ' +
+      'public read path is reachable',
+  );
+}
 
 /**
  * Exclusive verdict, assigned in the SCORER's own gate order so the audit
@@ -98,7 +150,11 @@ export const closeScheduleAuditRecordSchema = z
      * stamped polygon. The reader re-checks both against meta.
      */
     network: z.string().min(1),
-    source: z.string().min(1),
+    // A LITERAL, not a free string. Record-vs-meta agreement alone is not
+    // enough: rewriting meta AND every record together to another feed left a
+    // globally rebranded artifact that still validated. Binding the format to
+    // the canonical source makes that rewrite unparseable.
+    source: z.literal(CLOSE_SOURCE),
     gameId: z.string().min(1),
     market: z.enum(['moneyline', 'spread', 'total']),
     sport: z.string().min(1),
@@ -125,9 +181,13 @@ export const closeScheduleAuditMetaSchema = z
     network: z.string().min(1),
     /** The one feed every close in this corpus came from; every record must
      *  agree with it, so a mixed-source blend cannot hide behind an average. */
-    closeSource: z.string().min(1),
+    closeSource: z.literal(CLOSE_SOURCE),
+    /** See {@link AUDIT_ENUMERATION_SEMANTICS} — a literal, so an artifact
+     *  cannot quietly re-describe itself as complete. */
+    enumerationSemantics: z.literal(AUDIT_ENUMERATION_SEMANTICS),
     scheduleChangeToleranceMs: z.number().int().nonnegative(),
-    /** Every closing line seen on the network, all markets. */
+    /** Closing lines OBSERVED on the network by this walk, all markets — a
+     *  lower bound on the table, not a census. See `enumerationSemantics`. */
     closesSeen: z.number().int().nonnegative(),
     records: z.number().int().nonnegative(),
     gamesJoined: z.number().int().nonnegative(),
@@ -147,7 +207,7 @@ export const closeScheduleAuditMetaSchema = z
      * Rows per market. Published because it is the one field in which an
      * incomplete ENUMERATION is visible to a reader: every other count is
      * derived from the same fetch, so a walk that silently narrowed to one
-     * market would self-verify. A whole-corpus audit reports all three
+     * market would self-verify. An unnarrowed audit reports all three
      * markets; a single key here means the walk was filtered.
      */
     markets: z.record(z.string(), z.number().int().nonnegative()),
@@ -185,7 +245,7 @@ function afterStrict(label: string, a: string | null, b: string): boolean {
       `${label}: cannot compare "${a}" against "${b}" — ${(err as Error).message}`,
     );
   }
-  return left - right > POLL_GAP_COHERENCE_TOLERANCE_MS;
+  return left > right;
 }
 
 /**
@@ -277,6 +337,7 @@ export function deriveCloseScheduleAuditFields(
     valueCapturedAt: evidence.valueCapturedAt,
     lastPolledAt: evidence.lastPolledAt,
     pollGapSeconds: evidence.pollGapSeconds,
+    confidence: evidence.confidence,
   });
   if (timing.kind === 'unusable') {
     throw new ScheduleAuditError(
@@ -327,7 +388,11 @@ export function closeScheduleAuditRecord(
     // checked against the corpus it claims to describe — meta carried a
     // caller-supplied network and the records carried no identity at all.
     network: close.network,
-    source: close.source,
+    // The canonical literal, not `close.source`. The builder refuses any row
+    // whose source differs before reaching here, so the two are equal by
+    // construction — writing the constant makes the artifact's binding to it
+    // explicit rather than incidental.
+    source: CLOSE_SOURCE,
     sport: game.sport,
     ...evidence,
     ...deriveCloseScheduleAuditFields(evidence, toleranceMs),
@@ -695,6 +760,7 @@ export function closeScheduleAuditMeta(options: {
     recordType: 'close_schedule_audit_meta',
     network: options.network,
     closeSource: CLOSE_SOURCE,
+    enumerationSemantics: AUDIT_ENUMERATION_SEMANTICS,
     scheduleChangeToleranceMs: options.toleranceMs,
     closesSeen: options.closesSeen,
     records: records.length,

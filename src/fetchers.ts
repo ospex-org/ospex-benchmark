@@ -309,7 +309,8 @@ export async function keysetWalk<T>(options: {
 }
 
 /**
- * EVERY closing line on a network — optionally narrowed to ONE market —
+ * Closing lines on a network observed by ONE keyset walk — optionally
+ * narrowed to ONE market — a LOWER BOUND on the table, never a census —
  * enumerated directly from the source table the snapshot claims to cover
  * (not via a pre-enumerated game list, which would silently hide closes
  * whose games row is missing or unexpected). Keyset-paginated on the
@@ -317,7 +318,7 @@ export async function keysetWalk<T>(options: {
  *
  * `market: null` means no market filter: all three markets in one walk.
  * The filter is the ONLY difference between the totals snapshot and a
- * whole-corpus audit, so both go through this one walker rather than a
+ * close-schedule audit, so both go through this one walker rather than a
  * second copy that could drift from it.
  */
 export async function fetchClosingLinesByMarket(

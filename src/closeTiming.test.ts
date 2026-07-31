@@ -15,8 +15,9 @@ const LOCK_MS = Date.parse(LOCK);
 function raw(overrides: Partial<RawCloseTiming> = {}): RawCloseTiming {
   const base = {
     lockTime: LOCK,
-    valueCapturedAt: '2026-07-12T20:09:40+00:00',
+    valueCapturedAt: '2026-07-12T20:09:40+00:00' as string | null,
     pollGapSeconds: 15 as number | null,
+    confidence: 'fresh' as 'fresh' | 'stale' | 'missing',
     ...overrides,
   };
   // Tolerates the deliberately-broken inputs these cases supply (an
@@ -58,14 +59,49 @@ test('an offset-less instant is REFUSED, never read as host-local time', () => {
   }
 });
 
-test('a null valueCapturedAt / lastPolledAt is ABSENT evidence, not unreadable evidence', () => {
-  // The market was never seen in the snapshot; upstream already downgrades
-  // that to close_stale. Refusing it here would double-count one refusal
-  // under a second name and quietly change coverage.
-  const t = closeTiming(raw({ valueCapturedAt: null, lastPolledAt: null, pollGapSeconds: null }));
-  assert.equal(t.kind, 'usable');
-  assert.equal(closeAfterStart(t), false, 'a never-seen market is not "after start"');
-  assert.equal(closeValueAfterLock(t), false);
+test('a NON-fresh close may carry absent timing — it is already refused on its own reason', () => {
+  // The market was never seen in the snapshot. `close_stale` / `close_not_captured`
+  // run first and refuse it; demanding the instants here would double-count one
+  // refusal under a second name and quietly change coverage.
+  for (const confidence of ['stale', 'missing'] as const) {
+    const t = closeTiming(
+      raw({ confidence, valueCapturedAt: null, lastPolledAt: null, pollGapSeconds: null }),
+    );
+    assert.equal(t.kind, 'usable', confidence);
+    assert.equal(closeAfterStart(t), false, 'a never-seen market is not "after start"');
+    assert.equal(closeValueAfterLock(t), false);
+  }
+});
+
+test('a FRESH close missing any required timing field is unusable', () => {
+  // `fresh` is a claim that the capture observed this market at a known
+  // instant. Permitting a fresh row with no instants was fail-open on exactly
+  // the evidence these gates exist to judge: it scored a full CLV with
+  // unscoredReason null, on the unverified assumption that upstream freshness
+  // would have downgraded it.
+  for (const field of ['valueCapturedAt', 'lastPolledAt', 'pollGapSeconds'] as const) {
+    // pollGapSeconds null also derives lastPolledAt null via the fixture, so
+    // pin lastPolledAt explicitly to isolate each field.
+    const t = closeTiming(raw({ lastPolledAt: raw().lastPolledAt, [field]: null }));
+    assert.equal(t.kind, 'unusable', field);
+    assert.ok(
+      violations(t).some((v) => /fresh close must carry complete timing evidence/.test(v)),
+      `${field}: ${violations(t).join('; ')}`,
+    );
+  }
+  // All three absent at once reports all three, not just the first.
+  const all = closeTiming(
+    raw({ valueCapturedAt: null, lastPolledAt: null, pollGapSeconds: null }),
+  );
+  assert.equal(all.kind, 'unusable');
+  assert.ok(
+    violations(all).some(
+      (v) => /value_captured_at, last_polled_at, poll_gap_seconds are null/.test(v),
+    ),
+    violations(all).join('; '),
+  );
+  // NEGATIVE CONTROL: complete evidence on a fresh row is usable.
+  assert.equal(closeTiming(raw()).kind, 'usable');
 });
 
 // ── coherence between the stored gap and the raw instants ───────────────────
@@ -84,9 +120,10 @@ test('the coherence tolerance is a boundary, swept from both sides', () => {
   const at = (residualMs: number) =>
     closeTiming({
       lockTime: LOCK,
-      valueCapturedAt: null,
+      valueCapturedAt: fromLock(-20_000),
       lastPolledAt: fromLock(-15_000 + residualMs),
       pollGapSeconds: 15,
+      confidence: 'fresh',
     }).kind;
   assert.equal(at(0), 'usable');
   assert.equal(at(POLL_GAP_COHERENCE_TOLERANCE_MS), 'usable', 'exactly at tolerance is tolerated');
@@ -117,6 +154,7 @@ test('every problem is reported at once, not just the first', () => {
     valueCapturedAt: 'not-a-date',
     lastPolledAt: 'also-not-a-date',
     pollGapSeconds: 15,
+    confidence: 'fresh',
   });
   assert.equal(t.kind, 'unusable');
   assert.equal(violations(t).length, 3, violations(t).join('; '));
@@ -138,9 +176,10 @@ test('closeAfterStart sweeps the boundary and is derived from the instants', () 
     closeAfterStart(
       closeTiming({
         lockTime: LOCK,
-        valueCapturedAt: null,
+        valueCapturedAt: fromLock(-20_000),
         lastPolledAt: fromLock(deltaMs),
         pollGapSeconds: -Math.round(deltaMs / 1000),
+        confidence: 'fresh',
       }),
     );
   assert.equal(at(-15_000), false, 'polled well before lock');
@@ -158,6 +197,7 @@ test('closeValueAfterLock is distinct from closeAfterStart', () => {
     valueCapturedAt: fromLock(60_000),
     lastPolledAt: fromLock(-15_000),
     pollGapSeconds: 15,
+    confidence: 'fresh',
   });
   assert.equal(t.kind, 'usable');
   assert.equal(closeAfterStart(t), false, 'the feed stopped listing it before lock');
@@ -188,4 +228,27 @@ test('the verdict does not depend on the host timezone', () => {
     else process.env.TZ = original;
   }
   assert.equal(new Set(results).size, 1, `verdict differed across timezones: ${results.join(', ')}`);
+});
+
+test('closeValueAfterLock is STRICT — the poll-gap rounding tolerance does not apply to it', () => {
+  // `poll_gap_seconds` is stored at integer-second granularity, which is why
+  // the post-lock POLL classification tolerates sub-second residue.
+  // `value_captured_at` is a direct timestamp with no such quantisation, so
+  // borrowing that tolerance silently accepted a price captured up to 999ms
+  // past its own cutoff. The acceptance rule is value_captured_at <= lock_time.
+  const at = (deltaMs: number): boolean =>
+    closeValueAfterLock(
+      closeTiming({
+        lockTime: LOCK,
+        valueCapturedAt: fromLock(deltaMs),
+        lastPolledAt: fromLock(-15_000),
+        pollGapSeconds: 15,
+        confidence: 'fresh',
+      }),
+    );
+  assert.equal(at(-1), false, 'before the lock');
+  assert.equal(at(0), false, 'exactly AT the lock is at the cutoff, not past it');
+  assert.equal(at(1), true, 'one millisecond past the cutoff is past the cutoff');
+  assert.equal(at(999), true, 'inside the poll-gap tolerance, but that tolerance does not apply');
+  assert.equal(at(POLL_GAP_COHERENCE_TOLERANCE_MS), true);
 });

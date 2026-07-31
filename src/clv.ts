@@ -221,7 +221,14 @@ function selectedValues(
  * with its own instants is refused upstream as `close_timing_unusable`
  * rather than being judged on either.
  *
- * A last poll after the lock is a direct observation that the odds feed still
+ * The threshold is a last poll at least 1000ms past the lock, not any
+ * positive amount: `poll_gap_seconds` is stored at integer-second
+ * granularity, so a poll a few hundred ms after lock rounds to a stored gap
+ * of 0, and the tolerance absorbs exactly that quantisation. It does NOT
+ * extend to `close_value_after_lock`, which compares direct timestamps and is
+ * strict — one millisecond past the lock refuses.
+ *
+ * A last poll past the lock is a direct observation that the odds feed still
  * listed this market past its recorded cutoff.
  * At least three readings fit that observation, and the row does not
  * distinguish them: the game had not started (the recorded start is early
@@ -259,6 +266,7 @@ export function closeTimingOf(close: CloseQuote): CloseTiming {
     valueCapturedAt: close.valueCapturedAt,
     lastPolledAt: close.lastPolledAt,
     pollGapSeconds: close.pollGapSeconds,
+    confidence: close.confidence,
   });
 }
 

@@ -3,19 +3,25 @@ import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
 import { fetchClosingLinesByMarket, fetchGamesRowsByIds } from './fetchers.js';
 import { writeNdjson } from './records.js';
-import { CLOSE_SOURCE } from './closeSource.js';
-import { buildCloseScheduleAudit, ScheduleAuditError } from './scheduleAudit.js';
+import {
+  assertNonEmptyCorpus,
+  AUDIT_COMPLETENESS_DISCLOSURE,
+  buildCloseScheduleAudit,
+  ScheduleAuditError,
+} from './scheduleAudit.js';
 import { SCHEDULE_CHANGE_TOLERANCE_MS } from './scoring.js';
 
 /**
- * ospex-benchmark close-schedule audit — measures the WHOLE captured
- * closing-line corpus against the scorer's close-timing checks, so the
- * checks' real cost and yield are published numbers rather than estimates.
+ * ospex-benchmark close-schedule audit — measures the captured closing-line
+ * corpus, as observed by ONE keyset walk, against the scorer's close-timing
+ * checks, so the checks' real cost and yield are published numbers rather
+ * than estimates. The observation is a LOWER BOUND on the table, never a
+ * census — see the `enumerationSemantics` field stamped into every artifact.
  *
  * Read-only over the public anon key: closing_lines + games via PostgREST,
  * the same rows any outside reproducer can fetch. Nothing is written back.
  *
- * Completeness posture: the CLAIMED source table (closing_lines on the
+ * Enumeration posture: the CLAIMED source table (closing_lines on the
  * network, ALL markets) is enumerated directly with keyset pagination on
  * its identity key — never via a pre-enumerated game list, which would
  * silently hide closes whose games row is missing or unexpected. Games are
@@ -112,7 +118,7 @@ async function main(): Promise<number> {
   const loaded = loadDotEnv();
   const options = parseArgs(process.argv.slice(2));
   printLine(
-    `ospex-benchmark close-schedule audit — every captured close on ${options.network} ` +
+    `ospex-benchmark close-schedule audit — captured closes observed by one keyset walk on ${options.network} ` +
       `(tolerance ${options.toleranceMs}ms)`,
   );
   if (loaded.length > 0) {
@@ -143,13 +149,7 @@ async function main(): Promise<number> {
   // indistinguishable from one whose filter silently narrowed to nothing. The
   // reader refuses a records-less dataset for the same reason, so the CLI can
   // no longer emit an artifact its own verifier rejects.
-  if (closes.length === 0) {
-    throw new ScheduleAuditError(
-      `no closing lines found on network "${options.network}" from source "${CLOSE_SOURCE}" — ` +
-        'refusing to certify an empty corpus. Check the network and source filters and that the ' +
-        'public read path is reachable',
-    );
-  }
+  assertNonEmptyCorpus(closes.length, options.network);
   // NOT "keyset-complete". The walk enumerates by identity key, which rules
   // out the offset-pagination failure (a concurrent insert shifting page
   // boundaries) but does NOT prove the enumeration saw every committed row —
@@ -199,7 +199,7 @@ async function main(): Promise<number> {
       `(${meta.lockEarlierThanMatchTime} lock-earlier, ${meta.lockLaterThanMatchTime} lock-later)`,
   );
   printLine(`  confidence: ${JSON.stringify(meta.confidence)}`);
-  // A whole-corpus walk reports all three markets. One key here means the
+  // An unnarrowed walk reports all three markets. One key here means the
   // enumeration was narrowed — the one incompleteness the meta arithmetic
   // cannot catch, since every count derives from the same fetch.
   printLine(`  markets (all three = an unfiltered walk): ${JSON.stringify(meta.markets)}`);
@@ -217,17 +217,7 @@ async function main(): Promise<number> {
       'close_after_start count is sourced from feed behaviour rather than the schedule record.',
   );
   printLine('');
-  printLine(
-    'COMPLETENESS: the rows above are what ONE keyset walk over closing_lines.id observed. ' +
-      'Paging by identity key rules out the offset-pagination failure — a concurrent insert ' +
-      'shifting page boundaries so one row duplicates and another drops — and the walk refuses ' +
-      'a non-increasing id. It does NOT prove the enumeration saw every committed row: identity ' +
-      'is allocated before commit, so a transaction holding a LOW id can commit after the ' +
-      'cursor has already passed it, and that row is missed. Reading this over the public anon ' +
-      'REST path there is no transaction, no repeatable-read snapshot and no visibility cursor ' +
-      'to close that gap, so the guarantee is stated rather than claimed away. Treat these ' +
-      'counts as a lower bound on the corpus, and re-run if a figure is load-bearing.',
-  );
+  printLine(AUDIT_COMPLETENESS_DISCLOSURE);
   printLine(`dataset: ${outPath}`);
   return 0;
 }

@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fetchClosingLinesByMarket, fetchTotalsClosingLines, keysetWalk } from './fetchers.js';
+import {
+  fetchClosingLines,
+  fetchClosingLinesByMarket,
+  fetchTotalsClosingLines,
+  keysetWalk,
+} from './fetchers.js';
 
 /**
  * Keyset-pagination invariants. The fake below emulates PostgREST semantics
@@ -264,4 +269,136 @@ test('the closing-line walk continues past a short page — a whole-corpus audit
   } finally {
     stub.restore();
   }
+});
+
+// ── canonical identity: both fetch paths filter AND verify ───────────────────
+
+test('BOTH closing-line fetch paths filter on the canonical source', async () => {
+  // The scoring path (fetchClosingLines) and the audit path
+  // (fetchClosingLinesByMarket) are separate functions; the identity contract
+  // has to hold on both, and only one of them was previously exercised here.
+  const byMarket = stubFetch({ closing_lines: [[closingWireRow(1, 'total')], []] });
+  try {
+    await fetchClosingLinesByMarket('https://db.example', 'anon-key', 'polygon', null);
+    assert.ok(
+      byMarket.urls.every((u) => u.includes('source=eq.jsonodds')),
+      `byMarket urls: ${byMarket.urls.join(' | ')}`,
+    );
+    assert.ok(byMarket.urls.every((u) => u.includes('network=eq.polygon')));
+  } finally {
+    byMarket.restore();
+  }
+
+  const byIds = stubFetch({ closing_lines: [[closingWireRow(1, 'total')]] });
+  try {
+    await fetchClosingLines('https://db.example', 'anon-key', 'polygon', [
+      '00000000-0000-4000-8000-000000000001',
+    ]);
+    assert.ok(
+      byIds.urls.every((u) => u.includes('source=eq.jsonodds')),
+      `byIds urls: ${byIds.urls.join(' | ')}`,
+    );
+    assert.ok(byIds.urls.every((u) => u.includes('network=eq.polygon')));
+  } finally {
+    byIds.restore();
+  }
+});
+
+test('a row the server returns in DEFIANCE of the filter is rejected, on both fetch paths', async () => {
+  // The query filters server-side, but nothing verified the response honoured
+  // it. Removing the filter and the check together left the suite green, so
+  // the runtime guard was unpinned. These cases return a row that violates the
+  // filter and assert the fetcher refuses rather than scoring another
+  // network's book or another feed's prices.
+  const cases = [
+    { label: 'wrong network', patch: { network: 'amoy' }, pattern: /network "amoy"/ },
+    { label: 'wrong source', patch: { source: 'rundown' }, pattern: /source "rundown"/ },
+  ];
+  for (const { label, patch, pattern } of cases) {
+    const a = stubFetch({
+      closing_lines: [[{ ...closingWireRow(1, 'total'), ...patch }], []],
+    });
+    try {
+      await assert.rejects(
+        () => fetchClosingLinesByMarket('https://db.example', 'anon-key', 'polygon', null),
+        pattern,
+        `fetchClosingLinesByMarket: ${label}`,
+      );
+    } finally {
+      a.restore();
+    }
+
+    const b = stubFetch({ closing_lines: [[{ ...closingWireRow(1, 'total'), ...patch }]] });
+    try {
+      await assert.rejects(
+        () =>
+          fetchClosingLines('https://db.example', 'anon-key', 'polygon', [
+            '00000000-0000-4000-8000-000000000001',
+          ]),
+        pattern,
+        `fetchClosingLines: ${label}`,
+      );
+    } finally {
+      b.restore();
+    }
+  }
+});
+
+test('NEGATIVE CONTROL: canonical rows pass both fetch paths untouched', async () => {
+  const a = stubFetch({ closing_lines: [[closingWireRow(1, 'total')], []] });
+  try {
+    const rows = await fetchClosingLinesByMarket('https://db.example', 'anon-key', 'polygon', null);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.source, 'jsonodds');
+  } finally {
+    a.restore();
+  }
+  const b = stubFetch({ closing_lines: [[closingWireRow(1, 'total')]] });
+  try {
+    const rows = await fetchClosingLines('https://db.example', 'anon-key', 'polygon', [
+      '00000000-0000-4000-8000-000000000001',
+    ]);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.network, 'polygon');
+  } finally {
+    b.restore();
+  }
+});
+
+test('a LOW id that commits after the cursor has passed it is MISSED — the walk is a lower bound', async () => {
+  // Identity is allocated by a sequence BEFORE the inserting transaction
+  // commits, and allocation order is not commit order. This models exactly
+  // that: id 50 is allocated but still invisible while 51-53 commit and are
+  // walked, then commits afterwards. Nothing on the public anon REST path can
+  // close the gap — no transaction, no repeatable-read snapshot, no visibility
+  // cursor — which is why the audit states a bound instead of claiming a
+  // census.
+  //
+  // This test PINS A KNOWN LIMITATION. If it ever fails because the row is now
+  // returned, the enumeration guarantee has changed and the artifact's
+  // `enumerationSemantics` must be revisited rather than this test relaxed.
+  const late: Row = { id: 50, name: 'row-50' };
+  const early: Row[] = [51, 52, 53].map((id) => ({ id, name: `row-${id}` }));
+  let served = 0;
+  const fetchPage = async (afterId: number): Promise<Row[]> => {
+    served += 1;
+    const visible = served > 1 ? [late, ...early] : early;
+    return visible.filter((row) => row.id > afterId).sort((a, b) => a.id - b.id);
+  };
+
+  const rows = await keysetWalk({ fetchPage, idOf: (row: Row) => row.id });
+  assert.deepEqual(
+    rows.map((r) => r.id),
+    [51, 52, 53],
+    'the cursor advanced past 50 before 50 became visible',
+  );
+
+  // ...and by the end it IS committed and visible, so this is a MISS rather
+  // than an absence: a fresh walk from scratch now returns all four.
+  const after = await fetchPage(0);
+  assert.deepEqual(
+    after.map((r) => r.id),
+    [50, 51, 52, 53],
+    'the delayed row is committed by the end of the walk',
+  );
 });
