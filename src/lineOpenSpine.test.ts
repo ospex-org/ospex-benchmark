@@ -39,8 +39,13 @@ import { sealPreparedFire } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
-import { mintInjectedAdapterCapability } from './cohortAdapterCapability.js';
+import {
+  createCohortMockAdapterCapability,
+  createCohortRealShapedFakeCapability,
+  mintInjectedAdapterCapability,
+} from './cohortAdapterCapability.js';
 import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
+import { checkProviderCollision } from './providers/family.js';
 import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import { serializeSpendEscalationSidecar, spendEscalationSidecarSha256 } from './spendEscalationSidecar.js';
 import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
@@ -988,6 +993,236 @@ test('the fire seam rejects a raw adapter map, a structural lookalike, and a cop
     assert.equal(store.admitCalls.length, 0, `${label}: rejected before any admission`);
     assert.equal(sink.calls.length, 0, `${label}: nothing installed`);
   }
+});
+
+// ===========================================================================
+// the real-shaped fake capability: no-network sentinel, dry-vs-real-shaped
+// artifact parity, and the mock-blind classification paths
+// ===========================================================================
+
+/** Run one fire with the given capability over a fresh store/sink and require Installed.
+ *  `timeoutMs` stays SMALL: the mock xai arm sleeps past the timeout before its typed
+ *  timeout throw, so the dispatch timeout bounds this test's wall clock. */
+async function capabilityFire(
+  capability: CohortAdapterCapability,
+  snapshot: PreparedFireSnapshot,
+): Promise<{ artifact: FireArtifactV1; store: ScriptedStore }> {
+  const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  const outcome = await runOneFire({
+    snapshot,
+    capability,
+    claimPort: new StoreClaimPort(store),
+    sink,
+    runOptions: runOpts({ timeoutMs: 200 }),
+    admission: ADMISSION,
+    now: () => NOW_MS,
+  });
+  if (outcome.kind !== 'Installed') throw new Error(`capability fire: expected Installed, got ${outcome.kind}`);
+  return { artifact: outcome.artifact, store };
+}
+
+/** Collect every differing leaf path between two plain-JSON trees (dotted/indexed paths). */
+function collectDiffPaths(a: unknown, b: unknown, path: string, out: string[]): void {
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) {
+      out.push(path);
+      return;
+    }
+    for (let i = 0; i < a.length; i += 1) collectDiffPaths(a[i], b[i], `${path}[${i}]`, out);
+    return;
+  }
+  if (typeof a === 'object' && a !== null && typeof b === 'object' && b !== null && !Array.isArray(a) && !Array.isArray(b)) {
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    for (const key of keys) {
+      collectDiffPaths(
+        (a as Record<string, unknown>)[key],
+        (b as Record<string, unknown>)[key],
+        path === '' ? key : `${path}.${key}`,
+        out,
+      );
+    }
+    return;
+  }
+  if (!Object.is(a, b)) out.push(path);
+}
+
+/**
+ * The POSITIVE, EXHAUSTIVE allow-list of leaf paths where a dry (mock) artifact and a
+ * real-shaped-fake artifact may legitimately differ — response TEXT, its exact transitive
+ * digest dependencies, and per-attempt TIMING. (A provider response id is a legitimate
+ * difference too, but it is deliberately not persisted into the artifact, so it cannot
+ * appear as a diff path.) Whole digest subtrees are NOT ignored: `verifyFireArtifactReplay`
+ * RECOMPUTES every derived digest (responseSha256, acceptedResponseDigest, armDigest) from
+ * each candidate artifact, so an allowed-to-differ digest is still proven internally correct.
+ */
+const PARITY_ALLOWED_LEAF_PATTERNS: readonly RegExp[] = [
+  // The response text itself...
+  /^arms\[\d+\]\.orderedAttempts\[\d+\]\.persistedResponseBody$/,
+  // ...and its exact transitive digest dependencies:
+  /^arms\[\d+\]\.orderedAttempts\[\d+\]\.responseSha256$/,
+  /^arms\[\d+\]\.acceptedResponseDigest$/,
+  /^arms\[\d+\]\.armDigest$/,
+  // Per-attempt timing (deterministic here under the one injected tick clock, allowed
+  // because timing is a legitimate leaf difference by contract):
+  /^arms\[\d+\]\.initialRequestStartedAt$/,
+  /^arms\[\d+\]\.orderedAttempts\[\d+\]\.(requestStartedAt|requestReceivedAt|acceptedAt)$/,
+];
+
+function assertParity(mockArtifact: FireArtifactV1, fakeArtifact: FireArtifactV1): string[] {
+  // Compare the CANONICAL persisted bytes' JSON (the serializer authenticates + redacts),
+  // so the comparison is over exactly what a scorer would re-parse.
+  const mockJson = JSON.parse(serializeFireArtifactV1(mockArtifact)) as unknown;
+  const fakeJson = JSON.parse(serializeFireArtifactV1(fakeArtifact)) as unknown;
+  const diffs: string[] = [];
+  collectDiffPaths(mockJson, fakeJson, '', diffs);
+  const disallowed = diffs.filter((d) => !PARITY_ALLOWED_LEAF_PATTERNS.some((p) => p.test(d)));
+  assert.deepEqual(disallowed, [], `unrelated divergence between dry and real-shaped artifacts: ${disallowed.join(', ')}`);
+  // Each allowed derived digest is RECOMPUTED from its candidate artifact and checked.
+  assert.deepEqual(verifyFireArtifactReplay(mockArtifact), []);
+  assert.deepEqual(verifyFireArtifactReplay(fakeArtifact), []);
+  return diffs;
+}
+
+test('the real-shaped fake fires with ZERO network: a throwing fetch sentinel is never touched', async () => {
+  const snapshot = sealed();
+  const originalFetch = globalThis.fetch;
+  let fetchTouches = 0;
+  globalThis.fetch = (async () => {
+    fetchTouches += 1;
+    throw new Error('network sentinel: the real-shaped fake must never fetch');
+  }) as typeof fetch;
+  try {
+    // Positive control first: the sentinel genuinely throws when touched.
+    await assert.rejects(() => globalThis.fetch('https://example.invalid'), /network sentinel/);
+    fetchTouches = 0;
+    const { artifact } = await capabilityFire(createCohortRealShapedFakeCapability({ simulateCollision: false }), snapshot);
+    assert.equal(fetchTouches, 0, 'a whole real-shaped-fake fire reaches the fetch seam zero times');
+    assert.ok(artifact.arms.length > 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('dry vs real-shaped parity: same fire, byte-identical artifacts outside the allow-listed leaves', async () => {
+  const snapshot = sealed();
+  const { artifact: mockArtifact } = await capabilityFire(createCohortMockAdapterCapability({ simulateCollision: false }), snapshot);
+  const { artifact: fakeArtifact } = await capabilityFire(
+    createCohortRealShapedFakeCapability({ simulateCollision: false }),
+    snapshot,
+  );
+
+  const diffs = assertParity(mockArtifact, fakeArtifact);
+
+  // Diagnosticity: the fake's realistic text envelope MUST have produced text-leaf
+  // differences (else this test could pass with a comparator that compares nothing).
+  assert.ok(
+    diffs.some((d) => /persistedResponseBody$/.test(d)),
+    'the real-shaped envelope differs in at least one persisted response body',
+  );
+  assert.ok(
+    diffs.some((d) => /armDigest$/.test(d)),
+    'a text difference transitively moves the arm digest',
+  );
+  // Load-bearing EQUALITIES: decisions, outcomes, identity, and usage are byte-identical.
+  const mockJson = JSON.parse(serializeFireArtifactV1(mockArtifact)) as FireArtifactV1;
+  const fakeJson = JSON.parse(serializeFireArtifactV1(fakeArtifact)) as FireArtifactV1;
+  assert.deepEqual(
+    fakeJson.arms.map((a) => a.terminalOutcome),
+    mockJson.arms.map((a) => a.terminalOutcome),
+  );
+  assert.deepEqual(
+    fakeJson.arms.map((a) => a.acceptedDecisionFingerprint),
+    mockJson.arms.map((a) => a.acceptedDecisionFingerprint),
+  );
+  assert.deepEqual(
+    fakeJson.arms.map((a) => a.orderedAttempts.map((at) => at.usage)),
+    mockJson.arms.map((a) => a.orderedAttempts.map((at) => at.usage)),
+  );
+
+  // Negative control: a NON-allow-listed leaf difference must FAIL the comparator — a
+  // token count is nudged on a plain reparse and the diff must surface as disallowed.
+  const tampered = JSON.parse(serializeFireArtifactV1(fakeArtifact)) as {
+    arms: Array<{ orderedAttempts: Array<{ usage: { inputTokens: number | null } | null }> }>;
+  };
+  const usage = tampered.arms
+    .flatMap((a) => a.orderedAttempts)
+    .map((at) => at.usage)
+    .find((u) => u !== null && u.inputTokens !== null);
+  assert.ok(usage, 'fixture: a priced attempt exists to tamper');
+  usage.inputTokens = (usage.inputTokens as number) + 1;
+  const tamperedDiffs: string[] = [];
+  collectDiffPaths(JSON.parse(serializeFireArtifactV1(mockArtifact)), tampered, '', tamperedDiffs);
+  const tamperedDisallowed = tamperedDiffs.filter((d) => !PARITY_ALLOWED_LEAF_PATTERNS.some((p) => p.test(d)));
+  assert.ok(
+    tamperedDisallowed.some((d) => /usage\.inputTokens$/.test(d)),
+    'the tampered token count is reported as an unrelated (disallowed) divergence',
+  );
+});
+
+test('the fake exercises the mock-blind paths: unapproved model echo FAILS the identity check', async () => {
+  const snapshot = sealed();
+  const { artifact } = await capabilityFire(createCohortRealShapedFakeCapability({ simulateCollision: true }), snapshot);
+
+  const inputs = artifact.expectedArmIdentities.map((identity, i) => {
+    const attempts = artifact.arms[i]!.orderedAttempts;
+    const reported = [...new Set(attempts.map((a) => a.reportedModelId).filter((id): id is string => id !== null))];
+    const unidentified = attempts.filter((a) => a.persistedResponseBody !== null && a.reportedModelId === null).length;
+    return {
+      participantId: identity.participantId,
+      provider: identity.provider as ProviderName,
+      requestedModelId: identity.requestedModelId,
+      approvedReportedModelIds: [...identity.approvedReportedModelIds],
+      reportedModelIds: reported,
+      unidentifiedResponses: unidentified,
+    };
+  });
+  const collided = checkProviderCollision(inputs);
+  assert.ok(
+    collided.failures.some((f) => /MODEL_IDENTITY/.test(f) && /unapproved model ID "gpt-5\.6-sol"/.test(f)),
+    'the collided echo is refused fail-closed against the approved list',
+  );
+  assert.ok(
+    collided.failures.some((f) => /PROVIDER_COLLISION/.test(f)),
+    'two arms resolving to one family is a collision failure',
+  );
+
+  // Negative control: the CLEAN fake passes the same fail-closed check outright.
+  const clean = await capabilityFire(createCohortRealShapedFakeCapability({ simulateCollision: false }), sealed());
+  const cleanInputs = clean.artifact.expectedArmIdentities.map((identity, i) => {
+    const attempts = clean.artifact.arms[i]!.orderedAttempts;
+    const reported = [...new Set(attempts.map((a) => a.reportedModelId).filter((id): id is string => id !== null))];
+    return {
+      participantId: identity.participantId,
+      provider: identity.provider as ProviderName,
+      requestedModelId: identity.requestedModelId,
+      approvedReportedModelIds: [...identity.approvedReportedModelIds],
+      reportedModelIds: reported,
+      unidentifiedResponses: 0,
+    };
+  });
+  assert.deepEqual(checkProviderCollision(cleanInputs).failures, []);
+});
+
+test('the fake exercises 429, timeout, and prose+fence repair classification through a whole fire', async () => {
+  const snapshot = sealed();
+  const { artifact } = await capabilityFire(
+    createCohortRealShapedFakeCapability({ simulateCollision: false, rateLimitedGameId: GAME_ID }),
+    snapshot,
+  );
+  const byParticipant = new Map(artifact.arms.map((a) => [a.expectedArmIdentity.participantId, a]));
+  // HTTP 429 → rate_limited, never a model failure.
+  assert.equal(byParticipant.get('openai-gpt-5.6-sol')!.terminalOutcome, 'rate_limited');
+  // A never-answering arm → timeout.
+  assert.equal(byParticipant.get('xai-grok-4.5')!.terminalOutcome, 'timeout');
+  // Prose+fenced JSON with a wrong echo → parse succeeds, the single repair fixes the echo
+  // with identical decisions: two persisted attempts, terminal valid, fingerprint accepted.
+  const google = byParticipant.get('google-gemini-3.1-pro-preview')!;
+  assert.equal(google.terminalOutcome, 'valid');
+  assert.equal(google.orderedAttempts.length, 2, 'initial + fingerprint-preserving repair');
+  assert.notEqual(google.acceptedDecisionFingerprint, null);
+  // The clean-JSON arm stays valid on one attempt.
+  assert.equal(byParticipant.get('anthropic-claude-fable-5')!.terminalOutcome, 'valid');
 });
 
 // ===========================================================================

@@ -1,4 +1,6 @@
 import { createMockAdapters } from './mock.js';
+import { createRealShapedFakeAdapters } from './realShapedFake.js';
+import type { RealShapedFakeOptions } from './realShapedFake.js';
 import type { BillingClass } from './spendGuard.js';
 import type { ProviderAdapter } from './types.js';
 
@@ -20,12 +22,14 @@ import type { ProviderAdapter } from './types.js';
  *    map, and no mutable view.
  *  - Relabeling therefore requires MINTING a different capability — an auditable producer
  *    act — never flipping a field on an input.
- *  - The only production producer in this build is the mock one, which constructs its own
- *    adapters and is always `known-zero`. A capability whose class is `billable` can only
- *    come from the injected-fixture producer below (billable-SHAPED fakes for escalation
- *    tests); REAL billable authority additionally requires a gated producer bound to an
- *    exact booted cohort + operator authorization, which does not exist in this build —
- *    no real adapter is reachable from the cohort path at all.
+ *  - Every producer in this build mints `known-zero` and constructs its OWN adapters: the
+ *    mock producer (the cohort runner's production path) and the real-shaped fake producer
+ *    (zero-network provider-shaped envelopes for parity/classification proofs). A
+ *    capability whose class is `billable` can only come from the injected-fixture producer
+ *    below (billable-SHAPED fakes for escalation tests); REAL billable authority
+ *    additionally requires a gated producer bound to an exact booted cohort + operator
+ *    authorization, which does not exist in this build — no real adapter is reachable from
+ *    the cohort path at all.
  */
 
 const CAPABILITY_BRAND = new WeakSet<object>();
@@ -92,6 +96,18 @@ function mint(adapters: ReadonlyMap<string, ProviderAdapter>, billingClass: Bill
  */
 export function createCohortMockAdapterCapability(options: { simulateCollision: boolean }): CohortAdapterCapability {
   return mint(createMockAdapters(options), 'known-zero');
+}
+
+/**
+ * The REAL-SHAPED fake producer: constructs its OWN zero-network provider-shaped fake
+ * adapters (same decisions and scenario map as the mock, realistic provider envelope —
+ * verbatim per-provider `usageRaw` shapes, provider-formatted ids, fenced/prose text) and
+ * mints them `known-zero` — the fake never touches the network, and a sentinel test proves
+ * a whole fire under a throwing `globalThis.fetch` never reaches the seam. A caller
+ * supplies no adapters, so there is nothing to mislabel.
+ */
+export function createCohortRealShapedFakeCapability(options: RealShapedFakeOptions): CohortAdapterCapability {
+  return mint(createRealShapedFakeAdapters(options), 'known-zero');
 }
 
 /**
