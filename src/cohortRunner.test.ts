@@ -19,7 +19,11 @@ import type { BootedCohort } from './cohortBoot.js';
 import type { CohortTickInput, CohortTickResult, FireOutcomeSummary } from './cohortRunner.js';
 import type { DiscoverFn, DiscoveryReads, MarketEvidenceRead, ReadMarketEvidenceFn } from './lineOpenRead.js';
 import type { ClaimOutcome, ClaimPort } from './lineOpenClaim.js';
+import { mintInjectedAdapterCapability } from './cohortAdapterCapability.js';
+import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
+import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import type { ArtifactInstaller, LineOpenRunOptions } from './lineOpenSpine.js';
+import type { BillingClass } from './spendGuard.js';
 import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import type { ArtifactFs } from './fireArtifactSink.js';
 import type { PublicationVerified } from './manifestPublication.js';
@@ -351,6 +355,9 @@ function countingSink(real: ArtifactInstaller): ArtifactInstaller & { calls: Fir
       calls.push(artifact);
       return real.install(artifact);
     },
+    installSpendEscalationSidecar(sidecar) {
+      return real.installSpendEscalationSidecar(sidecar);
+    },
   };
 }
 
@@ -393,7 +400,9 @@ function bodyFromPrompt(turns: ChatTurn[]): string {
   return JSON.stringify(body);
 }
 
-function smartAdapters(): Map<string, ProviderAdapter> {
+function smartAdapters(
+  usageRawFor?: (arm: { participantId: string; provider: string }) => unknown,
+): Map<string, ProviderAdapter> {
   const map = new Map<string, ProviderAdapter>();
   for (const arm of CODE_ARMS) {
     const adapter: ProviderAdapter = {
@@ -402,7 +411,7 @@ function smartAdapters(): Map<string, ProviderAdapter> {
       credentialEnvVar: `${arm.participantId.replace(/[^a-z0-9]/gi, '_').toUpperCase()}_KEY`,
       hasCredential: () => true,
       async chat(turns: ChatTurn[], _ms: number): Promise<ProviderResponse> {
-        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {} };
+        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: usageRawFor ? usageRawFor(arm) : {}, requestParams: {} };
       },
     };
     map.set(arm.participantId, adapter);
@@ -431,6 +440,9 @@ function tickInput(
     sink?: ArtifactInstaller;
     adapters?: ReadonlyMap<string, ProviderAdapter>;
     readMarketEvidence?: ReadMarketEvidenceFn;
+    billingClass?: BillingClass;
+    /** When set, used VERBATIM as the tick's capability (for brand-rejection probes). */
+    capability?: CohortAdapterCapability;
     now?: () => number;
     onStatus?: (line: string) => void;
   },
@@ -442,7 +454,12 @@ function tickInput(
     discover: discoverFn(games, odds),
     readMarketEvidence: over.readMarketEvidence ?? evidenceReader(),
     claimPort: over.claimPort,
-    adapters: over.adapters ?? smartAdapters(),
+    capability:
+      over.capability ??
+      mintInjectedAdapterCapability({
+        adapters: over.adapters ?? smartAdapters(),
+        billingClass: over.billingClass ?? 'known-zero',
+      }),
     sink: over.sink ?? new FireArtifactSink('/base', new MemoryFs()),
     runOptions: runOpts(),
     admission: ADMISSION,
@@ -877,4 +894,114 @@ test('an installed fire whose settle is refused stays Installed with an unsettle
   assert.deepEqual(settledOutcome.completion, { status: 'settled' });
   assert.deepEqual(unsettledOutcome.completion, { status: 'unsettled', reason: 'version_mismatch' });
   assert.notDeepEqual(unsettledOutcome.completion, settledOutcome.completion);
+});
+
+// ===========================================================================
+// spend-guard escalation stops the tick (and only escalation does)
+// ===========================================================================
+
+/** Minimal VALID per-provider `usageRaw` the conservative arithmetic prices without ambiguity. */
+function pricedUsageFor(provider: string): unknown {
+  switch (provider) {
+    case 'openai':
+      return { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
+    case 'anthropic':
+      return { input_tokens: 1, output_tokens: 1 };
+    case 'google':
+      return { promptTokenCount: 1, candidatesTokenCount: 1, thoughtsTokenCount: 0, totalTokenCount: 2 };
+    case 'xai':
+      return { prompt_tokens: 1, completion_tokens: 1, completion_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 };
+    default:
+      throw new Error(`no priced usage fixture for provider ${provider}`);
+  }
+}
+
+const ANTHROPIC_ARM_ID = CODE_ARMS.find((a) => a.provider === 'anthropic')!.participantId;
+/** One input token past the exact $100 reservation at the guard table's $10/Mtok anthropic input rate. */
+const OVER_CAP_USAGE = { input_tokens: 10_000_001, output_tokens: 0 };
+
+/** The fixture manifest with the billable guard-table pin (a billable fire refuses without it). */
+function billableManifestJson(): string {
+  const parsed = JSON.parse(manifestJson()) as Record<string, unknown>;
+  parsed['modelPriceTableVersion'] = SPEND_GUARD_PRICE_TABLE_VERSION;
+  parsed['modelPriceTableDigest'] = modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION);
+  return JSON.stringify(parsed);
+}
+
+test('a spend-guard escalation stops the tick: it COUNTS as an admitted dispatch, and no later fire admits', async () => {
+  const json = billableManifestJson();
+  const store = new ScriptedStore(CODE_ARMS.length);
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  const status: string[] = [];
+  const adapters = smartAdapters((arm) => (arm.participantId === ANTHROPIC_ARM_ID ? OVER_CAP_USAGE : pricedUsageFor(arm.provider)));
+  const games = [makeGame({ gameId: 'g1' }), makeGame({ gameId: 'g2' })];
+  const odds = [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' }), makeOdds({ jsonodds_id: 'g2', market: 'moneyline' })];
+  const { input } = tickInput(json, games, odds, {
+    claimPort: new StoreClaimPort(store),
+    sink,
+    adapters,
+    billingClass: 'billable',
+    onStatus: (line) => status.push(line),
+  });
+
+  const result = await runCohortTick(input);
+
+  // Both candidates were discovered and prepared, but the FIRST fire escalated and the loop
+  // stopped: the second fire was never admitted, dispatched, or evaluated.
+  assert.equal(result.discoveredCount, 2);
+  assert.equal(result.dispositions.length, 2);
+  assert.equal(result.fireOutcomes.length, 1, 'the tick stopped after the escalated fire');
+  const escalated = result.fireOutcomes[0]!.outcome;
+  assert.equal(escalated.kind, 'InstalledEscalated');
+  if (escalated.kind !== 'InstalledEscalated') return;
+  assert.equal(escalated.reason, 'spend_attempt_over_reservation');
+  // The escalated fire WAS admitted and dispatched — the admission accounting must say so
+  // (admittedCount reports admitted dispatches, not clean settlements).
+  assert.equal(result.admittedCount, 1, 'the escalated fire counts as an admitted dispatch');
+  // The escalated fire's evidence still durably installed; nothing settled; no second admission.
+  assert.equal(sink.calls.length, 1, 'exactly one artifact: the escalated fire evidence');
+  assert.equal(store.admitCalls.length, 1, 'the second fire was never admitted');
+  assert.equal(store.completeCalls.length, 0, 'nothing settled');
+  // The escalated fire is still surfaced on the status line, named as an escalation.
+  assert.equal(status.length, 1);
+  assert.match(status[0]!, /InstalledEscalated\/spend_attempt_over_reservation/);
+});
+
+test('clean billable fires do NOT stop the tick — the stop is escalation-only, both admit and settle', async () => {
+  const json = billableManifestJson();
+  const store = new ScriptedStore(CODE_ARMS.length);
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  // Every arm reports valid priced usage far under the reservation, across all four provider shapes.
+  const adapters = smartAdapters((arm) => pricedUsageFor(arm.provider));
+  const games = [makeGame({ gameId: 'g1' }), makeGame({ gameId: 'g2' })];
+  const odds = [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' }), makeOdds({ jsonodds_id: 'g2', market: 'moneyline' })];
+  const { input } = tickInput(json, games, odds, { claimPort: new StoreClaimPort(store), sink, adapters, billingClass: 'billable' });
+
+  const result = await runCohortTick(input);
+
+  // The negative control for the stop rule: passing billable fires must run the tick to completion.
+  assert.equal(result.fireOutcomes.length, 2, 'both fires evaluated — no over-eager stop');
+  assert.ok(result.fireOutcomes.every((f) => f.outcome.kind === 'Installed'), 'both fires installed cleanly');
+  assert.equal(result.admittedCount, 2);
+  assert.equal(store.completeCalls.length, 2, 'both fires settled');
+});
+
+test('the tick rejects a raw adapter map posing as the capability BEFORE discovery runs', async () => {
+  const json = manifestJson();
+  const store = new ScriptedStore(CODE_ARMS.length);
+  let discoveryRan = false;
+  const { input } = tickInput(json, [makeGame({ gameId: 'g1' })], [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' })], {
+    claimPort: new StoreClaimPort(store),
+    capability: smartAdapters() as unknown as CohortAdapterCapability,
+  });
+  const probed: CohortTickInput = {
+    ...input,
+    discover: async (booted) => {
+      discoveryRan = true;
+      return input.discover(booted);
+    },
+  };
+  await assert.rejects(() => runCohortTick(probed), /not a minted cohort adapter capability/);
+  assert.equal(discoveryRan, false, 'the brand fails before any seam executes');
+  assert.equal(store.admitCalls.length, 0);
 });

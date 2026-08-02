@@ -5,8 +5,8 @@ import type { ProviderName } from './types.js';
  * The runtime spend guard's policy layer. It classifies each provider attempt by billing
  * provenance + sent-evidence, prices the billable+received ones via the conservative arithmetic
  * ({@link deriveConservativeActualUsdMicros}), compares each against the per-attempt reservation,
- * and reduces a whole fire to PASS / BREACH / UNKNOWN. The consumer (the fire spine, a later
- * slice) installs the artifact first, then escalates on BREACH or UNKNOWN — this module is pure
+ * and reduces a whole fire to PASS / BREACH / UNKNOWN. The consumer (`runOneFire` in the fire
+ * spine) installs the artifact first, then escalates on BREACH or UNKNOWN — this module is pure
  * and takes no I/O, no clock, and no adapters.
  *
  * Two invariants shape every decision: an undercount silently defeats the hard-stop (so every

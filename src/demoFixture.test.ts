@@ -4,9 +4,9 @@ import { cohortBoot } from './cohortBoot.js';
 import { runCohortTick } from './cohortRunner.js';
 import { decodeManifestText, selfResolvePublication } from './cohortRunnerMain.js';
 import { DEMO_GAME_ID, buildDemoFixture } from './demoFixture.js';
+import { createCohortMockAdapterCapability } from './cohortAdapterCapability.js';
 import { FireArtifactSink } from './fireArtifactSink.js';
 import { RehearsalClaimPort, StoreClaimPort } from './lineOpenClaim.js';
-import { createMockAdapters } from './mock.js';
 import { defaultExpectedArms } from './scoring.js';
 import { STORE_SCHEMA_VERSION } from './store/constants.js';
 import type { BootedCohort } from './cohortBoot.js';
@@ -172,7 +172,7 @@ function tickInput(over: { claimPort: ClaimPort; sink?: CohortTickInput['sink'];
     discover: fixture.discover,
     readMarketEvidence: fixture.readMarketEvidence,
     claimPort: over.claimPort,
-    adapters: createMockAdapters({ simulateCollision: false }),
+    capability: createCohortMockAdapterCapability({ simulateCollision: false }),
     sink: over.sink ?? new FireArtifactSink('/base', new MemoryFs()),
     runOptions: runOpts(),
     admission: { ownerId: 'demo-owner', expectedSchemaVersion: STORE_SCHEMA_VERSION },

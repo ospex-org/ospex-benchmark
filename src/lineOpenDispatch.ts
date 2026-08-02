@@ -23,8 +23,8 @@ import type { ChatTurn, GameBundle, MarketKey, ProviderAdapter, ProviderCallOpti
  * plan, and captured request before a single facade is handed on. Any disagreement — or a
  * retained scope narrower than the full proposal, which this non-activating path does not
  * support — refuses, releases every distinct admitted lease exactly once, and yields no
- * `AuthorizedDispatch`. Dispatch itself (the attempt lifecycle at the HTTP boundary) is a
- * later slice, which accepts only the branded value this module produces.
+ * `AuthorizedDispatch`. The canonical HTTP-boundary lifecycle runs through
+ * `runAuthorizedDispatch`, which accepts only the branded value this module produces.
  *
  * No provider is contacted here, no artifact is produced or installed, and no claim is
  * completed.

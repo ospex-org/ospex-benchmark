@@ -10,13 +10,15 @@ import type {
 import type { CandidateOutcome } from './lineOpenProject.js';
 import type { ClaimPort } from './lineOpenClaim.js';
 import type { PublicationVerified } from './manifestPublication.js';
+import { assertCohortAdapterCapability } from './cohortAdapterCapability.js';
+import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
 import type {
   ArtifactInstaller,
   LineOpenAdmissionParameters,
   LineOpenFireOutcome,
   LineOpenRunOptions,
 } from './lineOpenSpine.js';
-import type { MarketKey, ProviderAdapter } from './types.js';
+import type { MarketKey } from './types.js';
 
 /**
  * The per-tick cohort runner loop (SPEC-line-open-speculation-runner.md §3–§4;
@@ -47,7 +49,12 @@ export interface CohortTickInput {
   /** Read one `(gameId, market)` pair's full opener evidence. */
   readonly readMarketEvidence: ReadMarketEvidenceFn;
   readonly claimPort: ClaimPort;
-  readonly adapters: ReadonlyMap<string, ProviderAdapter>;
+  /** The MINTED adapter capability for the whole tick — adapter facades AND billing
+   *  provenance as one unforgeable value, threaded to every fire. Raw adapter maps and
+   *  structural lookalikes are rejected by the runtime brand; production ticks mint via
+   *  `createCohortMockAdapterCapability` (known-zero — the only production producer in
+   *  this build). */
+  readonly capability: CohortAdapterCapability;
   readonly sink: ArtifactInstaller;
   readonly runOptions: LineOpenRunOptions;
   readonly admission: LineOpenAdmissionParameters;
@@ -84,6 +91,9 @@ export interface FireOutcomeSummary {
  * dispatch budget stopped short of), and the count of newly-admitted (`Installed`) fires. A
  * `fireOutcomes` entry is an evaluated fire, NOT necessarily an attempted/claimed one: a pre-claim
  * `CoverageMiss` is evaluated and reported here but takes no claim and consumes none of the budget.
+ * `admittedCount` counts newly-ADMITTED dispatches: clean `Installed` fires AND `InstalledEscalated`
+ * fires (an escalated fire was admitted, dispatched, and installed its evidence — only settlement
+ * was refused). An escalated fire is always the LAST entry — the loop stops admitting after it.
  */
 export interface CohortTickResult {
   readonly discoveredCount: number;
@@ -102,6 +112,10 @@ function describeOutcome(outcome: LineOpenFireOutcome): string {
       return outcome.completion.status === 'settled'
         ? 'Installed/settled'
         : `Installed/unsettled(${outcome.completion.reason})`;
+    case 'InstalledEscalated':
+      // An escalation, not a success: the artifact IS durably installed, but the spend guard
+      // refused settlement and the tick stops admitting. Name the reason and every offender.
+      return `InstalledEscalated/${outcome.reason} (${outcome.offenders.length} offending attempt(s))`;
     case 'CoverageMiss':
       return `CoverageMiss/${outcome.reason}`;
     case 'NotAdmitted': {
@@ -139,7 +153,7 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
     discover,
     readMarketEvidence,
     claimPort,
-    adapters,
+    capability,
     sink,
     runOptions,
     admission,
@@ -147,9 +161,11 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
     onStatus,
   } = input;
 
-  // (1) Fail closed on the booted cohort before anything reads a manifest field. Every
-  //     downstream stage (`projectPreparedFires`, `runOneFire`) authenticates its own brands.
+  // (1) Fail closed on the booted cohort AND the adapter capability before anything else
+  //     runs. `runOneFire` re-asserts the capability per fire; asserting here too makes a
+  //     raw-map/lookalike tick fail before discovery ever executes.
   assertBootedCohort(booted);
+  assertCohortAdapterCapability(capability);
 
   // (2) Discover the fire candidates from the current-odds snapshot.
   const discovery = await discover(booted);
@@ -172,16 +188,17 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
 
   // (5) Serial, admit-counted dispatch loop. Iterate fires in projection order; stop once
   //     the manifest's per-tick budget of newly-admitted dispatches is reached. Only an
-  //     `Installed` outcome consumes the budget — a `NotAdmitted` (all_claimed / defer /
-  //     refused / rehearsal) or a pre-claim `CoverageMiss` (first pitch / windowEnd already
-  //     passed, so no claim was taken) is recorded but never counted, so a leading
-  //     coverage-missed or all_claimed fire does not strand a later admittable one under the cap.
+  //     admitted dispatch (`Installed` or `InstalledEscalated`) consumes the budget — a
+  //     `NotAdmitted` (all_claimed / defer / refused / rehearsal) or a pre-claim
+  //     `CoverageMiss` (first pitch / windowEnd already passed, so no claim was taken) is
+  //     recorded but never counted, so a leading coverage-missed or all_claimed fire does
+  //     not strand a later admittable one under the cap.
   const maxDispatchesPerTick = booted.manifest.constants.maxDispatchesPerTick;
   const fireOutcomes: FireOutcomeSummary[] = [];
   let admittedCount = 0;
   for (const fire of fires) {
     if (admittedCount >= maxDispatchesPerTick) break;
-    const outcome = await runOneFire({ snapshot: fire, adapters, claimPort, sink, runOptions, admission, now });
+    const outcome = await runOneFire({ snapshot: fire, capability, claimPort, sink, runOptions, admission, now });
     // Single-market fires: the fire's sole proposed market is `proposedMarkets[0]`. The full typed
     // outcome is retained by reference and the summary is only SHALLOW-frozen — `deepFreeze` would
     // re-traverse the spine's already-frozen/branded outcome graph (artifact / permit / any
@@ -193,8 +210,16 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
       outcome,
     });
     fireOutcomes.push(summary);
-    if (outcome.kind === 'Installed') admittedCount += 1;
+    // `admittedCount` counts newly-ADMITTED dispatches — the quantity the per-tick budget
+    // bounds — not clean settlements. An escalated fire passed admission, dispatched, and
+    // installed its evidence, so it COUNTS; whether it settled is reported separately by the
+    // retained outcome (`Installed.completion` vs `InstalledEscalated`).
+    if (outcome.kind === 'Installed' || outcome.kind === 'InstalledEscalated') admittedCount += 1;
     onStatus?.(`fire ${summary.fireId} (${summary.gameId} ${summary.market}): ${describeOutcome(outcome)}`);
+    // A spend-guard escalation STOPS the tick: an over-reservation or unpriceable attempt means the
+    // spend model is not holding, so no further serial fire may be admitted this tick. The escalated
+    // fire's summary is already retained above (by reference, with its installed evidence + sidecar).
+    if (outcome.kind === 'InstalledEscalated') break;
   }
 
   // Shallow-freeze only: each summary is already frozen above, `dispositions` is already deep-frozen
