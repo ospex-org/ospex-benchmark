@@ -1706,7 +1706,7 @@ test('the spine imports no runtime store, settles only via the permit-resolved c
   }
   assert.ok(/sortedLeaseIndexes\[i\] !== i/.test(src), 'the roster bijection is derived, not assumed');
 
-  // The only product change outside S4 is the additive scopeKeyOf export.
+  // The pre-dispatch scope-key owner remains additively exported for the composition spine.
   const dispatchSrc = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'lineOpenDispatch.ts'), 'utf8');
   assert.ok(dispatchSrc.includes('export function scopeKeyOf'), 'scopeKeyOf is additively exported');
 });

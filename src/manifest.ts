@@ -10,11 +10,10 @@ import { canonicalize, sha256Hex } from './canonical.js';
  * `cohortId` is DERIVED from the canonical bytes of the strictly-parsed object
  * and is NOT a field inside the object it hashes.
  *
- * This first slice is the data model + strict structural parse + `cohortId`
- * only. The known-version / recomputed-digest checks, the full-roster / spend
- * boot gates, the canonical config-lock, and the public-Git publication
- * verification are deliberately DEFERRED to later slices — so this module
- * carries no cross-module or network dependency.
+ * This module intentionally owns only the data model, strict structural parse, and
+ * `cohortId`. Known-version/digest checks, full-roster/spend boot gates, config locking,
+ * and public-Git publication verification are owned by their dedicated boot/publication
+ * modules, so this parser retains no cross-module or network dependency.
  */
 
 // Lowercase canonical hex (matches sha256Hex output) so digests hashed into

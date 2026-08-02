@@ -28,20 +28,20 @@ import type { AdmitDispatchRequest, ClaimKey } from './store/contract.js';
  * The composition spine: the single thin entry that runs ONE sealed fire end to end — admit,
  * authorize, dispatch, produce, reconcile, install, settle — and returns a typed outcome.
  *
- * Every stage it calls is already merged and already fail-closed by its own brand: this module
- * mints no permit, plan, dispatch, artifact, or lease authority, and holds no store, provider, or
- * filesystem of its own. Its only genuinely new logic is (a) DERIVING the full-scope admission
- * request from the sealed snapshot, (b) the permit↔artifact RECONCILIATION the durable sink
- * reserves for "a later slice's thin authorized wrapper" — the check that the fire we admitted is
- * the fire we are about to persist — and (c) settling the claim exactly once, strictly AFTER the
- * artifact is durably installed. The sink deliberately never sees a permit, and the producer never
- * sees one either, so nothing else in the pipeline compares the admission's identity to the
- * artifact's; this module is where those two independently-derived paths meet.
+ * Each stage has its own fail-closed boundary: this module mints no permit, plan, dispatch,
+ * artifact, or lease authority, and holds no store, provider, or filesystem of its own. It derives
+ * the full-scope admission request, reconciles the permit to the produced artifact, applies the
+ * post-dispatch spend guard, installs the canonical artifact (plus an escalation sidecar when
+ * required), and settles a clean claim exactly once strictly AFTER durable installation. The sink
+ * deliberately never sees a permit, and the producer never sees one either, so this module is where
+ * those independently-derived identity paths meet.
  *
- * This stays non-activating: nothing schedules `runOneFire`, no CLI/watcher/smoke calls it, and it
- * touches no `--live` path. It settles the claim only through the permit-resolved completion
- * capability, and it folds any settle failure to a typed `unsettled` completion that never discards
- * the persisted artifact — an activation consumer must branch on `completion.status` and escalate
+ * This build remains non-activating for REAL provider spend: the production cohort runner and its
+ * fixture CLI reach `runOneFire` only through the mock, `known-zero` capability producer; no `--live`
+ * path or gated real-adapter producer exists here. It settles a clean claim only through the
+ * permit-resolved completion capability, and it folds any settle failure to a typed `unsettled`
+ * completion that never discards the persisted artifact — an activation consumer must branch on
+ * `completion.status` and escalate
  * `unsettled` (a later recovery slice re-settles an aged `unsettled` fire against durable
  * exact-artifact proof). Canonical persistence must survive the production host lifecycle: the local
  * filesystem sink is crash-consistent only on a persistent POSIX filesystem, so a durable

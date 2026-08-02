@@ -11,9 +11,11 @@ import type { ProviderAdapter } from './types.js';
  * lookalike, or a spread/copy of a genuine capability all fail the runtime brand.
  *
  * Unforgeability boundary, stated exactly:
- *  - The adapter entries and their `hasCredential`/`chat` facades are captured ONCE at
- *    mint (methods bound, entries copied), so mutating the source map or the source
- *    adapter objects AFTER minting cannot change what the capability dispatches.
+ *  - The adapter entries and their exact `hasCredential`/`chat` function references are
+ *    captured ONCE at mint (methods bound, entries copied), so replacing source-map entries
+ *    or replacing either source method AFTER minting cannot change the captured facade.
+ *    The bound methods still run with the original adapter as their receiver; the producer
+ *    remains responsible for trusting that adapter implementation and its internal state.
  *  - `billingClass` is fixed at mint on a frozen object; there is no setter, no exposed
  *    map, and no mutable view.
  *  - Relabeling therefore requires MINTING a different capability — an auditable producer
@@ -57,8 +59,9 @@ export function assertCohortAdapterCapability(value: unknown): asserts value is 
 
 /** Capture-and-freeze mint. Module-private: every exported producer states its own provenance. */
 function mint(adapters: ReadonlyMap<string, ProviderAdapter>, billingClass: BillingClass): CohortAdapterCapability {
-  // Capture each adapter's identity and method facades EXACTLY ONCE. Binding here is what
-  // makes a post-mint `adapter.chat = ...` swap, or a source-map set/delete, ineffective.
+  // Capture each adapter's identity and method references EXACTLY ONCE. Binding here is what
+  // makes a post-mint `adapter.chat = ...` swap, or a source-map set/delete, ineffective;
+  // producer trust still covers state consulted by the original bound method.
   const captured = new Map<string, ProviderAdapter>();
   for (const [participantId, adapter] of adapters) {
     captured.set(

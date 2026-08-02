@@ -27,11 +27,11 @@ import type { MarketKey } from './types.js';
  * `ArtifactFs` port — the sink, NOT the port, owns the complete-write loop — so the durable
  * install ORDER and partial/zero-write behavior are deterministically testable.
  *
- * It accepts ONLY the artifact: no permit, claim, admission, lease, lifecycle, store, or
- * prepared-fire snapshot. The permit reconciliation (binding the artifact to the admission)
- * is a later slice's thin authorized wrapper, which authenticates the permit and then
- * delegates to this sink. Pure serialization + a thin `node:fs` install; no producer, store,
- * watcher, provider, close, CLV, scoring, coverage, or runtime wiring.
+ * It accepts only durable records: a fire artifact or its token-only spend-escalation sidecar —
+ * never a permit, claim, admission, lease, lifecycle, store, or prepared-fire snapshot. The
+ * composition spine owns permit reconciliation before delegating here. This remains pure
+ * serialization plus a thin `node:fs` install, with no producer, store, watcher, provider,
+ * close, CLV, scoring, or coverage logic.
  */
 
 /** Lowercase 64-hex sha256, required for every path-forming identifier. */

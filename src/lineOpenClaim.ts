@@ -32,8 +32,8 @@ import type { MarketKey } from './types.js';
  *
  * The permit carries the admitted `ownerId` and `expectedSchemaVersion`, and the same
  * admission also yields an opaque `AdmissionLeaseAuthority` that closes over the exact store
- * plus those captured values. Lease work — pre-dispatch cleanup here, and the attempt
- * lifecycle in a later slice — goes through that authority, so an owner or schema version can
+ * plus those captured values. Lease work — pre-dispatch cleanup here and the canonical attempt
+ * lifecycle in `runner.ts` — goes through that authority, so an owner or schema version can
  * never be substituted after admission by an independently supplied constructor argument.
  */
 
@@ -78,9 +78,8 @@ export function assertDispatchPermit(permit: DispatchPermit): void {
  * supplies only the lease id (or arm/ordinal) and CANNOT substitute a different owner,
  * schema version, or store. Minted together with the permit and carried with it.
  *
- * This slice uses `releaseLease` for pre-dispatch cleanup; the per-arm attempt lifecycle
- * (the initial/repair state machine driven at the HTTP boundary) is a later slice built on
- * top of this same authority.
+ * Pre-dispatch cleanup uses `releaseLease`; the per-arm initial/repair lifecycle at the HTTP
+ * boundary uses both operations through this same authority.
  */
 export interface AdmissionLeaseAuthority {
   releaseLease(leaseId: string): Promise<ReleaseResult>;

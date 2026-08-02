@@ -14,9 +14,9 @@ import { deepFreeze } from './freeze.js';
  * boot validator RECOMPUTES the digest for the recorded version and rejects a
  * mismatch, so a silent edit to a rate cannot pass as the pinned table. An unknown
  * version or an unpriced model fails closed (throws) — this baseline is the only
- * current price registry, and zero is never a valid price. Consumption of these
- * rates (token counting, the conservative spend estimate) is a later slice; this
- * module performs no arithmetic.
+ * current price registry, and zero is never a valid price. Token accounting and
+ * conservative spend arithmetic live in `conservativeSpend.ts` / `spendGuard.ts`;
+ * this module remains the immutable rate registry and performs no arithmetic.
  *
  * Baseline snapshot as of 2026-07-20, from each provider's published API pricing
  * (input / output per million tokens, standard uncached tier):
@@ -78,9 +78,9 @@ const MODEL_PRICE_TABLE_V1: ModelPriceTable = {
  *   - `claude-fable-5` ........ Anthropic, single tier (no long-context premium): $10 / $50
  *   - `gemini-3.1-pro-preview`  Google, >200K tier: $4 / $18
  *   - `grok-4.5` .............. xAI, ≥200K tier (higher rate on all tokens): $4 / $12
- * Reasoning/thinking bill at the OUTPUT rate; the per-provider derived-actual (a later slice)
- * multiplies the right token buckets by these input/output rates — this module holds only the
- * rates and does no arithmetic.
+ * Reasoning/thinking bill at the OUTPUT rate; the conservative spend path multiplies the right
+ * token buckets by these input/output rates — this module holds only the rates and does no
+ * arithmetic.
  */
 const MODEL_PRICE_TABLE_V2: ModelPriceTable = {
   'gpt-5.6-sol': { inputUsdMicrosPerMillionTokens: 12_500_000, outputUsdMicrosPerMillionTokens: 60_000_000 },

@@ -63,7 +63,7 @@ test('the capability is frozen: billingClass cannot be flipped after minting', (
   assert.equal(cap.billingClass, 'billable', 'the minted class is unchanged');
 });
 
-test('entries and facades are captured at mint: source-map and source-adapter mutation are ineffective', async () => {
+test('entries and facades are captured at mint: source-map and source-method replacement are ineffective', async () => {
   const original = adapterFixture('original-response');
   const source = new Map<string, ProviderAdapter>([['arm-1', original]]);
   const cap = mintInjectedAdapterCapability({ adapters: source, billingClass: 'known-zero' });
