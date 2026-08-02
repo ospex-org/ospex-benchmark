@@ -37,6 +37,7 @@ import { sealPreparedFire } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
+import type { BillingClass } from './spendGuard.js';
 import type { CandidateInput } from './detection.js';
 import type { TwoSidedHistoryRow } from './oddsHistory.js';
 import type {
@@ -330,7 +331,7 @@ function validBody(participantId: string, requestedModelId: string, cohortId: st
 function scriptedAdapter(
   identity: { participantId: string; provider: string; requestedModelId: string },
   bodies: (call: number) => string | Promise<string>,
-  opts: { hasCredential?: boolean } = {},
+  opts: { hasCredential?: boolean; usageRawFor?: (call: number) => unknown } = {},
 ): Scripted {
   const state = { calls: 0 };
   const adapter: ProviderAdapter = {
@@ -341,17 +342,26 @@ function scriptedAdapter(
     async chat(_t: ChatTurn[], _ms: number): Promise<ProviderResponse> {
       state.calls += 1;
       const body = await bodies(state.calls);
-      return { rawText: body, reportedModelId: identity.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {} };
+      return { rawText: body, reportedModelId: identity.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: opts.usageRawFor ? opts.usageRawFor(state.calls) : {}, requestParams: {} };
     },
   };
   return { adapter, get calls() { return state.calls; } } as Scripted;
 }
 
-function validAdapters(snapshot: PreparedFireSnapshot, cohortId: string, game: GameBundle): { map: Map<string, ProviderAdapter>; scripts: Scripted[] } {
+function validAdapters(
+  snapshot: PreparedFireSnapshot,
+  cohortId: string,
+  game: GameBundle,
+  usageRawFor?: (identity: { participantId: string; provider: string }, call: number) => unknown,
+): { map: Map<string, ProviderAdapter>; scripts: Scripted[] } {
   const scripts: Scripted[] = [];
   const map = new Map<string, ProviderAdapter>();
   for (const id of snapshot.expectedArmIdentities) {
-    const s = scriptedAdapter(id, () => validBody(id.participantId, id.requestedModelId, cohortId, snapshot.prepared.requestSha256, game));
+    const s = scriptedAdapter(
+      id,
+      () => validBody(id.participantId, id.requestedModelId, cohortId, snapshot.prepared.requestSha256, game),
+      usageRawFor ? { usageRawFor: (call) => usageRawFor(id, call) } : {},
+    );
     scripts.push(s);
     map.set(id.participantId, s.adapter);
   }
@@ -418,7 +428,16 @@ function deferredInstaller(): {
  *  is injected via `now` (default `() => NOW_MS`, the boundary-safe reading whose V-lag against the
  *  fixture `detectedAt` equals `maxDispatchLagMs`, so the gate admits); a late clock drives the
  *  gate-refusal rows. */
-async function fireOf(opts: SealOpts & { store?: ScriptedStore; runOptions?: LineOpenRunOptions; fs?: ArtifactFs; now?: () => number } = {}): Promise<{
+async function fireOf(
+  opts: SealOpts & {
+    store?: ScriptedStore;
+    runOptions?: LineOpenRunOptions;
+    fs?: ArtifactFs;
+    now?: () => number;
+    billingClass?: BillingClass;
+    usageRawFor?: (identity: { participantId: string; provider: string }, call: number) => unknown;
+  } = {},
+): Promise<{
   outcome: Awaited<ReturnType<typeof runOneFire>>;
   store: ScriptedStore;
   snapshot: PreparedFireSnapshot;
@@ -429,7 +448,7 @@ async function fireOf(opts: SealOpts & { store?: ScriptedStore; runOptions?: Lin
   const cohortId = snapshot.booted.cohortId;
   const game = scopedGame(opts.gameId ?? GAME_ID, opts.markets ?? BOTH);
   const store = opts.store ?? new ScriptedStore(snapshot.expectedArmIdentities.length);
-  const { map, scripts } = validAdapters(snapshot, cohortId, game);
+  const { map, scripts } = validAdapters(snapshot, cohortId, game, opts.usageRawFor);
   const sink = countingSink(new FireArtifactSink('/base', opts.fs ?? new MemoryFs()));
   const outcome = await runOneFire({
     snapshot,
@@ -438,6 +457,7 @@ async function fireOf(opts: SealOpts & { store?: ScriptedStore; runOptions?: Lin
     sink,
     runOptions: opts.runOptions ?? runOpts(),
     admission: ADMISSION,
+    billingClass: opts.billingClass ?? 'known-zero',
     now: opts.now ?? (() => NOW_MS),
   });
   return { outcome, store, snapshot, scripts, sink };
@@ -535,6 +555,168 @@ test('one fire runs admit->authorize->dispatch->produce->reconcile->install exac
   // The claim is settled exactly once, AFTER the install, and reports settled.
   assert.equal(store.completeCalls.length, 1, 'exactly one settle on the installed path');
   assert.deepEqual(outcome.completion, { status: 'settled' }, 'a completed store settle reports settled');
+});
+
+// ===========================================================================
+// the runtime spend guard at the spine seam (post-install escalation)
+// ===========================================================================
+
+/** Minimal VALID per-provider `usageRaw` the conservative arithmetic prices without ambiguity —
+ *  each shape carries every required field plus the corroboration its provider demands. */
+function pricedUsageFor(provider: string): unknown {
+  switch (provider) {
+    case 'openai':
+      return { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
+    case 'anthropic':
+      return { input_tokens: 1, output_tokens: 1 };
+    case 'google':
+      return { promptTokenCount: 1, candidatesTokenCount: 1, thoughtsTokenCount: 0, totalTokenCount: 2 };
+    case 'xai':
+      return { prompt_tokens: 1, completion_tokens: 1, completion_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 };
+    default:
+      throw new Error(`no priced usage fixture for provider ${provider}`);
+  }
+}
+
+const ANTHROPIC_ARM_ID = CODE_ARMS.find((a) => a.provider === 'anthropic')!.participantId;
+/** claude-fable-5 prices at $10/Mtok input on the guard's conservative table, i.e. 10 USD-micros per
+ *  input token — so 10,000,000 input tokens derive EXACTLY the $100 (100,000,000 µUSD) per-attempt
+ *  reservation, and one more token is the smallest expressible step above it (+10 µUSD). The exact
+ *  value must PASS (the threshold is strictly `>`); the next reachable value must escalate. */
+const AT_CAP_USAGE = { input_tokens: 10_000_000, output_tokens: 0 };
+const OVER_CAP_USAGE = { input_tokens: 10_000_001, output_tokens: 0 };
+const OVER_CAP_DERIVED_USD_MICROS = 100_000_010;
+
+test('a billable attempt priced over the reservation escalates AFTER install and never settles', async () => {
+  const { outcome, store, sink } = await fireOf({
+    billingClass: 'billable',
+    usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? OVER_CAP_USAGE : pricedUsageFor(id.provider)),
+  });
+  assert.equal(outcome.kind, 'InstalledEscalated');
+  if (outcome.kind !== 'InstalledEscalated') return;
+  assert.equal(outcome.reason, 'spend_attempt_over_reservation');
+  // Identity, not membership: the exact offender — arm, role, and derived-actual — from the
+  // exact authenticated envelope, nothing else flagged.
+  assert.deepEqual(
+    outcome.offenders.map((o) => ({ ...o })),
+    [{ participantId: ANTHROPIC_ARM_ID, role: 'initial', status: 'breach', derivedActualUsdMicros: OVER_CAP_DERIVED_USD_MICROS }],
+  );
+  // The evidence durably installed FIRST: escalation is strictly post-install, and the outcome
+  // carries the exact produced artifact + the exact sink result by identity.
+  assert.equal(sink.calls.length, 1, 'the artifact durably installed before the refusal');
+  assert.strictEqual(outcome.artifact, sink.calls[0]!.arg, 'the escalated outcome carries the installed artifact');
+  assert.strictEqual(outcome.install, sink.calls[0]!.result, 'the escalated outcome carries the sink result');
+  assert.equal(outcome.install.created, true);
+  assert.doesNotThrow(() => assertFireArtifact(outcome.artifact));
+  // ...and settlement NEVER ran — the claim and its full reservation stay pending (retained).
+  assert.equal(store.completeCalls.length, 0, 'a breached fire never settles');
+});
+
+test('the guard prices at the CONSERVATIVE table, not the manifest-stamped default version', async () => {
+  // Only a provider whose rates DIFFER between the default table and the conservative guard table
+  // can observe the version wiring (the anthropic row is identical in both). Google input prices at
+  // $2/Mtok on the default table but $4/Mtok on the guard table, so 30M prompt tokens derive
+  // 60,000,000 µUSD (PASS) at the default and 120,000,000 µUSD (BREACH) at the guard table —
+  // a guard wired to the manifest's stamped version would silently settle this fire.
+  const googleArmId = CODE_ARMS.find((a) => a.provider === 'google')!.participantId;
+  const googleOverCap = { promptTokenCount: 30_000_000, candidatesTokenCount: 0, thoughtsTokenCount: 0, totalTokenCount: 30_000_000 };
+  const { outcome, store } = await fireOf({
+    billingClass: 'billable',
+    usageRawFor: (id) => (id.participantId === googleArmId ? googleOverCap : pricedUsageFor(id.provider)),
+  });
+  assert.equal(outcome.kind, 'InstalledEscalated');
+  if (outcome.kind !== 'InstalledEscalated') return;
+  assert.equal(outcome.reason, 'spend_attempt_over_reservation');
+  assert.deepEqual(
+    outcome.offenders.map((o) => ({ ...o })),
+    [{ participantId: googleArmId, role: 'initial', status: 'breach', derivedActualUsdMicros: 120_000_000 }],
+  );
+  assert.equal(store.completeCalls.length, 0, 'never settled');
+});
+
+test('a billable sent attempt with NO usage is UNKNOWN — escalates, never read as zero, never settles', async () => {
+  const { outcome, store, sink } = await fireOf({
+    billingClass: 'billable',
+    usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? null : pricedUsageFor(id.provider)),
+  });
+  assert.equal(outcome.kind, 'InstalledEscalated');
+  if (outcome.kind !== 'InstalledEscalated') return;
+  assert.equal(outcome.reason, 'spend_evidence_unknown');
+  assert.deepEqual(
+    outcome.offenders.map((o) => ({ ...o })),
+    [{ participantId: ANTHROPIC_ARM_ID, role: 'initial', status: 'unknown', derivedActualUsdMicros: null }],
+  );
+  assert.equal(sink.calls.length, 1, 'an UNKNOWN spend still installs its evidence first');
+  assert.equal(store.completeCalls.length, 0, 'an UNKNOWN spend never settles');
+});
+
+test('a billable fire priced EXACTLY at the reservation passes — the threshold is strictly greater — and settles', async () => {
+  const { outcome, store } = await fireOf({
+    billingClass: 'billable',
+    usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? AT_CAP_USAGE : pricedUsageFor(id.provider)),
+  });
+  // The bidirectional pair of the breach test above: PASS ⇒ settles (and the exact `==` boundary
+  // is accepted), BREACH ⇒ does not — both directions asserted, not just the failing one.
+  assert.equal(outcome.kind, 'Installed');
+  if (outcome.kind !== 'Installed') return;
+  assert.deepEqual(outcome.completion, { status: 'settled' });
+  assert.equal(store.completeCalls.length, 1, 'a passing billable fire settles exactly once');
+});
+
+test('the SAME over-cap-shaped usage on a known-zero fire settles clean — billing provenance decides, not shape', async () => {
+  const { outcome, store } = await fireOf({
+    billingClass: 'known-zero',
+    usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? OVER_CAP_USAGE : pricedUsageFor(id.provider)),
+  });
+  assert.equal(outcome.kind, 'Installed');
+  if (outcome.kind !== 'Installed') return;
+  assert.deepEqual(outcome.completion, { status: 'settled' });
+  assert.equal(store.completeCalls.length, 1, 'the known-zero mock path is unchanged by the guard');
+});
+
+test('an over-reservation REPAIR attempt escalates with role repair — the repair leg reaches the guard', async () => {
+  const snapshot = sealed();
+  const cohortId = snapshot.booted.cohortId;
+  const game = scopedGame(GAME_ID, BOTH);
+  const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+  const map = new Map<string, ProviderAdapter>();
+  for (const id of snapshot.expectedArmIdentities) {
+    const target = id.participantId === ANTHROPIC_ARM_ID;
+    const clean = validBody(id.participantId, id.requestedModelId, cohortId, snapshot.prepared.requestSha256, game);
+    // The target arm's INITIAL is shape-valid with a complete decision fingerprint but fails the
+    // semantic evidence check (an unknown evidenceRef) — the one class of defect a repair may fix —
+    // with clean priced usage; its REPAIR returns the clean body (fingerprint preserved) but
+    // reports over-reservation usage. Every other arm is clean throughout.
+    const bogusRef = (): string => {
+      const parsed = JSON.parse(clean) as { games: Array<{ forecasts: Array<{ evidenceRefs: string[] }> }> };
+      parsed.games[0]!.forecasts[0]!.evidenceRefs = ['ev:not-a-real-ref'];
+      return JSON.stringify(parsed);
+    };
+    const s = scriptedAdapter(id, (call) => (target && call === 1 ? bogusRef() : clean), {
+      usageRawFor: (call) => (target && call === 2 ? OVER_CAP_USAGE : pricedUsageFor(id.provider)),
+    });
+    map.set(id.participantId, s.adapter);
+  }
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  const outcome = await runOneFire({
+    snapshot,
+    adapters: map,
+    claimPort: new StoreClaimPort(store),
+    sink,
+    runOptions: runOpts(),
+    admission: ADMISSION,
+    billingClass: 'billable',
+    now: () => NOW_MS,
+  });
+  assert.equal(outcome.kind, 'InstalledEscalated');
+  if (outcome.kind !== 'InstalledEscalated') return;
+  assert.equal(outcome.reason, 'spend_attempt_over_reservation');
+  assert.deepEqual(
+    outcome.offenders.map((o) => ({ ...o })),
+    [{ participantId: ANTHROPIC_ARM_ID, role: 'repair', status: 'breach', derivedActualUsdMicros: OVER_CAP_DERIVED_USD_MICROS }],
+  );
+  assert.equal(sink.calls.length, 1, 'the escalated fire still installed its evidence');
+  assert.equal(store.completeCalls.length, 0, 'never settled');
 });
 
 // ===========================================================================
@@ -724,6 +906,7 @@ test('mutating the caller inputs while the claim is pending does not redirect th
     sink: realSink,
     runOptions: runOpts(),
     admission: { ...ADMISSION },
+    billingClass: 'known-zero',
     now: () => NOW_MS,
   };
   const outcome = await runOneFire(fireInput);
@@ -754,6 +937,7 @@ test('every ordinary NotAdmitted outcome is returned by identity with zero side 
       sink,
       runOptions: runOpts(),
       admission: ADMISSION,
+      billingClass: 'known-zero',
       now: () => NOW_MS,
     });
     assert.equal(outcome.kind, 'NotAdmitted');
@@ -783,6 +967,7 @@ test('a claim-port throw propagates unchanged with zero side effects', async () 
         sink,
         runOptions: runOpts(),
         admission: ADMISSION,
+        billingClass: 'known-zero',
         now: () => NOW_MS,
       }),
     (e) => e === sentinel,
@@ -800,7 +985,7 @@ test('an admitted narrowed scope propagates the refusal and releases every lease
   const { map, scripts } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS }),
+    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS }),
     /retained_scope_not_supported|does not|narrower/,
   );
   // Exactly the distinct initial-lease IDs are released once each — compared to the expected set,
@@ -826,7 +1011,7 @@ test('a narrowed scope whose cleanup also fails surfaces the cleanup error, inst
   // of the failures (or attempts) is caught here rather than normalized away by a sort.
   const expectedLeaseIds = snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`);
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS }),
+    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS }),
     (error: unknown) => {
       // The typed cleanup error is propagated UNCHANGED — its structured, ORDERED evidence must
       // survive, so a re-wrap that reverses the retained failures is a regression this catches.
@@ -861,7 +1046,7 @@ test('a dispatch fault propagates and installs nothing', async () => {
   const { map } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS }),
+    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS }),
     (error: unknown) => {
       // The typed dispatch fault is propagated UNCHANGED — every retained arm cause must survive in
       // roster order, so a re-wrap that reverses the causes is caught here.
@@ -899,7 +1084,7 @@ test('a producer failure after dispatch leaves leases settled and installs nothi
   const { map } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: options, admission: ADMISSION, now: () => NOW_MS }),
+    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: options, admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS }),
     /baseline/i,
   );
   assert.deepEqual([...releaseIds(store)].sort(), snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`).sort(), 'all leases already released');
@@ -1158,7 +1343,7 @@ test('settlement runs exactly once, strictly after the install resolves; a pendi
     const { map } = validAdapters(snapshot, cohortId, game);
     const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
     const d = deferredInstaller();
-    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS });
+    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS });
     await d.reached;
     assert.equal(d.installCalls(), 1, 'install reached exactly once');
     assert.equal(store.completeCalls.length, 0, 'no settle while the install promise is pending');
@@ -1175,7 +1360,7 @@ test('settlement runs exactly once, strictly after the install resolves; a pendi
     const { map } = validAdapters(snapshot, cohortId, game);
     const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
     const d = deferredInstaller();
-    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS });
+    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS });
     await d.reached;
     assert.equal(store.completeCalls.length, 0, 'no settle before the install resolves');
     const boom = new Error('durable sink unreachable');
@@ -1313,7 +1498,7 @@ test('the snapshot-derived gate wins over hostile permissive runOptions mutated 
       return port.admit(req);
     },
   };
-  const outcome = await runOneFire({ snapshot, adapters: map, claimPort: wrapped, sink, runOptions, admission: ADMISSION, now: () => LATE_NOW });
+  const outcome = await runOneFire({ snapshot, adapters: map, claimPort: wrapped, sink, runOptions, admission: ADMISSION, billingClass: 'known-zero', now: () => LATE_NOW });
   assert.equal(outcome.kind, 'Installed', 'the fire runs — every initial gated out by the snapshot operands');
   assert.equal(
     scripts.reduce((n, s) => n + s.calls, 0),
@@ -1457,6 +1642,7 @@ test('B1-R1(d): a forged/unsealed snapshot fails the brand BEFORE the gate — t
         sink,
         runOptions: runOpts(),
         admission: ADMISSION,
+        billingClass: 'known-zero',
         now: () => AT_FIRST_PITCH,
       }),
     /was not produced/,
@@ -1483,6 +1669,7 @@ test('B1-R1(e): EVERY non-finite reading (NaN, +Infinity, -Infinity) fails CLOSE
           sink,
           runOptions: runOpts(),
           admission: ADMISSION,
+          billingClass: 'known-zero',
           now: () => bad,
         }),
       (e) => e instanceof PreClaimClockError,

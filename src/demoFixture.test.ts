@@ -176,6 +176,7 @@ function tickInput(over: { claimPort: ClaimPort; sink?: CohortTickInput['sink'];
     sink: over.sink ?? new FireArtifactSink('/base', new MemoryFs()),
     runOptions: runOpts(),
     admission: { ownerId: 'demo-owner', expectedSchemaVersion: STORE_SCHEMA_VERSION },
+    billingClass: 'known-zero',
     now,
   };
 }

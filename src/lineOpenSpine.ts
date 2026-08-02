@@ -12,6 +12,9 @@ import { assertFireArtifact, buildFireArtifact } from './fireArtifactProducer.js
 import type { FireArtifactV1, FireContext, MarketFireContextV1 } from './fireArtifactProducer.js';
 import { MARKET_ORDINAL } from './fireArtifact.js';
 import { FireArtifactSink } from './fireArtifactSink.js';
+import { SPEND_GUARD_PRICE_TABLE_VERSION } from './modelPriceTable.js';
+import { computeFireSpendGuard } from './spendGuard.js';
+import type { BillingClass, GuardArmInput, SpendGuardOffender } from './spendGuard.js';
 import { deriveFireSpendReservationUsdMicros, spendReservationPolicyForVersion } from './spendReservationPolicy.js';
 import type { CohortManifestV1 } from './manifest.js';
 import type { MarketKey, ProviderAdapter } from './types.js';
@@ -156,7 +159,9 @@ export class PreClaimClockError extends Error {
  *  state. No envelope, pricing actual, or raw model response. A `CoverageMiss` is the PRE-CLAIM gate's
  *  distinct outcome (B1): a timely initial was already impossible at the authenticated pre-claim clock
  *  reading, so NO claim was taken, NO artifact produced, and NO budget consumed — the candidate becomes
- *  a coverage miss through a later independent finalizer (never routed here). */
+ *  a coverage miss through a later independent finalizer (never routed here). An `InstalledEscalated`
+ *  fire ALSO durably installed its artifact — install is unconditional once evidence exists — but the
+ *  spend guard refused settlement, so its claim/reservation is deliberately left pending. */
 export type LineOpenFireOutcome =
   | Extract<AuthorizePreparedDispatchResult, { kind: 'NotAdmitted' }>
   | {
@@ -170,6 +175,25 @@ export type LineOpenFireOutcome =
       readonly artifact: FireArtifactV1;
       readonly install: ArtifactInstallResult;
       readonly completion: CompletionStatus;
+    }
+  | {
+      /** The fire's evidence IS durably installed, but the runtime spend guard refused settlement:
+       *  at least one billable attempt priced over the per-attempt reservation
+       *  (`spend_attempt_over_reservation`), or at least one billable attempt could not be priced
+       *  with confidence (`spend_evidence_unknown` — an UNKNOWN spend escalates, never reads as
+       *  zero). The claim and its full reservation are deliberately RETAINED (never settled, never
+       *  released here), and the serial tick stops admitting further fires. The escalation is NOT
+       *  written to the store — the store cannot infer a per-attempt breach from an aggregate under
+       *  the fire reservation, so the durable evidence is the installed artifact itself; a consumer
+       *  surfaces this outcome loudly instead. */
+      readonly kind: 'InstalledEscalated';
+      readonly permit: DispatchPermit;
+      readonly artifact: FireArtifactV1;
+      readonly install: ArtifactInstallResult;
+      readonly reason: 'spend_attempt_over_reservation' | 'spend_evidence_unknown';
+      /** Every non-passing attempt, in arm order — identity, role, and (for a breach) the
+       *  conservative derived-actual that crossed the reservation. */
+      readonly offenders: readonly SpendGuardOffender[];
     };
 
 export interface RunOneFireInput {
@@ -179,6 +203,13 @@ export interface RunOneFireInput {
   readonly sink: ArtifactInstaller;
   readonly runOptions: LineOpenRunOptions;
   readonly admission: LineOpenAdmissionParameters;
+  /** Whether this fire's adapters can incur REAL provider spend — the spend guard's provenance
+   *  input. REQUIRED, never defaulted: a `known-zero` default would fail OPEN for a billable tick
+   *  (silently skipping the guard on real money), so every construction site must state it. Today
+   *  every cohort caller passes `'known-zero'` (the fire path is hard-wired to mock adapters); once
+   *  a gated real capability exists, this value must come from that unforgeable capability — not a
+   *  free caller boolean. One class per fire: the whole fire dispatches through one adapter set. */
+  readonly billingClass: BillingClass;
   /** The ONE tick clock (from `CohortTickInput.now`): the SOLE source of BOTH the projection
    *  `detectedAt` (stamped upstream by `projectPreparedFires`) and the dispatch `runnerOptions.nowMs`,
    *  so detection and the send-time V-lag gate compare against a single coherent benchmark-host clock.
@@ -419,6 +450,7 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
   const runOptions = input.runOptions;
   const ownerId = input.admission.ownerId;
   const expectedSchemaVersion = input.admission.expectedSchemaVersion;
+  const billingClass = input.billingClass;
   // The ONE tick clock, captured (like every other caller input) BEFORE the first await so a later
   // swap of `input.now` cannot redirect the dispatch. It is the sole source of the dispatch's
   // `runnerOptions.nowMs` — the SAME clock that stamped the snapshot's `detectedAt` upstream — so the
@@ -553,6 +585,33 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
   };
 
   const artifact = buildFireArtifact(envelope, ctx);
+
+  // The runtime spend guard's verdict is computed HERE — from the STILL-LIVE envelope, because the
+  // installed artifact is redacted (no `usageRaw` survives into it) — and the escalation branch is
+  // taken only AFTER the install below: a paid dispatch has already spent the money, so the artifact
+  // is the evidence of what was spent and MUST persist before this run refuses to settle. Each arm's
+  // guard identity comes from the authenticated envelope (the dispatched `ArmSpec`), never a free
+  // caller tuple; the fire's ONE `billingClass` (captured above) covers every arm. The price version
+  // is the code-owned CONSERVATIVE guard table, deliberately NOT the manifest's stamped
+  // `modelPriceTableVersion` — a hard-stop must price at the conservative rates, and a stamped
+  // manifest must not be able to weaken it — while the per-attempt cap IS the manifest's
+  // authenticated reservation constant (boot re-verifies it equals the code-owned policy value).
+  // `computeFireSpendGuard` never throws for a money ambiguity (a typed UNKNOWN from the arithmetic
+  // folds to an `unknown` verdict inside it), so no spend question can escape around the install.
+  const guardArms: GuardArmInput[] = envelope.results.map((r) => ({
+    participantId: r.arm.participantId,
+    billingClass,
+    provider: r.arm.provider,
+    requestedModelId: r.arm.requestedModelId,
+    attempt: { requestAt: r.attempt.requestAt, usageRaw: r.attempt.usageRaw },
+    repair: r.repair === null ? null : { requestAt: r.repair.requestAt, usageRaw: r.repair.usageRaw },
+  }));
+  const verdict = computeFireSpendGuard({
+    arms: guardArms,
+    priceVersion: SPEND_GUARD_PRICE_TABLE_VERSION,
+    perAttemptReservationUsdMicros: snapshot.booted.manifest.constants.providerAttemptReservationUsdMicros,
+  });
+
   const installed = await installReconciledArtifact(artifact, permit, capturedInstaller);
   // Only after the artifact is durably installed does this run settle the claim exactly once. A settle
   // refusal or throw NEVER discards the persisted artifact: it folds to a typed `unsettled` completion
@@ -561,6 +620,20 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
   // the artifact is preserved and the reservation is only ever conservatively held — never over-admitting
   // and never a blind re-settle. Install throwing/rejecting propagates BEFORE this line, so settlement
   // never runs for a fire whose evidence did not persist.
-  const completion = await settleCompletedFire(permit);
-  return { kind: 'Installed', permit, artifact, install: installed, completion };
+  if (verdict.kind === 'pass') {
+    const completion = await settleCompletedFire(permit);
+    return { kind: 'Installed', permit, artifact, install: installed, completion };
+  }
+  // BREACH or UNKNOWN: do NOT settle — the claim and its full reservation stay pending (retained),
+  // which is the conservative direction; nothing is written to the store about the escalation.
+  // The outcome is frozen here because, like a `CoverageMiss`, it is an escalation RECORD retained
+  // by reference downstream (`offenders` is already frozen by the guard).
+  return Object.freeze({
+    kind: 'InstalledEscalated' as const,
+    permit,
+    artifact,
+    install: installed,
+    reason: verdict.kind === 'breach' ? ('spend_attempt_over_reservation' as const) : ('spend_evidence_unknown' as const),
+    offenders: verdict.offenders,
+  });
 }

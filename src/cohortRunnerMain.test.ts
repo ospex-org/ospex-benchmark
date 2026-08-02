@@ -198,6 +198,8 @@ test('buildRehearsalTickInput wires a report-only claim, a no-op sink, a full ro
   assert.equal(input.runOptions.baselinePolicyVersion, 'baselines-v0.3.0');
   assert.equal(input.admission.expectedSchemaVersion, STORE_SCHEMA_VERSION);
   assert.equal(input.admission.ownerId, 'owner-x');
+  // The rehearsal's mock adapters incur no real spend — the spend guard's provenance input says so.
+  assert.equal(input.billingClass, 'known-zero');
 });
 
 test('a rehearsal tick discovers, projects one prepared candidate, and reports it as WouldAdmit', async () => {
@@ -403,6 +405,52 @@ test('B1-R4: formatTickResult renders a CoverageMiss line without throwing', () 
 test('B1-R4: installedArtifactPaths ignores a CoverageMiss (it installed no artifact)', () => {
   const result = tickResultOf([fireSummary('f1', coverageMissOutcome())]);
   assert.deepEqual(installedArtifactPaths(result), []);
+});
+
+// ---------------------------------------------------------------------------
+// Every LineOpenFireOutcome consumer handles a spend-guard escalation truthfully:
+// the fire DID durably install (its path must survive; the message must not claim
+// otherwise) but it is NOT a completed demo (nonzero), and the rendered line names
+// the escalation reason.
+// ---------------------------------------------------------------------------
+
+/** Synthesize an `InstalledEscalated` outcome. The consumers read only `outcome.kind`,
+ *  `outcome.reason`, `outcome.offenders.length`, and `outcome.install.path`. */
+const installedEscalatedOutcome = (path: string): LineOpenFireOutcome =>
+  ({
+    kind: 'InstalledEscalated',
+    install: { path, created: true },
+    reason: 'spend_attempt_over_reservation',
+    offenders: [{ participantId: 'arm-1', role: 'initial', status: 'breach', derivedActualUsdMicros: 100_000_010 }],
+  }) as unknown as LineOpenFireOutcome;
+
+test('classifyStoreFireResult rejects an escalated fire with an HONEST reason — installed, not settled', () => {
+  const result = tickResultOf([fireSummary('f1', installedEscalatedOutcome('/out/cohort/fire-a.json'))]);
+  const classification = classifyStoreFireResult(result);
+  assert.equal(classification.ok, false, 'an escalated fire is never a completed demo');
+  if (classification.ok) return;
+  // The message must not claim "installed no artifact" — the whole point of post-install
+  // escalation is that the evidence exists; what failed is settlement.
+  assert.doesNotMatch(classification.reason, /installed no artifact/);
+  assert.match(classification.reason, /spend guard refused settlement/);
+  assert.match(classification.reason, /spend_attempt_over_reservation/);
+});
+
+test('formatTickResult renders an escalated fire as an escalation with its reason', () => {
+  const result = tickResultOf([fireSummary('f1', installedEscalatedOutcome('/out/cohort/fire-a.json'))]);
+  const lines = formatTickResult(result);
+  assert.ok(
+    lines.some((l) => /InstalledEscalated\/spend_attempt_over_reservation/.test(l)),
+    'the escalation reason renders on the fire-outcome line',
+  );
+});
+
+test('installedArtifactPaths KEEPS an escalated fire path — its evidence durably installed', () => {
+  const result = tickResultOf([
+    fireSummary('f1', installedSettledOutcome('/out/cohort/fire-a.json')),
+    fireSummary('f2', installedEscalatedOutcome('/out/cohort/fire-b.json')),
+  ]);
+  assert.deepEqual(installedArtifactPaths(result), ['/out/cohort/fire-a.json', '/out/cohort/fire-b.json']);
 });
 
 test('B1-R4: runStoreBackedFire exits nonzero for a CoverageMiss tick (classifier wired to the exit)', async () => {

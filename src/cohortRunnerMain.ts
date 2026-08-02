@@ -245,6 +245,8 @@ export function buildRehearsalTickInput(params: RehearsalTickParams): CohortTick
     sink: NO_OP_SINK,
     runOptions: deriveRunOptions(booted.manifest),
     admission: { ownerId: params.ownerId, expectedSchemaVersion: STORE_SCHEMA_VERSION },
+    // Mock adapters incur no real provider spend; the rehearsal never dispatches at all.
+    billingClass: 'known-zero',
     now: params.now,
   };
 }
@@ -260,6 +262,10 @@ function describeOutcome(outcome: LineOpenFireOutcome): string {
       return outcome.completion.status === 'settled'
         ? 'Installed/settled'
         : `Installed/unsettled(${outcome.completion.reason})`;
+    case 'InstalledEscalated':
+      // An escalation, not a success: the artifact IS durably installed, but the spend guard
+      // refused settlement and the tick stopped admitting. Name the reason and every offender.
+      return `InstalledEscalated/${outcome.reason} (${outcome.offenders.length} offending attempt(s))`;
     case 'CoverageMiss':
       return `CoverageMiss/${outcome.reason}`;
     case 'NotAdmitted': {
@@ -291,12 +297,16 @@ export function formatTickResult(result: CohortTickResult): string[] {
   return lines;
 }
 
-/** The durable path of every fire this tick actually installed (an `Installed` outcome carries
- *  the canonical artifact path). Empty when nothing admitted. */
+/** The durable path of every fire this tick actually installed. BOTH installed kinds carry one:
+ *  a clean `Installed`, and an `InstalledEscalated` — the whole point of post-install escalation
+ *  is that the evidence durably exists, so dropping the escalated fire's path here would erase
+ *  exactly the artifact an operator most needs to find. Empty when nothing installed. */
 export function installedArtifactPaths(result: CohortTickResult): string[] {
   const paths: string[] = [];
   for (const f of result.fireOutcomes) {
-    if (f.outcome.kind === 'Installed') paths.push(f.outcome.install.path);
+    if (f.outcome.kind === 'Installed' || f.outcome.kind === 'InstalledEscalated') {
+      paths.push(f.outcome.install.path);
+    }
   }
   return paths;
 }
@@ -322,6 +332,15 @@ export function classifyStoreFireResult(
     return { ok: false, reason: `expected exactly one fire, got ${outcomes.length}` };
   }
   const only = outcomes[0]!;
+  if (only.outcome.kind === 'InstalledEscalated') {
+    // Loud and non-clean, with an honest message: the artifact DID durably install — what failed
+    // is settlement, refused by the spend guard. This branch is the store/`runner:fire` path's
+    // nonzero-exit owner for an escalation.
+    return {
+      ok: false,
+      reason: `the fire installed its evidence but the spend guard refused settlement: ${describeOutcome(only.outcome)}`,
+    };
+  }
   if (only.outcome.kind !== 'Installed') {
     return { ok: false, reason: `the fire installed no artifact: ${describeOutcome(only.outcome)}` };
   }
@@ -450,6 +469,8 @@ export async function runStoreBackedFire(
       sink: new FireArtifactSink(outDir),
       runOptions: deriveRunOptions(booted.manifest),
       admission: { ownerId, expectedSchemaVersion: STORE_SCHEMA_VERSION },
+      // The store-backed fixture fire dispatches through mock adapters — zero real spend.
+      billingClass: 'known-zero',
       now,
     };
     printLine(`dispatching the synthetic fire (mock adapters, artifacts → ${outDir}) ...`);

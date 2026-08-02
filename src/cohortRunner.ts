@@ -16,6 +16,7 @@ import type {
   LineOpenFireOutcome,
   LineOpenRunOptions,
 } from './lineOpenSpine.js';
+import type { BillingClass } from './spendGuard.js';
 import type { MarketKey, ProviderAdapter } from './types.js';
 
 /**
@@ -51,6 +52,12 @@ export interface CohortTickInput {
   readonly sink: ArtifactInstaller;
   readonly runOptions: LineOpenRunOptions;
   readonly admission: LineOpenAdmissionParameters;
+  /** Whether this tick's adapters can incur REAL provider spend (the spend guard's provenance
+   *  input, threaded to every fire). REQUIRED so a billable tick can never silently default to
+   *  "skip the guard" — every construction site states it. Today every caller passes
+   *  `'known-zero'`: the cohort fire path is hard-wired to mock adapters, and a gated real
+   *  capability (which will own this value) does not exist yet. */
+  readonly billingClass: BillingClass;
   /** ONE injected clock for the tick; also drives `projectPreparedFires`'s detection/seal reads. */
   readonly now: () => number;
   /** Optional observability hook, called once per attempted fire. */
@@ -84,6 +91,8 @@ export interface FireOutcomeSummary {
  * dispatch budget stopped short of), and the count of newly-admitted (`Installed`) fires. A
  * `fireOutcomes` entry is an evaluated fire, NOT necessarily an attempted/claimed one: a pre-claim
  * `CoverageMiss` is evaluated and reported here but takes no claim and consumes none of the budget.
+ * An `InstalledEscalated` fire appears in `fireOutcomes` (with its installed evidence) but is NOT
+ * in `admittedCount`, and it is always the LAST entry — the loop stops admitting after it.
  */
 export interface CohortTickResult {
   readonly discoveredCount: number;
@@ -102,6 +111,10 @@ function describeOutcome(outcome: LineOpenFireOutcome): string {
       return outcome.completion.status === 'settled'
         ? 'Installed/settled'
         : `Installed/unsettled(${outcome.completion.reason})`;
+    case 'InstalledEscalated':
+      // An escalation, not a success: the artifact IS durably installed, but the spend guard
+      // refused settlement and the tick stops admitting. Name the reason and every offender.
+      return `InstalledEscalated/${outcome.reason} (${outcome.offenders.length} offending attempt(s))`;
     case 'CoverageMiss':
       return `CoverageMiss/${outcome.reason}`;
     case 'NotAdmitted': {
@@ -143,6 +156,7 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
     sink,
     runOptions,
     admission,
+    billingClass,
     now,
     onStatus,
   } = input;
@@ -181,7 +195,7 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
   let admittedCount = 0;
   for (const fire of fires) {
     if (admittedCount >= maxDispatchesPerTick) break;
-    const outcome = await runOneFire({ snapshot: fire, adapters, claimPort, sink, runOptions, admission, now });
+    const outcome = await runOneFire({ snapshot: fire, adapters, claimPort, sink, runOptions, admission, billingClass, now });
     // Single-market fires: the fire's sole proposed market is `proposedMarkets[0]`. The full typed
     // outcome is retained by reference and the summary is only SHALLOW-frozen — `deepFreeze` would
     // re-traverse the spine's already-frozen/branded outcome graph (artifact / permit / any
@@ -195,6 +209,11 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
     fireOutcomes.push(summary);
     if (outcome.kind === 'Installed') admittedCount += 1;
     onStatus?.(`fire ${summary.fireId} (${summary.gameId} ${summary.market}): ${describeOutcome(outcome)}`);
+    // A spend-guard escalation STOPS the tick: an over-reservation or unpriceable attempt means the
+    // spend model is not holding, so no further serial fire may be admitted this tick. The escalated
+    // fire's summary is already retained above (by reference, with its installed evidence) and it is
+    // deliberately NOT counted as an admission — it is not a clean one.
+    if (outcome.kind === 'InstalledEscalated') break;
   }
 
   // Shallow-freeze only: each summary is already frozen above, `dispositions` is already deep-frozen
