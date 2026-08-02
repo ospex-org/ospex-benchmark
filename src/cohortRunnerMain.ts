@@ -15,7 +15,7 @@ import { RehearsalClaimPort, StoreClaimPort } from './lineOpenClaim.js';
 import { createDiscoverFn, createReadMarketEvidenceFn } from './lineOpenRead.js';
 import { parseManifest } from './manifest.js';
 import { checkPublication } from './manifestPublication.js';
-import { createMockAdapters } from './mock.js';
+import { createCohortMockAdapterCapability } from './cohortAdapterCapability.js';
 import { buildRehearsalManifest } from './rehearsalManifest.js';
 import { SqlAtomicStore, pgStoreQuery } from './store/atomicStore.js';
 import { STORE_SCHEMA_VERSION } from './store/constants.js';
@@ -210,6 +210,9 @@ const NO_OP_SINK: ArtifactInstaller = {
   install() {
     throw new Error('rehearsal installs no artifact — the claim port never admits a dispatch');
   },
+  installSpendEscalationSidecar() {
+    throw new Error('rehearsal installs no sidecar — the claim port never admits a dispatch');
+  },
 };
 
 export interface RehearsalTickParams {
@@ -241,12 +244,12 @@ export function buildRehearsalTickInput(params: RehearsalTickParams): CohortTick
     discover: createDiscoverFn(params.config),
     readMarketEvidence: createReadMarketEvidenceFn(params.config),
     claimPort: new RehearsalClaimPort(),
-    adapters: createMockAdapters({ simulateCollision: false }),
+    // The production capability producer constructs its OWN mock adapters (known-zero) —
+    // no raw map, no caller-supplied billing label; the rehearsal never dispatches at all.
+    capability: createCohortMockAdapterCapability({ simulateCollision: false }),
     sink: NO_OP_SINK,
     runOptions: deriveRunOptions(booted.manifest),
     admission: { ownerId: params.ownerId, expectedSchemaVersion: STORE_SCHEMA_VERSION },
-    // Mock adapters incur no real provider spend; the rehearsal never dispatches at all.
-    billingClass: 'known-zero',
     now: params.now,
   };
 }
@@ -292,6 +295,10 @@ export function formatTickResult(result: CohortTickResult): string[] {
   lines.push(`fire outcomes (${result.fireOutcomes.length}):`);
   for (const f of result.fireOutcomes) {
     lines.push(`  fire ${f.fireId} (${f.gameId} ${f.market}): ${describeOutcome(f.outcome)}`);
+    if (f.outcome.kind === 'InstalledEscalated') {
+      // The operator report carries the durable escalation evidence: sidecar path + hash.
+      lines.push(`    sidecar: ${f.outcome.sidecar.path} sha256 ${f.outcome.sidecar.sha256}`);
+    }
   }
   lines.push(`admitted ${result.admittedCount} fire(s)`);
   return lines;
@@ -465,12 +472,12 @@ export async function runStoreBackedFire(
       discover: fixture.discover,
       readMarketEvidence: fixture.readMarketEvidence,
       claimPort: new StoreClaimPort(store),
-      adapters: createMockAdapters({ simulateCollision: false }),
+      // The store-backed fixture fire dispatches through the production mock capability —
+      // producer-constructed adapters, known-zero provenance, zero real spend.
+      capability: createCohortMockAdapterCapability({ simulateCollision: false }),
       sink: new FireArtifactSink(outDir),
       runOptions: deriveRunOptions(booted.manifest),
       admission: { ownerId, expectedSchemaVersion: STORE_SCHEMA_VERSION },
-      // The store-backed fixture fire dispatches through mock adapters — zero real spend.
-      billingClass: 'known-zero',
       now,
     };
     printLine(`dispatching the synthetic fire (mock adapters, artifacts → ${outDir}) ...`);

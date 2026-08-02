@@ -6,12 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
-import { StoreClaimPort } from './lineOpenClaim.js';
+import { assertDispatchPermit, StoreClaimPort } from './lineOpenClaim.js';
 import type { DispatchPermit } from './lineOpenClaim.js';
 import { DispatchAuthorizationError, PreDispatchCleanupError, scopeKeyOf } from './lineOpenDispatch.js';
 import { AuthorizedDispatchFaultError } from './runner.js';
 import { LifecycleFaultError } from './lineOpenLifecycle.js';
 import {
+  BillablePriceIdentityError,
   buildFullScopeAdmitRequest,
   deriveSpendReservationUsdMicros,
   FireReconciliationError,
@@ -19,6 +20,7 @@ import {
   PreClaimClockError,
   reconcileArtifactToPermit,
   runOneFire,
+  SpendGuardInternalError,
 } from './lineOpenSpine.js';
 import type { ArtifactInstaller, ArtifactInstallResult, CoverageMissReason, LineOpenAdmissionParameters, LineOpenRunOptions, RunOneFireInput } from './lineOpenSpine.js';
 import type { DeferReason, RejectReason } from './lineOpenProject.js';
@@ -37,6 +39,11 @@ import { sealPreparedFire } from './preparedFire.js';
 import type { PreparedFireSnapshot } from './preparedFire.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
+import { mintInjectedAdapterCapability } from './cohortAdapterCapability.js';
+import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
+import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
+import { serializeSpendEscalationSidecar, spendEscalationSidecarSha256 } from './spendEscalationSidecar.js';
+import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
 import type { BillingClass } from './spendGuard.js';
 import type { CandidateInput } from './detection.js';
 import type { TwoSidedHistoryRow } from './oddsHistory.js';
@@ -383,14 +390,35 @@ const ADMISSION = { ownerId: OWNER, expectedSchemaVersion: SCHEMA } as const;
 const releaseIds = (store: ScriptedStore): string[] =>
   store.calls.filter((c): c is Extract<StoreCall, { op: 'release' }> => c.op === 'release').map((c) => c.leaseId);
 
+/** Mint a known-zero capability around scripted test adapters (the injected-fixture producer). */
+function knownZeroCap(adapters: ReadonlyMap<string, ProviderAdapter>): CohortAdapterCapability {
+  return mintInjectedAdapterCapability({ adapters, billingClass: 'known-zero' });
+}
+
+/** The v2 price pin a BILLABLE fire's manifest must carry (the billable price-identity gate). */
+const V2_PIN = {
+  modelPriceTableVersion: SPEND_GUARD_PRICE_TABLE_VERSION,
+  modelPriceTableDigest: modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION),
+} as const;
+
 /** An installer spy that delegates to a real sink and records each call + result. */
-function countingSink(real: ArtifactInstaller): ArtifactInstaller & { calls: Array<{ arg: FireArtifactV1; result: ReturnType<ArtifactInstaller['install']> }> } {
+function countingSink(real: ArtifactInstaller): ArtifactInstaller & {
+  calls: Array<{ arg: FireArtifactV1; result: ReturnType<ArtifactInstaller['install']> }>;
+  sidecarCalls: Array<{ arg: SpendEscalationSidecarV1; result: ReturnType<ArtifactInstaller['install']> }>;
+} {
   const calls: Array<{ arg: FireArtifactV1; result: ReturnType<ArtifactInstaller['install']> }> = [];
+  const sidecarCalls: Array<{ arg: SpendEscalationSidecarV1; result: ReturnType<ArtifactInstaller['install']> }> = [];
   return {
     calls,
+    sidecarCalls,
     install(artifact) {
       const result = real.install(artifact);
       calls.push({ arg: artifact, result });
+      return result;
+    },
+    installSpendEscalationSidecar(sidecar) {
+      const result = real.installSpendEscalationSidecar(sidecar);
+      sidecarCalls.push({ arg: sidecar, result });
       return result;
     },
   };
@@ -419,6 +447,9 @@ function deferredInstaller(): {
       });
       signalReached();
       return pending;
+    },
+    installSpendEscalationSidecar() {
+      throw new Error('deferred installer fixture: no escalation is expected on this path');
     },
   };
   return { installer, reached, resolve: (r) => resolveFn(r), reject: (e) => rejectFn(e), installCalls: () => installCalls };
@@ -452,12 +483,11 @@ async function fireOf(
   const sink = countingSink(new FireArtifactSink('/base', opts.fs ?? new MemoryFs()));
   const outcome = await runOneFire({
     snapshot,
-    adapters: map,
+    capability: mintInjectedAdapterCapability({ adapters: map, billingClass: opts.billingClass ?? 'known-zero' }),
     claimPort: new StoreClaimPort(store),
     sink,
     runOptions: opts.runOptions ?? runOpts(),
     admission: ADMISSION,
-    billingClass: opts.billingClass ?? 'known-zero',
     now: opts.now ?? (() => NOW_MS),
   });
   return { outcome, store, snapshot, scripts, sink };
@@ -590,6 +620,7 @@ const OVER_CAP_DERIVED_USD_MICROS = 100_000_010;
 test('a billable attempt priced over the reservation escalates AFTER install and never settles', async () => {
   const { outcome, store, sink } = await fireOf({
     billingClass: 'billable',
+    manifestExtra: V2_PIN,
     usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? OVER_CAP_USAGE : pricedUsageFor(id.provider)),
   });
   assert.equal(outcome.kind, 'InstalledEscalated');
@@ -612,16 +643,19 @@ test('a billable attempt priced over the reservation escalates AFTER install and
   assert.equal(store.completeCalls.length, 0, 'a breached fire never settles');
 });
 
-test('the guard prices at the CONSERVATIVE table, not the manifest-stamped default version', async () => {
-  // Only a provider whose rates DIFFER between the default table and the conservative guard table
-  // can observe the version wiring (the anthropic row is identical in both). Google input prices at
-  // $2/Mtok on the default table but $4/Mtok on the guard table, so 30M prompt tokens derive
-  // 60,000,000 µUSD (PASS) at the default and 120,000,000 µUSD (BREACH) at the guard table —
-  // a guard wired to the manifest's stamped version would silently settle this fire.
+test('the guard prices at the CONSERVATIVE table the billable manifest pinned', async () => {
+  // Only a provider whose rates DIFFER between the default replay table and the conservative
+  // guard table can observe the version wiring (the anthropic row is identical in both). Google
+  // input prices at $2/Mtok on the default table but $4/Mtok on the guard table, so 30M prompt
+  // tokens derive 60,000,000 µUSD (PASS) at the default and 120,000,000 µUSD (BREACH) at the
+  // guard table — a guard priced at the cheaper table would silently settle this fire. The
+  // manifest here pins the guard table (the billable price-identity gate requires it), so the
+  // authenticated identity and the judged identity agree.
   const googleArmId = CODE_ARMS.find((a) => a.provider === 'google')!.participantId;
   const googleOverCap = { promptTokenCount: 30_000_000, candidatesTokenCount: 0, thoughtsTokenCount: 0, totalTokenCount: 30_000_000 };
   const { outcome, store } = await fireOf({
     billingClass: 'billable',
+    manifestExtra: V2_PIN,
     usageRawFor: (id) => (id.participantId === googleArmId ? googleOverCap : pricedUsageFor(id.provider)),
   });
   assert.equal(outcome.kind, 'InstalledEscalated');
@@ -637,6 +671,7 @@ test('the guard prices at the CONSERVATIVE table, not the manifest-stamped defau
 test('a billable sent attempt with NO usage is UNKNOWN — escalates, never read as zero, never settles', async () => {
   const { outcome, store, sink } = await fireOf({
     billingClass: 'billable',
+    manifestExtra: V2_PIN,
     usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? null : pricedUsageFor(id.provider)),
   });
   assert.equal(outcome.kind, 'InstalledEscalated');
@@ -653,6 +688,7 @@ test('a billable sent attempt with NO usage is UNKNOWN — escalates, never read
 test('a billable fire priced EXACTLY at the reservation passes — the threshold is strictly greater — and settles', async () => {
   const { outcome, store } = await fireOf({
     billingClass: 'billable',
+    manifestExtra: V2_PIN,
     usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? AT_CAP_USAGE : pricedUsageFor(id.provider)),
   });
   // The bidirectional pair of the breach test above: PASS ⇒ settles (and the exact `==` boundary
@@ -675,7 +711,7 @@ test('the SAME over-cap-shaped usage on a known-zero fire settles clean — bill
 });
 
 test('an over-reservation REPAIR attempt escalates with role repair — the repair leg reaches the guard', async () => {
-  const snapshot = sealed();
+  const snapshot = sealed({ manifestExtra: V2_PIN });
   const cohortId = snapshot.booted.cohortId;
   const game = scopedGame(GAME_ID, BOTH);
   const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
@@ -700,12 +736,11 @@ test('an over-reservation REPAIR attempt escalates with role repair — the repa
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   const outcome = await runOneFire({
     snapshot,
-    adapters: map,
+    capability: mintInjectedAdapterCapability({ adapters: map, billingClass: 'billable' }),
     claimPort: new StoreClaimPort(store),
     sink,
     runOptions: runOpts(),
     admission: ADMISSION,
-    billingClass: 'billable',
     now: () => NOW_MS,
   });
   assert.equal(outcome.kind, 'InstalledEscalated');
@@ -717,6 +752,242 @@ test('an over-reservation REPAIR attempt escalates with role repair — the repa
   );
   assert.equal(sink.calls.length, 1, 'the escalated fire still installed its evidence');
   assert.equal(store.completeCalls.length, 0, 'never settled');
+  // The durable sidecar records the REPAIR leg with its over-cap token buckets.
+  const repairEntry = sink.sidecarCalls[0]!.arg.attempts.find(
+    (a) => a.participantId === ANTHROPIC_ARM_ID && a.role === 'repair',
+  );
+  assert.deepEqual({ ...repairEntry?.usageTokens }, { input_tokens: 10_000_001, output_tokens: 0 });
+  assert.equal(repairEntry?.status, 'breach');
+});
+
+test('a BILLABLE fire under a manifest that does not pin the guard price table refuses PRE-CLAIM', async () => {
+  // The billable price-identity gate: money may only be judged under the price identity the
+  // authenticated cohort precommitted to. The default fixture manifest pins the replay table,
+  // so a billable fire under it must refuse BEFORE any claim — zero admissions, zero installs,
+  // zero adapter calls, zero spend.
+  const snapshot = sealed(); // default manifest: the replay table, NOT the guard table
+  const cohortId = snapshot.booted.cohortId;
+  const game = scopedGame(GAME_ID, BOTH);
+  const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+  const { map, scripts } = validAdapters(snapshot, cohortId, game);
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  await assert.rejects(
+    () =>
+      runOneFire({
+        snapshot,
+        capability: mintInjectedAdapterCapability({ adapters: map, billingClass: 'billable' }),
+        claimPort: new StoreClaimPort(store),
+        sink,
+        runOptions: runOpts(),
+        admission: ADMISSION,
+        now: () => NOW_MS,
+      }),
+    (e) => e instanceof BillablePriceIdentityError,
+  );
+  assert.equal(store.admitCalls.length, 0, 'refused before any claim');
+  assert.equal(sink.calls.length, 0, 'nothing installed');
+  assert.equal(scripts.reduce((n, s) => n + s.calls, 0), 0, 'zero adapter calls');
+  // Negative control: the SAME manifest is fine for a known-zero fire (existing suites run it
+  // throughout); the gate is billable-only.
+});
+
+test('an escalated outcome carries NO live settlement authority — no permit, nothing that settles', async () => {
+  const { outcome } = await fireOf({
+    billingClass: 'billable',
+    manifestExtra: V2_PIN,
+    usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? OVER_CAP_USAGE : pricedUsageFor(id.provider)),
+  });
+  assert.equal(outcome.kind, 'InstalledEscalated');
+  if (outcome.kind !== 'InstalledEscalated') return;
+  // Type-level: the member has no `permit`. Runtime: no own property of the outcome — at any
+  // top-level position — authenticates as a DispatchPermit, so a caller holding this record
+  // cannot resolve a completion capability from it.
+  assert.ok(!('permit' in outcome), 'the escalated outcome exposes no permit key');
+  for (const [key, value] of Object.entries(outcome)) {
+    assert.throws(
+      () => assertDispatchPermit(value as unknown as DispatchPermit),
+      `outcome.${key} must not authenticate as a permit`,
+    );
+  }
+  // The record is frozen — a consumer cannot graft settlement authority onto it either.
+  assert.ok(Object.isFrozen(outcome));
+});
+
+test('a NON-money guard fault installs the artifact FIRST, then surfaces loudly with the cause and path', async () => {
+  // A hostile/buggy usage object whose token field THROWS a plain error when read: the guard's
+  // contract is to rethrow non-money faults, and before this seam existed that throw escaped
+  // BETWEEN dispatch and install — losing the paid attempt's canonical evidence. Now the
+  // artifact must durably install before the fault surfaces, settlement must never run, and
+  // the typed error must carry the original cause plus the installed path.
+  const sentinel = new Error('unexpected adapter/guard bug after a response');
+  // NON-enumerable: an enumerating walker (spread / JSON / entries) elsewhere in the pipeline
+  // never touches it, but the guard's arithmetic reads the token field by DIRECT keyed access
+  // (after an Object.hasOwn check, which sees non-enumerable own keys) — so the fault fires
+  // exactly at guard evaluation, the case this seam exists for.
+  const faultingUsage = Object.defineProperty({ output_tokens: 0 }, 'input_tokens', {
+    enumerable: false,
+    get() {
+      throw sentinel;
+    },
+  });
+  const snapshot = sealed({ manifestExtra: V2_PIN });
+  const cohortId = snapshot.booted.cohortId;
+  const game = scopedGame(GAME_ID, BOTH);
+  const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+  const { map } = validAdapters(snapshot, cohortId, game, (id) =>
+    id.participantId === ANTHROPIC_ARM_ID ? faultingUsage : pricedUsageFor(id.provider),
+  );
+  const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+  await assert.rejects(
+    () =>
+      runOneFire({
+        snapshot,
+        capability: mintInjectedAdapterCapability({ adapters: map, billingClass: 'billable' }),
+        claimPort: new StoreClaimPort(store),
+        sink,
+        runOptions: runOpts(),
+        admission: ADMISSION,
+        now: () => NOW_MS,
+      }),
+    (e) => {
+      if (!(e instanceof SpendGuardInternalError)) return false;
+      assert.strictEqual(e.cause, sentinel, 'the original fault is preserved as the cause');
+      assert.equal(e.installedArtifactPath, (sink.calls[0]!.result as { path: string }).path);
+      return true;
+    },
+  );
+  assert.equal(sink.calls.length, 1, 'the paid-attempt artifact durably installed BEFORE the fault surfaced');
+  assert.equal(store.completeCalls.length, 0, 'a guard fault never settles');
+  assert.equal(sink.sidecarCalls.length, 0, 'no verdict was reached, so no sidecar');
+});
+
+test('the escalation sidecar is durable, identity-bound, recomputable, and hashed into the outcome', async () => {
+  const { outcome, sink } = await fireOf({
+    billingClass: 'billable',
+    manifestExtra: V2_PIN,
+    usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? OVER_CAP_USAGE : pricedUsageFor(id.provider)),
+  });
+  assert.equal(outcome.kind, 'InstalledEscalated');
+  if (outcome.kind !== 'InstalledEscalated') return;
+
+  assert.equal(sink.sidecarCalls.length, 1, 'exactly one durable sidecar install');
+  const record = sink.sidecarCalls[0]!.arg;
+  // Identity binds to the EXACT installed artifact.
+  assert.equal(record.cohortId, outcome.artifact.cohortId);
+  assert.equal(record.fireId, outcome.artifact.fireId);
+  assert.equal(record.runId, outcome.artifact.runId);
+  assert.equal(record.gameId, outcome.artifact.gameId);
+  assert.equal(record.requestSha256, outcome.artifact.requestSha256);
+  assert.deepEqual([...record.scopedMarkets], [...outcome.artifact.scopedMarkets]);
+  // The judged price identity + cap are pinned durably.
+  assert.equal(record.reason, 'spend_attempt_over_reservation');
+  assert.equal(record.priceVersion, SPEND_GUARD_PRICE_TABLE_VERSION);
+  assert.equal(record.priceTableDigest, modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION));
+  assert.equal(record.perAttemptReservationUsdMicros, 100_000_000);
+  // The offending attempt's raw token buckets survive, redacted to counts.
+  const offender = record.attempts.find((a) => a.participantId === ANTHROPIC_ARM_ID && a.role === 'initial');
+  assert.deepEqual({ ...offender?.usageTokens }, { input_tokens: 10_000_001, output_tokens: 0 });
+  assert.equal(offender?.status, 'breach');
+  assert.equal(offender?.spendClass, 'price');
+  assert.equal(offender?.derivedActualUsdMicros, 100_000_010);
+  assert.equal(typeof offender?.requestAt, 'string', 'the sent fact is recorded');
+  // A PASSING attempt is recorded too — the whole-fire verdict is recomputable from the record.
+  const passing = record.attempts.find((a) => a.provider === 'openai' && a.role === 'initial');
+  assert.equal(passing?.status, 'pass');
+  assert.equal(passing?.spendClass, 'price');
+  assert.deepEqual({ ...passing?.usageTokens }, { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 });
+  // The outcome's hash is the hash of the EXACT record the sink installed, and the path is the
+  // sink's durable result beside the artifact.
+  assert.equal(outcome.sidecar.sha256, spendEscalationSidecarSha256(record));
+  assert.equal(outcome.sidecar.path, (sink.sidecarCalls[0]!.result as { path: string }).path);
+  assert.equal(outcome.sidecar.created, true);
+  assert.match(outcome.sidecar.path, /-spend\.json$/);
+  assert.notEqual(outcome.sidecar.path, outcome.install.path, 'a separately named durable record');
+});
+
+test('the sidecar is token-count-only: content-bearing fields in usageRaw never reach the durable bytes', async () => {
+  const poisoned = {
+    input_tokens: 10_000_001,
+    output_tokens: 0,
+    secret_note: 'THE-RAW-CONTENT-MARKER',
+    nested: { prompt_excerpt: 'ANOTHER-CONTENT-MARKER' },
+  };
+  const { outcome, sink } = await fireOf({
+    billingClass: 'billable',
+    manifestExtra: V2_PIN,
+    usageRawFor: (id) => (id.participantId === ANTHROPIC_ARM_ID ? poisoned : pricedUsageFor(id.provider)),
+  });
+  assert.equal(outcome.kind, 'InstalledEscalated');
+  const bytes = serializeSpendEscalationSidecar(sink.sidecarCalls[0]!.arg);
+  assert.ok(!bytes.includes('THE-RAW-CONTENT-MARKER'), 'unlisted string fields are never persisted');
+  assert.ok(!bytes.includes('ANOTHER-CONTENT-MARKER'), 'nested content is never persisted');
+  const offender = sink.sidecarCalls[0]!.arg.attempts.find((a) => a.participantId === ANTHROPIC_ARM_ID);
+  assert.deepEqual({ ...offender?.usageTokens }, { input_tokens: 10_000_001, output_tokens: 0 });
+});
+
+test('the sidecar install is atomic no-clobber: identical bytes are idempotent, different bytes fail loud', async () => {
+  const fs = new MemoryFs();
+  const sink = new FireArtifactSink('/base', fs);
+  const record: SpendEscalationSidecarV1 = {
+    sidecarSchemaVersion: 1,
+    cohortId: 'a'.repeat(64),
+    fireId: 'b'.repeat(64),
+    runId: 'c'.repeat(64),
+    gameId: GAME_ID,
+    scopedMarkets: ['moneyline', 'total'],
+    requestSha256: 'd'.repeat(64),
+    reason: 'spend_attempt_over_reservation',
+    priceVersion: SPEND_GUARD_PRICE_TABLE_VERSION,
+    priceTableDigest: modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION),
+    perAttemptReservationUsdMicros: 100_000_000,
+    attempts: [],
+  };
+  const first = sink.installSpendEscalationSidecar(record);
+  assert.equal(first.created, true);
+  assert.equal(fs.readFile(first.path).toString('utf8'), serializeSpendEscalationSidecar(record));
+  // An exact-byte retry is idempotent...
+  const retry = sink.installSpendEscalationSidecar(record);
+  assert.deepEqual(retry, { path: first.path, created: false });
+  // ...and a byte-different record at the same identity fails loud, never overwriting.
+  const different = { ...record, perAttemptReservationUsdMicros: 200_000_000 };
+  assert.throws(
+    () => sink.installSpendEscalationSidecar(different),
+    /refusing to overwrite a byte-different spend escalation sidecar/,
+  );
+  assert.equal(fs.readFile(first.path).toString('utf8'), serializeSpendEscalationSidecar(record), 'original bytes intact');
+});
+
+test('the fire seam rejects a raw adapter map, a structural lookalike, and a copied capability', async () => {
+  const snapshot = sealed();
+  const cohortId = snapshot.booted.cohortId;
+  const game = scopedGame(GAME_ID, BOTH);
+  const { map } = validAdapters(snapshot, cohortId, game);
+  const genuine = knownZeroCap(map);
+  const impostors: Array<[string, unknown]> = [
+    ['raw adapter map', map],
+    ['structural lookalike', { billingClass: 'known-zero', adapters: () => new Map(map) }],
+    ['spread copy of a genuine capability', { ...genuine }],
+  ];
+  for (const [label, impostor] of impostors) {
+    const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+    const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
+    await assert.rejects(
+      () =>
+        runOneFire({
+          snapshot,
+          capability: impostor as CohortAdapterCapability,
+          claimPort: new StoreClaimPort(store),
+          sink,
+          runOptions: runOpts(),
+          admission: ADMISSION,
+          now: () => NOW_MS,
+        }),
+      /not a minted cohort adapter capability/,
+      `${label} must fail the brand`,
+    );
+    assert.equal(store.admitCalls.length, 0, `${label}: rejected before any admission`);
+    assert.equal(sink.calls.length, 0, `${label}: nothing installed`);
+  }
 });
 
 // ===========================================================================
@@ -891,7 +1162,7 @@ test('mutating the caller inputs while the claim is pending does not redirect th
   // use the references it captured BEFORE the first await, not these later swaps.
   const fireInput: RunOneFireInput = {
     snapshot,
-    adapters: map,
+    capability: knownZeroCap(map),
     claimPort: {
       admit(req: AdmitDispatchRequest) {
         (realSink as { install: unknown }).install = () => {
@@ -906,7 +1177,6 @@ test('mutating the caller inputs while the claim is pending does not redirect th
     sink: realSink,
     runOptions: runOpts(),
     admission: { ...ADMISSION },
-    billingClass: 'known-zero',
     now: () => NOW_MS,
   };
   const outcome = await runOneFire(fireInput);
@@ -932,12 +1202,11 @@ test('every ordinary NotAdmitted outcome is returned by identity with zero side 
     const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
     const outcome = await runOneFire({
       snapshot,
-      adapters: map,
+      capability: knownZeroCap(map),
       claimPort: { admit: () => Promise.resolve(claimOutcome) },
       sink,
       runOptions: runOpts(),
       admission: ADMISSION,
-      billingClass: 'known-zero',
       now: () => NOW_MS,
     });
     assert.equal(outcome.kind, 'NotAdmitted');
@@ -962,12 +1231,11 @@ test('a claim-port throw propagates unchanged with zero side effects', async () 
     () =>
       runOneFire({
         snapshot,
-        adapters: map,
+        capability: knownZeroCap(map),
         claimPort: { admit: () => Promise.reject(sentinel) },
         sink,
         runOptions: runOpts(),
         admission: ADMISSION,
-        billingClass: 'known-zero',
         now: () => NOW_MS,
       }),
     (e) => e === sentinel,
@@ -985,7 +1253,7 @@ test('an admitted narrowed scope propagates the refusal and releases every lease
   const { map, scripts } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS }),
+    () => runOneFire({ snapshot, capability: knownZeroCap(map), claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS }),
     /retained_scope_not_supported|does not|narrower/,
   );
   // Exactly the distinct initial-lease IDs are released once each — compared to the expected set,
@@ -1011,7 +1279,7 @@ test('a narrowed scope whose cleanup also fails surfaces the cleanup error, inst
   // of the failures (or attempts) is caught here rather than normalized away by a sort.
   const expectedLeaseIds = snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`);
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS }),
+    () => runOneFire({ snapshot, capability: knownZeroCap(map), claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS }),
     (error: unknown) => {
       // The typed cleanup error is propagated UNCHANGED — its structured, ORDERED evidence must
       // survive, so a re-wrap that reverses the retained failures is a regression this catches.
@@ -1046,7 +1314,7 @@ test('a dispatch fault propagates and installs nothing', async () => {
   const { map } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS }),
+    () => runOneFire({ snapshot, capability: knownZeroCap(map), claimPort: new StoreClaimPort(store), sink, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS }),
     (error: unknown) => {
       // The typed dispatch fault is propagated UNCHANGED — every retained arm cause must survive in
       // roster order, so a re-wrap that reverses the causes is caught here.
@@ -1084,7 +1352,7 @@ test('a producer failure after dispatch leaves leases settled and installs nothi
   const { map } = validAdapters(snapshot, cohortId, game);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   await assert.rejects(
-    () => runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink, runOptions: options, admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS }),
+    () => runOneFire({ snapshot, capability: knownZeroCap(map), claimPort: new StoreClaimPort(store), sink, runOptions: options, admission: ADMISSION, now: () => NOW_MS }),
     /baseline/i,
   );
   assert.deepEqual([...releaseIds(store)].sort(), snapshot.expectedArmIdentities.map((_, i) => `lease-${i}`).sort(), 'all leases already released');
@@ -1343,7 +1611,7 @@ test('settlement runs exactly once, strictly after the install resolves; a pendi
     const { map } = validAdapters(snapshot, cohortId, game);
     const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
     const d = deferredInstaller();
-    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS });
+    const p = runOneFire({ snapshot, capability: knownZeroCap(map), claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS });
     await d.reached;
     assert.equal(d.installCalls(), 1, 'install reached exactly once');
     assert.equal(store.completeCalls.length, 0, 'no settle while the install promise is pending');
@@ -1360,7 +1628,7 @@ test('settlement runs exactly once, strictly after the install resolves; a pendi
     const { map } = validAdapters(snapshot, cohortId, game);
     const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
     const d = deferredInstaller();
-    const p = runOneFire({ snapshot, adapters: map, claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, billingClass: 'known-zero', now: () => NOW_MS });
+    const p = runOneFire({ snapshot, capability: knownZeroCap(map), claimPort: new StoreClaimPort(store), sink: d.installer, runOptions: runOpts(), admission: ADMISSION, now: () => NOW_MS });
     await d.reached;
     assert.equal(store.completeCalls.length, 0, 'no settle before the install resolves');
     const boom = new Error('durable sink unreachable');
@@ -1498,7 +1766,7 @@ test('the snapshot-derived gate wins over hostile permissive runOptions mutated 
       return port.admit(req);
     },
   };
-  const outcome = await runOneFire({ snapshot, adapters: map, claimPort: wrapped, sink, runOptions, admission: ADMISSION, billingClass: 'known-zero', now: () => LATE_NOW });
+  const outcome = await runOneFire({ snapshot, capability: knownZeroCap(map), claimPort: wrapped, sink, runOptions, admission: ADMISSION, now: () => LATE_NOW });
   assert.equal(outcome.kind, 'Installed', 'the fire runs — every initial gated out by the snapshot operands');
   assert.equal(
     scripts.reduce((n, s) => n + s.calls, 0),
@@ -1637,12 +1905,11 @@ test('B1-R1(d): a forged/unsealed snapshot fails the brand BEFORE the gate — t
     () =>
       runOneFire({
         snapshot: { ...genuine } as PreparedFireSnapshot,
-        adapters: new Map(),
+        capability: knownZeroCap(new Map()),
         claimPort: new StoreClaimPort(store),
         sink,
         runOptions: runOpts(),
         admission: ADMISSION,
-        billingClass: 'known-zero',
         now: () => AT_FIRST_PITCH,
       }),
     /was not produced/,
@@ -1664,12 +1931,11 @@ test('B1-R1(e): EVERY non-finite reading (NaN, +Infinity, -Infinity) fails CLOSE
       () =>
         runOneFire({
           snapshot,
-          adapters: new Map(),
+          capability: knownZeroCap(new Map()),
           claimPort: new StoreClaimPort(store),
           sink,
           runOptions: runOpts(),
           admission: ADMISSION,
-          billingClass: 'known-zero',
           now: () => bad,
         }),
       (e) => e instanceof PreClaimClockError,

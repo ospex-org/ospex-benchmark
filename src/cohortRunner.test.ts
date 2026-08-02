@@ -19,6 +19,9 @@ import type { BootedCohort } from './cohortBoot.js';
 import type { CohortTickInput, CohortTickResult, FireOutcomeSummary } from './cohortRunner.js';
 import type { DiscoverFn, DiscoveryReads, MarketEvidenceRead, ReadMarketEvidenceFn } from './lineOpenRead.js';
 import type { ClaimOutcome, ClaimPort } from './lineOpenClaim.js';
+import { mintInjectedAdapterCapability } from './cohortAdapterCapability.js';
+import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
+import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import type { ArtifactInstaller, LineOpenRunOptions } from './lineOpenSpine.js';
 import type { BillingClass } from './spendGuard.js';
 import type { FireArtifactV1 } from './fireArtifactProducer.js';
@@ -352,6 +355,9 @@ function countingSink(real: ArtifactInstaller): ArtifactInstaller & { calls: Fir
       calls.push(artifact);
       return real.install(artifact);
     },
+    installSpendEscalationSidecar(sidecar) {
+      return real.installSpendEscalationSidecar(sidecar);
+    },
   };
 }
 
@@ -435,6 +441,8 @@ function tickInput(
     adapters?: ReadonlyMap<string, ProviderAdapter>;
     readMarketEvidence?: ReadMarketEvidenceFn;
     billingClass?: BillingClass;
+    /** When set, used VERBATIM as the tick's capability (for brand-rejection probes). */
+    capability?: CohortAdapterCapability;
     now?: () => number;
     onStatus?: (line: string) => void;
   },
@@ -446,11 +454,15 @@ function tickInput(
     discover: discoverFn(games, odds),
     readMarketEvidence: over.readMarketEvidence ?? evidenceReader(),
     claimPort: over.claimPort,
-    adapters: over.adapters ?? smartAdapters(),
+    capability:
+      over.capability ??
+      mintInjectedAdapterCapability({
+        adapters: over.adapters ?? smartAdapters(),
+        billingClass: over.billingClass ?? 'known-zero',
+      }),
     sink: over.sink ?? new FireArtifactSink('/base', new MemoryFs()),
     runOptions: runOpts(),
     admission: ADMISSION,
-    billingClass: over.billingClass ?? 'known-zero',
     now: over.now ?? tickClock(),
     ...(over.onStatus ? { onStatus: over.onStatus } : {}),
   };
@@ -908,8 +920,16 @@ const ANTHROPIC_ARM_ID = CODE_ARMS.find((a) => a.provider === 'anthropic')!.part
 /** One input token past the exact $100 reservation at the guard table's $10/Mtok anthropic input rate. */
 const OVER_CAP_USAGE = { input_tokens: 10_000_001, output_tokens: 0 };
 
-test('a spend-guard escalation stops the tick: later serial fires are not admitted, and it is not counted', async () => {
-  const json = manifestJson();
+/** The fixture manifest with the billable guard-table pin (a billable fire refuses without it). */
+function billableManifestJson(): string {
+  const parsed = JSON.parse(manifestJson()) as Record<string, unknown>;
+  parsed['modelPriceTableVersion'] = SPEND_GUARD_PRICE_TABLE_VERSION;
+  parsed['modelPriceTableDigest'] = modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION);
+  return JSON.stringify(parsed);
+}
+
+test('a spend-guard escalation stops the tick: it COUNTS as an admitted dispatch, and no later fire admits', async () => {
+  const json = billableManifestJson();
   const store = new ScriptedStore(CODE_ARMS.length);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   const status: string[] = [];
@@ -935,7 +955,9 @@ test('a spend-guard escalation stops the tick: later serial fires are not admitt
   assert.equal(escalated.kind, 'InstalledEscalated');
   if (escalated.kind !== 'InstalledEscalated') return;
   assert.equal(escalated.reason, 'spend_attempt_over_reservation');
-  assert.equal(result.admittedCount, 0, 'an escalated fire is not a clean admission');
+  // The escalated fire WAS admitted and dispatched — the admission accounting must say so
+  // (admittedCount reports admitted dispatches, not clean settlements).
+  assert.equal(result.admittedCount, 1, 'the escalated fire counts as an admitted dispatch');
   // The escalated fire's evidence still durably installed; nothing settled; no second admission.
   assert.equal(sink.calls.length, 1, 'exactly one artifact: the escalated fire evidence');
   assert.equal(store.admitCalls.length, 1, 'the second fire was never admitted');
@@ -946,7 +968,7 @@ test('a spend-guard escalation stops the tick: later serial fires are not admitt
 });
 
 test('clean billable fires do NOT stop the tick — the stop is escalation-only, both admit and settle', async () => {
-  const json = manifestJson();
+  const json = billableManifestJson();
   const store = new ScriptedStore(CODE_ARMS.length);
   const sink = countingSink(new FireArtifactSink('/base', new MemoryFs()));
   // Every arm reports valid priced usage far under the reservation, across all four provider shapes.
@@ -962,4 +984,24 @@ test('clean billable fires do NOT stop the tick — the stop is escalation-only,
   assert.ok(result.fireOutcomes.every((f) => f.outcome.kind === 'Installed'), 'both fires installed cleanly');
   assert.equal(result.admittedCount, 2);
   assert.equal(store.completeCalls.length, 2, 'both fires settled');
+});
+
+test('the tick rejects a raw adapter map posing as the capability BEFORE discovery runs', async () => {
+  const json = manifestJson();
+  const store = new ScriptedStore(CODE_ARMS.length);
+  let discoveryRan = false;
+  const { input } = tickInput(json, [makeGame({ gameId: 'g1' })], [makeOdds({ jsonodds_id: 'g1', market: 'moneyline' })], {
+    claimPort: new StoreClaimPort(store),
+    capability: smartAdapters() as unknown as CohortAdapterCapability,
+  });
+  const probed: CohortTickInput = {
+    ...input,
+    discover: async (booted) => {
+      discoveryRan = true;
+      return input.discover(booted);
+    },
+  };
+  await assert.rejects(() => runCohortTick(probed), /not a minted cohort adapter capability/);
+  assert.equal(discoveryRan, false, 'the brand fails before any seam executes');
+  assert.equal(store.admitCalls.length, 0);
 });

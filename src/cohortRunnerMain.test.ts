@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { assertCohortAdapterCapability } from './cohortAdapterCapability.js';
 import { CohortBootError, assertBootedCohort, cohortBoot } from './cohortBoot.js';
 import { runCohortTick } from './cohortRunner.js';
 import {
@@ -188,9 +189,14 @@ test('buildRehearsalTickInput wires a report-only claim, a no-op sink, a full ro
   assert.ok(input.claimPort instanceof RehearsalClaimPort, 'the claim port is report-only');
   // The sink is a never-called no-op: invoking it is a broken invariant and throws.
   assert.throws(() => (input.sink.install as unknown as () => never)());
-  // The adapter map covers the whole expected roster (required for the pre-claim plan build).
+  assert.throws(() => (input.sink.installSpendEscalationSidecar as unknown as () => never)());
+  // The adapter authority is a MINTED capability (not a raw map), known-zero, covering the
+  // whole expected roster (required for the pre-claim plan build).
+  assert.doesNotThrow(() => assertCohortAdapterCapability(input.capability));
+  assert.equal(input.capability.billingClass, 'known-zero');
+  const adapters = input.capability.adapters();
   for (const arm of defaultExpectedArms()) {
-    assert.ok(input.adapters.has(arm.participantId), `adapter present for ${arm.participantId}`);
+    assert.ok(adapters.has(arm.participantId), `adapter present for ${arm.participantId}`);
   }
   // Run options + admission are derived from the booted manifest / store constants.
   assert.equal(input.runOptions.timeoutMs, manifest.constants.providerCallTimeoutMs);
@@ -198,8 +204,6 @@ test('buildRehearsalTickInput wires a report-only claim, a no-op sink, a full ro
   assert.equal(input.runOptions.baselinePolicyVersion, 'baselines-v0.3.0');
   assert.equal(input.admission.expectedSchemaVersion, STORE_SCHEMA_VERSION);
   assert.equal(input.admission.ownerId, 'owner-x');
-  // The rehearsal's mock adapters incur no real spend â€” the spend guard's provenance input says so.
-  assert.equal(input.billingClass, 'known-zero');
 });
 
 test('a rehearsal tick discovers, projects one prepared candidate, and reports it as WouldAdmit', async () => {
@@ -415,11 +419,12 @@ test('B1-R4: installedArtifactPaths ignores a CoverageMiss (it installed no arti
 // ---------------------------------------------------------------------------
 
 /** Synthesize an `InstalledEscalated` outcome. The consumers read only `outcome.kind`,
- *  `outcome.reason`, `outcome.offenders.length`, and `outcome.install.path`. */
+ *  `outcome.reason`, `outcome.offenders.length`, `outcome.install.path`, and `outcome.sidecar`. */
 const installedEscalatedOutcome = (path: string): LineOpenFireOutcome =>
   ({
     kind: 'InstalledEscalated',
     install: { path, created: true },
+    sidecar: { path: `${path.replace(/\.json$/, '')}-spend.json`, created: true, sha256: 'ab'.repeat(32) },
     reason: 'spend_attempt_over_reservation',
     offenders: [{ participantId: 'arm-1', role: 'initial', status: 'breach', derivedActualUsdMicros: 100_000_010 }],
   }) as unknown as LineOpenFireOutcome;
@@ -436,12 +441,17 @@ test('classifyStoreFireResult rejects an escalated fire with an HONEST reason â€
   assert.match(classification.reason, /spend_attempt_over_reservation/);
 });
 
-test('formatTickResult renders an escalated fire as an escalation with its reason', () => {
+test('formatTickResult renders an escalated fire as an escalation with its reason AND the sidecar evidence', () => {
   const result = tickResultOf([fireSummary('f1', installedEscalatedOutcome('/out/cohort/fire-a.json'))]);
   const lines = formatTickResult(result);
   assert.ok(
     lines.some((l) => /InstalledEscalated\/spend_attempt_over_reservation/.test(l)),
     'the escalation reason renders on the fire-outcome line',
+  );
+  // The operator report carries the durable escalation evidence: sidecar path + its hash.
+  assert.ok(
+    lines.some((l) => l.includes('/out/cohort/fire-a-spend.json') && l.includes('ab'.repeat(32))),
+    'the sidecar path and sha256 render in the operator report',
   );
 });
 

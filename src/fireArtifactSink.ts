@@ -3,6 +3,8 @@ import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, unli
 import { join } from 'node:path';
 import { MARKET_ORDINAL } from './fireArtifact.js';
 import { parseFireArtifactV1, serializeFireArtifactV1, verifyFireArtifactReplay } from './fireArtifactWriter.js';
+import { serializeSpendEscalationSidecar } from './spendEscalationSidecar.js';
+import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
 import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import type { MarketKey } from './types.js';
 
@@ -89,6 +91,12 @@ function byOrdinal(a: MarketKey, b: MarketKey): number {
   return MARKET_ORDINAL[a] - MARKET_ORDINAL[b];
 }
 
+/** The ONE path encoder: an arbitrary gameId becomes a single base64url segment (no
+ *  separator / traversal escape), shared by the artifact and sidecar path derivations. */
+function gameIdSegment(gameId: string): string {
+  return Buffer.from(gameId, 'utf8').toString('base64url');
+}
+
 /**
  * The write-path owners the sink composes, injectable ONLY as a test seam. The default is
  * the single set of production owners imported from `fireArtifactWriter.ts` (S3 adds no
@@ -141,15 +149,48 @@ export class FireArtifactSink {
     // The collision-safe final path — gameId → ONE base64url segment (no separator /
     // traversal), scope in canonical MARKET_ORDINAL order.
     const scope = [...parsed.scopedMarkets].sort(byOrdinal).join('+');
-    const gameSegment = Buffer.from(parsed.gameId, 'utf8').toString('base64url');
+    const gameSegment = gameIdSegment(parsed.gameId);
     const dir = join(this.baseDir, parsed.cohortId);
     const finalPath = join(dir, `fire-${gameSegment}-${scope}-${parsed.fireId}.json`);
+    return this.installBytesNoClobber(dir, finalPath, parsed.fireId, buffer, 'fire artifact');
+  }
 
+  /**
+   * Install a spend-escalation sidecar durably, beside its fire's artifact, under the SAME
+   * atomic no-clobber fsync-durable loop: `fire-<gameSegment>-<scope>-<fireId>-spend.json`.
+   * The bytes are the module serializer's canonical output, so a completion retry is
+   * exact-byte idempotent and a byte-different pre-existing sidecar fails loud. Identity
+   * fields are grammar-checked before they become path components, exactly like the
+   * artifact's.
+   */
+  installSpendEscalationSidecar(sidecar: SpendEscalationSidecarV1): { path: string; created: boolean } {
+    const bytes = serializeSpendEscalationSidecar(sidecar);
+    const buffer = Buffer.from(bytes, 'utf8');
+    if (!SHA256_HEX.test(sidecar.cohortId)) throw new Error('sidecar cohortId is not a lowercase sha256 digest');
+    if (!SHA256_HEX.test(sidecar.fireId)) throw new Error('sidecar fireId is not a lowercase sha256 digest');
+    const scope = [...sidecar.scopedMarkets].sort(byOrdinal).join('+');
+    const gameSegment = gameIdSegment(sidecar.gameId);
+    const dir = join(this.baseDir, sidecar.cohortId);
+    const finalPath = join(dir, `fire-${gameSegment}-${scope}-${sidecar.fireId}-spend.json`);
+    return this.installBytesNoClobber(dir, finalPath, `${sidecar.fireId}-spend`, buffer, 'spend escalation sidecar');
+  }
+
+  /** The shared atomic no-clobber byte-install loop (temp → complete write → fsync → close
+   *  → hard-link no-clobber → directory fsync; a pre-existing final path is accepted only
+   *  for exact raw-byte identity). Moved verbatim from `install` so both durable records
+   *  ride ONE tested write path. */
+  private installBytesNoClobber(
+    dir: string,
+    finalPath: string,
+    tmpStem: string,
+    buffer: Buffer,
+    label: string,
+  ): { path: string; created: boolean } {
     this.fs.mkdirp(dir);
 
     // A same-directory exclusive temp with an opaque collision-resistant suffix; the `wx`
     // open is the authority that two calls never own the same temp.
-    const tmpPath = join(dir, `.${parsed.fireId}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
+    const tmpPath = join(dir, `.${tmpStem}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
     let tempCreated = false;
     const cleanupTemp = (): void => {
       // Best-effort, after the result/durability decision is known: never masks the primary
@@ -175,7 +216,7 @@ export class FireArtifactSink {
           const remaining = buffer.length - offset;
           const n = this.fs.write(fd, buffer, offset, remaining);
           if (!Number.isInteger(n) || n < 1 || n > remaining) {
-            throw new Error(`fire artifact temp write made invalid progress (${String(n)} of ${remaining} remaining)`);
+            throw new Error(`${label} temp write made invalid progress (${String(n)} of ${remaining} remaining)`);
           }
           offset += n;
         }
@@ -220,7 +261,7 @@ export class FireArtifactSink {
       } else {
         const existing = this.fs.readFile(finalPath);
         if (!existing.equals(buffer)) {
-          throw new Error(`refusing to overwrite a byte-different fire artifact already installed at ${finalPath}`);
+          throw new Error(`refusing to overwrite a byte-different ${label} already installed at ${finalPath}`);
         }
         // Re-establish directory durability: a prior call may have linked the final entry and
         // then failed its own directory fsync, so the idempotent path must sync too.
