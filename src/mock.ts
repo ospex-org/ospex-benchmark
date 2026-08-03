@@ -40,10 +40,11 @@ import type {
 
 export const FIXTURE_SLATE_DATE = '2026-07-12';
 
-/** Fixture game that the anthropic mock corrupts (schema-invalid). */
-const INVALID_SCHEMA_GAME_ID = '00000000-0000-4000-8000-000000000001';
+/** Fixture game that the anthropic mock corrupts (schema-invalid). Exported so the
+ *  real-shaped fake mirrors the SAME scenario triggers — parity depends on it. */
+export const INVALID_SCHEMA_GAME_ID = '00000000-0000-4000-8000-000000000001';
 /** Fixture game on which the openai mock simulates an HTTP 429 throttle. */
-const RATE_LIMITED_GAME_ID = '00000000-0000-4000-8000-000000000003';
+export const RATE_LIMITED_GAME_ID = '00000000-0000-4000-8000-000000000003';
 
 const fixtureSchema = z.object({
   note: z.string(),
@@ -84,7 +85,7 @@ export function createFixtureClock(): () => number {
 // Deterministic mock forecasting
 // ---------------------------------------------------------------------------
 
-interface RequestPayload {
+export interface RequestPayload {
   cohortId: string;
   participantId: string;
   requestedModelId: string;
@@ -93,7 +94,9 @@ interface RequestPayload {
   bundle: SlateBundle;
 }
 
-function parseRequestPayload(turns: ChatTurn[]): {
+/** Parse the prompt's request payload — SHARED with the real-shaped fake so both derive
+ *  decisions from the exact same prompt contract. */
+export function parseRequestPayload(turns: ChatTurn[]): {
   payload: RequestPayload;
   isRepair: boolean;
   gameId: string;
@@ -179,7 +182,10 @@ function buildForecast(
   };
 }
 
-function buildValidResponse(payload: RequestPayload): BenchmarkResponse {
+/** The ONE deterministic decision derivation — shared by the mock and the real-shaped
+ *  fake, so a dry-vs-real-shaped parity run produces byte-identical decisions and differs
+ *  only in the provider envelope (text wrapping, response ids, timing). */
+export function buildValidResponse(payload: RequestPayload): BenchmarkResponse {
   return {
     schemaVersion: 1,
     cohortId: payload.cohortId,
@@ -203,7 +209,8 @@ function buildValidResponse(payload: RequestPayload): BenchmarkResponse {
   };
 }
 
-function buildSchemaInvalidResponse(payload: RequestPayload): BenchmarkResponse {
+/** The shared schema-corruption used on {@link INVALID_SCHEMA_GAME_ID} (mock + fake). */
+export function buildSchemaInvalidResponse(payload: RequestPayload): BenchmarkResponse {
   const invalid = structuredClone(buildValidResponse(payload));
   const game = invalid.games[0];
   if (game) {

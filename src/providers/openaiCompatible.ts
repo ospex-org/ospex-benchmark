@@ -20,7 +20,8 @@ export function createOpenAiCompatibleAdapter(config: {
   requestedModelId: string;
   credentialEnvVar: string;
   baseUrl: string;
-  /** Param name for the output cap ('max_completion_tokens' on OpenAI, 'max_tokens' on xAI). */
+  /** Registry-selected output-cap field. Keeping it explicit makes upstream contract drift
+   *  visible in the complete-wire canned tests and straightforward to update. */
   maxTokensParam: string;
 }): ProviderAdapter {
   return {
