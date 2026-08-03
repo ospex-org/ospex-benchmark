@@ -313,9 +313,17 @@ export function formatTickResult(result: CohortTickResult): string[] {
   lines.push(`fire outcomes (${result.fireOutcomes.length}):`);
   for (const f of result.fireOutcomes) {
     lines.push(`  fire ${f.fireId} (${f.gameId} ${f.market}): ${describeOutcome(f.outcome)}`);
-    if (f.outcome.kind === 'InstalledEscalated') {
-      // The operator report carries the durable escalation evidence: sidecar path + hash.
-      lines.push(`    sidecar: ${f.outcome.sidecar.path} sha256 ${f.outcome.sidecar.sha256}`);
+    // The operator report carries the durable spend evidence (path + hash): every BILLABLE
+    // fire has a sidecar — an escalated one always, a clean Installed when non-null.
+    // Known-zero fires carry null and print nothing (the default output is unchanged).
+    const sidecar =
+      f.outcome.kind === 'InstalledEscalated'
+        ? f.outcome.sidecar
+        : f.outcome.kind === 'Installed'
+          ? f.outcome.sidecar
+          : null;
+    if (sidecar !== null) {
+      lines.push(`    sidecar: ${sidecar.path} sha256 ${sidecar.sha256}`);
     }
   }
   lines.push(`admitted ${result.admittedCount} fire(s)`);

@@ -31,8 +31,8 @@ import type { AdmitDispatchRequest, ClaimKey } from './store/contract.js';
  * Each stage has its own fail-closed boundary: this module mints no permit, plan, dispatch,
  * artifact, or lease authority, and holds no store, provider, or filesystem of its own. It derives
  * the full-scope admission request, reconciles the permit to the produced artifact, applies the
- * post-dispatch spend guard, installs the canonical artifact (plus an escalation sidecar when
- * required), and settles a clean claim exactly once strictly AFTER durable installation. The sink
+ * post-dispatch spend guard, installs the canonical artifact (plus, for every BILLABLE fire, the
+ * redacted spend sidecar), and settles a clean claim exactly once strictly AFTER durable installation. The sink
  * deliberately never sees a permit, and the producer never sees one either, so this module is where
  * those independently-derived identity paths meet.
  *
@@ -80,9 +80,10 @@ export type ArtifactInstallResult = ReturnType<FireArtifactSink['install']>;
  */
 export interface ArtifactInstaller {
   install(artifact: FireArtifactV1): ArtifactInstallResult | Promise<ArtifactInstallResult>;
-  /** Durably install a spend-escalation sidecar beside the fire's artifact (same atomic
-   *  no-clobber contract). REQUIRED on the seam so every sink decides its disposition —
-   *  a sink that can never see an escalation (the rehearsal no-op) throws. */
+  /** Durably install a spend sidecar beside the fire's artifact (same atomic no-clobber
+   *  contract). Every BILLABLE fire installs one — clean pass or escalation. REQUIRED on
+   *  the seam so every sink decides its disposition — a sink that can never see a
+   *  billable fire (the rehearsal no-op) throws. */
   installSpendEscalationSidecar(sidecar: SpendEscalationSidecarV1): ArtifactInstallResult | Promise<ArtifactInstallResult>;
 }
 
@@ -224,6 +225,11 @@ export type LineOpenFireOutcome =
       readonly artifact: FireArtifactV1;
       readonly install: ArtifactInstallResult;
       readonly completion: CompletionStatus;
+      /** The durable redacted token-only spend evidence — present (non-null) for EVERY
+       *  billable fire, clean pass included, installed BEFORE settlement so a paid fire
+       *  can never settle without its spend evidence persisting first. `null` IFF the
+       *  fire was known-zero (mock/fake — nothing was billed, nothing to evidence). */
+      readonly sidecar: { readonly path: string; readonly created: boolean; readonly sha256: string } | null;
     }
   | {
       /** The fire's evidence IS durably installed, but the runtime spend guard refused settlement:
@@ -709,8 +715,35 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
   // and never a blind re-settle. Install throwing/rejecting propagates BEFORE this line, so settlement
   // never runs for a fire whose evidence did not persist.
   if (verdict.kind === 'pass') {
+    // EVERY billable fire durably installs the redacted token-only spend sidecar — a clean
+    // pass included — BEFORE settlement: the raw token buckets the guard priced exist only
+    // in the still-live envelope, and the paid crossing's acceptance recomputes the spend
+    // (and checks for a real reasoning-token observation) from this record. Installing it
+    // before `settleCompletedFire` means a sidecar-install failure propagates and the claim
+    // stays retained — a paid fire never settles without its spend evidence persisting.
+    // Known-zero fires (mock/fake) bill nothing and install no sidecar: every default path
+    // is unchanged apart from the outcome's `sidecar: null` field.
+    let sidecar: Extract<LineOpenFireOutcome, { kind: 'Installed' }>['sidecar'] = null;
+    if (billingClass === 'billable') {
+      const cleanRecord: SpendEscalationSidecarV1 = buildSpendEscalationSidecar({
+        artifact,
+        results: envelope.results,
+        billingClass,
+        verdict,
+        reason: null,
+        priceVersion: SPEND_GUARD_PRICE_TABLE_VERSION,
+        priceTableDigest: modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION),
+        perAttemptReservationUsdMicros,
+      });
+      const sidecarInstall = await capturedInstaller.installSpendEscalationSidecar(cleanRecord);
+      sidecar = Object.freeze({
+        path: sidecarInstall.path,
+        created: sidecarInstall.created,
+        sha256: spendEscalationSidecarSha256(cleanRecord),
+      });
+    }
     const completion = await settleCompletedFire(permit);
-    return { kind: 'Installed', permit, artifact, install: installed, completion };
+    return { kind: 'Installed', permit, artifact, install: installed, completion, sidecar };
   }
   // BREACH or UNKNOWN: do NOT settle — the claim and its full reservation stay pending (retained),
   // which is the conservative direction; nothing is written to the store about the escalation.

@@ -292,11 +292,15 @@ function fireSummary(fireId: string, outcome: LineOpenFireOutcome): FireOutcomeS
 const notAdmittedOutcome = (): LineOpenFireOutcome =>
   ({ kind: 'NotAdmitted', outcome: { kind: 'WouldAdmit' } }) as unknown as LineOpenFireOutcome;
 
-const installedSettledOutcome = (path: string): LineOpenFireOutcome =>
+const installedSettledOutcome = (
+  path: string,
+  sidecar: { path: string; created: boolean; sha256: string } | null = null,
+): LineOpenFireOutcome =>
   ({
     kind: 'Installed',
     install: { path, created: true },
     completion: { status: 'settled' },
+    sidecar,
   }) as unknown as LineOpenFireOutcome;
 
 const installedUnsettledOutcome = (path: string): LineOpenFireOutcome =>
@@ -304,6 +308,7 @@ const installedUnsettledOutcome = (path: string): LineOpenFireOutcome =>
     kind: 'Installed',
     install: { path, created: true },
     completion: { status: 'unsettled', reason: 'store_complete_failed' },
+    sidecar: null,
   }) as unknown as LineOpenFireOutcome;
 
 /** Wrap synthesized fire outcomes in a minimal `CohortTickResult` (the classifier reads only
@@ -449,6 +454,27 @@ test('formatTickResult renders an escalated fire as an escalation with its reaso
     lines.some((l) => l.includes('/out/cohort/fire-a-spend.json') && l.includes('ab'.repeat(32))),
     'the sidecar path and sha256 render in the operator report',
   );
+});
+
+test('formatTickResult renders the CLEAN billable sidecar line, and prints none for a known-zero fire', () => {
+  const withSidecar = tickResultOf([
+    fireSummary(
+      'f1',
+      installedSettledOutcome('/out/cohort/fire-a.json', {
+        path: '/out/cohort/fire-a-spend.json',
+        created: true,
+        sha256: 'cd'.repeat(32),
+      }),
+    ),
+  ]);
+  const lines = formatTickResult(withSidecar);
+  assert.ok(
+    lines.some((l) => l.includes('/out/cohort/fire-a-spend.json') && l.includes('cd'.repeat(32))),
+    'the clean billable fire reports its durable spend evidence',
+  );
+
+  const knownZero = formatTickResult(tickResultOf([fireSummary('f1', installedSettledOutcome('/out/cohort/fire-a.json'))]));
+  assert.ok(!knownZero.some((l) => /sidecar:/.test(l)), 'a known-zero fire prints no sidecar line — output unchanged');
 });
 
 test('installedArtifactPaths KEEPS an escalated fire path — its evidence durably installed', () => {
