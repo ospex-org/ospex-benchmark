@@ -1,33 +1,33 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createAnthropicAdapter } from './anthropic.js';
 import { ProviderHttpError, ProviderTimeoutError } from './errors.js';
-import { createGoogleAdapter } from './google.js';
-import { createOpenAiCompatibleAdapter } from './openaiCompatible.js';
-import type { ChatTurn } from '../types.js';
+import { ARMS, createRealAdapters } from './index.js';
+import type { ChatTurn, ProviderAdapter } from '../types.js';
 
 /**
- * CANNED-HTTP parser ownership for each REAL provider adapter: provider-shaped JSON is
+ * CANNED-HTTP parser ownership for each REAL provider adapter, exercised through the
+ * PRODUCTION registry: every adapter under test comes from `createRealAdapters()` — never a
+ * reconstructed factory config — so a miswired registry entry (wrong endpoint, wrong
+ * output-token parameter name) fails here, not in production. Provider-shaped JSON is
  * driven through the ACTUAL request builder and response parser via a controlled
- * `globalThis.fetch` sentinel — no network is reachable (the sentinel IS the only fetch,
- * and every test asserts exactly the expected invocations). A cooperating fake cannot
- * prove the real adapter preserves billing fields; these tests own that boundary:
+ * `globalThis.fetch` sentinel; no network is reachable (the sentinel is the only fetch and
+ * every test asserts exactly the expected invocations).
  *
- * - the exact endpoint, method, auth header, and request body (including a FINITE
- *   output-token parameter under the provider's own parameter name);
- * - FULL verbatim `usageRaw` preservation — google's nonzero `thoughtsTokenCount`
- *   survives, xai's ADDITIVE reasoning bucket survives, openai's reasoning stays a
- *   subset (preserved, never re-added), anthropic's cache fields survive;
- * - 429 and timeout classification shapes (typed errors the runner maps to
- *   `rate_limited` / `timeout`).
- *
- * Credentials are synthetic values set for the duration of each test — never real keys.
+ * Request assertions DEEP-EQUAL the COMPLETE recorded call — exact URL, method, the entire
+ * header object, and the entire parsed body — so an undeclared extra field (e.g. a sampling
+ * override) is a failure, not a silent addition. Response assertions own FULL verbatim
+ * `usageRaw` preservation: google's nonzero `thoughtsTokenCount` survives, xai's ADDITIVE
+ * reasoning bucket survives, openai's reasoning stays a subset (preserved, never re-added),
+ * anthropic's cache fields survive. 429 and timeout surface as the typed errors the runner
+ * classifies. Credentials are synthetic values set per test — never real keys.
  */
 
 const TURNS: ChatTurn[] = [
   { role: 'system', content: 'system prompt' },
   { role: 'user', content: 'user prompt' },
 ];
+
+const SYNTHETIC_KEY = 'synthetic-test-credential';
 
 interface RecordedCall {
   url: string;
@@ -36,8 +36,16 @@ interface RecordedCall {
   body: unknown;
 }
 
+/** The production registry adapter for one canonical participant — the ONLY construction
+ *  path these tests accept. */
+function registryAdapter(participantId: string): ProviderAdapter {
+  const adapter = createRealAdapters().get(participantId);
+  if (adapter === undefined) throw new Error(`production registry has no adapter for ${participantId}`);
+  return adapter;
+}
+
 /** Swap `globalThis.fetch` for a canned responder for the duration of `fn`; record every
- *  call; ALWAYS restore. The recorder is the only reachable network seam. */
+ *  call COMPLETELY (url, method, full headers, full parsed body); ALWAYS restore. */
 async function withCannedFetch<T>(
   respond: (url: string, init: RequestInit) => Response | Promise<Response>,
   fn: () => Promise<T>,
@@ -79,19 +87,29 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 // ---------------------------------------------------------------------------
-// openai (openai-compatible, max_completion_tokens)
+// the production registry itself
 // ---------------------------------------------------------------------------
 
-const OPENAI_ADAPTER = () =>
-  createOpenAiCompatibleAdapter({
-    provider: 'openai',
-    requestedModelId: 'gpt-5.6-sol',
-    credentialEnvVar: 'OPENAI_API_KEY',
-    baseUrl: 'https://api.openai.com/v1',
-    maxTokensParam: 'max_completion_tokens',
-  });
+test('createRealAdapters() rosters exactly the four canonical arms with exact identities', () => {
+  const adapters = createRealAdapters();
+  assert.deepEqual(
+    [...adapters.keys()].sort(),
+    ARMS.map((a) => a.participantId).sort(),
+    'the registry rosters exactly the canonical participant ids',
+  );
+  for (const arm of ARMS) {
+    const adapter = adapters.get(arm.participantId)!;
+    assert.equal(adapter.provider, arm.provider);
+    assert.equal(adapter.requestedModelId, arm.requestedModelId);
+    assert.equal(adapter.credentialEnvVar, arm.credentialEnvVar);
+  }
+});
 
-test('openai adapter: exact request, finite output-token param, verbatim usageRaw with reasoning kept a SUBSET', async () => {
+// ---------------------------------------------------------------------------
+// openai (registry arm; max_completion_tokens)
+// ---------------------------------------------------------------------------
+
+test('openai registry adapter: COMPLETE exact request, finite output-token param, verbatim usageRaw with reasoning kept a SUBSET', async () => {
   const cannedUsage = {
     prompt_tokens: 100,
     completion_tokens: 40,
@@ -99,7 +117,7 @@ test('openai adapter: exact request, finite output-token param, verbatim usageRa
     prompt_tokens_details: { cached_tokens: 25 },
     completion_tokens_details: { reasoning_tokens: 16 },
   };
-  const { result, calls } = await withEnv('OPENAI_API_KEY', 'synthetic-test-credential', () =>
+  const { result, calls } = await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, () =>
     withCannedFetch(
       () =>
         jsonResponse({
@@ -108,25 +126,26 @@ test('openai adapter: exact request, finite output-token param, verbatim usageRa
           choices: [{ message: { content: '{"ok":true}' } }],
           usage: cannedUsage,
         }),
-      () => OPENAI_ADAPTER().chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+      () => registryAdapter('openai-gpt-5.6-sol').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
     ),
   );
-  // Exactly one controlled invocation — the sentinel is the only network seam.
+  // Exactly one controlled invocation, DEEP-EQUALED in full: url, method, the entire header
+  // object, and the entire body — an undeclared extra request field is a failure here.
   assert.equal(calls.length, 1);
-  const call = calls[0]!;
-  assert.equal(call.url, 'https://api.openai.com/v1/chat/completions');
-  assert.equal(call.method, 'POST');
-  assert.equal(call.headers['authorization'], 'Bearer synthetic-test-credential');
-  assert.equal(call.headers['content-type'], 'application/json');
-  const body = call.body as Record<string, unknown>;
-  assert.equal(body['model'], 'gpt-5.6-sol');
-  assert.deepEqual(body['messages'], [
-    { role: 'system', content: 'system prompt' },
-    { role: 'user', content: 'user prompt' },
-  ]);
-  // The FINITE output-token cap travels under the provider's own parameter name.
-  assert.equal(body['max_completion_tokens'], 16_000);
-  assert.ok(Number.isFinite(body['max_completion_tokens']));
+  assert.deepEqual(calls[0], {
+    url: 'https://api.openai.com/v1/chat/completions',
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${SYNTHETIC_KEY}` },
+    body: {
+      model: 'gpt-5.6-sol',
+      messages: [
+        { role: 'system', content: 'system prompt' },
+        { role: 'user', content: 'user prompt' },
+      ],
+      max_completion_tokens: 16_000,
+    },
+  });
+  assert.ok(Number.isFinite((calls[0]!.body as { max_completion_tokens: number }).max_completion_tokens));
   // Parser ownership: text, identity, and VERBATIM usageRaw — the reasoning bucket
   // survives as the subset it is (normalized output stays 40, never 40 + 16).
   assert.equal(result.rawText, '{"ok":true}');
@@ -138,19 +157,10 @@ test('openai adapter: exact request, finite output-token param, verbatim usageRa
 });
 
 // ---------------------------------------------------------------------------
-// xai (openai-compatible, max_tokens, ADDITIVE reasoning)
+// xai (registry arm; max_tokens; ADDITIVE reasoning)
 // ---------------------------------------------------------------------------
 
-const XAI_ADAPTER = () =>
-  createOpenAiCompatibleAdapter({
-    provider: 'xai',
-    requestedModelId: 'grok-4.5',
-    credentialEnvVar: 'XAI_API_KEY',
-    baseUrl: 'https://api.x.ai/v1',
-    maxTokensParam: 'max_tokens',
-  });
-
-test('xai adapter: exact request under max_tokens, verbatim usageRaw with the ADDITIVE reasoning bucket intact', async () => {
+test('xai registry adapter: COMPLETE exact request under max_tokens, verbatim usageRaw with the ADDITIVE reasoning bucket intact', async () => {
   // Additive semantics: total = prompt + completion + reasoning (90 + 30 + 400 = 520).
   // Only usageRaw carries the additive bucket — dropping it would silently undercount
   // the dominant cost component, which is exactly what verbatim preservation prevents.
@@ -160,7 +170,7 @@ test('xai adapter: exact request under max_tokens, verbatim usageRaw with the AD
     total_tokens: 520,
     completion_tokens_details: { reasoning_tokens: 400 },
   };
-  const { result, calls } = await withEnv('XAI_API_KEY', 'synthetic-test-credential', () =>
+  const { result, calls } = await withEnv('XAI_API_KEY', SYNTHETIC_KEY, () =>
     withCannedFetch(
       () =>
         jsonResponse({
@@ -169,16 +179,24 @@ test('xai adapter: exact request under max_tokens, verbatim usageRaw with the AD
           choices: [{ message: { content: 'grok says hi' } }],
           usage: cannedUsage,
         }),
-      () => XAI_ADAPTER().chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+      () => registryAdapter('xai-grok-4.5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
     ),
   );
   assert.equal(calls.length, 1);
-  const call = calls[0]!;
-  assert.equal(call.url, 'https://api.x.ai/v1/chat/completions');
-  const body = call.body as Record<string, unknown>;
-  assert.equal(body['model'], 'grok-4.5');
-  assert.equal(body['max_tokens'], 16_000);
-  assert.ok(Number.isFinite(body['max_tokens']));
+  assert.deepEqual(calls[0], {
+    url: 'https://api.x.ai/v1/chat/completions',
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${SYNTHETIC_KEY}` },
+    body: {
+      model: 'grok-4.5',
+      messages: [
+        { role: 'system', content: 'system prompt' },
+        { role: 'user', content: 'user prompt' },
+      ],
+      max_tokens: 16_000,
+    },
+  });
+  assert.ok(Number.isFinite((calls[0]!.body as { max_tokens: number }).max_tokens));
   assert.deepEqual(result.usage, { inputTokens: 90, outputTokens: 30, totalTokens: 520 });
   assert.deepEqual(result.usageRaw, cannedUsage);
   const raw = result.usageRaw as { completion_tokens_details: { reasoning_tokens: number } };
@@ -186,17 +204,17 @@ test('xai adapter: exact request under max_tokens, verbatim usageRaw with the AD
 });
 
 // ---------------------------------------------------------------------------
-// anthropic (system split, always-set max_tokens, cache fields)
+// anthropic (registry arm; system split; always-set max_tokens; cache fields)
 // ---------------------------------------------------------------------------
 
-test('anthropic adapter: system/messages split, finite max_tokens, verbatim usageRaw with BOTH cache fields', async () => {
+test('anthropic registry adapter: COMPLETE exact request, finite max_tokens, verbatim usageRaw with BOTH cache fields', async () => {
   const cannedUsage = {
     input_tokens: 80,
     output_tokens: 20,
     cache_creation_input_tokens: 64,
     cache_read_input_tokens: 512,
   };
-  const { result, calls } = await withEnv('ANTHROPIC_API_KEY', 'synthetic-test-credential', () =>
+  const { result, calls } = await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, () =>
     withCannedFetch(
       () =>
         jsonResponse({
@@ -208,20 +226,26 @@ test('anthropic adapter: system/messages split, finite max_tokens, verbatim usag
           ],
           usage: cannedUsage,
         }),
-      () => createAnthropicAdapter('claude-fable-5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+      () => registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
     ),
   );
   assert.equal(calls.length, 1);
-  const call = calls[0]!;
-  assert.equal(call.url, 'https://api.anthropic.com/v1/messages');
-  assert.equal(call.headers['x-api-key'], 'synthetic-test-credential');
-  assert.equal(call.headers['anthropic-version'], '2023-06-01');
-  const body = call.body as Record<string, unknown>;
-  assert.equal(body['model'], 'claude-fable-5');
-  assert.equal(body['system'], 'system prompt', 'the system turn travels in the dedicated field');
-  assert.deepEqual(body['messages'], [{ role: 'user', content: 'user prompt' }]);
-  assert.equal(body['max_tokens'], 16_000);
-  assert.ok(Number.isFinite(body['max_tokens']));
+  assert.deepEqual(calls[0], {
+    url: 'https://api.anthropic.com/v1/messages',
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': SYNTHETIC_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: {
+      model: 'claude-fable-5',
+      max_tokens: 16_000,
+      system: 'system prompt',
+      messages: [{ role: 'user', content: 'user prompt' }],
+    },
+  });
+  assert.ok(Number.isFinite((calls[0]!.body as { max_tokens: number }).max_tokens));
   assert.equal(result.rawText, 'hello world', 'text blocks concatenate');
   assert.equal(result.reportedModelId, 'claude-fable-5');
   assert.deepEqual(result.usage, { inputTokens: 80, outputTokens: 20, totalTokens: 100 });
@@ -230,10 +254,10 @@ test('anthropic adapter: system/messages split, finite max_tokens, verbatim usag
 });
 
 // ---------------------------------------------------------------------------
-// google (role mapping, generationConfig cap, ADDITIVE thoughts)
+// google (registry arm; role mapping; generationConfig cap; ADDITIVE thoughts)
 // ---------------------------------------------------------------------------
 
-test('google adapter: role mapping, finite generationConfig cap, verbatim usageMetadata with NONZERO thoughts', async () => {
+test('google registry adapter: COMPLETE exact request, finite generationConfig cap, verbatim usageMetadata with NONZERO thoughts', async () => {
   const cannedUsage = {
     promptTokenCount: 70,
     candidatesTokenCount: 10,
@@ -241,7 +265,7 @@ test('google adapter: role mapping, finite generationConfig cap, verbatim usageM
     totalTokenCount: 980,
   };
   const turns: ChatTurn[] = [...TURNS, { role: 'assistant', content: 'earlier answer' }];
-  const { result, calls } = await withEnv('GEMINI_API_KEY', 'synthetic-test-credential', () =>
+  const { result, calls } = await withEnv('GEMINI_API_KEY', SYNTHETIC_KEY, () =>
     withCannedFetch(
       () =>
         jsonResponse({
@@ -259,30 +283,26 @@ test('google adapter: role mapping, finite generationConfig cap, verbatim usageM
           ],
           usageMetadata: cannedUsage,
         }),
-      () =>
-        createGoogleAdapter('gemini-3.1-pro-preview').chat(turns, 5_000, { maxOutputTokens: 16_000 }),
+      () => registryAdapter('google-gemini-3.1-pro-preview').chat(turns, 5_000, { maxOutputTokens: 16_000 }),
     ),
   );
   assert.equal(calls.length, 1);
-  const call = calls[0]!;
-  assert.equal(
-    call.url,
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent',
+  assert.deepEqual(calls[0], {
+    url: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent',
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': SYNTHETIC_KEY },
+    body: {
+      systemInstruction: { parts: [{ text: 'system prompt' }] },
+      contents: [
+        { role: 'user', parts: [{ text: 'user prompt' }] },
+        { role: 'model', parts: [{ text: 'earlier answer' }] },
+      ],
+      generationConfig: { maxOutputTokens: 16_000 },
+    },
+  });
+  assert.ok(
+    Number.isFinite((calls[0]!.body as { generationConfig: { maxOutputTokens: number } }).generationConfig.maxOutputTokens),
   );
-  assert.equal(call.headers['x-goog-api-key'], 'synthetic-test-credential');
-  const body = call.body as {
-    systemInstruction: { parts: Array<{ text: string }> };
-    contents: Array<{ role: string; parts: Array<{ text: string }> }>;
-    generationConfig: { maxOutputTokens: number };
-  };
-  assert.equal(body.systemInstruction.parts[0]!.text, 'system prompt');
-  assert.deepEqual(
-    body.contents.map((c) => c.role),
-    ['user', 'model'],
-    'assistant turns map to the google "model" role',
-  );
-  assert.equal(body.generationConfig.maxOutputTokens, 16_000);
-  assert.ok(Number.isFinite(body.generationConfig.maxOutputTokens));
   assert.equal(result.rawText, 'the answer', 'thought parts are excluded from answer text');
   assert.equal(result.reportedModelId, 'gemini-3.1-pro-preview');
   assert.equal(result.providerResponseId, 'resp-canned-1');
@@ -294,27 +314,26 @@ test('google adapter: role mapping, finite generationConfig cap, verbatim usageM
 });
 
 // ---------------------------------------------------------------------------
-// classification shapes: 429 and timeout, per typed error
+// classification shapes: 429 and timeout, per typed error, through the registry
 // ---------------------------------------------------------------------------
 
 test('an HTTP 429 surfaces as ProviderHttpError with status 429 (the rate_limited classification shape)', async () => {
-  await withEnv('OPENAI_API_KEY', 'synthetic-test-credential', async () => {
-    const { result } = await withCannedFetch(
+  await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, async () => {
+    await withCannedFetch(
       () => new Response('slow down', { status: 429 }),
       async () => {
         await assert.rejects(
-          () => OPENAI_ADAPTER().chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+          () => registryAdapter('openai-gpt-5.6-sol').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
           (e: unknown) => e instanceof ProviderHttpError && e.status === 429,
         );
         return null;
       },
     );
-    void result;
   });
 });
 
 test('an aborted call surfaces as ProviderTimeoutError (the timeout classification shape)', async () => {
-  await withEnv('ANTHROPIC_API_KEY', 'synthetic-test-credential', async () => {
+  await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, async () => {
     await withCannedFetch(
       (_url, init) =>
         new Promise<Response>((_resolve, reject) => {
@@ -323,7 +342,7 @@ test('an aborted call surfaces as ProviderTimeoutError (the timeout classificati
         }),
       async () => {
         await assert.rejects(
-          () => createAnthropicAdapter('claude-fable-5').chat(TURNS, 30, { maxOutputTokens: 16_000 }),
+          () => registryAdapter('anthropic-claude-fable-5').chat(TURNS, 30, { maxOutputTokens: 16_000 }),
           (e: unknown) => e instanceof ProviderTimeoutError,
         );
         return null;

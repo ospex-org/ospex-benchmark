@@ -1213,7 +1213,8 @@ test('the fake exercises 429, timeout, and prose+fence repair classification thr
   const byParticipant = new Map(artifact.arms.map((a) => [a.expectedArmIdentity.participantId, a]));
   // HTTP 429 → rate_limited, never a model failure.
   assert.equal(byParticipant.get('openai-gpt-5.6-sol')!.terminalOutcome, 'rate_limited');
-  // A never-answering arm → timeout.
+  // The xai fake throws the typed timeout error directly (the never-answering scenario's
+  // classification — no wall-clock wait is simulated).
   assert.equal(byParticipant.get('xai-grok-4.5')!.terminalOutcome, 'timeout');
   // Prose+fenced JSON with a wrong echo → parse succeeds, the single repair fixes the echo
   // with identical decisions: two persisted attempts, terminal valid, fingerprint accepted.
