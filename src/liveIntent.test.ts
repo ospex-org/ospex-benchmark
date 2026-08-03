@@ -13,7 +13,7 @@ import { defaultExpectedArms } from './scoring.js';
  * Tri-state live-intent resolution: `MockRequested` touches nothing; a live
  * request is refused (typed, accumulated violations, no prompt) on any pin or
  * credential violation; the exact terms print BEFORE the single confirmation;
- * ONLY an explicit affirmative authorizes (Enter / other answers / EOF refuse);
+ * explicit affirmatives and empty Enter authorize; other answers and EOF refuse;
  * and the authorization is the exact frozen record the gated producer expects.
  * A refused or unconfirmed live request NEVER resolves to mock.
  */
@@ -176,8 +176,8 @@ test('the standard [Y/n] semantics: y/yes AND the empty Enter default authorize;
     const resolution = await resolveLiveIntent(h.request);
     assert.equal(resolution.kind, 'LiveAuthorized', `answer ${JSON.stringify(answer)} authorizes`);
   }
-  // NEGATIVE and EOF: any non-affirmative answer refuses, and a closed stream refuses —
-  // EOF is NOT Enter, so headless/piped input can never accept the default.
+  // NEGATIVE and EOF: any non-affirmative answer refuses, and a stream that closes
+  // without producing a line is EOF rather than the empty-line Enter default.
   const refusals: (string | null)[] = ['n', 'N', 'no', 'q', 'yeah', 'true', '1', null];
   for (const answer of refusals) {
     const h = harness({ live: true, booted: bootedCrossing(), answer });

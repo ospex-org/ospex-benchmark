@@ -45,8 +45,8 @@ import type { CanaryAuthorization } from './cohortAdapterCapability.js';
  * authorizes; `n`, any other text, or a closed input stream (EOF) refuses. The
  * deliberate arm signal is the explicit `--live` flag plus the printed terms —
  * the prompt is the attended second look. EOF is NOT Enter: a stream that closes
- * without an answer always refuses, so a piped/headless invocation can never
- * accept the default.
+ * without producing a line always refuses. An actual empty line — interactive or
+ * deliberately piped — is Enter and accepts the default.
  */
 
 export type LiveIntentResolution =
@@ -139,7 +139,8 @@ export async function resolveLiveIntent(request: LiveIntentRequest): Promise<Liv
   const normalized = answer.trim().toLowerCase();
   // The standard [Y/n] semantics: Enter (an empty answer) accepts the capital-Y default,
   // and 'y'/'yes' accept explicitly; anything else refuses. EOF was refused ABOVE — a
-  // closed stream is not an Enter, so headless/piped input can never accept the default.
+  // stream that closes without producing a line is not Enter, while an actual empty line
+  // (interactive or deliberately piped) is Enter and accepts the default.
   if (normalized !== '' && normalized !== 'y' && normalized !== 'yes') {
     return refused([
       `live confirmation declined (answer ${JSON.stringify(answer)}); Enter or 'y' proceeds`,
