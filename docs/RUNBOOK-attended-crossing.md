@@ -37,8 +37,12 @@ those raw buckets: recomputing each attempt's conservative derived cost, and the
 builds and installs the spend sidecar — clean pass or escalation — keyed off the
 capability's `billingClass` in `runOneFire`, with the sidecar path + sha256 added
 to the clean `Installed` outcome's operator report. Known-zero fires remain
-sidecar-free, so every default/mock/test path is byte-identical. Do not execute
-this runbook until that slice (or an equivalent agreed mechanism) is merged.
+sidecar-free, so every default/mock/test path is byte-identical. The slice also
+ships a deterministic OFFLINE sidecar-cost verifier (the exact conservative
+integer ceiling arithmetic over the sidecar's token buckets at the pinned rates)
+so the §10 spend recomputation is repeatable rather than hand-derived. Do not
+execute this runbook until that slice (or an equivalent agreed mechanism) is
+merged.
 
 - [ ] Prerequisite slice merged; `yarn test` green at the crossing commit.
 
@@ -46,8 +50,13 @@ this runbook until that slice (or an equivalent agreed mechanism) is merged.
 
 ## 1. Roles and hard rules
 
-- **Operator**: the repository owner, at the keyboard, in an interactive terminal
-  (the confirmation reads stdin; a piped/headless stdin sees EOF and refuses).
+- **Operator**: the repository owner, at the keyboard, in an INTERACTIVE
+  terminal. **Never pipe or redirect the confirmation input.** The `[Y/n]`
+  stdin semantics are exact: only a stream that closes WITHOUT producing a line
+  is EOF (refused); a piped EMPTY LINE (`\n`) is an Enter, and Enter accepts
+  the capital-Y default — **a piped newline AUTHORIZES the spend**. The
+  interactive-terminal requirement is therefore an operating rule, not a
+  convenience.
 - **One invocation per attempt. No automatic retry of any kind.** A failed or
   escalated attempt is investigated and recorded before any human decision to
   attempt again (§9).
@@ -102,9 +111,10 @@ Both destinations must survive the process and be readable afterwards.
       producer independently probe each adapter's own credential check; any
       missing key refuses before the prompt.
 - [ ] Each key belongs to an account the operator controls, with billing enabled
-      and a spending limit the operator has reviewed. Expected spend is well
-      under $5 (§8); provider-side limits are an independent backstop, not part
-      of this protocol.
+      and a spending limit the operator has reviewed. The expected invoice is
+      well under $1, and the committed conservative worst-case bound for the
+      whole fire is ≈$219 (§8) — set provider-side limits with that bound in
+      mind; they are an independent backstop, not part of this protocol.
 - [ ] No key material is ever committed, pasted into the execution log, or
       included in any artifact (the artifact and sidecar carry token counts and
       digests, never credentials — spot-check after the run, §7).
@@ -159,8 +169,10 @@ Expected sequence — read each stage as it happens:
    answering.** There is no time pressure at the prompt — the fixture's
    freshness clock anchors after the confirmation.
 4. `proceed with the attended live crossing? [Y/n]` — Enter or `y`/`yes`
-   proceeds; `n`, any other answer, or EOF refuses (exit `2`, nothing spent).
-   **Answering affirmatively is the spend decision.**
+   proceeds; `n`, any other answer, or EOF (a stream closing without a line)
+   refuses (exit `2`, nothing spent). **Answering affirmatively is the spend
+   decision — and a piped empty line counts as Enter (§1), which is why this
+   prompt is only ever answered interactively.**
 5. The gated producer re-validates and mints the billable capability; the store
    opens; the cohort budget pins; the one fire dispatches — four concurrent
    initial requests, at most one repair per arm on an invalid response. Worst
@@ -173,13 +185,27 @@ Expected sequence — read each stage as it happens:
 
 ## 8. Expected cost
 
-- Realistic: each attempt sends ~1.5–2.5k input tokens and receives a few
-  hundred output tokens → roughly $0.02–$0.05 per attempt at the pinned rates,
-  ≈ **$0.25–$0.50 for the whole fire**.
-- Bounded: even if all 8 attempts exhausted the 16000-token output cap, the
-  total at pinned rates is under ~$5. The runtime guard independently
-  hard-stops any single attempt that prices over $100, and the store reserves
-  exactly $800 for the fire — the ceiling, not the bill.
+- **Expected invoice (an estimate, never a guarantee)**: each attempt sends
+  ~1.5–2.5k input tokens and typically receives a few hundred output tokens →
+  roughly $0.02–$0.05 per attempt at the pinned rates, ≈ **$0.25–$0.50 for the
+  whole fire**.
+- **The committed conservative worst-case bound** is the one in
+  `docs/SPEND-BOUND-PROOF.md`, at the pinned `prices-v2` rates — note that
+  Google `thoughtsTokenCount` and xAI reasoning tokens are ADDITIVE and are NOT
+  bounded by `maxOutputTokens` (their bound is the model's own output
+  envelope), so the visible-output cap alone does not bound the bill. Per
+  attempt: OpenAI $20.805, Anthropic $56.40, Google $24.248320, xAI $8.00 —
+  each under the $100 per-attempt reservation — giving a conservative
+  full-fire bound (two attempts per model) of **$218.906640**, well under the
+  $800 reservation ceiling.
+- **What the $100 guard is and is not**: it is a POST-DISPATCH control. It
+  prices the RETURNED usage and, on any attempt over $100 or any attempt it
+  cannot price, refuses settlement — escalating with durable evidence and
+  stopping later admissions. It cannot stop an already-dispatched request from
+  billing whatever the provider bills. The pre-dispatch protections are the
+  committed per-attempt proof and the pinned cost-driver profile; $800 is the
+  store's reservation ceiling, not the expected invoice; and provider-side
+  account spending limits (§4) remain an independent backstop.
 
 ## 9. Outcome playbook
 
@@ -187,16 +213,24 @@ Expected sequence — read each stage as it happens:
 |---|---|---|
 | exit `2` before the prompt | Refused (pins/credentials/mode). Nothing spent. | Fix the named violations; re-run freely. |
 | exit `2` at the prompt (declined/EOF) | Operator refused. Nothing spent. | Re-run freely when ready. |
-| `Installed/settled`, exit `0` | **The clean crossing.** Artifact durably installed, claim settled. | Proceed to §10 verification. |
+| `Installed/settled`, exit `0` | **Runtime-clean CANDIDATE** — artifact durably installed, claim settled. Not yet an accepted crossing: the runtime exit cannot establish the sidecar hash, the per-attempt spend recomputation, the reasoning observation, or the store state. | Continue to §10; the crossing is ACCEPTED only when every §10 check passes. |
 | `InstalledEscalated/spend_evidence_unknown` (or `.../spend_attempt_over_reservation`), exit `1` | Money was spent; at least one attempt could not be priced with confidence (typical cause: a provider timeout/429 returned no usage) or priced over the reservation. The artifact AND the redacted sidecar are durably installed (paths + sha256 printed); the claim + $800 reservation stay retained in the store. | **The crossing attempt FAILED — an UNKNOWN never passes.** Do not retry. Read the sidecar, identify the offending attempt(s), record everything in the log. A later fresh attempt is a new decision after review (each invocation boots a new cohort, so the store does not block it — the discipline is procedural, not mechanical). |
 | `Installed/unsettled(...)`, exit `1` | Artifact durable; settlement unconfirmed against the store. | Do not re-run. Inspect the store's claim row for this fire first; reconcile deliberately. |
 | `SpendGuardInternalError` thrown | A non-money bug escaped the guard AFTER dispatch; the artifact was installed first (its path is in the error). | Treat as a failed crossing AND a code defect: file it, fix it, re-review before any new attempt. |
+| Artifact INSTALL failure after `y` (the process exits nonzero with an install error) | Requests may already be billed, but NO durable canonical artifact exists; the claim + $800 reservation stay retained in the store. Evidence state is incomplete. | **Failed crossing.** Inspect the durable store's claim row AND the artifact directory (including any temp files) FIRST; record everything in the log; no retry without review. |
+| Spend-SIDECAR install failure (escalation path: artifact installed, sidecar write failed, nonzero exit) | The canonical artifact is durable but the raw token evidence that explains the escalation is missing. | **Failed crossing.** Inspect the store + artifact directory first; record; no retry without review. |
+| Any OTHER post-`y` exception or nonzero result not listed above | Spend and evidence state unknown. | **Failed crossing.** Same discipline: inspect the durable store + artifact destination first, record the attempt, and never retry blind. |
 | Process interrupted/killed after `y` | Spend state unknown; evidence possibly incomplete. | Do not re-run. The store's claim state is the source of truth; inspect it and the artifact directory before anything else. |
 
-## 10. Post-run verification (the acceptance, checked in order)
+## 10. Post-run verification (the acceptance — EVERY item is mandatory)
 
-- [ ] Exit code `0`; exactly one fire outcome, `Installed/settled`; exactly one
-      installed artifact path.
+Runtime exit `0` is only a candidate pass. The crossing is ACCEPTED only when
+every check below passes; any failed or UNPROVABLE item means the crossing
+FAILED — it authorizes nothing, and any new attempt is a fresh reviewed
+decision, never a retry.
+
+- [ ] Runtime candidate: exit code `0`; exactly one fire outcome,
+      `Installed/settled`; exactly one installed artifact path.
 - [ ] **Artifact read-back**: open the installed `fire-*.json` from the durable
       directory. It parses; its `cohortId`/`fireId` equal the console report;
       all four arms are present with terminal outcomes; every attempt carries
@@ -204,10 +238,11 @@ Expected sequence — read each stage as it happens:
 - [ ] **Sidecar** (via the §0 slice): the `*-spend.json` exists beside the
       artifact; recompute its SHA-256 and confirm it equals the recorded hash;
       it contains token counts only.
-- [ ] **Per-attempt spend**: from the sidecar's raw token buckets and the pinned
-      `prices-v2` rates, recompute each billable attempt's conservative cost.
-      Every attempt strictly under $100; the aggregate under $800. Record the
-      per-attempt figures in the log.
+- [ ] **Per-attempt spend**: recompute each billable attempt's conservative cost
+      from the sidecar's raw token buckets at the pinned `prices-v2` rates,
+      using the offline verifier shipped with the §0 slice (the exact integer
+      ceiling arithmetic — not a hand estimate). Every attempt strictly under
+      $100; the aggregate under $800. Record the per-attempt figures in the log.
 - [ ] **Reasoning observation**: at least one attempt shows a real nonzero
       reasoning/thinking token field in its raw buckets (e.g. Google
       `thoughtsTokenCount` or OpenAI `reasoning_tokens`).
