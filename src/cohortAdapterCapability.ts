@@ -144,7 +144,7 @@ export function mintInjectedAdapterCapability(input: {
 
 /**
  * The operator authorization a REAL (billable) capability mint requires. It is produced by
- * the attended tri-state live resolution (after the explicit confirmation) and consumed by
+ * the attended tri-state live resolution (after the [Y/n] confirmation) and consumed by
  * {@link gateRealCohortAdapterCapability}, which re-validates every field at runtime and
  * binds it to the EXACT booted cohort — a stale authorization for another cohort fails even
  * with equal caps, and any manifest change after authorization changes `cohortId` (the hash

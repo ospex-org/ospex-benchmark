@@ -13,8 +13,8 @@ import type { CanaryAuthorization } from './cohortAdapterCapability.js';
  *   - `MockRequested` — `--live` was not passed; the caller selects the known-zero
  *     mock capability exactly as before. This is the only path that may run mock.
  *   - `LiveAuthorized` — `--live` was passed, every prerequisite held, AND the
- *     operator explicitly confirmed the printed terms; carries the exact
- *     `CanaryAuthorization` the gated billable producer will re-validate.
+ *     operator confirmed the printed terms at the `[Y/n]` prompt; carries the
+ *     exact `CanaryAuthorization` the gated billable producer will re-validate.
  *   - `LiveRefused` — `--live` was passed and ANYTHING was missing or invalid, or
  *     the confirmation was declined/EOF. The caller MUST exit nonzero. A live
  *     request is NEVER reinterpreted as "authorization absent → run mock":
@@ -39,11 +39,14 @@ import type { CanaryAuthorization } from './cohortAdapterCapability.js';
  * credential through the injected probe (production: the real adapters' own
  * `hasCredential`, which for the Google arm credits its supported credential
  * alias), and — only with zero violations — prints the exact terms (cohortId, the
- * $ reservation ceiling, the call cap, the one-fire limit) and asks for the
- * `[y/N]` confirmation. ONLY an explicit affirmative answer (`y` / `yes`,
- * case-insensitive) authorizes; an empty answer, any other text, or a closed
- * input stream (EOF) refuses — on a money gate the default is NO, so pressing
- * Enter never spends, and the prompt label says so (`[y/N]`, capital N).
+ * $ reservation ceiling, the call cap, the one-fire limit) and asks the standard
+ * `[Y/n]` confirmation with the convention's normal semantics: `y` / `yes`
+ * (case-insensitive) or an EMPTY answer (Enter accepts the capital-Y default)
+ * authorizes; `n`, any other text, or a closed input stream (EOF) refuses. The
+ * deliberate arm signal is the explicit `--live` flag plus the printed terms —
+ * the prompt is the attended second look. EOF is NOT Enter: a stream that closes
+ * without an answer always refuses, so a piped/headless invocation can never
+ * accept the default.
  */
 
 export type LiveIntentResolution =
@@ -127,16 +130,19 @@ export async function resolveLiveIntent(request: LiveIntentRequest): Promise<Liv
       `${1 + manifest.constants.maxRepairAttemptsPerArm} attempts)`,
   );
   print(`  one fire maximum this invocation (maxDispatchesPerTick ${manifest.constants.maxDispatchesPerTick})`);
-  print("  an EXPLICIT 'y' is required; Enter, any other answer, or EOF refuses");
+  print("  Enter or 'y' proceeds; 'n', any other answer, or EOF refuses");
 
-  const answer = await confirm('proceed with the attended live crossing? [y/N] ');
+  const answer = await confirm('proceed with the attended live crossing? [Y/n] ');
   if (answer === null) {
-    return refused(['live confirmation stream closed (EOF) before an explicit answer — refusing']);
+    return refused(['live confirmation stream closed (EOF) before an answer — refusing']);
   }
   const normalized = answer.trim().toLowerCase();
-  if (normalized !== 'y' && normalized !== 'yes') {
+  // The standard [Y/n] semantics: Enter (an empty answer) accepts the capital-Y default,
+  // and 'y'/'yes' accept explicitly; anything else refuses. EOF was refused ABOVE — a
+  // closed stream is not an Enter, so headless/piped input can never accept the default.
+  if (normalized !== '' && normalized !== 'y' && normalized !== 'yes') {
     return refused([
-      `live confirmation declined (answer ${JSON.stringify(answer)}); an explicit 'y' is required`,
+      `live confirmation declined (answer ${JSON.stringify(answer)}); Enter or 'y' proceeds`,
     ]);
   }
 

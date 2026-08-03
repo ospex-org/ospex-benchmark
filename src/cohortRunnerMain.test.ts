@@ -593,9 +593,14 @@ test('the spawned CLI drives the PRODUCTION confirm seam to EOF: terms print, th
     typeof status === 'number' && status !== 0,
     `expected a nonzero exit; status=${String(status)} signal=${String(signal)} out=${out}`,
   );
-  // The terms printed BEFORE the prompt (the run was authorizable up to the confirmation).
+  // The terms printed BEFORE the prompt (the run was authorizable up to the confirmation),
+  // and the PRODUCTION readline seam emitted the exact [Y/n] prompt label end to end.
   assert.ok(/ATTENDED LIVE CROSSING/.test(out), `the terms header printed; out=${out}`);
   assert.ok(out.includes('$800.00'), `the $800 ceiling printed; out=${out}`);
+  assert.ok(
+    out.includes('proceed with the attended live crossing? [Y/n]'),
+    `the exact [Y/n] prompt reached stdout through the production seam; out=${out}`,
+  );
   // The EOF refusal, with no mock fallback and no DB/dispatch of any kind.
   assert.ok(/--live refused — no mock fallback/.test(out), `the refusal printed; out=${out}`);
   assert.ok(/EOF/.test(out), `the refusal names EOF; out=${out}`);
@@ -748,7 +753,7 @@ test('a resolution that DISAGREES with the live flag is refused by the coherence
 });
 
 test('the LIVE fixture seams anchor AFTER the resolution — a slow attended confirmation cannot stale the snapshot', async () => {
-  // The resolution (production: the human [y/N] prompt) is unbounded; the projector's
+  // The resolution (production: the human [Y/n] prompt) is unbounded; the projector's
   // freshness gate compares detection to the seams' fetchCompletedAt with a 30s budget.
   // So the seams must anchor after the resolution returns, not at the boot anchor.
   let resolutionDoneMs = 0;

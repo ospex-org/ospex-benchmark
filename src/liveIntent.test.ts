@@ -155,21 +155,30 @@ test('the exact terms print BEFORE the single confirmation: cohortId, $800.00, c
   assert.ok(h.printed.some((l) => /provider call cap 8/.test(l)), 'the 8-call cap printed');
   assert.ok(h.printed.some((l) => /one fire maximum/.test(l)), 'the one-fire limit printed');
 
-  // Sequencing on the ONE shared event log: every print strictly precedes the one confirm.
-  const confirmIndexes = h.events.flatMap((e, i) => (e.startsWith('confirm:') ? [i] : []));
-  assert.equal(confirmIndexes.length, 1, 'the confirmation is requested exactly once');
+  // Sequencing on the ONE shared event log: every print strictly precedes the one confirm —
+  // whose recorded event pins the EXACT frozen prompt bytes (label drift fails here).
+  const confirmEvents = h.events.filter((e) => e.startsWith('confirm:'));
+  assert.deepEqual(
+    confirmEvents,
+    ['confirm:proceed with the attended live crossing? [Y/n] '],
+    'the confirmation is requested exactly once, with the exact [Y/n] prompt bytes',
+  );
   const lastPrint = h.events.lastIndexOf('print');
-  assert.ok(lastPrint >= 0 && lastPrint < confirmIndexes[0]!, 'every term printed before the prompt');
+  assert.ok(lastPrint >= 0 && lastPrint < h.events.indexOf(confirmEvents[0]!), 'every term printed before the prompt');
 });
 
-test('ONLY an explicit affirmative authorizes; Enter, other answers, and EOF all refuse (never mock)', async () => {
-  const affirmatives = ['y', 'Y', 'yes', 'Yes', ' y '];
+test('the standard [Y/n] semantics: y/yes AND the empty Enter default authorize; n/other/EOF refuse (never mock)', async () => {
+  // POSITIVE and DEFAULT: explicit affirmatives, and the empty Enter accepting the
+  // capital-Y default (whitespace-only trims to empty and reads as Enter).
+  const affirmatives = ['y', 'Y', 'yes', 'Yes', ' y ', '', '   '];
   for (const answer of affirmatives) {
     const h = harness({ live: true, booted: bootedCrossing(), answer });
     const resolution = await resolveLiveIntent(h.request);
     assert.equal(resolution.kind, 'LiveAuthorized', `answer ${JSON.stringify(answer)} authorizes`);
   }
-  const refusals: (string | null)[] = ['', 'n', 'N', 'no', 'q', 'yeah', 'true', '1', ' ', null];
+  // NEGATIVE and EOF: any non-affirmative answer refuses, and a closed stream refuses —
+  // EOF is NOT Enter, so headless/piped input can never accept the default.
+  const refusals: (string | null)[] = ['n', 'N', 'no', 'q', 'yeah', 'true', '1', null];
   for (const answer of refusals) {
     const h = harness({ live: true, booted: bootedCrossing(), answer });
     const resolution = await resolveLiveIntent(h.request);

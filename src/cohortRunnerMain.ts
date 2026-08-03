@@ -62,7 +62,7 @@ const DEFAULT_FIRE_ARTIFACTS_DIR = './.fire-artifacts';
  * resolved TRI-STATE (`resolveLiveIntent`): without `--live` the mock capability is
  * selected exactly as before; with `--live`, the run either (a) fully authorizes — the
  * pinned crossing-profile cohort, every roster credential observed, the exact terms
- * printed, and an explicit operator confirmation — and mints REAL billable adapters via
+ * printed, and the attended [Y/n] confirmation — and mints REAL billable adapters via
  * the gated producer, or (b) refuses NONZERO. A live request is NEVER silently downgraded
  * to mock.
  *
@@ -100,8 +100,9 @@ Options:
                           or FIRE_ARTIFACTS_DIR). Only used under --store=postgres.
   --live                  Request the ATTENDED live crossing (REAL provider adapters, real
                           spend). Requires --store=postgres --fixture, the pinned crossing
-                          profile, every roster credential, and an explicit confirmation;
-                          any missing prerequisite fails NONZERO (never mock fallback).
+                          profile, every roster credential, and the attended [Y/n]
+                          confirmation; any missing prerequisite fails NONZERO (never mock
+                          fallback).
   -h, --help              Show this help.`;
 
 interface CliOptions {
