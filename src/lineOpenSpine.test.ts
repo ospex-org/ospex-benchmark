@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -48,7 +49,7 @@ import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
 import { checkProviderCollision } from './providers/family.js';
 import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import { serializeSpendEscalationSidecar, spendEscalationSidecarSha256 } from './spendEscalationSidecar.js';
-import { verifySpendSidecar } from './verifySpendSidecar.js';
+import { verifySpendEvidence } from './verifySpendSidecar.js';
 import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
 import type { BillingClass } from './spendGuard.js';
 import type { CandidateInput } from './detection.js';
@@ -716,13 +717,15 @@ test('the SAME over-cap-shaped usage on a known-zero fire settles clean — bill
   assert.equal(store.completeCalls.length, 1, 'the known-zero mock path is unchanged by the guard');
 });
 
-test('a CLEAN billable pass durably installs the spend sidecar and carries it on the outcome — and the offline verifier passes it', async () => {
+test('a CLEAN billable pass durably installs the spend sidecar and carries it on the outcome — and the offline pair verifier passes it', async () => {
   // Google reports nonzero thoughts so the produced record also satisfies the verifier's
   // reasoning-observed check (the crossing-acceptance round trip below).
   const googleThoughts = { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 };
+  const fs = new MemoryFs();
   const { outcome, store, sink } = await fireOf({
     billingClass: 'billable',
     manifestExtra: V2_PIN,
+    fs,
     usageRawFor: (id) => (id.provider === 'google' ? googleThoughts : pricedUsageFor(id.provider)),
   });
   assert.equal(outcome.kind, 'Installed');
@@ -794,9 +797,13 @@ test('a CLEAN billable pass durably installs the spend sidecar and carries it on
   assert.match(outcome.sidecar.path, /-spend\.json$/);
   assert.notEqual(outcome.sidecar.path, outcome.install.path);
 
-  // Round trip: the REAL produced record, re-parsed from its canonical bytes, PASSES the
-  // offline verifier the crossing acceptance uses — every named check green.
-  const verification = verifySpendSidecar(JSON.parse(serializeSpendEscalationSidecar(record)));
+  // Round trip: the REAL durable PAIR — the installed artifact's exact bytes plus the
+  // produced record re-parsed from its canonical bytes — PASSES the offline pair verifier
+  // the crossing acceptance uses, every named check green.
+  const verification = verifySpendEvidence({
+    artifactBytes: fs.readFile(outcome.install.path).toString('utf8'),
+    sidecar: JSON.parse(serializeSpendEscalationSidecar(record)),
+  });
   assert.deepEqual(
     verification.checks.filter((c) => !c.ok),
     [],
@@ -845,6 +852,369 @@ test('a clean-pass sidecar-install failure propagates BEFORE settlement — a pa
   );
   assert.equal(artifactInstalls, 1, 'the canonical artifact was durably installed first');
   assert.equal(store.completeCalls.length, 0, 'settlement never ran — the evidence-first ordering holds');
+});
+
+// ===========================================================================
+// The offline PAIR verifier, driven adversarially against REAL produced pairs.
+// The artifact is the relational witness (strict-parsed + replay-verified), so a
+// truncated, duplicated, fabricated, contradictory, or foreign sidecar must fail
+// a named check — and a prototype-pollution key must fail shape without touching
+// any global prototype.
+// ===========================================================================
+
+interface EvidencePair {
+  readonly artifactBytes: string;
+  readonly sidecar: Record<string, unknown>;
+}
+
+/** One REAL clean billable pair (google reports nonzero thoughts), memoized per run. */
+let cleanPairPromise: Promise<EvidencePair> | null = null;
+function cleanPair(): Promise<EvidencePair> {
+  cleanPairPromise ??= (async () => {
+    const fs = new MemoryFs();
+    const googleThoughts = { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 };
+    const { outcome, sink } = await fireOf({
+      billingClass: 'billable',
+      manifestExtra: V2_PIN,
+      fs,
+      usageRawFor: (id) => (id.provider === 'google' ? googleThoughts : pricedUsageFor(id.provider)),
+    });
+    if (outcome.kind !== 'Installed') throw new Error(`fixture: expected Installed, got ${outcome.kind}`);
+    return {
+      artifactBytes: fs.readFile(outcome.install.path).toString('utf8'),
+      sidecar: JSON.parse(serializeSpendEscalationSidecar(sink.sidecarCalls[0]!.arg)) as Record<string, unknown>,
+    };
+  })();
+  return cleanPairPromise;
+}
+
+/** A REAL pair in which EVERY arm's initial is semantically invalid (a bogus evidenceRef)
+ *  and repaired — 8 sent attempts, each priced EXACTLY at the $100 reservation, so the
+ *  fire aggregate is exactly the $800 crossing cap (the == boundary). Memoized per run. */
+let repairPairPromise: Promise<EvidencePair> | null = null;
+function repairPair(): Promise<EvidencePair> {
+  repairPairPromise ??= (async () => {
+    const snapshot = sealed({ manifestExtra: V2_PIN });
+    const cohortId = snapshot.booted.cohortId;
+    const game = scopedGame(GAME_ID, BOTH);
+    const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+    // Per-provider usage priced EXACTLY at the $100 reservation (integer-divisible, with a
+    // small nonzero google thoughts bucket folded into the exact total).
+    const atCapFor = (provider: string): unknown => {
+      switch (provider) {
+        case 'openai':
+          return { prompt_tokens: 8_000_000, completion_tokens: 0, total_tokens: 8_000_000 };
+        case 'anthropic':
+          return { input_tokens: 10_000_000, output_tokens: 0 };
+        case 'google':
+          return { promptTokenCount: 24_999_991, candidatesTokenCount: 0, thoughtsTokenCount: 2, totalTokenCount: 24_999_993 };
+        case 'xai':
+          return { prompt_tokens: 25_000_000, completion_tokens: 0, total_tokens: 25_000_000, completion_tokens_details: { reasoning_tokens: 0 } };
+        default:
+          throw new Error(`no at-cap usage for ${provider}`);
+      }
+    };
+    const map = new Map<string, ProviderAdapter>();
+    for (const id of snapshot.expectedArmIdentities) {
+      const clean = validBody(id.participantId, id.requestedModelId, cohortId, snapshot.prepared.requestSha256, game);
+      const bogusRef = (): string => {
+        const parsed = JSON.parse(clean) as { games: Array<{ forecasts: Array<{ evidenceRefs: string[] }> }> };
+        parsed.games[0]!.forecasts[0]!.evidenceRefs = ['ev:not-a-real-ref'];
+        return JSON.stringify(parsed);
+      };
+      const s = scriptedAdapter(id, (call) => (call === 1 ? bogusRef() : clean), {
+        usageRawFor: () => atCapFor(id.provider),
+      });
+      map.set(id.participantId, s.adapter);
+    }
+    const fs = new MemoryFs();
+    const sink = countingSink(new FireArtifactSink('/base', fs));
+    const outcome = await runOneFire({
+      snapshot,
+      capability: mintInjectedAdapterCapability({ adapters: map, billingClass: 'billable' }),
+      claimPort: new StoreClaimPort(store),
+      sink,
+      runOptions: runOpts(),
+      admission: ADMISSION,
+      now: () => NOW_MS,
+    });
+    if (outcome.kind !== 'Installed') throw new Error(`fixture: expected Installed, got ${outcome.kind}`);
+    return {
+      artifactBytes: fs.readFile(outcome.install.path).toString('utf8'),
+      sidecar: JSON.parse(serializeSpendEscalationSidecar(sink.sidecarCalls[0]!.arg)) as Record<string, unknown>,
+    };
+  })();
+  return repairPairPromise;
+}
+
+/** Deep-copy the sidecar and apply a mutation (the original pair stays pristine). */
+function mutatedSidecar(pair: EvidencePair, mutate: (sidecar: Record<string, unknown>) => void): unknown {
+  const copy = JSON.parse(JSON.stringify(pair.sidecar)) as Record<string, unknown>;
+  mutate(copy);
+  return copy;
+}
+
+type SidecarRow = Record<string, unknown>;
+const rowsOf = (sidecar: Record<string, unknown>): SidecarRow[] => sidecar['attempts'] as SidecarRow[];
+
+function failedNames(verification: ReturnType<typeof verifySpendEvidence>): string[] {
+  return verification.checks.filter((c) => !c.ok).map((c) => c.name);
+}
+
+test('pair verifier: a TRUNCATED sidecar (one arm only) fails attempt-completeness', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      s['attempts'] = rowsOf(s).filter((r) => (r['participantId'] as string).startsWith('google'));
+    }),
+  });
+  assert.ok(failedNames(verification).includes('attempt-completeness'), JSON.stringify(verification.checks));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: a DUPLICATED initial row fails attempt-completeness', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      rowsOf(s).push(JSON.parse(JSON.stringify(rowsOf(s)[0])) as SidecarRow);
+    }),
+  });
+  assert.ok(failedNames(verification).includes('attempt-completeness'));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: a FABRICATED participant fails attempt-completeness', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      const fake = JSON.parse(JSON.stringify(rowsOf(s)[0])) as SidecarRow;
+      fake['participantId'] = 'fabricated-arm';
+      rowsOf(s).push(fake);
+    }),
+  });
+  assert.ok(failedNames(verification).includes('attempt-completeness'));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: an escalation reason over all-pass rows fails reason-recomputed', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      s['reason'] = 'spend_evidence_unknown';
+    }),
+  });
+  assert.ok(failedNames(verification).includes('reason-recomputed'));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: a PASS row with a false non-null derived cost fails record-consistency', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      rowsOf(s)[0]!['derivedActualUsdMicros'] = 12_345;
+    }),
+  });
+  assert.ok(failedNames(verification).includes('record-consistency'));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: a sent/priced row mislabeled spendClass unknown fails record-consistency', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      rowsOf(s)[0]!['spendClass'] = 'unknown';
+    }),
+  });
+  assert.ok(failedNames(verification).includes('record-consistency'));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: a non-whitelisted token key fails shape (provider-strict buckets)', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      (rowsOf(s)[0]!['usageTokens'] as Record<string, number>)['bogus_field'] = 5;
+    }),
+  });
+  assert.ok(failedNames(verification).includes('shape'));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: identity/market divergence from the artifact fails artifact-binding', async () => {
+  const pair = await cleanPair();
+  for (const mutate of [
+    (s: Record<string, unknown>) => {
+      s['gameId'] = 'not-the-artifact-game';
+    },
+    (s: Record<string, unknown>) => {
+      s['requestSha256'] = 'f'.repeat(64);
+    },
+    (s: Record<string, unknown>) => {
+      s['scopedMarkets'] = ['total', 'moneyline']; // reordered — canonical order is binding
+    },
+  ]) {
+    const verification = verifySpendEvidence({ artifactBytes: pair.artifactBytes, sidecar: mutatedSidecar(pair, mutate) });
+    assert.ok(failedNames(verification).includes('artifact-binding'), JSON.stringify(verification.checks));
+    assert.equal(verification.ok, false);
+  }
+});
+
+test('pair verifier: an incoherent never-sent row (erasing a sent attempt) fails attempt-completeness', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      const row = rowsOf(s)[0]!;
+      row['requestAt'] = null; // "never sent" — but responseAt/buckets remain, and the artifact SENT it
+    }),
+  });
+  const failed = failedNames(verification);
+  assert.ok(failed.includes('attempt-completeness'), JSON.stringify(verification.checks));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: a __proto__ token key fails shape and does NOT pollute Object.prototype', async () => {
+  const pair = await cleanPair();
+  const before = ({} as Record<string, unknown>)['ospexPolluted'];
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      (rowsOf(s)[0]!['usageTokens'] as Record<string, number>)['__proto__.ospexPolluted'] = 1337;
+    }),
+  });
+  assert.ok(failedNames(verification).includes('shape'), JSON.stringify(verification.checks));
+  assert.equal(verification.ok, false);
+  assert.equal(({} as Record<string, unknown>)['ospexPolluted'], before, 'Object.prototype is untouched');
+  assert.equal(before, undefined);
+});
+
+test('pair verifier: a tampered or unparseable artifact fails artifact-integrity before anything else', async () => {
+  const pair = await cleanPair();
+  // Unparseable bytes.
+  const broken = verifySpendEvidence({ artifactBytes: '{ not json', sidecar: pair.sidecar });
+  assert.deepEqual(failedNames(broken), ['artifact-integrity']);
+  // Parse-clean but digest-tampered: flip the artifact's requestSha256 value in the bytes —
+  // the strict parse may accept the shape, but the digest replay must refuse the witness.
+  const parsed = JSON.parse(pair.artifactBytes) as Record<string, unknown>;
+  parsed['requestSha256'] = 'f'.repeat(64);
+  const tampered = verifySpendEvidence({ artifactBytes: JSON.stringify(parsed), sidecar: pair.sidecar });
+  assert.ok(failedNames(tampered).includes('artifact-integrity'), JSON.stringify(tampered.checks));
+});
+
+test('pair verifier: exact per-attempt values on the clean pair (ceiling arithmetic, shared with the guard)', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({ artifactBytes: pair.artifactBytes, sidecar: pair.sidecar });
+  assert.equal(verification.ok, true, JSON.stringify(verification.checks));
+  // Hand-computed at the pinned v2 rates (µUSD): openai (1×12.5 + 1×60 → 72.5 → CEIL 73);
+  // anthropic 1×10 + 1×50 = 60; google 1465×4 + (471+305)×18 = 19_828; xai 1×4 + 1×12 = 16.
+  assert.deepEqual(
+    verification.attempts.map((a) => [a.participantId, a.derivedActualUsdMicros]),
+    [
+      ['openai-gpt-5.6-sol', 73],
+      ['anthropic-claude-fable-5', 60],
+      ['google-gemini-3.1-pro-preview', 19_828],
+      ['xai-grok-4.5', 16],
+    ],
+  );
+  assert.equal(verification.aggregateUsdMicros, 73 + 60 + 19_828 + 16);
+});
+
+test('pair verifier: the full-repair pair passes with 8 at-cap attempts summing EXACTLY to the $800 cap', async () => {
+  const pair = await repairPair();
+  const verification = verifySpendEvidence({ artifactBytes: pair.artifactBytes, sidecar: pair.sidecar });
+  assert.deepEqual(failedNames(verification), [], JSON.stringify(verification.checks));
+  assert.equal(verification.attempts.length, 8, 'four initials + four repairs');
+  assert.ok(
+    verification.attempts.every((a) => a.derivedActualUsdMicros === 100_000_000),
+    'every attempt EXACTLY at the reservation — the == boundary passes',
+  );
+  assert.equal(verification.aggregateUsdMicros, 800_000_000, 'the aggregate == the crossing cap boundary passes');
+});
+
+test('pair verifier: a MISSING repair row (artifact sent it) fails attempt-completeness', async () => {
+  const pair = await repairPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      const rows = rowsOf(s);
+      const index = rows.findIndex((r) => r['role'] === 'repair');
+      rows.splice(index, 1);
+    }),
+  });
+  assert.ok(failedNames(verification).includes('attempt-completeness'), JSON.stringify(verification.checks));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: an over-reservation row (one micro-step over, honestly recorded) fails within-reservation only', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      const row = rowsOf(s).find((r) => (r['participantId'] as string).startsWith('anthropic'))!;
+      row['usageTokens'] = { input_tokens: 10_000_001, output_tokens: 0 }; // 100,000,010 µUSD
+      row['status'] = 'breach';
+      row['derivedActualUsdMicros'] = 100_000_010;
+      s['reason'] = 'spend_attempt_over_reservation';
+    }),
+  });
+  // The record is internally coherent (status/derived/reason all recomputed-consistent), so
+  // the money bound is the sole failure. The aggregate stays under the cap with four
+  // attempts — an aggregate-over-cap failure is reachable only jointly with a reservation
+  // failure, since 8 attempts × $100 equals the cap exactly.
+  assert.deepEqual(failedNames(verification), ['attempts-within-reservation'], JSON.stringify(verification.checks));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier CLI: the real pair PASSES exit 0; a truncated sidecar FAILS exit 1; wrong arity exits 2', async () => {
+  const pair = await cleanPair();
+  const dir = mkdtempSync(join(tmpdir(), 'verify-pair-'));
+  const artifactPath = join(dir, 'fire.json');
+  const sidecarPath = join(dir, 'fire-spend.json');
+  const truncatedPath = join(dir, 'truncated-spend.json');
+  writeFileSync(artifactPath, pair.artifactBytes);
+  writeFileSync(sidecarPath, JSON.stringify(pair.sidecar, null, 2));
+  writeFileSync(
+    truncatedPath,
+    JSON.stringify(
+      mutatedSidecar(pair, (s) => {
+        s['attempts'] = rowsOf(s).slice(0, 1);
+      }),
+      null,
+      2,
+    ),
+  );
+
+  const scriptPath = fileURLToPath(new URL('./verifySpendSidecar.ts', import.meta.url));
+  const repoRoot = dirname(dirname(scriptPath));
+  const run = (args: string[]): { status: number | null; out: string } => {
+    const result = spawnSync(process.execPath, ['--import', 'tsx', scriptPath, ...args], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      timeout: 60_000,
+      input: '',
+    });
+    return { status: result.status, out: `${result.stdout ?? ''}\n${result.stderr ?? ''}` };
+  };
+
+  const pass = run([artifactPath, sidecarPath]);
+  assert.equal(pass.status, 0, pass.out);
+  assert.match(pass.out, /VERDICT: PASS/);
+  assert.match(pass.out, /\[ok\] attempt-completeness/);
+
+  const fail = run([artifactPath, truncatedPath]);
+  assert.equal(fail.status, 1, fail.out);
+  assert.match(fail.out, /VERDICT: FAIL/);
+  assert.match(fail.out, /\[FAIL\] attempt-completeness/);
+
+  const arity = run([sidecarPath]);
+  assert.equal(arity.status, 2, arity.out);
 });
 
 test('an over-reservation REPAIR attempt escalates with role repair — the repair leg reaches the guard', async () => {

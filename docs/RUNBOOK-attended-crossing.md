@@ -39,11 +39,17 @@ The mechanism satisfying this is in the tree:
   path + sha256 carried on the fire's outcome and printed in the operator
   report. Known-zero (mock/fake) fires install none, so every default path is
   unchanged.
-- **The deterministic offline verifier** the §10 spend recomputation uses:
-  `yarn verify:sidecar <path-to-spend.json>` — the exact conservative integer
-  ceiling arithmetic (the same code as the runtime guard) at the code-pinned
-  table, plus the price-identity, reservation, aggregate-cap, record-consistency,
-  and reasoning-observation checks. Exit 0 IFF every named check passes.
+- **The deterministic offline PAIR verifier** the §10 spend recomputation uses:
+  `yarn verify:sidecar <fire-artifact.json> <fire-spend.json>` — it verifies the
+  durable artifact–sidecar PAIR, never the sidecar alone: the artifact is
+  strict-parsed and digest-replay-verified with its existing owners and then
+  serves as the relational witness (`artifact-binding` and
+  `attempt-completeness` checks: exact identity, the frozen roster, exactly one
+  matching row per sent attempt — no missing, duplicate, fabricated, or foreign
+  rows), and every cost and the whole-fire verdict are recomputed with the exact
+  runtime arithmetic at the code-pinned table (price-identity, reservation,
+  aggregate-cap, record-consistency, reason, and reasoning-observation checks).
+  Exit 0 IFF every named check passes.
 
 - [ ] Confirm at the crossing commit: `yarn test` fully green and both mechanisms
       present (the billable-sidecar install and `yarn verify:sidecar`).
@@ -240,11 +246,14 @@ decision, never a retry.
 - [ ] **Sidecar**: the `*-spend.json` exists beside the artifact (every billable
       fire installs one — §0); recompute its SHA-256 and confirm it equals the
       hash printed in the run's operator report; it contains token counts only.
-- [ ] **Per-attempt spend**: run `yarn verify:sidecar <path-to-spend.json>` (§0)
-      — the exact integer ceiling arithmetic, not a hand estimate. It must print
-      `VERDICT: PASS` (every attempt priceable and within the $100 reservation,
-      aggregate within the $800 cap, record consistent, reasoning observed).
-      Record the per-attempt figures it prints in the log.
+- [ ] **Per-attempt spend + pair binding**: run
+      `yarn verify:sidecar <fire-artifact.json> <fire-spend.json>` (§0) — the
+      exact integer ceiling arithmetic against the artifact–sidecar pair, not a
+      hand estimate. It must print `VERDICT: PASS` (artifact integrity + binding
+      + attempt completeness against the artifact's own record of what was sent,
+      every attempt priceable and within the $100 reservation, aggregate within
+      the $800 cap, record consistent, whole-fire reason recomputed, reasoning
+      observed). Record the per-attempt figures it prints in the log.
 - [ ] **Reasoning observation**: at least one attempt shows a real nonzero
       reasoning/thinking token field in its raw buckets (e.g. Google
       `thoughtsTokenCount` or OpenAI `reasoning_tokens`).

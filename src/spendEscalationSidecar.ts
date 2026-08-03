@@ -68,8 +68,9 @@ export interface SpendEscalationSidecarV1 {
 }
 
 /** The exact per-provider token-count fields the conservative arithmetic reads (dotted =
- *  nested). Nothing outside this list is ever copied into a sidecar. */
-const TOKEN_FIELD_WHITELIST: Readonly<Record<ProviderName, readonly string[]>> = Object.freeze({
+ *  nested). Nothing outside this list is ever copied into a sidecar — and the offline
+ *  pair verifier rejects any persisted key outside it (the same single source). */
+export const TOKEN_FIELD_WHITELIST: Readonly<Record<ProviderName, readonly string[]>> = Object.freeze({
   openai: Object.freeze([
     'prompt_tokens',
     'completion_tokens',
