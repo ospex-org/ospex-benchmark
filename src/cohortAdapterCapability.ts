@@ -1,5 +1,6 @@
 import { assertBootedCohort } from './cohortBoot.js';
 import type { BootedCohort } from './cohortBoot.js';
+import { campaignBoundsViolations } from './campaignProfile.js';
 import { CROSSING_PROFILE, crossingPinViolations } from './crossingProfile.js';
 import { createMockAdapters } from './mock.js';
 import { createRealAdapters } from './providers/index.js';
@@ -332,6 +333,53 @@ export function gateRealCohortAdapterCapability(
   booted: BootedCohort,
   canaryAuthorization: CanaryAuthorization,
 ): CohortAdapterCapability {
+  return gateRealAdapterCapability(booted, canaryAuthorization, (manifest) => {
+    // The pinned crossing profile + the explicit canary money ceiling. The ceiling is
+    // redundant with the exact spend-cap pin today; it stays explicit so a future pin edit
+    // that raises the spend cap without a deliberate ceiling decision still refuses.
+    const violations = [...crossingPinViolations(manifest)];
+    if (manifest.cohortSpendCapUsdMicros > CROSSING_PROFILE.canaryCeilingUsdMicros) {
+      violations.push(
+        `cohortSpendCapUsdMicros (${manifest.cohortSpendCapUsdMicros}) exceeds the canary ceiling ` +
+          `(${CROSSING_PROFILE.canaryCeilingUsdMicros})`,
+      );
+    }
+    return violations;
+  });
+}
+
+/**
+ * The GATED real producer for a scheduled CAMPAIGN. Identical authority in every respect
+ * except which cohort SHAPE it accepts: a campaign's size is the operator's decision, so
+ * instead of the crossing's exact one-fire pins it enforces {@link campaignBoundsViolations}
+ * — the priced-attempt shape pinned exactly (roster, repairs, per-attempt reservation,
+ * conservative price table, output-token cap, provider timeout), and the campaign's own
+ * levers bounded by code-owned maxima so an operator cannot arm an unbounded campaign by
+ * typing a large number into a manifest.
+ *
+ * Everything else is the same shared gate: genuine boot brand, strict one-read authorization
+ * capture, exact cohort/roster/price/cap binding, and an INDEPENDENT credential observation
+ * reconciled against the authorization's claim. A campaign authorization reaches this
+ * producer only after `resolveCampaignIntent` has separately validated the durable record's
+ * liveness and binding, so this is the second of two independent passes.
+ */
+export function gateRealCampaignAdapterCapability(
+  booted: BootedCohort,
+  campaignAuthorization: CanaryAuthorization,
+): CohortAdapterCapability {
+  return gateRealAdapterCapability(booted, campaignAuthorization, campaignBoundsViolations);
+}
+
+/**
+ * The shared body of every real-billable mint. `profileViolations` is the ONLY thing that
+ * differs between the attended one-fire crossing and a scheduled campaign — every other
+ * check here is common, so neither path can drift from the other's authority.
+ */
+function gateRealAdapterCapability(
+  booted: BootedCohort,
+  canaryAuthorization: CanaryAuthorization,
+  profileViolations: (manifest: BootedCohort['manifest']) => string[],
+): CohortAdapterCapability {
   assertBootedCohort(booted);
   const captured = captureCanaryAuthorization(canaryAuthorization);
 
@@ -377,16 +425,9 @@ export function gateRealCohortAdapterCapability(
     }
   }
 
-  // (4) The pinned crossing profile + the explicit canary money ceiling. The ceiling is
-  //     redundant with the exact spend-cap pin today; it stays explicit so a future pin
-  //     edit that raises the spend cap without a deliberate ceiling decision still refuses.
-  violations.push(...crossingPinViolations(manifest));
-  if (manifest.cohortSpendCapUsdMicros > CROSSING_PROFILE.canaryCeilingUsdMicros) {
-    violations.push(
-      `cohortSpendCapUsdMicros (${manifest.cohortSpendCapUsdMicros}) exceeds the canary ceiling ` +
-        `(${CROSSING_PROFILE.canaryCeilingUsdMicros})`,
-    );
-  }
+  // (4) The caller's cohort-SHAPE profile — the pinned one-fire crossing, or the bounded
+  //     campaign shape. Everything else in this gate is common to both.
+  violations.push(...profileViolations(manifest));
 
   // (5) Independent adapter construction + credential observation.
   const real = createRealAdapters();
