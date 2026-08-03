@@ -5,11 +5,16 @@ import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import type { ArmGameResult, MarketKey, ProviderName } from './types.js';
 
 /**
- * The REDACTED, token-count-only spend-escalation SIDECAR: the durable evidence record a
- * spend-guard escalation leaves beside the fire artifact. The installed `FireArtifactV1`
- * deliberately redacts `usageRaw` and persists only normalized token counts, so without
- * this record the raw provider token buckets that produced a BREACH/UNKNOWN verdict — and
- * the price identity it was judged under — would exist nowhere durable after process loss.
+ * The REDACTED, token-count-only spend SIDECAR: the durable spend-evidence record EVERY
+ * BILLABLE fire leaves beside its artifact — on a spend-guard escalation AND on a clean
+ * pass (`reason: null`). The installed `FireArtifactV1` deliberately redacts `usageRaw`
+ * and persists only normalized token counts, so without this record the raw provider
+ * token buckets the guard priced — and the price identity it judged under — would exist
+ * nowhere durable after process loss. A clean pass needs that evidence too: the first
+ * paid crossing's acceptance recomputes each attempt's conservative cost and checks for
+ * a real nonzero reasoning-token observation, both of which live only in these buckets.
+ * Known-zero (mock/fake) fires install no sidecar. (The symbol names retain the module's
+ * escalation origin; the semantics are billable spend evidence generally.)
  *
  * Redaction contract: per-provider WHITELIST of token-count fields, copied ONLY when the
  * value is a finite number. No string, object, or unlisted field ever survives into the
@@ -53,7 +58,8 @@ export interface SpendEscalationSidecarV1 {
   readonly gameId: string;
   readonly scopedMarkets: readonly MarketKey[];
   readonly requestSha256: string;
-  readonly reason: 'spend_attempt_over_reservation' | 'spend_evidence_unknown';
+  /** The escalation reason, or `null` for a CLEAN billable pass (evidence, no escalation). */
+  readonly reason: 'spend_attempt_over_reservation' | 'spend_evidence_unknown' | null;
   /** The price identity the guard judged under — version + recomputed table digest. */
   readonly priceVersion: string;
   readonly priceTableDigest: string;
@@ -110,17 +116,18 @@ export function redactUsageTokens(provider: ProviderName, usageRaw: unknown): Re
 }
 
 /**
- * Build the sidecar record for one escalated fire, from the STILL-LIVE envelope results
- * (the only place `usageRaw` exists) and the guard's verdict. Every attempt of every arm
- * is recorded — passing attempts included — so the whole-fire verdict is recomputable
- * from the durable record alone.
+ * Build the sidecar record for one BILLABLE fire, from the STILL-LIVE envelope results
+ * (the only place `usageRaw` exists) and the guard's verdict — escalated (`reason` set)
+ * or clean pass (`reason: null`, every attempt `pass`). Every attempt of every arm is
+ * recorded — passing attempts included — so the whole-fire verdict is recomputable from
+ * the durable record alone.
  */
 export function buildSpendEscalationSidecar(input: {
   artifact: FireArtifactV1;
   results: readonly ArmGameResult[];
   billingClass: BillingClass;
-  verdict: Extract<FireSpendVerdict, { kind: 'breach' | 'unknown' }>;
-  reason: 'spend_attempt_over_reservation' | 'spend_evidence_unknown';
+  verdict: FireSpendVerdict;
+  reason: 'spend_attempt_over_reservation' | 'spend_evidence_unknown' | null;
   priceVersion: string;
   priceTableDigest: string;
   perAttemptReservationUsdMicros: number;
@@ -133,9 +140,12 @@ export function buildSpendEscalationSidecar(input: {
     ];
     for (const [role, attempt] of legs) {
       if (attempt === null) continue;
-      const offender = input.verdict.offenders.find(
-        (o) => o.participantId === result.arm.participantId && o.role === role,
-      );
+      const offender =
+        input.verdict.kind === 'pass'
+          ? undefined
+          : input.verdict.offenders.find(
+              (o) => o.participantId === result.arm.participantId && o.role === role,
+            );
       attempts.push(
         Object.freeze({
           participantId: result.arm.participantId,

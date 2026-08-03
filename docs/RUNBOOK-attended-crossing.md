@@ -20,31 +20,33 @@ authorizes nothing beyond itself.
 
 ---
 
-## 0. Prerequisite code slice (must merge BEFORE this runbook is executable)
+## 0. The spend-evidence mechanism (a prerequisite, now in-tree)
 
 The frozen evidence contract requires a redacted token-only `usageRaw` sidecar,
 keyed to the fire/artifact id with its SHA-256 recorded, **for the first crossing
-even when the spend guard passes cleanly**. As merged, `runOneFire` installs the
-sidecar only on a spend-guard ESCALATION; a clean pass installs the artifact
-alone, and the artifact deliberately carries only NORMALIZED usage (three token
-counts per attempt) — the provider-specific raw buckets (Google
-`thoughtsTokenCount`, OpenAI `reasoning_tokens`, Anthropic cache fields, xAI
-additive reasoning) exist only in the sidecar. Two crossing checks depend on
-those raw buckets: recomputing each attempt's conservative derived cost, and the
-≥1 real reasoning-field observation (§7.5).
+even when the spend guard passes cleanly** — the artifact deliberately carries
+only NORMALIZED usage (three token counts per attempt), while the
+provider-specific raw buckets (Google `thoughtsTokenCount`, OpenAI
+`reasoning_tokens`, Anthropic cache fields, xAI additive reasoning) exist only in
+the sidecar. Two §10 checks depend on those buckets: recomputing each attempt's
+conservative derived cost, and the ≥1 real reasoning-field observation.
 
-**Proposed slice (small, to be reviewed on its own):** a BILLABLE fire always
-builds and installs the spend sidecar — clean pass or escalation — keyed off the
-capability's `billingClass` in `runOneFire`, with the sidecar path + sha256 added
-to the clean `Installed` outcome's operator report. Known-zero fires remain
-sidecar-free, so every default/mock/test path is byte-identical. The slice also
-ships a deterministic OFFLINE sidecar-cost verifier (the exact conservative
-integer ceiling arithmetic over the sidecar's token buckets at the pinned rates)
-so the §10 spend recomputation is repeatable rather than hand-derived. Do not
-execute this runbook until that slice (or an equivalent agreed mechanism) is
-merged.
+The mechanism satisfying this is in the tree:
 
-- [ ] Prerequisite slice merged; `yarn test` green at the crossing commit.
+- **Every BILLABLE fire durably installs the spend sidecar** (`*-spend.json`
+  beside the artifact) — clean pass or escalation — keyed off the capability's
+  `billingClass` in `runOneFire`, installed BEFORE settlement, with the sidecar
+  path + sha256 carried on the fire's outcome and printed in the operator
+  report. Known-zero (mock/fake) fires install none, so every default path is
+  unchanged.
+- **The deterministic offline verifier** the §10 spend recomputation uses:
+  `yarn verify:sidecar <path-to-spend.json>` — the exact conservative integer
+  ceiling arithmetic (the same code as the runtime guard) at the code-pinned
+  table, plus the price-identity, reservation, aggregate-cap, record-consistency,
+  and reasoning-observation checks. Exit 0 IFF every named check passes.
+
+- [ ] Confirm at the crossing commit: `yarn test` fully green and both mechanisms
+      present (the billable-sidecar install and `yarn verify:sidecar`).
 
 ---
 
@@ -218,7 +220,7 @@ Expected sequence — read each stage as it happens:
 | `Installed/unsettled(...)`, exit `1` | Artifact durable; settlement unconfirmed against the store. | Do not re-run. Inspect the store's claim row for this fire first; reconcile deliberately. |
 | `SpendGuardInternalError` thrown | A non-money bug escaped the guard AFTER dispatch; the artifact was installed first (its path is in the error). | Treat as a failed crossing AND a code defect: file it, fix it, re-review before any new attempt. |
 | Artifact INSTALL failure after `y` (the process exits nonzero with an install error) | Requests may already be billed, but NO durable canonical artifact exists; the claim + $800 reservation stay retained in the store. Evidence state is incomplete. | **Failed crossing.** Inspect the durable store's claim row AND the artifact directory (including any temp files) FIRST; record everything in the log; no retry without review. |
-| Spend-SIDECAR install failure (escalation path: artifact installed, sidecar write failed, nonzero exit) | The canonical artifact is durable but the raw token evidence that explains the escalation is missing. | **Failed crossing.** Inspect the store + artifact directory first; record; no retry without review. |
+| Spend-SIDECAR install failure (clean pass or escalation: artifact installed, sidecar write failed, nonzero exit; on a clean pass this refuses settlement — the claim stays retained) | The canonical artifact is durable but the raw token evidence is missing. | **Failed crossing.** Inspect the store + artifact directory first; record; no retry without review. |
 | Any OTHER post-`y` exception or nonzero result not listed above | Spend and evidence state unknown. | **Failed crossing.** Same discipline: inspect the durable store + artifact destination first, record the attempt, and never retry blind. |
 | Process interrupted/killed after `y` | Spend state unknown; evidence possibly incomplete. | Do not re-run. The store's claim state is the source of truth; inspect it and the artifact directory before anything else. |
 
@@ -235,14 +237,14 @@ decision, never a retry.
       directory. It parses; its `cohortId`/`fireId` equal the console report;
       all four arms are present with terminal outcomes; every attempt carries
       normalized usage; no credential material appears anywhere in it.
-- [ ] **Sidecar** (via the §0 slice): the `*-spend.json` exists beside the
-      artifact; recompute its SHA-256 and confirm it equals the recorded hash;
-      it contains token counts only.
-- [ ] **Per-attempt spend**: recompute each billable attempt's conservative cost
-      from the sidecar's raw token buckets at the pinned `prices-v2` rates,
-      using the offline verifier shipped with the §0 slice (the exact integer
-      ceiling arithmetic — not a hand estimate). Every attempt strictly under
-      $100; the aggregate under $800. Record the per-attempt figures in the log.
+- [ ] **Sidecar**: the `*-spend.json` exists beside the artifact (every billable
+      fire installs one — §0); recompute its SHA-256 and confirm it equals the
+      hash printed in the run's operator report; it contains token counts only.
+- [ ] **Per-attempt spend**: run `yarn verify:sidecar <path-to-spend.json>` (§0)
+      — the exact integer ceiling arithmetic, not a hand estimate. It must print
+      `VERDICT: PASS` (every attempt priceable and within the $100 reservation,
+      aggregate within the $800 cap, record consistent, reasoning observed).
+      Record the per-attempt figures it prints in the log.
 - [ ] **Reasoning observation**: at least one attempt shows a real nonzero
       reasoning/thinking token field in its raw buckets (e.g. Google
       `thoughtsTokenCount` or OpenAI `reasoning_tokens`).

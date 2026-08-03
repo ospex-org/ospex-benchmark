@@ -48,6 +48,7 @@ import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
 import { checkProviderCollision } from './providers/family.js';
 import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import { serializeSpendEscalationSidecar, spendEscalationSidecarSha256 } from './spendEscalationSidecar.js';
+import { verifySpendSidecar } from './verifySpendSidecar.js';
 import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
 import type { BillingClass } from './spendGuard.js';
 import type { CandidateInput } from './detection.js';
@@ -713,6 +714,137 @@ test('the SAME over-cap-shaped usage on a known-zero fire settles clean — bill
   if (outcome.kind !== 'Installed') return;
   assert.deepEqual(outcome.completion, { status: 'settled' });
   assert.equal(store.completeCalls.length, 1, 'the known-zero mock path is unchanged by the guard');
+});
+
+test('a CLEAN billable pass durably installs the spend sidecar and carries it on the outcome — and the offline verifier passes it', async () => {
+  // Google reports nonzero thoughts so the produced record also satisfies the verifier's
+  // reasoning-observed check (the crossing-acceptance round trip below).
+  const googleThoughts = { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 };
+  const { outcome, store, sink } = await fireOf({
+    billingClass: 'billable',
+    manifestExtra: V2_PIN,
+    usageRawFor: (id) => (id.provider === 'google' ? googleThoughts : pricedUsageFor(id.provider)),
+  });
+  assert.equal(outcome.kind, 'Installed');
+  if (outcome.kind !== 'Installed') return;
+  assert.deepEqual(outcome.completion, { status: 'settled' });
+  assert.equal(store.completeCalls.length, 1, 'the clean pass still settles exactly once');
+
+  // Exactly one durable sidecar, beside (not replacing) the artifact.
+  assert.equal(sink.sidecarCalls.length, 1, 'a billable fire ALWAYS installs its spend evidence');
+  const record = sink.sidecarCalls[0]!.arg;
+
+  // The record binds the exact installed artifact and pins the guard's price identity.
+  assert.equal(record.cohortId, outcome.artifact.cohortId);
+  assert.equal(record.fireId, outcome.artifact.fireId);
+  assert.equal(record.runId, outcome.artifact.runId);
+  assert.equal(record.gameId, outcome.artifact.gameId);
+  assert.equal(record.requestSha256, outcome.artifact.requestSha256);
+  assert.equal(record.reason, null, 'a clean pass is evidence, not an escalation');
+  assert.equal(record.priceVersion, SPEND_GUARD_PRICE_TABLE_VERSION);
+  assert.equal(record.priceTableDigest, modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION));
+  assert.equal(record.perAttemptReservationUsdMicros, 100_000_000);
+
+  // COMPLETE per-attempt content (minus the two dynamic instants, asserted as present):
+  // every arm's initial, all passing, with the whitelisted token buckets verbatim.
+  for (const attempt of record.attempts) {
+    assert.equal(typeof attempt.requestAt, 'string');
+    assert.equal(typeof attempt.responseAt, 'string');
+  }
+  assert.deepEqual(
+    record.attempts.map((a) => ({
+      participantId: a.participantId,
+      provider: a.provider,
+      requestedModelId: a.requestedModelId,
+      role: a.role,
+      usageTokens: { ...a.usageTokens },
+      spendClass: a.spendClass,
+      status: a.status,
+      derivedActualUsdMicros: a.derivedActualUsdMicros,
+    })),
+    CODE_ARMS.map((arm) => ({
+      participantId: arm.participantId,
+      provider: arm.provider,
+      requestedModelId: arm.requestedModelId,
+      role: 'initial',
+      usageTokens:
+        arm.provider === 'openai'
+          ? { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }
+          : arm.provider === 'anthropic'
+            ? { input_tokens: 1, output_tokens: 1 }
+            : arm.provider === 'google'
+              ? { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 }
+              : { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, 'completion_tokens_details.reasoning_tokens': 0 },
+      spendClass: 'price',
+      status: 'pass',
+      derivedActualUsdMicros: null,
+    })),
+  );
+
+  // The outcome carries the durable evidence identity: path, created, and the exact hash.
+  assert.ok(outcome.sidecar, 'the clean billable outcome carries its sidecar');
+  assert.deepEqual(
+    { ...outcome.sidecar },
+    {
+      path: (sink.sidecarCalls[0]!.result as { path: string }).path,
+      created: true,
+      sha256: spendEscalationSidecarSha256(record),
+    },
+  );
+  assert.match(outcome.sidecar.path, /-spend\.json$/);
+  assert.notEqual(outcome.sidecar.path, outcome.install.path);
+
+  // Round trip: the REAL produced record, re-parsed from its canonical bytes, PASSES the
+  // offline verifier the crossing acceptance uses — every named check green.
+  const verification = verifySpendSidecar(JSON.parse(serializeSpendEscalationSidecar(record)));
+  assert.deepEqual(
+    verification.checks.filter((c) => !c.ok),
+    [],
+    `every verifier check passes: ${JSON.stringify(verification.checks)}`,
+  );
+  assert.equal(verification.ok, true);
+});
+
+test('a known-zero pass installs NO sidecar and carries null — the default paths are unchanged', async () => {
+  const { outcome, sink } = await fireOf();
+  assert.equal(outcome.kind, 'Installed');
+  if (outcome.kind !== 'Installed') return;
+  assert.equal(outcome.sidecar, null, 'nothing was billed, nothing to evidence');
+  assert.equal(sink.sidecarCalls.length, 0, 'the sidecar seam is never touched on a known-zero fire');
+});
+
+test('a clean-pass sidecar-install failure propagates BEFORE settlement — a paid fire never settles without its evidence', async () => {
+  const snapshot = sealed({ manifestExtra: V2_PIN });
+  const cohortId = snapshot.booted.cohortId;
+  const game = scopedGame(GAME_ID, BOTH);
+  const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+  const { map } = validAdapters(snapshot, cohortId, game, (id) => pricedUsageFor(id.provider));
+  const real = new FireArtifactSink('/base', new MemoryFs());
+  let artifactInstalls = 0;
+  const sink: ArtifactInstaller = {
+    install(artifact) {
+      artifactInstalls += 1;
+      return real.install(artifact);
+    },
+    installSpendEscalationSidecar() {
+      throw new Error('sidecar install failed (fixture)');
+    },
+  };
+  await assert.rejects(
+    () =>
+      runOneFire({
+        snapshot,
+        capability: mintInjectedAdapterCapability({ adapters: map, billingClass: 'billable' }),
+        claimPort: new StoreClaimPort(store),
+        sink,
+        runOptions: runOpts(),
+        admission: ADMISSION,
+        now: () => NOW_MS,
+      }),
+    /sidecar install failed/,
+  );
+  assert.equal(artifactInstalls, 1, 'the canonical artifact was durably installed first');
+  assert.equal(store.completeCalls.length, 0, 'settlement never ran — the evidence-first ordering holds');
 });
 
 test('an over-reservation REPAIR attempt escalates with role repair — the repair leg reaches the guard', async () => {
