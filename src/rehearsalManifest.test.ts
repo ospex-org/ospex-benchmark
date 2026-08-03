@@ -19,7 +19,7 @@ const NOW = Date.parse('2026-07-18T12:00:40.000Z');
 test('buildRehearsalManifest is code-consistent: cohortBoot accepts it and the cohortId matches', () => {
   const { manifest, bytes } = buildRehearsalManifest(NOW);
 
-  const booted = cohortBoot({ live: false, manifestBytes: bytes });
+  const booted = cohortBoot({ manifestBytes: bytes });
   assert.doesNotThrow(() => assertBootedCohort(booted));
   assert.equal(booted.cohortId, cohortId(parseManifest(JSON.parse(bytes) as unknown)));
   // The returned manifest is the strict parse of the returned bytes.
@@ -38,7 +38,7 @@ test('a drifted code-owned digest fails cohortBoot (the code-consistency guard i
   const raw = JSON.parse(bytes) as Record<string, unknown>;
   raw.marketPolicyDigest = 'f'.repeat(64); // well-formed hex, wrong value
   assert.throws(
-    () => cohortBoot({ live: false, manifestBytes: JSON.stringify(raw) }),
+    () => cohortBoot({ manifestBytes: JSON.stringify(raw) }),
     (e: unknown) => e instanceof CohortBootError && /marketPolicyDigest mismatch/.test(e.message),
   );
 });

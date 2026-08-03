@@ -1,3 +1,4 @@
+import { buildCrossingManifest } from './crossingProfile.js';
 import { discover } from './lineOpenRead.js';
 import { buildRehearsalManifest } from './rehearsalManifest.js';
 import type { DiscoverFn, ReadMarketEvidenceFn } from './lineOpenRead.js';
@@ -122,17 +123,11 @@ export interface DemoFixture {
   readonly readMarketEvidence: ReadMarketEvidenceFn;
 }
 
-/**
- * Assemble the whole demo fixture anchored at `anchorMs`: a code-consistent manifest (with a
- * small provider timeout), the real discovery seam over the synthetic games/current-odds reads,
- * and the real per-market opener read over the synthetic history. The manifest window is
- * now-relative (`windowStart = anchorMs − 168h`, `windowEnd = anchorMs + 6h`), so the anchor's
- * detection instant and the opener both fall inside it.
- */
-export function buildDemoFixture(anchorMs: number): DemoFixture {
-  const { bytes } = buildRehearsalManifest(anchorMs, {
-    providerCallTimeoutMs: DEMO_PROVIDER_CALL_TIMEOUT_MS,
-  });
+/** Wrap the synthetic candidate reads around `manifestBytes`: the real discovery seam over the
+ *  in-memory games/current-odds rows (`fetchCompletedAt = anchorMs`) plus the real per-market
+ *  opener read over the synthetic history. Shared by the demo and crossing fixtures, so both
+ *  drive the exact production projector over the exact same candidate — only the manifest differs. */
+function assembleFixture(manifestBytes: string, anchorMs: number): DemoFixture {
   const rows = buildDemoRows(anchorMs);
   const discoverNow = (): number => anchorMs;
 
@@ -156,8 +151,35 @@ export function buildDemoFixture(anchorMs: number): DemoFixture {
   });
 
   return {
-    manifestBytes: new TextEncoder().encode(bytes),
+    manifestBytes: new TextEncoder().encode(manifestBytes),
     discover: discoverFn,
     readMarketEvidence: readMarketEvidenceFn,
   };
+}
+
+/**
+ * Assemble the whole demo fixture anchored at `anchorMs`: a code-consistent manifest (with a
+ * small provider timeout), the real discovery seam over the synthetic games/current-odds reads,
+ * and the real per-market opener read over the synthetic history. The manifest window is
+ * now-relative (`windowStart = anchorMs − 168h`, `windowEnd = anchorMs + 6h`), so the anchor's
+ * detection instant and the opener both fall inside it.
+ */
+export function buildDemoFixture(anchorMs: number): DemoFixture {
+  const { bytes } = buildRehearsalManifest(anchorMs, {
+    providerCallTimeoutMs: DEMO_PROVIDER_CALL_TIMEOUT_MS,
+  });
+  return assembleFixture(bytes, anchorMs);
+}
+
+/**
+ * The CROSSING fixture: the exact same synthetic candidate and timing model, under the pinned
+ * one-fire crossing manifest (`buildCrossingManifest` — $800 spend cap, call cap 8, one dispatch
+ * per tick, conservative guard price table pinned, production 300s provider timeout). This is the
+ * fixture the attended `--live` crossing boots: "fixture-backed" means the CANDIDATE is synthetic
+ * while the admission, dispatch, and adapters are real. Building it performs no I/O and authorizes
+ * nothing — billable adapter authority still requires the gated capability producer under an
+ * attended live authorization.
+ */
+export function buildCrossingFixture(anchorMs: number): DemoFixture {
+  return assembleFixture(buildCrossingManifest(anchorMs).bytes, anchorMs);
 }

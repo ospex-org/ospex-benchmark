@@ -14,8 +14,9 @@ import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
  * The canonical boot gate. The valid fixture is built FROM the running code (real
  * market-policy digest, prompt-scaffold hash, scoring version, and expected arm
  * roster), so a clean boot proves the gate accepts a code-consistent manifest;
- * each mutation proves a specific refusal — `--live`, a bad manifest, a code
- * mismatch, or a canonical override that diverges from the manifest.
+ * each mutation proves a specific refusal — a bad manifest, a code mismatch, or
+ * a canonical override that diverges from the manifest. (Live intent is not a
+ * boot concern; the request shape carries no live lever.)
  */
 
 const LOCKED_CONSTANTS = {
@@ -82,7 +83,7 @@ function codeConsistentRaw(): Record<string, unknown> {
 
 /** A booting request from a raw manifest object (JSON-serialized to bytes). */
 function req(raw: Record<string, unknown>, extra: Partial<Omit<CohortBootRequest, 'manifestBytes'>> = {}) {
-  return { live: false, manifestBytes: JSON.stringify(raw), ...extra };
+  return { manifestBytes: JSON.stringify(raw), ...extra };
 }
 type CohortBootRequest = Parameters<typeof cohortBoot>[0];
 
@@ -141,19 +142,18 @@ test('cohortBoot rejects an unknown spend-reservation version and a wrong per-at
   assert.doesNotThrow(() => cohortBoot(req(codeConsistentRaw())));
 });
 
-test('--live is hard-disabled — refused BEFORE the manifest is even parsed', () => {
-  // Garbage bytes: if `--live` were not checked first, this would surface a JSON
-  // error instead of the live refusal.
-  const err = assertBootError(() => cohortBoot({ live: true, manifestBytes: 'not json at all' }));
-  assert.deepEqual(err.violations, ['--live is hard-disabled']);
-  assert.match(err.message, /remove --live/);
-  // Also refused with an otherwise-valid manifest.
-  const err2 = assertBootError(() => cohortBoot(req(codeConsistentRaw(), { live: true })));
-  assert.deepEqual(err2.violations, ['--live is hard-disabled']);
+test('the boot request carries NO live lever — a smuggled `live` field cannot reach the gate', () => {
+  // Live intent is owned by the tri-state CLI resolver + the gated billable capability
+  // producer, never by boot: booting authorizes no dispatch of any kind. The request shape
+  // has no `live` field, so an `as`-cast extra is inert — the boot result is identical.
+  const raw = codeConsistentRaw();
+  const withExtra = { manifestBytes: JSON.stringify(raw), live: true } as unknown as CohortBootRequest;
+  const booted = cohortBoot(withExtra);
+  assert.equal(booted.cohortId, cohortId(parseManifest(raw)), 'the extra field changes nothing');
 });
 
 test('invalid JSON fails boot', () => {
-  const err = assertBootError(() => cohortBoot({ live: false, manifestBytes: '{ not json' }));
+  const err = assertBootError(() => cohortBoot({ manifestBytes: '{ not json' }));
   assert.match(err.message, /not valid JSON/);
 });
 
@@ -259,11 +259,11 @@ test('the booted manifest is deep-frozen — no post-boot cast can drift the con
 
 test('cohortId is independent of manifest byte formatting (whitespace / key order)', () => {
   const raw = codeConsistentRaw();
-  const compact = cohortBoot({ live: false, manifestBytes: JSON.stringify(raw) });
-  const pretty = cohortBoot({ live: false, manifestBytes: JSON.stringify(raw, null, 2) });
+  const compact = cohortBoot({ manifestBytes: JSON.stringify(raw) });
+  const pretty = cohortBoot({ manifestBytes: JSON.stringify(raw, null, 2) });
   // Reversed top-level key order — same semantic object, different bytes.
   const reordered = Object.fromEntries(Object.entries(raw).reverse());
-  const shuffled = cohortBoot({ live: false, manifestBytes: JSON.stringify(reordered) });
+  const shuffled = cohortBoot({ manifestBytes: JSON.stringify(reordered) });
   assert.equal(compact.cohortId, pretty.cohortId);
   assert.equal(compact.cohortId, shuffled.cohortId);
 });

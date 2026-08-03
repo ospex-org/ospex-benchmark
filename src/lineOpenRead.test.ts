@@ -108,7 +108,7 @@ function manifestRaw(
 }
 
 function bootMlbCohort(constantsOverrides: Record<string, unknown> = {}): BootedCohort {
-  return cohortBoot({ live: false, manifestBytes: JSON.stringify(manifestRaw({}, constantsOverrides)) });
+  return cohortBoot({ manifestBytes: JSON.stringify(manifestRaw({}, constantsOverrides)) });
 }
 
 function makeGame(overrides: Partial<GamesEndpointRow> = {}): GamesEndpointRow {
@@ -764,8 +764,8 @@ test('retainedSnapshotRowsMatchSourceExactly', async () => {
 // ===========================================================================
 
 test('a discovery snapshot is bound to its producing cohort', async () => {
-  const bootedA = cohortBoot({ live: false, manifestBytes: JSON.stringify(manifestRaw({ network: 'polygon' })) });
-  const bootedB = cohortBoot({ live: false, manifestBytes: JSON.stringify(manifestRaw({ network: 'polygon-amoy' })) });
+  const bootedA = cohortBoot({ manifestBytes: JSON.stringify(manifestRaw({ network: 'polygon' })) });
+  const bootedB = cohortBoot({ manifestBytes: JSON.stringify(manifestRaw({ network: 'polygon-amoy' })) });
   assert.notEqual(bootedA.cohortId, bootedB.cohortId, 'the two cohorts have distinct identities');
   const { deps } = fakeDiscoveryReads([makeGame({ gameId: 'cb1' })], [makeOdds({ jsonodds_id: 'cb1' })]);
   const snap = await discover(bootedA, deps);

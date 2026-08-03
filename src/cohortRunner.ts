@@ -51,9 +51,10 @@ export interface CohortTickInput {
   readonly claimPort: ClaimPort;
   /** The MINTED adapter capability for the whole tick — adapter facades AND billing
    *  provenance as one unforgeable value, threaded to every fire. Raw adapter maps and
-   *  structural lookalikes are rejected by the runtime brand; production ticks mint via
-   *  `createCohortMockAdapterCapability` (every producer in this build is known-zero;
-   *  real billable authority requires a gated producer that does not exist yet). */
+   *  structural lookalikes are rejected by the runtime brand; default ticks mint via
+   *  `createCohortMockAdapterCapability` (known-zero), and REAL billable authority exists
+   *  only via the gated `gateRealCohortAdapterCapability` producer under an attended,
+   *  explicitly-confirmed live authorization. */
   readonly capability: CohortAdapterCapability;
   readonly sink: ArtifactInstaller;
   readonly runOptions: LineOpenRunOptions;

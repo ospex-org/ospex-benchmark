@@ -36,9 +36,10 @@ import type { AdmitDispatchRequest, ClaimKey } from './store/contract.js';
  * deliberately never sees a permit, and the producer never sees one either, so this module is where
  * those independently-derived identity paths meet.
  *
- * This build remains non-activating for REAL provider spend: the production cohort runner and its
- * fixture CLI reach `runOneFire` only through the mock, `known-zero` capability producer; no `--live`
- * path or gated real-adapter producer exists here. It settles a clean claim only through the
+ * Every DEFAULT path reaches `runOneFire` through a `known-zero` capability producer (mock or
+ * real-shaped fake); REAL provider spend is reachable ONLY through the billable capability minted by
+ * the gated producer (`gateRealCohortAdapterCapability`) under an attended, explicitly-confirmed
+ * live authorization — absent that, no fire this module runs can bill. It settles a clean claim only through the
  * permit-resolved completion capability, and it folds any settle failure to a typed `unsettled`
  * completion that never discards the persisted artifact — an activation consumer must branch on
  * `completion.status` and escalate

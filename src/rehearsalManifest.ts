@@ -2,7 +2,8 @@ import { canonicalize } from './canonical.js';
 import { parseManifest } from './manifest.js';
 import type { CohortManifestV1 } from './manifest.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
-import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
+import { MODEL_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
+import type { ModelPriceTableVersion } from './modelPriceTable.js';
 import { SOURCE_QUERY_VERSION } from './oddsHistory.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { CODE_MAX_REPAIRS_PER_ARM, REPAIR_POLICY_VERSION } from './repairPolicy.js';
@@ -28,9 +29,11 @@ import {
  *
  * The observation window is NOW-RELATIVE: `windowStart = now − gameDiscoveryWindowHours`
  * and `windowEnd = now + a few hours`, so a rehearsal run's wall clock is always
- * inside the window and today's live games can be in-window. This is a REHEARSAL
- * manifest only — the runner boots it with `--live` hard-disabled and the report-only
- * claim port, so it never authorizes a paid dispatch.
+ * inside the window and today's live games can be in-window. By default this is a
+ * REHEARSAL manifest — the rehearsal runner pairs it with the report-only claim port
+ * and the known-zero mock capability, so it never authorizes a paid dispatch. The
+ * pinned one-fire crossing manifest is built through this same code-consistent
+ * builder (`buildCrossingManifest`), with every crossing lever set explicitly.
  */
 
 const HOUR_MS = 3_600_000;
@@ -47,6 +50,18 @@ export interface RehearsalManifestOptions {
    * changes only this generated manifest's pinned constant, never any production default.
    */
   readonly providerCallTimeoutMs?: number;
+  /**
+   * Crossing-profile construction levers (`buildCrossingManifest` sets all five to the
+   * pinned one-fire crossing values). Each default reproduces the rehearsal shape exactly,
+   * so an omitting caller gets byte-identical rehearsal bytes; the price-table DIGEST is
+   * always RECOMPUTED from the version here — a caller cannot pin a version/digest pair
+   * that disagrees.
+   */
+  readonly maxConcurrentProviderRequests?: number;
+  readonly maxDispatchesPerTick?: number;
+  readonly cohortCallCap?: number;
+  readonly cohortSpendCapUsdMicros?: number;
+  readonly modelPriceTableVersion?: ModelPriceTableVersion;
 }
 
 export interface RehearsalManifest {
@@ -67,6 +82,11 @@ export function buildRehearsalManifest(now: number, opts: RehearsalManifestOptio
   const windowForwardMs = opts.windowForwardMs ?? 6 * HOUR_MS;
   const providerCallTimeoutMs = opts.providerCallTimeoutMs ?? 300_000;
   const arms = defaultExpectedArms();
+  const maxConcurrentProviderRequests = opts.maxConcurrentProviderRequests ?? Math.max(8, arms.length);
+  const maxDispatchesPerTick = opts.maxDispatchesPerTick ?? 8;
+  const cohortCallCap = opts.cohortCallCap ?? 1_000;
+  const cohortSpendCapUsdMicros = opts.cohortSpendCapUsdMicros ?? 1_000_000_000;
+  const modelPriceTableVersion = opts.modelPriceTableVersion ?? MODEL_PRICE_TABLE_VERSION;
 
   const windowStart = new Date(now - gameDiscoveryWindowHours * HOUR_MS).toISOString();
   const windowEnd = new Date(now + windowForwardMs).toISOString();
@@ -97,8 +117,8 @@ export function buildRehearsalManifest(now: number, opts: RehearsalManifestOptio
     repairPolicyVersion: REPAIR_POLICY_VERSION,
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     uncertaintyPolicyVersion: 'uncertainty-v1',
-    modelPriceTableVersion: MODEL_PRICE_TABLE_VERSION,
-    modelPriceTableDigest: MODEL_PRICE_TABLE_DIGEST,
+    modelPriceTableVersion,
+    modelPriceTableDigest: modelPriceTableDigest(modelPriceTableVersion),
     spendReservationPolicyVersion: SPEND_RESERVATION_POLICY_VERSION,
     runnerCommitSha: '0'.repeat(40),
     constants: {
@@ -119,12 +139,13 @@ export function buildRehearsalManifest(now: number, opts: RehearsalManifestOptio
       // A literal here could drift, and the two paths would then tag at
       // different thresholds under one policy version and one knob name.
       scheduleChangeToleranceMs: SCHEDULE_CHANGE_TOLERANCE_MS,
-      // The scheduler must be able to launch the whole roster concurrently.
-      maxConcurrentProviderRequests: Math.max(8, arms.length),
-      maxDispatchesPerTick: 8,
+      // The scheduler must be able to launch the whole roster concurrently
+      // (boot refuses concurrency below the roster size).
+      maxConcurrentProviderRequests,
+      maxDispatchesPerTick,
     },
-    cohortCallCap: 1_000,
-    cohortSpendCapUsdMicros: 1_000_000_000,
+    cohortCallCap,
+    cohortSpendCapUsdMicros,
   };
 
   const bytes = canonicalize(raw);

@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { assertCohortAdapterCapability } from './cohortAdapterCapability.js';
-import { CohortBootError, assertBootedCohort, cohortBoot } from './cohortBoot.js';
+import { CanaryAuthorizationError, assertCohortAdapterCapability } from './cohortAdapterCapability.js';
+import { assertBootedCohort, cohortBoot } from './cohortBoot.js';
 import { runCohortTick } from './cohortRunner.js';
+import { CROSSING_PROFILE } from './crossingProfile.js';
+import { observeRealAdapterCredentials, resolveLiveIntent } from './liveIntent.js';
 import {
   buildRehearsalTickInput,
   classifyStoreFireResult,
@@ -170,7 +172,7 @@ function fixtureTickInput(bytes: string, games: GamesEndpointRow[], odds: Curren
 
 test('selfResolvePublication yields a genuine PublicationVerified bound to the booted cohort', () => {
   const { bytes } = buildRehearsalManifest(FIXED_NOW);
-  const booted = cohortBoot({ live: false, manifestBytes: bytes });
+  const booted = cohortBoot({ manifestBytes: bytes });
   const publication = selfResolvePublication(enc(bytes));
   assert.doesNotThrow(() => assertPublicationVerified(publication));
   assert.equal(publication.cohortId, booted.cohortId, 'publication is verified for THIS cohort');
@@ -238,14 +240,6 @@ test('a rehearsal tick over an empty discovery renders a zero-candidate result (
   assert.equal(result.fireOutcomes.length, 0);
   assert.equal(result.admittedCount, 0);
   assert.ok(formatTickResult(result).some((l) => /discovered 0 candidate/.test(l)));
-});
-
-test('--live is rejected by cohortBoot (the mechanism the CLI routes into)', () => {
-  const { bytes } = buildRehearsalManifest(FIXED_NOW);
-  assert.throws(
-    () => cohortBoot({ live: true, manifestBytes: bytes }),
-    (e: unknown) => e instanceof CohortBootError && /--live is hard-disabled/.test(e.violations.join('; ')),
-  );
 });
 
 test('invalid-UTF-8 manifest bytes THROW at the fatal decode — never silently rewritten', () => {
@@ -495,11 +489,22 @@ function fakeInitializedStore(): AtomicStore {
   };
 }
 
-/** Store-fire deps that open the fake store (no DB) and return `result` from the (never-DB) tick. */
-function fakeStoreFireDeps(result: CohortTickResult): StoreFireDeps {
+/** Store-fire deps that open the fake store (no DB) and return `result` from the (never-DB) tick.
+ *  Live resolution defaults to the REAL resolver (which returns `MockRequested` for `live: false`,
+ *  proving the default path flows through the production tri-state seam). */
+function fakeStoreFireDeps(result: CohortTickResult, over: Partial<StoreFireDeps> = {}): StoreFireDeps {
   return {
     openStore: async () => ({ store: fakeInitializedStore(), close: async () => {} }),
     runTick: async () => result,
+    resolveLive: ({ live, booted }) =>
+      resolveLiveIntent({
+        live,
+        booted,
+        observeCredentials: (ids) => new Map(ids.map((id) => [id, false])),
+        print: () => {},
+        confirm: async () => null,
+      }),
+    ...over,
   };
 }
 
@@ -532,11 +537,18 @@ test('runStoreBackedFire returns nonzero for an Installed but unsettled tick (cl
   assert.notEqual(code, 0, 'an unsettled completion must not report success — bypassing the classifier call turns this red');
 });
 
-test('the spawned CLI hard-disables --live before any DB work under --store=postgres --fixture', () => {
+test('the spawned CLI refuses --live (missing credentials) BEFORE any DB work — and never runs mock instead', () => {
   const dir = mkdtempSync(join(tmpdir(), 'runner-fire-live-'));
   const outDir = join(dir, 'artifacts');
+  // Pin every provider credential ABSENT: an empty value counts as set for the .env loader
+  // (so a local .env cannot re-supply it) and reads as undefined for the adapters' probes.
   const { status, signal, out } = runCli(['--store=postgres', '--fixture', '--live', '--out', outDir], {
     STORE_DATABASE_URL: UNREACHABLE_STORE_URL,
+    OPENAI_API_KEY: '',
+    ANTHROPIC_API_KEY: '',
+    GEMINI_API_KEY: '',
+    GOOGLE_API_KEY: '',
+    XAI_API_KEY: '',
   });
 
   // A real nonzero exit (not a timeout kill, which would leave status === null).
@@ -544,14 +556,26 @@ test('the spawned CLI hard-disables --live before any DB work under --store=post
     typeof status === 'number' && status !== 0,
     `expected a nonzero exit; status=${String(status)} signal=${String(signal)} out=${out}`,
   );
-  // The refusal is the --live hard-disable surfaced from cohortBoot...
-  assert.ok(/--live rejected by cohortBoot/.test(out), `expected the --live hard-disable message; out=${out}`);
-  // ...raised BEFORE the store branch: no DB connection was attempted against the unreachable URL,
-  // and DB setup was never reached.
+  // The tri-state resolution refused (no usable credentials) and said so — with NO mock fallback.
+  assert.ok(/--live refused — no mock fallback/.test(out), `expected the live refusal message; out=${out}`);
+  assert.ok(/no usable credential/.test(out), `expected the credential violations; out=${out}`);
+  // Refused BEFORE the store was opened: no DB connection was attempted against the unreachable
+  // URL, and DB setup was never reached — a refused live request touches nothing.
   assert.ok(!/ECONNREFUSED/i.test(out), `must not surface a DB connection error; out=${out}`);
   assert.ok(!/store schema \+ functions applied/.test(out), `must not reach DB setup; out=${out}`);
+  // No dispatch of ANY kind ran (the mock demo would have printed its dispatch line).
+  assert.ok(!/dispatching the/.test(out), `must not dispatch mock OR live; out=${out}`);
   // And no artifact was produced.
   assert.ok(!existsSync(outDir), 'no artifact directory should be created');
+});
+
+test('the spawned CLI refuses --live outside the store-backed crossing path (rehearsal), nonzero', () => {
+  const { status, out } = runCli(['--store=rehearsal', '--live']);
+  assert.ok(typeof status === 'number' && status !== 0, `expected a nonzero exit; out=${out}`);
+  assert.ok(/--live is only valid on the store-backed crossing path/.test(out), `expected the combo refusal; out=${out}`);
+  // Refused BEFORE the banner: no rehearsal mode line printed, no tick ran.
+  assert.ok(!/REHEARSAL \(dry-run\)/.test(out), `no rehearsal banner; out=${out}`);
+  assert.ok(!/discovered \d+ candidate/.test(out), `no rehearsal tick ran; out=${out}`);
 });
 
 test('the spawned CLI refuses --emit-manifest with --store=postgres before any DB work, writing no file', () => {
@@ -581,4 +605,199 @@ test('the demo fixture manifest pins providerCallTimeoutMs to the fast demo time
   const manifest = parseManifest(JSON.parse(decodeManifestText(fixture.manifestBytes)) as unknown);
   // The fast-timeout claim is load-bearing: the always-timing-out mock arm settles in ~1s.
   assert.equal(manifest.constants.providerCallTimeoutMs, DEMO_PROVIDER_CALL_TIMEOUT_MS);
+});
+
+// ---------------------------------------------------------------------------
+// Tri-state live wiring: the store-fire builder's adapter selection is owned by
+// the resolution. MockRequested keeps the known-zero mock demo byte-identical;
+// LiveRefused exits nonzero having touched NOTHING; LiveAuthorized mints the
+// REAL billable capability through the gated producer (which re-validates the
+// authorization itself — a stale one is refused loudly before any store work).
+// ---------------------------------------------------------------------------
+
+/** Synthetic provider credentials for the no-dispatch wiring tests (never real keys); the
+ *  Google arm exercises its primary env var. */
+const SYNTHETIC_PROVIDER_ENV: Record<string, string | undefined> = {
+  OPENAI_API_KEY: 'synthetic-test-credential',
+  ANTHROPIC_API_KEY: 'synthetic-test-credential',
+  GEMINI_API_KEY: 'synthetic-test-credential',
+  GOOGLE_API_KEY: undefined,
+  XAI_API_KEY: 'synthetic-test-credential',
+};
+
+/** Run `fn` with `vars` applied to the environment (undefined = deleted), restoring after. */
+async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const saved = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(vars)) {
+    saved.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+/** Run `fn` under a THROWING `globalThis.fetch`: proof the wiring under test never
+ *  reaches the network (minting captures facades; the faked tick dispatches nothing). */
+async function withThrowingFetch<T>(fn: () => Promise<T>): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = (() => {
+    throw new Error('network reached during a non-dispatching wiring test');
+  }) as typeof fetch;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test('the default (no --live) store fire resolves MockRequested and mints the known-zero mock capability over the DEMO manifest', async () => {
+  let captured: CohortTickInput | undefined;
+  const result = tickResultOf([fireSummary('f1', installedSettledOutcome('/out/cohort/fire-a.json'))]);
+  const code = await runStoreBackedFire(
+    FIRE_OPTIONS,
+    fakeStoreFireDeps(result, {
+      runTick: async (input) => {
+        captured = input;
+        return result;
+      },
+    }),
+  );
+  assert.equal(code, 0);
+  assert.ok(captured, 'the tick ran');
+  assert.doesNotThrow(() => assertCohortAdapterCapability(captured!.capability));
+  assert.equal(captured!.capability.billingClass, 'known-zero', 'the default path stays known-zero');
+  // The DEMO manifest, not the crossing manifest: fast mock timeout and the demo caps.
+  assert.equal(captured!.booted.manifest.constants.providerCallTimeoutMs, DEMO_PROVIDER_CALL_TIMEOUT_MS);
+  assert.equal(captured!.booted.manifest.cohortSpendCapUsdMicros, 1_000_000_000);
+});
+
+test('runStoreBackedFire exits 2 on LiveRefused having touched NOTHING — no store open, no tick, no mock fallback', async () => {
+  const events: string[] = [];
+  const deps: StoreFireDeps = {
+    openStore: async () => {
+      events.push('openStore');
+      return { store: fakeInitializedStore(), close: async () => {} };
+    },
+    runTick: async () => {
+      events.push('runTick');
+      return tickResultOf([]);
+    },
+    resolveLive: async () => ({ kind: 'LiveRefused', violations: ['injected refusal'] }),
+  };
+  const code = await runStoreBackedFire({ ...FIRE_OPTIONS, live: true }, deps);
+  assert.equal(code, 2, 'a refused live request exits nonzero');
+  assert.deepEqual(events, [], 'neither the store nor the tick was touched — and no mock ran in its place');
+});
+
+test('--live + full authorization mints the REAL billable capability over the CROSSING manifest — terms printed, no dispatch, no network', async () => {
+  const printed: string[] = [];
+  let captured: CohortTickInput | undefined;
+  const result = tickResultOf([fireSummary('f1', installedSettledOutcome('/out/cohort/fire-a.json'))]);
+  const deps: StoreFireDeps = fakeStoreFireDeps(result, {
+    runTick: async (input) => {
+      captured = input;
+      return result;
+    },
+    // The REAL resolver + the REAL credential probe (over synthetic env), scripted 'y'.
+    resolveLive: ({ live, booted }) =>
+      resolveLiveIntent({
+        live,
+        booted,
+        observeCredentials: observeRealAdapterCredentials,
+        print: (line) => printed.push(line),
+        confirm: async () => 'y',
+      }),
+  });
+  // The assertions run INSIDE the synthetic-env scope: the capability's facades are
+  // LIVE-BOUND to the real adapters' env probes (deliberately — proven in the capability
+  // suite), so `hasCredential()` must be read while the synthetic credentials exist.
+  await withEnv(SYNTHETIC_PROVIDER_ENV, () =>
+    withThrowingFetch(async () => {
+      const code = await runStoreBackedFire({ ...FIRE_OPTIONS, live: true }, deps);
+      assert.equal(code, 0);
+      assert.ok(captured, 'the tick ran');
+
+      // The printed terms carry the exact facts: cohortId, the $800 ceiling, call cap 8, one fire.
+      assert.ok(printed.some((l) => l.includes(captured!.booted.cohortId)), 'the exact cohortId was printed');
+      assert.ok(printed.some((l) => l.includes('$800.00')), 'the $800 reservation ceiling was printed');
+      assert.ok(printed.some((l) => /provider call cap 8/.test(l)), 'the 8-call cap was printed');
+      assert.ok(printed.some((l) => /one fire maximum/.test(l)), 'the one-fire limit was printed');
+
+      // The CROSSING manifest (not the demo): pinned caps, conservative guard table, real timeout.
+      const manifest = captured!.booted.manifest;
+      assert.equal(manifest.cohortSpendCapUsdMicros, CROSSING_PROFILE.cohortSpendCapUsdMicros);
+      assert.equal(manifest.cohortCallCap, CROSSING_PROFILE.cohortCallCap);
+      assert.equal(manifest.constants.maxDispatchesPerTick, CROSSING_PROFILE.maxDispatchesPerTick);
+      assert.equal(manifest.constants.maxConcurrentProviderRequests, CROSSING_PROFILE.maxConcurrentProviderRequests);
+      assert.equal(manifest.modelPriceTableVersion, 'prices-v2');
+      assert.equal(captured!.runOptions.timeoutMs, 300_000, 'the crossing keeps the production provider timeout');
+
+      // The capability is REAL and billable: the gated producer minted the four real adapter
+      // identities (complete identity tuples, in roster order), each with a usable credential.
+      assert.doesNotThrow(() => assertCohortAdapterCapability(captured!.capability));
+      assert.equal(captured!.capability.billingClass, 'billable');
+      const adapters = captured!.capability.adapters();
+      assert.deepEqual(
+        [...adapters.entries()].map(([id, a]) => ({
+          id,
+          provider: a.provider,
+          requestedModelId: a.requestedModelId,
+          credentialEnvVar: a.credentialEnvVar,
+          hasCredential: a.hasCredential(),
+        })),
+        [
+          { id: 'openai-gpt-5.6-sol', provider: 'openai', requestedModelId: 'gpt-5.6-sol', credentialEnvVar: 'OPENAI_API_KEY', hasCredential: true },
+          { id: 'anthropic-claude-fable-5', provider: 'anthropic', requestedModelId: 'claude-fable-5', credentialEnvVar: 'ANTHROPIC_API_KEY', hasCredential: true },
+          { id: 'google-gemini-3.1-pro-preview', provider: 'google', requestedModelId: 'gemini-3.1-pro-preview', credentialEnvVar: 'GEMINI_API_KEY', hasCredential: true },
+          { id: 'xai-grok-4.5', provider: 'xai', requestedModelId: 'grok-4.5', credentialEnvVar: 'XAI_API_KEY', hasCredential: true },
+        ],
+      );
+    }),
+  );
+});
+
+test('a LiveAuthorized resolution with a STALE authorization is refused by the gated producer — loud, before any store work', async () => {
+  const events: string[] = [];
+  const deps: StoreFireDeps = {
+    openStore: async () => {
+      events.push('openStore');
+      return { store: fakeInitializedStore(), close: async () => {} };
+    },
+    runTick: async () => {
+      events.push('runTick');
+      return tickResultOf([]);
+    },
+    // A shape-valid authorization for ANOTHER cohort (equal caps, wrong cohortId): the
+    // producer must not trust the resolution — it re-binds to the booted cohort itself.
+    resolveLive: async ({ booted }) => ({
+      kind: 'LiveAuthorized',
+      authorization: {
+        cohortId: 'f'.repeat(64),
+        participantIds: booted.manifest.expectedArmRoster.map((a) => a.participantId),
+        modelPriceTableVersion: booted.manifest.modelPriceTableVersion,
+        modelPriceTableDigest: booted.manifest.modelPriceTableDigest,
+        liveOptIn: true,
+        observedCredentialedParticipantIds: booted.manifest.expectedArmRoster.map((a) => a.participantId),
+        cohortSpendCapUsdMicros: CROSSING_PROFILE.cohortSpendCapUsdMicros,
+        cohortCallCap: CROSSING_PROFILE.cohortCallCap,
+        maxConcurrentProviderRequests: CROSSING_PROFILE.maxConcurrentProviderRequests,
+        maxDispatchesPerTick: CROSSING_PROFILE.maxDispatchesPerTick,
+        maxRepairAttemptsPerArm: CROSSING_PROFILE.maxRepairAttemptsPerArm,
+      },
+    }),
+  };
+  await withEnv(SYNTHETIC_PROVIDER_ENV, () =>
+    assert.rejects(
+      () => runStoreBackedFire({ ...FIRE_OPTIONS, live: true }, deps),
+      (e: unknown) => e instanceof CanaryAuthorizationError && /cohortId/.test(e.message),
+    ),
+  );
+  assert.deepEqual(events, [], 'refused before the store was ever opened');
 });
