@@ -55,8 +55,9 @@ export const CAMPAIGN_BOUNDS = deepFreeze({
 
   /** Bounded levers. A campaign must reach at least one whole fire, and no more than these. */
   minCohortCallCap: CROSSING_PROFILE.maxAttemptsPerFire, // 8 = one fire's worth
-  /** 4000 calls = 500 fires ≈ $23 at the observed rate. Deliberately the tightest bound that
-   *  still covers a full MLB month; raising it is a conscious, reviewable edit. */
+  /** 4000 calls = 500 fires ≈ $185 at the observed per-attempt rate. Deliberately the
+   *  tightest bound that still covers a full MLB month; raising it is a conscious,
+   *  reviewable edit. */
   maxCohortCallCap: 4_000,
   /** The reservation cap must cover the call cap's fires and may not exceed this. */
   maxCohortSpendCapUsdMicros: 400_000_000_000, // 500 fires × $800 reservation

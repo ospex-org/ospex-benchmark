@@ -9,8 +9,9 @@ import type { CampaignAuthorization, CampaignAuthorizationPort } from '../campai
  *
  * The JSON record is the single source of truth — there are no denormalized columns to drift
  * from it. Arming INSERTs and refuses to overwrite; disarming writes `disarmedAt` INSIDE the
- * record and never deletes the row, so both the arming and the stop remain auditable, and a
- * disarmed campaign can never be silently re-armed by a second `arm` call.
+ * record and never deletes the row, so both the arming and the stop remain auditable. A
+ * cohort is armed at most once, EVER — the primary key refuses every second arm, including
+ * after a disarm; another campaign is a new manifest and therefore a new cohortId.
  */
 export class SqlCampaignAuthorizationPort implements CampaignAuthorizationPort {
   constructor(private readonly query: StoreQuery) {}
@@ -22,9 +23,10 @@ export class SqlCampaignAuthorizationPort implements CampaignAuthorizationPort {
   }
 
   /**
-   * Insert the record for a cohort not already armed. `on conflict do nothing` makes a
-   * second arm a no-op rather than an overwrite: re-arming is an explicit disarm-then-arm
-   * of a NEW cohort, never a silent replacement of live terms.
+   * Insert the record for a cohort never armed before. `on conflict do nothing` makes any
+   * second arm for the same cohort a refusal rather than an overwrite — including after a
+   * disarm: the record is immutable history, and running another campaign means a NEW
+   * manifest (a new window gives a new cohortId), never a replacement of this one.
    */
   async arm(record: CampaignAuthorization): Promise<'armed' | 'already_armed'> {
     const rows = await this.query(

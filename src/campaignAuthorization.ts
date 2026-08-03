@@ -78,8 +78,10 @@ export interface CampaignAuthorization {
 export interface CampaignAuthorizationPort {
   /** The stored record for `cohortId`, RAW and unvalidated, or `null` when none exists. */
   read(cohortId: string): Promise<unknown | null>;
-  /** Durably record a new authorization. Refuses when one already exists for the cohort —
-   *  re-arming is an explicit disarm-then-arm, never a silent overwrite. */
+  /** Durably record a new authorization. Refuses when ANY record already exists for the
+   *  cohort — even a disarmed one. A cohort is armed at most once, ever: its record is
+   *  immutable history, and running another campaign means building a NEW manifest (a new
+   *  window gives a new cohortId) and arming that. */
   arm(record: CampaignAuthorization): Promise<'armed' | 'already_armed'>;
   /** Revoke; idempotent. The stop lever. */
   disarm(cohortId: string, at: string): Promise<'disarmed' | 'not_found'>;

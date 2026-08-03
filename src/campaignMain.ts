@@ -1,35 +1,21 @@
-import { readFileSync, writeFileSync } from 'node:fs';
-import { hostname } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { isBaselinePolicyVersion } from './baselines.js';
 import { buildCampaignAuthorization, resolveCampaignIntent } from './campaignAuthorization.js';
-import type { CampaignAuthorizationPort } from './campaignAuthorization.js';
+import type { CampaignAuthorization, CampaignAuthorizationPort } from './campaignAuthorization.js';
 import { buildCampaignManifest, campaignBoundsViolations, projectCampaignCost } from './campaignProfile.js';
 import { assertCohortBudgetInitialized, buildCohortBudgetInitRequest } from './cohortBudgetInit.js';
 import { cohortBoot } from './cohortBoot.js';
 import type { BootedCohort } from './cohortBoot.js';
-import { gateRealCampaignAdapterCapability } from './cohortAdapterCapability.js';
-import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
-import { runCohortTick } from './cohortRunner.js';
-import type { CohortTickInput, CohortTickResult } from './cohortRunner.js';
-import { decodeManifestText, formatTickResult, installedArtifactPaths, selfResolvePublication } from './cohortRunnerMain.js';
+import { decodeManifestText } from './cohortRunnerMain.js';
 import { describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
-import { FireArtifactSink } from './fireArtifactSink.js';
-import { StoreClaimPort } from './lineOpenClaim.js';
-import { createDiscoverFn, createReadMarketEvidenceFn } from './lineOpenRead.js';
 import { askLiveConfirmation, observeRealAdapterCredentials } from './liveIntent.js';
-import { DEFAULT_OSPEX_API_URL } from './config.js';
-import type { LineOpenReadConfig } from './lineOpenRead.js';
-import type { CohortManifestV1 } from './manifest.js';
-import type { LineOpenRunOptions } from './lineOpenSpine.js';
+import { instantMs, isParseableInstant } from './time.js';
 import type { AtomicStore } from './store/contract.js';
-import { STORE_SCHEMA_VERSION } from './store/constants.js';
 
 /**
- * The CAMPAIGN entrypoint — `arm`, `stop`, `tick`.
+ * The CAMPAIGN entrypoint — `arm`, `tick`, `stop`.
  *
  * The attended crossing authorized exactly one fire, with a human answering a prompt. A
  * scheduled benchmark cannot answer a prompt (and by design an unanswered prompt refuses), so
@@ -37,43 +23,61 @@ import { STORE_SCHEMA_VERSION } from './store/constants.js';
  *
  *   - `arm`  — ATTENDED, once per campaign. Boots the cohort, prints the exact terms
  *              (identity, window, size in calls and fires, and what that costs at both the
- *              observed rate and the committed conservative bound), takes the `[Y/n]`,
- *              initializes the cohort budget, and records the durable authorization.
- *   - `tick` — UNATTENDED, what cron calls. Resolves live intent by READING that record.
- *              Never prompts, never falls back to mock: it either holds a validated
- *              authorization or fires nothing and exits nonzero.
- *   - `stop` — revokes the authorization. Fail-safe: the next tick fires nothing.
+ *              observed rate and the committed conservative bound), takes the standard
+ *              `[Y/n]` confirmation, and then makes the durable writes in AUTHORITY ORDER:
+ *              the manifest file first (no-clobber + fsync + read-back), the cohort budget
+ *              next (durable but NOT authorizing), and the authorization record LAST — the
+ *              single authorizing transition. A failed arm therefore never leaves standing
+ *              authority without its manifest on disk, and re-running the same arm
+ *              reconciles any intermediate failure.
+ *   - `tick` — UNATTENDED, what a scheduler will call. Resolves live intent by READING that
+ *              record — never prompts, never falls back to mock — and then REFUSES to
+ *              dispatch: scheduled activation is structurally disabled in this build (no
+ *              code path in this entrypoint constructs a provider adapter or reaches a
+ *              dispatch). What must land before that flips — real public-Git publication
+ *              evidence for the campaign manifest and a durable escalation latch checked
+ *              before every dispatch — is specified in docs/CAMPAIGN-ACTIVATION.md.
+ *   - `stop` — revokes the authorization. Fail-safe: the next tick resolves nothing.
  *
  * Three bounds hold an armed campaign, and only the first needs nobody's attention: the
  * store's cohort call/spend caps (enforced in a row lock, so no number of ticks can exceed
  * them), this authorization (expiring on its own and revocable at any moment), and the
  * manifest's observation window.
  *
- * A spend-guard ESCALATION auto-disarms the campaign. An escalation means the spend model is
- * not holding; ending only that tick would let a systematic mispricing repeat on the next
- * cron interval, so the campaign stops itself and requires a human to look.
+ * A cohort is armed at most once, EVER: its authorization record is immutable history
+ * (revocation stamps it; nothing rewrites or replaces it). Running another campaign means
+ * building a NEW manifest — a new window gives a new cohortId — and arming that.
  */
 
 class UsageError extends Error {}
 
 const USAGE = `Usage:
   yarn campaign:arm  --calls <n> --days <n> [--start <ISO>] [--dispatches <n>] [--emit <path>]
-  yarn campaign:tick --manifest <path> [--out <dir>]
+  yarn campaign:tick --manifest <path>
   yarn campaign:stop --manifest <path>
 
 ARM (attended, once per campaign): builds a campaign manifest sized in provider CALLS,
-prints the exact terms and their cost, asks for confirmation, initializes the cohort
-budget, and records the durable authorization. Writes the manifest to --emit (default
-./campaign-manifest.json) — every later tick and the stop must be given that same file,
-because its bytes ARE the campaign's identity.
+prints the exact terms and their cost, asks the standard [Y/n] confirmation (Enter or
+'y' proceeds; 'n', any other answer, or EOF refuses), then makes the durable writes in
+AUTHORITY ORDER: the manifest file first (no-clobber, fsync'd, read back), the cohort
+budget next, and the durable authorization LAST — so a failed arm never leaves standing
+authority, and re-running the same arm reconciles any intermediate failure. --start must
+be an offset-qualified ISO-8601 instant. The manifest is written to --emit (default
+./campaign-manifest.json); every later tick and the stop must be given that same file,
+because its bytes ARE the campaign's identity. A cohort is armed at most once, ever —
+running another campaign means a new manifest (a new window gives a new cohortId).
 
-TICK (unattended): one cohort tick against the armed campaign. This is what cron calls.
-Exits 0 when the tick ran (including when nothing was eligible), 2 when no live
-authorization covers the cohort, and 1 on a loud failure.
+TICK (unattended, what a scheduler will call): validates the armed authorization END TO
+END — the durable record, its liveness at this clock, its exact binding to this
+manifest, and a fresh credential observation — and then REFUSES to dispatch: scheduled
+activation is structurally disabled in this build (see docs/CAMPAIGN-ACTIVATION.md).
+Never prompts, never falls back to mock. Exits 3 when the authorization is valid
+(activation refused), 2 when no live authorization covers the cohort, 1 on a loud
+failure.
 
 STOP: revokes the authorization. The next tick fires nothing.
 
-Needs STORE_DATABASE_URL, SUPABASE_URL + SUPABASE_ANON_KEY (and optionally OSPEX_API_URL).`;
+Needs STORE_DATABASE_URL.`;
 
 interface CampaignOptions {
   command: 'arm' | 'tick' | 'stop';
@@ -83,7 +87,6 @@ interface CampaignOptions {
   dispatches: number;
   manifestPath: string | null;
   emitPath: string;
-  outDir: string | null;
 }
 
 function parseArgs(argv: string[]): CampaignOptions {
@@ -103,7 +106,6 @@ function parseArgs(argv: string[]): CampaignOptions {
     dispatches: 1,
     manifestPath: null,
     emitPath: './campaign-manifest.json',
-    outDir: null,
   };
   for (let i = 1; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -124,7 +126,6 @@ function parseArgs(argv: string[]): CampaignOptions {
     else if (arg === '--dispatches') options.dispatches = asCount(next(), '--dispatches');
     else if (arg === '--manifest') options.manifestPath = next();
     else if (arg === '--emit') options.emitPath = next();
-    else if (arg === '--out') options.outDir = next();
     else if (arg === '-h' || arg === '--help') {
       printLine(USAGE);
       process.exit(0);
@@ -133,22 +134,25 @@ function parseArgs(argv: string[]): CampaignOptions {
   return options;
 }
 
-/** The run options a tick derives from the booted manifest (mirrors the fixture runner). */
-function deriveRunOptions(manifest: CohortManifestV1): LineOpenRunOptions {
-  const baselinePolicyVersion = isBaselinePolicyVersion(manifest.baselinePolicyVersion)
-    ? manifest.baselinePolicyVersion
-    : undefined;
-  return {
-    timeoutMs: manifest.constants.providerCallTimeoutMs,
-    maxOutputTokens: manifest.constants.maxOutputTokens,
-    executionPolicy: 'fixed-moneyline-total',
-    baselinePolicyVersion,
-  };
-}
-
 function usd(micros: number): string {
   return `$${(micros / 1_000_000).toFixed(2)}`;
 }
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Scheduled activation is STRUCTURALLY disabled: no code path in this entrypoint constructs
+ * a provider adapter or reaches a dispatch, so a valid authorization proves the arming state
+ * machine end to end while spending nothing. A valid authorization therefore exits 3 — never
+ * 0 — so any scheduler pointed at this build notices instead of no-op looping.
+ */
+const ACTIVATION_DISABLED =
+  'REFUSING to dispatch: scheduled campaign activation is structurally disabled in this build. ' +
+  'Dispatching additionally requires real public-Git publication evidence for the campaign manifest ' +
+  'and a durable escalation latch checked before every dispatch (see docs/CAMPAIGN-ACTIVATION.md). ' +
+  'No provider call was made.';
 
 // ---------------------------------------------------------------------------
 // Injectable seams (so the whole owner-level flow is drivable without a database)
@@ -158,10 +162,76 @@ export interface CampaignDeps {
   readonly openStore: (
     databaseUrl: string,
   ) => Promise<{ store: AtomicStore; authorizations: CampaignAuthorizationPort; close: () => Promise<void> }>;
-  readonly runTick: (input: CohortTickInput) => Promise<CohortTickResult>;
   readonly observeCredentials: (participantIds: readonly string[]) => ReadonlyMap<string, boolean>;
   readonly confirm: (prompt: string) => Promise<string | null>;
   readonly now: () => number;
+}
+
+// ---------------------------------------------------------------------------
+// Manifest installation — durable, no-clobber, verified
+// ---------------------------------------------------------------------------
+
+export type ManifestInstallOutcome =
+  | { readonly kind: 'installed' }
+  | { readonly kind: 'already_installed' }
+  | { readonly kind: 'conflict'; readonly message: string }
+  | { readonly kind: 'failed'; readonly message: string };
+
+/**
+ * Install the campaign manifest at `path` BEFORE any authority exists: exclusive-create
+ * (`wx` — an existing path is never clobbered), full write, fsync, then a read-back byte
+ * compare. An existing byte-identical file reconciles (`already_installed` — the re-run of
+ * an arm that failed after this step); an existing different file is a `conflict` (that
+ * path belongs to some other campaign); every other failure — a directory at the path, a
+ * full disk, a torn write — is `failed`, and the caller must not create any authority.
+ */
+export function installManifestNoClobber(path: string, bytes: Buffer): ManifestInstallOutcome {
+  let fd: number;
+  try {
+    fd = openSync(path, 'wx');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      let existing: Buffer;
+      try {
+        existing = readFileSync(path);
+      } catch (readError) {
+        return {
+          kind: 'failed',
+          message: `${path} already exists but cannot be read (${messageOf(readError)}); refusing to touch it`,
+        };
+      }
+      if (existing.equals(bytes)) return { kind: 'already_installed' };
+      return {
+        kind: 'conflict',
+        message:
+          `refusing to overwrite ${path}: it already holds DIFFERENT bytes (another campaign's ` +
+          `manifest?) — pass a different --emit path or move the file aside`,
+      };
+    }
+    return { kind: 'failed', message: `installing the manifest at ${path} failed: ${messageOf(error)}` };
+  }
+  try {
+    let written = 0;
+    while (written < bytes.length) written += writeSync(fd, bytes, written, bytes.length - written);
+    fsyncSync(fd);
+  } catch (error) {
+    return {
+      kind: 'failed',
+      message: `writing the manifest to ${path} failed: ${messageOf(error)} — delete the partial file before re-running`,
+    };
+  } finally {
+    closeSync(fd);
+  }
+  let readBack: Buffer;
+  try {
+    readBack = readFileSync(path);
+  } catch (error) {
+    return { kind: 'failed', message: `read-back of ${path} failed: ${messageOf(error)}` };
+  }
+  if (!readBack.equals(bytes)) {
+    return { kind: 'failed', message: `read-back verification failed for ${path} — delete the file and re-run` };
+  }
+  return { kind: 'installed' };
 }
 
 // ---------------------------------------------------------------------------
@@ -169,18 +239,68 @@ export interface CampaignDeps {
 // ---------------------------------------------------------------------------
 
 /**
- * ARM a campaign: build the sized manifest, boot it, print the exact terms, take the
- * confirmation, initialize the cohort budget, and record the authorization. Nothing here
- * dispatches; the first fire happens on the first tick after the window opens.
+ * A second arm found a standing record for this exact cohort. A cohort is armed at most
+ * once, EVER — the record is immutable history — so this is either the benign re-run of an
+ * interrupted arm (the standing record still validates: reconcile, succeed, change nothing)
+ * or a dead campaign (disarmed/expired/divergent: refuse, and running again means a NEW
+ * manifest — a new window gives a new cohortId — never a rewrite of this one).
+ */
+async function reconcileExistingAuthorization(
+  authorizations: CampaignAuthorizationPort,
+  booted: BootedCohort,
+  deps: CampaignDeps,
+): Promise<number> {
+  const stored = await authorizations.read(booted.cohortId);
+  const resolution = resolveCampaignIntent({
+    booted,
+    stored,
+    now: deps.now(),
+    observeCredentials: deps.observeCredentials,
+  });
+  if (resolution.kind === 'Authorized') {
+    printLine('');
+    printLine(
+      `cohort ${booted.cohortId} was ALREADY armed; the standing authorization validates ` +
+        `against this manifest and stands unchanged.`,
+    );
+    return 0;
+  }
+  printError(
+    `cohort ${booted.cohortId} was already armed once and its record no longer authorizes ticks: ` +
+      resolution.violations.join('; '),
+  );
+  printError(
+    'a cohort is armed at most once, ever. To run another campaign, build a NEW manifest ' +
+      '(a new --start gives a new window and a new cohortId) and arm that.',
+  );
+  return 2;
+}
+
+/**
+ * ARM a campaign. Everything is built and validated FIRST — the manifest, the boot, the
+ * bounds, the credentials, the full authorization record, the database URL — so nothing
+ * after the confirmation can refuse for a reason that was knowable before it. Then the
+ * durable writes run in AUTHORITY ORDER: manifest file (no-clobber, verified), cohort
+ * budget (idempotent for identical pins), and the authorization record LAST as the single
+ * authorizing transition. Nothing here dispatches; the first fire would happen on a
+ * scheduled tick once activation lands (docs/CAMPAIGN-ACTIVATION.md).
  */
 export async function armCampaign(options: CampaignOptions, deps: CampaignDeps): Promise<number> {
+  // ---- Build + validate everything. Nothing in this block is durable. ----
   if (options.calls <= 0 || options.days <= 0) {
     printError('arm requires --calls <n> and --days <n>');
     return 2;
   }
-  const startMs = options.startIso === null ? deps.now() : Date.parse(options.startIso);
-  if (!Number.isFinite(startMs)) {
-    printError(`--start ${String(options.startIso)} is not a parseable instant`);
+  let startMs: number;
+  if (options.startIso === null) {
+    startMs = deps.now();
+  } else if (isParseableInstant(options.startIso)) {
+    startMs = instantMs(options.startIso);
+  } else {
+    printError(
+      `--start ${JSON.stringify(options.startIso)} must be an offset-qualified ISO-8601 instant ` +
+        `(e.g. 2026-08-05T17:00:00Z)`,
+    );
     return 2;
   }
   const windowForwardMs = options.days * 24 * 3_600_000;
@@ -193,7 +313,7 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
       maxDispatchesPerTick: options.dispatches,
     });
   } catch (error) {
-    printError(`refusing to arm: ${error instanceof Error ? error.message : String(error)}`);
+    printError(`refusing to arm: ${messageOf(error)}`);
     return 2;
   }
   const booted = cohortBoot({ manifestBytes: built.bytes });
@@ -213,10 +333,28 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
     return 2;
   }
 
-  const projection = projectCampaignCost(booted.manifest);
+  const databaseUrl = envValue('STORE_DATABASE_URL');
+  if (databaseUrl === undefined) {
+    printError('arming needs STORE_DATABASE_URL');
+    return 2;
+  }
+
   const armedAtMs = deps.now();
   const expiresAtMs = startMs + windowForwardMs;
+  let record: CampaignAuthorization;
+  try {
+    record = buildCampaignAuthorization({
+      booted,
+      observedCredentialedParticipantIds: credentialed,
+      armedAtMs,
+      expiresAtMs,
+    });
+  } catch (error) {
+    printError(`refusing to arm: ${messageOf(error)}`);
+    return 2;
+  }
 
+  const projection = projectCampaignCost(booted.manifest);
   printLine('ARM CAMPAIGN — real provider spend, unattended, on confirmation:');
   printLine(`  cohortId ${booted.cohortId}`);
   printLine(`  sports ${booted.manifest.sportAllowList.join(', ')}`);
@@ -225,47 +363,72 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
   printLine(`  cost   ≈ ${usd(projection.observedUsdMicros)} expected at the observed rate`);
   printLine(`         ≤ ${usd(projection.conservativeUsdMicros)} at the committed conservative worst case`);
   printLine(`  bounds ${booted.manifest.constants.maxDispatchesPerTick} fire(s)/tick; every attempt hard-stopped above $100`);
-  printLine(`  expiry ${new Date(expiresAtMs).toISOString()} (the authorization stops on its own)`);
-  printLine("  an EXPLICIT 'y' is required; Enter, any other answer, or EOF refuses");
+  printLine(`  expiry ${record.expiresAt} (the authorization stops on its own)`);
+  printLine("  Enter or 'y' proceeds; 'n', any other answer, or EOF refuses");
 
-  const answer = await deps.confirm('arm this campaign for unattended running? [y/N] ');
+  // The standard [Y/n] confirmation. EOF is refused BEFORE normalization — a stream that
+  // closes without producing a line is not Enter, while an actual empty line (interactive
+  // or deliberately piped) is Enter and accepts the default.
+  const answer = await deps.confirm('arm this campaign for unattended running? [Y/n] ');
   if (answer === null) {
     printError('arming refused: the confirmation stream closed (EOF) before an answer');
     return 2;
   }
   const normalized = answer.trim().toLowerCase();
-  if (normalized !== 'y' && normalized !== 'yes') {
-    printError(`arming refused (answer ${JSON.stringify(answer)}); an explicit 'y' is required`);
+  if (normalized !== '' && normalized !== 'y' && normalized !== 'yes') {
+    printError(`arming refused (answer ${JSON.stringify(answer)}); Enter or 'y' proceeds`);
     return 2;
   }
 
-  const databaseUrl = envValue('STORE_DATABASE_URL');
-  if (databaseUrl === undefined) {
-    printError('arming needs STORE_DATABASE_URL');
+  // ---- Durable writes, in AUTHORITY ORDER. (1) The manifest file: no-clobber + fsync +
+  // read-back, BEFORE any store write, so standing authority always implies its manifest
+  // is on disk (`stop` needs that file). (2) The cohort budget: durable but NOT
+  // authorizing — a budget with no authorization arms nothing, and re-initializing with
+  // identical pins reconciles. (3) The authorization record LAST: the single authorizing
+  // transition. ----
+  const manifestBytes = Buffer.from(built.bytes, 'utf8');
+  const install = installManifestNoClobber(options.emitPath, manifestBytes);
+  if (install.kind === 'conflict') {
+    printError(install.message);
     return 2;
   }
-  const { store, authorizations, close } = await deps.openStore(databaseUrl);
+  if (install.kind === 'failed') {
+    printError(`arming FAILED before any authority was created: ${install.message}`);
+    return 1;
+  }
+  if (install.kind === 'already_installed') {
+    printLine(`manifest already installed at ${options.emitPath} (byte-identical) — continuing`);
+  }
+
+  let opened: Awaited<ReturnType<CampaignDeps['openStore']>> | null = null;
+  let authorizing = false;
   try {
-    const initResult = await store.initCohortBudget(buildCohortBudgetInitRequest(booted));
+    opened = await deps.openStore(databaseUrl);
+    const initResult = await opened.store.initCohortBudget(buildCohortBudgetInitRequest(booted));
     assertCohortBudgetInitialized(initResult);
-    const record = buildCampaignAuthorization({
-      booted,
-      observedCredentialedParticipantIds: credentialed,
-      armedAtMs,
-      expiresAtMs,
-    });
-    const outcome = await authorizations.arm(record);
+    authorizing = true;
+    const outcome = await opened.authorizations.arm(record);
     if (outcome === 'already_armed') {
-      printError(`a campaign is already armed for cohort ${booted.cohortId}; stop it before re-arming`);
-      return 2;
+      return await reconcileExistingAuthorization(opened.authorizations, booted, deps);
     }
-    writeFileSync(options.emitPath, built.bytes);
     printLine('');
-    printLine(`ARMED. cohort budget initialized and authorization recorded.`);
-    printLine(`manifest written to ${options.emitPath} — every tick and the stop need this exact file.`);
+    printLine('ARMED. cohort budget initialized and authorization recorded.');
+    printLine(`manifest at ${options.emitPath} — every tick and the stop need this exact file.`);
     return 0;
+  } catch (error) {
+    if (!authorizing) {
+      printError(`arming FAILED before the authorizing step — NO standing authority was created: ${messageOf(error)}`);
+      printError(`the manifest at ${options.emitPath} grants nothing by itself; re-running the same arm reconciles.`);
+      return 1;
+    }
+    printError(`the authorizing write FAILED with its commit status UNKNOWN: ${messageOf(error)}`);
+    printError(
+      `re-run the same arm to reconcile (a standing record is verified, never overwritten), or run ` +
+        `campaign:stop --manifest ${options.emitPath} to revoke whatever may have been recorded.`,
+    );
+    return 1;
   } finally {
-    await close();
+    if (opened !== null) await opened.close();
   }
 }
 
@@ -275,27 +438,22 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
 
 /**
  * One UNATTENDED tick. Resolves live intent from the durable record — no prompt, no mock
- * fallback — and on a spend-guard escalation DISARMS the campaign before returning, so a
- * systematic mispricing cannot repeat on the next cron interval.
+ * fallback — and then refuses to dispatch, because scheduled activation is structurally
+ * disabled in this build: this function validates the whole authorization chain and owns
+ * no path to a provider adapter, a claim, or a dispatch.
  */
 export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps): Promise<number> {
   if (options.manifestPath === null) {
     printError('tick requires --manifest <path> (the exact manifest the campaign was armed with)');
     return 2;
   }
-  const rawBytes = readFileSync(options.manifestPath);
-  const booted = cohortBoot({ manifestBytes: decodeManifestText(rawBytes) });
-  const publication = selfResolvePublication(rawBytes);
-
-  const supabaseUrl = envValue('SUPABASE_URL');
-  const anonKey = envValue('SUPABASE_ANON_KEY');
+  const booted = cohortBoot({ manifestBytes: decodeManifestText(readFileSync(options.manifestPath)) });
   const databaseUrl = envValue('STORE_DATABASE_URL');
-  if (supabaseUrl === undefined || anonKey === undefined || databaseUrl === undefined) {
-    printError('a tick needs SUPABASE_URL, SUPABASE_ANON_KEY, and STORE_DATABASE_URL');
+  if (databaseUrl === undefined) {
+    printError('a tick needs STORE_DATABASE_URL');
     return 2;
   }
-
-  const { store, authorizations, close } = await deps.openStore(databaseUrl);
+  const { authorizations, close } = await deps.openStore(databaseUrl);
   try {
     const stored = await authorizations.read(booted.cohortId);
     const resolution = resolveCampaignIntent({
@@ -309,49 +467,13 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
       printError(`no live campaign authorization for cohort ${booted.cohortId}: ${resolution.violations.join('; ')}`);
       return 2;
     }
-
-    // The gated producer independently re-validates the binding, the campaign bounds, and the
-    // credentials before minting; a refusal throws loudly out of this tick.
-    const capability: CohortAdapterCapability = gateRealCampaignAdapterCapability(booted, resolution.authorization);
-
-    const now = deps.now;
-    const config: LineOpenReadConfig = {
-      apiUrl: envValue('OSPEX_API_URL') ?? DEFAULT_OSPEX_API_URL,
-      supabaseUrl,
-      anonKey,
-      now,
-    };
-    const outDir = options.outDir ?? envValue('FIRE_ARTIFACTS_DIR') ?? './.fire-artifacts';
-    const ownerId = `${hostname()}-${process.pid}-${randomUUID()}`;
-    const result = await deps.runTick({
-      booted,
-      publication,
-      discover: createDiscoverFn(config),
-      readMarketEvidence: createReadMarketEvidenceFn(config),
-      claimPort: new StoreClaimPort(store),
-      capability,
-      sink: new FireArtifactSink(outDir),
-      runOptions: deriveRunOptions(booted.manifest),
-      admission: { ownerId, expectedSchemaVersion: STORE_SCHEMA_VERSION },
-      now,
-    });
-
-    for (const line of formatTickResult(result)) printLine(line);
-    for (const path of installedArtifactPaths(result)) printLine(`  installed ${path}`);
-
-    // A spend-guard escalation stops the CAMPAIGN, not merely this tick: the spend model is
-    // not holding, and the next cron interval would otherwise repeat it.
-    const escalated = result.fireOutcomes.filter((f) => f.outcome.kind === 'InstalledEscalated');
-    if (escalated.length > 0) {
-      const at = new Date(deps.now()).toISOString();
-      await authorizations.disarm(booted.cohortId, at);
-      printError(
-        `spend-guard escalation on ${escalated.length} fire(s) — the campaign has been DISARMED at ${at}. ` +
-          `Its evidence is installed; investigate before arming again.`,
-      );
-      return 1;
-    }
-    return 0;
+    printLine(
+      `campaign authorization VALID for cohort ${booted.cohortId} ` +
+        `(${resolution.authorization.observedCredentialedParticipantIds.length}/${resolution.authorization.participantIds.length} ` +
+        `roster credentials observed now)`,
+    );
+    printError(ACTIVATION_DISABLED);
+    return 3;
   } finally {
     await close();
   }
@@ -413,7 +535,6 @@ const PRODUCTION_DEPS: CampaignDeps = {
       close: () => pool.end(),
     };
   },
-  runTick: (input) => runCohortTick({ ...input, onStatus: (line) => printLine(`  ${line}`) }),
   observeCredentials: observeRealAdapterCredentials,
   confirm: askLiveConfirmation,
   now: () => Date.now(),
