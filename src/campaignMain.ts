@@ -1,4 +1,5 @@
-import { closeSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { basename, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { buildCampaignAuthorization, resolveCampaignIntent } from './campaignAuthorization.js';
 import type { CampaignAuthorization, CampaignAuthorizationPort } from './campaignAuthorization.js';
@@ -10,6 +11,8 @@ import { decodeManifestText } from './cohortRunnerMain.js';
 import { describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
+import { ByteDifferentCollisionError, installBytesNoClobber, nodeArtifactFs } from './fireArtifactSink.js';
+import type { ArtifactFs } from './fireArtifactSink.js';
 import { askLiveConfirmation, observeRealAdapterCredentials } from './liveIntent.js';
 import { instantMs, isParseableInstant } from './time.js';
 import type { AtomicStore } from './store/contract.js';
@@ -21,12 +24,15 @@ import type { AtomicStore } from './store/contract.js';
  * scheduled benchmark cannot answer a prompt (and by design an unanswered prompt refuses), so
  * the confirmation MOVES rather than disappearing:
  *
- *   - `arm`  — ATTENDED, once per campaign. Boots the cohort, prints the exact terms
- *              (identity, window, size in calls and fires, and what that costs at both the
- *              observed rate and the committed conservative bound), takes the standard
- *              `[Y/n]` confirmation, and then makes the durable writes in AUTHORITY ORDER:
- *              the manifest file first (no-clobber + fsync + read-back), the cohort budget
- *              next (durable but NOT authorizing), and the authorization record LAST — the
+ *   - `arm`  — ATTENDED, once per campaign, with a REQUIRED `--start` (the campaign's
+ *              identity anchor, so the identical command stays byte-identical across
+ *              retries). Boots the cohort, prints the exact terms (identity, window, size
+ *              in calls and fires, and what that costs at both the observed rate and the
+ *              committed conservative bound), takes the standard `[Y/n]` confirmation, and
+ *              then makes the durable writes in AUTHORITY ORDER: the manifest file first
+ *              (the fire-artifact sink's durable temp + atomic no-clobber hard-link +
+ *              directory-sync loop, plus a final read-back), the cohort budget next
+ *              (durable but NOT authorizing), and the authorization record LAST — the
  *              single authorizing transition. A failed arm therefore never leaves standing
  *              authority without its manifest on disk, and re-running the same arm
  *              reconciles any intermediate failure.
@@ -52,17 +58,20 @@ import type { AtomicStore } from './store/contract.js';
 class UsageError extends Error {}
 
 const USAGE = `Usage:
-  yarn campaign:arm  --calls <n> --days <n> [--start <ISO>] [--dispatches <n>] [--emit <path>]
+  yarn campaign:arm  --calls <n> --days <n> --start <ISO> [--dispatches <n>] [--emit <path>]
   yarn campaign:tick --manifest <path>
   yarn campaign:stop --manifest <path>
 
 ARM (attended, once per campaign): builds a campaign manifest sized in provider CALLS,
 prints the exact terms and their cost, asks the standard [Y/n] confirmation (Enter or
 'y' proceeds; 'n', any other answer, or EOF refuses), then makes the durable writes in
-AUTHORITY ORDER: the manifest file first (no-clobber, fsync'd, read back), the cohort
-budget next, and the durable authorization LAST — so a failed arm never leaves standing
-authority, and re-running the same arm reconciles any intermediate failure. --start must
-be an offset-qualified ISO-8601 instant. The manifest is written to --emit (default
+AUTHORITY ORDER: the manifest file first (published complete via a same-directory fsync'd
+temp and an atomic no-clobber hard link, parent directory sync'd where the platform
+supports it, then read back), the cohort budget next, and the durable authorization
+LAST — so a failed arm never leaves standing authority, and re-running the same arm
+reconciles any intermediate failure. --start is REQUIRED and must be an offset-qualified
+ISO-8601 instant: it is part of the campaign identity, which is what keeps the identical
+command byte-identical across retries. The manifest is written to --emit (default
 ./campaign-manifest.json); every later tick and the stop must be given that same file,
 because its bytes ARE the campaign's identity. A cohort is armed at most once, ever —
 running another campaign means a new manifest (a new window gives a new cohortId).
@@ -143,6 +152,25 @@ function messageOf(error: unknown): string {
 }
 
 /**
+ * Close the store AFTER the command's outcome is already decided. Cleanup must never
+ * falsify a classified authority transition: a confirmed ARMED/STOPPED, a reconciled
+ * standing authorization, a validated refusal, a named pre-authority error, or the
+ * unknown-commit recovery message all remain authoritative. A close failure is therefore
+ * reported as a warning and swallowed — it can neither replace the primary error nor turn
+ * a confirmed outcome into a generic failure exit.
+ */
+async function closeQuietly(close: () => Promise<void>): Promise<void> {
+  try {
+    await close();
+  } catch (error) {
+    printError(
+      `warning: closing the store connection failed AFTER the outcome was decided — the reported ` +
+        `outcome stands: ${messageOf(error)}`,
+    );
+  }
+}
+
+/**
  * Scheduled activation is STRUCTURALLY disabled: no code path in this entrypoint constructs
  * a provider adapter or reaches a dispatch, so a valid authorization proves the arming state
  * machine end to end while spending nothing. A valid authorization therefore exits 3 — never
@@ -178,29 +206,40 @@ export type ManifestInstallOutcome =
   | { readonly kind: 'failed'; readonly message: string };
 
 /**
- * Install the campaign manifest at `path` BEFORE any authority exists: exclusive-create
- * (`wx` — an existing path is never clobbered), full write, fsync, then a read-back byte
- * compare. An existing byte-identical file reconciles (`already_installed` — the re-run of
- * an arm that failed after this step); an existing different file is a `conflict` (that
- * path belongs to some other campaign); every other failure — a directory at the path, a
- * full disk, a torn write — is `failed`, and the caller must not create any authority.
+ * Install the campaign manifest at `path` BEFORE any authority exists, riding the SAME
+ * durable write path as every other durable file this repo installs — the fire-artifact
+ * sink's {@link installBytesNoClobber} loop: a same-directory exclusive temp, a checked
+ * complete-write loop (zero/invalid progress fails loudly), temp fsync, close with
+ * write-beats-close error precedence, an atomic no-clobber hard-link publication (the final
+ * name either does not exist or refers to a complete fsynced file — never a partial), a
+ * parent-directory fsync (POSIX; Windows exposes no directory fsync and is a documented
+ * no-op in `nodeArtifactFs.syncDir`), and best-effort temp cleanup that never masks the
+ * primary result. A directory-sync failure is an UNKNOWN-persistence state and reports
+ * `failed`; the identical re-run reconciles through the byte-identity path, which re-runs
+ * the directory sync. This wrapper then adds a final read-back byte compare — the last
+ * verification before the caller may create any authority.
+ *
+ * Outcomes: fresh publication → `installed`; an existing byte-identical file →
+ * `already_installed` (the re-run of an arm that failed after this step); an existing
+ * byte-different file → `conflict`, untouched; anything else → `failed`, and the caller
+ * must not create authority.
  */
-export function installManifestNoClobber(path: string, bytes: Buffer): ManifestInstallOutcome {
-  let fd: number;
+export function installManifestNoClobber(
+  path: string,
+  bytes: Buffer,
+  fsx: ArtifactFs = nodeArtifactFs,
+): ManifestInstallOutcome {
+  let created: boolean;
   try {
-    fd = openSync(path, 'wx');
+    created = installBytesNoClobber(fsx, {
+      dir: dirname(path),
+      finalPath: path,
+      tmpStem: basename(path),
+      buffer: bytes,
+      label: 'campaign manifest',
+    }).created;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      let existing: Buffer;
-      try {
-        existing = readFileSync(path);
-      } catch (readError) {
-        return {
-          kind: 'failed',
-          message: `${path} already exists but cannot be read (${messageOf(readError)}); refusing to touch it`,
-        };
-      }
-      if (existing.equals(bytes)) return { kind: 'already_installed' };
+    if (error instanceof ByteDifferentCollisionError) {
       return {
         kind: 'conflict',
         message:
@@ -208,30 +247,18 @@ export function installManifestNoClobber(path: string, bytes: Buffer): ManifestI
           `manifest?) — pass a different --emit path or move the file aside`,
       };
     }
-    return { kind: 'failed', message: `installing the manifest at ${path} failed: ${messageOf(error)}` };
-  }
-  try {
-    let written = 0;
-    while (written < bytes.length) written += writeSync(fd, bytes, written, bytes.length - written);
-    fsyncSync(fd);
-  } catch (error) {
-    return {
-      kind: 'failed',
-      message: `writing the manifest to ${path} failed: ${messageOf(error)} — delete the partial file before re-running`,
-    };
-  } finally {
-    closeSync(fd);
+    return { kind: 'failed', message: messageOf(error) };
   }
   let readBack: Buffer;
   try {
-    readBack = readFileSync(path);
+    readBack = fsx.readFile(path);
   } catch (error) {
     return { kind: 'failed', message: `read-back of ${path} failed: ${messageOf(error)}` };
   }
   if (!readBack.equals(bytes)) {
-    return { kind: 'failed', message: `read-back verification failed for ${path} — delete the file and re-run` };
+    return { kind: 'failed', message: `read-back verification failed for ${path} — the durable bytes do not match; delete the file and re-run` };
   }
-  return { kind: 'installed' };
+  return created ? { kind: 'installed' } : { kind: 'already_installed' };
 }
 
 // ---------------------------------------------------------------------------
@@ -291,18 +318,27 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
     printError('arm requires --calls <n> and --days <n>');
     return 2;
   }
-  let startMs: number;
+  // --start is REQUIRED: it is part of the campaign IDENTITY. Deriving it from a moving
+  // clock would make "re-running the same arm reconciles" false — one minute later the
+  // identical public command would build a different window, different bytes, and a
+  // different cohortId, then refuse on the installed manifest instead of reconciling the
+  // standing authorization. Refused here, before the prompt, the filesystem, or the store.
   if (options.startIso === null) {
-    startMs = deps.now();
-  } else if (isParseableInstant(options.startIso)) {
-    startMs = instantMs(options.startIso);
-  } else {
+    printError(
+      'arm requires an explicit --start <ISO> (offset-qualified, e.g. 2026-08-05T17:00:00Z): ' +
+        'the start is part of the campaign identity, so a retried arm must rebuild the ' +
+        'IDENTICAL manifest rather than a new one from a moving clock',
+    );
+    return 2;
+  }
+  if (!isParseableInstant(options.startIso)) {
     printError(
       `--start ${JSON.stringify(options.startIso)} must be an offset-qualified ISO-8601 instant ` +
         `(e.g. 2026-08-05T17:00:00Z)`,
     );
     return 2;
   }
+  const startMs = instantMs(options.startIso);
   const windowForwardMs = options.days * 24 * 3_600_000;
 
   let built: ReturnType<typeof buildCampaignManifest>;
@@ -428,7 +464,7 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
     );
     return 1;
   } finally {
-    if (opened !== null) await opened.close();
+    if (opened !== null) await closeQuietly(opened.close);
   }
 }
 
@@ -475,7 +511,7 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
     printError(ACTIVATION_DISABLED);
     return 3;
   } finally {
-    await close();
+    await closeQuietly(close);
   }
 }
 
@@ -506,7 +542,7 @@ export async function stopCampaign(options: CampaignOptions, deps: CampaignDeps)
     printLine(`STOPPED. cohort ${booted.cohortId} is disarmed; the next tick will fire nothing.`);
     return 0;
   } finally {
-    await close();
+    await closeQuietly(close);
   }
 }
 

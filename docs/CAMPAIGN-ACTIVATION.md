@@ -8,14 +8,20 @@ the refusal is not a flag, it is the absence of the paid path from the entrypoin
 
 ## What exists today
 
-- **Arming** (`campaign:arm`, attended, once per cohort): builds a bounds-checked campaign
+- **Arming** (`campaign:arm`, attended, once per cohort): requires an explicit
+  offset-qualified `--start` — the campaign's identity anchor, which keeps the identical
+  public command byte-identical across retries. It builds a bounds-checked campaign
   manifest sized in provider calls, prints the exact terms and cost projections, takes the
   standard `[Y/n]` confirmation, then performs the durable writes in **authority order** —
-  the manifest file first (exclusive-create, fsync, read-back verified), the cohort budget
-  next (durable but not authorizing), and the durable authorization record **last**, as the
-  single authorizing transition. A failed arm therefore cannot leave standing authority, and
-  re-running the same arm reconciles every intermediate failure. A cohort is armed at most
-  once, ever; another campaign is a new manifest and therefore a new cohortId.
+  the manifest file first (riding the fire-artifact sink's durable loop: a same-directory
+  fsynced exclusive temp, an atomic no-clobber hard-link publication, a parent-directory
+  sync where the platform supports one, then a final read-back), the cohort budget next
+  (durable but not authorizing), and the durable authorization record **last**, as the
+  single authorizing transition. A failed arm therefore cannot leave standing authority,
+  cleanup failures cannot falsify a decided outcome, and re-running the same arm reconciles
+  every intermediate failure — including an authorizing write whose commit status was lost.
+  A cohort is armed at most once, ever; another campaign is a new manifest and therefore a
+  new cohortId.
 - **Ticking** (`campaign:tick`, unattended): reads the durable record, validates liveness at
   the tick clock, exact binding to the booted manifest (identity, roster, price identity,
   every cap), and a fresh independent credential observation — then refuses to dispatch.

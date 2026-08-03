@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,7 @@ import { buildCampaignManifest } from './campaignProfile.js';
 import { armCampaign, installManifestNoClobber, stopCampaign, tickCampaign } from './campaignMain.js';
 import type { CampaignDeps } from './campaignMain.js';
 import { cohortBoot } from './cohortBoot.js';
+import type { ArtifactFs } from './fireArtifactSink.js';
 import type { AtomicStore } from './store/contract.js';
 import { defaultExpectedArms } from './scoring.js';
 
@@ -127,7 +128,9 @@ function options(over: Record<string, unknown> = {}): Parameters<typeof armCampa
     command: 'arm',
     calls: 800,
     days: 7,
-    startIso: null,
+    // --start is REQUIRED (the campaign's identity anchor); the fixture pins it to the same
+    // instant as the test clock so derived expectations (window, expiry) stay byte-stable.
+    startIso: '2026-08-05T00:00:00.000Z',
     dispatches: 1,
     manifestPath: null,
     emitPath: join(mkdtempSync(join(tmpdir(), 'campaign-')), 'campaign-manifest.json'),
@@ -141,10 +144,10 @@ function expectedManifestBytes(): string {
 }
 
 // ===========================================================================
-// the manifest installer (durable, no-clobber, verified)
+// the manifest installer — the fire-artifact sink's durable loop + a final read-back
 // ===========================================================================
 
-test('installManifestNoClobber: installs, reconciles identical bytes, refuses different bytes, fails on a directory', () => {
+test('installManifestNoClobber (real fs): installs, reconciles identical bytes, refuses different bytes, fails on a directory — no temp litter', () => {
   const dir = mkdtempSync(join(tmpdir(), 'campaign-install-'));
   const path = join(dir, 'm.json');
   const bytes = Buffer.from('{"a":1}', 'utf8');
@@ -155,6 +158,221 @@ test('installManifestNoClobber: installs, reconciles identical bytes, refuses di
   assert.equal(conflict.kind, 'conflict');
   assert.equal(readFileSync(path, 'utf8'), '{"a":1}', 'an existing file is NEVER clobbered');
   assert.equal(installManifestNoClobber(dir, bytes).kind, 'failed', 'a directory at the path fails, not throws');
+  assert.deepEqual(readdirSync(dir), ['m.json'], 'every outcome cleans its temp — no litter beside the manifest');
+});
+
+// --- a recording, stateful fake ArtifactFs (mirrors the sink's own test harness) ---------
+
+type FakeOp = 'mkdirp' | 'openExclusive' | 'write' | 'fsync' | 'close' | 'link' | 'syncDir' | 'readFile' | 'unlink';
+
+function errWithCode(message: string, code: string): NodeJS.ErrnoException {
+  const e: NodeJS.ErrnoException = new Error(message);
+  e.code = code;
+  return e;
+}
+
+class FakeInstallFs implements ArtifactFs {
+  readonly log: FakeOp[] = [];
+  readonly files = new Map<string, Buffer>();
+  private readonly temps = new Map<number, { path: string; chunks: Buffer[] }>();
+  private nextFd = 7;
+  private writeCalls = 0;
+  private syncDirCalls = 0;
+  onWrite?: (length: number, call: number) => number;
+  onReadFile?: (path: string) => Buffer;
+  throwOn: Partial<Record<FakeOp, Error>> = {};
+  /** Fail only the FIRST syncDir (the fresh-publication one); a retry's syncDir succeeds. */
+  syncDirFailFirstOnly?: Error;
+
+  mkdirp(_dir: string): void {
+    this.log.push('mkdirp');
+    if (this.throwOn.mkdirp) throw this.throwOn.mkdirp;
+  }
+  openExclusive(path: string): number {
+    this.log.push('openExclusive');
+    if (this.throwOn.openExclusive) throw this.throwOn.openExclusive;
+    if (this.files.has(path)) throw errWithCode('EEXIST: file already exists', 'EEXIST');
+    const fd = this.nextFd;
+    this.nextFd += 1;
+    this.temps.set(fd, { path, chunks: [] });
+    return fd;
+  }
+  write(fd: number, data: Buffer, offset: number, length: number): number {
+    this.log.push('write');
+    if (this.throwOn.write) throw this.throwOn.write;
+    this.writeCalls += 1;
+    // A hang is not an acceptable failure mode for a battery: if the loop under test ever
+    // accepts zero progress, this guard turns the runaway into a loud error instead.
+    if (this.writeCalls > 10_000) throw new Error('fake fs: runaway write loop — zero progress was accepted');
+    const n = this.onWrite ? this.onWrite(length, this.writeCalls) : length;
+    if (Number.isInteger(n) && n >= 1 && n <= length) {
+      this.temps.get(fd)?.chunks.push(Buffer.from(data.subarray(offset, offset + n)));
+    }
+    return n;
+  }
+  fsync(_fd: number): void {
+    this.log.push('fsync');
+    if (this.throwOn.fsync) throw this.throwOn.fsync;
+  }
+  close(fd: number): void {
+    this.log.push('close');
+    const t = this.temps.get(fd);
+    if (t) this.files.set(t.path, Buffer.concat(t.chunks)); // the temp is durable after close
+    if (this.throwOn.close) throw this.throwOn.close;
+  }
+  link(existingPath: string, newPath: string): void {
+    this.log.push('link');
+    if (this.throwOn.link) throw this.throwOn.link;
+    if (this.files.has(newPath)) throw errWithCode('EEXIST: file already exists', 'EEXIST');
+    const bytes = this.files.get(existingPath);
+    if (bytes === undefined) throw new Error(`fake link: missing source ${existingPath}`);
+    this.files.set(newPath, bytes);
+  }
+  syncDir(_dir: string): void {
+    this.log.push('syncDir');
+    this.syncDirCalls += 1;
+    if (this.syncDirFailFirstOnly && this.syncDirCalls === 1) throw this.syncDirFailFirstOnly;
+    if (this.throwOn.syncDir) throw this.throwOn.syncDir;
+  }
+  readFile(path: string): Buffer {
+    this.log.push('readFile');
+    if (this.throwOn.readFile) throw this.throwOn.readFile;
+    if (this.onReadFile) return this.onReadFile(path);
+    const b = this.files.get(path);
+    if (b === undefined) throw new Error(`fake readFile: missing ${path}`);
+    return b;
+  }
+  unlink(path: string): void {
+    this.log.push('unlink');
+    this.files.delete(path);
+    if (this.throwOn.unlink) throw this.throwOn.unlink;
+  }
+}
+
+const FINAL = '/campaigns/m.json';
+const MANIFEST_BYTES = Buffer.from('{"manifest":1}', 'utf8');
+
+test('durable install ORDER: temp open → complete write → file sync → close → no-clobber link → directory sync → temp cleanup → final read-back', () => {
+  const fs = new FakeInstallFs();
+  assert.deepEqual(installManifestNoClobber(FINAL, MANIFEST_BYTES, fs), { kind: 'installed' });
+  assert.deepEqual(fs.log, ['mkdirp', 'openExclusive', 'write', 'fsync', 'close', 'link', 'syncDir', 'unlink', 'readFile']);
+  assert.ok(fs.files.get(FINAL)!.equals(MANIFEST_BYTES), 'the final bytes are exact');
+  assert.equal(fs.files.size, 1, 'the temp is gone; only the final remains');
+});
+
+test('a short-writing filesystem is looped to completion; the final bytes are exact', () => {
+  const fs = new FakeInstallFs();
+  fs.onWrite = () => 1; // one byte per call
+  assert.deepEqual(installManifestNoClobber(FINAL, MANIFEST_BYTES, fs), { kind: 'installed' });
+  assert.equal(fs.log.filter((op) => op === 'write').length, MANIFEST_BYTES.length);
+  assert.ok(fs.files.get(FINAL)!.equals(MANIFEST_BYTES));
+});
+
+test('ZERO write progress fails loudly — never an infinite loop, never a partial final', () => {
+  const fs = new FakeInstallFs();
+  fs.onWrite = () => 0;
+  const result = installManifestNoClobber(FINAL, MANIFEST_BYTES, fs);
+  assert.equal(result.kind, 'failed');
+  assert.match((result as { message: string }).message, /invalid progress/);
+  assert.ok(!fs.log.includes('link'), 'no publication was attempted');
+  assert.ok(!fs.files.has(FINAL), 'the final path never came to exist');
+});
+
+test('a temp fsync failure fails BEFORE publication, with the temp cleaned up', () => {
+  const fs = new FakeInstallFs();
+  fs.throwOn.fsync = new Error('fsync-boom');
+  const result = installManifestNoClobber(FINAL, MANIFEST_BYTES, fs);
+  assert.equal(result.kind, 'failed');
+  assert.match((result as { message: string }).message, /fsync-boom/);
+  assert.ok(!fs.log.includes('link'));
+  assert.equal(fs.files.size, 0, 'no final, and the temp was unlinked');
+});
+
+test('close-failure precedence: a lone close failure fails the install; a write failure WINS over a close failure', () => {
+  const closeOnly = new FakeInstallFs();
+  closeOnly.throwOn.close = new Error('close-boom');
+  const r1 = installManifestNoClobber(FINAL, MANIFEST_BYTES, closeOnly);
+  assert.equal(r1.kind, 'failed');
+  assert.match((r1 as { message: string }).message, /close-boom/);
+  assert.ok(!closeOnly.log.includes('link'), 'no publication after a failed close');
+
+  const both = new FakeInstallFs();
+  both.throwOn.write = new Error('write-boom');
+  both.throwOn.close = new Error('close-boom');
+  const r2 = installManifestNoClobber(FINAL, MANIFEST_BYTES, both);
+  assert.equal(r2.kind, 'failed');
+  assert.match((r2 as { message: string }).message, /write-boom/, 'the first meaningful error is preserved');
+});
+
+test('a non-EEXIST publication failure fails with the final path never created and the temp cleaned', () => {
+  const fs = new FakeInstallFs();
+  fs.throwOn.link = errWithCode('EPERM: operation not permitted', 'EPERM');
+  const result = installManifestNoClobber(FINAL, MANIFEST_BYTES, fs);
+  assert.equal(result.kind, 'failed');
+  assert.ok(!fs.files.has(FINAL));
+  assert.equal(fs.files.size, 0);
+});
+
+test('an existing IDENTICAL final reconciles as replay success — and re-runs the directory sync', () => {
+  const fs = new FakeInstallFs();
+  fs.files.set(FINAL, Buffer.from(MANIFEST_BYTES));
+  assert.deepEqual(installManifestNoClobber(FINAL, MANIFEST_BYTES, fs), { kind: 'already_installed' });
+  assert.ok(fs.log.includes('syncDir'), 'the idempotent path re-establishes directory durability');
+  assert.equal(fs.log.filter((op) => op === 'readFile').length, 2, 'the identity compare AND the final read-back both ran');
+});
+
+test('an existing DIFFERENT final is a conflict: untouched, never truncated, never rewritten', () => {
+  const fs = new FakeInstallFs();
+  const other = Buffer.from('{"someone":"else"}', 'utf8');
+  fs.files.set(FINAL, other);
+  const result = installManifestNoClobber(FINAL, MANIFEST_BYTES, fs);
+  assert.equal(result.kind, 'conflict');
+  assert.ok(fs.files.get(FINAL)!.equals(other), 'the existing bytes are exactly as they were');
+});
+
+test('a directory-sync failure is UNKNOWN persistence (failed) — and the identical retry converges, retrying the sync', () => {
+  const fs = new FakeInstallFs();
+  fs.syncDirFailFirstOnly = new Error('dirsync-boom');
+  const first = installManifestNoClobber(FINAL, MANIFEST_BYTES, fs);
+  assert.equal(first.kind, 'failed');
+  assert.match((first as { message: string }).message, /dirsync-boom/);
+  // The entry exists but its durability is unknown; the identical retry re-validates the
+  // final bytes and re-runs the directory sync, which now succeeds.
+  const retry = installManifestNoClobber(FINAL, MANIFEST_BYTES, fs);
+  assert.deepEqual(retry, { kind: 'already_installed' });
+  assert.equal(fs.log.filter((op) => op === 'syncDir').length, 2);
+});
+
+test('a temp-cleanup failure never replaces the primary result', () => {
+  const fs = new FakeInstallFs();
+  fs.throwOn.unlink = new Error('unlink-boom');
+  assert.deepEqual(installManifestNoClobber(FINAL, MANIFEST_BYTES, fs), { kind: 'installed' });
+});
+
+test('a failing or lying final read-back fails the install AFTER publication', () => {
+  const throwing = new FakeInstallFs();
+  throwing.throwOn.readFile = new Error('readback-boom');
+  const r1 = installManifestNoClobber(FINAL, MANIFEST_BYTES, throwing);
+  assert.equal(r1.kind, 'failed');
+  assert.match((r1 as { message: string }).message, /read-back of/);
+
+  const lying = new FakeInstallFs();
+  lying.onReadFile = () => Buffer.from('{"corrupted":true}', 'utf8');
+  const r2 = installManifestNoClobber(FINAL, MANIFEST_BYTES, lying);
+  assert.equal(r2.kind, 'failed');
+  assert.match((r2 as { message: string }).message, /read-back verification failed/);
+});
+
+test('a temp-open or mkdirp failure fails with nothing created anywhere', () => {
+  const openFail = new FakeInstallFs();
+  openFail.throwOn.openExclusive = errWithCode('EACCES: permission denied', 'EACCES');
+  assert.equal(installManifestNoClobber(FINAL, MANIFEST_BYTES, openFail).kind, 'failed');
+  assert.equal(openFail.files.size, 0);
+
+  const mkdirFail = new FakeInstallFs();
+  mkdirFail.throwOn.mkdirp = new Error('mkdir-boom');
+  assert.equal(installManifestNoClobber(FINAL, MANIFEST_BYTES, mkdirFail).kind, 'failed');
+  assert.deepEqual(mkdirFail.log, ['mkdirp'], 'nothing ran after the failed mkdirp');
 });
 
 // ===========================================================================
@@ -286,6 +504,127 @@ test('arm refuses a --start that is not an offset-qualified instant, and accepts
   assert.equal(code, 0);
   const record = [...d.auth.records.values()][0]!;
   assert.equal(record.expiresAt, '2026-08-16T00:00:00.000Z', 'expiry = the chosen start + the window');
+});
+
+// ---------------------------------------------------------------------------
+// --start is REQUIRED — the campaign's identity anchor, so the identical public command
+// stays byte-identical while the clock advances and every retry actually reconciles.
+// ---------------------------------------------------------------------------
+
+test('an OMITTED --start refuses before the prompt, the filesystem, and the store', async () => {
+  let storeOpened = false;
+  const d = deps({
+    confirm: async () => {
+      throw new Error('must not prompt without a start');
+    },
+    openStore: async () => {
+      storeOpened = true;
+      throw new Error('must not open the store');
+    },
+  });
+  const opts = options({ startIso: null });
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /requires an explicit --start/);
+  assert.ok(!existsSync(opts.emitPath), 'no manifest was written');
+  assert.equal(storeOpened, false, 'the store was never opened');
+  assert.deepEqual(d.auth.calls, []);
+});
+
+test('RETRY IDENTITY: fixed --start + an advancing clock + a pre-authorization failure → the identical retry succeeds with the exact same bytes', async () => {
+  const auth = new MemoryAuthPort();
+  const opts = options();
+  const first = deps({
+    auth,
+    openStore: async () => {
+      throw new Error('store unreachable');
+    },
+  });
+  const r1 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, first)));
+  assert.equal(r1.value, 1);
+  assert.match(r1.errors.join('\n'), /NO standing authority was created/);
+  const bytesAfterFirst = readFileSync(opts.emitPath);
+
+  // One minute later, the IDENTICAL public command — only the clock moved.
+  const retry = deps({ auth, now: () => NOW + 60_000 });
+  const r2 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, retry)));
+  assert.equal(r2.value, 0, r2.errors.join('\n'));
+  assert.ok(readFileSync(opts.emitPath).equals(bytesAfterFirst), 'the manifest bytes never changed across the retry');
+  assert.equal(auth.records.size, 1, 'exactly one standing authorization');
+});
+
+test('UNKNOWN-COMMIT convergence: an authorizing write that commits but loses its response reconciles on the identical retry, rewriting nothing', async () => {
+  const auth = new MemoryAuthPort();
+  const originalArm = auth.arm.bind(auth);
+  let firstAttempt = true;
+  auth.arm = async (record) => {
+    if (firstAttempt) {
+      firstAttempt = false;
+      await originalArm(record); // the INSERT commits...
+      throw new Error('response lost'); // ...but the caller never learns it
+    }
+    return originalArm(record);
+  };
+  const opts = options();
+  const r1 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+  assert.equal(r1.value, 1);
+  assert.match(r1.errors.join('\n'), /commit status UNKNOWN/);
+  const committed = [...auth.records.values()][0]!;
+
+  const r2 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth, now: () => NOW + 60_000 }))));
+  assert.equal(r2.value, 0, r2.errors.join('\n'));
+  assert.match(r2.logs.join('\n'), /ALREADY armed; the standing authorization validates/);
+  assert.deepEqual([...auth.records.values()][0], committed, 'the committed record was re-read and fully validated, never rewritten');
+});
+
+test('UNKNOWN-COMMIT with a disarmed/expired/divergent/malformed stored row REFUSES on the identical retry', async () => {
+  // Each retry must refuse (exit 2) and must NOT rewrite the standing record. The refusal
+  // message differs by where it fires: a disarmed/divergent/malformed record survives to
+  // the reconciliation read and refuses with the once-ever guidance; an EXPIRED campaign's
+  // retry cannot even rebuild its own record (its expiry is no longer after the retry
+  // clock), so it refuses in the pre-prompt build — earlier, which is strictly safer.
+  const scenarios: Array<{
+    label: string;
+    tamper: (rec: CampaignAuthorization) => unknown;
+    retryNow?: number;
+    expect: RegExp;
+  }> = [
+    {
+      label: 'disarmed',
+      tamper: (rec) => ({ ...rec, disarmedAt: '2026-08-05T01:00:00.000Z' }),
+      expect: /armed at most once, ever/,
+    },
+    { label: 'expired', tamper: (rec) => rec, retryNow: NOW + WEEK_MS + 1, expect: /refusing to arm/ },
+    {
+      label: 'divergent caps',
+      tamper: (rec) => ({ ...rec, cohortCallCap: rec.cohortCallCap + 8 }),
+      expect: /armed at most once, ever/,
+    },
+    {
+      label: 'malformed (missing expiresAt)',
+      tamper: (rec) => {
+        const { expiresAt: _dropped, ...rest } = rec;
+        return rest;
+      },
+      expect: /armed at most once, ever/,
+    },
+  ];
+  for (const scenario of scenarios) {
+    const auth = new MemoryAuthPort();
+    const opts = options();
+    const armed0 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+    assert.equal(armed0.value, 0, scenario.label);
+    const cohortId = [...auth.records.keys()][0]!;
+    const tampered = scenario.tamper(auth.records.get(cohortId)!) as CampaignAuthorization;
+    auth.records.set(cohortId, tampered);
+
+    const retry = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth, now: () => scenario.retryNow ?? NOW + 60_000 }))),
+    );
+    assert.equal(retry.value, 2, `${scenario.label}: a dead or divergent standing record refuses`);
+    assert.match(retry.errors.join('\n'), scenario.expect, scenario.label);
+    assert.deepEqual(auth.records.get(cohortId), tampered, `${scenario.label}: the standing record was not rewritten`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -463,6 +802,122 @@ test('arm against a DISARMED cohort refuses: a cohort is armed at most once, eve
 });
 
 // ===========================================================================
+// cleanup must not falsify a decided outcome — close-failure injection per phase
+// ===========================================================================
+
+const FAILING_CLOSE = async (): Promise<void> => {
+  throw new Error('simulated close failure');
+};
+
+/** deps whose store close ALWAYS rejects; the decided outcome must stand anyway. */
+function depsWithFailingClose(
+  over: Partial<CampaignDeps> & { auth?: MemoryAuthPort } = {},
+): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[] } {
+  const base = deps(over);
+  return {
+    ...base,
+    openStore: async () => {
+      const opened = await base.openStore('unused');
+      return { ...opened, close: FAILING_CLOSE };
+    },
+  };
+}
+
+test('a CONFIRMED arm survives a close failure: exit 0, ARMED stands, the cleanup is a warning', async () => {
+  const d = depsWithFailingClose();
+  const opts = options();
+  const { value: code, logs, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
+  assert.equal(code, 0, 'the durable authorization is real — the exit must say so');
+  assert.match(logs.join('\n'), /ARMED\./);
+  assert.match(errors.join('\n'), /warning: closing the store connection failed AFTER the outcome was decided/);
+  assert.equal(d.auth.records.size, 1);
+});
+
+test('a PRE-AUTHORITY failure keeps its primary error through a close failure', async () => {
+  const auth = new MemoryAuthPort();
+  const storeCalls: string[] = [];
+  const refusingStore: AtomicStore = {
+    ...recordingStore(storeCalls),
+    initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
+  };
+  const d = deps({ auth, openStore: async () => ({ store: refusingStore, authorizations: auth, close: FAILING_CLOSE }) });
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d)));
+  assert.equal(code, 1);
+  const output = errors.join('\n');
+  assert.match(output, /NO standing authority was created/, 'the primary pre-authority error is preserved');
+  assert.match(output, /warning: closing the store connection failed/);
+  assert.deepEqual(auth.calls, [], 'the authorizing write was never attempted');
+});
+
+test('an UNKNOWN-COMMIT arm keeps its recovery message through a close failure', async () => {
+  const auth = new MemoryAuthPort();
+  auth.arm = async () => {
+    throw new Error('socket hang up');
+  };
+  const d = depsWithFailingClose({ auth });
+  const opts = options();
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
+  assert.equal(code, 1);
+  const output = errors.join('\n');
+  assert.match(output, /commit status UNKNOWN/, 'the unknown-commit classification is preserved');
+  assert.match(output, /re-run the same arm/, 'both recovery paths still print');
+  assert.match(output, /warning: closing the store connection failed/);
+});
+
+test('a RECONCILED already-armed re-run survives a close failure: exit 0', async () => {
+  const auth = new MemoryAuthPort();
+  const opts = options();
+  const first = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+  assert.equal(first.value, 0);
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => armCampaign(opts, depsWithFailingClose({ auth }))),
+  );
+  assert.equal(code, 0);
+  assert.match(logs.join('\n'), /ALREADY armed/);
+});
+
+test('a CONFIRMED stop and an ABSENT stop keep their outcomes through a close failure', async () => {
+  const { manifestPath, auth, cohortId } = await armed();
+  const stopped = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => stopCampaign(options({ command: 'stop', manifestPath }), depsWithFailingClose({ auth }))),
+  );
+  assert.equal(stopped.value, 0, 'the disarm is durable — the exit must say so');
+  assert.match(stopped.logs.join('\n'), /STOPPED\./);
+  assert.match(stopped.errors.join('\n'), /warning: closing the store connection failed/);
+  assert.notEqual(auth.records.get(cohortId)!.disarmedAt, null);
+
+  const { bytes } = buildCampaignManifest(NOW + 3_600_000, { callCap: 800, windowForwardMs: WEEK_MS });
+  const otherPath = join(mkdtempSync(join(tmpdir(), 'campaign-close-absent-')), 'manifest.json');
+  writeFileSync(otherPath, bytes);
+  const absent = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () =>
+      stopCampaign(options({ command: 'stop', manifestPath: otherPath }), depsWithFailingClose({ auth })),
+    ),
+  );
+  assert.equal(absent.value, 2, 'the never-armed refusal is preserved');
+});
+
+test('both tick outcomes keep their exit codes through a close failure', async () => {
+  const { manifestPath, auth } = await armed();
+  const valid = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () =>
+      tickCampaign(options({ command: 'tick', manifestPath }), depsWithFailingClose({ auth, confirm: NEVER_PROMPT })),
+    ),
+  );
+  assert.equal(valid.value, 3, 'the activation refusal is preserved');
+
+  const { bytes } = buildCampaignManifest(NOW + 7_200_000, { callCap: 800, windowForwardMs: WEEK_MS });
+  const strangerPath = join(mkdtempSync(join(tmpdir(), 'campaign-close-tick-')), 'manifest.json');
+  writeFileSync(strangerPath, bytes);
+  const refused = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () =>
+      tickCampaign(options({ command: 'tick', manifestPath: strangerPath }), depsWithFailingClose({ auth, confirm: NEVER_PROMPT })),
+    ),
+  );
+  assert.equal(refused.value, 2, 'the no-authorization refusal is preserved');
+});
+
+// ===========================================================================
 // tick
 // ===========================================================================
 
@@ -625,7 +1080,7 @@ const PROBE_ENV = {
 
 test('spawned CLI: a piped EMPTY LINE is Enter and ACCEPTS — then the manifest installs BEFORE any authority', () => {
   const emitPath = join(mkdtempSync(join(tmpdir(), 'campaign-cli-enter-')), 'campaign-manifest.json');
-  const { status, signal, out } = runCli(['arm', '--calls', '8', '--days', '1', '--emit', emitPath], PROBE_ENV, '\n');
+  const { status, signal, out } = runCli(['arm', '--calls', '8', '--days', '1', '--start', '2027-01-01T00:00:00Z', '--emit', emitPath], PROBE_ENV, '\n');
   // The exact [Y/n] prompt reached stdout through the production readline seam.
   assert.ok(
     out.includes('arm this campaign for unattended running? [Y/n]'),
@@ -642,7 +1097,7 @@ test('spawned CLI: a piped EMPTY LINE is Enter and ACCEPTS — then the manifest
 
 test('spawned CLI: true EOF (stream closes without a line) REFUSES with nothing durable', () => {
   const emitPath = join(mkdtempSync(join(tmpdir(), 'campaign-cli-eof-')), 'campaign-manifest.json');
-  const { status, out } = runCli(['arm', '--calls', '8', '--days', '1', '--emit', emitPath], PROBE_ENV, '');
+  const { status, out } = runCli(['arm', '--calls', '8', '--days', '1', '--start', '2027-01-01T00:00:00Z', '--emit', emitPath], PROBE_ENV, '');
   assert.equal(status, 2, `EOF refuses with exit 2; out=${out}`);
   assert.ok(/confirmation stream closed \(EOF\)/.test(out), `the refusal names EOF; out=${out}`);
   assert.ok(!existsSync(emitPath), 'no manifest was written');
@@ -651,8 +1106,17 @@ test('spawned CLI: true EOF (stream closes without a line) REFUSES with nothing 
 
 test("spawned CLI: an explicit 'n' REFUSES with nothing durable", () => {
   const emitPath = join(mkdtempSync(join(tmpdir(), 'campaign-cli-n-')), 'campaign-manifest.json');
-  const { status, out } = runCli(['arm', '--calls', '8', '--days', '1', '--emit', emitPath], PROBE_ENV, 'n\n');
+  const { status, out } = runCli(['arm', '--calls', '8', '--days', '1', '--start', '2027-01-01T00:00:00Z', '--emit', emitPath], PROBE_ENV, 'n\n');
   assert.equal(status, 2, `'n' refuses with exit 2; out=${out}`);
   assert.ok(/arming refused \(answer "n"\)/.test(out), `the refusal echoes the answer; out=${out}`);
+  assert.ok(!existsSync(emitPath), 'no manifest was written');
+});
+
+test('spawned CLI: an OMITTED --start refuses before the prompt is ever shown', () => {
+  const emitPath = join(mkdtempSync(join(tmpdir(), 'campaign-cli-nostart-')), 'campaign-manifest.json');
+  const { status, out } = runCli(['arm', '--calls', '8', '--days', '1', '--emit', emitPath], PROBE_ENV, '\n');
+  assert.equal(status, 2, `a missing --start refuses with exit 2; out=${out}`);
+  assert.ok(/requires an explicit --start/.test(out), `the refusal names the requirement; out=${out}`);
+  assert.ok(!out.includes('[Y/n]'), `the prompt was never shown; out=${out}`);
   assert.ok(!existsSync(emitPath), 'no manifest was written');
 });

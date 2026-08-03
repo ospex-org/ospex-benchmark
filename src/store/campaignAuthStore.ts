@@ -40,24 +40,42 @@ export class SqlCampaignAuthorizationPort implements CampaignAuthorizationPort {
   }
 
   /**
-   * Stamp `disarmedAt` inside the stored record. Idempotent, and it never overwrites an
-   * earlier stop instant — the FIRST disarm is the true one, and a repeated stop must not
-   * rewrite that history. Returns `not_found` only when no campaign was ever armed.
+   * Stamp `disarmedAt` inside the stored record — classified in ONE SQL statement, one
+   * PostgreSQL snapshot. The `attempt` CTE conditionally updates the live row (its
+   * `disarmedAt is null` predicate is what preserves the FIRST stop instant — a repeated
+   * stop never rewrites history); the `standing` CTE reads row presence in the SAME
+   * statement snapshot. A standing row the update did not touch is either already disarmed
+   * in the snapshot or was disarmed by a concurrent stop this statement waited on — both
+   * truthfully `disarmed` — while a row INSERTED after the snapshot is invisible to both
+   * CTEs and yields `not_found`, never a false `disarmed`. (The two-statement
+   * update-then-presence-probe shape this replaces could observe such an insert in the
+   * second query's LATER snapshot and misreport an ACTIVE authorization as stopped.)
+   * `not_found` therefore means: no campaign was armed as of this statement's snapshot.
+   * An off-contract result shape throws rather than being coerced.
    */
   async disarm(cohortId: string, at: string): Promise<'disarmed' | 'not_found'> {
     const rows = await this.query(
-      `update store.campaign_authorizations
-          set record = jsonb_set(record, '{disarmedAt}', to_jsonb($2::text), true)
-        where cohort_id = $1
-          and record ->> 'disarmedAt' is null
-        returning cohort_id`,
+      `with attempt as (
+         update store.campaign_authorizations
+            set record = jsonb_set(record, '{disarmedAt}', to_jsonb($2::text), true)
+          where cohort_id = $1
+            and record ->> 'disarmedAt' is null
+         returning cohort_id
+       ),
+       standing as (
+         select cohort_id from store.campaign_authorizations where cohort_id = $1
+       )
+       select case
+                when exists (select 1 from attempt) then 'disarmed'
+                when exists (select 1 from standing) then 'disarmed'
+                else 'not_found'
+              end as outcome`,
       [cohortId, at],
     );
-    if (rows.length === 1) return 'disarmed';
-    // No row updated: either already disarmed (still 'disarmed' — the stop holds) or absent.
-    const existing = await this.query('select 1 as present from store.campaign_authorizations where cohort_id = $1', [
-      cohortId,
-    ]);
-    return existing.length === 1 ? 'disarmed' : 'not_found';
+    const outcome = rows.length === 1 ? rows[0]!['outcome'] : undefined;
+    if (outcome !== 'disarmed' && outcome !== 'not_found') {
+      throw new Error(`disarm returned an off-contract result shape: ${JSON.stringify(rows)}`);
+    }
+    return outcome;
   }
 }

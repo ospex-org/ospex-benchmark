@@ -96,25 +96,48 @@ test('arm sends the cohortId and the exact JSON-serialized record as its paramet
 });
 
 // ---------------------------------------------------------------------------
-// disarm — the tri-state mapping
+// disarm — ONE statement, one snapshot; the SQL outcome is passed through, never inferred
 // ---------------------------------------------------------------------------
 
-test('disarm maps an updated row to "disarmed" in ONE statement, with [cohortId, at] parameters', async () => {
-  const { query, calls } = scriptedQuery([[{ cohort_id: 'c1' }]]);
-  assert.equal(await new SqlCampaignAuthorizationPort(query).disarm('c1', '2026-08-06T00:00:00.000Z'), 'disarmed');
-  assert.equal(calls.length, 1, 'no second probe when the update matched');
-  assert.deepEqual(calls[0]!.params, ['c1', '2026-08-06T00:00:00.000Z']);
+test('disarm classifies in EXACTLY ONE statement for both outcomes, with [cohortId, at] parameters', async () => {
+  const hit = scriptedQuery([[{ outcome: 'disarmed' }]]);
+  assert.equal(await new SqlCampaignAuthorizationPort(hit.query).disarm('c1', '2026-08-06T00:00:00.000Z'), 'disarmed');
+  assert.equal(hit.calls.length, 1, 'one statement — a later-snapshot presence probe is the race this bans');
+  assert.deepEqual(hit.calls[0]!.params, ['c1', '2026-08-06T00:00:00.000Z']);
+
+  const miss = scriptedQuery([[{ outcome: 'not_found' }]]);
+  assert.equal(
+    await new SqlCampaignAuthorizationPort(miss.query).disarm('c1', '2026-08-06T00:00:00.000Z'),
+    'not_found',
+  );
+  assert.equal(miss.calls.length, 1, 'not_found comes from the SAME single statement, not a second query');
 });
 
-test('disarm on an ALREADY-disarmed row (update matched nothing, row present) still reports "disarmed"', async () => {
-  const { query, calls } = scriptedQuery([[], [{ present: 1 }]]);
-  assert.equal(await new SqlCampaignAuthorizationPort(query).disarm('c1', '2026-08-06T00:00:00.000Z'), 'disarmed');
-  assert.equal(calls.length, 2, 'the presence probe ran');
+test('the single disarm statement carries the first-stop predicate and the snapshot CTE shape', async () => {
+  // The SQL text IS the wire protocol here: these two fragments are exactly what the
+  // durability contract depends on. Dropping the null-disarm predicate (a repeated stop
+  // would then overwrite the FIRST stop instant) or the same-snapshot presence CTE (the
+  // check/use race would return) must turn this red even without a live database.
+  const { query, calls } = scriptedQuery([[{ outcome: 'disarmed' }]]);
+  await new SqlCampaignAuthorizationPort(query).disarm('c1', '2026-08-06T00:00:00.000Z');
+  const sql = calls[0]!.sql;
+  assert.ok(sql.includes("record ->> 'disarmedAt' is null"), 'the FIRST-stop-wins predicate is present');
+  assert.ok(/with\s+attempt\s+as/i.test(sql), 'the conditional update runs as a CTE of the one statement');
+  assert.ok(/standing/i.test(sql), 'presence is read in the SAME statement snapshot');
 });
 
-test('disarm on a cohort never armed (update matched nothing, row absent) reports "not_found"', async () => {
-  const { query } = scriptedQuery([[], []]);
-  assert.equal(await new SqlCampaignAuthorizationPort(query).disarm('c1', '2026-08-06T00:00:00.000Z'), 'not_found');
+test('disarm THROWS on an off-contract result shape — never coerced into an outcome', async () => {
+  for (const rows of [[], [{ outcome: 'weird' }], [{ nope: 1 }], [{ outcome: 'disarmed' }, { outcome: 'disarmed' }]]) {
+    await assert.rejects(
+      () =>
+        new SqlCampaignAuthorizationPort(scriptedQuery([rows as ReadonlyArray<Record<string, unknown>>]).query).disarm(
+          'c1',
+          '2026-08-06T00:00:00.000Z',
+        ),
+      /off-contract/,
+      JSON.stringify(rows),
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -127,11 +150,6 @@ test('a failing query REJECTS read, arm, and disarm — never a success-shaped r
   await assert.rejects(() => new SqlCampaignAuthorizationPort(scriptedQuery([boom]).query).arm(RECORD), /connection lost/);
   await assert.rejects(
     () => new SqlCampaignAuthorizationPort(scriptedQuery([boom]).query).disarm('c1', '2026-08-06T00:00:00.000Z'),
-    /connection lost/,
-  );
-  // The failure of the second (presence-probe) statement also propagates.
-  await assert.rejects(
-    () => new SqlCampaignAuthorizationPort(scriptedQuery([[], boom]).query).disarm('c1', '2026-08-06T00:00:00.000Z'),
     /connection lost/,
   );
 });

@@ -87,6 +87,10 @@ export const nodeArtifactFs: ArtifactFs = {
   unlink: (path) => unlinkSync(path),
 };
 
+/** A byte-different file already occupies the final path — the no-clobber refusal, typed so
+ *  a caller can distinguish a collision from an environmental install failure. */
+export class ByteDifferentCollisionError extends Error {}
+
 function byOrdinal(a: MarketKey, b: MarketKey): number {
   return MARKET_ORDINAL[a] - MARKET_ORDINAL[b];
 }
@@ -175,10 +179,9 @@ export class FireArtifactSink {
     return this.installBytesNoClobber(dir, finalPath, `${sidecar.fireId}-spend`, buffer, 'spend escalation sidecar');
   }
 
-  /** The shared atomic no-clobber byte-install loop (temp → complete write → fsync → close
-   *  → hard-link no-clobber → directory fsync; a pre-existing final path is accepted only
-   *  for exact raw-byte identity). Moved verbatim from `install` so both durable records
-   *  ride ONE tested write path. */
+  /** The shared atomic no-clobber byte-install loop. Delegates to the module-level
+   *  {@link installBytesNoClobber} so both durable records — and the campaign manifest
+   *  installer — ride ONE tested write path. */
   private installBytesNoClobber(
     dir: string,
     finalPath: string,
@@ -186,93 +189,110 @@ export class FireArtifactSink {
     buffer: Buffer,
     label: string,
   ): { path: string; created: boolean } {
-    this.fs.mkdirp(dir);
+    return installBytesNoClobber(this.fs, { dir, finalPath, tmpStem, buffer, label });
+  }
+}
 
-    // A same-directory exclusive temp with an opaque collision-resistant suffix; the `wx`
-    // open is the authority that two calls never own the same temp.
-    const tmpPath = join(dir, `.${tmpStem}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
-    let tempCreated = false;
-    const cleanupTemp = (): void => {
-      // Best-effort, after the result/durability decision is known: never masks the primary
-      // result or exception, only unlinks a temp THIS call created, never the final path.
-      if (!tempCreated) return;
-      try {
-        this.fs.unlink(tmpPath);
-      } catch {
-        /* best-effort */
-      }
-    };
+/**
+ * The atomic no-clobber byte-install loop (temp → complete write → fsync → close →
+ * hard-link no-clobber → directory fsync; a pre-existing final path is accepted only for
+ * exact raw-byte identity). Extracted verbatim from the sink so every durable file this
+ * repo installs rides ONE tested write path; a byte-different pre-existing final throws the
+ * typed {@link ByteDifferentCollisionError}, every other failure throws its own error.
+ */
+export function installBytesNoClobber(
+  fs: ArtifactFs,
+  params: { dir: string; finalPath: string; tmpStem: string; buffer: Buffer; label: string },
+): { path: string; created: boolean } {
+  const { dir, finalPath, tmpStem, buffer, label } = params;
+  fs.mkdirp(dir);
 
+  // A same-directory exclusive temp with an opaque collision-resistant suffix; the `wx`
+  // open is the authority that two calls never own the same temp.
+  const tmpPath = join(dir, `.${tmpStem}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`);
+  let tempCreated = false;
+  const cleanupTemp = (): void => {
+    // Best-effort, after the result/durability decision is known: never masks the primary
+    // result or exception, only unlinks a temp THIS call created, never the final path.
+    if (!tempCreated) return;
     try {
-      const fd = this.fs.openExclusive(tmpPath);
-      tempCreated = true;
-
-      // Complete write + temp fsync, then close EXACTLY ONCE (even on a write/fsync
-      // failure), with a fixed error precedence.
-      let writeError: unknown;
-      try {
-        let offset = 0;
-        while (offset < buffer.length) {
-          const remaining = buffer.length - offset;
-          const n = this.fs.write(fd, buffer, offset, remaining);
-          if (!Number.isInteger(n) || n < 1 || n > remaining) {
-            throw new Error(`${label} temp write made invalid progress (${String(n)} of ${remaining} remaining)`);
-          }
-          offset += n;
-        }
-        this.fs.fsync(fd);
-      } catch (error) {
-        writeError = error;
-      }
-      let closeError: unknown;
-      try {
-        this.fs.close(fd);
-      } catch (error) {
-        closeError = error;
-      }
-      // A write/fsync failure wins over a close failure; a close failure surfaces only when
-      // the write/fsync succeeded. No link occurs unless write, fsync, and close all pass.
-      if (writeError !== undefined) throw writeError;
-      if (closeError !== undefined) throw closeError;
-
-      // Atomic no-clobber install → directory fsync; a pre-existing final path is an
-      // idempotent retry ONLY for exact raw-byte identity, else a fail-loud collision.
-      //
-      // The catch below wraps ONLY `link`, so reconciliation is entered solely by an EEXIST
-      // that ORIGINATED THERE. Once the link has succeeded, this fire's durable entry exists
-      // and every later failure — including one that merely happens to carry an EEXIST code,
-      // e.g. from `syncDir` — must propagate as the primary error rather than be read as a
-      // pre-existing-path collision. (An origin-blind `code === 'EEXIST'` test over both calls
-      // would report a durably-unsynced install as an idempotent completion.)
-      let linkFoundExisting = false;
-      try {
-        this.fs.link(tmpPath, finalPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        linkFoundExisting = true;
-      }
-
-      let result: { path: string; created: boolean };
-      if (!linkFoundExisting) {
-        // The link installed this call's bytes; a directory-sync failure fails the call (the
-        // entry may exist but is not durable — recoverable by the identical-byte retry below).
-        this.fs.syncDir(dir);
-        result = { path: finalPath, created: true };
-      } else {
-        const existing = this.fs.readFile(finalPath);
-        if (!existing.equals(buffer)) {
-          throw new Error(`refusing to overwrite a byte-different ${label} already installed at ${finalPath}`);
-        }
-        // Re-establish directory durability: a prior call may have linked the final entry and
-        // then failed its own directory fsync, so the idempotent path must sync too.
-        this.fs.syncDir(dir);
-        result = { path: finalPath, created: false };
-      }
-      cleanupTemp();
-      return result;
-    } catch (error) {
-      cleanupTemp();
-      throw error;
+      fs.unlink(tmpPath);
+    } catch {
+      /* best-effort */
     }
+  };
+
+  try {
+    const fd = fs.openExclusive(tmpPath);
+    tempCreated = true;
+
+    // Complete write + temp fsync, then close EXACTLY ONCE (even on a write/fsync
+    // failure), with a fixed error precedence.
+    let writeError: unknown;
+    try {
+      let offset = 0;
+      while (offset < buffer.length) {
+        const remaining = buffer.length - offset;
+        const n = fs.write(fd, buffer, offset, remaining);
+        if (!Number.isInteger(n) || n < 1 || n > remaining) {
+          throw new Error(`${label} temp write made invalid progress (${String(n)} of ${remaining} remaining)`);
+        }
+        offset += n;
+      }
+      fs.fsync(fd);
+    } catch (error) {
+      writeError = error;
+    }
+    let closeError: unknown;
+    try {
+      fs.close(fd);
+    } catch (error) {
+      closeError = error;
+    }
+    // A write/fsync failure wins over a close failure; a close failure surfaces only when
+    // the write/fsync succeeded. No link occurs unless write, fsync, and close all pass.
+    if (writeError !== undefined) throw writeError;
+    if (closeError !== undefined) throw closeError;
+
+    // Atomic no-clobber install → directory fsync; a pre-existing final path is an
+    // idempotent retry ONLY for exact raw-byte identity, else a fail-loud collision.
+    //
+    // The catch below wraps ONLY `link`, so reconciliation is entered solely by an EEXIST
+    // that ORIGINATED THERE. Once the link has succeeded, this fire's durable entry exists
+    // and every later failure — including one that merely happens to carry an EEXIST code,
+    // e.g. from `syncDir` — must propagate as the primary error rather than be read as a
+    // pre-existing-path collision. (An origin-blind `code === 'EEXIST'` test over both calls
+    // would report a durably-unsynced install as an idempotent completion.)
+    let linkFoundExisting = false;
+    try {
+      fs.link(tmpPath, finalPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      linkFoundExisting = true;
+    }
+
+    let result: { path: string; created: boolean };
+    if (!linkFoundExisting) {
+      // The link installed this call's bytes; a directory-sync failure fails the call (the
+      // entry may exist but is not durable — recoverable by the identical-byte retry below).
+      fs.syncDir(dir);
+      result = { path: finalPath, created: true };
+    } else {
+      const existing = fs.readFile(finalPath);
+      if (!existing.equals(buffer)) {
+        throw new ByteDifferentCollisionError(
+          `refusing to overwrite a byte-different ${label} already installed at ${finalPath}`,
+        );
+      }
+      // Re-establish directory durability: a prior call may have linked the final entry and
+      // then failed its own directory fsync, so the idempotent path must sync too.
+      fs.syncDir(dir);
+      result = { path: finalPath, created: false };
+    }
+    cleanupTemp();
+    return result;
+  } catch (error) {
+    cleanupTemp();
+    throw error;
   }
 }

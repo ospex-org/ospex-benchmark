@@ -118,6 +118,36 @@ async function main(): Promise<void> {
     assert.equal(await port.disarm(cohortName('ghost'), '2026-08-06T12:00:00.000Z'), 'not_found');
   });
 
+  await check('deterministic race: an arm landing right after the disarm statement can NEVER produce a false disarmed', async () => {
+    // The reviewer-shaped interleaving that broke the two-statement disarm: the stop's first
+    // statement finds nothing, then a concurrent arm INSERTS an active row, then the old
+    // second (presence) statement — running in a LATER snapshot — saw the row and reported
+    // 'disarmed' while the authorization was live. This seam wrapper forces exactly that
+    // interleaving: the insert lands immediately after EACH statement returns and before the
+    // adapter sees its rows. A single-statement adapter classifies from the pre-insert
+    // snapshot and reports not_found (1 query); any adapter that consults a second statement
+    // would observe the inserted row and misreport a live authorization as stopped.
+    const c = cohortName('race');
+    const rec = record(c);
+    const baseQuery = pgStoreQuery(pool);
+    let inserted = false;
+    let statements = 0;
+    const racingQuery: typeof baseQuery = async (sql, params) => {
+      const rows = await baseQuery(sql, params);
+      statements += 1;
+      if (!inserted) {
+        inserted = true;
+        assert.equal(await port.arm(rec), 'armed'); // the concurrent arm, via the plain port
+      }
+      return rows;
+    };
+    const outcome = await new SqlCampaignAuthorizationPort(racingQuery).disarm(c, '2026-08-06T12:00:00.000Z');
+    assert.equal(statements, 1, 'stop classification consulted exactly one statement');
+    assert.equal(outcome, 'not_found', 'a row inserted after the snapshot must never read as disarmed');
+    const standing = (await port.read(c)) as CampaignAuthorization;
+    assert.equal(standing.disarmedAt, null, 'the concurrently armed authorization is STILL ACTIVE — proving a false STOPPED here would have lied');
+  });
+
   await pool.end();
 
   const failed = results.filter((x) => !x.ok);
