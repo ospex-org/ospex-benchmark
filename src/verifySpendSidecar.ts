@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url';
 import { printError, printLine } from './console.js';
 import { ConservativeSpendUnknownError, deriveConservativeActualUsdMicros } from './conservativeSpend.js';
 import { CROSSING_PROFILE } from './crossingProfile.js';
+import { MARKET_ORDINAL } from './fireArtifact.js';
 import { parseFireArtifactV1, verifyFireArtifactReplay } from './fireArtifactWriter.js';
 import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import { SPEND_SIDECAR_SCHEMA_VERSION, TOKEN_FIELD_WHITELIST } from './spendEscalationSidecar.js';
@@ -10,9 +11,10 @@ import { classifyAttemptSpend, computeFireSpendGuard } from './spendGuard.js';
 import type { GuardArmInput } from './spendGuard.js';
 import { PROVIDER_ATTEMPT_RESERVATION_USD_MICROS } from './spendReservationPolicy.js';
 import { ARMS } from './providers/index.js';
+import { isParseableInstant } from './time.js';
 import type { FireArtifactV1 } from './fireArtifactProducer.js';
 import type { SidecarAttemptRecord, SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
-import type { ProviderName } from './types.js';
+import type { MarketKey, ProviderName } from './types.js';
 
 /**
  * The DETERMINISTIC OFFLINE spend-evidence verifier — the tool the attended-crossing
@@ -41,9 +43,9 @@ import type { ProviderName } from './types.js';
  *                              (participant/provider/model tuples, in order).
  *   - `attempt-completeness` — exactly one initial sidecar row per roster arm, at most
  *                              one repair; every SENT artifact attempt has exactly one
- *                              matching sidecar row (role + request instant + arm
- *                              identity) and vice versa — no missing, duplicate, or
- *                              foreign rows; a never-sent row must be fully coherent
+ *                              matching sidecar row (role + request/response evidence +
+ *                              arm identity) and vice versa — no missing, duplicate, or
+ *                              foreign rows; a never-sent initial must be fully coherent
  *                              (`requestAt`/`responseAt`/buckets all null, spendClass
  *                              `zero`) and cannot stand in for a sent attempt.
  *   - `attempts-priceable`   — every sent attempt's cost recomputes (UNKNOWN fails).
@@ -214,7 +216,9 @@ function parseSidecarRecord(raw: unknown): SpendEscalationSidecarV1 {
     }
     for (const field of ['requestAt', 'responseAt']) {
       const v = attempt[field];
-      if (v !== null && !isNonEmptyString(v)) throw new Error(`attempts[${index}].${field} must be a string or null`);
+      if (v !== null && (!isNonEmptyString(v) || !isParseableInstant(v))) {
+        throw new Error(`attempts[${index}].${field} must be an offset-qualified instant or null`);
+      }
     }
     if (attempt['usageTokens'] !== null) {
       const issue = tokenBucketIssue(attempt['provider'] as ProviderName, attempt['usageTokens']);
@@ -270,6 +274,7 @@ interface ArtifactSentAttempt {
   readonly requestedModelId: string;
   readonly kind: 'initial' | 'repair';
   readonly requestStartedAt: string;
+  readonly requestReceivedAt: string | null;
 }
 
 export interface SpendEvidenceInput {
@@ -338,6 +343,11 @@ export function verifySpendEvidence(input: SpendEvidenceInput): SidecarVerificat
       `scopedMarkets [${record.scopedMarkets.join(', ')}] != artifact [${artifact.scopedMarkets.join(', ')}]`,
     );
   }
+  const artifactMarkets = artifact.scopedMarkets as readonly MarketKey[];
+  const canonicalArtifactMarkets = [...artifactMarkets].sort((a, b) => MARKET_ORDINAL[a] - MARKET_ORDINAL[b]);
+  if (!orderedEqual(artifactMarkets, canonicalArtifactMarkets)) {
+    bindingIssues.push(`artifact scopedMarkets [${artifact.scopedMarkets.join(', ')}] are not in canonical market order`);
+  }
   checks.push({
     name: 'artifact-binding',
     ok: bindingIssues.length === 0,
@@ -374,6 +384,7 @@ export function verifySpendEvidence(input: SpendEvidenceInput): SidecarVerificat
         requestedModelId: arm.expectedArmIdentity.requestedModelId,
         kind: attempt.kind,
         requestStartedAt: attempt.requestStartedAt,
+        requestReceivedAt: attempt.requestReceivedAt,
       });
     }
   }
@@ -398,7 +409,12 @@ export function verifySpendEvidence(input: SpendEvidenceInput): SidecarVerificat
     rowCounts.set(row.participantId, counts);
 
     if (row.requestAt === null) {
-      // A never-sent row must be fully coherent and must not shadow a sent artifact attempt.
+      // The producer persists one terminal initial per roster arm, but never fabricates an
+      // unsent repair: pre-dispatch repair refusal is represented by `repair: null`.
+      if (row.role === 'repair') {
+        completenessIssues.push(`${who}: a never-sent repair has no artifact witness`);
+      }
+      // A never-sent initial must be fully coherent and must not shadow a sent artifact attempt.
       if (row.responseAt !== null || row.usageTokens !== null || row.spendClass !== 'zero') {
         completenessIssues.push(`${who}: never-sent row must have null responseAt, null buckets, and spendClass zero`);
       }
@@ -409,7 +425,8 @@ export function verifySpendEvidence(input: SpendEvidenceInput): SidecarVerificat
       continue;
     }
     const key = `${row.participantId}::${row.role}::${row.requestAt}`;
-    if (!sentByKey.has(key)) {
+    const sent = sentByKey.get(key);
+    if (sent === undefined) {
       completenessIssues.push(`${who}: no artifact attempt matches (role + request instant) — foreign or fabricated row`);
       continue;
     }
@@ -418,6 +435,14 @@ export function verifySpendEvidence(input: SpendEvidenceInput): SidecarVerificat
       continue;
     }
     matchedKeys.add(key);
+    if (sent.requestReceivedAt !== null && row.responseAt !== sent.requestReceivedAt) {
+      completenessIssues.push(
+        `${who}: responseAt ${String(row.responseAt)} != artifact requestReceivedAt ${sent.requestReceivedAt}`,
+      );
+    }
+    if (sent.requestReceivedAt === null && row.usageTokens !== null) {
+      completenessIssues.push(`${who}: sidecar has usage buckets but the artifact records no received response`);
+    }
   }
   for (const key of sentByKey.keys()) {
     if (!matchedKeys.has(key)) {

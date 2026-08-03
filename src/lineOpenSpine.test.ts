@@ -1080,6 +1080,68 @@ test('pair verifier: an incoherent never-sent row (erasing a sent attempt) fails
   assert.equal(verification.ok, false);
 });
 
+test('pair verifier: responseAt must be a canonical instant and bind to the artifact receipt', async () => {
+  const pair = await cleanPair();
+
+  const malformed = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      rowsOf(s)[0]!['responseAt'] = 'not-an-instant';
+    }),
+  });
+  assert.ok(failedNames(malformed).includes('shape'), JSON.stringify(malformed.checks));
+  assert.equal(malformed.ok, false);
+
+  const substituted = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      const row = rowsOf(s)[0]!;
+      const requestAt = row['requestAt'] as string;
+      row['responseAt'] = new Date(Date.parse(requestAt) + 86_400_000).toISOString();
+    }),
+  });
+  assert.ok(failedNames(substituted).includes('attempt-completeness'), JSON.stringify(substituted.checks));
+  assert.equal(substituted.ok, false);
+});
+
+test('pair verifier: a fabricated coherent never-sent repair row fails attempt-completeness', async () => {
+  const pair = await cleanPair();
+  const verification = verifySpendEvidence({
+    artifactBytes: pair.artifactBytes,
+    sidecar: mutatedSidecar(pair, (s) => {
+      const initial = rowsOf(s)[0]!;
+      rowsOf(s).push({
+        participantId: initial['participantId'],
+        provider: initial['provider'],
+        requestedModelId: initial['requestedModelId'],
+        role: 'repair',
+        requestAt: null,
+        responseAt: null,
+        usageTokens: null,
+        spendClass: 'zero',
+        status: 'pass',
+        derivedActualUsdMicros: null,
+      });
+    }),
+  });
+  assert.ok(failedNames(verification).includes('attempt-completeness'), JSON.stringify(verification.checks));
+  assert.equal(verification.ok, false);
+});
+
+test('pair verifier: coordinated noncanonical market order fails artifact-binding', async () => {
+  const pair = await cleanPair();
+  const artifact = JSON.parse(pair.artifactBytes) as Record<string, unknown>;
+  artifact['scopedMarkets'] = [...(artifact['scopedMarkets'] as string[])].reverse();
+  const verification = verifySpendEvidence({
+    artifactBytes: JSON.stringify(artifact),
+    sidecar: mutatedSidecar(pair, (s) => {
+      s['scopedMarkets'] = [...(s['scopedMarkets'] as string[])].reverse();
+    }),
+  });
+  assert.ok(failedNames(verification).includes('artifact-binding'), JSON.stringify(verification.checks));
+  assert.equal(verification.ok, false);
+});
+
 test('pair verifier: a __proto__ token key fails shape and does NOT pollute Object.prototype', async () => {
   const pair = await cleanPair();
   const before = ({} as Record<string, unknown>)['ospexPolluted'];
@@ -1172,12 +1234,16 @@ test('pair verifier: an over-reservation row (one micro-step over, honestly reco
   assert.equal(verification.ok, false);
 });
 
-test('pair verifier CLI: the real pair PASSES exit 0; a truncated sidecar FAILS exit 1; wrong arity exits 2', async () => {
+test('pair verifier CLI: valid pair passes; truncated and final-round relational mutations fail; wrong arity exits 2', async () => {
   const pair = await cleanPair();
   const dir = mkdtempSync(join(tmpdir(), 'verify-pair-'));
   const artifactPath = join(dir, 'fire.json');
   const sidecarPath = join(dir, 'fire-spend.json');
   const truncatedPath = join(dir, 'truncated-spend.json');
+  const malformedResponsePath = join(dir, 'malformed-response-spend.json');
+  const fabricatedRepairPath = join(dir, 'fabricated-repair-spend.json');
+  const noncanonicalArtifactPath = join(dir, 'noncanonical-fire.json');
+  const noncanonicalSidecarPath = join(dir, 'noncanonical-spend.json');
   writeFileSync(artifactPath, pair.artifactBytes);
   writeFileSync(sidecarPath, JSON.stringify(pair.sidecar, null, 2));
   writeFileSync(
@@ -1185,6 +1251,51 @@ test('pair verifier CLI: the real pair PASSES exit 0; a truncated sidecar FAILS 
     JSON.stringify(
       mutatedSidecar(pair, (s) => {
         s['attempts'] = rowsOf(s).slice(0, 1);
+      }),
+      null,
+      2,
+    ),
+  );
+  writeFileSync(
+    malformedResponsePath,
+    JSON.stringify(
+      mutatedSidecar(pair, (s) => {
+        rowsOf(s)[0]!['responseAt'] = 'not-an-instant';
+      }),
+      null,
+      2,
+    ),
+  );
+  writeFileSync(
+    fabricatedRepairPath,
+    JSON.stringify(
+      mutatedSidecar(pair, (s) => {
+        const initial = rowsOf(s)[0]!;
+        rowsOf(s).push({
+          participantId: initial['participantId'],
+          provider: initial['provider'],
+          requestedModelId: initial['requestedModelId'],
+          role: 'repair',
+          requestAt: null,
+          responseAt: null,
+          usageTokens: null,
+          spendClass: 'zero',
+          status: 'pass',
+          derivedActualUsdMicros: null,
+        });
+      }),
+      null,
+      2,
+    ),
+  );
+  const noncanonicalArtifact = JSON.parse(pair.artifactBytes) as Record<string, unknown>;
+  noncanonicalArtifact['scopedMarkets'] = [...(noncanonicalArtifact['scopedMarkets'] as string[])].reverse();
+  writeFileSync(noncanonicalArtifactPath, JSON.stringify(noncanonicalArtifact, null, 2));
+  writeFileSync(
+    noncanonicalSidecarPath,
+    JSON.stringify(
+      mutatedSidecar(pair, (s) => {
+        s['scopedMarkets'] = [...(s['scopedMarkets'] as string[])].reverse();
       }),
       null,
       2,
@@ -1212,6 +1323,21 @@ test('pair verifier CLI: the real pair PASSES exit 0; a truncated sidecar FAILS 
   assert.equal(fail.status, 1, fail.out);
   assert.match(fail.out, /VERDICT: FAIL/);
   assert.match(fail.out, /\[FAIL\] attempt-completeness/);
+
+  const malformedResponse = run([artifactPath, malformedResponsePath]);
+  assert.equal(malformedResponse.status, 1, malformedResponse.out);
+  assert.match(malformedResponse.out, /VERDICT: FAIL/);
+  assert.match(malformedResponse.out, /\[FAIL\] shape/);
+
+  const fabricatedRepair = run([artifactPath, fabricatedRepairPath]);
+  assert.equal(fabricatedRepair.status, 1, fabricatedRepair.out);
+  assert.match(fabricatedRepair.out, /VERDICT: FAIL/);
+  assert.match(fabricatedRepair.out, /\[FAIL\] attempt-completeness/);
+
+  const noncanonicalScope = run([noncanonicalArtifactPath, noncanonicalSidecarPath]);
+  assert.equal(noncanonicalScope.status, 1, noncanonicalScope.out);
+  assert.match(noncanonicalScope.out, /VERDICT: FAIL/);
+  assert.match(noncanonicalScope.out, /\[FAIL\] artifact-binding/);
 
   const arity = run([sidecarPath]);
   assert.equal(arity.status, 2, arity.out);
