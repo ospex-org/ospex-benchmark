@@ -182,7 +182,7 @@ test('google fake under collision: the reported id echoes the openai arm — the
   assert.equal(result.reportedModelId, 'gpt-5.6-sol');
 });
 
-test('xai fake: never answers — rejects with the typed timeout the runner classifies', async () => {
+test('xai fake: rejects directly with the typed timeout the runner classifies', async () => {
   const payload = payloadFor('xai-grok-4.5', 'grok-4.5', GAME_ID);
   await assert.rejects(
     () => fake().get('xai-grok-4.5')!.chat(turnsFor(payload), 1_234),

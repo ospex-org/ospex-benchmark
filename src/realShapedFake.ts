@@ -10,9 +10,9 @@ import type { ProviderAdapter, ProviderResponse, ProviderUsage } from './types.j
 
 /**
  * The REAL-SHAPED, zero-network fake adapters: the same deterministic decisions and the
- * same scenario map as the mock (valid everywhere; HTTP 429 on the throttle fixture game;
- * schema-invalid on the corruption fixture game; a prose+fenced wrong-cohort echo on every
- * first google attempt, repaired cleanly; xai never answers) — but wrapped in a REALISTIC
+ * same scenario outcomes as the mock (valid everywhere; HTTP 429 on the throttle fixture;
+ * schema-invalid on the corruption fixture; a prose+fenced wrong-cohort echo on every
+ * first google attempt, repaired cleanly; typed xai timeout) — but wrapped in a REALISTIC
  * provider envelope: provider-formatted response ids, provider-true verbatim `usageRaw`
  * shapes (openai reasoning as a SUBSET bucket plus cached prompt tokens; anthropic cache
  * fields; google additive `thoughtsTokenCount`), and model-echo metadata, with response
@@ -174,8 +174,8 @@ export function createRealShapedFakeAdapters(options: RealShapedFakeOptions): Ma
     credentialEnvVar: 'XAI_API_KEY',
     hasCredential: () => true,
     async chat(_turns, timeoutMs): Promise<ProviderResponse> {
-      // Never answers, like the mock — but throws the typed timeout immediately (timing
-      // is an allow-listed parity leaf; the classification comes from the error type).
+      // Model the mock's timeout outcome without a wall-clock wait. Timing is an
+      // allow-listed parity leaf; classification comes from the typed error.
       throw new ProviderTimeoutError('xai', timeoutMs);
     },
   });
