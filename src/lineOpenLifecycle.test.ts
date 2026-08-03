@@ -175,7 +175,7 @@ function sealedSnapshot(): PreparedFireSnapshot {
     slug: 'mil-pit-2026-07-18',
     slateDate: '2026-07-18',
     bundleTimestamp: BUNDLE_TS,
-    booted: cohortBoot({ live: false, manifestBytes: json }),
+    booted: cohortBoot({ manifestBytes: json }),
     publication: checkPublication({
       localManifestBytes: bytes,
       publication: { repositoryOwner: 'ospex-org', repositoryName: 'ospex-benchmark', path: 'manifests/cohort.json', commitSha: 'a'.repeat(40) },

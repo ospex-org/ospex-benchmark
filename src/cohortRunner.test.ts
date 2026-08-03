@@ -447,7 +447,7 @@ function tickInput(
     onStatus?: (line: string) => void;
   },
 ): { booted: BootedCohort; input: CohortTickInput } {
-  const booted = cohortBoot({ live: false, manifestBytes: json });
+  const booted = cohortBoot({ manifestBytes: json });
   const input: CohortTickInput = {
     booted,
     publication: publicationFor(json),

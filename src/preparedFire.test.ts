@@ -105,7 +105,7 @@ function manifestJson(over?: { network?: string }): string {
 }
 
 function bootFrom(json: string): BootedCohort {
-  return cohortBoot({ live: false, manifestBytes: json });
+  return cohortBoot({ manifestBytes: json });
 }
 
 function publicationFor(json: string): PublicationVerified {

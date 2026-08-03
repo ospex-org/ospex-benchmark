@@ -4,25 +4,34 @@ import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { isBaselinePolicyVersion } from './baselines.js';
 import { assertCohortBudgetInitialized, buildCohortBudgetInitRequest } from './cohortBudgetInit.js';
-import { CohortBootError, cohortBoot } from './cohortBoot.js';
+import { cohortBoot } from './cohortBoot.js';
 import { runCohortTick } from './cohortRunner.js';
 import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
-import { buildDemoFixture } from './demoFixture.js';
+import { buildCrossingManifest } from './crossingProfile.js';
+import { buildDemoFixture, buildFixtureSeams } from './demoFixture.js';
 import { loadDotEnv } from './env.js';
 import { FireArtifactSink } from './fireArtifactSink.js';
 import { RehearsalClaimPort, StoreClaimPort } from './lineOpenClaim.js';
 import { createDiscoverFn, createReadMarketEvidenceFn } from './lineOpenRead.js';
+import { askLiveConfirmation, observeRealAdapterCredentials, resolveLiveIntent } from './liveIntent.js';
 import { parseManifest } from './manifest.js';
 import { checkPublication } from './manifestPublication.js';
-import { createCohortMockAdapterCapability } from './cohortAdapterCapability.js';
+import {
+  createCohortMockAdapterCapability,
+  gateRealCohortAdapterCapability,
+} from './cohortAdapterCapability.js';
 import { buildRehearsalManifest } from './rehearsalManifest.js';
 import { SqlAtomicStore, pgStoreQuery } from './store/atomicStore.js';
 import { STORE_SCHEMA_VERSION } from './store/constants.js';
+import type { BootedCohort } from './cohortBoot.js';
+import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
+import type { FixtureSeams } from './demoFixture.js';
 import type { CohortManifestV1 } from './manifest.js';
 import type { CohortTickInput, CohortTickResult } from './cohortRunner.js';
 import type { AtomicStore } from './store/contract.js';
 import type { LineOpenReadConfig } from './lineOpenRead.js';
+import type { LiveIntentResolution } from './liveIntent.js';
 import type { PublicationVerified } from './manifestPublication.js';
 import type { ArtifactInstaller, LineOpenFireOutcome, LineOpenRunOptions } from './lineOpenSpine.js';
 import type { Pool } from 'pg';
@@ -42,14 +51,20 @@ const DEFAULT_FIRE_ARTIFACTS_DIR = './.fire-artifacts';
  * claim port never admits, so every fire returns `NotAdmitted/WouldAdmit`, no mock
  * adapter is ever called, and the no-op sink is never invoked.
  *
- * `--live` is routed into `cohortBoot`, which hard-disables it (rejected). A
- * store-backed (`--store=postgres`) run additionally admits a real fire: over
+ * A store-backed (`--store=postgres`) run additionally admits a real fire: over
  * `--fixture` (a now-relative synthetic candidate that passes the projector against the
  * wall clock) it boots the cohort, applies + initializes the atomic store, runs one tick
  * with a genuine `StoreClaimPort` + mock adapters (zero provider spend) + a durable
  * `FireArtifactSink`, and installs one real artifact — the deterministic "see it fire"
- * demo. Real GitHub publication resolution stays self-resolved; `--live` is still
- * unreachable.
+ * demo. Real GitHub publication resolution stays self-resolved.
+ *
+ * `--live` requests the ATTENDED crossing on that same store-backed fixture path, and is
+ * resolved TRI-STATE (`resolveLiveIntent`): without `--live` the mock capability is
+ * selected exactly as before; with `--live`, the run either (a) fully authorizes — the
+ * pinned crossing-profile cohort, every roster credential observed, the exact terms
+ * printed, and the attended [Y/n] confirmation — and mints REAL billable adapters via
+ * the gated producer, or (b) refuses NONZERO. A live request is NEVER silently downgraded
+ * to mock.
  *
  * The env/argv glue lives in `main`; the boot + seam construction + rendering are
  * extracted into pure, injectable helpers (`buildRehearsalTickInput`,
@@ -83,8 +98,11 @@ Options:
                           --store=postgres (real MLB discovery is always stale-rejected).
   --out <dir>             Durable artifact output root for the fire (default ${DEFAULT_FIRE_ARTIFACTS_DIR},
                           or FIRE_ARTIFACTS_DIR). Only used under --store=postgres.
-  --live                  Routed into cohortBoot, which hard-disables live firing
-                          (always rejected in this build).
+  --live                  Request the ATTENDED live crossing (REAL provider adapters, real
+                          spend). Requires --store=postgres --fixture, the pinned crossing
+                          profile, every roster credential, and the attended [Y/n]
+                          confirmation; any missing prerequisite fails NONZERO (never mock
+                          fallback).
   -h, --help              Show this help.`;
 
 interface CliOptions {
@@ -236,7 +254,7 @@ export interface RehearsalTickParams {
  * invoked until `runCohortTick` runs.
  */
 export function buildRehearsalTickInput(params: RehearsalTickParams): CohortTickInput {
-  const booted = cohortBoot({ live: false, manifestBytes: decodeManifestText(params.manifestBytes) });
+  const booted = cohortBoot({ manifestBytes: decodeManifestText(params.manifestBytes) });
   const publication = selfResolvePublication(params.manifestBytes);
   return {
     booted,
@@ -389,6 +407,18 @@ export interface StoreFireDeps {
   readonly openStore: (databaseUrl: string) => Promise<{ store: AtomicStore; close: () => Promise<void> }>;
   /** Run ONE cohort tick over the assembled input. */
   readonly runTick: (input: CohortTickInput) => Promise<CohortTickResult>;
+  /**
+   * Resolve the invocation's tri-state live intent against the booted cohort. The
+   * production default wires `resolveLiveIntent` with the real credential probe, the
+   * CLI printer, and the attended stdin confirmation; tests inject scripted
+   * resolutions. The RESOLUTION selects; the gated producer (NOT injectable here)
+   * still independently re-validates the cohort binding, crossing pins, and
+   * credentials before any billable mint — the attended confirmation itself is the
+   * resolution's own gate (see the `liveIntent` module header), which is why an
+   * injected resolution is trusted exactly as far as the coherence guard and the
+   * producer's re-validation allow.
+   */
+  readonly resolveLive: (request: { live: boolean; booted: BootedCohort }) => Promise<LiveIntentResolution>;
 }
 
 /**
@@ -416,18 +446,34 @@ const PRODUCTION_STORE_FIRE_DEPS: StoreFireDeps = {
     return { store: new SqlAtomicStore(pgStoreQuery(pool)), close: () => pool.end() };
   },
   runTick: (input) => runCohortTick({ ...input, onStatus: (line) => printLine(`  ${line}`) }),
+  resolveLive: ({ live, booted }) =>
+    resolveLiveIntent({
+      live,
+      booted,
+      observeCredentials: observeRealAdapterCredentials,
+      print: printLine,
+      confirm: askLiveConfirmation,
+    }),
 };
 
 /**
- * Run the store-backed fixture fire: apply + initialize the atomic store, boot the now-relative
- * synthetic cohort, then run ONE tick with a genuine `StoreClaimPort` (real admission), mock
- * adapters (zero provider spend), and a durable `FireArtifactSink`. On an admitted candidate this
- * dispatches the roster, produces + installs one artifact, and settles the claim. Returns the
- * process exit code; the store is always closed.
+ * Run the store-backed fixture fire: resolve the tri-state live intent, apply + initialize the
+ * atomic store, boot the now-relative synthetic cohort, then run ONE tick with a genuine
+ * `StoreClaimPort` (real admission), the selected adapter capability, and a durable
+ * `FireArtifactSink`. On an admitted candidate this dispatches the roster, produces + installs
+ * one artifact, and settles the claim. Returns the process exit code; the store is always closed.
  *
- * The DB-bound seams (`openStore`, `runTick`) are injected with a production default so the whole
- * owner-level flow is drivable without a database; the default path is the live `runner:fire`
- * behavior, unchanged.
+ * Adapter selection is owned by the tri-state resolution: `MockRequested` selects the known-zero
+ * mock capability (the unchanged "see it fire" demo, zero provider spend); `LiveAuthorized` mints
+ * REAL billable adapters through the gated producer (which independently re-validates the
+ * authorization against the booted crossing cohort); `LiveRefused` exits NONZERO before any DB
+ * work — a live request never falls back to mock. Under `--live` the fixture boots the pinned
+ * one-fire CROSSING manifest instead of the demo manifest ($800 spend cap, call cap 8, one
+ * dispatch, conservative guard price table, production provider timeout).
+ *
+ * The DB-bound seams (`openStore`, `runTick`) and the live resolution (`resolveLive`) are
+ * injected with production defaults so the whole owner-level flow is drivable without a database;
+ * the default no-`--live` path is the live `runner:fire` behavior, unchanged.
  */
 export async function runStoreBackedFire(
   options: CliOptions,
@@ -443,44 +489,101 @@ export async function runStoreBackedFire(
   const databaseUrl = envValue('STORE_DATABASE_URL') ?? DEFAULT_STORE_DATABASE_URL;
   const outDir = options.outDir ?? envValue('FIRE_ARTIFACTS_DIR') ?? DEFAULT_FIRE_ARTIFACTS_DIR;
 
+  // (0) Boot the cohort and RESOLVE LIVE INTENT — all BEFORE any DB work, so a refused
+  //     live request touches nothing. The mock demo builds its whole fixture (manifest +
+  //     read seams) at one anchor, unchanged; the live crossing boots ONLY the crossing
+  //     MANIFEST here — its hours-wide, now-relative window tolerates the unbounded
+  //     attended confirmation — and anchors the read SEAMS separately below, AFTER
+  //     authorization, because the projector's snapshot-freshness gate (`freshFireMs`,
+  //     30s in these manifests) measures detection against the seams' fetch instant: seams
+  //     anchored before the prompt would go stale while the operator reads the terms.
+  const bootAnchorMs = Date.now();
+  const demoFixture = options.live ? null : buildDemoFixture(bootAnchorMs);
+  const manifestBytes: Uint8Array =
+    demoFixture === null
+      ? new TextEncoder().encode(buildCrossingManifest(bootAnchorMs).bytes)
+      : demoFixture.manifestBytes;
+  const booted = cohortBoot({ manifestBytes: decodeManifestText(manifestBytes) });
+  const publication = selfResolvePublication(manifestBytes);
+
+  const resolution = await deps.resolveLive({ live: options.live, booted });
+  // Coherence guard: the resolution must AGREE with the invocation's live flag in both
+  // directions. `MockRequested` for a live request is the banned silent downgrade (a mock
+  // run reported as the crossing); a non-mock resolution for a mock request would escalate
+  // an invocation the operator never armed. The production resolver cannot produce either,
+  // so this guards the injectable seam — the banner and dispatch labels below key on
+  // `options.live`, and this is what makes that equivalent to keying on the resolution.
+  if (options.live !== (resolution.kind !== 'MockRequested')) {
+    printError(
+      `live-intent resolution is incoherent with the invocation (--live=${String(options.live)}, ` +
+        `resolution ${resolution.kind}); refusing — a live request is never downgraded to mock, ` +
+        `and a mock request never escalates`,
+    );
+    return 1;
+  }
+  let capability: CohortAdapterCapability;
+  switch (resolution.kind) {
+    case 'LiveRefused':
+      // NONZERO, before any store/DB/artifact work. NEVER reinterpreted as mock: a silently
+      // downgraded run would report a rehearsal as if it were the crossing.
+      printError(`--live refused — no mock fallback: ${resolution.violations.join('; ')}`);
+      return 2;
+    case 'LiveAuthorized':
+      // The gated producer independently re-validates the authorization (cohort binding,
+      // crossing pins, credential observation) before minting billable adapters; a producer
+      // refusal throws loudly out of this function.
+      capability = gateRealCohortAdapterCapability(booted, resolution.authorization);
+      break;
+    case 'MockRequested':
+      // The store-backed fixture demo dispatches through the production mock capability —
+      // producer-constructed adapters, known-zero provenance, zero real spend.
+      capability = createCohortMockAdapterCapability({ simulateCollision: false });
+      break;
+    default: {
+      const _exhaustive: never = resolution;
+      return _exhaustive;
+    }
+  }
+
+  // The synthetic read seams. The mock demo reuses its fixture's boot-anchored seams (the
+  // sub-second store open below spends from the 30s freshness budget — fine locally); the
+  // live crossing anchors FRESH seams now, after the confirmation, so the freshness gate
+  // measures milliseconds rather than human reading time.
+  const seams: FixtureSeams = demoFixture ?? buildFixtureSeams(Date.now());
+
   // (1) Open the durable store (production: a pg Pool + idempotent DDL, no drop); the seam is
   //     injectable so the owner-level flow is drivable without a database. Always closed below.
   const { store, close } = await deps.openStore(databaseUrl);
   try {
     printLine('store schema + functions applied idempotently (no destructive drop)');
-
-    // (2) Anchor the synthetic candidate at NOW, boot the cohort, and self-resolve publication.
-    const anchorMs = Date.now();
-    const fixture = buildDemoFixture(anchorMs);
-    const manifestText = decodeManifestText(fixture.manifestBytes);
-    const booted = cohortBoot({ live: false, manifestBytes: manifestText });
-    const publication = selfResolvePublication(fixture.manifestBytes);
     printLine(`[fixture] cohort booted: cohortId ${booted.cohortId}`);
 
-    // (3) Pin the cohort's caps + constants in the store BEFORE the tick — every admit refuses
+    // (2) Pin the cohort's caps + constants in the store BEFORE the tick — every admit refuses
     //     `not_initialized` otherwise. The request is derived from authenticated boot identity.
     const initResult = await store.initCohortBudget(buildCohortBudgetInitRequest(booted));
     assertCohortBudgetInitialized(initResult);
     printLine('[fixture] cohort budget initialized in the store');
 
-    // (4) One tick on the wall clock: genuine admission, mock dispatch (zero spend), durable sink.
+    // (3) One tick on the wall clock: genuine admission, the selected capability, durable sink.
     const now = (): number => Date.now();
     const ownerId = `${hostname()}-${process.pid}-${randomUUID()}`;
     const input: CohortTickInput = {
       booted,
       publication,
-      discover: fixture.discover,
-      readMarketEvidence: fixture.readMarketEvidence,
+      discover: seams.discover,
+      readMarketEvidence: seams.readMarketEvidence,
       claimPort: new StoreClaimPort(store),
-      // The store-backed fixture fire dispatches through the production mock capability —
-      // producer-constructed adapters, known-zero provenance, zero real spend.
-      capability: createCohortMockAdapterCapability({ simulateCollision: false }),
+      capability,
       sink: new FireArtifactSink(outDir),
       runOptions: deriveRunOptions(booted.manifest),
       admission: { ownerId, expectedSchemaVersion: STORE_SCHEMA_VERSION },
       now,
     };
-    printLine(`dispatching the synthetic fire (mock adapters, artifacts → ${outDir}) ...`);
+    printLine(
+      options.live
+        ? `dispatching the LIVE crossing fire (REAL provider adapters, artifacts → ${outDir}) ...`
+        : `dispatching the synthetic fire (mock adapters, artifacts → ${outDir}) ...`,
+    );
 
     const result = await deps.runTick(input);
 
@@ -544,31 +647,26 @@ async function main(): Promise<number> {
     );
     return 2;
   }
+  // `--live` is meaningful ONLY on the store-backed crossing path; anywhere else it is refused
+  // NONZERO up front. It is deliberately NEVER ignored or downgraded: an operator who typed
+  // --live intended a paid run, and silently running the rehearsal instead would misreport it.
+  if (options.live && options.store !== 'postgres') {
+    printError(
+      '--live is only valid on the store-backed crossing path (--store=postgres --fixture); it never ' +
+        'applies to the rehearsal path and is never silently ignored. Remove --live, or run the crossing.',
+    );
+    return 2;
+  }
 
   printLine(
     options.store === 'postgres'
-      ? 'ospex-benchmark line-open runner — STORE-BACKED FIRE (postgres + fixture) — real admission, mock dispatch (zero model spend), durable artifact'
+      ? options.live
+        ? 'ospex-benchmark line-open runner — STORE-BACKED LIVE CROSSING (postgres + fixture + --live) — real admission, REAL provider adapters on attended confirmation, durable artifact'
+        : 'ospex-benchmark line-open runner — STORE-BACKED FIRE (postgres + fixture) — real admission, mock dispatch (zero model spend), durable artifact'
       : 'ospex-benchmark line-open runner — REHEARSAL (dry-run) — report-only claim, no store, no model spend, no artifacts',
   );
   if (loaded.length > 0) {
     printLine(`loaded ${loaded.length} env var(s) from .env: ${loaded.join(', ')}`);
-  }
-
-  // `--live` is hard-disabled by cohortBoot in EVERY mode; it rejects before the manifest is
-  // even parsed, so surface the refusal without needing real manifest bytes.
-  if (options.live) {
-    try {
-      cohortBoot({ live: true, manifestBytes: '{}' });
-    } catch (error) {
-      if (error instanceof CohortBootError) {
-        printError(`--live rejected by cohortBoot: ${error.message}`);
-        return 2;
-      }
-      throw error;
-    }
-    // Unreachable: cohortBoot always throws on live===true.
-    printError('unexpected: --live was not rejected');
-    return 1;
   }
 
   // The store-backed fixture fire is its own self-contained path (a synthetic candidate + a
@@ -600,7 +698,7 @@ async function main(): Promise<number> {
   // --emit-manifest: prove the manifest boots and its publication self-resolves, then
   // write the EXACT accepted raw bytes and exit — NO network I/O.
   if (options.emitManifestPath !== null) {
-    const booted = cohortBoot({ live: false, manifestBytes: manifestText });
+    const booted = cohortBoot({ manifestBytes: manifestText });
     selfResolvePublication(rawBytes);
     writeFileSync(options.emitManifestPath, rawBytes);
     printLine(`[rehearsal] cohort booted: cohortId ${booted.cohortId}`);

@@ -9,21 +9,27 @@ import { validateManifestAgainstCode } from './manifestValidate.js';
  * validated, config-locked cohort identity — or refuses to boot. This is the one
  * place the pure manifest checks become a real, fail-closed boot:
  *
- *   1. `--live` is HARD-DISABLED. Live firing is refused unconditionally in this
- *      phase (rehearsal only until the reviewed live-canary phase, Tier-0 §9),
- *      before the manifest is even read — a paid dispatch must be unreachable
- *      from this gate.
- *   2. The manifest is strictly parsed (`parseManifest`); an invalid manifest
+ *   1. The manifest is strictly parsed (`parseManifest`); an invalid manifest
  *      never runs.
- *   3. It is validated against the running code (`validateManifestAgainstCode`):
+ *   2. It is validated against the running code (`validateManifestAgainstCode`):
  *      an unknown policy version, a digest mismatch, a roster that does not equal
  *      the code roster, or concurrency below the roster all FAIL boot (§2; the
  *      capacity rule is case 38).
- *   4. The canonical config-lock rejects any eligibility-, completion-, or
+ *   3. The canonical config-lock rejects any eligibility-, completion-, or
  *      scoring-affecting value a CLI override tries to diverge from the manifest —
  *      every such value must come only from the manifest (§2 config lock;
  *      case 18).
- *   5. Only then is `cohortId` derived and the (deep-frozen) manifest returned.
+ *   4. Only then is `cohortId` derived and the (deep-frozen) manifest returned.
+ *
+ * Live intent is deliberately NOT a boot concern: booting a manifest authorizes
+ * no dispatch of any kind. Real (billable) adapter authority is POSITIVE
+ * authority — it exists only as a capability minted by the gated producer
+ * (`gateRealCohortAdapterCapability`) under an attended, explicitly-confirmed
+ * live authorization resolved by the tri-state CLI resolver (`resolveLiveIntent`),
+ * both of which are bound to the exact booted cohort this gate returns. The
+ * earlier build refused `--live` here unconditionally; that negative block was
+ * replaced by the positive capability gate when the reviewed live-canary phase
+ * landed.
  *
  * Pure and I/O-free: no filesystem, no network. The public-Git precommitment
  * verification (§2; case 17) and the CLI wiring that reads the manifest file and
@@ -77,8 +83,6 @@ export interface CanonicalOverrides {
 }
 
 export interface CohortBootRequest {
-  /** True IFF the invocation passed the (hard-disabled) `--live` flag. */
-  live: boolean;
   /** Raw bytes of the manifest file (UTF-8 JSON text). */
   manifestBytes: string;
   /** Canonical overrides explicitly supplied (unit-normalized); none by default. */
@@ -97,10 +101,10 @@ export interface BootedCohort {
 
 // Module-private registry of cohorts produced by cohortBoot. Nothing outside this
 // module can add to it, so membership is unforgeable proof that a BootedCohort
-// actually came through the canonical boot gate (--live hard-disable, strict
-// parse, code-consistency validation, config-lock) — a consumer that authenticates
-// against it cannot be handed a hand-built or structurally-copied cohort whose
-// manifest never passed `validateManifestAgainstCode`.
+// actually came through the canonical boot gate (strict parse, code-consistency
+// validation, config-lock) — a consumer that authenticates against it cannot be
+// handed a hand-built or structurally-copied cohort whose manifest never passed
+// `validateManifestAgainstCode`.
 const bootedCohorts = new WeakSet<BootedCohort>();
 
 /**
@@ -152,16 +156,7 @@ function enforceConfigLock(manifest: CohortManifestV1, overrides: CanonicalOverr
  * on any refusal; returns the frozen `{ cohortId, manifest }` on success.
  */
 export function cohortBoot(request: CohortBootRequest): BootedCohort {
-  // (1) `--live` is hard-disabled — refuse before touching the manifest so a paid
-  //     dispatch is unreachable from this gate.
-  if (request.live) {
-    throw new CohortBootError(
-      'live firing is disabled in this build — rehearsal only until the reviewed live-canary phase; remove --live',
-      ['--live is hard-disabled'],
-    );
-  }
-
-  // (2) Strict structural parse — an invalid manifest never runs. Both JSON and
+  // (1) Strict structural parse — an invalid manifest never runs. Both JSON and
   //     schema failures surface as a boot refusal.
   let parsedRaw: unknown;
   try {
@@ -178,8 +173,8 @@ export function cohortBoot(request: CohortBootRequest): BootedCohort {
     throw new CohortBootError(reason, [reason]);
   }
 
-  // (3) Semantic validation against the running code (version/digest/roster;
-  //     capacity is case 38) and (4) the canonical config-lock (case 18) both
+  // (2) Semantic validation against the running code (version/digest/roster;
+  //     capacity is case 38) and (3) the canonical config-lock (case 18) both
   //     accumulate into one refusal so the operator sees every problem at once.
   const violations = [
     ...validateManifestAgainstCode(manifest),
@@ -189,7 +184,7 @@ export function cohortBoot(request: CohortBootRequest): BootedCohort {
     throw new CohortBootError(`manifest failed canonical boot: ${violations.join('; ')}`, violations);
   }
 
-  // (5) Freeze the config the runner will read, then derive identity from it.
+  // (4) Freeze the config the runner will read, then derive identity from it.
   //     Freezing AFTER the checks and BEFORE returning means no downstream `as`
   //     cast can drift the eligibility / completion / scoring config post-boot —
   //     the same immutability rule that governs the canonical code registries.

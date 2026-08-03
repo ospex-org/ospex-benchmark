@@ -31,8 +31,7 @@ function orderedArrayEqual(a: readonly string[], b: readonly string[]): boolean 
  * roster and full-roster-capacity checks. Pure and I/O-free: it returns a
  * violations array (empty = valid), mirroring `verifyRunIntegrity`, so the
  * caller decides how to refuse a mismatched manifest. The boot wiring that
- * calls this (and the canonical config-lock and `--live` hard-disable) is a
- * separate slice.
+ * calls this (and the canonical config-lock) is a separate slice.
  *
  * Every check here recomputes/looks up against real code, so a manifest that
  * pins a version or digest the runner cannot actually honor fails closed rather

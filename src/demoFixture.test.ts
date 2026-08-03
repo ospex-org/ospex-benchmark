@@ -159,7 +159,7 @@ class MemoryFs implements ArtifactFs {
 /** Boot the demo cohort + self-resolve its publication from the fixture manifest bytes. */
 function bootFixture(anchorMs: number): { fixture: ReturnType<typeof buildDemoFixture>; booted: BootedCohort } {
   const fixture = buildDemoFixture(anchorMs);
-  const booted = cohortBoot({ live: false, manifestBytes: decodeManifestText(fixture.manifestBytes) });
+  const booted = cohortBoot({ manifestBytes: decodeManifestText(fixture.manifestBytes) });
   return { fixture, booted };
 }
 

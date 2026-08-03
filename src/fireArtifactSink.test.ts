@@ -279,7 +279,7 @@ async function producedFire(
   const awayTeam = opts.awayTeam ?? AWAY_TEAM;
   const fireId = opts.fireId ?? FIRE_ID;
   const json = manifestJson();
-  const booted: BootedCohort = cohortBoot({ live: false, manifestBytes: json });
+  const booted: BootedCohort = cohortBoot({ manifestBytes: json });
   const publication = publicationFor(json);
   const cohortId = booted.cohortId;
   const request = scopedRequest(markets, awayTeam);
@@ -788,7 +788,7 @@ test('the sink imports no permit/store/runtime authority, one owner, no legacy w
  */
 async function producedMixedNeverSentFire(): Promise<{ artifact: FireArtifactV1; refused: string }> {
   const json = manifestJson();
-  const booted: BootedCohort = cohortBoot({ live: false, manifestBytes: json });
+  const booted: BootedCohort = cohortBoot({ manifestBytes: json });
   const publication = publicationFor(json);
   const cohortId = booted.cohortId;
   const request = scopedRequest(['moneyline', 'total']);

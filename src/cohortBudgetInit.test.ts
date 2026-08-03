@@ -76,7 +76,7 @@ function manifestJson(): string {
 }
 
 function bootGenuine(): BootedCohort {
-  return cohortBoot({ live: false, manifestBytes: manifestJson() });
+  return cohortBoot({ manifestBytes: manifestJson() });
 }
 
 // E — the init mapper --------------------------------------------------------

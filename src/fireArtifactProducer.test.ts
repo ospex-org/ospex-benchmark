@@ -240,7 +240,7 @@ function manifestJson(over?: { baselinePolicyVersion?: string; network?: string 
 }
 
 function bootFrom(json: string): BootedCohort {
-  return cohortBoot({ live: false, manifestBytes: json });
+  return cohortBoot({ manifestBytes: json });
 }
 
 function publicationFor(json: string): PublicationVerified {

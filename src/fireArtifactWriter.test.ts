@@ -280,7 +280,7 @@ async function producedFire(
   const markets = opts.markets ?? (['moneyline', 'total'] as const);
   const awayTeam = opts.awayTeam ?? AWAY_TEAM;
   const json = manifestJson();
-  const booted: BootedCohort = cohortBoot({ live: false, manifestBytes: json });
+  const booted: BootedCohort = cohortBoot({ manifestBytes: json });
   const publication = publicationFor(json);
   const cohortId = booted.cohortId;
   const request = scopedRequest(markets, awayTeam);

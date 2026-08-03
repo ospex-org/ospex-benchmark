@@ -122,17 +122,23 @@ export interface DemoFixture {
   readonly readMarketEvidence: ReadMarketEvidenceFn;
 }
 
+/** The two synthetic READ seams alone, anchored at `anchorMs` — no manifest. */
+export interface FixtureSeams {
+  readonly discover: DiscoverFn;
+  readonly readMarketEvidence: ReadMarketEvidenceFn;
+}
+
 /**
- * Assemble the whole demo fixture anchored at `anchorMs`: a code-consistent manifest (with a
- * small provider timeout), the real discovery seam over the synthetic games/current-odds reads,
- * and the real per-market opener read over the synthetic history. The manifest window is
- * now-relative (`windowStart = anchorMs − 168h`, `windowEnd = anchorMs + 6h`), so the anchor's
- * detection instant and the opener both fall inside it.
+ * Build the synthetic candidate READ seams anchored at `anchorMs`: the real discovery seam
+ * over the in-memory games/current-odds rows (`fetchCompletedAt = anchorMs`) plus the real
+ * per-market opener read over the synthetic history. Exported separately from the manifest
+ * because the LIVE crossing must anchor these AFTER the unbounded attended confirmation —
+ * the projector's snapshot-freshness gate (`freshFireMs`, 30s in the generated manifests)
+ * measures detection against `fetchCompletedAt`, so seams anchored before a human prompt
+ * would go stale while the operator reads the terms. The manifest window is hours wide and
+ * tolerates the prompt; the freshness clock does not.
  */
-export function buildDemoFixture(anchorMs: number): DemoFixture {
-  const { bytes } = buildRehearsalManifest(anchorMs, {
-    providerCallTimeoutMs: DEMO_PROVIDER_CALL_TIMEOUT_MS,
-  });
+export function buildFixtureSeams(anchorMs: number): FixtureSeams {
   const rows = buildDemoRows(anchorMs);
   const discoverNow = (): number => anchorMs;
 
@@ -155,9 +161,26 @@ export function buildDemoFixture(anchorMs: number): DemoFixture {
     readCompletedAt: new Date(anchorMs).toISOString(),
   });
 
+  return { discover: discoverFn, readMarketEvidence: readMarketEvidenceFn };
+}
+
+/**
+ * Assemble the whole demo fixture anchored at `anchorMs`: a code-consistent manifest (with a
+ * small provider timeout), the real discovery seam over the synthetic games/current-odds reads,
+ * and the real per-market opener read over the synthetic history. The manifest window is
+ * now-relative (`windowStart = anchorMs − 168h`, `windowEnd = anchorMs + 6h`), so the anchor's
+ * detection instant and the opener both fall inside it. (The LIVE crossing does NOT use this
+ * one-shot assembly: it boots `buildCrossingManifest` early and anchors `buildFixtureSeams`
+ * separately, after the attended confirmation.)
+ */
+export function buildDemoFixture(anchorMs: number): DemoFixture {
+  const { bytes } = buildRehearsalManifest(anchorMs, {
+    providerCallTimeoutMs: DEMO_PROVIDER_CALL_TIMEOUT_MS,
+  });
+  const seams = buildFixtureSeams(anchorMs);
   return {
     manifestBytes: new TextEncoder().encode(bytes),
-    discover: discoverFn,
-    readMarketEvidence: readMarketEvidenceFn,
+    discover: seams.discover,
+    readMarketEvidence: seams.readMarketEvidence,
   };
 }
