@@ -250,15 +250,42 @@ test('an aggregate over the crossing cap fails even when every attempt is within
   assert.equal(verification.ok, false);
 });
 
-test('a record with NO nonzero reasoning field fails reasoning-observed', () => {
-  const verification = verifySpendSidecar(recordOf([attemptOf()]));
-  assert.equal(check(verification, 'reasoning-observed').ok, false);
+test('a record with NO nonzero reasoning field fails reasoning-observed — absent AND present-but-zero', () => {
+  // Absent entirely: the anthropic-only record carries no reasoning-class field.
+  const absent = verifySpendSidecar(recordOf([attemptOf()]));
+  assert.equal(check(absent, 'reasoning-observed').ok, false);
   assert.deepEqual(
-    verification.checks.filter((c) => !c.ok).map((c) => c.name),
+    absent.checks.filter((c) => !c.ok).map((c) => c.name),
     ['reasoning-observed'],
     'the reasoning tooth is the sole failure on an otherwise-clean record',
   );
-  assert.equal(verification.ok, false);
+  assert.equal(absent.ok, false);
+
+  // PRESENT WITH VALUE ZERO: the field exists but shows no real reasoning — this is the
+  // input only the `> 0` comparison can refuse (a presence check alone would accept it).
+  const zeroed = verifySpendSidecar(
+    recordOf([
+      attemptOf({
+        participantId: 'google-gemini-3.1-pro-preview',
+        provider: 'google',
+        requestedModelId: 'gemini-3.1-pro-preview',
+        usageTokens: { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 0, totalTokenCount: 1936 },
+      }),
+      attemptOf({
+        participantId: 'xai-grok-4.5',
+        provider: 'xai',
+        requestedModelId: 'grok-4.5',
+        usageTokens: {
+          prompt_tokens: 1500,
+          completion_tokens: 400,
+          total_tokens: 1900,
+          'completion_tokens_details.reasoning_tokens': 0,
+        },
+      }),
+    ]),
+  );
+  assert.equal(check(zeroed, 'reasoning-observed').ok, false, 'a zero-valued reasoning field is NOT an observation');
+  assert.equal(zeroed.ok, false);
 });
 
 test('shape is STRICT: extra/missing keys, a wrong schema version, empty attempts, and non-objects fail', () => {
