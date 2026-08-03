@@ -331,6 +331,8 @@ function runCli(args: string[], env: Record<string, string> = {}): {
     encoding: 'utf8',
     timeout: 60_000,
     env: { ...process.env, ...env },
+    // Explicit empty stdin: any read sees immediate EOF (the attended confirm must refuse).
+    input: '',
   });
   return { status: result.status, signal: result.signal, out: `${result.stdout ?? ''}\n${result.stderr ?? ''}` };
 }
@@ -569,6 +571,40 @@ test('the spawned CLI refuses --live (missing credentials) BEFORE any DB work �
   assert.ok(!existsSync(outDir), 'no artifact directory should be created');
 });
 
+test('the spawned CLI drives the PRODUCTION confirm seam to EOF: terms print, the run refuses, no DB is touched', () => {
+  // Synthetic credentials satisfy every pre-prompt gate, so this is the one test that
+  // executes PRODUCTION_STORE_FIRE_DEPS.resolveLive end to end — the real credential
+  // probe, the real term printing, and the real readline confirm hitting immediate EOF
+  // on the empty piped stdin. EOF refuses, so no capability is minted and the unreachable
+  // store URL is never dialed. (No affirmative answer is possible on this stdin, so no
+  // dispatch of any kind is reachable.)
+  const dir = mkdtempSync(join(tmpdir(), 'runner-fire-live-eof-'));
+  const outDir = join(dir, 'artifacts');
+  const { status, signal, out } = runCli(['--store=postgres', '--fixture', '--live', '--out', outDir], {
+    STORE_DATABASE_URL: UNREACHABLE_STORE_URL,
+    OPENAI_API_KEY: 'synthetic-test-credential',
+    ANTHROPIC_API_KEY: 'synthetic-test-credential',
+    GEMINI_API_KEY: 'synthetic-test-credential',
+    GOOGLE_API_KEY: '',
+    XAI_API_KEY: 'synthetic-test-credential',
+  });
+
+  assert.ok(
+    typeof status === 'number' && status !== 0,
+    `expected a nonzero exit; status=${String(status)} signal=${String(signal)} out=${out}`,
+  );
+  // The terms printed BEFORE the prompt (the run was authorizable up to the confirmation).
+  assert.ok(/ATTENDED LIVE CROSSING/.test(out), `the terms header printed; out=${out}`);
+  assert.ok(out.includes('$800.00'), `the $800 ceiling printed; out=${out}`);
+  // The EOF refusal, with no mock fallback and no DB/dispatch of any kind.
+  assert.ok(/--live refused — no mock fallback/.test(out), `the refusal printed; out=${out}`);
+  assert.ok(/EOF/.test(out), `the refusal names EOF; out=${out}`);
+  assert.ok(!/ECONNREFUSED/i.test(out), `must not dial the store; out=${out}`);
+  assert.ok(!/store schema \+ functions applied/.test(out), `must not reach DB setup; out=${out}`);
+  assert.ok(!/dispatching the/.test(out), `must not dispatch mock OR live; out=${out}`);
+  assert.ok(!existsSync(outDir), 'no artifact directory should be created');
+});
+
 test('the spawned CLI refuses --live outside the store-backed crossing path (rehearsal), nonzero', () => {
   const { status, out } = runCli(['--store=rehearsal', '--live']);
   assert.ok(typeof status === 'number' && status !== 0, `expected a nonzero exit; out=${out}`);
@@ -673,9 +709,84 @@ test('the default (no --live) store fire resolves MockRequested and mints the kn
   assert.ok(captured, 'the tick ran');
   assert.doesNotThrow(() => assertCohortAdapterCapability(captured!.capability));
   assert.equal(captured!.capability.billingClass, 'known-zero', 'the default path stays known-zero');
+  // The PRODUCTION mock capability, not any known-zero stand-in: the whole expected
+  // roster is present (an empty or partial capability would break the pre-claim plan).
+  const adapters = captured!.capability.adapters();
+  for (const arm of defaultExpectedArms()) {
+    assert.ok(adapters.has(arm.participantId), `mock adapter present for ${arm.participantId}`);
+  }
   // The DEMO manifest, not the crossing manifest: fast mock timeout and the demo caps.
   assert.equal(captured!.booted.manifest.constants.providerCallTimeoutMs, DEMO_PROVIDER_CALL_TIMEOUT_MS);
   assert.equal(captured!.booted.manifest.cohortSpendCapUsdMicros, 1_000_000_000);
+});
+
+test('a resolution that DISAGREES with the live flag is refused by the coherence guard — both directions', async () => {
+  // live:true resolved as MockRequested = the banned silent downgrade; live:false resolved
+  // as LiveAuthorized/LiveRefused = an escalation the operator never armed. Either way:
+  // nonzero, nothing opened, no tick, no capability path taken.
+  const cases: readonly { live: boolean; resolution: () => unknown }[] = [
+    { live: true, resolution: () => ({ kind: 'MockRequested' }) },
+    { live: false, resolution: () => ({ kind: 'LiveRefused', violations: ['x'] }) },
+  ];
+  for (const { live, resolution } of cases) {
+    const events: string[] = [];
+    const deps: StoreFireDeps = {
+      openStore: async () => {
+        events.push('openStore');
+        return { store: fakeInitializedStore(), close: async () => {} };
+      },
+      runTick: async () => {
+        events.push('runTick');
+        return tickResultOf([]);
+      },
+      resolveLive: async () => resolution() as never,
+    };
+    const code = await runStoreBackedFire({ ...FIRE_OPTIONS, live }, deps);
+    assert.notEqual(code, 0, `live=${live}: incoherent resolution exits nonzero`);
+    assert.deepEqual(events, [], `live=${live}: nothing was touched`);
+  }
+});
+
+test('the LIVE fixture seams anchor AFTER the resolution — a slow attended confirmation cannot stale the snapshot', async () => {
+  // The resolution (production: the human [y/N] prompt) is unbounded; the projector's
+  // freshness gate compares detection to the seams' fetchCompletedAt with a 30s budget.
+  // So the seams must anchor after the resolution returns, not at the boot anchor.
+  let resolutionDoneMs = 0;
+  let captured: CohortTickInput | undefined;
+  const result = tickResultOf([fireSummary('f1', installedSettledOutcome('/out/cohort/fire-a.json'))]);
+  const deps: StoreFireDeps = fakeStoreFireDeps(result, {
+    runTick: async (input) => {
+      captured = input;
+      return result;
+    },
+    resolveLive: ({ live, booted }) =>
+      resolveLiveIntent({
+        live,
+        booted,
+        observeCredentials: observeRealAdapterCredentials,
+        print: () => {},
+        confirm: async () => {
+          // A measurably slow attended confirmation (well under test-timeout, well over 0).
+          await new Promise((r) => setTimeout(r, 120));
+          resolutionDoneMs = Date.now();
+          return 'y';
+        },
+      }),
+  });
+  await withEnv(SYNTHETIC_PROVIDER_ENV, () =>
+    withThrowingFetch(async () => {
+      const code = await runStoreBackedFire({ ...FIRE_OPTIONS, live: true }, deps);
+      assert.equal(code, 0);
+    }),
+  );
+  assert.ok(captured && resolutionDoneMs > 0, 'the tick ran after a timed confirmation');
+  const discovery = await captured!.discover(captured!.booted);
+  assert.ok(
+    Date.parse(discovery.fetchCompletedAt) >= resolutionDoneMs,
+    `the discovery snapshot (${discovery.fetchCompletedAt}) must be anchored at/after the ` +
+      `confirmation completed (${new Date(resolutionDoneMs).toISOString()}) — anchoring it before ` +
+      `the unbounded prompt would spend the 30s freshness budget on human reading time`,
+  );
 });
 
 test('runStoreBackedFire exits 2 on LiveRefused having touched NOTHING — no store open, no tick, no mock fallback', async () => {

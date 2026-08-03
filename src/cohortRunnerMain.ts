@@ -8,7 +8,8 @@ import { cohortBoot } from './cohortBoot.js';
 import { runCohortTick } from './cohortRunner.js';
 import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
-import { buildCrossingFixture, buildDemoFixture } from './demoFixture.js';
+import { buildCrossingManifest } from './crossingProfile.js';
+import { buildDemoFixture, buildFixtureSeams } from './demoFixture.js';
 import { loadDotEnv } from './env.js';
 import { FireArtifactSink } from './fireArtifactSink.js';
 import { RehearsalClaimPort, StoreClaimPort } from './lineOpenClaim.js';
@@ -25,6 +26,7 @@ import { SqlAtomicStore, pgStoreQuery } from './store/atomicStore.js';
 import { STORE_SCHEMA_VERSION } from './store/constants.js';
 import type { BootedCohort } from './cohortBoot.js';
 import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
+import type { FixtureSeams } from './demoFixture.js';
 import type { CohortManifestV1 } from './manifest.js';
 import type { CohortTickInput, CohortTickResult } from './cohortRunner.js';
 import type { AtomicStore } from './store/contract.js';
@@ -409,7 +411,11 @@ export interface StoreFireDeps {
    * production default wires `resolveLiveIntent` with the real credential probe, the
    * CLI printer, and the attended stdin confirmation; tests inject scripted
    * resolutions. The RESOLUTION selects; the gated producer (NOT injectable here)
-   * still independently re-validates before any billable mint.
+   * still independently re-validates the cohort binding, crossing pins, and
+   * credentials before any billable mint — the attended confirmation itself is the
+   * resolution's own gate (see the `liveIntent` module header), which is why an
+   * injected resolution is trusted exactly as far as the coherence guard and the
+   * producer's re-validation allow.
    */
   readonly resolveLive: (request: { live: boolean; booted: BootedCohort }) => Promise<LiveIntentResolution>;
 }
@@ -482,18 +488,38 @@ export async function runStoreBackedFire(
   const databaseUrl = envValue('STORE_DATABASE_URL') ?? DEFAULT_STORE_DATABASE_URL;
   const outDir = options.outDir ?? envValue('FIRE_ARTIFACTS_DIR') ?? DEFAULT_FIRE_ARTIFACTS_DIR;
 
-  // (0) Anchor the synthetic candidate at NOW, boot the cohort, and RESOLVE LIVE INTENT —
-  //     all BEFORE any DB work, so a refused live request touches nothing. Under --live the
-  //     fixture is the pinned crossing manifest; otherwise the demo manifest, unchanged. The
-  //     anchor now precedes the store open, spending a few of the fixture's ~110s of
-  //     clean-entry slack on the (local, sub-second) schema apply — the timing model holds.
-  const anchorMs = Date.now();
-  const fixture = options.live ? buildCrossingFixture(anchorMs) : buildDemoFixture(anchorMs);
-  const manifestText = decodeManifestText(fixture.manifestBytes);
-  const booted = cohortBoot({ manifestBytes: manifestText });
-  const publication = selfResolvePublication(fixture.manifestBytes);
+  // (0) Boot the cohort and RESOLVE LIVE INTENT — all BEFORE any DB work, so a refused
+  //     live request touches nothing. The mock demo builds its whole fixture (manifest +
+  //     read seams) at one anchor, unchanged; the live crossing boots ONLY the crossing
+  //     MANIFEST here — its hours-wide, now-relative window tolerates the unbounded
+  //     attended confirmation — and anchors the read SEAMS separately below, AFTER
+  //     authorization, because the projector's snapshot-freshness gate (`freshFireMs`,
+  //     30s in these manifests) measures detection against the seams' fetch instant: seams
+  //     anchored before the prompt would go stale while the operator reads the terms.
+  const bootAnchorMs = Date.now();
+  const demoFixture = options.live ? null : buildDemoFixture(bootAnchorMs);
+  const manifestBytes: Uint8Array =
+    demoFixture === null
+      ? new TextEncoder().encode(buildCrossingManifest(bootAnchorMs).bytes)
+      : demoFixture.manifestBytes;
+  const booted = cohortBoot({ manifestBytes: decodeManifestText(manifestBytes) });
+  const publication = selfResolvePublication(manifestBytes);
 
   const resolution = await deps.resolveLive({ live: options.live, booted });
+  // Coherence guard: the resolution must AGREE with the invocation's live flag in both
+  // directions. `MockRequested` for a live request is the banned silent downgrade (a mock
+  // run reported as the crossing); a non-mock resolution for a mock request would escalate
+  // an invocation the operator never armed. The production resolver cannot produce either,
+  // so this guards the injectable seam — the banner and dispatch labels below key on
+  // `options.live`, and this is what makes that equivalent to keying on the resolution.
+  if (options.live !== (resolution.kind !== 'MockRequested')) {
+    printError(
+      `live-intent resolution is incoherent with the invocation (--live=${String(options.live)}, ` +
+        `resolution ${resolution.kind}); refusing — a live request is never downgraded to mock, ` +
+        `and a mock request never escalates`,
+    );
+    return 1;
+  }
   let capability: CohortAdapterCapability;
   switch (resolution.kind) {
     case 'LiveRefused':
@@ -518,6 +544,12 @@ export async function runStoreBackedFire(
     }
   }
 
+  // The synthetic read seams. The mock demo reuses its fixture's boot-anchored seams (the
+  // sub-second store open below spends from the 30s freshness budget — fine locally); the
+  // live crossing anchors FRESH seams now, after the confirmation, so the freshness gate
+  // measures milliseconds rather than human reading time.
+  const seams: FixtureSeams = demoFixture ?? buildFixtureSeams(Date.now());
+
   // (1) Open the durable store (production: a pg Pool + idempotent DDL, no drop); the seam is
   //     injectable so the owner-level flow is drivable without a database. Always closed below.
   const { store, close } = await deps.openStore(databaseUrl);
@@ -537,8 +569,8 @@ export async function runStoreBackedFire(
     const input: CohortTickInput = {
       booted,
       publication,
-      discover: fixture.discover,
-      readMarketEvidence: fixture.readMarketEvidence,
+      discover: seams.discover,
+      readMarketEvidence: seams.readMarketEvidence,
       claimPort: new StoreClaimPort(store),
       capability,
       sink: new FireArtifactSink(outDir),

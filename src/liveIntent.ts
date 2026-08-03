@@ -24,8 +24,15 @@ import type { CanaryAuthorization } from './cohortAdapterCapability.js';
  * Boot stays pure (`cohortBoot` validates manifests and derives identity; it owns
  * no live decision); this resolver is the impure complement, and the gated
  * producer (`gateRealCohortAdapterCapability`) is the positive authority that
- * actually mints billable adapters — it independently re-validates everything
- * resolved here, so a buggy or bypassed resolver still cannot mint on its own.
+ * actually mints billable adapters. The producer independently re-derives the
+ * cohort binding, the crossing pins, and the credential observations, so a buggy
+ * or bypassed resolver cannot widen WHAT can be minted — which cohort shape,
+ * which adapters, which caps. The attended confirmation itself is enforced by
+ * THIS resolution flow (the production CLI's only route to a `LiveAuthorized`);
+ * the producer consumes it as validated data and cannot re-derive that a human
+ * answered — making the confirmation a structural (branded) guarantee rather
+ * than a flow-enforced one is a deliberate follow-up decision, not part of this
+ * slice.
  *
  * For a live request the resolver, in order: authenticates the booted cohort,
  * checks it against the pinned one-fire crossing profile, observes every roster
@@ -33,10 +40,10 @@ import type { CanaryAuthorization } from './cohortAdapterCapability.js';
  * `hasCredential`, which for the Google arm credits its supported credential
  * alias), and — only with zero violations — prints the exact terms (cohortId, the
  * $ reservation ceiling, the call cap, the one-fire limit) and asks for the
- * `[Y/n]` confirmation. ONLY an explicit affirmative answer (`y` / `yes`,
+ * `[y/N]` confirmation. ONLY an explicit affirmative answer (`y` / `yes`,
  * case-insensitive) authorizes; an empty answer, any other text, or a closed
  * input stream (EOF) refuses — on a money gate the default is NO, so pressing
- * Enter never spends.
+ * Enter never spends, and the prompt label says so (`[y/N]`, capital N).
  */
 
 export type LiveIntentResolution =
@@ -122,7 +129,7 @@ export async function resolveLiveIntent(request: LiveIntentRequest): Promise<Liv
   print(`  one fire maximum this invocation (maxDispatchesPerTick ${manifest.constants.maxDispatchesPerTick})`);
   print("  an EXPLICIT 'y' is required; Enter, any other answer, or EOF refuses");
 
-  const answer = await confirm('proceed with the attended live crossing? [Y/n] ');
+  const answer = await confirm('proceed with the attended live crossing? [y/N] ');
   if (answer === null) {
     return refused(['live confirmation stream closed (EOF) before an explicit answer — refusing']);
   }

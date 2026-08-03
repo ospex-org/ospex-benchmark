@@ -120,11 +120,16 @@ export function createCohortRealShapedFakeCapability(options: RealShapedFakeOpti
 
 /**
  * The injected-fixture producer, for tests that drive the spine with scripted/synthetic
- * adapters. `'billable'` here labels billable-SHAPED fakes so the escalation path can be
- * proven with zero real spend — it does NOT mint real billing authority (real billable
- * authority exists only via {@link gateRealCohortAdapterCapability}, which is bound to an
- * exact booted cohort + a strictly-validated canary authorization). Production default
- * paths mint only via {@link createCohortMockAdapterCapability}.
+ * adapters. It is deliberately UNGUARDED and label-trusting — `mint(input.adapters,
+ * input.billingClass)` with no cohort binding, no authorization, no adapter validation —
+ * so "no real billing authority comes from here" is a usage convention enforced by
+ * review (no non-test caller exists), not a runtime property: handed real adapters it
+ * would mint them under whatever label the caller chose. `'billable'` in tests labels
+ * billable-SHAPED fakes so the escalation path can be proven with zero real spend. The
+ * GUARDED route to real billable authority is {@link gateRealCohortAdapterCapability}
+ * (exact booted cohort + strictly-validated canary authorization + independent credential
+ * observation); production default paths mint only via
+ * {@link createCohortMockAdapterCapability}.
  */
 export function mintInjectedAdapterCapability(input: {
   adapters: ReadonlyMap<string, ProviderAdapter>;
@@ -196,13 +201,6 @@ const CANARY_AUTHORIZATION_KEYS = [
 /** Exact ordered-sequence equality (length + element-by-element). */
 function orderedEqual(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((x, i) => x === b[i]);
-}
-
-/** Set equality (order- and duplicate-independent on both sides). */
-function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
-  const sa = new Set(a);
-  const sb = new Set(b);
-  return sa.size === sb.size && [...sa].every((x) => sb.has(x));
 }
 
 /**
@@ -321,8 +319,9 @@ function captureCanaryAuthorization(value: unknown): CanaryAuthorization {
  *      roster credential itself (`hasCredential()` — for the Google arm this
  *      credits the adapter's supported credential alias, never a literal env-var
  *      name equality). Every roster participant must be credentialed, and the
- *      observed set must equal the authorization's claimed observation — the claim
- *      is reconciled, never trusted.
+ *      observed sequence must equal the authorization's claimed observation by
+ *      ORDERED identity (like every other roster-shaped binding) — the claim is
+ *      reconciled, never trusted.
  *
  * Minting performs NO network I/O and dispatches nothing: it captures the adapters'
  * method facades exactly like every other producer. What it changes is provenance —
@@ -408,10 +407,10 @@ export function gateRealCohortAdapterCapability(
       );
     }
   }
-  if (!sameStringSet(observed, captured.observedCredentialedParticipantIds)) {
+  if (!orderedEqual(observed, captured.observedCredentialedParticipantIds)) {
     violations.push(
-      `independently observed credentialed set [${observed.join(', ')}] != authorization claim ` +
-        `[${captured.observedCredentialedParticipantIds.join(', ')}]`,
+      `independently observed credentialed participants [${observed.join(', ')}] != authorization claim ` +
+        `[${captured.observedCredentialedParticipantIds.join(', ')}] (ordered identity)`,
     );
   }
 

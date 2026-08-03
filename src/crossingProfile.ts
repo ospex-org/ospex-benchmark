@@ -19,7 +19,11 @@ import type { CohortManifestV1 } from './manifest.js';
  * `$800` is the code-side full-fire RESERVATION ceiling, not an expected invoice —
  * the committed per-model worst-case proof bounds each real attempt well under
  * $100, and the runtime spend guard escalates (refusing settlement) on any
- * attempt that prices over the reservation. The values are frozen literals, and
+ * attempt that prices over the reservation. That worst-case is a function of the
+ * per-attempt output-token cap, so the profile pins the cost DRIVERS too
+ * (`maxOutputTokens`, `providerCallTimeoutMs`) — a cohort with the right caps but
+ * an inflated output-token budget is not the profile the proof priced, and the
+ * producer refuses it. The values are frozen literals, and
  * `buildCrossingManifest` refuses to build if the running code's roster, repair
  * capability, or reservation policy ever drifts from them — the pin fails loudly
  * at construction rather than producing a manifest that no longer means what the
@@ -41,6 +45,10 @@ export const CROSSING_PROFILE = deepFreeze({
   cohortCallCap: 8,
   maxConcurrentProviderRequests: 4,
   maxDispatchesPerTick: 1,
+  /** The per-attempt output-token cap the worst-case spend proof priced. */
+  maxOutputTokens: 16_000,
+  /** The production per-attempt provider timeout (real model calls take minutes). */
+  providerCallTimeoutMs: 300_000,
 } as const);
 
 /**
@@ -81,6 +89,12 @@ export function crossingPinViolations(manifest: CohortManifestV1): string[] {
     manifest.constants.maxDispatchesPerTick,
     CROSSING_PROFILE.maxDispatchesPerTick,
   );
+  check('constants.maxOutputTokens', manifest.constants.maxOutputTokens, CROSSING_PROFILE.maxOutputTokens);
+  check(
+    'constants.providerCallTimeoutMs',
+    manifest.constants.providerCallTimeoutMs,
+    CROSSING_PROFILE.providerCallTimeoutMs,
+  );
   check('modelPriceTableVersion', manifest.modelPriceTableVersion, SPEND_GUARD_PRICE_TABLE_VERSION);
   check(
     'modelPriceTableDigest',
@@ -111,7 +125,9 @@ export function buildCrossingManifest(now: number): RehearsalManifest {
   const reserved = attempts * CROSSING_PROFILE.providerAttemptReservationUsdMicros;
   const consistency: string[] = [];
   if (attempts !== CROSSING_PROFILE.maxAttemptsPerFire) {
-    consistency.push(`maxAttemptsPerFire (${CROSSING_PROFILE.maxAttemptsPerFire}) != roster × attempts (${attempts})`);
+    consistency.push(
+      `maxAttemptsPerFire (${CROSSING_PROFILE.maxAttemptsPerFire}) != roster × (1 + repairs) (${attempts})`,
+    );
   }
   if (CROSSING_PROFILE.cohortCallCap !== CROSSING_PROFILE.maxAttemptsPerFire) {
     consistency.push(
@@ -145,6 +161,7 @@ export function buildCrossingManifest(now: number): RehearsalManifest {
     cohortCallCap: CROSSING_PROFILE.cohortCallCap,
     cohortSpendCapUsdMicros: CROSSING_PROFILE.cohortSpendCapUsdMicros,
     modelPriceTableVersion: SPEND_GUARD_PRICE_TABLE_VERSION,
+    providerCallTimeoutMs: CROSSING_PROFILE.providerCallTimeoutMs,
   });
 
   // Re-verify the BUILT manifest against the pins (roster size, repair cap, and the

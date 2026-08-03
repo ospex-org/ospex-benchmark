@@ -1,4 +1,3 @@
-import { buildCrossingManifest } from './crossingProfile.js';
 import { discover } from './lineOpenRead.js';
 import { buildRehearsalManifest } from './rehearsalManifest.js';
 import type { DiscoverFn, ReadMarketEvidenceFn } from './lineOpenRead.js';
@@ -123,11 +122,23 @@ export interface DemoFixture {
   readonly readMarketEvidence: ReadMarketEvidenceFn;
 }
 
-/** Wrap the synthetic candidate reads around `manifestBytes`: the real discovery seam over the
- *  in-memory games/current-odds rows (`fetchCompletedAt = anchorMs`) plus the real per-market
- *  opener read over the synthetic history. Shared by the demo and crossing fixtures, so both
- *  drive the exact production projector over the exact same candidate — only the manifest differs. */
-function assembleFixture(manifestBytes: string, anchorMs: number): DemoFixture {
+/** The two synthetic READ seams alone, anchored at `anchorMs` — no manifest. */
+export interface FixtureSeams {
+  readonly discover: DiscoverFn;
+  readonly readMarketEvidence: ReadMarketEvidenceFn;
+}
+
+/**
+ * Build the synthetic candidate READ seams anchored at `anchorMs`: the real discovery seam
+ * over the in-memory games/current-odds rows (`fetchCompletedAt = anchorMs`) plus the real
+ * per-market opener read over the synthetic history. Exported separately from the manifest
+ * because the LIVE crossing must anchor these AFTER the unbounded attended confirmation —
+ * the projector's snapshot-freshness gate (`freshFireMs`, 30s in the generated manifests)
+ * measures detection against `fetchCompletedAt`, so seams anchored before a human prompt
+ * would go stale while the operator reads the terms. The manifest window is hours wide and
+ * tolerates the prompt; the freshness clock does not.
+ */
+export function buildFixtureSeams(anchorMs: number): FixtureSeams {
   const rows = buildDemoRows(anchorMs);
   const discoverNow = (): number => anchorMs;
 
@@ -150,11 +161,7 @@ function assembleFixture(manifestBytes: string, anchorMs: number): DemoFixture {
     readCompletedAt: new Date(anchorMs).toISOString(),
   });
 
-  return {
-    manifestBytes: new TextEncoder().encode(manifestBytes),
-    discover: discoverFn,
-    readMarketEvidence: readMarketEvidenceFn,
-  };
+  return { discover: discoverFn, readMarketEvidence: readMarketEvidenceFn };
 }
 
 /**
@@ -162,24 +169,18 @@ function assembleFixture(manifestBytes: string, anchorMs: number): DemoFixture {
  * small provider timeout), the real discovery seam over the synthetic games/current-odds reads,
  * and the real per-market opener read over the synthetic history. The manifest window is
  * now-relative (`windowStart = anchorMs − 168h`, `windowEnd = anchorMs + 6h`), so the anchor's
- * detection instant and the opener both fall inside it.
+ * detection instant and the opener both fall inside it. (The LIVE crossing does NOT use this
+ * one-shot assembly: it boots `buildCrossingManifest` early and anchors `buildFixtureSeams`
+ * separately, after the attended confirmation.)
  */
 export function buildDemoFixture(anchorMs: number): DemoFixture {
   const { bytes } = buildRehearsalManifest(anchorMs, {
     providerCallTimeoutMs: DEMO_PROVIDER_CALL_TIMEOUT_MS,
   });
-  return assembleFixture(bytes, anchorMs);
-}
-
-/**
- * The CROSSING fixture: the exact same synthetic candidate and timing model, under the pinned
- * one-fire crossing manifest (`buildCrossingManifest` — $800 spend cap, call cap 8, one dispatch
- * per tick, conservative guard price table pinned, production 300s provider timeout). This is the
- * fixture the attended `--live` crossing boots: "fixture-backed" means the CANDIDATE is synthetic
- * while the admission, dispatch, and adapters are real. Building it performs no I/O and authorizes
- * nothing — billable adapter authority still requires the gated capability producer under an
- * attended live authorization.
- */
-export function buildCrossingFixture(anchorMs: number): DemoFixture {
-  return assembleFixture(buildCrossingManifest(anchorMs).bytes, anchorMs);
+  const seams = buildFixtureSeams(anchorMs);
+  return {
+    manifestBytes: new TextEncoder().encode(bytes),
+    discover: seams.discover,
+    readMarketEvidence: seams.readMarketEvidence,
+  };
 }

@@ -381,6 +381,14 @@ test('the price identity binds both ways: an authorization pinning the replay ta
       /modelPriceTableVersion/,
       'authorization pinning the replay table',
     );
+    // The DIGEST binds on its own: a correct version with a wrong digest refuses on the
+    // digest violation specifically (the version check cannot be what catches this input).
+    assertRefused(
+      () =>
+        gateRealCohortAdapterCapability(booted, authorizationFor(booted, { modelPriceTableDigest: 'f'.repeat(64) })),
+      /modelPriceTableDigest/,
+      'authorization with a mismatched digest only',
+    );
   });
 });
 
@@ -393,7 +401,7 @@ test('a missing roster credential refuses NAMING the participant, and the observ
       (e: unknown) =>
         e instanceof CanaryAuthorizationError &&
         e.violations.some((v) => /"anthropic-claude-fable-5" has no usable credential/.test(v)) &&
-        e.violations.some((v) => /independently observed credentialed set/.test(v)),
+        e.violations.some((v) => /independently observed credentialed participants/.test(v)),
       'missing anthropic credential',
     );
   });
@@ -407,8 +415,19 @@ test('a missing roster credential refuses NAMING the participant, and the observ
           booted,
           authorizationFor(booted, { observedCredentialedParticipantIds: ROSTER.slice(0, 3) }),
         ),
-      /independently observed credentialed set/,
+      /independently observed credentialed participants/,
       'under-claiming authorization',
+    );
+    // The reconcile is ORDERED identity, like every other roster-shaped binding: a claim
+    // with the right membership in the wrong order refuses (a set-compare would admit it).
+    assertRefused(
+      () =>
+        gateRealCohortAdapterCapability(
+          booted,
+          authorizationFor(booted, { observedCredentialedParticipantIds: [...ROSTER].reverse() }),
+        ),
+      /independently observed credentialed participants/,
+      'reordered observed claim',
     );
   });
 });

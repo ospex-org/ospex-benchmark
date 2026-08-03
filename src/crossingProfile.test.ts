@@ -2,9 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { cohortBoot } from './cohortBoot.js';
 import { CROSSING_PROFILE, buildCrossingManifest, crossingPinViolations } from './crossingProfile.js';
-import { buildCrossingFixture } from './demoFixture.js';
-import { DEMO_GAME_ID } from './demoFixture.js';
-import { decodeManifestText } from './cohortRunnerMain.js';
+import { DEMO_GAME_ID, buildFixtureSeams } from './demoFixture.js';
 import { deriveSpendReservationUsdMicros } from './lineOpenSpine.js';
 import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import { buildRehearsalManifest } from './rehearsalManifest.js';
@@ -27,7 +25,10 @@ test('the crossing manifest boots and pins the exact one-fire profile', () => {
   const booted = cohortBoot({ manifestBytes: bytes });
   assert.equal(booted.cohortId.length, 64, 'a real derived cohort identity');
 
-  // The complete pin tuple, compared as one object against the frozen profile.
+  // The complete pin tuple, compared as one object against the frozen profile. Every
+  // left-side entry is manifest-derived except the ceiling, which the manifest does not
+  // carry — it is asserted against the $800 LITERAL so the profile's own value is pinned
+  // here rather than compared to itself.
   assert.deepEqual(
     {
       rosterSize: manifest.expectedArmRoster.length,
@@ -36,10 +37,12 @@ test('the crossing manifest boots and pins the exact one-fire profile', () => {
         manifest.expectedArmRoster.length * (1 + manifest.constants.maxRepairAttemptsPerArm),
       providerAttemptReservationUsdMicros: manifest.constants.providerAttemptReservationUsdMicros,
       cohortSpendCapUsdMicros: manifest.cohortSpendCapUsdMicros,
-      canaryCeilingUsdMicros: CROSSING_PROFILE.canaryCeilingUsdMicros,
+      canaryCeilingUsdMicros: 800_000_000,
       cohortCallCap: manifest.cohortCallCap,
       maxConcurrentProviderRequests: manifest.constants.maxConcurrentProviderRequests,
       maxDispatchesPerTick: manifest.constants.maxDispatchesPerTick,
+      maxOutputTokens: manifest.constants.maxOutputTokens,
+      providerCallTimeoutMs: manifest.constants.providerCallTimeoutMs,
     },
     { ...CROSSING_PROFILE },
   );
@@ -136,6 +139,31 @@ test('crossingPinViolations is exact on every pin — one off in EITHER directio
       },
       expect: /maxRepairAttemptsPerArm \(2\)/,
     },
+    {
+      // A per-attempt COST DRIVER: the right caps with an inflated output-token budget is
+      // not the cohort the worst-case spend proof priced, so the pin refuses it.
+      label: 'an inflated per-attempt output-token cap',
+      build: () => {
+        const base = buildRehearsalManifest(FIXED_NOW, crossingLevers).manifest;
+        return { ...base, constants: { ...base.constants, maxOutputTokens: 16_001 } };
+      },
+      expect: /maxOutputTokens \(16001\)/,
+    },
+    {
+      label: 'a non-production provider timeout',
+      build: () =>
+        buildRehearsalManifest(FIXED_NOW, { ...crossingLevers, providerCallTimeoutMs: 1_000 }).manifest,
+      expect: /providerCallTimeoutMs \(1000\)/,
+    },
+    {
+      // The digest pin ALONE: the version is correct, so only the digest check can refuse.
+      label: 'a mismatched price-table digest under the correct version',
+      build: () => {
+        const base = buildRehearsalManifest(FIXED_NOW, crossingLevers).manifest;
+        return { ...base, modelPriceTableDigest: 'f'.repeat(64) };
+      },
+      expect: /modelPriceTableDigest/,
+    },
   ];
   for (const { label, build, expect } of cases) {
     const violations = crossingPinViolations(build());
@@ -161,12 +189,13 @@ test('the rehearsal/demo defaults are NOT the crossing profile (the demo did not
   assert.ok(violations.length >= 5, `the rehearsal shape violates the pins broadly: [${violations.join('; ')}]`);
 });
 
-test('the crossing fixture boots the crossing manifest over the same synthetic candidate', async () => {
-  const fixture = buildCrossingFixture(FIXED_NOW);
-  const booted = cohortBoot({ manifestBytes: decodeManifestText(fixture.manifestBytes) });
-  assert.deepEqual(crossingPinViolations(booted.manifest), [], 'the fixture manifest IS the crossing manifest');
-  // The shared synthetic candidate flows through the real discovery seam unchanged.
-  const discovery = await fixture.discover(booted);
+test('the crossing manifest + separately-anchored fixture seams serve the same synthetic candidate', async () => {
+  // The live path composes these two directly (manifest early, seams after the attended
+  // confirmation); this pins that the composition serves the demo candidate unchanged.
+  const booted = cohortBoot({ manifestBytes: buildCrossingManifest(FIXED_NOW).bytes });
+  assert.deepEqual(crossingPinViolations(booted.manifest), [], 'the booted manifest IS the crossing manifest');
+  const seams = buildFixtureSeams(FIXED_NOW + 60_000); // anchored later, like a post-confirmation anchor
+  const discovery = await seams.discover(booted);
   assert.equal(discovery.candidates.length, 1, 'exactly one synthetic candidate');
   assert.equal(discovery.candidates[0]!.gameId, DEMO_GAME_ID);
 });
