@@ -363,6 +363,68 @@ test('a failing or lying final read-back fails the install AFTER publication', (
   assert.match((r2 as { message: string }).message, /read-back verification failed/);
 });
 
+test('RETRY CONVERGENCE: after every pre-publication boundary failure, the identical retry installs cleanly', () => {
+  // The dir-sync case (publication happened, durability unknown) has its own test above;
+  // these are the failures where NOTHING was published — the retry must be a clean fresh
+  // install, with the final bytes exact and no stale state in the way.
+  const injections: Array<{ label: string; inject: (fs: FakeInstallFs) => void; clear: (fs: FakeInstallFs) => void }> = [
+    {
+      label: 'zero write progress',
+      inject: (fs) => {
+        fs.onWrite = () => 0;
+      },
+      clear: (fs) => {
+        delete fs.onWrite;
+      },
+    },
+    {
+      label: 'temp fsync failure',
+      inject: (fs) => {
+        fs.throwOn.fsync = new Error('fsync-boom');
+      },
+      clear: (fs) => {
+        delete fs.throwOn.fsync;
+      },
+    },
+    {
+      label: 'close failure',
+      inject: (fs) => {
+        fs.throwOn.close = new Error('close-boom');
+      },
+      clear: (fs) => {
+        delete fs.throwOn.close;
+      },
+    },
+    {
+      label: 'publish failure (EPERM)',
+      inject: (fs) => {
+        fs.throwOn.link = errWithCode('EPERM: operation not permitted', 'EPERM');
+      },
+      clear: (fs) => {
+        delete fs.throwOn.link;
+      },
+    },
+    {
+      label: 'temp open failure',
+      inject: (fs) => {
+        fs.throwOn.openExclusive = errWithCode('EACCES: permission denied', 'EACCES');
+      },
+      clear: (fs) => {
+        delete fs.throwOn.openExclusive;
+      },
+    },
+  ];
+  for (const { label, inject, clear } of injections) {
+    const fs = new FakeInstallFs();
+    inject(fs);
+    assert.equal(installManifestNoClobber(FINAL, MANIFEST_BYTES, fs).kind, 'failed', label);
+    assert.ok(!fs.files.has(FINAL), `${label}: nothing was published`);
+    clear(fs);
+    assert.deepEqual(installManifestNoClobber(FINAL, MANIFEST_BYTES, fs), { kind: 'installed' }, `${label}: retry converges`);
+    assert.ok(fs.files.get(FINAL)!.equals(MANIFEST_BYTES), `${label}: the retried bytes are exact`);
+  }
+});
+
 test('a temp-open or mkdirp failure fails with nothing created anywhere', () => {
   const openFail = new FakeInstallFs();
   openFail.throwOn.openExclusive = errWithCode('EACCES: permission denied', 'EACCES');
