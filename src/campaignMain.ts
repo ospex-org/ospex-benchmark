@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { buildCampaignAuthorization, resolveCampaignIntent } from './campaignAuthorization.js';
+import { buildCampaignAuthorization, classifyCampaignAuthorization, resolveCampaignIntent } from './campaignAuthorization.js';
 import type { CampaignAuthorization, CampaignAuthorizationPort } from './campaignAuthorization.js';
-import { buildCampaignManifest, campaignBoundsViolations, projectCampaignCost } from './campaignProfile.js';
+import { OBSERVED_USD_MICROS_PER_ATTEMPT, buildCampaignManifest, campaignBoundsViolations, projectCampaignCost } from './campaignProfile.js';
 import { assertCohortBudgetInitialized, buildCohortBudgetInitRequest } from './cohortBudgetInit.js';
 import { cohortBoot } from './cohortBoot.js';
 import type { BootedCohort } from './cohortBoot.js';
@@ -16,6 +16,7 @@ import type { ArtifactFs } from './fireArtifactSink.js';
 import { askLiveConfirmation, observeRealAdapterCredentials } from './liveIntent.js';
 import { instantMs, isParseableInstant } from './time.js';
 import type { AtomicStore } from './store/contract.js';
+import type { CampaignStatusReadPort } from './store/campaignStatusRead.js';
 
 /**
  * The CAMPAIGN entrypoint — `arm`, `tick`, `stop`.
@@ -43,6 +44,11 @@ import type { AtomicStore } from './store/contract.js';
  *              dispatch). What must land before that flips — real public-Git publication
  *              evidence for the campaign manifest and a durable escalation latch checked
  *              before every dispatch — is specified in docs/CAMPAIGN-ACTIVATION.md.
+ *   - `status` — READ-ONLY, what monitoring calls. Reports the durable state (the
+ *              authorization classified by the same strict validator the tick uses, budget
+ *              consumption with reservations labeled as reservations, fires/claims/leases)
+ *              and the verdict the next tick would reach. Performs no write; its exit code
+ *              mirrors the next tick's resolution so monitoring can alert on it.
  *   - `stop` — revokes the authorization. Fail-safe: the next tick resolves nothing.
  *
  * Three bounds hold an armed campaign, and only the first needs nobody's attention: the
@@ -58,9 +64,10 @@ import type { AtomicStore } from './store/contract.js';
 class UsageError extends Error {}
 
 const USAGE = `Usage:
-  yarn campaign:arm  --calls <n> --days <n> --start <ISO> [--dispatches <n>] [--emit <path>]
-  yarn campaign:tick --manifest <path>
-  yarn campaign:stop --manifest <path>
+  yarn campaign:arm    --calls <n> --days <n> --start <ISO> [--dispatches <n>] [--emit <path>]
+  yarn campaign:tick   --manifest <path>
+  yarn campaign:status --manifest <path>
+  yarn campaign:stop   --manifest <path>
 
 ARM (attended, once per campaign): builds a campaign manifest sized in provider CALLS,
 prints the exact terms and their cost, asks the standard [Y/n] confirmation (Enter or
@@ -84,12 +91,24 @@ Never prompts, never falls back to mock. Exits 3 when the authorization is valid
 (activation refused), 2 when no live authorization covers the cohort, 1 on a loud
 failure.
 
+STATUS (read-only, what monitoring calls): reports the campaign's durable state — the
+authorization (armed/disarmed/expired and its instants), calls reserved vs cap and
+attempts actually started, money as labeled RESERVATIONS (not invoices) plus an
+estimated invoice at the observed per-attempt rate, fires/claims/active leases — and
+the verdict the NEXT tick would reach, including a fresh credential observation.
+Performs no write of any kind: it opens its own connection with NO schema bootstrap and
+a server-enforced read-only session (a read-only role suffices to run it), so schema
+ownership stays with the mutating commands. Exits 0 when the next tick would hold a live
+authorization (which in this build still refuses to dispatch, exit 3), 2 when it would
+refuse, 1 on a loud failure. Per-tick observations (when the last tick ran, deferrals
+by reason) require the scheduler's durable journal and land with the activation slice.
+
 STOP: revokes the authorization. The next tick fires nothing.
 
 Needs STORE_DATABASE_URL.`;
 
 interface CampaignOptions {
-  command: 'arm' | 'tick' | 'stop';
+  command: 'arm' | 'tick' | 'stop' | 'status';
   calls: number;
   days: number;
   startIso: string | null;
@@ -104,7 +123,7 @@ function parseArgs(argv: string[]): CampaignOptions {
     printLine(USAGE);
     process.exit(0);
   }
-  if (command !== 'arm' && command !== 'tick' && command !== 'stop') {
+  if (command !== 'arm' && command !== 'tick' && command !== 'stop' && command !== 'status') {
     throw new UsageError(`unknown command: ${command ?? '(none)'}`);
   }
   const options: CampaignOptions = {
@@ -206,9 +225,22 @@ const ACTIVATION_DISABLED =
 // ---------------------------------------------------------------------------
 
 export interface CampaignDeps {
-  readonly openStore: (
-    databaseUrl: string,
-  ) => Promise<{ store: AtomicStore; authorizations: CampaignAuthorizationPort; close: () => Promise<void> }>;
+  /** The MUTATING open: applies the idempotent schema/function bootstrap and constructs the
+   *  full store. Owned by the commands that are allowed to write (arm, tick, stop). */
+  readonly openStore: (databaseUrl: string) => Promise<{
+    store: AtomicStore;
+    authorizations: CampaignAuthorizationPort;
+    close: () => Promise<void>;
+  }>;
+  /** The READ-ONLY open for the status surface: constructs only the read ports, applies NO
+   *  schema/function bootstrap, and (in production) forces the session read-only at the
+   *  server — so `status` structurally cannot write: its seam carries no store, and even a
+   *  regression that smuggled a statement through would be refused by PostgreSQL itself. */
+  readonly openReads: (databaseUrl: string) => Promise<{
+    authorizations: CampaignAuthorizationPort;
+    statusReads: CampaignStatusReadPort;
+    close: () => Promise<void>;
+  }>;
   readonly observeCredentials: (participantIds: readonly string[]) => ReadonlyMap<string, boolean>;
   readonly confirm: (prompt: string) => Promise<string | null>;
   readonly now: () => number;
@@ -535,6 +567,128 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
 }
 
 // ---------------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------------
+
+/**
+ * The READ-ONLY monitoring surface: report the campaign's durable state — authorization
+ * (classified by the same strict validator the tick uses), budget consumption (calls are
+ * the real money lever; reservations are labeled as reservations, never as invoices),
+ * fires/claims/leases — and the verdict the NEXT tick would reach, computed by the exact
+ * `resolveCampaignIntent` the tick runs (including a fresh credential observation, so a
+ * key rotated mid-campaign shows up here first). Performs no write of any kind.
+ *
+ * The exit code mirrors the next tick's resolution so monitoring can alert on it: 0 =
+ * a live authorization would resolve (and, in this build, then refuse to dispatch —
+ * activation is structurally disabled), 2 = the next tick would refuse, 1 = a loud
+ * failure, including the integrity anomaly of standing authority without a budget row.
+ */
+export async function statusCampaign(options: CampaignOptions, deps: CampaignDeps): Promise<number> {
+  if (options.manifestPath === null) {
+    printError('status requires --manifest <path> (the exact manifest the campaign was armed with)');
+    return 2;
+  }
+  const booted = cohortBoot({ manifestBytes: decodeManifestText(readFileSync(options.manifestPath)) });
+  const databaseUrl = envValue('STORE_DATABASE_URL');
+  if (databaseUrl === undefined) {
+    printError('status needs STORE_DATABASE_URL');
+    return 2;
+  }
+  // The READ-ONLY open: no schema bootstrap, no store, and (in production) a server-enforced
+  // read-only session. A status read against a database whose schema was never applied fails
+  // loudly — bootstrap belongs to the mutating commands, never to monitoring.
+  const { authorizations, statusReads, close } = await deps.openReads(databaseUrl);
+  try {
+    const manifest = booted.manifest;
+    const projection = projectCampaignCost(manifest);
+    printLine(`CAMPAIGN STATUS — cohort ${booted.cohortId}`);
+    printLine(`  sports ${manifest.sportAllowList.join(', ')}`);
+    printLine(`  window ${manifest.windowStart} → ${manifest.windowEnd}`);
+    printLine(`  size   at most ${projection.maxCalls} provider calls (${projection.maxFires} fires of 4 arms)`);
+
+    // The durable authorization, classified by the SAME strict validator the tick uses.
+    const stored = await authorizations.read(booted.cohortId);
+    const classification = classifyCampaignAuthorization(stored, deps.now());
+    switch (classification.kind) {
+      case 'absent':
+        printLine('  authorization NOT ARMED — no record exists for this cohort');
+        break;
+      case 'malformed':
+        printLine(`  authorization MALFORMED — ${classification.violations.join('; ')}`);
+        break;
+      case 'live':
+        printLine(`  authorization LIVE — armed ${classification.record.armedAt}, expires ${classification.record.expiresAt}`);
+        break;
+      case 'disarmed':
+        printLine(
+          `  authorization DISARMED at ${String(classification.record.disarmedAt)} ` +
+            `(armed ${classification.record.armedAt})`,
+        );
+        break;
+      case 'expired':
+        printLine(`  authorization EXPIRED at ${classification.record.expiresAt} (armed ${classification.record.armedAt})`);
+        break;
+      default: {
+        const _exhaustive: never = classification;
+        return _exhaustive;
+      }
+    }
+
+    // Durable budget + fire consumption. Calls are the real money lever; reservations are
+    // consumed in full per fire by design and are NOT invoices — label them so.
+    const budget = await statusReads.budget(booted.cohortId);
+    if (budget === null) {
+      if (classification.kind !== 'absent') {
+        // Authority implies its budget was initialized first (the arming order). A record
+        // without a budget row means the store lost state — a loud anomaly, not a report.
+        printError(
+          `INTEGRITY ANOMALY: an authorization record exists for cohort ${booted.cohortId} but no cohort ` +
+            `budget row does — arming initializes the budget BEFORE the authorization, so the store has ` +
+            `lost state. Investigate before arming anything further.`,
+        );
+        return 1;
+      }
+      printLine('  budget none — no cohort budget initialized (this cohort was never armed)');
+    } else {
+      const fires = await statusReads.fires(booted.cohortId);
+      printLine(`  calls  ${budget.callsReserved} reserved of ${budget.callCap} cap; ${fires.callsMade} attempt(s) actually started`);
+      printLine(
+        `  money  reservations ${usd(budget.spendReservedUsdMicros)} of ${usd(budget.spendCapUsdMicros)} cap ` +
+          `(reservations are consumed in full per fire — NOT invoices); ` +
+          `≈ ${usd(fires.callsMade * OBSERVED_USD_MICROS_PER_ATTEMPT)} expected invoice for the started attempts ` +
+          `at the observed rate (an estimate)`,
+      );
+      printLine(
+        `  fires  ${fires.firesAdmitted} admitted (${fires.firesCompleted} completed, ${fires.firesPending} pending); ` +
+          `claims ${fires.claimsCompleted} completed, ${fires.claimsPending} pending; ` +
+          `${fires.activeLeases} active lease(s)`,
+      );
+      printLine(`  last   fire admitted ${fires.lastAdmittedAt ?? 'never'}`);
+    }
+
+    // The verdict the NEXT tick would reach — the exact resolution the tick runs,
+    // including a fresh independent credential observation.
+    const resolution = resolveCampaignIntent({
+      booted,
+      stored,
+      now: deps.now(),
+      observeCredentials: deps.observeCredentials,
+    });
+    if (resolution.kind === 'Refused') {
+      printLine(`  next tick would REFUSE: ${resolution.violations.join('; ')}`);
+      return 2;
+    }
+    printLine(
+      '  next tick would AUTHORIZE — and then refuse to dispatch: activation is structurally ' +
+        'disabled in this build (exit 3; see docs/CAMPAIGN-ACTIVATION.md)',
+    );
+    return 0;
+  } finally {
+    await closeQuietly(close);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // stop
 // ---------------------------------------------------------------------------
 
@@ -590,6 +744,22 @@ const PRODUCTION_DEPS: CampaignDeps = {
       close: () => pool.end(),
     };
   },
+  openReads: async (databaseUrl) => {
+    const { Pool } = await import('pg');
+    const { pgStoreQuery } = await import('./store/atomicStore.js');
+    const { SqlCampaignAuthorizationPort } = await import('./store/campaignAuthStore.js');
+    const { SqlCampaignStatusReadPort } = await import('./store/campaignStatusRead.js');
+    // NO schema/function bootstrap here — a monitoring read must not mutate catalog state —
+    // and the session itself is forced read-only at the SERVER, so even a statement smuggled
+    // through this path in the future is refused by PostgreSQL rather than trusted to prose.
+    const pool = new Pool({ connectionString: databaseUrl, options: '-c default_transaction_read_only=on' });
+    const query = pgStoreQuery(pool);
+    return {
+      authorizations: new SqlCampaignAuthorizationPort(query),
+      statusReads: new SqlCampaignStatusReadPort(query),
+      close: () => pool.end(),
+    };
+  },
   observeCredentials: observeRealAdapterCredentials,
   confirm: askLiveConfirmation,
   now: () => Date.now(),
@@ -604,6 +774,8 @@ async function main(): Promise<number> {
       return armCampaign(options, PRODUCTION_DEPS);
     case 'tick':
       return tickCampaign(options, PRODUCTION_DEPS);
+    case 'status':
+      return statusCampaign(options, PRODUCTION_DEPS);
     case 'stop':
       return stopCampaign(options, PRODUCTION_DEPS);
     default: {

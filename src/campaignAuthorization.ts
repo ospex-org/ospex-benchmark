@@ -229,6 +229,46 @@ function captureRecord(value: unknown): { captured: CampaignAuthorization } | { 
 }
 
 /**
+ * The read-only CLASSIFICATION of a stored record, for the monitoring/status surface. This
+ * reuses the exact same strict capture as {@link resolveCampaignIntent} — one validator,
+ * never a second lighter one that could drift — but classifies instead of refusing, because
+ * a status read must truthfully DESCRIBE a dead campaign (disarmed, expired, malformed)
+ * rather than merely refuse it. Precedence: a malformed record is `malformed` (nothing else
+ * about it can be trusted); an explicit stop wins over expiry (`disarmed` names the operator
+ * action, the more informative fact); then `expired`; else `live`. `live` says only that the
+ * RECORD is live — whether the next tick would actually authorize (binding, credentials) is
+ * {@link resolveCampaignIntent}'s answer, and in the current build even an authorized tick
+ * refuses to dispatch (see docs/CAMPAIGN-ACTIVATION.md).
+ *
+ * `nowMs` must be finite — a non-finite clock is a broken caller, not a record state, and
+ * throws rather than mislabeling the record.
+ */
+export type CampaignAuthorizationClassification =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'malformed'; readonly violations: readonly string[] }
+  | { readonly kind: 'live'; readonly record: CampaignAuthorization }
+  | { readonly kind: 'disarmed'; readonly record: CampaignAuthorization }
+  | { readonly kind: 'expired'; readonly record: CampaignAuthorization };
+
+export function classifyCampaignAuthorization(
+  stored: unknown | null,
+  nowMs: number,
+): CampaignAuthorizationClassification {
+  if (!Number.isFinite(nowMs)) {
+    throw new Error('classifyCampaignAuthorization requires a finite clock reading');
+  }
+  if (stored === null || stored === undefined) return Object.freeze({ kind: 'absent' as const });
+  const capture = captureRecord(stored);
+  if ('violations' in capture) {
+    return Object.freeze({ kind: 'malformed' as const, violations: Object.freeze([...capture.violations]) });
+  }
+  const record = capture.captured;
+  if (record.disarmedAt !== null) return Object.freeze({ kind: 'disarmed' as const, record });
+  if (nowMs >= instantMs(record.expiresAt)) return Object.freeze({ kind: 'expired' as const, record });
+  return Object.freeze({ kind: 'live' as const, record });
+}
+
+/**
  * Resolve a scheduled tick's live intent from a stored campaign authorization. NO prompt, and
  * NO mock fallback: the caller either receives a momentary {@link CanaryAuthorization} to hand
  * the gated producer, or a typed refusal it must surface loudly while firing nothing.
