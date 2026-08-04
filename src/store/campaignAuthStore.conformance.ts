@@ -27,6 +27,7 @@ import { cohortBoot } from '../cohortBoot.js';
 import { SqlAtomicStore, pgStoreQuery } from './atomicStore.js';
 import { SqlCampaignAuthorizationPort } from './campaignAuthStore.js';
 import { SqlCampaignStatusReadPort } from './campaignStatusRead.js';
+import { SqlUnresolvedFireReadPort } from './escalationLatchRead.js';
 import { STORE_SCHEMA_VERSION } from './constants.js';
 import type { CampaignAuthorization } from '../campaignAuthorization.js';
 
@@ -222,6 +223,121 @@ async function main(): Promise<void> {
     assert.equal(after.claimsCompleted, 1);
   });
 
+  await check('escalation-latch read: released leases latch a pending fire; settlement clears it; live leases never latch', async () => {
+    // The unit suite pins the SQL text and the wire mapping; only a real database proves
+    // the predicate against the actual tables — that a fire is OFF the latch while its
+    // roster leases are live, ON it once every lease is released with the claim still
+    // pending (the exact durable shadow an escalated fire leaves), and OFF again when the
+    // claim settles.
+    const c = cohortName('latchread');
+    const store = new SqlAtomicStore(pgStoreQuery(pool));
+    const latchRead = new SqlUnresolvedFireReadPort(pgStoreQuery(pool));
+    assert.deepEqual(await latchRead.unresolvedFires(c), [], 'a cohort with no fires is clear');
+
+    assert.deepEqual(
+      await store.initCohortBudget({
+        cohortId: c,
+        schemaVersion: STORE_SCHEMA_VERSION,
+        callCap: 800,
+        spendCapUsdMicros: 80_000_000_000,
+        concurrencyLimit: 8,
+        rosterSize: 4,
+        maxRepairsPerArm: 1,
+        initialLeaseBoundMs: 600_000,
+        repairLeaseBoundMs: 300_000,
+      }),
+      { outcome: 'initialized' },
+    );
+    const admitted = await store.admitDispatch({
+      cohortId: c,
+      fireId: 'f1',
+      ownerId: 'w1',
+      expectedSchemaVersion: STORE_SCHEMA_VERSION,
+      gameId: 'g1',
+      proposedMarkets: ['moneyline'],
+      scopeReservations: {
+        moneyline: { spendReservationUsdMicros: 800_000_000, preparedBytesDigest: sha256Hex('latch-read-conformance') },
+      },
+    });
+    assert.equal(admitted.outcome, 'admitted');
+    if (admitted.outcome !== 'admitted') return;
+    assert.deepEqual(await latchRead.unresolvedFires(c), [], 'live initial leases keep an in-flight fire OFF the latch');
+
+    for (const lease of admitted.initialLeases) {
+      assert.deepEqual(await store.releaseLease({ leaseId: lease.leaseId, ownerId: 'w1' }), { outcome: 'released' });
+    }
+    const latched = await latchRead.unresolvedFires(c);
+    assert.equal(latched.length, 1, 'a pending fire with every lease released is ON the latch');
+    assert.equal(latched[0]!.fireId, 'f1');
+    assert.ok(!Number.isNaN(Date.parse(latched[0]!.admittedAt)), 'the admission instant round-trips as an instant');
+
+    // The correlation, behaviourally: a SECOND in-flight fire's live leases must not mask
+    // the unresolved one, and the unresolved fire's released leases must not latch the
+    // in-flight one. A dropped lease-to-fire correlation in the anti-join fails exactly
+    // here — any live lease in the cohort would read the whole cohort as clear.
+    const second = await store.admitDispatch({
+      cohortId: c,
+      fireId: 'f2',
+      ownerId: 'w1',
+      expectedSchemaVersion: STORE_SCHEMA_VERSION,
+      gameId: 'g2',
+      proposedMarkets: ['moneyline'],
+      scopeReservations: {
+        moneyline: { spendReservationUsdMicros: 800_000_000, preparedBytesDigest: sha256Hex('latch-read-second-fire') },
+      },
+    });
+    assert.equal(second.outcome, 'admitted');
+    assert.deepEqual(
+      (await latchRead.unresolvedFires(c)).map((f) => f.fireId),
+      ['f1'],
+      "the latch is per-fire: f2's live leases do not mask unresolved f1, and f1's released leases do not latch in-flight f2",
+    );
+
+    assert.deepEqual(await store.completeClaim({ cohortId: c, fireId: 'f1', expectedSchemaVersion: STORE_SCHEMA_VERSION }), {
+      outcome: 'completed',
+    });
+    assert.deepEqual(await latchRead.unresolvedFires(c), [], 'settling the unresolved fire clears the latch (f2 stays live-leased)');
+  });
+
+  await check('escalation-latch read: an EXPIRED never-released lease latches — the crash shape self-reports at its lease bound', async () => {
+    // A zero lease bound expires each lease at its own acquire instant, so by this read
+    // every lease is expired-but-unreleased — the durable shape of a dispatch whose
+    // process died holding its leases. Pending + no LIVE lease ⇒ latched, with no
+    // release call ever made.
+    const c = cohortName('latchexpiry');
+    const store = new SqlAtomicStore(pgStoreQuery(pool));
+    const latchRead = new SqlUnresolvedFireReadPort(pgStoreQuery(pool));
+    assert.deepEqual(
+      await store.initCohortBudget({
+        cohortId: c,
+        schemaVersion: STORE_SCHEMA_VERSION,
+        callCap: 800,
+        spendCapUsdMicros: 80_000_000_000,
+        concurrencyLimit: 8,
+        rosterSize: 4,
+        maxRepairsPerArm: 1,
+        initialLeaseBoundMs: 0,
+        repairLeaseBoundMs: 0,
+      }),
+      { outcome: 'initialized' },
+    );
+    const admitted = await store.admitDispatch({
+      cohortId: c,
+      fireId: 'f1',
+      ownerId: 'w1',
+      expectedSchemaVersion: STORE_SCHEMA_VERSION,
+      gameId: 'g1',
+      proposedMarkets: ['moneyline'],
+      scopeReservations: {
+        moneyline: { spendReservationUsdMicros: 800_000_000, preparedBytesDigest: sha256Hex('latch-expiry-conformance') },
+      },
+    });
+    assert.equal(admitted.outcome, 'admitted');
+    const latched = await latchRead.unresolvedFires(c);
+    assert.equal(latched.length, 1, 'expired never-released leases leave the pending fire latched');
+    assert.equal(latched[0]!.fireId, 'f1');
+  });
+
   await check('READ-ONLY public CLI: campaign:status runs as a SELECT-only role and rewrites NO catalog state', async () => {
     // Arm a real campaign via the admin ports: manifest → budget → authorization.
     const startMs = Date.now();
@@ -287,6 +403,10 @@ async function main(): Promise<void> {
     const out = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
     assert.equal(result.status, 0, `the read-only role renders the live report and exits 0; out=${out}`);
     assert.ok(out.includes('authorization LIVE'), `the report rendered; out=${out}`);
+    assert.ok(
+      out.includes('latch  clear — no unresolved fire'),
+      `the escalation-latch read ran under the SELECT-only role; out=${out}`,
+    );
     assert.ok(out.includes('next tick would AUTHORIZE'), `the verdict rendered; out=${out}`);
     assert.equal(await fingerprint(), before, 'the monitoring read rewrote NO store-function catalog row');
   });
