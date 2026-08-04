@@ -8,11 +8,12 @@ import { test } from 'node:test';
 import { buildCampaignAuthorization } from './campaignAuthorization.js';
 import type { CampaignAuthorization, CampaignAuthorizationPort } from './campaignAuthorization.js';
 import { buildCampaignManifest } from './campaignProfile.js';
-import { armCampaign, installManifestNoClobber, statusCampaign, stopCampaign, tickCampaign } from './campaignMain.js';
+import { armCampaign, installManifestNoClobber, resumeCampaign, statusCampaign, stopCampaign, tickCampaign } from './campaignMain.js';
 import type { CampaignDeps } from './campaignMain.js';
 import { cohortBoot } from './cohortBoot.js';
 import type { ArtifactFs } from './fireArtifactSink.js';
 import type { AtomicStore } from './store/contract.js';
+import type { CampaignTickJournalPort, CampaignTickOutcome, ScheduleEntry } from './campaignSchedule.js';
 import type { UnresolvedFire, UnresolvedFireRead } from './escalationLatch.js';
 import type { CampaignBudgetStatus, CampaignFireStatus, CampaignStatusReadPort } from './store/campaignStatusRead.js';
 import { defaultExpectedArms } from './scoring.js';
@@ -110,6 +111,27 @@ function recordingStore(calls: string[]): AtomicStore {
   };
 }
 
+/** A configurable in-memory tick journal; records calls, serves `entriesValue`. */
+class FakeTickJournal implements CampaignTickJournalPort {
+  readonly calls: string[] = [];
+  entriesValue: ScheduleEntry[] = [];
+  nextId = 71;
+  async begin(cohortId: string, startedAtIso: string): Promise<number> {
+    this.calls.push(`begin:${cohortId}:${startedAtIso}`);
+    return this.nextId;
+  }
+  async finish(entryId: number, outcome: CampaignTickOutcome, detail: string | null, finishedAtIso: string): Promise<void> {
+    this.calls.push(`finish:${entryId}:${outcome}:${detail ?? '<null>'}:${finishedAtIso}`);
+  }
+  async resume(cohortId: string, atIso: string, detail: string | null): Promise<void> {
+    this.calls.push(`resume:${cohortId}:${atIso}:${detail ?? '<null>'}`);
+  }
+  async entries(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
+    this.calls.push(`entries:${cohortId}:${limit}`);
+    return this.entriesValue;
+  }
+}
+
 /** A configurable store-derived escalation-latch read; records calls, returns `fires`. */
 class FakeUnresolvedFires implements UnresolvedFireRead {
   readonly calls: string[] = [];
@@ -151,21 +173,23 @@ function deps(
   storeCalls: string[];
   statusReads: FakeStatusReads;
   unresolvedFires: FakeUnresolvedFires;
+  tickJournal: FakeTickJournal;
   opens: { store: number; reads: number };
 } {
   const auth = over.auth ?? new MemoryAuthPort();
   const storeCalls: string[] = [];
   const statusReads = new FakeStatusReads();
   const unresolvedFires = new FakeUnresolvedFires();
+  const tickJournal = new FakeTickJournal();
   const opens = { store: 0, reads: 0 };
   const base: CampaignDeps = {
     openStore: async () => {
       opens.store += 1;
-      return { store: recordingStore(storeCalls), authorizations: auth, unresolvedFires, close: async () => {} };
+      return { store: recordingStore(storeCalls), authorizations: auth, unresolvedFires, tickJournal, close: async () => {} };
     },
     openReads: async () => {
       opens.reads += 1;
-      return { authorizations: auth, statusReads, unresolvedFires, close: async () => {} };
+      return { authorizations: auth, statusReads, unresolvedFires, tickJournal, close: async () => {} };
     },
     observeCredentials: (ids) => new Map(ids.map((id) => [id, true])),
     confirm: async () => 'y',
@@ -175,7 +199,7 @@ function deps(
     },
     ...over,
   };
-  return { ...base, auth, storeCalls, statusReads, unresolvedFires, opens };
+  return { ...base, auth, storeCalls, statusReads, unresolvedFires, tickJournal, opens };
 }
 
 function options(over: Record<string, unknown> = {}): Parameters<typeof armCampaign>[0] {
@@ -780,7 +804,7 @@ test('AUTHORITY ORDER: the manifest is on disk and byte-exact BEFORE the budget 
       throw new Error('unreached');
     },
   };
-  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, unresolvedFires: new FakeUnresolvedFires(), close: async () => {} }) });
+  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, unresolvedFires: new FakeUnresolvedFires(), tickJournal: new FakeTickJournal(), close: async () => {} }) });
   const { value: code } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
   assert.equal(code, 0);
   assert.deepEqual(
@@ -842,7 +866,7 @@ test('a budget-init refusal fails BEFORE the authorizing step: exit 1, no author
       throw new Error('unreached');
     },
   };
-  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, unresolvedFires: new FakeUnresolvedFires(), close: async () => {} }) });
+  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, unresolvedFires: new FakeUnresolvedFires(), tickJournal: new FakeTickJournal(), close: async () => {} }) });
   const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
   assert.equal(code, 1);
   assert.match(errors.join('\n'), /NO standing authority was created/);
@@ -962,7 +986,7 @@ test('a PRE-AUTHORITY failure keeps its primary error through a close failure', 
     ...recordingStore(storeCalls),
     initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
   };
-  const d = deps({ auth, openStore: async () => ({ store: refusingStore, authorizations: auth, unresolvedFires: new FakeUnresolvedFires(), close: FAILING_CLOSE }) });
+  const d = deps({ auth, openStore: async () => ({ store: refusingStore, authorizations: auth, unresolvedFires: new FakeUnresolvedFires(), tickJournal: new FakeTickJournal(), close: FAILING_CLOSE }) });
   const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d)));
   assert.equal(code, 1);
   const output = errors.join('\n');
@@ -1183,7 +1207,7 @@ test('PRE-AUTHORITY failures keep their classification under hostile values: row
       ...recordingStore(storeCalls1),
       initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
     };
-    const d1 = deps({ auth: auth1, openStore: async () => ({ store: refusing, authorizations: auth1, unresolvedFires: new FakeUnresolvedFires(), close: rejectWith(value) }) });
+    const d1 = deps({ auth: auth1, openStore: async () => ({ store: refusing, authorizations: auth1, unresolvedFires: new FakeUnresolvedFires(), tickJournal: new FakeTickJournal(), close: rejectWith(value) }) });
     const r1 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d1)));
     assert.equal(r1.value, 1, `${label} (hostile close): pre-authority failure resolves 1`);
     assert.match(r1.errors.join('\n'), /NO standing authority was created/, label);
@@ -1198,7 +1222,7 @@ test('PRE-AUTHORITY failures keep their classification under hostile values: row
         throw value;
       },
     };
-    const d2 = deps({ auth: auth2, openStore: async () => ({ store: hostileInit, authorizations: auth2, unresolvedFires: new FakeUnresolvedFires(), close: rejectWith(value) }) });
+    const d2 = deps({ auth: auth2, openStore: async () => ({ store: hostileInit, authorizations: auth2, unresolvedFires: new FakeUnresolvedFires(), tickJournal: new FakeTickJournal(), close: rejectWith(value) }) });
     const r2 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d2)));
     assert.equal(r2.value, 1, `${label} (hostile primary + hostile close): still resolves 1`);
     assert.match(r2.errors.join('\n'), /NO standing authority was created/, label);
@@ -1301,6 +1325,10 @@ test('a tick with NO armed authorization fires nothing and exits 2 — never a m
   assert.equal(code, 2);
   assert.match(errors.join('\n'), /no live campaign authorization/);
   assert.deepEqual(d.storeCalls, [], 'the store was never touched');
+  assert.ok(
+    d.tickJournal.calls.some((c) => c.startsWith('finish:71:no_live_authorization:')),
+    'the refusal is a journaled outcome the schedule halt rule will see',
+  );
 });
 
 test('a tick against a DISARMED campaign fires nothing and exits 2', async () => {
@@ -1340,6 +1368,73 @@ test('a VALID armed authorization: the tick validates end to end and REFUSES to 
   assert.deepEqual(auth.calls, [`read:${cohortId}`], 'the ONLY port interaction is the read');
   assert.deepEqual(d.unresolvedFires.calls, [`unresolved:${cohortId}`], 'the latch read ran exactly once, for this cohort');
   assert.deepEqual(d.storeCalls, [], 'no budget init, no claim, no dispatch-path store call');
+  const at = new Date(NOW).toISOString();
+  assert.deepEqual(
+    d.tickJournal.calls,
+    [`entries:${cohortId}:50`, `begin:${cohortId}:${at}`, `finish:71:validated_refused:<null>:${at}`],
+    'the halt rule read the journal, then the tick journaled begin and the healthy outcome',
+  );
+});
+
+test('a HALTED schedule refuses the tick (exit 2) BEFORE anything else — no journal write, no authorization read', async () => {
+  const { manifestPath, auth, cohortId } = await armed();
+  auth.calls.length = 0;
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.tickJournal.entriesValue = [
+    { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: 'boom' },
+  ];
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
+  );
+  assert.equal(code, 2);
+  const refusal = errors.join('\n');
+  assert.match(refusal, /SCHEDULE HALTED — refusing to run/);
+  assert.match(refusal, /"loud_failure"/);
+  assert.match(refusal, /campaign:resume/, 'the operator is told the lever');
+  assert.deepEqual(d.tickJournal.calls, [`entries:${cohortId}:50`], 'a halted tick writes NOTHING — its refusal is derived state');
+  assert.deepEqual(auth.calls, [], 'the halt precedes even the authorization read');
+  assert.deepEqual(d.unresolvedFires.calls, [], 'and the latch read');
+});
+
+test('a tick that finds a STALE UNFINISHED entry (the crash shape) halts the same way', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  // Started far beyond the campaign manifest tick deadline, never finished.
+  d.tickJournal.entriesValue = [
+    { id: 4, kind: 'tick', startedAt: '2026-08-04T00:00:00.000Z', finishedAt: null, outcome: null, detail: null },
+  ];
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
+  );
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /never finished within the tick deadline/);
+});
+
+test('a journal FINISH failure never changes the decided outcome — reported, and the entry left to halt the schedule', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.tickJournal.finish = async (): Promise<never> => {
+    throw new Error('journal write lost');
+  };
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
+  );
+  assert.equal(code, 3, 'the decided outcome stands');
+  assert.match(errors.join('\n'), /journal finish failed AFTER the outcome was decided/);
+  assert.match(errors.join('\n'), /will halt the schedule until an operator reviews it/);
+});
+
+test('a journal BEGIN failure is LOUD — a tick that cannot reach the journal proceeds to nothing', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.tickJournal.begin = async (): Promise<never> => {
+    throw new Error('journal begin lost');
+  };
+  await assert.rejects(
+    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d))),
+    /journal begin lost/,
+  );
+  assert.deepEqual(d.auth.calls.filter((c) => c.startsWith('read:')), [], 'no authorization was read');
 });
 
 test('a tick under a LIVE authorization but a TRIPPED escalation latch refuses (exit 2) and names the unresolved fire', async () => {
@@ -1358,9 +1453,13 @@ test('a tick under a LIVE authorization but a TRIPPED escalation latch refuses (
   assert.match(refusal, /campaign:stop/, 'the operator is told the lever');
   assert.doesNotMatch(refusal, /structurally disabled/, 'the latch refusal REPLACES the structural refusal, not decorates it');
   assert.deepEqual(d.unresolvedFires.calls, [`unresolved:${cohortId}`]);
+  assert.ok(
+    d.tickJournal.calls.some((c) => c.startsWith(`finish:71:escalation_latched:${fireId}`)),
+    'the latched refusal is journaled with the unresolved fire named',
+  );
 });
 
-test('a latch read failure fails the tick LOUD — a broken latch is never read as clear', async () => {
+test('a latch read failure fails the tick LOUD — a broken latch is never read as clear — and journals loud_failure', async () => {
   const { manifestPath, auth } = await armed();
   const d = deps({ auth, confirm: NEVER_PROMPT });
   d.unresolvedFires.unresolvedFires = async (): Promise<never> => {
@@ -1370,6 +1469,71 @@ test('a latch read failure fails the tick LOUD — a broken latch is never read 
     captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d))),
     /latch read: connection reset/,
   );
+  assert.ok(
+    d.tickJournal.calls.some((c) => c.startsWith('finish:71:loud_failure:latch read: connection reset')),
+    'the loud failure is journaled best-effort before it propagates',
+  );
+});
+
+test('resume: a schedule that is NOT halted has nothing to resume — exit 2, no write, no prompt', async () => {
+  const { manifestPath, auth, cohortId } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => resumeCampaign(options({ command: 'resume', manifestPath }), d)),
+  );
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /nothing to resume — the schedule is not halted/);
+  assert.deepEqual(d.tickJournal.calls, [`entries:${cohortId}:50`], 'read-only: no resume row was written');
+});
+
+test('resume: a HALTED schedule resumes only through the standard [Y/n] — accept writes the acknowledgment, exit 0', async () => {
+  const { manifestPath, auth, cohortId } = await armed();
+  const prompts: string[] = [];
+  const d = deps({
+    auth,
+    confirm: async (prompt) => {
+      prompts.push(prompt);
+      return '';
+    },
+  });
+  d.tickJournal.entriesValue = [
+    { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: 'boom' },
+  ];
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => resumeCampaign(options({ command: 'resume', manifestPath }), d)),
+  );
+  assert.equal(code, 0, logs.join('\n'));
+  assert.deepEqual(prompts, ['resume scheduled ticking for this campaign? [Y/n] '], 'the exact prompt bytes');
+  const output = logs.join('\n');
+  assert.match(output, /RESUME SCHEDULING/);
+  assert.match(output, /clears the schedule halt ONLY/);
+  assert.match(output, /RESUMED\./);
+  const at = new Date(NOW).toISOString();
+  assert.equal(d.tickJournal.calls.length, 2);
+  assert.equal(d.tickJournal.calls[0], `entries:${cohortId}:50`);
+  assert.ok(
+    d.tickJournal.calls[1]!.startsWith(`resume:${cohortId}:${at}:tick 4 finished`),
+    `the acknowledgment carries the reviewed halt reason; got ${d.tickJournal.calls[1]}`,
+  );
+});
+
+test('resume: EOF and a negative answer both refuse without writing', async () => {
+  for (const [confirm, expectation] of [
+    [async () => null, /confirmation stream closed \(EOF\)/],
+    [async () => 'n', /resume refused \(answer "n"\)/],
+  ] as const) {
+    const { manifestPath, auth } = await armed();
+    const d = deps({ auth, confirm });
+    d.tickJournal.entriesValue = [
+      { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: null },
+    ];
+    const { value: code, errors } = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () => resumeCampaign(options({ command: 'resume', manifestPath }), d)),
+    );
+    assert.equal(code, 2);
+    assert.match(errors.join('\n'), expectation);
+    assert.ok(!d.tickJournal.calls.some((c) => c.startsWith('resume:')), 'no acknowledgment was written');
+  }
 });
 
 // ===========================================================================
@@ -1439,6 +1603,8 @@ test('status of a LIVE campaign: exit 0 and the full durable report, with reserv
   );
   assert.match(output, /last {3}fire admitted 2026-08-05T12:00:00\.000Z/);
   assert.match(output, /latch {2}clear — no unresolved fire/);
+  assert.match(output, /ticks {2}none recorded/);
+  assert.match(output, /sched {2}clear — scheduling may continue/);
   assert.match(output, /next tick would AUTHORIZE/);
   assert.match(output, /activation is structurally disabled/, 'a LIVE report must never read as "spending"');
   assert.deepEqual(d.auth.calls, [`read:${cohortId}`]);
@@ -1463,6 +1629,58 @@ test('status of a LIVE campaign with a TRIPPED escalation latch: the latch line 
   assert.match(output, new RegExp(`${fireId} \\(admitted 2026-08-05T12:00:00\\.000Z\\)`));
   assert.match(output, /next tick would REFUSE — the escalation latch is tripped/);
   assert.doesNotMatch(output, /next tick would AUTHORIZE/);
+});
+
+test('status renders the tick journal and a HALTED schedule, and the verdict mirrors the tick precedence (exit 2)', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.statusReads.budgetValue = { callCap: 800, callsReserved: 8, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 800_000_000 };
+  d.tickJournal.entriesValue = [
+    { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: 'boom' },
+  ];
+  // The latch is ALSO tripped: the halted schedule must still own the verdict line — the
+  // tick's own precedence checks the halt before anything else.
+  d.unresolvedFires.fires = [{ fireId: 'f'.repeat(64), admittedAt: '2026-08-05T12:00:00.000Z' }];
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
+  );
+  assert.equal(code, 2);
+  const output = logs.join('\n');
+  assert.match(output, /ticks {2}last tick 4 started 2026-08-04T23:00:00\.000Z — finished 2026-08-04T23:00:05\.000Z \(loud_failure\)/);
+  assert.match(output, /sched {2}HALTED — .*campaign:resume to resume scheduling/);
+  assert.match(output, /next tick would REFUSE — the schedule is halted \(operator resume required\)/);
+  assert.doesNotMatch(output, /next tick would REFUSE — the escalation latch/, 'the halt owns the verdict, in the tick’s own precedence');
+  assert.doesNotMatch(output, /next tick would AUTHORIZE/);
+});
+
+test('status renders an UNFINISHED last tick distinctly', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+  // Fresh enough to be in-flight: the schedule stays clear, the line says unfinished.
+  d.tickJournal.entriesValue = [
+    { id: 7, kind: 'tick', startedAt: new Date(NOW - 1_000).toISOString(), finishedAt: null, outcome: null, detail: null },
+  ];
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
+  );
+  assert.equal(code, 0, logs.join('\n'));
+  const output = logs.join('\n');
+  assert.match(output, /ticks {2}last tick 7 started .* — unfinished/);
+  assert.match(output, /sched {2}clear/);
+});
+
+test('a status journal read failure is LOUD — monitoring must never render a schedule it could not read', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+  d.tickJournal.entries = async (): Promise<never> => {
+    throw new Error('journal read: connection reset');
+  };
+  await assert.rejects(
+    captured(() => withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d))),
+    /journal read: connection reset/,
+  );
 });
 
 test('a status latch read failure is LOUD — monitoring must never render a clear latch it could not read', async () => {

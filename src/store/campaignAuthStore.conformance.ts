@@ -28,6 +28,7 @@ import { SqlAtomicStore, pgStoreQuery } from './atomicStore.js';
 import { SqlCampaignAuthorizationPort } from './campaignAuthStore.js';
 import { SqlCampaignStatusReadPort } from './campaignStatusRead.js';
 import { SqlUnresolvedFireReadPort } from './escalationLatchRead.js';
+import { SqlCampaignTickJournalPort } from './campaignTickJournal.js';
 import { STORE_SCHEMA_VERSION } from './constants.js';
 import type { CampaignAuthorization } from '../campaignAuthorization.js';
 
@@ -338,6 +339,38 @@ async function main(): Promise<void> {
     assert.equal(latched[0]!.fireId, 'f1');
   });
 
+  await check('tick journal: two-phase begin/finish against real rows; the FIRST finish wins; resume appends; newest-first read', async () => {
+    const c = cohortName('journal');
+    const journal = new SqlCampaignTickJournalPort(pgStoreQuery(pool));
+    assert.deepEqual(await journal.entries(c, 10), [], 'a cohort that never ticked has an empty journal');
+
+    const id1 = await journal.begin(c, '2026-08-05T00:00:00.000Z');
+    let rows = await journal.entries(c, 10);
+    assert.deepEqual(
+      rows,
+      [{ id: id1, kind: 'tick', startedAt: '2026-08-05T00:00:00.000Z', finishedAt: null, outcome: null, detail: null }],
+      'a begun entry is durably UNFINISHED — the crash shape the halt rule detects',
+    );
+
+    await journal.finish(id1, 'validated_refused', null, '2026-08-05T00:00:05.000Z');
+    await journal.finish(id1, 'loud_failure', 'a later racer', '2026-08-05T00:00:09.000Z');
+    rows = await journal.entries(c, 10);
+    assert.equal(rows[0]!.outcome, 'validated_refused', 'the FIRST finish stands — a later finish changes nothing');
+    assert.equal(rows[0]!.finishedAt, '2026-08-05T00:00:05.000Z');
+    assert.equal(rows[0]!.detail, null);
+
+    const id2 = await journal.begin(c, '2026-08-05T01:00:00.000Z');
+    await journal.resume(c, '2026-08-05T02:00:00.000Z', 'reviewed the halt');
+    rows = await journal.entries(c, 10);
+    assert.deepEqual(rows.map((r) => r.kind), ['resume', 'tick', 'tick'], 'newest first');
+    assert.ok(rows[0]!.id > rows[1]!.id && rows[1]!.id > rows[2]!.id, 'the id is the append-order authority');
+    assert.equal(rows[0]!.outcome, 'operator_resumed');
+    assert.equal(rows[0]!.startedAt, '2026-08-05T02:00:00.000Z');
+    assert.equal(rows[0]!.finishedAt, '2026-08-05T02:00:00.000Z');
+    assert.equal(rows[1]!.id, id2);
+    assert.equal(rows[1]!.finishedAt, null);
+  });
+
   await check('READ-ONLY public CLI: campaign:status runs as a SELECT-only role and rewrites NO catalog state', async () => {
     // Arm a real campaign via the admin ports: manifest → budget → authorization.
     const startMs = Date.now();
@@ -407,6 +440,8 @@ async function main(): Promise<void> {
       out.includes('latch  clear — no unresolved fire'),
       `the escalation-latch read ran under the SELECT-only role; out=${out}`,
     );
+    assert.ok(out.includes('ticks  none recorded'), `the tick-journal read ran under the SELECT-only role; out=${out}`);
+    assert.ok(out.includes('sched  clear — scheduling may continue'), `the schedule state rendered; out=${out}`);
     assert.ok(out.includes('next tick would AUTHORIZE'), `the verdict rendered; out=${out}`);
     assert.equal(await fingerprint(), before, 'the monitoring read rewrote NO store-function catalog row');
   });
