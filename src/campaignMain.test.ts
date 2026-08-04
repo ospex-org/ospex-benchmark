@@ -1447,6 +1447,11 @@ test('a VALID armed authorization DISPATCHES: billable capability, branded publi
   assert.deepEqual([...input.capability.adapters().keys()], ROSTER);
   assert.equal(input.publication.cohortId, cohortId, 'the verified publication record is bound to this cohort');
   assert.ok(input.sink instanceof FireArtifactSink, 'the durable artifact sink is wired');
+  assert.equal(
+    (input.sink as unknown as { baseDir: string }).baseDir,
+    opts.outDir,
+    'the sink writes under the SAME root the evidence scan reads — a sink pointed elsewhere would orphan its evidence',
+  );
   assert.equal(input.admission.expectedSchemaVersion, STORE_SCHEMA_VERSION);
   assert.ok(input.admission.ownerId.length > 0);
 
@@ -2160,6 +2165,40 @@ test('the claim port handed to the tick is LATCH-GUARDED: an admission after the
   );
 });
 
+test('the admission guard consults the EVIDENCE half too: a sidecar installed mid-tick trips the guarded admit', async () => {
+  // The store half of the admission guard is pinned by the test above; this one proves
+  // the guard wraps the COMPOSED latch — a guard composed from the store source alone
+  // would admit here, because no unresolved fire exists.
+  const { manifestPath, auth } = await armed();
+  const resolver = publishedResolver(manifestPath);
+  const opts = options({ command: 'tick', manifestPath, publicationPath: publicationFile() });
+  const sidecarName = `fire-g9-total-${'ab'.repeat(32)}-spend.json`;
+  const d = deps({
+    auth,
+    confirm: NEVER_PROMPT,
+    resolvePublication: resolver.resolve,
+    runTick: async (input) => {
+      // The escalation evidence lands AFTER the tick-level check (which read clear) and
+      // BEFORE this admission — only an admission guard that includes the evidence scan
+      // can catch it.
+      const cohortDir = join(opts.outDir!, input.booted.cohortId);
+      mkdirSync(cohortDir, { recursive: true });
+      writeFileSync(join(cohortDir, sidecarName), JSON.stringify({ reason: 'spend_evidence_unknown' }));
+      await input.claimPort.admit({ cohortId: input.booted.cohortId } as never);
+      throw new Error('unreachable — the guarded admit must throw on installed escalation evidence');
+    },
+  });
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 2);
+  const refusal = errors.join('\n');
+  assert.match(refusal, /escalation latch is tripped .* refusing to admit any dispatch/);
+  assert.ok(refusal.includes(sidecarName), 'the refusal names the evidence installed mid-tick');
+  assert.ok(
+    d.tickJournal.calls.some((c) => c.startsWith('finish:71:escalation_latched:installed escalation evidence')),
+    'the mid-tick evidence trip is journaled with its cause',
+  );
+});
+
 test('installed escalation evidence under the artifact root trips the TICK-LEVEL latch: exit 2, nothing dispatched', async () => {
   const { manifestPath, auth, cohortId } = await armed();
   const { d, opts } = tickFixture(manifestPath, auth);
@@ -2195,11 +2234,11 @@ test('a dispatched fire that left UNRESOLVED spend evidence journals dispatch_un
       label: 'unconfirmed settlement',
       outcome: {
         kind: 'Installed',
-        completion: { status: 'unsettled', reason: 'wire_skew' },
+        completion: { status: 'unsettled', reason: 'store_complete_failed' },
         sidecar: null,
         install: { path: 'artifact.json' },
       },
-      desc: 'Installed/unsettled(wire_skew)',
+      desc: 'Installed/unsettled(store_complete_failed)',
     },
   ];
   for (const { label, outcome, desc } of cases) {
@@ -2241,7 +2280,22 @@ test('a healthy dispatched tick journals its detail: deferrals grouped by reason
         market: 'total',
         outcome: { kind: 'Installed', completion: { status: 'settled' }, sidecar: null, install: { path: 'artifact.json' } },
       },
-      { fireId: 'e5'.repeat(32), gameId: 'g6', market: 'moneyline', outcome: { kind: 'NotAdmitted', outcome: { kind: 'all_claimed' } } },
+      // The claim shapes the SPINE actually emits (`ClaimOutcome`): a Skip carries its
+      // reason, and a cap-exhaustion refusal maps to Defer — both are HEALTHY here (the
+      // negative control: a completed campaign keeps ticking healthily on Defer until its
+      // authorization expires; only Fault/WouldAdmit outcomes are escalated).
+      {
+        fireId: 'e5'.repeat(32),
+        gameId: 'g6',
+        market: 'moneyline',
+        outcome: { kind: 'NotAdmitted', outcome: { kind: 'Skip', reason: 'all_claimed' } },
+      },
+      {
+        fireId: 'e6'.repeat(32),
+        gameId: 'g7',
+        market: 'total',
+        outcome: { kind: 'NotAdmitted', outcome: { kind: 'Defer', reason: 'spend_cap' } },
+      },
     ],
     admittedCount: 1,
   } as unknown as CohortTickResult;
@@ -2254,12 +2308,46 @@ test('a healthy dispatched tick journals its detail: deferrals grouped by reason
   assert.equal(finish.outcome, 'dispatched');
   assert.deepEqual(JSON.parse(finish.detail!), {
     discovered: 5,
-    evaluated: 2,
+    evaluated: 3,
     admitted: 1,
     deferrals: { 'defer:opener_not_visible': 2, 'defer:quote_moved': 1, 'reject:stale_entry': 1 },
-    outcomes: { 'Installed/settled': 1, 'NotAdmitted/all_claimed': 1 },
+    outcomes: { 'Installed/settled': 1, 'NotAdmitted/Skip(all_claimed)': 1, 'NotAdmitted/Defer(spend_cap)': 1 },
     installed: [`${fireId} g5 total Installed/settled`],
   });
+});
+
+test('a FAULT-class admission outcome journals dispatch_faulted and exits 2 — a dead or migrated store must halt the schedule, never tick healthily over it', async () => {
+  const cases = [
+    {
+      label: 'store schema skew',
+      outcome: { kind: 'NotAdmitted', outcome: { kind: 'Fault', reason: 'version_mismatch' } },
+      desc: 'NotAdmitted/Fault(version_mismatch)',
+    },
+    {
+      label: 'rehearsal port wired into the paid path',
+      outcome: { kind: 'NotAdmitted', outcome: { kind: 'WouldAdmit' } },
+      desc: 'NotAdmitted/WouldAdmit',
+    },
+  ];
+  for (const { label, outcome, desc } of cases) {
+    const fireId = 'f6'.repeat(32);
+    const result = {
+      discoveredCount: 1,
+      dispositions: [{ gameId: 'g1', market: 'total', outcome: 'prepared' }],
+      fireOutcomes: [{ fireId, gameId: 'g1', market: 'total', outcome }],
+      admittedCount: 0,
+    } as unknown as CohortTickResult;
+    const { manifestPath, auth } = await armed();
+    const { d, opts } = tickFixture(manifestPath, auth, { runTick: async () => result });
+    const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+    assert.equal(code, 2, label);
+    assert.match(errors.join('\n'), /DISPATCH FAULTED — 1 admission\(s\)/, label);
+    assert.match(errors.join('\n'), /store contract is not holding/, label);
+    const finish = d.tickJournal.finishes[0]!;
+    assert.equal(finish.outcome, 'dispatch_faulted', label);
+    const detail = JSON.parse(finish.detail!) as { outcomes: Record<string, number> };
+    assert.deepEqual(detail.outcomes, { [desc]: 1 }, label);
+  }
 });
 
 test("the gated mint is a SECOND independent pass: a vanished real credential refuses the tick even when the resolution's observation passes", async () => {
@@ -2288,6 +2376,7 @@ test('missing read-seam env refuses BEFORE the store: exit 2, no open, no journa
   assert.match(errors.join('\n'), /missing env: SUPABASE_URL/);
   assert.deepEqual(d.opens, { store: 0, reads: 0 });
   assert.deepEqual(d.tickJournal.calls, []);
+  assert.equal(d.tickInputs.length, 0, 'and dispatches nothing');
 });
 
 test('an unusable artifact root refuses BEFORE the store: exit 2, no open', async () => {
@@ -2301,6 +2390,8 @@ test('an unusable artifact root refuses BEFORE the store: exit 2, no open', asyn
   assert.equal(code, 2);
   assert.match(errors.join('\n'), /artifact root .* is unusable/);
   assert.deepEqual(d.opens, { store: 0, reads: 0 });
+  assert.deepEqual(d.tickJournal.calls, [], 'no journal trace');
+  assert.equal(d.tickInputs.length, 0, 'and dispatches nothing');
 });
 
 test('a loud dispatch failure journals loud_failure best-effort and propagates', async () => {

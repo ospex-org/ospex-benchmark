@@ -63,13 +63,17 @@ export interface ScheduleEntry {
  *  settled cleanly or took no claim (a tick that discovered nothing eligible is healthy —
  *  its journal detail says so). `dispatch_unresolved` is a dispatched tick that left
  *  unresolved spend evidence — a spend-guard escalation, or an installed fire whose
- *  settlement was refused or failed — which the tick escalates to the operator. A journal
+ *  settlement was refused or failed — which the tick escalates to the operator.
+ *  `dispatch_faulted` is a tick whose admissions returned a fault-class claim outcome
+ *  (store-contract skew, an uninitialized budget, a store error — non-authorizing and
+ *  spending nothing, but an unattended campaign must not keep ticking over it). A journal
  *  written by the PRE-activation build carries `validated_refused` rows; this build does
  *  not recognize that outcome, so such a journal halts once for operator review when the
  *  build changes (fail closed, the deliberate direction). */
 export type CampaignTickOutcome =
   | 'dispatched'
   | 'dispatch_unresolved'
+  | 'dispatch_faulted'
   | 'no_live_authorization'
   | 'publication_refused'
   | 'escalation_latched'

@@ -24,10 +24,11 @@ Everything below states the contract that holds it.
   new cohortId.
 - **Ticking** (`campaign:tick`, unattended): the paid path. Its gates, in order, are the
   subject of the next section. Exit 0 = a healthy dispatched tick (including one that
-  found nothing eligible — the journal detail says so); exit 2 = a refusal (halted
-  schedule, missing or failed publication evidence, no live authorization, tripped
-  escalation latch, or a dispatched fire that left unresolved spend evidence); exit 1 =
-  loud failure.
+  found nothing eligible — the journal detail says so); exit 2 = a refusal (a halted
+  schedule, missing or failed publication evidence, missing configuration — the store
+  URL, the read-seam env, an unusable artifact root — no live authorization, a tripped
+  escalation latch, a dispatched fire that left unresolved spend evidence, or a
+  fault-class admission outcome); exit 1 = loud failure.
 - **Status** (`campaign:status`, read-only): reports the durable state and the verdict the
   next tick would reach, in the tick's own precedence. Detailed below.
 - **Resuming** (`campaign:resume`, attended): clears a halted schedule after operator
@@ -83,16 +84,25 @@ Everything below states the contract that holds it.
    manifest-derived run options. At most the manifest's per-tick dispatch budget admits;
    the store's row-locked caps arbitrate every admission.
 9. **Outcome classification**: a mid-tick latch trip (`EscalationLatchedError` from the
-   guarded port) journals `escalation_latched` (exit 2). Any evaluated fire that left
-   unresolved spend evidence — a spend-guard escalation (`InstalledEscalated`) or an
-   installed fire whose settlement was refused or failed (`Installed`/unsettled) —
-   journals `dispatch_unresolved` (exit 2): the schedule halts for review, and the same
-   fires trip the store-derived latch on any later tick regardless. Otherwise the tick
-   journals `dispatched` (exit 0) with a machine-readable detail: candidate counts,
-   per-reason deferral counts (grouped, so a slate-sized tick does not write a slate-sized
-   row), evaluated-fire outcome counts, and the individually-named installed fires
-   (bounded by the per-tick dispatch budget). Any other failure journals `loud_failure`
-   best-effort and propagates (exit 1).
+   guarded port) journals `escalation_latched` (exit 2); fires admitted earlier in that
+   same tick are recorded durably in the store and under the artifact root —
+   `campaign:status` shows them — while the journal entry records the latch causes. Any
+   evaluated fire that left unresolved spend evidence — a spend-guard escalation
+   (`InstalledEscalated`) or an installed fire whose settlement was refused or failed
+   (`Installed`/unsettled) — journals `dispatch_unresolved` (exit 2): the schedule halts
+   for review, and the same fires trip the store-derived latch on any later tick
+   regardless. A fault-class admission outcome (`NotAdmitted`/`Fault` — store-contract
+   skew, an uninitialized budget, a store error; or a `WouldAdmit`, which on this path
+   can only mean a rehearsal claim port was wired in) journals `dispatch_faulted`
+   (exit 2): a fault authorizes nothing and spends nothing, but an unattended campaign
+   must not keep ticking over a store whose contract is not holding. Cap and concurrency
+   refusals map to `Defer` and stay healthy — a completed campaign keeps ticking
+   healthily until its authorization expires. Otherwise the tick journals `dispatched`
+   (exit 0) with a machine-readable detail: candidate counts, per-reason deferral counts
+   (grouped, so a slate-sized tick does not write a slate-sized row), evaluated-fire
+   outcome counts, and the individually-named installed fires (bounded by the per-tick
+   dispatch budget). Any other failure journals `loud_failure` best-effort and
+   propagates (exit 1).
 
 ## The durable escalation latch
 

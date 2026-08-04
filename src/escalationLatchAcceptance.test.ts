@@ -58,7 +58,7 @@ import type {
  * specifies: force an INSTALLED escalation (a real billable fire through the real spine,
  * its artifact and escalated spend sidecar durably on a real filesystem), FAIL the disarm
  * write, RESTART (every object rebuilt fresh over the same durable substrate), then drive
- * the next dispatch attempt through the same spine a flipped tick will drive — and prove
+ * the next dispatch attempt through the same spine a scheduled tick drives — and prove
  * no provider call is reachable: the latch-guarded claim port refuses the admission before
  * any adapter is invoked, so the fresh attempt's provider adapters are tripwires that must
  * never fire.
@@ -539,8 +539,8 @@ test('installed escalation + failed disarm + restart: a fresh tick cannot reach 
   assert.deepEqual([...state.fires.keys()], [fireId], 'no new fire was admitted');
   assert.deepEqual(readdirSync(join(artifactRoot, cohortId)).sort(), filesAfterEscalation, 'no new artifact or sidecar was written');
 
-  // The composed latch reports the same verdict directly (campaign:tick surfaces the
-  // store-derived half of this today; the flip wires the whole composition).
+  // The composed latch reports the same verdict directly — the same composition
+  // campaign:tick consults at the tick level and wraps around every admission.
   const verdict = await latch.check(cohortId);
   assert.equal(verdict.latched, true);
 });

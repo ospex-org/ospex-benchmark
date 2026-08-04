@@ -2,7 +2,7 @@ import type { ClaimPort } from './lineOpenClaim.js';
 import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
 
 /**
- * The durable escalation latch (docs/CAMPAIGN-ACTIVATION.md §"A durable escalation latch"):
+ * The durable escalation latch (docs/CAMPAIGN-ACTIVATION.md §"The durable escalation latch"):
  * once a spend-guard escalation exists for a cohort, no further dispatch may begin — across
  * process restarts, and independently of whether a disarm write ever succeeded.
  *

@@ -152,9 +152,12 @@ refuses this tick (exit 2, writing no journal entry and touching no campaign sta
 until an operator runs campaign:resume. A finish-write failure leaves the unfinished
 entry that halts the schedule once it passes the tick deadline — failing toward review.
 Never prompts, never falls back to mock. Exits 0 on a healthy tick (including one that
-dispatched nothing eligible), 2 when the schedule is halted, the publication descriptor
-is missing or refuses, no live authorization covers the cohort, the escalation latch is
-tripped, or a dispatched fire left unresolved spend evidence, 1 on a loud failure.
+dispatched nothing eligible), 2 on any refusal — a halted schedule, a missing or failed
+publication descriptor, missing configuration (STORE_DATABASE_URL, the read-seam env, an
+unusable artifact root), no live authorization, a tripped escalation latch, a dispatched
+fire that left unresolved spend evidence, or a fault-class admission outcome (a
+non-authorizing store-contract failure; the schedule halts rather than tick over it) —
+and 1 on a loud failure.
 
 STATUS (read-only, what monitoring calls): reports the campaign's durable state — the
 authorization (armed/disarmed/expired and its instants), calls reserved vs cap and
@@ -652,7 +655,9 @@ function tickJournalDetail(result: CohortTickResult): string {
  * adapters through the gated producer (the second of two independent validation passes),
  * and runs ONE real cohort tick: discovery, admission through the store's row-locked caps
  * behind the latch-guarded claim port, dispatch, durable artifact install, settlement.
- * The decided outcome is journaled on every terminal path. A journal FINISH failure never
+ * The decided outcome is journaled on every terminal path — healthy `dispatched`,
+ * `dispatch_unresolved` for a fire that left unresolved spend evidence, or
+ * `dispatch_faulted` for a fault-class admission. A journal FINISH failure never
  * changes a decided outcome — it is reported, and the unfinished entry halts the schedule
  * until an operator reviews it (fail toward review). A tick that fails before its begin
  * entry leaves no journal trace and can reach no dispatch either: every dispatch path
@@ -890,7 +895,11 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
         // caught it.
         if (error instanceof EscalationLatchedError) {
           printError(error.message);
-          printError(`run campaign:stop --manifest ${options.manifestPath} and investigate the installed evidence.`);
+          printError(
+            'fires admitted earlier in this tick are recorded durably in the store and under the ' +
+              'artifact root (campaign:status shows them) — this journal entry records the latch ' +
+              `causes. Run campaign:stop --manifest ${options.manifestPath} and investigate the installed evidence.`,
+          );
           await finishQuietly('escalation_latched', error.causes.map(describeEscalationLatchCause).join('; '));
           return 2;
         }
@@ -909,6 +918,19 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
           f.outcome.kind === 'InstalledEscalated' ||
           (f.outcome.kind === 'Installed' && f.outcome.completion.status !== 'settled'),
       );
+      // A FAULT-class admission is a non-authorizing store-contract failure (schema skew,
+      // an uninitialized budget, a store error) — it takes no claim and spends nothing,
+      // but an unattended campaign must not keep ticking over it: without this, a dead or
+      // migrated store would journal healthy ticks and exit 0 forever, and monitoring
+      // keyed on nonzero exits would never fire. `WouldAdmit` joins the class: on this
+      // path it can only mean a rehearsal claim port was wired into the paid path. Cap
+      // and concurrency refusals map to `Defer` (a completed campaign keeps ticking
+      // healthily until its authorization expires), so they are deliberately NOT here.
+      const faultedOutcomes = result.fireOutcomes.filter(
+        (f) =>
+          f.outcome.kind === 'NotAdmitted' &&
+          (f.outcome.outcome.kind === 'Fault' || f.outcome.outcome.kind === 'WouldAdmit'),
+      );
       const detail = tickJournalDetail(result);
       if (unresolvedOutcomes.length > 0) {
         printError(
@@ -920,6 +942,19 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
             `under ${outDir}, then campaign:resume to continue scheduling or campaign:stop to end the campaign.`,
         );
         await finishQuietly('dispatch_unresolved', detail);
+        return 2;
+      }
+      if (faultedOutcomes.length > 0) {
+        printError(
+          `DISPATCH FAULTED — ${faultedOutcomes.length} admission(s) returned a fault-class outcome: ` +
+            faultedOutcomes.map((f) => `${f.fireId} ${describeFireOutcome(f.outcome)}`).join('; '),
+        );
+        printError(
+          'a fault is non-authorizing and spends nothing, but it means the store contract is not ' +
+            'holding for this campaign. The schedule halts for operator review; fix the cause, then ' +
+            'campaign:resume to continue scheduling or campaign:stop to end the campaign.',
+        );
+        await finishQuietly('dispatch_faulted', detail);
         return 2;
       }
       await finishQuietly('dispatched', detail);
