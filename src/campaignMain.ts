@@ -14,6 +14,8 @@ import { loadDotEnv } from './env.js';
 import { ByteDifferentCollisionError, installBytesNoClobber, nodeArtifactFs } from './fireArtifactSink.js';
 import type { ArtifactFs } from './fireArtifactSink.js';
 import { askLiveConfirmation, observeRealAdapterCredentials } from './liveIntent.js';
+import { PublicationError, parseManifestPublication, verifyPublication } from './manifestPublication.js';
+import type { ManifestPublicationV1, ResolvedPublication } from './manifestPublication.js';
 import { instantMs, isParseableInstant } from './time.js';
 import type { AtomicStore } from './store/contract.js';
 import type { CampaignStatusReadPort } from './store/campaignStatusRead.js';
@@ -65,7 +67,7 @@ class UsageError extends Error {}
 
 const USAGE = `Usage:
   yarn campaign:arm    --calls <n> --days <n> --start <ISO> [--dispatches <n>] [--emit <path>]
-  yarn campaign:tick   --manifest <path>
+  yarn campaign:tick   --manifest <path> [--publication <path>]
   yarn campaign:status --manifest <path>
   yarn campaign:stop   --manifest <path>
 
@@ -87,6 +89,12 @@ TICK (unattended, what a scheduler will call): validates the armed authorization
 END — the durable record, its liveness at this clock, its exact binding to this
 manifest, and a fresh credential observation — and then REFUSES to dispatch: scheduled
 activation is structurally disabled in this build (see docs/CAMPAIGN-ACTIVATION.md).
+With --publication <path> (a JSON descriptor: repositoryOwner, repositoryName, path,
+commitSha — the full 40-hex commit the manifest bytes were published at), the tick also
+verifies the public-Git precommitment: byte-identical published blob, same cohortId,
+committer strictly before windowStart. ANY publication failure — including a network
+failure or the all-zeros rehearsal commit — refuses the tick (exit 2); without the flag
+the tick reports the evidence as not configured (activation will require it).
 Never prompts, never falls back to mock. Exits 3 when the authorization is valid
 (activation refused), 2 when no live authorization covers the cohort, 1 on a loud
 failure.
@@ -115,6 +123,7 @@ interface CampaignOptions {
   dispatches: number;
   manifestPath: string | null;
   emitPath: string;
+  publicationPath: string | null;
 }
 
 function parseArgs(argv: string[]): CampaignOptions {
@@ -134,6 +143,7 @@ function parseArgs(argv: string[]): CampaignOptions {
     dispatches: 1,
     manifestPath: null,
     emitPath: './campaign-manifest.json',
+    publicationPath: null,
   };
   for (let i = 1; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -154,6 +164,7 @@ function parseArgs(argv: string[]): CampaignOptions {
     else if (arg === '--dispatches') options.dispatches = asCount(next(), '--dispatches');
     else if (arg === '--manifest') options.manifestPath = next();
     else if (arg === '--emit') options.emitPath = next();
+    else if (arg === '--publication') options.publicationPath = next();
     else if (arg === '-h' || arg === '--help') {
       printLine(USAGE);
       process.exit(0);
@@ -244,6 +255,10 @@ export interface CampaignDeps {
   readonly observeCredentials: (participantIds: readonly string[]) => ReadonlyMap<string, boolean>;
   readonly confirm: (prompt: string) => Promise<string | null>;
   readonly now: () => number;
+  /** Resolve a public-Git precommitment descriptor to its blob bytes + committer instant
+   *  (production: the GitHub resolver). Injected so every publication failure mode is
+   *  drivable without a network; a rejection is always a refusal, never a pass. */
+  readonly resolvePublication: (publication: ManifestPublicationV1) => Promise<ResolvedPublication>;
 }
 
 // ---------------------------------------------------------------------------
@@ -534,7 +549,49 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
     printError('tick requires --manifest <path> (the exact manifest the campaign was armed with)');
     return 2;
   }
-  const booted = cohortBoot({ manifestBytes: decodeManifestText(readFileSync(options.manifestPath)) });
+  const rawManifestBytes = readFileSync(options.manifestPath);
+  const booted = cohortBoot({ manifestBytes: decodeManifestText(rawManifestBytes) });
+
+  // Public-Git precommitment evidence. When a descriptor is supplied, it must verify —
+  // real repository, full commit, byte-identical blob, committer strictly before
+  // windowStart — and ANY failure (including a network failure) is a refusal, never a
+  // pass-through. The all-zeros rehearsal sentinel is rejected STRUCTURALLY, before any
+  // network request: it is the self-resolver's marker and can never be evidence. When no
+  // descriptor is supplied, the tick says so — activation will make it mandatory.
+  if (options.publicationPath !== null) {
+    let descriptor: ManifestPublicationV1;
+    try {
+      descriptor = parseManifestPublication(JSON.parse(readFileSync(options.publicationPath, 'utf8')));
+    } catch (error) {
+      printError(`publication descriptor at ${options.publicationPath} is unusable: ${messageOf(error)}`);
+      return 2;
+    }
+    if (descriptor.commitSha === '0'.repeat(40)) {
+      printError(
+        'publication descriptor carries the all-zeros rehearsal commit — the self-resolved ' +
+          'rehearsal marker is not publication evidence; refusing before any resolution',
+      );
+      return 2;
+    }
+    try {
+      const verified = await verifyPublication({
+        localManifestBytes: rawManifestBytes,
+        publication: descriptor,
+        resolver: { resolve: deps.resolvePublication },
+      });
+      printLine(
+        `publication evidence VERIFIED — ${descriptor.repositoryOwner}/${descriptor.repositoryName}:` +
+          `${descriptor.path} @ ${descriptor.commitSha} (committed ${verified.committerTimestamp})`,
+      );
+    } catch (error) {
+      const detail = error instanceof PublicationError ? error.violations.join('; ') : messageOf(error);
+      printError(`publication evidence REFUSED — the precommitment did not verify: ${detail}`);
+      return 2;
+    }
+  } else {
+    printLine('publication evidence NOT CONFIGURED (--publication) — required before activation');
+  }
+
   const databaseUrl = envValue('STORE_DATABASE_URL');
   if (databaseUrl === undefined) {
     printError('a tick needs STORE_DATABASE_URL');
@@ -763,6 +820,10 @@ const PRODUCTION_DEPS: CampaignDeps = {
   observeCredentials: observeRealAdapterCredentials,
   confirm: askLiveConfirmation,
   now: () => Date.now(),
+  resolvePublication: async (publication) => {
+    const { GitHubPublicationResolver } = await import('./gitHubPublicationResolver.js');
+    return new GitHubPublicationResolver().resolve(publication);
+  },
 };
 
 async function main(): Promise<number> {

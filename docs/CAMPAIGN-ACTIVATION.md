@@ -55,6 +55,16 @@ Before activation, a scheduled tick must:
 - **reject the zero/synthetic rehearsal descriptor with zero provider calls**, proven by
   negative tests at both the unit and public-CLI level.
 
+**Status of this piece:** the machinery exists and is wired, verification-first. The
+concrete resolver (`GitHubPublicationResolver` — commits endpoint for the committer
+instant with a sha-echo substitution guard, raw host for the exact blob bytes, fail-closed
+on every non-OK/shape/timeout path) feeds the pure `verifyPublication` core, and
+`campaign:tick --publication <descriptor.json>` verifies the precommitment before its
+authorization validation: any failure — including a network failure or the all-zeros
+rehearsal commit, which is rejected structurally before any resolution — refuses the tick.
+What remains for activation is exactly one tightening: the descriptor becomes **required**
+(a tick without one refuses instead of reporting "not configured").
+
 ### 2. A durable escalation latch
 
 A spend-guard escalation means the spend model is not holding; it must not be able to repeat
