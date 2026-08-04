@@ -96,9 +96,13 @@ test('a cohortId outside the sink path grammar throws BEFORE any filesystem oper
   assert.deepEqual(ops, [], 'no path was formed from an unvalidated identifier');
 });
 
-test('real directory: escalation sidecars latch, a clean pass does not, fire artifacts and unrelated files are ignored — in sorted name order', async () => {
+test('real directory: escalation sidecars latch, an UNPAIRED clean claim latches, fire artifacts and unrelated files are ignored — in sorted name order', async () => {
   const { base, dir } = freshCohortDir();
-  // Real serialized sidecar bytes, exactly what the sink installs.
+  // Serializer-produced sidecar bytes. Escalated records latch on their declared reason
+  // alone (latching needs no proof); a clean CLAIM must verify against its paired
+  // artifact, and this one has no pair — so it latches as unverified. (The clean claim
+  // that genuinely verifies — a real spine-produced pair — is owned by the acceptance
+  // battery, which dispatches through it.)
   writeFileSync(join(dir, 'fire-g1-moneyline-b-spend.json'), serializeSpendEscalationSidecar(sidecar('spend_evidence_unknown')));
   writeFileSync(join(dir, 'fire-g1-moneyline-a-spend.json'), serializeSpendEscalationSidecar(sidecar('spend_attempt_over_reservation')));
   writeFileSync(join(dir, 'fire-g1-moneyline-c-spend.json'), serializeSpendEscalationSidecar(sidecar(null)));
@@ -106,14 +110,56 @@ test('real directory: escalation sidecars latch, a clean pass does not, fire art
   writeFileSync(join(dir, 'notes.txt'), 'unrelated');
 
   const causes = await escalationEvidenceLatchSource(base).causes(COHORT);
+  assert.equal(causes.length, 3, 'two escalations plus the unpaired clean claim');
   assert.deepEqual(
-    causes.map((c) => ({ ...c })),
+    causes.slice(0, 2).map((c) => ({ ...c })),
     [
       { kind: 'escalation_evidence', path: join(dir, 'fire-g1-moneyline-a-spend.json'), reason: 'spend_attempt_over_reservation' },
       { kind: 'escalation_evidence', path: join(dir, 'fire-g1-moneyline-b-spend.json'), reason: 'spend_evidence_unknown' },
     ],
-    'both escalations latch, sorted by name; the clean pass, the artifact, and the stray file do not',
+    'both escalations latch, sorted by name; the artifact and the stray file are ignored',
   );
+  const unpaired = causes[2]!;
+  assert.equal(unpaired.kind, 'unverified_evidence');
+  if (unpaired.kind !== 'unverified_evidence') return;
+  assert.equal(unpaired.path, join(dir, 'fire-g1-moneyline-c-spend.json'));
+  assert.match(unpaired.detail, /paired fire artifact fire-g1-moneyline-c\.json could not be read/);
+});
+
+test("the reviewer probe: a bare {\"reason\":null} file latches — a clean claim earns nothing on its own say-so", async () => {
+  const { base, dir } = freshCohortDir();
+  writeFileSync(join(dir, 'bare-spend.json'), '{"reason":null}');
+  const causes = await escalationEvidenceLatchSource(base).causes(COHORT);
+  assert.equal(causes.length, 1);
+  const cause = causes[0]!;
+  assert.equal(cause.kind, 'unverified_evidence');
+  if (cause.kind !== 'unverified_evidence') return;
+  assert.match(cause.detail, /not the scanned cohort/, 'the first unmet obligation: the claim does not even name this cohort');
+});
+
+test('a clean claim naming ANOTHER cohort latches — a foreign pair dropped into this directory is never this cohort’s clear', async () => {
+  const { base, dir } = freshCohortDir();
+  const foreign = { ...sidecar(null), cohortId: OTHER_COHORT };
+  writeFileSync(join(dir, 'foreign-spend.json'), `${JSON.stringify(foreign, null, 2)}\n`);
+  const causes = await escalationEvidenceLatchSource(base).causes(COHORT);
+  assert.equal(causes.length, 1);
+  const cause = causes[0]!;
+  assert.equal(cause.kind, 'unverified_evidence');
+  if (cause.kind !== 'unverified_evidence') return;
+  assert.match(cause.detail, /not the scanned cohort/);
+});
+
+test('a clean claim whose paired artifact does not even parse latches with the verifier’s artifact-integrity failure', async () => {
+  const { base, dir } = freshCohortDir();
+  writeFileSync(join(dir, 'fire-x-moneyline-p-spend.json'), serializeSpendEscalationSidecar(sidecar(null)));
+  writeFileSync(join(dir, 'fire-x-moneyline-p.json'), 'not an artifact at all');
+  const causes = await escalationEvidenceLatchSource(base).causes(COHORT);
+  assert.equal(causes.length, 1);
+  const cause = causes[0]!;
+  assert.equal(cause.kind, 'unverified_evidence');
+  if (cause.kind !== 'unverified_evidence') return;
+  assert.match(cause.detail, /clean-pass claim did not verify/);
+  assert.match(cause.detail, /artifact-integrity/);
 });
 
 test('an escalated cohort does not latch a DIFFERENT cohort — the scan is per-cohort-directory', async () => {

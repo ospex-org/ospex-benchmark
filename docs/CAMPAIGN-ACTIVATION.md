@@ -100,7 +100,11 @@ also holds crashed-unsettled and settle-failed fires, the conservative direction
 unattended path — and the **installed escalation evidence itself**, a spend sidecar with a
 non-null `reason` under the sink's cohort directory (`escalationEvidenceScan.ts`), which
 keeps the latch tripped even if the escalated claim is later settled through a reviewed
-recovery path. "Checked before every dispatch" is `latchGuardedClaimPort`: every dispatch
+recovery path. A sidecar CLAIMING a clean pass (`reason: null`) is never trusted on its
+own say-so: it reads clear only when it names the scanned cohort AND the offline pair
+verifier (`verifySpendEvidence`, reused wholesale — `reason-recomputed` authoritative)
+passes every named check against the paired installed artifact; a missing, unreadable,
+foreign, or contradicted pair latches as unverified evidence. "Checked before every dispatch" is `latchGuardedClaimPort`: every dispatch
 begins with `claimPort.admit`, and the guarded port consults the latch before every
 admission and aborts the tick with a typed error on a trip — with no change to the store
 contract, the claim port, or the spine. Both sources fail CLOSED (a source that cannot be

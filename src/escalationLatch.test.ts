@@ -266,6 +266,15 @@ test('describeEscalationLatchCause names each cause kind with its identifying fa
     describeEscalationLatchCause(UNREADABLE),
     'unreadable spend evidence /base/cohort/fire-y-total-def-spend.json: not valid JSON',
   );
+  assert.equal(
+    describeEscalationLatchCause({
+      kind: 'unverified_evidence',
+      path: '/base/cohort/fire-z-moneyline-ghi-spend.json',
+      detail: 'clean-pass claim did not verify against fire-z-moneyline-ghi.json — reason-recomputed: …',
+    }),
+    'unverified clean-pass claim /base/cohort/fire-z-moneyline-ghi-spend.json: ' +
+      'clean-pass claim did not verify against fire-z-moneyline-ghi.json — reason-recomputed: …',
+  );
 });
 
 test('EscalationLatchedError freezes a COPY of the causes — mutating the input array afterwards changes nothing', () => {

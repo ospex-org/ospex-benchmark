@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -261,7 +261,10 @@ function pricedUsageFor(provider: string): unknown {
     case 'anthropic':
       return { input_tokens: 1, output_tokens: 1 };
     case 'google':
-      return { promptTokenCount: 1, candidatesTokenCount: 1, thoughtsTokenCount: 0, totalTokenCount: 2 };
+      // Nonzero thoughts: a genuinely clean pair must pass the offline verifier's FULL
+      // check set (the evidence latch runs it), which requires a real nonzero
+      // reasoning-token observation somewhere on the fire.
+      return { promptTokenCount: 1, candidatesTokenCount: 1, thoughtsTokenCount: 1, totalTokenCount: 3 };
     case 'xai':
       return { prompt_tokens: 1, completion_tokens: 1, completion_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 };
     default:
@@ -595,6 +598,82 @@ test('the evidence source ALONE holds the latch after a recovery settle clears t
     (error: unknown) => {
       assert.ok(error instanceof EscalationLatchedError);
       assert.deepEqual(error.causes.map((c) => c.kind), ['escalation_evidence']);
+      return true;
+    },
+  );
+  assert.equal(tripwire.touched(), 0);
+});
+
+test('the review probe at full scale: the real escalated pair with ONLY its reason flipped to null still latches — zero provider contact', async () => {
+  const state = new DurableCohortState();
+  const artifactRoot = mkdtempSync(join(tmpdir(), 'escalation-latch-tamper-'));
+  const { cohortId, fireId } = await installEscalation(state, artifactRoot);
+
+  // A reviewed recovery settles the escalated claim, clearing the store shadow — the
+  // evidence source is the remaining authority, exactly the state the latch's clean-claim
+  // verification exists for.
+  const snapshotForRoster = sealed(GAME_ID2);
+  await storeOver(state, snapshotForRoster.expectedArmIdentities.length, () => NOW_MS).completeClaim({
+    cohortId,
+    fireId,
+    expectedSchemaVersion: STORE_SCHEMA_VERSION,
+  });
+  assert.deepEqual(await unresolvedFireReadOver(state, () => NOW_MS).unresolvedFires(cohortId), []);
+
+  // Tamper ONLY the top-level reason of the real installed sidecar to null — a clean
+  // claim whose own attempt evidence still records the breach.
+  const sidecarName = spendSidecarFiles(artifactRoot, cohortId)[0]!;
+  const sidecarPath = join(artifactRoot, cohortId, sidecarName);
+  const tampered = JSON.parse(readFileSync(sidecarPath, 'utf8')) as Record<string, unknown>;
+  assert.equal(tampered['reason'], 'spend_attempt_over_reservation', 'the untampered record is the real escalation');
+  tampered['reason'] = null;
+  writeFileSync(sidecarPath, `${JSON.stringify(tampered, null, 2)}\n`);
+
+  const { claimPort } = restartHarness(state, artifactRoot, snapshotForRoster.expectedArmIdentities.length);
+  const tripwire = tripwireAdapters(snapshotForRoster);
+  await assert.rejects(
+    runBillableFire(state, artifactRoot, GAME_ID2, { claimPort, adapters: tripwire.map }),
+    (error: unknown) => {
+      assert.ok(error instanceof EscalationLatchedError, `expected the latch refusal, got: ${String(error)}`);
+      assert.deepEqual(error.causes.map((c) => c.kind), ['unverified_evidence']);
+      const cause = error.causes[0]!;
+      assert.ok(
+        cause.kind === 'unverified_evidence' && /reason-recomputed/.test(cause.detail),
+        'the recomputed whole-fire verdict contradicts the tampered clean claim',
+      );
+      return true;
+    },
+  );
+  assert.equal(tripwire.touched(), 0, 'no provider adapter was ever invoked');
+});
+
+test('a clean pair whose ARTIFACT file is gone latches — a clean claim with no witness is never clear', async () => {
+  const state = new DurableCohortState();
+  const artifactRoot = mkdtempSync(join(tmpdir(), 'escalation-latch-unpaired-'));
+  const snapshot1 = sealed(GAME_ID);
+  const clean = respondingAdapters(snapshot1, scopedGame(GAME_ID), (_id, provider) => pricedUsageFor(provider));
+  const first = await runBillableFire(state, artifactRoot, GAME_ID, { adapters: clean.map });
+  assert.equal(first.kind, 'Installed');
+  const cohortId = snapshot1.booted.cohortId;
+
+  // Remove the artifact; keep the clean-claiming sidecar. The store shadow is clear (the
+  // fire settled), so the unpaired clean claim is the only thing standing.
+  const files = readdirSync(join(artifactRoot, cohortId));
+  const artifactName = files.find((n) => n.endsWith('.json') && !n.endsWith('-spend.json'));
+  assert.ok(artifactName !== undefined);
+  rmSync(join(artifactRoot, cohortId, artifactName));
+
+  const snapshot2 = sealed(GAME_ID2);
+  const { claimPort } = restartHarness(state, artifactRoot, snapshot2.expectedArmIdentities.length);
+  const tripwire = tripwireAdapters(snapshot2);
+  await assert.rejects(
+    runBillableFire(state, artifactRoot, GAME_ID2, { claimPort, adapters: tripwire.map }),
+    (error: unknown) => {
+      assert.ok(error instanceof EscalationLatchedError);
+      assert.ok(
+        error.causes.some((c) => c.kind === 'unverified_evidence' && /could not be read/.test(c.detail)),
+        'the missing witness is the named cause',
+      );
       return true;
     },
   );

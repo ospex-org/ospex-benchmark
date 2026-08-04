@@ -25,9 +25,12 @@ import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
  *      the store, and it holds even when the escalation sidecar's install itself failed.
  *   2. The installed escalation evidence itself (`escalationEvidenceLatchSource` in
  *      `escalationEvidenceScan.ts`): a spend sidecar with a non-null `reason` in the fire
- *      artifact sink's cohort directory. This source is same-box (it reads the sink root),
- *      and it keeps the latch tripped even if the escalated claim is later settled through
- *      a reviewed recovery path without the campaign being stopped.
+ *      artifact sink's cohort directory. A sidecar CLAIMING a clean pass (`reason: null`)
+ *      does not read clear on its own say-so: the claim must verify — cohort binding plus
+ *      the offline pair verifier's full recomputation against the paired installed
+ *      artifact — or it latches. This source is same-box (it reads the sink root), and it
+ *      keeps the latch tripped even if the escalated claim is later settled through a
+ *      reviewed recovery path without the campaign being stopped.
  *
  * The unresolved-fire predicate is deliberately BROADER than escalation: it also holds for
  * a fire whose process crashed after admission (once its leases expire) and for a fire
@@ -68,6 +71,16 @@ export type EscalationLatchCause =
       readonly kind: 'unreadable_evidence';
       readonly path: string;
       readonly detail: string;
+    }
+  | {
+      /** A sidecar CLAIMING a clean pass (`reason: null`) whose claim did not earn it:
+       *  it is not bound to the scanned cohort, its paired fire artifact is missing or
+       *  unreadable, or the offline pair verifier's recomputation contradicts the claim.
+       *  Fail closed: a clean verdict is verified, never trusted from the record's own
+       *  say-so — an unverifiable clean claim latches. */
+      readonly kind: 'unverified_evidence';
+      readonly path: string;
+      readonly detail: string;
     };
 
 export type EscalationLatchVerdict =
@@ -106,6 +119,8 @@ export function describeEscalationLatchCause(cause: EscalationLatchCause): strin
       return `installed escalation evidence ${cause.path} (${cause.reason})`;
     case 'unreadable_evidence':
       return `unreadable spend evidence ${cause.path}: ${cause.detail}`;
+    case 'unverified_evidence':
+      return `unverified clean-pass claim ${cause.path}: ${cause.detail}`;
     default: {
       const _exhaustive: never = cause;
       return _exhaustive;
