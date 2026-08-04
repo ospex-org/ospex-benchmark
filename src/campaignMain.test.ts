@@ -980,6 +980,233 @@ test('both tick outcomes keep their exit codes through a close failure', async (
 });
 
 // ===========================================================================
+// HOSTILE rejection values — error rendering must be TOTAL, or reporting a cleanup or
+// authorizing failure would itself throw and replace the already-classified outcome.
+// ===========================================================================
+
+/**
+ * The four hostile fixtures from the frozen correction, built WITHOUT converting them:
+ * the harness never calls String(value), reads its prototype, or serializes it — each
+ * value is paired with a separate safe string label used in every assertion message.
+ */
+function hostileFixtures(): Array<{ label: string; value: unknown }> {
+  const throwingCoercion = Object.create(null) as { toString(): string };
+  throwingCoercion.toString = () => {
+    throw new Error('coercion escaped');
+  };
+
+  const throwingMessageGetter = new Error('hidden');
+  Object.defineProperty(throwingMessageGetter, 'message', {
+    get() {
+      throw new Error('message getter escaped');
+    },
+  });
+
+  const pair = Proxy.revocable({}, {});
+  pair.revoke();
+
+  const selfThrowingCoercion = Object.create(null) as { toString(): string };
+  selfThrowingCoercion.toString = () => {
+    throw selfThrowingCoercion;
+  };
+
+  return [
+    { label: 'object whose toString() throws', value: throwingCoercion },
+    { label: 'Error whose message getter throws', value: throwingMessageGetter },
+    { label: 'revoked proxy', value: pair.proxy },
+    { label: 'object whose coercion throws itself', value: selfThrowingCoercion },
+  ];
+}
+
+/** A close() that rejects with the given hostile value. */
+const rejectWith = (value: unknown) => async (): Promise<void> => {
+  throw value;
+};
+
+/** deps whose store close rejects with `value`; everything else is the normal fake. */
+function depsWithHostileClose(
+  value: unknown,
+  over: Partial<CampaignDeps> & { auth?: MemoryAuthPort } = {},
+): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[] } {
+  const base = deps(over);
+  return {
+    ...base,
+    openStore: async () => {
+      const opened = await base.openStore('unused');
+      return { ...opened, close: rejectWith(value) };
+    },
+  };
+}
+
+test('HOSTILE close rejection cannot override a CONFIRMED arm: 0, ARMED, one durable row, fallback-rendered warning', async () => {
+  for (const { label, value } of hostileFixtures()) {
+    const d = depsWithHostileClose(value);
+    const opts = options();
+    const { value: code, logs, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
+    assert.equal(code, 0, `${label}: the confirmed arm resolves 0 — it must never reject`);
+    assert.match(logs.join('\n'), /ARMED\./, label);
+    const output = errors.join('\n');
+    assert.match(output, /warning: closing the store connection failed/, label);
+    assert.match(output, /<unprintable thrown value>/, `${label}: the fixed fallback literal renders`);
+    assert.equal(d.auth.records.size, 1, `${label}: exactly one durable authorization`);
+  }
+});
+
+test('HOSTILE close rejection cannot override a RECONCILED existing arm: 0, standing row untouched', async () => {
+  for (const { label, value } of hostileFixtures()) {
+    const auth = new MemoryAuthPort();
+    const opts = options();
+    const first = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+    assert.equal(first.value, 0, label);
+    const standing = [...auth.records.values()][0]!;
+
+    const { value: code, logs, errors } = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () => armCampaign(opts, depsWithHostileClose(value, { auth }))),
+    );
+    assert.equal(code, 0, `${label}: the reconciled re-run resolves 0`);
+    assert.match(logs.join('\n'), /ALREADY armed; the standing authorization validates/, label);
+    assert.match(errors.join('\n'), /warning: closing the store connection failed/, label);
+    assert.deepEqual([...auth.records.values()][0], standing, `${label}: the standing record was not rewritten`);
+  }
+});
+
+test('HOSTILE authorizing rejection still names UNKNOWN commit and both recovery paths: resolves 1, one durable row', async () => {
+  for (const { label, value } of hostileFixtures()) {
+    const auth = new MemoryAuthPort();
+    const originalArm = auth.arm.bind(auth);
+    auth.arm = async (record) => {
+      await originalArm(record); // the INSERT commits...
+      throw value; // ...and the acknowledgement is a hostile value
+    };
+    const opts = options();
+    const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+    assert.equal(code, 1, `${label}: the command resolves failure — it must never reject`);
+    const output = errors.join('\n');
+    assert.match(output, /commit status UNKNOWN/, label);
+    assert.match(output, /re-run the same arm/, label);
+    assert.match(output, /campaign:stop/, label);
+    assert.equal(auth.records.size, 1, `${label}: the committed row stands`);
+  }
+});
+
+test('HOSTILE authorizing rejection + HOSTILE close rejection together preserve the unknown-commit classification', async () => {
+  const fixtures = hostileFixtures();
+  const armHostile = fixtures[2]!; // revoked proxy from the authorizing write
+  const closeHostile = fixtures[0]!; // throwing coercion from the cleanup
+  const auth = new MemoryAuthPort();
+  const originalArm = auth.arm.bind(auth);
+  auth.arm = async (record) => {
+    await originalArm(record);
+    throw armHostile.value;
+  };
+  const d = depsWithHostileClose(closeHostile.value, { auth });
+  const opts = options();
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
+  assert.equal(code, 1, 'the primary unknown-commit classification survives BOTH hostile failures');
+  const output = errors.join('\n');
+  assert.match(output, /commit status UNKNOWN/);
+  assert.match(output, /re-run the same arm/);
+  assert.match(output, /warning: closing the store connection failed/);
+  assert.equal(auth.records.size, 1);
+});
+
+test('PRE-AUTHORITY failures keep their classification under hostile values: rows 0, resolves 1, no authority', async () => {
+  for (const { label, value } of hostileFixtures()) {
+    // (i) a normal budget refusal with a HOSTILE close rejection...
+    const auth1 = new MemoryAuthPort();
+    const storeCalls1: string[] = [];
+    const refusing: AtomicStore = {
+      ...recordingStore(storeCalls1),
+      initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
+    };
+    const d1 = deps({ auth: auth1, openStore: async () => ({ store: refusing, authorizations: auth1, close: rejectWith(value) }) });
+    const r1 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d1)));
+    assert.equal(r1.value, 1, `${label} (hostile close): pre-authority failure resolves 1`);
+    assert.match(r1.errors.join('\n'), /NO standing authority was created/, label);
+    assert.equal(auth1.records.size, 0, label);
+
+    // (ii) ...and a budget initialization that REJECTS with the hostile value itself.
+    const auth2 = new MemoryAuthPort();
+    const storeCalls2: string[] = [];
+    const hostileInit: AtomicStore = {
+      ...recordingStore(storeCalls2),
+      initCohortBudget: async () => {
+        throw value;
+      },
+    };
+    const d2 = deps({ auth: auth2, openStore: async () => ({ store: hostileInit, authorizations: auth2, close: rejectWith(value) }) });
+    const r2 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d2)));
+    assert.equal(r2.value, 1, `${label} (hostile primary + hostile close): still resolves 1`);
+    assert.match(r2.errors.join('\n'), /NO standing authority was created/, label);
+    assert.equal(auth2.records.size, 0, label);
+  }
+});
+
+test('CONFIRMED and ABSENT stop keep their outcomes under hostile close rejections; the first stop instant stands', async () => {
+  for (const { label, value } of hostileFixtures()) {
+    const { manifestPath, auth, cohortId } = await armed();
+    const stopped = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () =>
+        stopCampaign(options({ command: 'stop', manifestPath }), depsWithHostileClose(value, { auth })),
+      ),
+    );
+    assert.equal(stopped.value, 0, `${label}: the durable disarm resolves 0`);
+    assert.match(stopped.logs.join('\n'), /STOPPED\./, label);
+    const firstInstant = auth.records.get(cohortId)!.disarmedAt;
+    assert.notEqual(firstInstant, null, label);
+
+    // A repeated stop (also with a hostile close) preserves the FIRST stop instant.
+    const again = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () =>
+        stopCampaign(
+          options({ command: 'stop', manifestPath }),
+          depsWithHostileClose(value, { auth, now: () => NOW + 120_000 }),
+        ),
+      ),
+    );
+    assert.equal(again.value, 0, label);
+    assert.equal(auth.records.get(cohortId)!.disarmedAt, firstInstant, `${label}: history was not rewritten`);
+
+    // The absent-cohort refusal is preserved too.
+    const { bytes } = buildCampaignManifest(NOW + 5_400_000, { callCap: 800, windowForwardMs: WEEK_MS });
+    const otherPath = join(mkdtempSync(join(tmpdir(), 'campaign-hostile-absent-')), 'manifest.json');
+    writeFileSync(otherPath, bytes);
+    const absent = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () =>
+        stopCampaign(options({ command: 'stop', manifestPath: otherPath }), depsWithHostileClose(value, { auth })),
+      ),
+    );
+    assert.equal(absent.value, 2, `${label}: the never-armed refusal is preserved`);
+  }
+});
+
+test('the disabled tick keeps its exits under hostile close rejections: 3 when valid, 2 when refused', async () => {
+  for (const { label, value } of hostileFixtures()) {
+    const { manifestPath, auth } = await armed();
+    const valid = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () =>
+        tickCampaign(options({ command: 'tick', manifestPath }), depsWithHostileClose(value, { auth, confirm: NEVER_PROMPT })),
+      ),
+    );
+    assert.equal(valid.value, 3, `${label}: the structural activation refusal is preserved`);
+    assert.match(valid.logs.join('\n'), /campaign authorization VALID/, label);
+
+    const { bytes } = buildCampaignManifest(NOW + 9_000_000, { callCap: 800, windowForwardMs: WEEK_MS });
+    const strangerPath = join(mkdtempSync(join(tmpdir(), 'campaign-hostile-tick-')), 'manifest.json');
+    writeFileSync(strangerPath, bytes);
+    const refused = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () =>
+        tickCampaign(
+          options({ command: 'tick', manifestPath: strangerPath }),
+          depsWithHostileClose(value, { auth, confirm: NEVER_PROMPT }),
+        ),
+      ),
+    );
+    assert.equal(refused.value, 2, `${label}: the no-authorization refusal is preserved`);
+  }
+});
+
+// ===========================================================================
 // tick
 // ===========================================================================
 

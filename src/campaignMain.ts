@@ -147,8 +147,27 @@ function usd(micros: number): string {
   return `$${(micros / 1_000_000).toFixed(2)}`;
 }
 
+/**
+ * TOTAL over `unknown`: rendering a thrown value must never itself throw, because every
+ * authority-outcome guard in this module reports through it — a hostile rejection value
+ * (a revoked Proxy, a throwing `message` getter, a throwing coercion) must degrade to a
+ * fixed literal rather than let the reporting failure escape and replace an
+ * already-classified outcome.
+ */
 function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  try {
+    if (error instanceof Error && typeof error.message === 'string') {
+      return error.message;
+    }
+  } catch {
+    // A revoked Proxy or hostile message getter is not safe to inspect.
+  }
+
+  try {
+    return String(error);
+  } catch {
+    return '<unprintable thrown value>';
+  }
 }
 
 /**
