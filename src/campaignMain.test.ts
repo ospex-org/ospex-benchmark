@@ -111,10 +111,12 @@ function recordingStore(calls: string[]): AtomicStore {
   };
 }
 
-/** A configurable in-memory tick journal; records calls, serves `entriesValue`. */
+/** A configurable in-memory tick journal; records calls, serves `entriesValue` and
+ *  `unfinishedValue`. */
 class FakeTickJournal implements CampaignTickJournalPort {
   readonly calls: string[] = [];
   entriesValue: ScheduleEntry[] = [];
+  unfinishedValue: ScheduleEntry[] = [];
   nextId = 71;
   async begin(cohortId: string, startedAtIso: string): Promise<number> {
     this.calls.push(`begin:${cohortId}:${startedAtIso}`);
@@ -129,6 +131,10 @@ class FakeTickJournal implements CampaignTickJournalPort {
   async entries(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
     this.calls.push(`entries:${cohortId}:${limit}`);
     return this.entriesValue;
+  }
+  async unfinishedTicks(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
+    this.calls.push(`unfinished:${cohortId}:${limit}`);
+    return this.unfinishedValue;
   }
 }
 
@@ -1371,12 +1377,12 @@ test('a VALID armed authorization: the tick validates end to end and REFUSES to 
   const at = new Date(NOW).toISOString();
   assert.deepEqual(
     d.tickJournal.calls,
-    [`entries:${cohortId}:50`, `begin:${cohortId}:${at}`, `finish:71:validated_refused:<null>:${at}`],
-    'the halt rule read the journal, then the tick journaled begin and the healthy outcome',
+    [`entries:${cohortId}:50`, `unfinished:${cohortId}:50`, `begin:${cohortId}:${at}`, `finish:71:validated_refused:<null>:${at}`],
+    'the halt rule read the journal (recent + unfinished), then the tick journaled begin and the healthy outcome',
   );
 });
 
-test('a HALTED schedule refuses the tick (exit 2) BEFORE anything else — no journal write, no authorization read', async () => {
+test('a HALTED schedule refuses the tick (exit 2) before any journal write or authorization read', async () => {
   const { manifestPath, auth, cohortId } = await armed();
   auth.calls.length = 0;
   const d = deps({ auth, confirm: NEVER_PROMPT });
@@ -1391,9 +1397,31 @@ test('a HALTED schedule refuses the tick (exit 2) BEFORE anything else — no jo
   assert.match(refusal, /SCHEDULE HALTED — refusing to run/);
   assert.match(refusal, /"loud_failure"/);
   assert.match(refusal, /campaign:resume/, 'the operator is told the lever');
-  assert.deepEqual(d.tickJournal.calls, [`entries:${cohortId}:50`], 'a halted tick writes NOTHING — its refusal is derived state');
+  assert.deepEqual(
+    d.tickJournal.calls,
+    [`entries:${cohortId}:50`, `unfinished:${cohortId}:50`],
+    'a halted tick writes no journal entry — its refusal is derived state',
+  );
   assert.deepEqual(auth.calls, [], 'the halt precedes even the authorization read');
   assert.deepEqual(d.unresolvedFires.calls, [], 'and the latch read');
+});
+
+test('a crashed tick surfaces through the DEDICATED unfinished read even when the recent window no longer holds it', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  // The recent-entries read returns only healthy ticks (a fast cron pushed the crash out);
+  // the unfinished read still carries the stale entry — the merge is what halts.
+  d.tickJournal.entriesValue = [
+    { id: 60, kind: 'tick', startedAt: '2026-08-04T23:50:00.000Z', finishedAt: '2026-08-04T23:50:05.000Z', outcome: 'validated_refused', detail: null },
+  ];
+  d.tickJournal.unfinishedValue = [
+    { id: 3, kind: 'tick', startedAt: '2026-08-04T00:00:00.000Z', finishedAt: null, outcome: null, detail: null },
+  ];
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
+  );
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /tick 3 started .* never finished within the tick deadline/);
 });
 
 test('a tick that finds a STALE UNFINISHED entry (the crash shape) halts the same way', async () => {
@@ -1483,7 +1511,11 @@ test('resume: a schedule that is NOT halted has nothing to resume — exit 2, no
   );
   assert.equal(code, 2);
   assert.match(errors.join('\n'), /nothing to resume — the schedule is not halted/);
-  assert.deepEqual(d.tickJournal.calls, [`entries:${cohortId}:50`], 'read-only: no resume row was written');
+  assert.deepEqual(
+    d.tickJournal.calls,
+    [`entries:${cohortId}:50`, `unfinished:${cohortId}:50`],
+    'read-only: no resume row was written',
+  );
 });
 
 test('resume: a HALTED schedule resumes only through the standard [Y/n] — accept writes the acknowledgment, exit 0', async () => {
@@ -1509,12 +1541,86 @@ test('resume: a HALTED schedule resumes only through the standard [Y/n] — acce
   assert.match(output, /clears the schedule halt ONLY/);
   assert.match(output, /RESUMED\./);
   const at = new Date(NOW).toISOString();
-  assert.equal(d.tickJournal.calls.length, 2);
+  assert.equal(d.tickJournal.calls.length, 3);
   assert.equal(d.tickJournal.calls[0], `entries:${cohortId}:50`);
+  assert.equal(d.tickJournal.calls[1], `unfinished:${cohortId}:50`);
   assert.ok(
-    d.tickJournal.calls[1]!.startsWith(`resume:${cohortId}:${at}:tick 4 finished`),
-    `the acknowledgment carries the reviewed halt reason; got ${d.tickJournal.calls[1]}`,
+    d.tickJournal.calls[2]!.startsWith(`resume:${cohortId}:${at}:tick 4 finished`),
+    `the acknowledgment carries the reviewed halt reason; got ${d.tickJournal.calls[2]}`,
   );
+});
+
+test('a publication-verification failure journals publication_refused — the halt rule sees it on the next tick', async () => {
+  const { manifestPath, auth } = await armed();
+  auth.calls.length = 0; // observe only the tick's interactions
+  const dir = mkdtempSync(join(tmpdir(), 'campaign-pub-journal-'));
+  const publicationPath = join(dir, 'publication.json');
+  writeFileSync(
+    publicationPath,
+    JSON.stringify({ repositoryOwner: 'ospex-org', repositoryName: 'ospex-benchmark', path: 'manifests/campaign.json', commitSha: 'a'.repeat(40) }),
+  );
+  const d = deps({
+    auth,
+    confirm: NEVER_PROMPT,
+    resolvePublication: async () => {
+      throw new Error('resolver unreachable');
+    },
+  });
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath, publicationPath }), d)),
+  );
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /publication evidence REFUSED/);
+  assert.ok(
+    d.tickJournal.calls.some((c) => c.startsWith('finish:71:publication_refused:')),
+    `the refusal is a journaled outcome; calls: ${d.tickJournal.calls.join(' | ')}`,
+  );
+  assert.deepEqual(auth.calls, [], 'refused before the authorization read');
+});
+
+test("the tick's journal read failure is LOUD — a broken journal is never read as a clear schedule", async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.tickJournal.entries = async (): Promise<never> => {
+    throw new Error('journal read: connection reset');
+  };
+  await assert.rejects(
+    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d))),
+    /journal read: connection reset/,
+  );
+  assert.deepEqual(auth.calls.filter((c) => c.startsWith('read:')), [], 'nothing proceeded past the broken read');
+});
+
+test('an unusable publication descriptor refuses BEFORE the store: no open, no journal trace', async () => {
+  const { manifestPath, auth } = await armed();
+  const dir = mkdtempSync(join(tmpdir(), 'campaign-pub-unusable-'));
+  const publicationPath = join(dir, 'publication.json');
+  writeFileSync(publicationPath, '{"not":"a descriptor"}');
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath, publicationPath }), d)),
+  );
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /publication descriptor .* is unusable/);
+  assert.deepEqual(d.opens, { store: 0, reads: 0 }, 'a configuration error never opens the store');
+  assert.deepEqual(d.tickJournal.calls, [], 'and leaves no journal trace — the documented pre-journal bound');
+});
+
+test('resume: refuses while an IN-FLIGHT tick has no outcome to review — nothing may be bounded out of the window unseen', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.tickJournal.entriesValue = [
+    // The halt cause the operator is reviewing...
+    { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: null },
+    // ...and an overlapping tick still inside its deadline, outcome pending.
+    { id: 5, kind: 'tick', startedAt: new Date(NOW - 1_000).toISOString(), finishedAt: null, outcome: null, detail: null },
+  ];
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => resumeCampaign(options({ command: 'resume', manifestPath }), d)),
+  );
+  assert.equal(code, 2, 'refused — no prompt was reached (the confirm seam throws if touched)');
+  assert.match(errors.join('\n'), /refusing to resume: tick 5 .* still in flight/);
+  assert.ok(!d.tickJournal.calls.some((c) => c.startsWith('resume:')), 'no acknowledgment was written');
 });
 
 test('resume: EOF and a negative answer both refuse without writing', async () => {

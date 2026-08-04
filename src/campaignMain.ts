@@ -19,9 +19,10 @@ import type { ManifestPublicationV1, ResolvedPublication } from './manifestPubli
 import { instantMs, isParseableInstant } from './time.js';
 import {
   HEALTHY_TICK_OUTCOMES,
-  SCHEDULE_WINDOW_LIMIT,
+  readScheduleEntries,
   resolveScheduleState,
   tickDeadlineMs,
+  unreviewedInFlightTick,
 } from './campaignSchedule.js';
 import type { CampaignTickJournalPort, CampaignTickOutcome } from './campaignSchedule.js';
 import type { UnresolvedFireRead } from './escalationLatch.js';
@@ -120,11 +121,13 @@ unresolved fire — pending with no live lease, the durable state an escalated, 
 or never-settled dispatch leaves behind — refuses the tick (exit 2) until the campaign
 is stopped and investigated.
 Every substantive tick writes a TWO-PHASE JOURNAL ENTRY (begin, then finish with its
-outcome), and before anything else a tick evaluates the SCHEDULE HALT RULE over that
-journal: a prior tick that finished outside the healthy set, or that started and never
-finished within the tick deadline (the crash shape), refuses this tick (exit 2, writing
-nothing) until an operator runs campaign:resume. A finish-write failure leaves the
-unfinished entry that halts the schedule — failing toward review, never past it.
+outcome), and before any journal write, authorization read, or latch read a tick
+evaluates the SCHEDULE HALT RULE over that
+journal: a prior tick that finished outside the healthy set — wherever it sits in the
+window — or that started and never finished within the tick deadline (the crash shape),
+refuses this tick (exit 2, writing no journal entry and touching no campaign state)
+until an operator runs campaign:resume. A finish-write failure leaves the unfinished
+entry that halts the schedule once it passes the tick deadline — failing toward review.
 Never prompts, never falls back to mock. Exits 3 when the authorization is valid
 (activation refused), 2 when the schedule is halted, no live authorization covers the
 cohort, the publication evidence refuses, or an unresolved fire holds it, 1 on a loud
@@ -277,7 +280,7 @@ const ACTIVATION_DISABLED =
 
 export interface CampaignDeps {
   /** The MUTATING open: applies the idempotent schema/function bootstrap and constructs the
-   *  full store. Owned by the commands that are allowed to write (arm, tick, stop). */
+   *  full store. Owned by the commands that are allowed to write (arm, tick, resume, stop). */
   readonly openStore: (databaseUrl: string) => Promise<{
     store: AtomicStore;
     authorizations: CampaignAuthorizationPort;
@@ -636,12 +639,13 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
   }
   const { authorizations, unresolvedFires, tickJournal, close } = await deps.openStore(databaseUrl);
   try {
-    // The SCHEDULE HALT RULE, before anything else: a prior tick that finished outside
-    // the healthy set, or that started and never finished within the tick deadline,
-    // halts scheduling until an operator resumes. A halted tick writes NOTHING — its
-    // refusal is derived state, so repeated cron firings cannot bury the entry that
-    // needs review. A journal read failure propagates (loud exit 1, never read as clear).
-    const journalEntries = await tickJournal.entries(booted.cohortId, SCHEDULE_WINDOW_LIMIT);
+    // The SCHEDULE HALT RULE, before any journal write, authorization read, or latch
+    // read: a prior tick that finished outside the healthy set, or that started and never
+    // finished within the tick deadline, halts scheduling until an operator resumes. A
+    // halted tick writes no journal entry and touches no campaign state — its refusal is
+    // derived, so repeated cron firings cannot bury the entry that needs review. A
+    // journal read failure propagates (loud exit 1, never read as clear).
+    const journalEntries = await readScheduleEntries(tickJournal, booted.cohortId);
     const schedule = resolveScheduleState({
       entries: journalEntries,
       nowMs: deps.now(),
@@ -879,7 +883,7 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
 
     // The per-tick half of the monitoring surface: the durable journal, and the schedule
     // state evaluated by the SAME pure rule the tick refuses on.
-    const journalEntries = await tickJournal.entries(booted.cohortId, SCHEDULE_WINDOW_LIMIT);
+    const journalEntries = await readScheduleEntries(tickJournal, booted.cohortId);
     const lastTick = journalEntries.find((entry) => entry.kind === 'tick');
     if (lastTick === undefined) {
       printLine('  ticks  none recorded');
@@ -963,15 +967,29 @@ export async function resumeCampaign(options: CampaignOptions, deps: CampaignDep
   }
   const { tickJournal, close } = await deps.openStore(databaseUrl);
   try {
-    const journalEntries = await tickJournal.entries(booted.cohortId, SCHEDULE_WINDOW_LIMIT);
+    const journalEntries = await readScheduleEntries(tickJournal, booted.cohortId);
+    const deadlineMs = tickDeadlineMs(booted.manifest);
     const schedule = resolveScheduleState({
       entries: journalEntries,
       nowMs: deps.now(),
-      deadlineMs: tickDeadlineMs(booted.manifest),
+      deadlineMs,
       healthyOutcomes: HEALTHY_TICK_OUTCOMES,
     });
     if (schedule.kind === 'clear') {
       printError(`nothing to resume — the schedule is not halted for cohort ${booted.cohortId}`);
+      return 2;
+    }
+    // An IN-FLIGHT tick has no outcome to review yet, and the resume row would bound its
+    // entry out of the halt window forever — so its eventual crash or failure could never
+    // halt the schedule. Refuse until it finishes or passes the tick deadline (at which
+    // point it is the stale crash shape the operator is reviewing).
+    const inFlight = unreviewedInFlightTick({ entries: journalEntries, nowMs: deps.now(), deadlineMs });
+    if (inFlight !== null) {
+      printError(
+        `refusing to resume: tick ${inFlight.id} (started ${inFlight.startedAt}) is still in flight — ` +
+          'its outcome does not exist yet, and resuming now would exclude it from the halt window ' +
+          'forever. Wait for it to finish or to pass the tick deadline, then resume.',
+      );
       return 2;
     }
     printLine(`RESUME SCHEDULING — cohort ${booted.cohortId}`);

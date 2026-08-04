@@ -4,8 +4,10 @@ import {
   HEALTHY_TICK_OUTCOMES,
   OPERATOR_RESUMED,
   SCHEDULE_WINDOW_LIMIT,
+  readScheduleEntries,
   resolveScheduleState,
   tickDeadlineMs,
+  unreviewedInFlightTick,
 } from './campaignSchedule.js';
 import type { ScheduleEntry } from './campaignSchedule.js';
 import { buildCampaignManifest } from './campaignProfile.js';
@@ -93,6 +95,31 @@ test('a crashed tick BURIED under later healthy ticks still halts — the sweep 
   if (state.kind === 'halted') assert.match(state.why, /tick 1 started .* never finished/);
 });
 
+test('a non-healthy FINISHED outcome BURIED under a later healthy finish still halts — the overlap shape', () => {
+  // Slow tick 1 finished loud_failure AFTER fast tick 2 already finished healthy: the
+  // journal orders by id, so the failure sits below the healthy finish. A latest-only
+  // check would read this clear forever; the sweep covers every finished outcome.
+  const entries = [
+    entry({ id: 1, startedAt: '2026-08-05T00:00:00.000Z', finishedAt: '2026-08-05T03:00:00.000Z', outcome: 'loud_failure' }),
+    entry({ id: 2, startedAt: '2026-08-05T00:30:00.000Z', finishedAt: '2026-08-05T00:31:00.000Z' }),
+  ];
+  const state = resolve(entries);
+  assert.equal(state.kind, 'halted');
+  if (state.kind === 'halted') assert.match(state.why, /tick 1 finished .* "loud_failure"/);
+});
+
+test('TWO resumes: only the NEWEST bounds the window — reviewed-then-rehalted-then-reviewed history stays clear', () => {
+  // [bad, resume, bad, resume]: a bound at the OLDEST resume would leave the second bad
+  // tick in the window and halt; only the newest-resume bound reads this clear.
+  const entries = [
+    entry({ id: 1, outcome: 'loud_failure' }),
+    entry({ id: 2, kind: 'resume', outcome: OPERATOR_RESUMED }),
+    entry({ id: 3, outcome: 'escalation_latched' }),
+    entry({ id: 4, kind: 'resume', outcome: OPERATOR_RESUMED }),
+  ];
+  assert.deepEqual(resolve(entries), { kind: 'clear' });
+});
+
 test('an operator resume bounds the window: bad history BEFORE it clears; anything bad AFTER it halts again', () => {
   const resumeRow = entry({ id: 2, kind: 'resume', outcome: OPERATOR_RESUMED });
   assert.deepEqual(resolve([entry({ id: 1, outcome: 'loud_failure' }), resumeRow]), { kind: 'clear' });
@@ -114,6 +141,46 @@ test('order-independence: the journal id is the append authority, whatever order
   ];
   // Sorted by id, the crash (1) precedes the resume (2): reviewed history, clear.
   assert.deepEqual(resolve(shuffled), { kind: 'clear' });
+});
+
+test('unreviewedInFlightTick: a fresh unfinished tick blocks a resume; stale, finished, pre-resume, and unreadable shapes behave as stated', () => {
+  const fresh = entry({ id: 5, startedAt: new Date(NOW - 1_000).toISOString(), finishedAt: null, outcome: null });
+  const stale = entry({ id: 6, startedAt: new Date(NOW - DEADLINE).toISOString(), finishedAt: null, outcome: null });
+  const args = (entries: readonly ScheduleEntry[]) => ({ entries, nowMs: NOW, deadlineMs: DEADLINE });
+
+  assert.equal(unreviewedInFlightTick(args([fresh]))?.id, 5, 'a fresh unfinished tick is in flight — unreviewable');
+  assert.equal(unreviewedInFlightTick(args([stale])), null, 'a stale entry is the reviewed crash shape — resume may acknowledge it');
+  assert.equal(unreviewedInFlightTick(args([entry({ id: 7 })])), null, 'a finished tick has an outcome — nothing pending');
+  assert.equal(
+    unreviewedInFlightTick(args([fresh, entry({ id: 9, kind: 'resume', outcome: OPERATOR_RESUMED })])),
+    null,
+    'an in-flight entry BEFORE the last resume is outside the window',
+  );
+  const unreadable = unreviewedInFlightTick(args([entry({ id: 8, startedAt: 'garbage', finishedAt: null, outcome: null })]));
+  assert.equal(unreadable?.id, 8, 'an unreadable age cannot prove staleness — fail closed, counts as in flight');
+  assert.throws(() => unreviewedInFlightTick({ entries: [], nowMs: Number.NaN, deadlineMs: DEADLINE }), /finite clock/);
+});
+
+test('readScheduleEntries merges the recent window with the dedicated unfinished read, deduplicated by id', async () => {
+  const recent = [entry({ id: 60 }), entry({ id: 59, finishedAt: null, outcome: null })];
+  const buried = entry({ id: 3, startedAt: '2026-08-05T00:00:00.000Z', finishedAt: null, outcome: null });
+  const calls: string[] = [];
+  const journal = {
+    async entries(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
+      calls.push(`entries:${cohortId}:${limit}`);
+      return recent;
+    },
+    async unfinishedTicks(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
+      calls.push(`unfinished:${cohortId}:${limit}`);
+      return [recent[1]!, buried]; // one overlap, one entry the recent window lost
+    },
+  };
+  const merged = await readScheduleEntries(journal, 'c'.repeat(64));
+  assert.deepEqual(calls, [`entries:${'c'.repeat(64)}:${SCHEDULE_WINDOW_LIMIT}`, `unfinished:${'c'.repeat(64)}:${SCHEDULE_WINDOW_LIMIT}`]);
+  assert.deepEqual(merged.map((e) => e.id).sort((a, b) => a - b), [3, 59, 60], 'both reads contribute; the overlap appears once');
+  // The merged input is what lets the halt rule see the buried crash.
+  const state = resolveScheduleState({ entries: merged, nowMs: NOW, deadlineMs: DEADLINE, healthyOutcomes: HEALTHY_TICK_OUTCOMES });
+  assert.equal(state.kind, 'halted');
 });
 
 test('fail closed on what cannot be read: an unreadable start instant halts; a broken clock or deadline throws', () => {

@@ -60,21 +60,40 @@ export class SqlCampaignTickJournalPort implements CampaignTickJournalPort {
         limit $2`,
       [cohortId, limit],
     );
-    return rows.map((row) => {
-      const kind = row['kind'];
-      if (kind !== 'tick' && kind !== 'resume') {
-        throw new Error(`tick journal read: kind is neither tick nor resume: ${String(kind)}`);
-      }
-      return {
-        id: asEntryId(row['id']),
-        kind,
-        startedAt: asInstant('started_at', row['started_at']),
-        finishedAt: row['finished_at'] === null || row['finished_at'] === undefined ? null : asInstant('finished_at', row['finished_at']),
-        outcome: asTextOrNull('outcome', row['outcome']),
-        detail: asTextOrNull('detail', row['detail']),
-      };
-    });
+    return rows.map(asScheduleEntry);
   }
+
+  async unfinishedTicks(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new Error(`tick journal read requires a positive entry limit, got ${String(limit)}`);
+    }
+    const rows = await this.query(
+      `select id, kind, started_at, finished_at, outcome, detail
+         from store.campaign_ticks
+        where cohort_id = $1
+          and kind = 'tick'
+          and finished_at is null
+        order by id desc
+        limit $2`,
+      [cohortId, limit],
+    );
+    return rows.map(asScheduleEntry);
+  }
+}
+
+function asScheduleEntry(row: Record<string, unknown>): ScheduleEntry {
+  const kind = row['kind'];
+  if (kind !== 'tick' && kind !== 'resume') {
+    throw new Error(`tick journal read: kind is neither tick nor resume: ${String(kind)}`);
+  }
+  return {
+    id: asEntryId(row['id']),
+    kind,
+    startedAt: asInstant('started_at', row['started_at']),
+    finishedAt: row['finished_at'] === null || row['finished_at'] === undefined ? null : asInstant('finished_at', row['finished_at']),
+    outcome: asTextOrNull('outcome', row['outcome']),
+    detail: asTextOrNull('detail', row['detail']),
+  };
 }
 
 function asEntryId(value: unknown): number {

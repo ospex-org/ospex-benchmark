@@ -2,36 +2,46 @@ import { instantMs, isParseableInstant } from './time.js';
 import type { CohortManifestV1 } from './manifest.js';
 
 /**
- * The scheduler's DURABLE halt semantics (docs/CAMPAIGN-ACTIVATION.md §"What the scheduler
- * itself must specify"): a scheduled campaign stops scheduling on any journaled tick
- * outcome outside the healthy set, and on any tick that started and never finished — the
- * unknown-outcome crash shape — until a human resumes it.
+ * The scheduler's DURABLE halt semantics (docs/CAMPAIGN-ACTIVATION.md §"The scheduler
+ * contract"): a scheduled campaign stops scheduling on any journaled tick outcome outside
+ * the healthy set, and on any tick that started and never finished — the unknown-outcome
+ * crash shape — until a human resumes it.
  *
  * Cron cannot be trusted to stop itself, so the rule is enforced by the TICK, from the
- * store: every substantive tick journals a two-phase entry (begin → finish with a semantic
- * outcome), and before doing anything else a tick evaluates this rule over the journal and
- * refuses to proceed while it reports halted. That makes the halt durable (it survives
- * restarts and reaches every box that reaches the store), and it makes a journal-write
- * failure safe in the conservative direction: a tick that could not finish its entry
- * leaves exactly the stale unfinished row that halts the schedule until a human looks.
+ * store: every substantive tick journals a two-phase entry (begin → finish with a
+ * semantic outcome), and a tick evaluates this rule before any journal write,
+ * authorization read, or latch read, refusing to proceed while it reports halted. That
+ * makes the halt durable (it survives restarts and reaches every box that reaches the
+ * store), and it makes a journal-write failure safe in the conservative direction: a tick
+ * that could not finish its entry leaves the stale unfinished row that halts the schedule
+ * once the entry passes the tick deadline — until then it reads as in-flight, so the halt
+ * arrives within one deadline, not instantly.
  *
  * The rule, over the entries SINCE THE LAST OPERATOR RESUME (newest first by journal id):
  *   - any tick entry that is unfinished and older than the tick deadline → HALTED
  *     (started, never finished — the crash shape; a fresh unfinished entry is an
  *     in-flight overlapping tick and does not halt);
- *   - the latest FINISHED tick entry's outcome outside `healthyOutcomes` → HALTED —
- *     including any outcome string this build does not know (fail closed: a journal
- *     written by a different build is operator-review territory, never silently healthy);
+ *   - ANY finished tick entry's outcome outside `healthyOutcomes` → HALTED — the sweep
+ *     covers the whole window, so an overlapping slow tick's failure cannot be buried
+ *     under a faster tick's healthy finish — and any outcome string this build does not
+ *     know halts too (fail closed: a journal written by a different build is
+ *     operator-review territory, never silently healthy);
  *   - otherwise CLEAR. An operator resume bounds the window: entries before it are
- *     history, already reviewed.
+ *     history, already reviewed ({@link unreviewedInFlightTick} is what keeps that
+ *     premise true — a resume refuses while an in-flight entry's outcome is still
+ *     pending).
  *
- * Two stated bounds. The rule sees the entries it is given (callers read the most recent
- * `SCHEDULE_WINDOW_LIMIT`); an unfinished entry buried deeper than that is outside the
- * schedule window — the escalation latch, not the journal, is the money backstop for an
- * old crashed dispatch (its unresolved fire latches every admission). And a tick that
- * fails before it can write its begin entry leaves no journal trace — such a tick cannot
- * reach a dispatch either (every dispatch path needs the same store), so it is
- * self-limiting and surfaces through its process exit code and monitoring.
+ * Stated bounds. Callers assemble the rule's input with {@link readScheduleEntries} — the
+ * most recent `SCHEDULE_WINDOW_LIMIT` entries plus every unfinished tick — so a crashed
+ * tick still inside its deadline cannot be pushed out of view by a fast cron cadence; the
+ * escalation latch remains the money backstop for anything the journal window cannot see.
+ * A tick that fails before it can write its begin entry leaves no journal trace — such a
+ * tick cannot reach a dispatch either (every dispatch path needs the same store), so it
+ * is self-limiting and surfaces through its process exit code and monitoring. Staleness
+ * compares the instant the RUNNER wrote at begin against the EVALUATOR's clock: on the
+ * single-box cron this build targets, NTP-scale skew disappears into the deadline's slack
+ * (a runner clock ahead by S delays crash detection by S; behind, it halts early — the
+ * conservative direction).
  */
 
 /** One journal row, as read back. `outcome` is deliberately a plain string on the read
@@ -83,6 +93,9 @@ export interface CampaignTickJournalPort {
   finish(entryId: number, outcome: CampaignTickOutcome, detail: string | null, finishedAtIso: string): Promise<void>;
   resume(cohortId: string, atIso: string, detail: string | null): Promise<void>;
   entries(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]>;
+  /** Every unfinished tick entry, newest first, same bound — the read a fast cron cannot
+   *  push a not-yet-stale crash out of (see {@link readScheduleEntries}). */
+  unfinishedTicks(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]>;
 }
 
 /**
@@ -123,9 +136,7 @@ export function resolveScheduleState(input: {
   if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) {
     throw new Error(`the schedule halt rule requires a positive tick deadline, got ${deadlineMs}`);
   }
-  const ordered = [...entries].sort((a, b) => b.id - a.id);
-  const resumeIndex = ordered.findIndex((entry) => entry.kind === 'resume');
-  const window = resumeIndex === -1 ? ordered : ordered.slice(0, resumeIndex);
+  const window = windowSinceLastResume(entries);
 
   // ANY stale unfinished tick in the window halts — not just the latest entry, so a
   // crashed tick buried under later healthy ticks still surfaces for review.
@@ -148,14 +159,75 @@ export function resolveScheduleState(input: {
     }
   }
 
-  const latestFinished = window.find((entry) => entry.kind === 'tick' && entry.finishedAt !== null);
-  if (latestFinished !== undefined && !healthyOutcomes.includes(latestFinished.outcome ?? '')) {
-    return {
-      kind: 'halted',
-      why:
-        `tick ${latestFinished.id} finished ${latestFinished.finishedAt} with outcome ` +
-        `${JSON.stringify(latestFinished.outcome)} — operator review required before scheduling continues`,
-    };
+  // ANY finished tick outcome in the window outside the healthy set halts — newest first,
+  // so the reported entry is the most recent violation. A latest-only check would let an
+  // overlapping slow tick's failure be buried forever under a faster tick's healthy
+  // finish; every outcome in the window gets reviewed, whatever order it landed in.
+  for (const entry of window) {
+    if (entry.kind !== 'tick' || entry.finishedAt === null) continue;
+    if (!healthyOutcomes.includes(entry.outcome ?? '')) {
+      return {
+        kind: 'halted',
+        why:
+          `tick ${entry.id} finished ${entry.finishedAt} with outcome ` +
+          `${JSON.stringify(entry.outcome)} — operator review required before scheduling continues`,
+      };
+    }
   }
   return { kind: 'clear' };
+}
+
+function windowSinceLastResume(entries: readonly ScheduleEntry[]): readonly ScheduleEntry[] {
+  const ordered = [...entries].sort((a, b) => b.id - a.id);
+  const resumeIndex = ordered.findIndex((entry) => entry.kind === 'resume');
+  return resumeIndex === -1 ? ordered : ordered.slice(0, resumeIndex);
+}
+
+/**
+ * The window's IN-FLIGHT unfinished tick, if any: an entry whose outcome does not exist
+ * yet and therefore cannot have been reviewed. `campaign:resume` refuses while one exists —
+ * a resume row appended now would bound that entry out of the halt window forever, so its
+ * eventual crash or failure could never halt the schedule. An unfinished entry whose
+ * start instant cannot be read counts as in-flight (fail closed: its age cannot prove it
+ * stale); an entry at or past the deadline is the stale crash shape — already a halt
+ * cause the operator is reviewing, so it does not block the resume that acknowledges it.
+ * Stated bound: a tick that outlives its deadline and finishes later lands before the
+ * resume boundary — the deadline is the operating contract for how long a tick may run.
+ */
+export function unreviewedInFlightTick(input: {
+  entries: readonly ScheduleEntry[];
+  nowMs: number;
+  deadlineMs: number;
+}): ScheduleEntry | null {
+  const { entries, nowMs, deadlineMs } = input;
+  if (!Number.isFinite(nowMs)) {
+    throw new Error('the in-flight check requires a finite clock reading — a non-finite reading fails closed');
+  }
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) {
+    throw new Error(`the in-flight check requires a positive tick deadline, got ${deadlineMs}`);
+  }
+  for (const entry of windowSinceLastResume(entries)) {
+    if (entry.kind !== 'tick' || entry.finishedAt !== null) continue;
+    if (!isParseableInstant(entry.startedAt)) return entry; // unreadable age: fail closed, in-flight
+    if (nowMs - instantMs(entry.startedAt) < deadlineMs) return entry;
+  }
+  return null;
+}
+
+/**
+ * Read the halt rule's inputs: the most recent {@link SCHEDULE_WINDOW_LIMIT} entries PLUS
+ * every unfinished tick entry (newest first, same bound), merged by id. The dedicated
+ * unfinished read is what a fast cron cannot outrun: without it, a crashed tick still
+ * inside its deadline could be pushed past the recent-entries window by enough healthy
+ * ticks and then never be seen again once stale. Both reads reject loudly on failure.
+ */
+export async function readScheduleEntries(
+  journal: Pick<CampaignTickJournalPort, 'entries' | 'unfinishedTicks'>,
+  cohortId: string,
+): Promise<readonly ScheduleEntry[]> {
+  const recent = await journal.entries(cohortId, SCHEDULE_WINDOW_LIMIT);
+  const unfinished = await journal.unfinishedTicks(cohortId, SCHEDULE_WINDOW_LIMIT);
+  const byId = new Map<number, ScheduleEntry>();
+  for (const entry of [...recent, ...unfinished]) byId.set(entry.id, entry);
+  return [...byId.values()];
 }

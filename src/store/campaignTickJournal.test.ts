@@ -110,6 +110,26 @@ test('entries: a non-positive or fractional limit is refused BEFORE any query; w
   await assert.rejects(scripted([{ ...base, kind: 'tick', outcome: 42 }]).port.entries(COHORT, 5), /neither text nor null/);
 });
 
+test('unfinishedTicks: the dedicated crash read — tick kind only, unfinished only, newest first, bounded', async () => {
+  const { port, calls } = scripted([
+    { id: '3', kind: 'tick', started_at: new Date('2026-08-05T00:00:00.000Z'), finished_at: null, outcome: null, detail: null },
+  ]);
+  assert.deepEqual(await port.unfinishedTicks(COHORT, 50), [
+    { id: 3, kind: 'tick', startedAt: '2026-08-05T00:00:00.000Z', finishedAt: null, outcome: null, detail: null },
+  ]);
+  const { sql, params } = calls[0]!;
+  assert.match(sql, /kind = 'tick'/);
+  assert.match(sql, /finished_at is null/);
+  assert.match(sql, /order by id desc/);
+  assert.match(sql, /limit \$2/);
+  assert.deepEqual(params, [COHORT, 50]);
+  for (const limit of [0, -1]) {
+    const bad = scripted([]);
+    await assert.rejects(bad.port.unfinishedTicks(COHORT, limit), /positive entry limit/);
+    assert.equal(bad.calls.length, 0);
+  }
+});
+
 test('a query failure propagates — never an empty (clear) journal', async () => {
   const failing: StoreQuery = async () => {
     throw new Error('connection reset');

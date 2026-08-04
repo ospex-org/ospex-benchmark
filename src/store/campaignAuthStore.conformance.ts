@@ -369,6 +369,12 @@ async function main(): Promise<void> {
     assert.equal(rows[0]!.finishedAt, '2026-08-05T02:00:00.000Z');
     assert.equal(rows[1]!.id, id2);
     assert.equal(rows[1]!.finishedAt, null);
+
+    // The dedicated crash read: exactly the unfinished tick — never resume rows, never
+    // finished ticks — and it empties once the entry finishes.
+    assert.deepEqual((await journal.unfinishedTicks(c, 10)).map((r) => r.id), [id2]);
+    await journal.finish(id2, 'validated_refused', null, '2026-08-05T03:00:00.000Z');
+    assert.deepEqual(await journal.unfinishedTicks(c, 10), []);
   });
 
   await check('READ-ONLY public CLI: campaign:status runs as a SELECT-only role and rewrites NO catalog state', async () => {
@@ -393,6 +399,12 @@ async function main(): Promise<void> {
     );
     const manifestPath = join(mkdtempSync(join(tmpdir(), 'campaign-ro-status-')), 'manifest.json');
     writeFileSync(manifestPath, built.bytes);
+
+    // Seed one finished healthy tick so the RO role provably SELECTs real journal rows
+    // (an empty journal would render the none-recorded branch without touching the table).
+    const journal = new SqlCampaignTickJournalPort(pgStoreQuery(pool));
+    const seededTick = await journal.begin(booted.cohortId, new Date(startMs).toISOString());
+    await journal.finish(seededTick, 'validated_refused', null, new Date(startMs + 1_000).toISOString());
 
     // A SELECT-only role: it cannot create schemas, tables, or functions — the exact
     // capability the monitoring read must not need.
@@ -440,7 +452,10 @@ async function main(): Promise<void> {
       out.includes('latch  clear — no unresolved fire'),
       `the escalation-latch read ran under the SELECT-only role; out=${out}`,
     );
-    assert.ok(out.includes('ticks  none recorded'), `the tick-journal read ran under the SELECT-only role; out=${out}`);
+    assert.ok(
+      out.includes(`ticks  last tick ${seededTick} started`) && out.includes('(validated_refused)'),
+      `the RO role SELECTed the real journal row; out=${out}`,
+    );
     assert.ok(out.includes('sched  clear — scheduling may continue'), `the schedule state rendered; out=${out}`);
     assert.ok(out.includes('next tick would AUTHORIZE'), `the verdict rendered; out=${out}`);
     assert.equal(await fingerprint(), before, 'the monitoring read rewrote NO store-function catalog row');

@@ -22,8 +22,10 @@ the refusal is not a flag, it is the absence of the paid path from the entrypoin
   every intermediate failure — including an authorizing write whose commit status was lost.
   A cohort is armed at most once, ever; another campaign is a new manifest and therefore a
   new cohortId.
-- **Ticking** (`campaign:tick`, unattended): evaluates the **schedule halt rule** first
-  (below — a halted schedule refuses, writing nothing), then journals a two-phase entry;
+- **Ticking** (`campaign:tick`, unattended): evaluates the **schedule halt rule** before
+  any journal write, authorization read, or latch read (below — a halted schedule
+  refuses, writing no journal entry and touching no campaign state), then journals a
+  two-phase entry;
   reads the durable record, validates liveness at the tick clock, exact binding to the
   booted manifest (identity, roster, price identity, every cap), and a fresh independent
   credential observation; checks the **durable escalation latch** (an unresolved fire —
@@ -128,30 +130,41 @@ the admission is refused and no provider call is reachable.
 - **Halt semantics — delivered, enforced by the tick itself.** Cron cannot be trusted to
   stop itself, so every substantive tick writes a **two-phase journal entry**
   (`store.campaign_ticks`: begin, then finish exactly once with a semantic outcome), and
-  before doing anything else a tick evaluates the halt rule (`campaignSchedule.ts`) over
-  the journal: a prior tick that finished outside the healthy set — including any outcome
-  this build does not recognize — or that started and never finished within the
+  before any journal write, authorization read, or latch read a tick evaluates the halt
+  rule (`campaignSchedule.ts`) over the journal: ANY prior tick in the window that
+  finished outside the healthy set — wherever it sits, so an overlapping slow tick's
+  failure cannot be buried under a faster tick's healthy finish, and including any
+  outcome this build does not recognize — or that started and never finished within the
   manifest-derived tick deadline (the crash shape, "unknown outcome") refuses this tick
-  (exit 2) until an operator resumes. A halted tick writes nothing, so repeated cron
-  firings cannot bury the entry that needs review; a journal FINISH failure leaves the
-  unfinished entry that halts the schedule — failing toward review, never past it. The
+  (exit 2) until an operator resumes. A halted tick writes no journal entry and touches
+  no campaign state, so repeated cron firings cannot bury the entry that needs review; a
+  journal FINISH failure leaves the unfinished entry that halts the schedule once it
+  passes the tick deadline — failing toward review. The
   healthy set in this build is exactly the structural refusal (`validated_refused`); the
   flip replaces it with the real dispatched outcome, landed together with the flip.
-  Two stated bounds: the halt window is the most recent 50 journal entries since the last
-  operator resume (the escalation latch — not the journal — is the money backstop for
-  anything older), and a tick that fails before its begin entry leaves no journal trace —
-  such a tick can reach no dispatch either, because every dispatch path needs the same
-  store it could not reach.
+  Stated bounds: the halt evaluation reads the most recent 50 journal entries since the
+  last operator resume PLUS every unfinished tick entry (a dedicated read, so a fast cron
+  cadence cannot push a not-yet-stale crash out of view; the escalation latch remains the
+  money backstop for anything the window cannot see). A tick that fails before its begin
+  entry leaves no journal trace: for store-class failures such a tick can reach no
+  dispatch either (every dispatch path needs the same store it could not reach), and the
+  pre-store configuration refusals — an unusable or all-zeros publication descriptor —
+  are pinned by test to open nothing and dispatch nothing; repeated pre-journal failures
+  surface only through the process exit code and its monitoring channel, never the
+  journal.
 - **Resuming is attended.** `campaign:resume` clears a halted schedule with the standard
   `[Y/n]` confirmation, appending an operator-acknowledgment entry that bounds the halt
-  window. It grants nothing else: the next tick still validates the authorization, the
-  publication evidence, and the escalation latch in full. A schedule that is not halted
-  has nothing to resume.
+  window. It refuses while an in-flight tick's outcome is still pending — a resume would
+  bound that entry out of the halt window before it could ever be reviewed — and it
+  grants nothing else: the next tick still validates the authorization, the publication
+  evidence, and the escalation latch in full. A schedule that is not halted has nothing
+  to resume.
 - **Notification and the kill lever — specified.** Monitoring runs `campaign:status`
   (read-only; its exit code mirrors the next tick's verdict, and the journal + schedule
   lines carry the state) and alerts on nonzero through whatever channel operates the
   monitoring box. The kill lever is `campaign:stop`, runnable from any box that reaches
-  the store — it does not need the runner.
+  the store and holds a copy of the campaign manifest (its bytes are the campaign's
+  identity) — it does not need the runner.
 - A status surface so monitoring reads state instead of inferring it from logs — both
   halves now exist: `campaign:status` (read-only) reports the authorization's
   classification, calls reserved vs cap and attempts actually started, reservations
