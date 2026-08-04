@@ -23,6 +23,12 @@ import { OPERATOR_RESUMED } from '../campaignSchedule.js';
  * only while the journal frontier (max id) still equals the exact frontier the operator's
  * review read — any tick that begins in between moves the frontier and the resume refuses
  * (`frontier_moved`) instead of silently bounding the new entry out of the halt window.
+ * The resume runs as a REAL transaction on one checked-out connection, taking the lock as
+ * its own command and only then running the CAS as a second command: under READ COMMITTED
+ * each command snapshots at its own start, so the CAS sees every row committed by the
+ * begin that held the lock. A single statement with the lock inline cannot give that —
+ * its snapshot is taken before it blocks on the lock, so a raced begin's committed row
+ * could stay invisible to the frontier compare it finishes evaluating afterwards.
  *
  * Wire care: `id` arrives from `pg` as a bigint STRING (plain reads) or a JSON number
  * (the window read); timestamps arrive as `Date` (plain reads) or as `store._iso` text
@@ -31,8 +37,54 @@ import { OPERATOR_RESUMED } from '../campaignSchedule.js';
  * build reaches the halt rule (which fails closed on outcomes it does not recognize)
  * instead of breaking the read.
  */
+/** One checked-out connection, usable for several commands in one transaction. */
+export interface PgTransactionClient {
+  query(sql: string, params: readonly unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>;
+  release(): void;
+}
+
+/** The minimal pool shape the transactor needs — structural, so `pg` stays a
+ *  runtime-wiring dependency here exactly as it is for `pgStoreQuery`. */
+export interface PgPoolLike {
+  connect(): Promise<PgTransactionClient>;
+}
+
+/** Run several commands on ONE checked-out connection inside BEGIN … COMMIT, rolling back
+ *  on every error. A `Pool.query` sequence cannot stand in for this: successive calls may
+ *  run on different connections, and an advisory xact lock taken on one of them guards
+ *  nothing on the next. */
+export interface StoreTransactor {
+  transaction<T>(fn: (query: StoreQuery) => Promise<T>): Promise<T>;
+}
+
+export function pgStoreTransactor(pool: PgPoolLike): StoreTransactor {
+  return {
+    async transaction<T>(fn: (query: StoreQuery) => Promise<T>): Promise<T> {
+      const client = await pool.connect();
+      try {
+        await client.query('begin isolation level read committed', []);
+        const result = await fn(async (sql, params) => (await client.query(sql, params)).rows);
+        await client.query('commit', []);
+        return result;
+      } catch (error) {
+        try {
+          await client.query('rollback', []);
+        } catch {
+          // The primary error stands; the released connection is discarded or reset by the pool.
+        }
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+  };
+}
+
 export class SqlCampaignTickJournalPort implements CampaignTickJournalPort {
-  constructor(private readonly query: StoreQuery) {}
+  constructor(
+    private readonly query: StoreQuery,
+    private readonly transactor: StoreTransactor,
+  ) {}
 
   async begin(cohortId: string, startedAtIso: string): Promise<number> {
     // The per-cohort advisory xact lock (released at this autocommit statement's end)
@@ -70,19 +122,23 @@ export class SqlCampaignTickJournalPort implements CampaignTickJournalPort {
     if (!Number.isSafeInteger(expectedFrontierId) || expectedFrontierId < 0) {
       throw new Error(`resume requires the reviewed journal frontier id, got ${String(expectedFrontierId)}`);
     }
-    // The frontier CAS, under the same per-cohort advisory lock `begin` takes: the
-    // acknowledgment commits only while max(id) still equals the exact frontier the
-    // operator's review read. Zero rows = the journal advanced (a tick began, finished,
-    // or another resume landed) — nothing is written, the operator reviews again.
-    const rows = await this.query(
-      `insert into store.campaign_ticks (cohort_id, kind, started_at, finished_at, outcome, detail)
+    // A REAL transaction on one checked-out connection. The per-cohort advisory lock is
+    // its OWN command: when it returns, any `begin` that held the lock has committed (or
+    // rolled back). Only THEN does the frontier CAS run, as a second command — under READ
+    // COMMITTED its snapshot is taken at ITS start, after the lock, so a raced begin's
+    // row is visible to the max(id) compare. Zero rows = the journal advanced (a tick
+    // began, or another resume landed) — nothing is written, the operator reviews again.
+    return await this.transactor.transaction(async (query) => {
+      await query('select pg_advisory_xact_lock(hashtext($1))', [cohortId]);
+      const rows = await query(
+        `insert into store.campaign_ticks (cohort_id, kind, started_at, finished_at, outcome, detail)
        select $1, 'resume', $2::timestamptz, $2::timestamptz, $3, $4
-         from (select pg_advisory_xact_lock(hashtext($1))) as serialize
         where (select coalesce(max(id), 0) from store.campaign_ticks where cohort_id = $1) = $5
        returning id`,
-      [cohortId, atIso, OPERATOR_RESUMED, detail, expectedFrontierId],
-    );
-    return rows.length > 0 ? 'resumed' : 'frontier_moved';
+        [cohortId, atIso, OPERATOR_RESUMED, detail, expectedFrontierId],
+      );
+      return rows.length > 0 ? 'resumed' : 'frontier_moved';
+    });
   }
 
   async scheduleWindow(cohortId: string, healthyOutcomes: readonly string[]): Promise<ScheduleWindow> {

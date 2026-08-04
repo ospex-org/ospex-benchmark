@@ -74,7 +74,8 @@ export const OPERATOR_RESUMED = 'operator_resumed';
 /** The outcomes a scheduler may follow with another tick. Everything else halts. */
 export const HEALTHY_TICK_OUTCOMES: readonly string[] = Object.freeze(['validated_refused']);
 
-/** How many journal entries the halt evaluation reads (newest first). */
+/** How many journal entries the bounded DISPLAY read returns (newest first). Display
+ *  only: the halt evaluation reads the unbounded `scheduleWindow`, never this. */
 export const SCHEDULE_WINDOW_LIMIT = 50;
 
 export type ScheduleState =
@@ -227,4 +228,3 @@ export function unreviewedInFlightTick(input: {
   }
   return null;
 }
-

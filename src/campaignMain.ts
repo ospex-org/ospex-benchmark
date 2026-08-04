@@ -1016,8 +1016,8 @@ export async function resumeCampaign(options: CampaignOptions, deps: CampaignDep
       return 2;
     }
     // The CONDITIONAL append: commits only while the journal frontier still equals the
-    // exact frontier this review read. Any tick that began (or finished, or any other
-    // resume) in the meantime moves the frontier — nothing is written, and the operator
+    // exact frontier this review read. Any tick that began (or any other resume that
+    // landed) in the meantime moves the frontier — nothing is written, and the operator
     // reviews the new state instead of silently bounding it out of the halt window.
     const outcome = await tickJournal.resume(booted.cohortId, new Date(deps.now()).toISOString(), schedule.why, frontierId);
     if (outcome === 'frontier_moved') {
@@ -1085,12 +1085,12 @@ const PRODUCTION_DEPS: CampaignDeps = {
       throw error;
     }
     const query = pgStoreQuery(pool);
-    const { SqlCampaignTickJournalPort } = await import('./store/campaignTickJournal.js');
+    const { SqlCampaignTickJournalPort, pgStoreTransactor } = await import('./store/campaignTickJournal.js');
     return {
       store: new SqlAtomicStore(query),
       authorizations: new SqlCampaignAuthorizationPort(query),
       unresolvedFires: new SqlUnresolvedFireReadPort(query),
-      tickJournal: new SqlCampaignTickJournalPort(query),
+      tickJournal: new SqlCampaignTickJournalPort(query, pgStoreTransactor(pool)),
       close: () => pool.end(),
     };
   },
@@ -1105,12 +1105,14 @@ const PRODUCTION_DEPS: CampaignDeps = {
     // through this path in the future is refused by PostgreSQL rather than trusted to prose.
     const pool = new Pool({ connectionString: databaseUrl, options: '-c default_transaction_read_only=on' });
     const query = pgStoreQuery(pool);
-    const { SqlCampaignTickJournalPort } = await import('./store/campaignTickJournal.js');
+    const { SqlCampaignTickJournalPort, pgStoreTransactor } = await import('./store/campaignTickJournal.js');
     return {
       authorizations: new SqlCampaignAuthorizationPort(query),
       statusReads: new SqlCampaignStatusReadPort(query),
       unresolvedFires: new SqlUnresolvedFireReadPort(query),
-      tickJournal: new SqlCampaignTickJournalPort(query),
+      // Status never resumes; the transactor is required by the port's shape, and the
+      // server-enforced read-only session refuses any write it could ever carry.
+      tickJournal: new SqlCampaignTickJournalPort(query, pgStoreTransactor(pool)),
       close: () => pool.end(),
     };
   },

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SqlCampaignTickJournalPort } from './campaignTickJournal.js';
+import { SqlCampaignTickJournalPort, pgStoreTransactor } from './campaignTickJournal.js';
+import type { PgTransactionClient, StoreTransactor } from './campaignTickJournal.js';
 import type { StoreQuery } from './atomicStore.js';
 
 /**
@@ -16,13 +17,28 @@ const COHORT = 'c'.repeat(64);
 function scripted(rows: ReadonlyArray<Record<string, unknown>>): {
   port: SqlCampaignTickJournalPort;
   calls: Array<{ sql: string; params: readonly unknown[] }>;
+  boundaries: string[];
 } {
   const calls: Array<{ sql: string; params: readonly unknown[] }> = [];
+  const boundaries: string[] = [];
   const query: StoreQuery = async (sql, params) => {
     calls.push({ sql, params });
     return rows;
   };
-  return { port: new SqlCampaignTickJournalPort(query), calls };
+  const transactor: StoreTransactor = {
+    async transaction<T>(fn: (q: StoreQuery) => Promise<T>): Promise<T> {
+      boundaries.push('begin');
+      try {
+        const result = await fn(query);
+        boundaries.push('commit');
+        return result;
+      } catch (error) {
+        boundaries.push('rollback');
+        throw error;
+      }
+    },
+  };
+  return { port: new SqlCampaignTickJournalPort(query, transactor), calls, boundaries };
 }
 
 test('begin: one INSERT of an unfinished tick entry, returning the id — bigint-string converted, surprises loud', async () => {
@@ -52,22 +68,65 @@ test('finish: one UPDATE guarded by `finished_at is null` — the FIRST finish w
   assert.deepEqual(params, [71, '2026-08-05T12:00:05.000Z', 'validated_refused', null]);
 });
 
-test('resume: a CONDITIONAL append — frontier CAS + the same per-cohort lock begin takes — mapping 1 row to resumed, 0 to frontier_moved', async () => {
+test('resume: ONE real transaction — the lock as its OWN command, THEN the frontier CAS — mapping 1 row to resumed, 0 to frontier_moved', async () => {
   const accepted = scripted([{ id: '9' }]);
   assert.equal(await accepted.port.resume(COHORT, '2026-08-05T13:00:00.000Z', 'reviewed the loud failure', 8), 'resumed');
-  const { sql, params } = accepted.calls[0]!;
+  assert.deepEqual(accepted.boundaries, ['begin', 'commit'], 'both commands run inside one transaction');
+  assert.equal(accepted.calls.length, 2, 'the lock and the CAS are SEPARATE commands');
+  // (1) The per-cohort lock first, alone: when it returns, a raced begin has committed.
+  assert.match(accepted.calls[0]!.sql, /^select pg_advisory_xact_lock\(hashtext\(\$1\)\)$/);
+  assert.deepEqual(accepted.calls[0]!.params, [COHORT]);
+  // (2) The frontier CAS second: its OWN snapshot, taken after the lock, sees that commit.
+  //     A single statement with the lock inline snapshots before blocking — the exact
+  //     shape the concurrent conformance regression proves buries a raced tick.
+  const { sql, params } = accepted.calls[1]!;
   assert.match(sql, /insert into store\.campaign_ticks/);
   assert.match(sql, /'resume'/);
-  // The serialization contract: the SAME advisory lock begin takes, and the frontier CAS —
-  // the append commits only while max(id) still equals the exact reviewed frontier.
-  assert.match(sql, /pg_advisory_xact_lock\(hashtext\(\$1\)\)/);
   assert.match(sql, /where \(select coalesce\(max\(id\), 0\) from store\.campaign_ticks where cohort_id = \$1\) = \$5/);
   assert.match(sql, /returning id/);
+  assert.doesNotMatch(sql, /pg_advisory_xact_lock/, 'the CAS command must NOT re-take the lock inline');
   assert.deepEqual(params, [COHORT, '2026-08-05T13:00:00.000Z', 'operator_resumed', 'reviewed the loud failure', 8]);
 
   assert.equal(await scripted([]).port.resume(COHORT, '2026-08-05T13:00:00.000Z', null, 8), 'frontier_moved');
-  await assert.rejects(scripted([]).port.resume(COHORT, '2026-08-05T13:00:00.000Z', null, -1), /reviewed journal frontier/);
-  await assert.rejects(scripted([]).port.resume(COHORT, '2026-08-05T13:00:00.000Z', null, 1.5), /reviewed journal frontier/);
+  const invalid = scripted([]);
+  await assert.rejects(invalid.port.resume(COHORT, '2026-08-05T13:00:00.000Z', null, -1), /reviewed journal frontier/);
+  await assert.rejects(invalid.port.resume(COHORT, '2026-08-05T13:00:00.000Z', null, 1.5), /reviewed journal frontier/);
+  assert.deepEqual(invalid.boundaries, [], 'an invalid frontier is refused before any transaction opens');
+});
+
+test('pgStoreTransactor: BEGIN → commands on ONE checked-out client → COMMIT; ROLLBACK + rethrow on error; always released', async () => {
+  const log: string[] = [];
+  const clientOf = (failOn?: string): PgTransactionClient => ({
+    async query(sql: string) {
+      log.push(sql);
+      if (failOn !== undefined && sql === failOn) throw new Error(`boom on ${sql}`);
+      return { rows: [{ ok: 1 }] };
+    },
+    release() {
+      log.push('release');
+    },
+  });
+
+  const happy = pgStoreTransactor({ connect: async () => (log.push('connect'), clientOf()) });
+  const result = await happy.transaction(async (query) => (await query('select 1', []))[0]);
+  assert.deepEqual(result, { ok: 1 }, "the caller's queries run through the client");
+  assert.deepEqual(log, ['connect', 'begin isolation level read committed', 'select 1', 'commit', 'release']);
+
+  log.length = 0;
+  const failing = pgStoreTransactor({ connect: async () => (log.push('connect'), clientOf('select 1')) });
+  await assert.rejects(failing.transaction(async (query) => query('select 1', [])), /boom on select 1/);
+  assert.deepEqual(log, ['connect', 'begin isolation level read committed', 'select 1', 'rollback', 'release']);
+
+  log.length = 0;
+  const doubleFault = pgStoreTransactor({ connect: async () => (log.push('connect'), clientOf('rollback')) });
+  await assert.rejects(
+    doubleFault.transaction(async () => {
+      throw new Error('primary fault');
+    }),
+    /primary fault/,
+    'a failing rollback never masks the primary error',
+  );
+  assert.deepEqual(log, ['connect', 'begin isolation level read committed', 'rollback', 'release']);
 });
 
 test('begin takes the same per-cohort advisory lock the resume CAS serializes on', async () => {
@@ -170,5 +229,10 @@ test('a query failure propagates — never an empty (clear) journal', async () =
   const failing: StoreQuery = async () => {
     throw new Error('connection reset');
   };
-  await assert.rejects(new SqlCampaignTickJournalPort(failing).entries(COHORT, 5), /connection reset/);
+  const neverTransacts: StoreTransactor = {
+    transaction(): Promise<never> {
+      throw new Error('unreached');
+    },
+  };
+  await assert.rejects(new SqlCampaignTickJournalPort(failing, neverTransacts).entries(COHORT, 5), /connection reset/);
 });
