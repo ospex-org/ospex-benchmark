@@ -35,7 +35,7 @@ import type { MarketKey } from './types.js';
  */
 
 /** Lowercase 64-hex sha256, required for every path-forming identifier. */
-const SHA256_HEX = /^[0-9a-f]{64}$/;
+export const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 /**
  * The RAW filesystem primitives the sink drives, in the order it drives them. The sink —

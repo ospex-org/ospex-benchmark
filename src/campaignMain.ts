@@ -17,6 +17,7 @@ import { askLiveConfirmation, observeRealAdapterCredentials } from './liveIntent
 import { PublicationError, parseManifestPublication, verifyPublication } from './manifestPublication.js';
 import type { ManifestPublicationV1, ResolvedPublication } from './manifestPublication.js';
 import { instantMs, isParseableInstant } from './time.js';
+import type { UnresolvedFireRead } from './escalationLatch.js';
 import type { AtomicStore } from './store/contract.js';
 import type { CampaignStatusReadPort } from './store/campaignStatusRead.js';
 
@@ -40,12 +41,14 @@ import type { CampaignStatusReadPort } from './store/campaignStatusRead.js';
  *              authority without its manifest on disk, and re-running the same arm
  *              reconciles any intermediate failure.
  *   - `tick` — UNATTENDED, what a scheduler will call. Resolves live intent by READING that
- *              record — never prompts, never falls back to mock — and then REFUSES to
- *              dispatch: scheduled activation is structurally disabled in this build (no
- *              code path in this entrypoint constructs a provider adapter or reaches a
- *              dispatch). What must land before that flips — real public-Git publication
- *              evidence for the campaign manifest and a durable escalation latch checked
- *              before every dispatch — is specified in docs/CAMPAIGN-ACTIVATION.md.
+ *              record — never prompts, never falls back to mock — checks the durable
+ *              escalation latch (an unresolved fire, pending with no live lease, refuses
+ *              the tick), and then REFUSES to dispatch: scheduled activation is
+ *              structurally disabled in this build (no code path in this entrypoint
+ *              constructs a provider adapter or reaches a dispatch). What must land before
+ *              that flips — the publication descriptor becoming required, and the real
+ *              tick input assembly that wires the latch-guarded claim port — is specified
+ *              in docs/CAMPAIGN-ACTIVATION.md.
  *   - `status` — READ-ONLY, what monitoring calls. Reports the durable state (the
  *              authorization classified by the same strict validator the tick uses, budget
  *              consumption with reservations labeled as reservations, fires/claims/leases)
@@ -95,15 +98,20 @@ verifies the public-Git precommitment: byte-identical published blob, same cohor
 committer strictly before windowStart. ANY publication failure — including a network
 failure or the all-zeros rehearsal commit — refuses the tick (exit 2); without the flag
 the tick reports the evidence as not configured (activation will require it).
+A live authorization is additionally checked against the durable ESCALATION LATCH: an
+unresolved fire — pending with no live lease, the durable state an escalated, crashed,
+or never-settled dispatch leaves behind — refuses the tick (exit 2) until the campaign
+is stopped and investigated.
 Never prompts, never falls back to mock. Exits 3 when the authorization is valid
-(activation refused), 2 when no live authorization covers the cohort, 1 on a loud
-failure.
+(activation refused), 2 when no live authorization covers the cohort or the escalation
+latch is tripped, 1 on a loud failure.
 
 STATUS (read-only, what monitoring calls): reports the campaign's durable state — the
 authorization (armed/disarmed/expired and its instants), calls reserved vs cap and
 attempts actually started, money as labeled RESERVATIONS (not invoices) plus an
-estimated invoice at the observed per-attempt rate, fires/claims/active leases — and
-the verdict the NEXT tick would reach, including a fresh credential observation.
+estimated invoice at the observed per-attempt rate, fires/claims/active leases, and the
+escalation-latch state (unresolved fires) — and the verdict the NEXT tick would reach,
+including a fresh credential observation.
 Performs no write of any kind: it opens its own connection with NO schema bootstrap and
 a server-enforced read-only session (a read-only role suffices to run it), so schema
 ownership stays with the mutating commands. Exits 0 when the next tick would hold a live
@@ -227,8 +235,9 @@ async function closeQuietly(close: () => Promise<void>): Promise<void> {
  */
 const ACTIVATION_DISABLED =
   'REFUSING to dispatch: scheduled campaign activation is structurally disabled in this build. ' +
-  'Dispatching additionally requires real public-Git publication evidence for the campaign manifest ' +
-  'and a durable escalation latch checked before every dispatch (see docs/CAMPAIGN-ACTIVATION.md). ' +
+  'Dispatching additionally requires the publication descriptor to become REQUIRED and the real ' +
+  'tick input assembly — which wires the latch-guarded claim port so the escalation latch guards ' +
+  'every admission, not only this tick-level check (see docs/CAMPAIGN-ACTIVATION.md). ' +
   'No provider call was made.';
 
 // ---------------------------------------------------------------------------
@@ -241,6 +250,8 @@ export interface CampaignDeps {
   readonly openStore: (databaseUrl: string) => Promise<{
     store: AtomicStore;
     authorizations: CampaignAuthorizationPort;
+    /** The store-derived escalation-latch read (pending fires with no live lease). */
+    unresolvedFires: UnresolvedFireRead;
     close: () => Promise<void>;
   }>;
   /** The READ-ONLY open for the status surface: constructs only the read ports, applies NO
@@ -250,6 +261,8 @@ export interface CampaignDeps {
   readonly openReads: (databaseUrl: string) => Promise<{
     authorizations: CampaignAuthorizationPort;
     statusReads: CampaignStatusReadPort;
+    /** The same store-derived escalation-latch read the tick refuses on. */
+    unresolvedFires: UnresolvedFireRead;
     close: () => Promise<void>;
   }>;
   readonly observeCredentials: (participantIds: readonly string[]) => ReadonlyMap<string, boolean>;
@@ -540,9 +553,10 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
 
 /**
  * One UNATTENDED tick. Resolves live intent from the durable record — no prompt, no mock
- * fallback — and then refuses to dispatch, because scheduled activation is structurally
- * disabled in this build: this function validates the whole authorization chain and owns
- * no path to a provider adapter, a claim, or a dispatch.
+ * fallback — checks the durable escalation latch, and then refuses to dispatch, because
+ * scheduled activation is structurally disabled in this build: this function validates
+ * the whole authorization chain and owns no path to a provider adapter, a claim, or a
+ * dispatch.
  */
 export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps): Promise<number> {
   if (options.manifestPath === null) {
@@ -597,7 +611,7 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
     printError('a tick needs STORE_DATABASE_URL');
     return 2;
   }
-  const { authorizations, close } = await deps.openStore(databaseUrl);
+  const { authorizations, unresolvedFires, close } = await deps.openStore(databaseUrl);
   try {
     const stored = await authorizations.read(booted.cohortId);
     const resolution = resolveCampaignIntent({
@@ -616,6 +630,30 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
         `(${resolution.authorization.observedCredentialedParticipantIds.length}/${resolution.authorization.participantIds.length} ` +
         `roster credentials observed now)`,
     );
+    // The DURABLE ESCALATION LATCH, at the exact point where the activation flip will
+    // assemble the real tick input: an unresolved fire — pending with no live lease — is
+    // the durable state an escalated, crashed, or never-settled dispatch leaves behind,
+    // so the campaign must not spend further even under a live authorization. The latch
+    // is DERIVED from that retained state (never a separate write), which is what makes
+    // it hold across a failed disarm and a process restart. At dispatch time the same
+    // fact also guards every admission (`latchGuardedClaimPort`); this tick-level check
+    // is the half a scheduler and an operator see. A read failure propagates — a loud
+    // exit 1, never read as clear.
+    const unresolved = await unresolvedFires.unresolvedFires(booted.cohortId);
+    if (unresolved.length > 0) {
+      printError(
+        `ESCALATION LATCH — refusing to dispatch: ${unresolved.length} unresolved fire(s) hold cohort ` +
+          `${booted.cohortId}: ${unresolved.map((f) => `${f.fireId} (admitted ${f.admittedAt})`).join('; ')}`,
+      );
+      printError(
+        'an unresolved fire is pending with no live lease — it escalated the spend guard, crashed, or ' +
+          'never settled, and its installed artifact and spend sidecar carry the evidence. Run ' +
+          `campaign:stop --manifest ${options.manifestPath} and investigate; a stopped campaign is over ` +
+          '(a cohort arms at most once, ever).',
+      );
+      return 2;
+    }
+    printLine('escalation latch CLEAR — no unresolved fire holds this cohort');
     printError(ACTIVATION_DISABLED);
     return 3;
   } finally {
@@ -631,9 +669,11 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
  * The READ-ONLY monitoring surface: report the campaign's durable state — authorization
  * (classified by the same strict validator the tick uses), budget consumption (calls are
  * the real money lever; reservations are labeled as reservations, never as invoices),
- * fires/claims/leases — and the verdict the NEXT tick would reach, computed by the exact
- * `resolveCampaignIntent` the tick runs (including a fresh credential observation, so a
- * key rotated mid-campaign shows up here first). Performs no write of any kind.
+ * fires/claims/leases, and the escalation-latch state (the same store-derived
+ * unresolved-fire read the tick refuses on) — and the verdict the NEXT tick would reach,
+ * computed by the exact `resolveCampaignIntent` the tick runs (including a fresh
+ * credential observation, so a key rotated mid-campaign shows up here first) followed by
+ * the same latch check. Performs no write of any kind.
  *
  * The exit code mirrors the next tick's resolution so monitoring can alert on it: 0 =
  * a live authorization would resolve (and, in this build, then refuse to dispatch —
@@ -654,7 +694,7 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
   // The READ-ONLY open: no schema bootstrap, no store, and (in production) a server-enforced
   // read-only session. A status read against a database whose schema was never applied fails
   // loudly — bootstrap belongs to the mutating commands, never to monitoring.
-  const { authorizations, statusReads, close } = await deps.openReads(databaseUrl);
+  const { authorizations, statusReads, unresolvedFires, close } = await deps.openReads(databaseUrl);
   try {
     const manifest = booted.manifest;
     const projection = projectCampaignCost(manifest);
@@ -723,8 +763,22 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
       printLine(`  last   fire admitted ${fires.lastAdmittedAt ?? 'never'}`);
     }
 
+    // The escalation latch, from the SAME store-derived read the tick refuses on: an
+    // unresolved fire — pending with no live lease — is the durable state an escalated,
+    // crashed, or never-settled dispatch leaves behind, and the next tick will refuse
+    // while one exists.
+    const unresolved = await unresolvedFires.unresolvedFires(booted.cohortId);
+    if (unresolved.length === 0) {
+      printLine('  latch  clear — no unresolved fire');
+    } else {
+      printLine(
+        `  latch  ESCALATION LATCH TRIPPED — ${unresolved.length} unresolved fire(s): ` +
+          unresolved.map((f) => `${f.fireId} (admitted ${f.admittedAt})`).join('; '),
+      );
+    }
+
     // The verdict the NEXT tick would reach — the exact resolution the tick runs,
-    // including a fresh independent credential observation.
+    // including a fresh independent credential observation, then the same latch check.
     const resolution = resolveCampaignIntent({
       booted,
       stored,
@@ -733,6 +787,13 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
     });
     if (resolution.kind === 'Refused') {
       printLine(`  next tick would REFUSE: ${resolution.violations.join('; ')}`);
+      return 2;
+    }
+    if (unresolved.length > 0) {
+      printLine(
+        `  next tick would REFUSE — the escalation latch is tripped (${unresolved.length} unresolved ` +
+          'fire(s); run campaign:stop and investigate the installed evidence)',
+      );
       return 2;
     }
     printLine(
@@ -785,6 +846,7 @@ const PRODUCTION_DEPS: CampaignDeps = {
     const { Pool } = await import('pg');
     const { SqlAtomicStore, pgStoreQuery } = await import('./store/atomicStore.js');
     const { SqlCampaignAuthorizationPort } = await import('./store/campaignAuthStore.js');
+    const { SqlUnresolvedFireReadPort } = await import('./store/escalationLatchRead.js');
     const pool = new Pool({ connectionString: databaseUrl });
     try {
       const { readFileSync: read } = await import('node:fs');
@@ -798,6 +860,7 @@ const PRODUCTION_DEPS: CampaignDeps = {
     return {
       store: new SqlAtomicStore(query),
       authorizations: new SqlCampaignAuthorizationPort(query),
+      unresolvedFires: new SqlUnresolvedFireReadPort(query),
       close: () => pool.end(),
     };
   },
@@ -806,6 +869,7 @@ const PRODUCTION_DEPS: CampaignDeps = {
     const { pgStoreQuery } = await import('./store/atomicStore.js');
     const { SqlCampaignAuthorizationPort } = await import('./store/campaignAuthStore.js');
     const { SqlCampaignStatusReadPort } = await import('./store/campaignStatusRead.js');
+    const { SqlUnresolvedFireReadPort } = await import('./store/escalationLatchRead.js');
     // NO schema/function bootstrap here — a monitoring read must not mutate catalog state —
     // and the session itself is forced read-only at the SERVER, so even a statement smuggled
     // through this path in the future is refused by PostgreSQL rather than trusted to prose.
@@ -814,6 +878,7 @@ const PRODUCTION_DEPS: CampaignDeps = {
     return {
       authorizations: new SqlCampaignAuthorizationPort(query),
       statusReads: new SqlCampaignStatusReadPort(query),
+      unresolvedFires: new SqlUnresolvedFireReadPort(query),
       close: () => pool.end(),
     };
   },

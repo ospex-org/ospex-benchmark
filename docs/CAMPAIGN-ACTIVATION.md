@@ -24,17 +24,19 @@ the refusal is not a flag, it is the absence of the paid path from the entrypoin
   new cohortId.
 - **Ticking** (`campaign:tick`, unattended): reads the durable record, validates liveness at
   the tick clock, exact binding to the booted manifest (identity, roster, price identity,
-  every cap), and a fresh independent credential observation — then refuses to dispatch.
-  Exit 3 = validly armed, activation refused; exit 2 = no live authorization; exit 1 = loud
-  failure. A valid authorization deliberately does **not** exit 0, so a scheduler pointed at
-  this build notices instead of no-op looping.
+  every cap), and a fresh independent credential observation; checks the **durable
+  escalation latch** (an unresolved fire — pending with no live lease — refuses the tick);
+  and then refuses to dispatch. Exit 3 = validly armed, activation refused; exit 2 = no live
+  authorization or the escalation latch is tripped; exit 1 = loud failure. A valid
+  authorization deliberately does **not** exit 0, so a scheduler pointed at this build
+  notices instead of no-op looping.
 - **Stopping** (`campaign:stop`): stamps `disarmedAt` inside the record (first stop wins,
   row never deleted). The next tick resolves nothing.
 - **The hard money bound** is unchanged and independent of all of the above: the store's
   cohort call/spend caps are enforced inside a row lock (`admit_dispatch`), so even a wrong
   authorization layer cannot spend past what arming fixed.
 
-## Why the tick refuses — the two missing load-bearing pieces
+## Why the tick refuses — the two load-bearing pieces
 
 ### 1. Real publication evidence
 
@@ -87,6 +89,28 @@ escalation latch that is:
 The acceptance test for this piece is exactly that sequence: force an installed escalation,
 fail the disarm write, restart, tick again — and prove no provider call is reachable.
 
+**Status of this piece:** the latch exists and is derived, never separately written, from
+two independent durable signals (`escalationLatch.ts`): the **store's shadow of the
+escalation** — a cohort fire that is `pending` with no live lease, which is true from
+strictly before the moment escalation evidence can exist (the spine settles every lease
+before the spend guard runs, and deliberately never settles an escalated claim) and which
+also holds crashed-unsettled and settle-failed fires, the conservative direction for an
+unattended path — and the **installed escalation evidence itself**, a spend sidecar with a
+non-null `reason` under the sink's cohort directory (`escalationEvidenceScan.ts`), which
+keeps the latch tripped even if the escalated claim is later settled through a reviewed
+recovery path. "Checked before every dispatch" is `latchGuardedClaimPort`: every dispatch
+begins with `claimPort.admit`, and the guarded port consults the latch before every
+admission and aborts the tick with a typed error on a trip — with no change to the store
+contract, the claim port, or the spine. Both sources fail CLOSED (a source that cannot be
+read rejects, never reads as clear). `campaign:tick` and `campaign:status` already consult
+the store-derived read (exit 2 / "next tick would REFUSE" when tripped); the composed
+latch behind the guarded claim port is wired in when the flip assembles the real tick
+input, with the evidence scan pointed at the same root as the artifact sink. The
+acceptance battery runs the doc'd sequence literally: a real installed escalation (real
+sidecar bytes on disk), a disarm write that fails, a restart (all fresh objects over the
+same durable substrate), and a fresh tick whose provider adapters are tripwires — proving
+the admission is refused and no provider call is reachable.
+
 ## What the scheduler itself must specify before activation
 
 - Halt semantics: the scheduler stops scheduling on **any nonzero or unknown** tick outcome
@@ -96,14 +120,17 @@ fail the disarm write, restart, tick again — and prove no provider call is rea
 - A status surface so monitoring reads state instead of inferring it from logs. The
   durable-state half exists: `campaign:status` (read-only) reports the authorization's
   classification, calls reserved vs cap and attempts actually started, reservations
-  (labeled as reservations, never invoices), fires/claims/active leases, and the verdict
-  the next tick would reach. The per-tick half — when the last tick ran and deferrals
-  grouped by reason — requires the scheduler's durable tick journal and lands with it.
+  (labeled as reservations, never invoices), fires/claims/active leases, the
+  escalation-latch state (unresolved fires), and the verdict the next tick would reach.
+  The per-tick half — when the last tick ran and deferrals grouped by reason — requires
+  the scheduler's durable tick journal and lands with it.
 
 ## How activation flips
 
 One well-marked change in `tickCampaign`: replace the refusal with the real tick input
-assembly (publication resolution, gated capability mint, store-backed claim port, artifact
+assembly (publication resolution, gated capability mint, the store-backed claim port
+wrapped in `latchGuardedClaimPort` over the composed latch — the store-derived
+unresolved-fire read plus the evidence scan pointed at the same root as the artifact
 sink), landed **together with** the two pieces above and their tests — never before. The
 gated campaign capability producer (`gateRealCampaignAdapterCapability`) already exists and
 is fully tested; it is deliberately not reachable from any entrypoint in this build.

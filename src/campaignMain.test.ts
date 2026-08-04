@@ -13,6 +13,7 @@ import type { CampaignDeps } from './campaignMain.js';
 import { cohortBoot } from './cohortBoot.js';
 import type { ArtifactFs } from './fireArtifactSink.js';
 import type { AtomicStore } from './store/contract.js';
+import type { UnresolvedFire, UnresolvedFireRead } from './escalationLatch.js';
 import type { CampaignBudgetStatus, CampaignFireStatus, CampaignStatusReadPort } from './store/campaignStatusRead.js';
 import { defaultExpectedArms } from './scoring.js';
 
@@ -109,6 +110,16 @@ function recordingStore(calls: string[]): AtomicStore {
   };
 }
 
+/** A configurable store-derived escalation-latch read; records calls, returns `fires`. */
+class FakeUnresolvedFires implements UnresolvedFireRead {
+  readonly calls: string[] = [];
+  fires: UnresolvedFire[] = [];
+  async unresolvedFires(cohortId: string): Promise<readonly UnresolvedFire[]> {
+    this.calls.push(`unresolved:${cohortId}`);
+    return this.fires;
+  }
+}
+
 /** A configurable read-only status port; records calls and, by construction, cannot write. */
 class FakeStatusReads implements CampaignStatusReadPort {
   readonly calls: string[] = [];
@@ -135,19 +146,26 @@ class FakeStatusReads implements CampaignStatusReadPort {
 
 function deps(
   over: Partial<CampaignDeps> & { auth?: MemoryAuthPort } = {},
-): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[]; statusReads: FakeStatusReads; opens: { store: number; reads: number } } {
+): CampaignDeps & {
+  auth: MemoryAuthPort;
+  storeCalls: string[];
+  statusReads: FakeStatusReads;
+  unresolvedFires: FakeUnresolvedFires;
+  opens: { store: number; reads: number };
+} {
   const auth = over.auth ?? new MemoryAuthPort();
   const storeCalls: string[] = [];
   const statusReads = new FakeStatusReads();
+  const unresolvedFires = new FakeUnresolvedFires();
   const opens = { store: 0, reads: 0 };
   const base: CampaignDeps = {
     openStore: async () => {
       opens.store += 1;
-      return { store: recordingStore(storeCalls), authorizations: auth, close: async () => {} };
+      return { store: recordingStore(storeCalls), authorizations: auth, unresolvedFires, close: async () => {} };
     },
     openReads: async () => {
       opens.reads += 1;
-      return { authorizations: auth, statusReads, close: async () => {} };
+      return { authorizations: auth, statusReads, unresolvedFires, close: async () => {} };
     },
     observeCredentials: (ids) => new Map(ids.map((id) => [id, true])),
     confirm: async () => 'y',
@@ -157,7 +175,7 @@ function deps(
     },
     ...over,
   };
-  return { ...base, auth, storeCalls, statusReads, opens };
+  return { ...base, auth, storeCalls, statusReads, unresolvedFires, opens };
 }
 
 function options(over: Record<string, unknown> = {}): Parameters<typeof armCampaign>[0] {
@@ -762,7 +780,7 @@ test('AUTHORITY ORDER: the manifest is on disk and byte-exact BEFORE the budget 
       throw new Error('unreached');
     },
   };
-  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, close: async () => {} }) });
+  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, unresolvedFires: new FakeUnresolvedFires(), close: async () => {} }) });
   const { value: code } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
   assert.equal(code, 0);
   assert.deepEqual(
@@ -824,7 +842,7 @@ test('a budget-init refusal fails BEFORE the authorizing step: exit 1, no author
       throw new Error('unreached');
     },
   };
-  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, close: async () => {} }) });
+  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, unresolvedFires: new FakeUnresolvedFires(), close: async () => {} }) });
   const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
   assert.equal(code, 1);
   assert.match(errors.join('\n'), /NO standing authority was created/);
@@ -944,7 +962,7 @@ test('a PRE-AUTHORITY failure keeps its primary error through a close failure', 
     ...recordingStore(storeCalls),
     initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
   };
-  const d = deps({ auth, openStore: async () => ({ store: refusingStore, authorizations: auth, close: FAILING_CLOSE }) });
+  const d = deps({ auth, openStore: async () => ({ store: refusingStore, authorizations: auth, unresolvedFires: new FakeUnresolvedFires(), close: FAILING_CLOSE }) });
   const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d)));
   assert.equal(code, 1);
   const output = errors.join('\n');
@@ -1165,7 +1183,7 @@ test('PRE-AUTHORITY failures keep their classification under hostile values: row
       ...recordingStore(storeCalls1),
       initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
     };
-    const d1 = deps({ auth: auth1, openStore: async () => ({ store: refusing, authorizations: auth1, close: rejectWith(value) }) });
+    const d1 = deps({ auth: auth1, openStore: async () => ({ store: refusing, authorizations: auth1, unresolvedFires: new FakeUnresolvedFires(), close: rejectWith(value) }) });
     const r1 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d1)));
     assert.equal(r1.value, 1, `${label} (hostile close): pre-authority failure resolves 1`);
     assert.match(r1.errors.join('\n'), /NO standing authority was created/, label);
@@ -1180,7 +1198,7 @@ test('PRE-AUTHORITY failures keep their classification under hostile values: row
         throw value;
       },
     };
-    const d2 = deps({ auth: auth2, openStore: async () => ({ store: hostileInit, authorizations: auth2, close: rejectWith(value) }) });
+    const d2 = deps({ auth: auth2, openStore: async () => ({ store: hostileInit, authorizations: auth2, unresolvedFires: new FakeUnresolvedFires(), close: rejectWith(value) }) });
     const r2 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d2)));
     assert.equal(r2.value, 1, `${label} (hostile primary + hostile close): still resolves 1`);
     assert.match(r2.errors.join('\n'), /NO standing authority was created/, label);
@@ -1293,6 +1311,7 @@ test('a tick against a DISARMED campaign fires nothing and exits 2', async () =>
     withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
   );
   assert.equal(code, 2);
+  assert.deepEqual(d.unresolvedFires.calls, [], 'the latch is not consulted once the authorization already refused');
 });
 
 test('a tick after EXPIRY fires nothing and exits 2', async () => {
@@ -1313,12 +1332,44 @@ test('a VALID armed authorization: the tick validates end to end and REFUSES to 
   );
   assert.equal(code, 3, 'a valid authorization exits 3 — NEVER 0 — while activation is disabled');
   assert.match(logs.join('\n'), /campaign authorization VALID/);
+  assert.match(logs.join('\n'), /escalation latch CLEAR — no unresolved fire holds this cohort/);
   const refusal = errors.join('\n');
   assert.match(refusal, /REFUSING to dispatch/);
   assert.match(refusal, /structurally disabled/);
   assert.match(refusal, /No provider call was made/);
   assert.deepEqual(auth.calls, [`read:${cohortId}`], 'the ONLY port interaction is the read');
+  assert.deepEqual(d.unresolvedFires.calls, [`unresolved:${cohortId}`], 'the latch read ran exactly once, for this cohort');
   assert.deepEqual(d.storeCalls, [], 'no budget init, no claim, no dispatch-path store call');
+});
+
+test('a tick under a LIVE authorization but a TRIPPED escalation latch refuses (exit 2) and names the unresolved fire', async () => {
+  const { manifestPath, auth, cohortId } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const fireId = 'f'.repeat(64);
+  d.unresolvedFires.fires = [{ fireId, admittedAt: '2026-08-05T12:00:00.000Z' }];
+  const { value: code, logs, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
+  );
+  assert.equal(code, 2, 'a latched campaign must not reach the validly-armed exit 3');
+  assert.match(logs.join('\n'), /campaign authorization VALID/, 'the authorization itself DID validate — the latch is what refused');
+  const refusal = errors.join('\n');
+  assert.match(refusal, /ESCALATION LATCH — refusing to dispatch: 1 unresolved fire\(s\)/);
+  assert.match(refusal, new RegExp(`${fireId} \\(admitted 2026-08-05T12:00:00\\.000Z\\)`));
+  assert.match(refusal, /campaign:stop/, 'the operator is told the lever');
+  assert.doesNotMatch(refusal, /structurally disabled/, 'the latch refusal REPLACES the structural refusal, not decorates it');
+  assert.deepEqual(d.unresolvedFires.calls, [`unresolved:${cohortId}`]);
+});
+
+test('a latch read failure fails the tick LOUD — a broken latch is never read as clear', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.unresolvedFires.unresolvedFires = async (): Promise<never> => {
+    throw new Error('latch read: connection reset');
+  };
+  await assert.rejects(
+    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d))),
+    /latch read: connection reset/,
+  );
 });
 
 // ===========================================================================
@@ -1387,11 +1438,44 @@ test('status of a LIVE campaign: exit 0 and the full durable report, with reserv
     'the exact labeled slots — a swapped pair cannot render this line',
   );
   assert.match(output, /last {3}fire admitted 2026-08-05T12:00:00\.000Z/);
+  assert.match(output, /latch {2}clear — no unresolved fire/);
   assert.match(output, /next tick would AUTHORIZE/);
   assert.match(output, /activation is structurally disabled/, 'a LIVE report must never read as "spending"');
   assert.deepEqual(d.auth.calls, [`read:${cohortId}`]);
+  assert.deepEqual(d.unresolvedFires.calls, [`unresolved:${cohortId}`], 'the latch read ran exactly once');
   assert.deepEqual(d.storeCalls, [], 'status performs no store write');
   assert.deepEqual(d.opens, { store: 0, reads: 1 }, 'status opens ONLY the read-only path — never the bootstrapping store');
+});
+
+test('status of a LIVE campaign with a TRIPPED escalation latch: the latch line renders and the verdict mirrors the tick (exit 2)', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.statusReads.budgetValue = { callCap: 800, callsReserved: 8, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 800_000_000 };
+  const fireId = 'f'.repeat(64);
+  d.unresolvedFires.fires = [{ fireId, admittedAt: '2026-08-05T12:00:00.000Z' }];
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
+  );
+  assert.equal(code, 2, 'a latched campaign mirrors the tick it predicts: REFUSE');
+  const output = logs.join('\n');
+  assert.match(output, /authorization LIVE/, 'the authorization itself is live — the latch is the refusing fact');
+  assert.match(output, /latch {2}ESCALATION LATCH TRIPPED — 1 unresolved fire\(s\)/);
+  assert.match(output, new RegExp(`${fireId} \\(admitted 2026-08-05T12:00:00\\.000Z\\)`));
+  assert.match(output, /next tick would REFUSE — the escalation latch is tripped/);
+  assert.doesNotMatch(output, /next tick would AUTHORIZE/);
+});
+
+test('a status latch read failure is LOUD — monitoring must never render a clear latch it could not read', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+  d.unresolvedFires.unresolvedFires = async (): Promise<never> => {
+    throw new Error('latch read: connection reset');
+  };
+  await assert.rejects(
+    captured(() => withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d))),
+    /latch read: connection reset/,
+  );
 });
 
 test('status of a DISARMED and of an EXPIRED campaign: exit 2 with the dead state named', async () => {
