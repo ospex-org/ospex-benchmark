@@ -1,12 +1,13 @@
 /**
- * Campaign-authorization adapter conformance against REAL Postgres: the
- * `SqlCampaignAuthorizationPort` driven over the checked-in schema, proving what the pure
- * scripted-query suite cannot — that the actual SQL statements against the actual
- * `store.campaign_authorizations` table produce the mapped outcomes: JSONB round-trip on
- * read, primary-key immutability (a second arm refuses FOREVER, including after a disarm),
- * first-disarm-wins stamping, and `not_found` only for a cohort never armed. Mirrors the
- * atomic-store conformance setup (drop + apply schema/functions on a scratch DB). NOT part
- * of `yarn test` (that suite is pure and DB-free).
+ * Campaign adapter conformance against REAL Postgres: the `SqlCampaignAuthorizationPort`
+ * and the read-only `SqlCampaignStatusReadPort` driven over the checked-in schema, proving
+ * what the pure scripted-query suites cannot — that the actual SQL statements against the
+ * actual tables produce the mapped outcomes: JSONB round-trip on read, primary-key
+ * immutability (a second arm refuses FOREVER, including after a disarm), first-disarm-wins
+ * stamping, `not_found` only for a cohort never armed, the single-statement stop under a
+ * deterministic race, and the status port's real budget/fires/claims/leases column reads.
+ * Mirrors the atomic-store conformance setup (drop + apply schema/functions on a scratch
+ * DB). NOT part of `yarn test` (that suite is pure and DB-free).
  *
  * Run: `docker run` a Postgres, then `STORE_DATABASE_URL=… yarn store:campaign-auth`
  * (defaults to the spike's local Docker Postgres).
@@ -14,8 +15,11 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
-import { pgStoreQuery } from './atomicStore.js';
+import { sha256Hex } from '../canonical.js';
+import { SqlAtomicStore, pgStoreQuery } from './atomicStore.js';
 import { SqlCampaignAuthorizationPort } from './campaignAuthStore.js';
+import { SqlCampaignStatusReadPort } from './campaignStatusRead.js';
+import { STORE_SCHEMA_VERSION } from './constants.js';
 import type { CampaignAuthorization } from '../campaignAuthorization.js';
 
 const DATABASE_URL = process.env.STORE_DATABASE_URL ?? 'postgres://postgres:spike@localhost:5433/store_spike';
@@ -146,6 +150,65 @@ async function main(): Promise<void> {
     assert.equal(outcome, 'not_found', 'a row inserted after the snapshot must never read as disarmed');
     const standing = (await port.read(c)) as CampaignAuthorization;
     assert.equal(standing.disarmedAt, null, 'the concurrently armed authorization is STILL ACTIVE — proving a false STOPPED here would have lied');
+  });
+
+  await check('status reads: the REAL budget/fires/claims/leases columns map through SqlCampaignStatusReadPort', async () => {
+    // The scripted-row unit suite pins the mappings; only a real database can prove the
+    // column names and aggregate SQL themselves (a typo'd column would pass every fake).
+    const c = cohortName('statusread');
+    const store = new SqlAtomicStore(pgStoreQuery(pool));
+    const reads = new SqlCampaignStatusReadPort(pgStoreQuery(pool));
+    assert.equal(await reads.budget(c), null, 'no budget row reads as null');
+
+    assert.deepEqual(
+      await store.initCohortBudget({
+        cohortId: c,
+        schemaVersion: STORE_SCHEMA_VERSION,
+        callCap: 800,
+        spendCapUsdMicros: 80_000_000_000,
+        concurrencyLimit: 8,
+        rosterSize: 4,
+        maxRepairsPerArm: 1,
+        initialLeaseBoundMs: 600_000,
+        repairLeaseBoundMs: 300_000,
+      }),
+      { outcome: 'initialized' },
+    );
+    const admitted = await store.admitDispatch({
+      cohortId: c,
+      fireId: 'f1',
+      ownerId: 'w1',
+      expectedSchemaVersion: STORE_SCHEMA_VERSION,
+      gameId: 'g1',
+      proposedMarkets: ['moneyline'],
+      scopeReservations: {
+        moneyline: { spendReservationUsdMicros: 800_000_000, preparedBytesDigest: sha256Hex('status-read-conformance') },
+      },
+    });
+    assert.equal(admitted.outcome, 'admitted');
+
+    assert.deepEqual(await reads.budget(c), {
+      callCap: 800,
+      callsReserved: 8, // roster 4 × (1 + 1 repair) — one dispatch's call delta
+      spendCapUsdMicros: 80_000_000_000,
+      spendReservedUsdMicros: 800_000_000,
+    });
+    const fires = await reads.fires(c);
+    assert.equal(fires.firesAdmitted, 1);
+    assert.equal(fires.firesPending, 1);
+    assert.equal(fires.firesCompleted, 0);
+    assert.equal(fires.callsMade, 0, 'no attempt was started');
+    assert.equal(fires.claimsPending, 1);
+    assert.equal(fires.claimsCompleted, 0);
+    assert.equal(fires.activeLeases, 4, 'the roster-sized initial lease set is live');
+    assert.equal(typeof fires.lastAdmittedAt, 'string', 'the admission instant round-trips');
+
+    assert.deepEqual(await store.completeClaim({ cohortId: c, fireId: 'f1', expectedSchemaVersion: STORE_SCHEMA_VERSION }), {
+      outcome: 'completed',
+    });
+    const after = await reads.fires(c);
+    assert.equal(after.firesCompleted, 1);
+    assert.equal(after.claimsCompleted, 1);
   });
 
   await pool.end();

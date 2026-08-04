@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   CAMPAIGN_AUTHORIZATION_VERSION,
   buildCampaignAuthorization,
+  classifyCampaignAuthorization,
   resolveCampaignIntent,
 } from './campaignAuthorization.js';
 import type { CampaignAuthorization } from './campaignAuthorization.js';
@@ -364,4 +365,41 @@ test('a forged (structurally-copied) booted cohort throws on BOTH the arm and re
     /not produced by cohortBoot/,
   );
   assert.throws(() => resolve(forged, armedRecord(genuine)), /not produced by cohortBoot/);
+});
+
+
+// ===========================================================================
+// classifyCampaignAuthorization — the read-only classification the status surface uses.
+// One validator: it rides the same strict capture as resolveCampaignIntent, so a record
+// the tick would reject as malformed can never classify as anything but malformed.
+// ===========================================================================
+
+test('classifyCampaignAuthorization: absent, malformed, live, disarmed (beats expired), expired', () => {
+  const booted = bootedCrossing();
+
+  assert.deepEqual(classifyCampaignAuthorization(null, DURING_MS), { kind: 'absent' });
+  assert.deepEqual(classifyCampaignAuthorization(undefined, DURING_MS), { kind: 'absent' });
+
+  const malformed = classifyCampaignAuthorization(armedRecord(booted, { expiresAt: undefined }), DURING_MS);
+  assert.equal(malformed.kind, 'malformed');
+  assert.ok(malformed.kind === 'malformed' && malformed.violations.length > 0, 'the violations are carried');
+
+  const live = classifyCampaignAuthorization(armedRecord(booted), DURING_MS);
+  assert.equal(live.kind, 'live');
+  assert.ok(live.kind === 'live' && live.record.armedAt === new Date(ARMED_MS).toISOString());
+
+  // An explicit stop is the more informative fact: disarmed wins even PAST expiry.
+  const stopped = armedRecord(booted, { disarmedAt: '2026-08-06T00:00:00.000Z' });
+  assert.equal(classifyCampaignAuthorization(stopped, DURING_MS).kind, 'disarmed');
+  assert.equal(classifyCampaignAuthorization(stopped, EXPIRES_MS + 1).kind, 'disarmed');
+
+  assert.equal(classifyCampaignAuthorization(armedRecord(booted), EXPIRES_MS).kind, 'expired');
+  assert.equal(classifyCampaignAuthorization(armedRecord(booted), EXPIRES_MS - 1).kind, 'live', 'expiry is exact');
+});
+
+test('classifyCampaignAuthorization THROWS on a non-finite clock — a broken caller, not a record state', () => {
+  const record = armedRecord(bootedCrossing());
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    assert.throws(() => classifyCampaignAuthorization(record, bad), /finite clock/);
+  }
 });

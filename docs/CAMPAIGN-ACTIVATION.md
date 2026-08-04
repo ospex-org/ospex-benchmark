@@ -77,8 +77,12 @@ fail the disarm write, restart, tick again — and prove no provider call is rea
   and requires human re-arming to resume.
 - Ownership of notification (who is told, on what channel) and of the kill lever
   (`campaign:stop` from a different box than the runner).
-- A status surface (armed?, window, calls/spend consumed vs cap, fires so far, deferrals by
-  reason) so monitoring reads state instead of inferring it from logs.
+- A status surface so monitoring reads state instead of inferring it from logs. The
+  durable-state half exists: `campaign:status` (read-only) reports the authorization's
+  classification, calls reserved vs cap and attempts actually started, reservations
+  (labeled as reservations, never invoices), fires/claims/active leases, and the verdict
+  the next tick would reach. The per-tick half — when the last tick ran and deferrals
+  grouped by reason — requires the scheduler's durable tick journal and lands with it.
 
 ## How activation flips
 

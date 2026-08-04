@@ -8,11 +8,12 @@ import { test } from 'node:test';
 import { buildCampaignAuthorization } from './campaignAuthorization.js';
 import type { CampaignAuthorization, CampaignAuthorizationPort } from './campaignAuthorization.js';
 import { buildCampaignManifest } from './campaignProfile.js';
-import { armCampaign, installManifestNoClobber, stopCampaign, tickCampaign } from './campaignMain.js';
+import { armCampaign, installManifestNoClobber, statusCampaign, stopCampaign, tickCampaign } from './campaignMain.js';
 import type { CampaignDeps } from './campaignMain.js';
 import { cohortBoot } from './cohortBoot.js';
 import type { ArtifactFs } from './fireArtifactSink.js';
 import type { AtomicStore } from './store/contract.js';
+import type { CampaignBudgetStatus, CampaignFireStatus, CampaignStatusReadPort } from './store/campaignStatusRead.js';
 import { defaultExpectedArms } from './scoring.js';
 
 /**
@@ -108,19 +109,44 @@ function recordingStore(calls: string[]): AtomicStore {
   };
 }
 
+/** A configurable read-only status port; records calls and, by construction, cannot write. */
+class FakeStatusReads implements CampaignStatusReadPort {
+  readonly calls: string[] = [];
+  budgetValue: CampaignBudgetStatus | null = null;
+  firesValue: CampaignFireStatus = {
+    firesAdmitted: 0,
+    firesCompleted: 0,
+    firesPending: 0,
+    callsMade: 0,
+    claimsPending: 0,
+    claimsCompleted: 0,
+    activeLeases: 0,
+    lastAdmittedAt: null,
+  };
+  async budget(cohortId: string): Promise<CampaignBudgetStatus | null> {
+    this.calls.push(`budget:${cohortId}`);
+    return this.budgetValue;
+  }
+  async fires(cohortId: string): Promise<CampaignFireStatus> {
+    this.calls.push(`fires:${cohortId}`);
+    return this.firesValue;
+  }
+}
+
 function deps(
   over: Partial<CampaignDeps> & { auth?: MemoryAuthPort } = {},
-): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[] } {
+): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[]; statusReads: FakeStatusReads } {
   const auth = over.auth ?? new MemoryAuthPort();
   const storeCalls: string[] = [];
+  const statusReads = new FakeStatusReads();
   const base: CampaignDeps = {
-    openStore: async () => ({ store: recordingStore(storeCalls), authorizations: auth, close: async () => {} }),
+    openStore: async () => ({ store: recordingStore(storeCalls), authorizations: auth, statusReads, close: async () => {} }),
     observeCredentials: (ids) => new Map(ids.map((id) => [id, true])),
     confirm: async () => 'y',
     now: () => NOW,
     ...over,
   };
-  return { ...base, auth, storeCalls };
+  return { ...base, auth, storeCalls, statusReads };
 }
 
 function options(over: Record<string, unknown> = {}): Parameters<typeof armCampaign>[0] {
@@ -724,7 +750,7 @@ test('AUTHORITY ORDER: the manifest is on disk and byte-exact BEFORE the budget 
       throw new Error('unreached');
     },
   };
-  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, close: async () => {} }) });
+  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, statusReads: new FakeStatusReads(), close: async () => {} }) });
   const { value: code } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
   assert.equal(code, 0);
   assert.deepEqual(
@@ -786,7 +812,7 @@ test('a budget-init refusal fails BEFORE the authorizing step: exit 1, no author
       throw new Error('unreached');
     },
   };
-  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, close: async () => {} }) });
+  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, statusReads: new FakeStatusReads(), close: async () => {} }) });
   const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
   assert.equal(code, 1);
   assert.match(errors.join('\n'), /NO standing authority was created/);
@@ -874,7 +900,7 @@ const FAILING_CLOSE = async (): Promise<void> => {
 /** deps whose store close ALWAYS rejects; the decided outcome must stand anyway. */
 function depsWithFailingClose(
   over: Partial<CampaignDeps> & { auth?: MemoryAuthPort } = {},
-): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[] } {
+): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[]; statusReads: FakeStatusReads } {
   const base = deps(over);
   return {
     ...base,
@@ -902,7 +928,7 @@ test('a PRE-AUTHORITY failure keeps its primary error through a close failure', 
     ...recordingStore(storeCalls),
     initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
   };
-  const d = deps({ auth, openStore: async () => ({ store: refusingStore, authorizations: auth, close: FAILING_CLOSE }) });
+  const d = deps({ auth, openStore: async () => ({ store: refusingStore, authorizations: auth, statusReads: new FakeStatusReads(), close: FAILING_CLOSE }) });
   const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d)));
   assert.equal(code, 1);
   const output = errors.join('\n');
@@ -1027,7 +1053,7 @@ const rejectWith = (value: unknown) => async (): Promise<void> => {
 function depsWithHostileClose(
   value: unknown,
   over: Partial<CampaignDeps> & { auth?: MemoryAuthPort } = {},
-): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[] } {
+): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[]; statusReads: FakeStatusReads } {
   const base = deps(over);
   return {
     ...base,
@@ -1119,7 +1145,7 @@ test('PRE-AUTHORITY failures keep their classification under hostile values: row
       ...recordingStore(storeCalls1),
       initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
     };
-    const d1 = deps({ auth: auth1, openStore: async () => ({ store: refusing, authorizations: auth1, close: rejectWith(value) }) });
+    const d1 = deps({ auth: auth1, openStore: async () => ({ store: refusing, authorizations: auth1, statusReads: new FakeStatusReads(), close: rejectWith(value) }) });
     const r1 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d1)));
     assert.equal(r1.value, 1, `${label} (hostile close): pre-authority failure resolves 1`);
     assert.match(r1.errors.join('\n'), /NO standing authority was created/, label);
@@ -1134,7 +1160,7 @@ test('PRE-AUTHORITY failures keep their classification under hostile values: row
         throw value;
       },
     };
-    const d2 = deps({ auth: auth2, openStore: async () => ({ store: hostileInit, authorizations: auth2, close: rejectWith(value) }) });
+    const d2 = deps({ auth: auth2, openStore: async () => ({ store: hostileInit, authorizations: auth2, statusReads: new FakeStatusReads(), close: rejectWith(value) }) });
     const r2 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d2)));
     assert.equal(r2.value, 1, `${label} (hostile primary + hostile close): still resolves 1`);
     assert.match(r2.errors.join('\n'), /NO standing authority was created/, label);
@@ -1276,6 +1302,175 @@ test('a VALID armed authorization: the tick validates end to end and REFUSES to 
 });
 
 // ===========================================================================
+// status — the read-only monitoring surface
+// ===========================================================================
+
+test('status with NO armed campaign: exit 2, NOT ARMED, never-armed budget note, and NO writes of any kind', async () => {
+  const { bytes } = buildCampaignManifest(NOW, { callCap: 800, windowForwardMs: WEEK_MS });
+  const dir = mkdtempSync(join(tmpdir(), 'campaign-status-'));
+  const manifestPath = join(dir, 'manifest.json');
+  writeFileSync(manifestPath, bytes);
+  const cohortId = cohortBoot({ manifestBytes: bytes }).cohortId;
+
+  const d = deps({ confirm: NEVER_PROMPT });
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
+  );
+  assert.equal(code, 2);
+  const output = logs.join('\n');
+  assert.match(output, /authorization NOT ARMED/);
+  assert.match(output, /budget none — no cohort budget initialized/);
+  assert.match(output, /next tick would REFUSE/);
+  assert.deepEqual(d.auth.calls, [`read:${cohortId}`], 'the only authorization interaction is the read');
+  assert.deepEqual(d.storeCalls, [], 'no budget init, no dispatch-path store call');
+  assert.deepEqual(d.statusReads.calls, [`budget:${cohortId}`], 'fires are not read when no budget exists');
+});
+
+test('status of a LIVE campaign: exit 0 and the full durable report, with reservations labeled and the estimate honest', async () => {
+  const { manifestPath, auth, cohortId } = await armed();
+  auth.calls.length = 0; // observe only the status call's interactions
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.statusReads.budgetValue = {
+    callCap: 800,
+    callsReserved: 16,
+    spendCapUsdMicros: 80_000_000_000,
+    spendReservedUsdMicros: 1_600_000_000,
+  };
+  d.statusReads.firesValue = {
+    firesAdmitted: 2,
+    firesCompleted: 1,
+    firesPending: 1,
+    callsMade: 9,
+    claimsPending: 1,
+    claimsCompleted: 3,
+    activeLeases: 4,
+    lastAdmittedAt: '2026-08-05T12:00:00.000Z',
+  };
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
+  );
+  assert.equal(code, 0, logs.join('\n'));
+  const output = logs.join('\n');
+  assert.match(output, /CAMPAIGN STATUS — cohort/);
+  assert.match(output, /authorization LIVE — armed 2026-08-05T00:00:00\.000Z, expires 2026-08-12T00:00:00\.000Z/);
+  assert.match(output, /calls {2}16 reserved of 800 cap; 9 attempt\(s\) actually started/);
+  assert.match(output, /reservations \$1600\.00 of \$80000\.00 cap/);
+  assert.match(output, /NOT invoices/, 'reservations are never presented as money spent');
+  assert.match(output, /≈ \$0\.42 expected invoice for the started attempts at the observed rate \(an estimate\)/);
+  assert.match(output, /fires {2}2 admitted \(1 completed, 1 pending\); claims 3 completed, 1 pending; 4 active lease\(s\)/);
+  assert.match(output, /last {3}fire admitted 2026-08-05T12:00:00\.000Z/);
+  assert.match(output, /next tick would AUTHORIZE/);
+  assert.match(output, /activation is structurally disabled/, 'a LIVE report must never read as "spending"');
+  assert.deepEqual(d.auth.calls, [`read:${cohortId}`]);
+  assert.deepEqual(d.storeCalls, [], 'status performs no store write');
+});
+
+test('status of a DISARMED and of an EXPIRED campaign: exit 2 with the dead state named', async () => {
+  const disarmedCase = await armed();
+  await disarmedCase.auth.disarm(disarmedCase.cohortId, new Date(NOW + 60_000).toISOString());
+  const d1 = deps({ auth: disarmedCase.auth, confirm: NEVER_PROMPT });
+  d1.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+  const r1 = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath: disarmedCase.manifestPath }), d1)),
+  );
+  assert.equal(r1.value, 2);
+  assert.match(r1.logs.join('\n'), /authorization DISARMED at 2026-08-05T00:01:00\.000Z/);
+  assert.match(r1.logs.join('\n'), /next tick would REFUSE/);
+
+  const expiredCase = await armed();
+  const d2 = deps({ auth: expiredCase.auth, confirm: NEVER_PROMPT, now: () => NOW + WEEK_MS + 1 });
+  d2.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+  const r2 = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath: expiredCase.manifestPath }), d2)),
+  );
+  assert.equal(r2.value, 2);
+  assert.match(r2.logs.join('\n'), /authorization EXPIRED at 2026-08-12T00:00:00\.000Z/);
+});
+
+test('status shows a LIVE record whose next tick would still REFUSE — a credential revoked mid-campaign surfaces here first', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({
+    auth,
+    confirm: NEVER_PROMPT,
+    observeCredentials: (ids) => new Map(ids.map((id) => [id, id !== ROSTER[1]])),
+  });
+  d.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
+  );
+  assert.equal(code, 2, 'the exit mirrors the next tick, not the record alone');
+  const output = logs.join('\n');
+  assert.match(output, /authorization LIVE/, 'the record itself is truthfully live');
+  assert.match(output, /next tick would REFUSE:.*no usable credential/);
+});
+
+test('status reports a MALFORMED stored record: exit 2 with the violations shown', async () => {
+  const { manifestPath, auth, cohortId } = await armed();
+  const record = auth.records.get(cohortId)!;
+  const { expiresAt: _dropped, ...malformed } = record;
+  auth.records.set(cohortId, malformed as CampaignAuthorization);
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
+  );
+  assert.equal(code, 2);
+  assert.match(logs.join('\n'), /authorization MALFORMED/);
+});
+
+test('status flags the INTEGRITY ANOMALY of standing authority without a budget row: exit 1', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  d.statusReads.budgetValue = null; // authority exists, budget row does not — the store lost state
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
+  );
+  assert.equal(code, 1, 'an anomaly is loud — never a normal report');
+  assert.match(errors.join('\n'), /INTEGRITY ANOMALY/);
+  assert.ok(!d.statusReads.calls.some((c) => c.startsWith('fires:')), 'no further reads after the anomaly');
+});
+
+test('status of an INTERRUPTED arm (budget exists, authorization absent): reports the budget and exits 2', async () => {
+  const { bytes } = buildCampaignManifest(NOW, { callCap: 800, windowForwardMs: WEEK_MS });
+  const dir = mkdtempSync(join(tmpdir(), 'campaign-status-interrupted-'));
+  const manifestPath = join(dir, 'manifest.json');
+  writeFileSync(manifestPath, bytes);
+  const d = deps({ confirm: NEVER_PROMPT });
+  d.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
+  );
+  assert.equal(code, 2);
+  const output = logs.join('\n');
+  assert.match(output, /authorization NOT ARMED/);
+  assert.match(output, /0 reserved of 800 cap/, 'the initialized budget still reports');
+  assert.match(output, /next tick would REFUSE/);
+});
+
+test('status outcomes survive close failures — normal and hostile alike', async () => {
+  // Normal Error close rejection on a live campaign: the 0 stands with a warning.
+  const live = await armed();
+  const dLive = depsWithFailingClose({ auth: live.auth, confirm: NEVER_PROMPT });
+  dLive.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+  const r1 = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath: live.manifestPath }), dLive)),
+  );
+  assert.equal(r1.value, 0);
+  assert.match(r1.errors.join('\n'), /warning: closing the store connection failed/);
+
+  // Hostile close rejections cannot override the classified outcome either.
+  for (const { label, value } of hostileFixtures()) {
+    const c = await armed();
+    const d = depsWithHostileClose(value, { auth: c.auth, confirm: NEVER_PROMPT });
+    d.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
+    const { value: code } = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath: c.manifestPath }), d)),
+    );
+    assert.equal(code, 0, `${label}: the status outcome stands`);
+  }
+});
+
+// ===========================================================================
 // stop
 // ===========================================================================
 
@@ -1408,4 +1603,23 @@ test('spawned CLI: an OMITTED --start refuses before the prompt is ever shown', 
   assert.ok(/requires an explicit --start/.test(out), `the refusal names the requirement; out=${out}`);
   assert.ok(!out.includes('[Y/n]'), `the prompt was never shown; out=${out}`);
   assert.ok(!existsSync(emitPath), 'no manifest was written');
+});
+
+test('spawned CLI: --help names the status command and its read-only contract', () => {
+  const { status, out } = runCli(['--help'], PROBE_ENV, '');
+  assert.equal(status, 0, `--help exits 0; out=${out}`);
+  assert.ok(out.includes('campaign:status'), `the status command is listed; out=${out}`);
+  assert.ok(/STATUS \(read-only/.test(out), `the read-only contract is stated; out=${out}`);
+  assert.ok(/NOT invoices/.test(out.replace(/\n/g, ' ')) || /RESERVATIONS \(not invoices\)/.test(out), `the reservations caveat is stated; out=${out}`);
+});
+
+test('spawned CLI: status against an unreachable store fails LOUD (exit 1), never prompts, never writes', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'campaign-cli-status-'));
+  const manifestPath = join(dir, 'manifest.json');
+  const { bytes } = buildCampaignManifest(Date.parse('2027-01-01T00:00:00Z'), { callCap: 800, windowForwardMs: WEEK_MS });
+  writeFileSync(manifestPath, bytes);
+  const { status, out } = runCli(['status', '--manifest', manifestPath], PROBE_ENV, '');
+  assert.equal(status, 1, `an unreachable store is a loud failure; out=${out}`);
+  assert.ok(!out.includes('[Y/n]'), `status never prompts; out=${out}`);
+  assert.ok(!/ARMED\.|STOPPED\./.test(out), `status changed nothing; out=${out}`);
 });
