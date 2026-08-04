@@ -237,8 +237,8 @@ function captureRecord(value: unknown): { captured: CampaignAuthorization } | { 
  * about it can be trusted); an explicit stop wins over expiry (`disarmed` names the operator
  * action, the more informative fact); then `expired`; else `live`. `live` says only that the
  * RECORD is live — whether the next tick would actually authorize (binding, credentials) is
- * {@link resolveCampaignIntent}'s answer, and in the current build even an authorized tick
- * refuses to dispatch (see docs/CAMPAIGN-ACTIVATION.md).
+ * {@link resolveCampaignIntent}'s answer, which the tick pairs with its own publication and
+ * escalation-latch checks before dispatching (see docs/CAMPAIGN-ACTIVATION.md).
  *
  * `nowMs` must be finite — a non-finite clock is a broken caller, not a record state, and
  * throws rather than mislabeling the record.

@@ -60,12 +60,12 @@ test('begin: one INSERT of an unfinished tick entry, returning the id — bigint
 
 test('finish: one UPDATE guarded by `finished_at is null` — the FIRST finish wins, a later one changes nothing', async () => {
   const { port, calls } = scripted([]);
-  await port.finish(71, 'validated_refused', null, '2026-08-05T12:00:05.000Z');
+  await port.finish(71, 'dispatched', null, '2026-08-05T12:00:05.000Z');
   assert.equal(calls.length, 1);
   const { sql, params } = calls[0]!;
   assert.match(sql, /update store\.campaign_ticks/);
   assert.match(sql, /finished_at is null/);
-  assert.deepEqual(params, [71, '2026-08-05T12:00:05.000Z', 'validated_refused', null]);
+  assert.deepEqual(params, [71, '2026-08-05T12:00:05.000Z', 'dispatched', null]);
 });
 
 test('resume: ONE real transaction — the lock as its OWN command, THEN the frontier CAS — mapping 1 row to resumed, 0 to frontier_moved', async () => {
@@ -195,7 +195,7 @@ test('scheduleWindow: ONE statement, boundary-anchored, filtered and UNBOUNDED �
     ],
   };
   const { port, calls } = scripted([windowRow]);
-  const window = await port.scheduleWindow(COHORT, ['validated_refused']);
+  const window = await port.scheduleWindow(COHORT, ['dispatched']);
   assert.equal(window.frontierId, 12);
   assert.deepEqual(
     window.entries.map((e) => [e.id, e.kind, e.outcome]),
@@ -214,15 +214,15 @@ test('scheduleWindow: ONE statement, boundary-anchored, filtered and UNBOUNDED �
   assert.match(sql, /outcome is null or not \(f\.outcome = any\(\$2\)\)/);
   assert.match(sql, /finished_at is null/);
   assert.match(sql, /finished_at is not null/);
-  assert.deepEqual(params, [COHORT, ['validated_refused']]);
+  assert.deepEqual(params, [COHORT, ['dispatched']]);
 });
 
 test('scheduleWindow: an empty journal yields frontier 0 and no entries; malformed JSON entries are loud', async () => {
   const { port } = scripted([{ frontier_id: '0', resume_row: null, unfinished_rows: [], unhealthy_rows: [] }]);
-  assert.deepEqual(await port.scheduleWindow(COHORT, ['validated_refused']), { frontierId: 0, entries: [] });
+  assert.deepEqual(await port.scheduleWindow(COHORT, ['dispatched']), { frontierId: 0, entries: [] });
 
   const bad = scripted([{ frontier_id: '1', resume_row: null, unfinished_rows: [{ id: 1, kind: 'other', startedAt: 'x' }], unhealthy_rows: [] }]);
-  await assert.rejects(bad.port.scheduleWindow(COHORT, ['validated_refused']), /neither tick nor resume/);
+  await assert.rejects(bad.port.scheduleWindow(COHORT, ['dispatched']), /neither tick nor resume/);
 });
 
 test('a query failure propagates — never an empty (clear) journal', async () => {

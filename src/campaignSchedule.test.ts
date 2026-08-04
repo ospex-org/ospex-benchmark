@@ -28,7 +28,7 @@ function entry(over: Partial<ScheduleEntry> & { id: number }): ScheduleEntry {
     kind: 'tick',
     startedAt: '2026-08-05T00:00:00.000Z',
     finishedAt: '2026-08-05T00:01:00.000Z',
-    outcome: 'validated_refused',
+    outcome: 'dispatched',
     detail: null,
     ...over,
   };
@@ -38,8 +38,8 @@ function resolve(entries: readonly ScheduleEntry[], nowMs: number = NOW) {
   return resolveScheduleState({ entries, nowMs, deadlineMs: DEADLINE, healthyOutcomes: HEALTHY_TICK_OUTCOMES });
 }
 
-test('the healthy set of THIS build is exactly the structural refusal — the flip replaces it deliberately', () => {
-  assert.deepEqual([...HEALTHY_TICK_OUTCOMES], ['validated_refused']);
+test('the healthy set of THIS build is exactly the dispatched outcome — anything else halts for review', () => {
+  assert.deepEqual([...HEALTHY_TICK_OUTCOMES], ['dispatched']);
   assert.equal(SCHEDULE_WINDOW_LIMIT, 50);
   assert.equal(OPERATOR_RESUMED, 'operator_resumed');
 });
@@ -63,9 +63,11 @@ test('an empty journal is CLEAR — a campaign that never ticked has nothing to 
   assert.deepEqual(resolve([]), { kind: 'clear' });
 });
 
-test('a latest finished HEALTHY tick is CLEAR; any non-healthy or UNKNOWN outcome halts — including one from a newer build', () => {
+test('a latest finished HEALTHY tick is CLEAR; any non-healthy or UNKNOWN outcome halts — including one from another build', () => {
   assert.deepEqual(resolve([entry({ id: 1 })]), { kind: 'clear' });
-  for (const outcome of ['no_live_authorization', 'publication_refused', 'escalation_latched', 'loud_failure', 'dispatched', null]) {
+  // `validated_refused` is the PRE-activation build's healthy outcome: unknown to this
+  // build, so a journal spanning the flip halts once for operator review (fail closed).
+  for (const outcome of ['no_live_authorization', 'publication_refused', 'escalation_latched', 'dispatch_unresolved', 'loud_failure', 'validated_refused', null]) {
     const state = resolve([entry({ id: 1, outcome })]);
     assert.equal(state.kind, 'halted', `outcome ${String(outcome)} must halt — fail closed on anything outside the healthy set`);
     if (state.kind !== 'halted') continue;
