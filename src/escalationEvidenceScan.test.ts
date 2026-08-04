@@ -141,9 +141,11 @@ test('fail closed on ambiguity: non-JSON, a non-object, a missing reason, and an
   );
 });
 
-test('a directory-listing failure other than ENOENT REJECTS — never read as clear', async () => {
+test('a directory-listing failure other than ENOENT REJECTS with the ORIGINAL error — no root probe, never read as clear', async () => {
+  let reads = 0;
   const denied: EvidenceDirFs = {
     readdir() {
+      reads += 1;
       const error = new Error('EACCES: permission denied') as NodeJS.ErrnoException;
       error.code = 'EACCES';
       throw error;
@@ -152,7 +154,16 @@ test('a directory-listing failure other than ENOENT REJECTS — never read as cl
       throw new Error('unreached');
     },
   };
-  await assert.rejects(escalationEvidenceLatchSource('/base', denied).causes(COHORT), /EACCES/);
+  // The refusal must be the cohort-directory failure ITSELF, propagated as-is: a scan that
+  // instead routed a non-absence failure through the root probe would reject with the
+  // wrapped "evidence root" message after a SECOND readdir — treating a permission failure
+  // as if it were absence. Both assertions discriminate that.
+  await assert.rejects(escalationEvidenceLatchSource('/base', denied).causes(COHORT), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, 'EACCES: permission denied', 'the original failure, not a wrapped root message');
+    return true;
+  });
+  assert.equal(reads, 1, 'exactly the cohort-directory read — a non-absence failure never probes the root');
 });
 
 test('a file-read failure latches THAT file as unreadable_evidence, and causes come in sorted name order even when readdir does not', async () => {
