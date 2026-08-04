@@ -83,3 +83,27 @@ create table if not exists store.campaign_authorizations (
   record     jsonb not null,
   created_at timestamptz not null default clock_timestamp()
 );
+
+-- ---------------------------------------------------------------------------
+-- The campaign tick journal.
+--
+-- Like `campaign_authorizations`, NOT part of the versioned cohort-budget contract: never
+-- read by admit/lease/complete, no conformance obligation on the money path. An
+-- APPEND-ONLY two-phase journal of scheduled activity: a tick inserts an unfinished entry
+-- when it begins and stamps outcome + finish instant exactly once when it ends; an
+-- operator resume appends its own (already-finished) row. The schedule halt rule
+-- (`campaignSchedule.ts`) reads it — a stale unfinished entry is a crashed tick, a
+-- non-healthy outcome halts scheduling until a human resumes — and `campaign:status`
+-- renders it. Rows are never updated after finishing and never deleted.
+-- ---------------------------------------------------------------------------
+create table if not exists store.campaign_ticks (
+  id          bigserial primary key,
+  cohort_id   text not null,
+  kind        text not null check (kind in ('tick', 'resume')),
+  started_at  timestamptz not null,
+  finished_at timestamptz,
+  outcome     text,
+  detail      text,
+  created_at  timestamptz not null default clock_timestamp()
+);
+create index if not exists campaign_ticks_by_cohort on store.campaign_ticks (cohort_id, id desc);

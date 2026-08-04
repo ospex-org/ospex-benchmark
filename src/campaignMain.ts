@@ -17,12 +17,20 @@ import { askLiveConfirmation, observeRealAdapterCredentials } from './liveIntent
 import { PublicationError, parseManifestPublication, verifyPublication } from './manifestPublication.js';
 import type { ManifestPublicationV1, ResolvedPublication } from './manifestPublication.js';
 import { instantMs, isParseableInstant } from './time.js';
+import {
+  HEALTHY_TICK_OUTCOMES,
+  SCHEDULE_WINDOW_LIMIT,
+  resolveScheduleState,
+  tickDeadlineMs,
+  unreviewedInFlightTick,
+} from './campaignSchedule.js';
+import type { CampaignTickJournalPort, CampaignTickOutcome } from './campaignSchedule.js';
 import type { UnresolvedFireRead } from './escalationLatch.js';
 import type { AtomicStore } from './store/contract.js';
 import type { CampaignStatusReadPort } from './store/campaignStatusRead.js';
 
 /**
- * The CAMPAIGN entrypoint — `arm`, `tick`, `stop`.
+ * The CAMPAIGN entrypoint — `arm`, `tick`, `status`, `resume`, `stop`.
  *
  * The attended crossing authorized exactly one fire, with a human answering a prompt. A
  * scheduled benchmark cannot answer a prompt (and by design an unanswered prompt refuses), so
@@ -40,10 +48,14 @@ import type { CampaignStatusReadPort } from './store/campaignStatusRead.js';
  *              single authorizing transition. A failed arm therefore never leaves standing
  *              authority without its manifest on disk, and re-running the same arm
  *              reconciles any intermediate failure.
- *   - `tick` — UNATTENDED, what a scheduler will call. Resolves live intent by READING that
- *              record — never prompts, never falls back to mock — checks the durable
- *              escalation latch (an unresolved fire, pending with no live lease, refuses
- *              the tick), and then REFUSES to dispatch: scheduled activation is
+ *   - `tick` — UNATTENDED, what a scheduler will call. Evaluates the durable SCHEDULE
+ *              HALT RULE first (a prior tick with a non-healthy or unknown journaled
+ *              outcome refuses this one, writing nothing), then journals a two-phase
+ *              entry, resolves live intent by READING the authorization record — never
+ *              prompts, never falls back to mock — verifies publication evidence when
+ *              given, checks the durable escalation latch (an unresolved fire, pending
+ *              with no live lease, refuses the tick), finishes its journal entry with the
+ *              decided outcome, and then REFUSES to dispatch: scheduled activation is
  *              structurally disabled in this build (no code path in this entrypoint
  *              constructs a provider adapter or reaches a dispatch). What must land before
  *              that flips — the publication descriptor becoming required, and the real
@@ -51,9 +63,14 @@ import type { CampaignStatusReadPort } from './store/campaignStatusRead.js';
  *              in docs/CAMPAIGN-ACTIVATION.md.
  *   - `status` — READ-ONLY, what monitoring calls. Reports the durable state (the
  *              authorization classified by the same strict validator the tick uses, budget
- *              consumption with reservations labeled as reservations, fires/claims/leases)
- *              and the verdict the next tick would reach. Performs no write; its exit code
- *              mirrors the next tick's resolution so monitoring can alert on it.
+ *              consumption with reservations labeled as reservations, fires/claims/leases,
+ *              the escalation-latch state, the tick journal, and the schedule state) and
+ *              the verdict the next tick would reach, in the tick's own precedence.
+ *              Performs no write; its exit code mirrors the next tick's resolution so
+ *              monitoring can alert on it.
+ *   - `resume` — ATTENDED. Clears a halted schedule after operator review, with the
+ *              standard `[Y/n]` confirmation; grants nothing else (the next tick still
+ *              validates everything in full).
  *   - `stop` — revokes the authorization. Fail-safe: the next tick resolves nothing.
  *
  * Three bounds hold an armed campaign, and only the first needs nobody's attention: the
@@ -72,6 +89,7 @@ const USAGE = `Usage:
   yarn campaign:arm    --calls <n> --days <n> --start <ISO> [--dispatches <n>] [--emit <path>]
   yarn campaign:tick   --manifest <path> [--publication <path>]
   yarn campaign:status --manifest <path>
+  yarn campaign:resume --manifest <path>
   yarn campaign:stop   --manifest <path>
 
 ARM (attended, once per campaign): builds a campaign manifest sized in provider CALLS,
@@ -102,9 +120,18 @@ A live authorization is additionally checked against the durable ESCALATION LATC
 unresolved fire — pending with no live lease, the durable state an escalated, crashed,
 or never-settled dispatch leaves behind — refuses the tick (exit 2) until the campaign
 is stopped and investigated.
+Every substantive tick writes a TWO-PHASE JOURNAL ENTRY (begin, then finish with its
+outcome), and before any journal write, authorization read, or latch read a tick
+evaluates the SCHEDULE HALT RULE over that
+journal: a prior tick that finished outside the healthy set — wherever it sits in the
+window — or that started and never finished within the tick deadline (the crash shape),
+refuses this tick (exit 2, writing no journal entry and touching no campaign state)
+until an operator runs campaign:resume. A finish-write failure leaves the unfinished
+entry that halts the schedule once it passes the tick deadline — failing toward review.
 Never prompts, never falls back to mock. Exits 3 when the authorization is valid
-(activation refused), 2 when no live authorization covers the cohort or an unresolved
-fire holds it, 1 on a loud failure.
+(activation refused), 2 when the schedule is halted, no live authorization covers the
+cohort, the publication evidence refuses, or an unresolved fire holds it, 1 on a loud
+failure.
 
 STATUS (read-only, what monitoring calls): reports the campaign's durable state — the
 authorization (armed/disarmed/expired and its instants), calls reserved vs cap and
@@ -114,17 +141,27 @@ escalation-latch state (unresolved fires) — and the verdict the NEXT tick woul
 including a fresh credential observation.
 Performs no write of any kind: it opens its own connection with NO schema bootstrap and
 a server-enforced read-only session (a read-only role suffices to run it), so schema
-ownership stays with the mutating commands. Exits 0 when the next tick would hold a live
-authorization (which in this build still refuses to dispatch, exit 3), 2 when it would
-refuse, 1 on a loud failure. Per-tick observations (when the last tick ran, deferrals
-by reason) require the scheduler's durable journal and land with the activation slice.
+ownership stays with the mutating commands. Reports the durable tick journal (when the
+last tick ran and how it finished) and the schedule state, evaluated by the same halt
+rule the tick refuses on. Exits 0 when the next tick would hold a live authorization
+(which in this build still refuses to dispatch, exit 3), 2 when it would refuse, 1 on a
+loud failure.
+
+RESUME (attended): clears a HALTED schedule after an operator has reviewed the campaign,
+with the standard [Y/n] confirmation. The acknowledgment is CONDITIONAL: it commits only
+while the journal frontier still equals the exact state the review read — a tick that
+begins meanwhile refuses the resume (exit 2, nothing written; review again) — and it
+refuses outright while an in-flight tick's outcome is still pending. Resuming grants
+NOTHING else: the next tick still validates the authorization, the publication evidence,
+and the escalation latch in full. A schedule that is not halted has nothing to resume
+(exit 2, no write).
 
 STOP: revokes the authorization. The next tick fires nothing.
 
 Needs STORE_DATABASE_URL.`;
 
 interface CampaignOptions {
-  command: 'arm' | 'tick' | 'stop' | 'status';
+  command: 'arm' | 'tick' | 'stop' | 'status' | 'resume';
   calls: number;
   days: number;
   startIso: string | null;
@@ -140,7 +177,7 @@ function parseArgs(argv: string[]): CampaignOptions {
     printLine(USAGE);
     process.exit(0);
   }
-  if (command !== 'arm' && command !== 'tick' && command !== 'stop' && command !== 'status') {
+  if (command !== 'arm' && command !== 'tick' && command !== 'stop' && command !== 'status' && command !== 'resume') {
     throw new UsageError(`unknown command: ${command ?? '(none)'}`);
   }
   const options: CampaignOptions = {
@@ -246,12 +283,14 @@ const ACTIVATION_DISABLED =
 
 export interface CampaignDeps {
   /** The MUTATING open: applies the idempotent schema/function bootstrap and constructs the
-   *  full store. Owned by the commands that are allowed to write (arm, tick, stop). */
+   *  full store. Owned by the commands that are allowed to write (arm, tick, resume, stop). */
   readonly openStore: (databaseUrl: string) => Promise<{
     store: AtomicStore;
     authorizations: CampaignAuthorizationPort;
     /** The store-derived escalation-latch read (pending fires with no live lease). */
     unresolvedFires: UnresolvedFireRead;
+    /** The durable two-phase tick journal (the schedule halt rule reads it). */
+    tickJournal: CampaignTickJournalPort;
     close: () => Promise<void>;
   }>;
   /** The READ-ONLY open for the status surface: constructs only the read ports, applies NO
@@ -263,6 +302,8 @@ export interface CampaignDeps {
     statusReads: CampaignStatusReadPort;
     /** The same store-derived escalation-latch read the tick refuses on. */
     unresolvedFires: UnresolvedFireRead;
+    /** The same tick journal the tick writes; status only ever reads it. */
+    tickJournal: CampaignTickJournalPort;
     close: () => Promise<void>;
   }>;
   readonly observeCredentials: (participantIds: readonly string[]) => ReadonlyMap<string, boolean>;
@@ -552,11 +593,17 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
 // ---------------------------------------------------------------------------
 
 /**
- * One UNATTENDED tick. Resolves live intent from the durable record — no prompt, no mock
- * fallback — checks the durable escalation latch, and then refuses to dispatch, because
- * scheduled activation is structurally disabled in this build: this function validates
- * the whole authorization chain and owns no path to a provider adapter, a claim, or a
- * dispatch.
+ * One UNATTENDED tick. Refuses outright while the schedule is halted (writing nothing);
+ * otherwise journals a two-phase entry, resolves live intent from the durable record — no
+ * prompt, no mock fallback — verifies publication evidence when given, checks the durable
+ * escalation latch, finishes the journal entry with the decided outcome, and then refuses
+ * to dispatch, because scheduled activation is structurally disabled in this build: this
+ * function validates the whole authorization chain and owns no path to a provider
+ * adapter, a claim, or a dispatch. A journal FINISH failure never changes a decided
+ * outcome — it is reported, and the unfinished entry halts the schedule until an operator
+ * reviews it (fail toward review). A tick that fails before its begin entry leaves no
+ * journal trace and can reach no dispatch either: every dispatch path needs the same
+ * store it could not reach.
  */
 export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps): Promise<number> {
   if (options.manifestPath === null) {
@@ -566,14 +613,13 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
   const rawManifestBytes = readFileSync(options.manifestPath);
   const booted = cohortBoot({ manifestBytes: decodeManifestText(rawManifestBytes) });
 
-  // Public-Git precommitment evidence. When a descriptor is supplied, it must verify —
-  // real repository, full commit, byte-identical blob, committer strictly before
-  // windowStart — and ANY failure (including a network failure) is a refusal, never a
-  // pass-through. The all-zeros rehearsal sentinel is rejected STRUCTURALLY, before any
-  // network request: it is the self-resolver's marker and can never be evidence. When no
-  // descriptor is supplied, the tick says so — activation will make it mandatory.
+  // Public-Git precommitment descriptor — LOCAL validation only, before the store: an
+  // unusable descriptor file and the all-zeros rehearsal sentinel are configuration
+  // errors, refused before anything opens. The network VERIFICATION runs inside the
+  // journaled section below, so a verification failure is a durable tick outcome the
+  // schedule halt rule sees.
+  let descriptor: ManifestPublicationV1 | null = null;
   if (options.publicationPath !== null) {
-    let descriptor: ManifestPublicationV1;
     try {
       descriptor = parseManifestPublication(JSON.parse(readFileSync(options.publicationPath, 'utf8')));
     } catch (error) {
@@ -587,23 +633,6 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
       );
       return 2;
     }
-    try {
-      const verified = await verifyPublication({
-        localManifestBytes: rawManifestBytes,
-        publication: descriptor,
-        resolver: { resolve: deps.resolvePublication },
-      });
-      printLine(
-        `publication evidence VERIFIED — ${descriptor.repositoryOwner}/${descriptor.repositoryName}:` +
-          `${descriptor.path} @ ${descriptor.commitSha} (committed ${verified.committerTimestamp})`,
-      );
-    } catch (error) {
-      const detail = error instanceof PublicationError ? error.violations.join('; ') : messageOf(error);
-      printError(`publication evidence REFUSED — the precommitment did not verify: ${detail}`);
-      return 2;
-    }
-  } else {
-    printLine('publication evidence NOT CONFIGURED (--publication) — required before activation');
   }
 
   const databaseUrl = envValue('STORE_DATABASE_URL');
@@ -611,52 +640,129 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
     printError('a tick needs STORE_DATABASE_URL');
     return 2;
   }
-  const { authorizations, unresolvedFires, close } = await deps.openStore(databaseUrl);
+  const { authorizations, unresolvedFires, tickJournal, close } = await deps.openStore(databaseUrl);
   try {
-    const stored = await authorizations.read(booted.cohortId);
-    const resolution = resolveCampaignIntent({
-      booted,
-      stored,
-      now: deps.now(),
-      observeCredentials: deps.observeCredentials,
+    // The SCHEDULE HALT RULE, before any journal write, authorization read, or latch
+    // read: a prior tick that finished outside the healthy set, or that started and never
+    // finished within the tick deadline, halts scheduling until an operator resumes. A
+    // halted tick writes no journal entry and touches no campaign state — its refusal is
+    // derived, so repeated cron firings cannot bury the entry that needs review. A
+    // journal read failure propagates (loud exit 1, never read as clear).
+    const { entries: journalEntries } = await tickJournal.scheduleWindow(booted.cohortId, HEALTHY_TICK_OUTCOMES);
+    const schedule = resolveScheduleState({
+      entries: journalEntries,
+      nowMs: deps.now(),
+      deadlineMs: tickDeadlineMs(booted.manifest),
+      healthyOutcomes: HEALTHY_TICK_OUTCOMES,
     });
-    if (resolution.kind === 'Refused') {
-      // NEVER a mock fallback: a tick with no live authorization fires nothing and says why.
-      printError(`no live campaign authorization for cohort ${booted.cohortId}: ${resolution.violations.join('; ')}`);
-      return 2;
-    }
-    printLine(
-      `campaign authorization VALID for cohort ${booted.cohortId} ` +
-        `(${resolution.authorization.observedCredentialedParticipantIds.length}/${resolution.authorization.participantIds.length} ` +
-        `roster credentials observed now)`,
-    );
-    // The DURABLE ESCALATION LATCH, at the exact point where the activation flip will
-    // assemble the real tick input: an unresolved fire — pending with no live lease — is
-    // the durable state an escalated, crashed, or never-settled dispatch leaves behind,
-    // so the campaign must not spend further even under a live authorization. The latch
-    // is DERIVED from that retained state (never a separate write), which is what makes
-    // it hold across a failed disarm and a process restart. At dispatch time the same
-    // fact also guards every admission (`latchGuardedClaimPort`); this tick-level check
-    // is the half a scheduler and an operator see. A read failure propagates — a loud
-    // exit 1, never read as clear.
-    const unresolved = await unresolvedFires.unresolvedFires(booted.cohortId);
-    if (unresolved.length > 0) {
+    if (schedule.kind === 'halted') {
+      printError(`SCHEDULE HALTED — refusing to run: ${schedule.why}`);
       printError(
-        `ESCALATION LATCH — refusing to dispatch: ${unresolved.length} unresolved fire(s) hold cohort ` +
-          `${booted.cohortId}: ${unresolved.map((f) => `${f.fireId} (admitted ${f.admittedAt})`).join('; ')}`,
-      );
-      printError(
-        'an unresolved fire is pending with no live lease — it escalated the spend guard, crashed, or ' +
-          "never settled. Check the sink's cohort directory for its installed artifact and spend " +
-          'sidecar (a fire that crashed before install may have neither). Run ' +
-          `campaign:stop --manifest ${options.manifestPath} and investigate; a stopped campaign is over ` +
-          '(a cohort arms at most once, ever).',
+        `review the campaign (campaign:status --manifest ${options.manifestPath}), then ` +
+          `campaign:resume --manifest ${options.manifestPath} to resume scheduling, or ` +
+          'campaign:stop to end the campaign.',
       );
       return 2;
     }
-    printLine('escalation latch CLEAR — no unresolved fire holds this cohort');
-    printError(ACTIVATION_DISABLED);
-    return 3;
+
+    // The two-phase journal entry: begin now, finish with the decided outcome on every
+    // terminal path. A begin failure propagates (a tick that cannot reach the journal
+    // cannot reach a dispatch either — the same store serves both). A FINISH failure
+    // never changes a decided outcome: it is reported, and the entry left unfinished is
+    // exactly what halts the schedule until an operator reviews it.
+    const tickEntryId = await tickJournal.begin(booted.cohortId, new Date(deps.now()).toISOString());
+    const finishQuietly = async (outcome: CampaignTickOutcome, detail: string | null): Promise<void> => {
+      try {
+        await tickJournal.finish(tickEntryId, outcome, detail, new Date(deps.now()).toISOString());
+      } catch (error) {
+        printError(
+          `warning: the tick journal finish failed AFTER the outcome was decided — the reported outcome ` +
+            `stands, and the unfinished journal entry will halt the schedule until an operator reviews it: ` +
+            messageOf(error),
+        );
+      }
+    };
+    try {
+      // Public-Git precommitment evidence. When a descriptor is supplied, it must verify —
+      // real repository, full commit, byte-identical blob, committer strictly before
+      // windowStart — and ANY failure (including a network failure) is a refusal, never a
+      // pass-through. When no descriptor is supplied, the tick says so — activation will
+      // make it mandatory. Verification runs BEFORE the authorization validation.
+      if (descriptor !== null) {
+        try {
+          const verified = await verifyPublication({
+            localManifestBytes: rawManifestBytes,
+            publication: descriptor,
+            resolver: { resolve: deps.resolvePublication },
+          });
+          printLine(
+            `publication evidence VERIFIED — ${descriptor.repositoryOwner}/${descriptor.repositoryName}:` +
+              `${descriptor.path} @ ${descriptor.commitSha} (committed ${verified.committerTimestamp})`,
+          );
+        } catch (error) {
+          const detail = error instanceof PublicationError ? error.violations.join('; ') : messageOf(error);
+          printError(`publication evidence REFUSED — the precommitment did not verify: ${detail}`);
+          await finishQuietly('publication_refused', detail);
+          return 2;
+        }
+      } else {
+        printLine('publication evidence NOT CONFIGURED (--publication) — required before activation');
+      }
+
+      const stored = await authorizations.read(booted.cohortId);
+      const resolution = resolveCampaignIntent({
+        booted,
+        stored,
+        now: deps.now(),
+        observeCredentials: deps.observeCredentials,
+      });
+      if (resolution.kind === 'Refused') {
+        // NEVER a mock fallback: a tick with no live authorization fires nothing and says why.
+        printError(`no live campaign authorization for cohort ${booted.cohortId}: ${resolution.violations.join('; ')}`);
+        await finishQuietly('no_live_authorization', resolution.violations.join('; '));
+        return 2;
+      }
+      printLine(
+        `campaign authorization VALID for cohort ${booted.cohortId} ` +
+          `(${resolution.authorization.observedCredentialedParticipantIds.length}/${resolution.authorization.participantIds.length} ` +
+          `roster credentials observed now)`,
+      );
+      // The DURABLE ESCALATION LATCH, at the exact point where the activation flip will
+      // assemble the real tick input: an unresolved fire — pending with no live lease — is
+      // the durable state an escalated, crashed, or never-settled dispatch leaves behind,
+      // so the campaign must not spend further even under a live authorization. The latch
+      // is DERIVED from that retained state (never a separate write), which is what makes
+      // it hold across a failed disarm and a process restart. At dispatch time the same
+      // fact also guards every admission (`latchGuardedClaimPort`); this tick-level check
+      // is the half a scheduler and an operator see. A read failure propagates — a loud
+      // exit 1, never read as clear.
+      const unresolved = await unresolvedFires.unresolvedFires(booted.cohortId);
+      if (unresolved.length > 0) {
+        printError(
+          `ESCALATION LATCH — refusing to dispatch: ${unresolved.length} unresolved fire(s) hold cohort ` +
+            `${booted.cohortId}: ${unresolved.map((f) => `${f.fireId} (admitted ${f.admittedAt})`).join('; ')}`,
+        );
+        printError(
+          'an unresolved fire is pending with no live lease — it escalated the spend guard, crashed, or ' +
+            "never settled. Check the sink's cohort directory for its installed artifact and spend " +
+            'sidecar (a fire that crashed before install may have neither). Run ' +
+            `campaign:stop --manifest ${options.manifestPath} and investigate; a stopped campaign is over ` +
+            '(a cohort arms at most once, ever).',
+        );
+        await finishQuietly('escalation_latched', unresolved.map((f) => f.fireId).join('; '));
+        return 2;
+      }
+      printLine('escalation latch CLEAR — no unresolved fire holds this cohort');
+      await finishQuietly('validated_refused', null);
+      printError(ACTIVATION_DISABLED);
+      return 3;
+    } catch (error) {
+      // A loud failure after the journal entry began: record it best-effort, then let the
+      // failure propagate unchanged. If this finish also fails, the entry stays
+      // unfinished — which halts the schedule, the conservative direction.
+      await finishQuietly('loud_failure', messageOf(error));
+      throw error;
+    }
   } finally {
     await closeQuietly(close);
   }
@@ -695,7 +801,7 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
   // The READ-ONLY open: no schema bootstrap, no store, and (in production) a server-enforced
   // read-only session. A status read against a database whose schema was never applied fails
   // loudly — bootstrap belongs to the mutating commands, never to monitoring.
-  const { authorizations, statusReads, unresolvedFires, close } = await deps.openReads(databaseUrl);
+  const { authorizations, statusReads, unresolvedFires, tickJournal, close } = await deps.openReads(databaseUrl);
   try {
     const manifest = booted.manifest;
     const projection = projectCampaignCost(manifest);
@@ -778,14 +884,48 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
       );
     }
 
-    // The verdict the NEXT tick would reach — the exact resolution the tick runs,
-    // including a fresh independent credential observation, then the same latch check.
+    // The per-tick half of the monitoring surface: a bounded newest-first read for the
+    // DISPLAY line, and the authoritative schedule window for the SAME pure rule the tick
+    // refuses on (the display read is deliberately not the halt authority).
+    const recentEntries = await tickJournal.entries(booted.cohortId, SCHEDULE_WINDOW_LIMIT);
+    const lastTick = recentEntries.find((entry) => entry.kind === 'tick');
+    if (lastTick === undefined) {
+      printLine('  ticks  none recorded');
+    } else if (lastTick.finishedAt === null) {
+      printLine(`  ticks  last tick ${lastTick.id} started ${lastTick.startedAt} — unfinished`);
+    } else {
+      printLine(
+        `  ticks  last tick ${lastTick.id} started ${lastTick.startedAt} — finished ${lastTick.finishedAt} ` +
+          `(${String(lastTick.outcome)})`,
+      );
+    }
+    const { entries: windowEntries } = await tickJournal.scheduleWindow(booted.cohortId, HEALTHY_TICK_OUTCOMES);
+    const schedule = resolveScheduleState({
+      entries: windowEntries,
+      nowMs: deps.now(),
+      deadlineMs: tickDeadlineMs(booted.manifest),
+      healthyOutcomes: HEALTHY_TICK_OUTCOMES,
+    });
+    if (schedule.kind === 'clear') {
+      printLine('  sched  clear — scheduling may continue');
+    } else {
+      printLine(`  sched  HALTED — ${schedule.why} (campaign:resume to resume scheduling)`);
+    }
+
+    // The verdict the NEXT tick would reach, in the tick's own precedence: the schedule
+    // halt first (the tick refuses before reading anything else), then the exact
+    // resolution the tick runs — including a fresh independent credential observation —
+    // then the same latch check.
     const resolution = resolveCampaignIntent({
       booted,
       stored,
       now: deps.now(),
       observeCredentials: deps.observeCredentials,
     });
+    if (schedule.kind === 'halted') {
+      printLine('  next tick would REFUSE — the schedule is halted (operator resume required)');
+      return 2;
+    }
     if (resolution.kind === 'Refused') {
       printLine(`  next tick would REFUSE: ${resolution.violations.join('; ')}`);
       return 2;
@@ -801,6 +941,93 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
       '  next tick would AUTHORIZE — and then refuse to dispatch: activation is structurally ' +
         'disabled in this build (exit 3; see docs/CAMPAIGN-ACTIVATION.md)',
     );
+    return 0;
+  } finally {
+    await closeQuietly(close);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// resume
+// ---------------------------------------------------------------------------
+
+/**
+ * Resume a HALTED schedule — attended, with the standard [Y/n] confirmation, because the
+ * halt exists precisely so a human reviews the campaign before scheduling continues.
+ * Resuming clears the schedule halt ONLY: it appends an operator-acknowledgment entry to
+ * the journal (bounding the halt window), and grants nothing else — the next tick still
+ * validates the authorization, the publication evidence, and the escalation latch in
+ * full. A schedule that is not halted has nothing to resume and refuses without writing.
+ */
+export async function resumeCampaign(options: CampaignOptions, deps: CampaignDeps): Promise<number> {
+  if (options.manifestPath === null) {
+    printError('resume requires --manifest <path> (the exact manifest the campaign was armed with)');
+    return 2;
+  }
+  const booted = cohortBoot({ manifestBytes: decodeManifestText(readFileSync(options.manifestPath)) });
+  const databaseUrl = envValue('STORE_DATABASE_URL');
+  if (databaseUrl === undefined) {
+    printError('resume needs STORE_DATABASE_URL');
+    return 2;
+  }
+  const { tickJournal, close } = await deps.openStore(databaseUrl);
+  try {
+    const { frontierId, entries: journalEntries } = await tickJournal.scheduleWindow(booted.cohortId, HEALTHY_TICK_OUTCOMES);
+    const deadlineMs = tickDeadlineMs(booted.manifest);
+    const schedule = resolveScheduleState({
+      entries: journalEntries,
+      nowMs: deps.now(),
+      deadlineMs,
+      healthyOutcomes: HEALTHY_TICK_OUTCOMES,
+    });
+    if (schedule.kind === 'clear') {
+      printError(`nothing to resume — the schedule is not halted for cohort ${booted.cohortId}`);
+      return 2;
+    }
+    // An IN-FLIGHT tick has no outcome to review yet, and the resume row would bound its
+    // entry out of the halt window forever — so its eventual crash or failure could never
+    // halt the schedule. Refuse until it finishes or passes the tick deadline (at which
+    // point it is the stale crash shape the operator is reviewing).
+    const inFlight = unreviewedInFlightTick({ entries: journalEntries, nowMs: deps.now(), deadlineMs });
+    if (inFlight !== null) {
+      printError(
+        `refusing to resume: tick ${inFlight.id} (started ${inFlight.startedAt}) is still in flight — ` +
+          'its outcome does not exist yet, and resuming now would exclude it from the halt window ' +
+          'forever. Wait for it to finish or to pass the tick deadline, then resume.',
+      );
+      return 2;
+    }
+    printLine(`RESUME SCHEDULING — cohort ${booted.cohortId}`);
+    printLine(`  halted ${schedule.why}`);
+    printLine('  resuming clears the schedule halt ONLY: the next tick still validates the');
+    printLine('  authorization, the publication evidence, and the escalation latch in full.');
+    printLine("  Enter or 'y' proceeds; 'n', any other answer, or EOF refuses");
+    // The standard [Y/n] confirmation. EOF is refused BEFORE normalization — a stream
+    // that closes without producing a line is not Enter, while an actual empty line
+    // (interactive or deliberately piped) is Enter and accepts the default.
+    const answer = await deps.confirm('resume scheduled ticking for this campaign? [Y/n] ');
+    if (answer === null) {
+      printError('resume refused: the confirmation stream closed (EOF) before an answer');
+      return 2;
+    }
+    const normalized = answer.trim().toLowerCase();
+    if (normalized !== '' && normalized !== 'y' && normalized !== 'yes') {
+      printError(`resume refused (answer ${JSON.stringify(answer)}); Enter or 'y' proceeds`);
+      return 2;
+    }
+    // The CONDITIONAL append: commits only while the journal frontier still equals the
+    // exact frontier this review read. Any tick that began (or any other resume that
+    // landed) in the meantime moves the frontier — nothing is written, and the operator
+    // reviews the new state instead of silently bounding it out of the halt window.
+    const outcome = await tickJournal.resume(booted.cohortId, new Date(deps.now()).toISOString(), schedule.why, frontierId);
+    if (outcome === 'frontier_moved') {
+      printError(
+        'refusing to resume: the journal advanced while you were reviewing — nothing was written. ' +
+          'Run campaign:resume again to review the current state.',
+      );
+      return 2;
+    }
+    printLine('RESUMED. the schedule halt is cleared; the next tick validates in full before anything else.');
     return 0;
   } finally {
     await closeQuietly(close);
@@ -858,10 +1085,12 @@ const PRODUCTION_DEPS: CampaignDeps = {
       throw error;
     }
     const query = pgStoreQuery(pool);
+    const { SqlCampaignTickJournalPort, pgStoreTransactor } = await import('./store/campaignTickJournal.js');
     return {
       store: new SqlAtomicStore(query),
       authorizations: new SqlCampaignAuthorizationPort(query),
       unresolvedFires: new SqlUnresolvedFireReadPort(query),
+      tickJournal: new SqlCampaignTickJournalPort(query, pgStoreTransactor(pool)),
       close: () => pool.end(),
     };
   },
@@ -876,10 +1105,14 @@ const PRODUCTION_DEPS: CampaignDeps = {
     // through this path in the future is refused by PostgreSQL rather than trusted to prose.
     const pool = new Pool({ connectionString: databaseUrl, options: '-c default_transaction_read_only=on' });
     const query = pgStoreQuery(pool);
+    const { SqlCampaignTickJournalPort, pgStoreTransactor } = await import('./store/campaignTickJournal.js');
     return {
       authorizations: new SqlCampaignAuthorizationPort(query),
       statusReads: new SqlCampaignStatusReadPort(query),
       unresolvedFires: new SqlUnresolvedFireReadPort(query),
+      // Status never resumes; the transactor is required by the port's shape, and the
+      // server-enforced read-only session refuses any write it could ever carry.
+      tickJournal: new SqlCampaignTickJournalPort(query, pgStoreTransactor(pool)),
       close: () => pool.end(),
     };
   },
@@ -903,6 +1136,8 @@ async function main(): Promise<number> {
       return tickCampaign(options, PRODUCTION_DEPS);
     case 'status':
       return statusCampaign(options, PRODUCTION_DEPS);
+    case 'resume':
+      return resumeCampaign(options, PRODUCTION_DEPS);
     case 'stop':
       return stopCampaign(options, PRODUCTION_DEPS);
     default: {

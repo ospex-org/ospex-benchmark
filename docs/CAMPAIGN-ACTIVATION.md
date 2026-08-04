@@ -22,18 +22,26 @@ the refusal is not a flag, it is the absence of the paid path from the entrypoin
   every intermediate failure — including an authorizing write whose commit status was lost.
   A cohort is armed at most once, ever; another campaign is a new manifest and therefore a
   new cohortId.
-- **Ticking** (`campaign:tick`, unattended): reads the durable record, validates liveness at
-  the tick clock, exact binding to the booted manifest (identity, roster, price identity,
-  every cap), and a fresh independent credential observation; checks the **durable
-  escalation latch** (an unresolved fire — pending with no live lease — refuses the tick);
-  and then refuses to dispatch. Exit 3 = validly armed, activation refused; exit 2 = no live
-  authorization or an unresolved fire holds the cohort (the store-derived latch signal —
-  the composed latch, evidence scan included, guards admissions at the flip); exit 1 =
-  loud failure. A valid
+- **Ticking** (`campaign:tick`, unattended): evaluates the **schedule halt rule** before
+  any journal write, authorization read, or latch read (below — a halted schedule
+  refuses, writing no journal entry and touching no campaign state), then journals a
+  two-phase entry;
+  reads the durable record, validates liveness at the tick clock, exact binding to the
+  booted manifest (identity, roster, price identity, every cap), and a fresh independent
+  credential observation; checks the **durable escalation latch** (an unresolved fire —
+  pending with no live lease — refuses the tick); finishes its journal entry with the
+  decided outcome; and then refuses to dispatch. Exit 3 = validly armed, activation
+  refused; exit 2 = the schedule is halted, no live authorization, the publication
+  evidence refuses, or an unresolved fire holds the cohort (the store-derived latch
+  signal — the composed latch, evidence scan included, guards admissions at the flip);
+  exit 1 = loud failure. A valid
   authorization deliberately does **not** exit 0, so a scheduler pointed at this build
   notices instead of no-op looping.
 - **Stopping** (`campaign:stop`): stamps `disarmedAt` inside the record (first stop wins,
   row never deleted). The next tick resolves nothing.
+- **Resuming** (`campaign:resume`, attended): clears a halted schedule after operator
+  review, with the standard `[Y/n]` confirmation — an operator-acknowledgment journal
+  entry, granting nothing else.
 - **The hard money bound** is unchanged and independent of all of the above: the store's
   cohort call/spend caps are enforced inside a row lock (`admit_dispatch`), so even a wrong
   authorization layer cannot spend past what arming fixed.
@@ -117,19 +125,61 @@ sidecar bytes on disk), a disarm write that fails, a restart (all fresh objects 
 same durable substrate), and a fresh tick whose provider adapters are tripwires — proving
 the admission is refused and no provider call is reachable.
 
-## What the scheduler itself must specify before activation
+## The scheduler contract — specified, with the durable halves delivered
 
-- Halt semantics: the scheduler stops scheduling on **any nonzero or unknown** tick outcome
-  and requires human re-arming to resume.
-- Ownership of notification (who is told, on what channel) and of the kill lever
-  (`campaign:stop` from a different box than the runner).
-- A status surface so monitoring reads state instead of inferring it from logs. The
-  durable-state half exists: `campaign:status` (read-only) reports the authorization's
+- **Halt semantics — delivered, enforced by the tick itself.** Cron cannot be trusted to
+  stop itself, so every substantive tick writes a **two-phase journal entry**
+  (`store.campaign_ticks`: begin, then finish exactly once with a semantic outcome), and
+  before any journal write, authorization read, or latch read a tick evaluates the halt
+  rule (`campaignSchedule.ts`) over the journal: ANY prior tick in the window that
+  finished outside the healthy set — wherever it sits, so an overlapping slow tick's
+  failure cannot be buried under a faster tick's healthy finish, and including any
+  outcome this build does not recognize — or that started and never finished within the
+  manifest-derived tick deadline (the crash shape, "unknown outcome") refuses this tick
+  (exit 2) until an operator resumes. A halted tick writes no journal entry and touches
+  no campaign state, so repeated cron firings cannot bury the entry that needs review; a
+  journal FINISH failure leaves the unfinished entry that halts the schedule once it
+  passes the tick deadline — failing toward review. The
+  healthy set in this build is exactly the structural refusal (`validated_refused`); the
+  flip replaces it with the real dispatched outcome, landed together with the flip.
+  Stated bounds: the halt evaluation's input is read in ONE snapshot, anchored at the
+  durable latest-resume boundary — the boundary row itself, EVERY unfinished tick after
+  it, and EVERY non-healthy finished tick after it, with deliberately no row limit: a
+  newest-N sample of the raw journal cannot authoritatively decide that no unreviewed
+  halt cause exists, so the bounded newest-first read serves display only (the escalation
+  latch remains the independent money backstop). A tick that fails before its begin
+  entry leaves no journal trace: for store-class failures such a tick can reach no
+  dispatch either (every dispatch path needs the same store it could not reach), and the
+  pre-store configuration refusals — an unusable or all-zeros publication descriptor —
+  are pinned by test to open nothing and dispatch nothing; repeated pre-journal failures
+  surface only through the process exit code and its monitoring channel, never the
+  journal.
+- **Resuming is attended.** `campaign:resume` clears a halted schedule with the standard
+  `[Y/n]` confirmation, appending an operator-acknowledgment entry that bounds the halt
+  window. It refuses while an in-flight tick's outcome is still pending — a resume would
+  bound that entry out of the halt window before it could ever be reviewed — and the
+  append itself is CONDITIONAL: it commits only while the journal frontier still equals
+  the exact frontier the review read (tick begin and resume serialize on one per-cohort
+  lock), so a tick beginning during the attended prompt refuses the acknowledgment
+  instead of being silently bounded out. It
+  grants nothing else: the next tick still validates the authorization, the publication
+  evidence, and the escalation latch in full. A schedule that is not halted has nothing
+  to resume.
+- **Notification and the kill lever — specified.** Monitoring runs `campaign:status`
+  (read-only; its exit code mirrors the next tick's verdict, and the journal + schedule
+  lines carry the state) and alerts on nonzero through whatever channel operates the
+  monitoring box. The kill lever is `campaign:stop`, runnable from any box that reaches
+  the store and holds a copy of the campaign manifest (its bytes are the campaign's
+  identity) — it does not need the runner.
+- A status surface so monitoring reads state instead of inferring it from logs — both
+  halves now exist: `campaign:status` (read-only) reports the authorization's
   classification, calls reserved vs cap and attempts actually started, reservations
   (labeled as reservations, never invoices), fires/claims/active leases, the
-  escalation-latch state (unresolved fires), and the verdict the next tick would reach.
-  The per-tick half — when the last tick ran and deferrals grouped by reason — requires
-  the scheduler's durable tick journal and lands with it.
+  escalation-latch state (unresolved fires), the tick journal (when the last tick ran and
+  how it finished), the schedule state under the same halt rule the tick refuses on, and
+  the verdict the next tick would reach in the tick's own precedence. Deferrals grouped
+  by reason exist only once ticks dispatch; the journal's detail field is where the flip
+  records them.
 
 ## How activation flips
 
@@ -138,5 +188,7 @@ assembly (publication resolution, gated capability mint, the store-backed claim 
 wrapped in `latchGuardedClaimPort` over the composed latch — the store-derived
 unresolved-fire read plus the evidence scan pointed at the same root as the artifact
 sink), landed **together with** the two pieces above and their tests — never before. The
+same change replaces the schedule healthy set (`validated_refused` → the dispatched
+outcome) and records per-fire deferrals in the journal entry's detail. The
 gated campaign capability producer (`gateRealCampaignAdapterCapability`) already exists and
 is fully tested; it is deliberately not reachable from any entrypoint in this build.
