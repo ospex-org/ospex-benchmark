@@ -27,8 +27,10 @@ export interface CampaignFireStatus {
   readonly firesAdmitted: number;
   readonly firesCompleted: number;
   readonly firesPending: number;
-  /** Attempts actually STARTED (`sum(made_calls)`) — the durable quantity closest to real
-   *  provider spend; reservations are not invoices. */
+  /** Attempts STARTED (`sum(made_calls)`) — the store's calls settle floor and the durable
+   *  quantity closest to real provider spend; reservations are not invoices. The initial
+   *  roster arms count from the moment their dispatch is ADMITTED (their leases exist and
+   *  the arms are in flight); each acquired repair lease adds one. */
   readonly callsMade: number;
   readonly claimsPending: number;
   readonly claimsCompleted: number;

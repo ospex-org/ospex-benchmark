@@ -197,7 +197,10 @@ async function main(): Promise<void> {
     assert.equal(fires.firesAdmitted, 1);
     assert.equal(fires.firesPending, 1);
     assert.equal(fires.firesCompleted, 0);
-    assert.equal(fires.callsMade, 0, 'no attempt was started');
+    // made_calls is seeded with the ROSTER SIZE at admission (the initial arms count as
+    // started the moment the dispatch is admitted — the calls settle floor) and grows by
+    // one per acquired repair lease. This assertion is what taught us that; a fake cannot.
+    assert.equal(fires.callsMade, 4, 'the admitted roster counts as started attempts');
     assert.equal(fires.claimsPending, 1);
     assert.equal(fires.claimsCompleted, 0);
     assert.equal(fires.activeLeases, 4, 'the roster-sized initial lease set is live');
