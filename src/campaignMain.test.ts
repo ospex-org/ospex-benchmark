@@ -1612,7 +1612,8 @@ test('an unusable descriptor file refuses: missing, malformed JSON, or an off-sc
   const malformed = publicationFile();
   writeFileSync(malformed, '{not json');
   const shortSha = publicationFile({ commitSha: 'abc123' });
-  for (const publicationPath of [missing, malformed, shortSha]) {
+  const traversal = publicationFile({ path: '../main/package.json' }); // the sha-pin bypass class
+  for (const publicationPath of [missing, malformed, shortSha, traversal]) {
     const d = deps({ auth, confirm: NEVER_PROMPT });
     const { value: code, errors } = await captured(() =>
       withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath, publicationPath }), d)),

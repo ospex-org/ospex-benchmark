@@ -331,3 +331,32 @@ async function assertRejectsPublication(promise: Promise<unknown>): Promise<Publ
   });
   return caught as PublicationError;
 }
+
+
+// ===========================================================================
+// The canonical-path rule: an accepted descriptor path must be immune to URL
+// canonicalization, or a dot segment could collapse the pinned /{sha}/ prefix of the
+// raw-content URL into a MOVING ref and pair an old committer instant with later bytes.
+// ===========================================================================
+
+test('the descriptor schema rejects every non-canonical path class and accepts canonical paths', () => {
+  for (const path of [
+    '../main/package.json', // dot-dot traversal (normalizes the pinned sha away)
+    './x.json',
+    'a/../b',
+    'a/../../b', // repeated traversal
+    'a/%2e%2e/b', // percent-encoded traversal variant
+    '/absolute.json',
+    'a//b', // empty segment
+    'a/', // trailing empty segment
+    'a\\b', // backslash ambiguity
+    'a\u0001b', // control character
+    'a b/c.json', // outside the canonical [A-Za-z0-9._-] alphabet
+    '',
+  ]) {
+    assert.throws(() => parseManifestPublication({ ...PUB, path }), /invalid manifest publication/, path);
+  }
+  for (const path of ['manifests/campaign.json', 'a/b-c_d.e', 'rehearsal-cohort.json']) {
+    assert.deepEqual(parseManifestPublication({ ...PUB, path }).path, path, path);
+  }
+});

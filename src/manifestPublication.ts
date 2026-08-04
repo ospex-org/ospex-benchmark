@@ -40,11 +40,36 @@ const commitShaSchema = z.string().regex(/^[0-9a-f]{40}$/);
 // mirrors the rigor manifest.ts applies to windowStart itself.
 const offsetDateTime = z.string().datetime({ offset: true });
 
+/**
+ * A CANONICAL repository-relative blob path: `/`-separated segments, each drawn from
+ * `[A-Za-z0-9._-]` only and never `.` or `..`. This is what keeps the raw-content URL
+ * immune to canonicalization: no absolute form, no dot-segment traversal (WHATWG URL
+ * normalization collapses `<sha>/../ref/…` into a MOVING-ref URL, silently removing the
+ * commit pin), no backslash or control-character ambiguity, and no percent-encoding
+ * tricks. Returns the violation, or null for a canonical path.
+ */
+export function publicationPathViolation(path: string): string | null {
+  if (path.length === 0) return 'path must be non-empty';
+  for (const segment of path.split('/')) {
+    if (segment === '') return 'path must not contain empty segments (no leading, trailing, or double slashes)';
+    if (segment === '.' || segment === '..') return 'path must not contain "." or ".." segments';
+    if (!/^[A-Za-z0-9._-]+$/.test(segment)) {
+      return `path segment ${JSON.stringify(segment)} must contain only [A-Za-z0-9._-] characters`;
+    }
+  }
+  return null;
+}
+
+function refinePublicationPath(path: string, ctx: z.RefinementCtx): void {
+  const violation = publicationPathViolation(path);
+  if (violation !== null) ctx.addIssue({ code: z.ZodIssueCode.custom, message: violation });
+}
+
 export const manifestPublicationV1Schema = z
   .object({
     repositoryOwner: z.string().min(1),
     repositoryName: z.string().min(1),
-    path: z.string().min(1),
+    path: z.string().min(1).superRefine(refinePublicationPath),
     commitSha: commitShaSchema,
   })
   .strict();
