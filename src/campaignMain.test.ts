@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { buildCampaignAuthorization } from './campaignAuthorization.js';
@@ -10,8 +10,12 @@ import type { CampaignAuthorization, CampaignAuthorizationPort } from './campaig
 import { buildCampaignManifest } from './campaignProfile.js';
 import { armCampaign, installManifestNoClobber, resumeCampaign, statusCampaign, stopCampaign, tickCampaign } from './campaignMain.js';
 import type { CampaignDeps } from './campaignMain.js';
+import { assertCohortAdapterCapability } from './cohortAdapterCapability.js';
 import { cohortBoot } from './cohortBoot.js';
+import type { CohortTickInput, CohortTickResult } from './cohortRunner.js';
+import { FireArtifactSink } from './fireArtifactSink.js';
 import type { ArtifactFs } from './fireArtifactSink.js';
+import { STORE_SCHEMA_VERSION } from './store/constants.js';
 import type { AtomicStore } from './store/contract.js';
 import type { CampaignTickJournalPort, CampaignTickOutcome, ScheduleEntry } from './campaignSchedule.js';
 import type { UnresolvedFire, UnresolvedFireRead } from './escalationLatch.js';
@@ -24,10 +28,11 @@ import { defaultExpectedArms } from './scoring.js';
  * attended arming gate with the standard [Y/n] semantics and exact prompt bytes; the
  * AUTHORITY-ORDERED durable writes (manifest → budget → authorization, so no failed arm
  * leaves standing authority); the reconciliation of re-runs and of already-armed cohorts;
- * and the unattended tick's two refusals — no live authorization (exit 2) and the
- * structural activation refusal (exit 3): a VALID authorization must still never dispatch
- * in this build. The spawned-CLI probes at the bottom drive the PRODUCTION readline seam
- * end to end.
+ * and the unattended tick's ACTIVATED path — the required publication evidence, the
+ * composed escalation latch, the gated billable mint (which probes the synthetic env
+ * credentials for itself), the assembled real tick input behind the injected `runTick`
+ * seam, and the journaled outcome classification. The spawned-CLI probes at the bottom
+ * drive the PRODUCTION readline seam end to end.
  */
 
 const NOW = Date.parse('2026-08-05T00:00:00.000Z');
@@ -36,6 +41,16 @@ const ROSTER = defaultExpectedArms().map((a) => a.participantId);
 
 const SYNTHETIC_ENV: Record<string, string | undefined> = {
   STORE_DATABASE_URL: 'postgres://synthetic/none',
+  // The tick constructs its real read seams from these (never invoked — `runTick` is
+  // injected), and the gated billable mint probes each roster adapter's credential env
+  // var FOR ITSELF — synthetic values satisfy the probe; no network call ever happens.
+  SUPABASE_URL: 'http://127.0.0.1:1',
+  SUPABASE_ANON_KEY: 'synthetic-anon-key',
+  OPENAI_API_KEY: 'synthetic-test-credential',
+  ANTHROPIC_API_KEY: 'synthetic-test-credential',
+  GEMINI_API_KEY: 'synthetic-test-credential',
+  GOOGLE_API_KEY: '',
+  XAI_API_KEY: 'synthetic-test-credential',
 };
 
 async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
@@ -115,6 +130,9 @@ function recordingStore(calls: string[]): AtomicStore {
  *  authoritative halt window, `entriesValue` the bounded display read. */
 class FakeTickJournal implements CampaignTickJournalPort {
   readonly calls: string[] = [];
+  /** Structured finish records, because a dispatched tick's detail is JSON (colons and
+   *  all) and the flat call string cannot be parsed back reliably. */
+  readonly finishes: Array<{ entryId: number; outcome: CampaignTickOutcome; detail: string | null }> = [];
   entriesValue: ScheduleEntry[] = [];
   windowValue: ScheduleEntry[] = [];
   frontierId = 70;
@@ -126,6 +144,7 @@ class FakeTickJournal implements CampaignTickJournalPort {
   }
   async finish(entryId: number, outcome: CampaignTickOutcome, detail: string | null, finishedAtIso: string): Promise<void> {
     this.calls.push(`finish:${entryId}:${outcome}:${detail ?? '<null>'}:${finishedAtIso}`);
+    this.finishes.push({ entryId, outcome, detail });
   }
   async resume(
     cohortId: string,
@@ -189,13 +208,18 @@ function deps(
   unresolvedFires: FakeUnresolvedFires;
   tickJournal: FakeTickJournal;
   opens: { store: number; reads: number };
+  /** Every assembled tick input `runTick` received — recorded even when a test injects
+   *  its own `runTick`, so the assembly is always observable. */
+  tickInputs: CohortTickInput[];
 } {
+  const { runTick: overRunTick, ...rest } = over;
   const auth = over.auth ?? new MemoryAuthPort();
   const storeCalls: string[] = [];
   const statusReads = new FakeStatusReads();
   const unresolvedFires = new FakeUnresolvedFires();
   const tickJournal = new FakeTickJournal();
   const opens = { store: 0, reads: 0 };
+  const tickInputs: CohortTickInput[] = [];
   const base: CampaignDeps = {
     openStore: async () => {
       opens.store += 1;
@@ -211,14 +235,20 @@ function deps(
     resolvePublication: async () => {
       throw new Error('no publication resolution was expected in this test');
     },
-    ...over,
+    runTick: async (input) => {
+      tickInputs.push(input);
+      if (overRunTick) return overRunTick(input);
+      return { discoveredCount: 0, dispositions: [], fireOutcomes: [], admittedCount: 0 };
+    },
+    ...rest,
   };
-  return { ...base, auth, storeCalls, statusReads, unresolvedFires, tickJournal, opens };
+  return { ...base, auth, storeCalls, statusReads, unresolvedFires, tickJournal, opens, tickInputs };
 }
 
 function options(over: Record<string, unknown> = {}): Parameters<typeof armCampaign>[0] {
+  const command = (over['command'] as string | undefined) ?? 'arm';
   return {
-    command: 'arm',
+    command,
     calls: 800,
     days: 7,
     // --start is REQUIRED (the campaign's identity anchor); the fixture pins it to the same
@@ -228,6 +258,10 @@ function options(over: Record<string, unknown> = {}): Parameters<typeof armCampa
     manifestPath: null,
     emitPath: join(mkdtempSync(join(tmpdir(), 'campaign-')), 'campaign-manifest.json'),
     publicationPath: null,
+    // ARM binds a durable evidence destination (mkdtemp is absolute); every other command
+    // takes none — a tick's root comes from the durable record, and a tick GIVEN one
+    // refuses.
+    artifactsPath: command === 'arm' ? mkdtempSync(join(tmpdir(), 'campaign-artifacts-')) : null,
     ...over,
   } as Parameters<typeof armCampaign>[0];
 }
@@ -687,6 +721,136 @@ test('an OMITTED --start refuses before the prompt, the filesystem, and the stor
   assert.deepEqual(d.auth.calls, []);
 });
 
+// ---------------------------------------------------------------------------
+// --artifacts is REQUIRED — the durable evidence destination, bound at arming for the
+// campaign's lifetime; its identity marker is what a tick verifies before reading
+// evidence.
+// ---------------------------------------------------------------------------
+
+test('an OMITTED --artifacts refuses before the prompt, the filesystem, and the store', async () => {
+  const d = deps({
+    confirm: async () => {
+      throw new Error('must not prompt without an evidence destination');
+    },
+  });
+  const opts = options({ artifactsPath: null });
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /requires an explicit --artifacts/);
+  assert.ok(!existsSync(opts.emitPath), 'no manifest was written');
+  assert.deepEqual(d.opens, { store: 0, reads: 0 });
+  assert.deepEqual(d.auth.calls, []);
+});
+
+test('arm INSTALLS the root identity marker and BINDS root + id into the record; an existing marker is adopted', async () => {
+  // Fresh root: the arm mints and durably installs the identity.
+  const { auth, cohortId, evidenceRoot } = await armed();
+  const markerPath = join(evidenceRoot, 'evidence-root.json');
+  const marker = JSON.parse(readFileSync(markerPath, 'utf8')) as { evidenceRootVersion: number; evidenceRootId: string };
+  assert.equal(marker.evidenceRootVersion, 1);
+  const record = auth.records.get(cohortId)!;
+  assert.equal(record.evidenceRoot, evidenceRoot, 'the record binds the RESOLVED absolute root');
+  assert.equal(record.evidenceRootId, marker.evidenceRootId, 'the record binds the id the arm durably installed');
+
+  // A root that ALREADY carries a marker: a second campaign at the same root adopts the
+  // same identity (a root has ONE identity for its lifetime).
+  const sharedRoot = mkdtempSync(join(tmpdir(), 'campaign-shared-root-'));
+  writeFileSync(join(sharedRoot, 'evidence-root.json'), `${JSON.stringify({ evidenceRootVersion: 1, evidenceRootId: 'pre-existing-identity' })}\n`);
+  const auth2 = new MemoryAuthPort();
+  const opts2 = options({ startIso: '2026-08-06T00:00:00.000Z', artifactsPath: sharedRoot });
+  const { value: code2 } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts2, deps({ auth: auth2 }))));
+  assert.equal(code2, 0);
+  const record2 = [...auth2.records.values()][0]!;
+  assert.equal(record2.evidenceRootId, 'pre-existing-identity');
+});
+
+test('an UNREADABLE root marker refuses the arm before the prompt', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'campaign-badmarker-'));
+  writeFileSync(join(root, 'evidence-root.json'), '{not json');
+  const d = deps({
+    confirm: async () => {
+      throw new Error('must not prompt over an unreadable root identity');
+    },
+  });
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => armCampaign(options({ artifactsPath: root }), d)),
+  );
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /identity marker at .* is unreadable/);
+  assert.deepEqual(d.auth.calls, []);
+});
+
+test('a marker RACED IN between the prompt and the durable install conflicts: refused with nothing durable', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'campaign-markerrace-'));
+  const d = deps({
+    confirm: async () => {
+      // The deterministic race: another identity lands on the root while the operator is
+      // answering — the no-clobber install must refuse rather than adopt or overwrite.
+      writeFileSync(join(root, 'evidence-root.json'), `${JSON.stringify({ evidenceRootVersion: 1, evidenceRootId: 'raced-in-identity' })}\n`);
+      return 'y';
+    },
+  });
+  const opts = options({ artifactsPath: root });
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /DIFFERENT identity marker/);
+  assert.ok(!existsSync(opts.emitPath), 'no manifest was written after the conflict');
+  assert.equal(d.auth.records.size, 0, 'no authority was created');
+});
+
+test('reconciliation requires the LIVE marker to match the standing identity — a replaced or recreated root refuses instead of reporting ALREADY armed', async () => {
+  // The negative control — an intact marker still reconciles exit 0 — is pinned by the
+  // 'UNKNOWN-COMMIT convergence' and 're-running the SAME arm reconciles' tests.
+  // (i) The marker at the same pathname is replaced with a different identity.
+  {
+    const auth = new MemoryAuthPort();
+    const opts = options();
+    const first = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+    assert.equal(first.value, 0);
+    const standing = [...auth.records.values()][0]!;
+    const root = resolve(opts.artifactsPath!);
+    writeFileSync(join(root, 'evidence-root.json'), `${JSON.stringify({ evidenceRootVersion: 1, evidenceRootId: 'identity-B' })}\n`);
+    const retry = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth, now: () => NOW + 60_000 }))));
+    assert.equal(retry.value, 2, 'the attended command must not report a reconciliation the next tick will refuse');
+    assert.match(retry.errors.join('\n'), /no longer carries the\s+armed identity/);
+    assert.deepEqual([...auth.records.values()][0], standing, 'the standing record was not rewritten');
+  }
+  // (ii) The root is lost entirely and the retry finds nothing to adopt: the retry stamps
+  // a FRESH identity onto the recreated pathname (durable step 0 precedes the store read
+  // by design), but the reconciliation still refuses against the standing id.
+  {
+    const auth = new MemoryAuthPort();
+    const opts = options();
+    const first = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+    assert.equal(first.value, 0);
+    const root = resolve(opts.artifactsPath!);
+    rmSync(root, { recursive: true, force: true });
+    const retry = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth, now: () => NOW + 60_000 }))));
+    assert.equal(retry.value, 2);
+    assert.match(retry.errors.join('\n'), /no longer carries the\s+armed identity/);
+  }
+});
+
+test('a RETRY pointed at a DIFFERENT --artifacts refuses to reconcile: the root is bound for the campaign\'s lifetime', async () => {
+  const auth = new MemoryAuthPort();
+  const opts = options();
+  const first = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+  assert.equal(first.value, 0);
+  const standing = [...auth.records.values()][0]!;
+
+  const retry = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () =>
+      armCampaign(
+        options({ emitPath: opts.emitPath, artifactsPath: mkdtempSync(join(tmpdir(), 'campaign-other-root-')) }),
+        deps({ auth, now: () => NOW + 60_000 }),
+      ),
+    ),
+  );
+  assert.equal(retry.value, 2);
+  assert.match(retry.errors.join('\n'), /refusing to reconcile an arm pointed at/);
+  assert.deepEqual([...auth.records.values()][0], standing, 'the standing record was not rewritten');
+});
+
 test('RETRY IDENTITY: fixed --start + an advancing clock + a pre-authorization failure → the identical retry succeeds with the exact same bytes', async () => {
   const auth = new MemoryAuthPort();
   const opts = options();
@@ -1059,19 +1223,27 @@ test('a CONFIRMED stop and an ABSENT stop keep their outcomes through a close fa
 
 test('both tick outcomes keep their exit codes through a close failure', async () => {
   const { manifestPath, auth } = await armed();
+  const resolver = publishedResolver(manifestPath);
   const valid = await captured(() =>
     withEnv(SYNTHETIC_ENV, () =>
-      tickCampaign(options({ command: 'tick', manifestPath }), depsWithFailingClose({ auth, confirm: NEVER_PROMPT })),
+      tickCampaign(
+        options({ command: 'tick', manifestPath, publicationPath: publicationFile() }),
+        depsWithFailingClose({ auth, confirm: NEVER_PROMPT, resolvePublication: resolver.resolve }),
+      ),
     ),
   );
-  assert.equal(valid.value, 3, 'the activation refusal is preserved');
+  assert.equal(valid.value, 0, 'the dispatched outcome is preserved');
 
   const { bytes } = buildCampaignManifest(NOW + 7_200_000, { callCap: 800, windowForwardMs: WEEK_MS });
   const strangerPath = join(mkdtempSync(join(tmpdir(), 'campaign-close-tick-')), 'manifest.json');
   writeFileSync(strangerPath, bytes);
+  const strangerResolver = publishedResolver(strangerPath);
   const refused = await captured(() =>
     withEnv(SYNTHETIC_ENV, () =>
-      tickCampaign(options({ command: 'tick', manifestPath: strangerPath }), depsWithFailingClose({ auth, confirm: NEVER_PROMPT })),
+      tickCampaign(
+        options({ command: 'tick', manifestPath: strangerPath, publicationPath: publicationFile() }),
+        depsWithFailingClose({ auth, confirm: NEVER_PROMPT, resolvePublication: strangerResolver.resolve }),
+      ),
     ),
   );
   assert.equal(refused.value, 2, 'the no-authorization refusal is preserved');
@@ -1282,25 +1454,30 @@ test('CONFIRMED and ABSENT stop keep their outcomes under hostile close rejectio
   }
 });
 
-test('the disabled tick keeps its exits under hostile close rejections: 3 when valid, 2 when refused', async () => {
+test('the tick keeps its exits under hostile close rejections: 0 when dispatched, 2 when refused', async () => {
   for (const { label, value } of hostileFixtures()) {
     const { manifestPath, auth } = await armed();
+    const resolver = publishedResolver(manifestPath);
     const valid = await captured(() =>
       withEnv(SYNTHETIC_ENV, () =>
-        tickCampaign(options({ command: 'tick', manifestPath }), depsWithHostileClose(value, { auth, confirm: NEVER_PROMPT })),
+        tickCampaign(
+          options({ command: 'tick', manifestPath, publicationPath: publicationFile() }),
+          depsWithHostileClose(value, { auth, confirm: NEVER_PROMPT, resolvePublication: resolver.resolve }),
+        ),
       ),
     );
-    assert.equal(valid.value, 3, `${label}: the structural activation refusal is preserved`);
+    assert.equal(valid.value, 0, `${label}: the dispatched outcome is preserved`);
     assert.match(valid.logs.join('\n'), /campaign authorization VALID/, label);
 
     const { bytes } = buildCampaignManifest(NOW + 9_000_000, { callCap: 800, windowForwardMs: WEEK_MS });
     const strangerPath = join(mkdtempSync(join(tmpdir(), 'campaign-hostile-tick-')), 'manifest.json');
     writeFileSync(strangerPath, bytes);
+    const strangerResolver = publishedResolver(strangerPath);
     const refused = await captured(() =>
       withEnv(SYNTHETIC_ENV, () =>
         tickCampaign(
-          options({ command: 'tick', manifestPath: strangerPath }),
-          depsWithHostileClose(value, { auth, confirm: NEVER_PROMPT }),
+          options({ command: 'tick', manifestPath: strangerPath, publicationPath: publicationFile() }),
+          depsWithHostileClose(value, { auth, confirm: NEVER_PROMPT, resolvePublication: strangerResolver.resolve }),
         ),
       ),
     );
@@ -1312,19 +1489,33 @@ test('the disabled tick keeps its exits under hostile close rejections: 3 when v
 // tick
 // ===========================================================================
 
-/** Arm a campaign and return its manifest path + the shared port. */
-async function armed(): Promise<{ manifestPath: string; auth: MemoryAuthPort; cohortId: string }> {
+/** Arm a campaign and return its manifest path, the shared port, and the BOUND evidence
+ *  root (the record's root — where a tick's evidence scan reads and its sink writes). */
+async function armed(): Promise<{ manifestPath: string; auth: MemoryAuthPort; cohortId: string; evidenceRoot: string }> {
   const auth = new MemoryAuthPort();
   const opts = options();
   const { value: code } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
   assert.equal(code, 0);
   const cohortId = cohortBoot({ manifestBytes: readFileSync(opts.emitPath, 'utf8') }).cohortId;
-  return { manifestPath: opts.emitPath, auth, cohortId };
+  return { manifestPath: opts.emitPath, auth, cohortId, evidenceRoot: resolve(opts.artifactsPath!) };
 }
 
 const NEVER_PROMPT = async (): Promise<string | null> => {
   throw new Error('an unattended tick must never prompt');
 };
+
+/** Tick deps + options against `manifestPath`, with VERIFIABLE publication evidence: the
+ *  resolver publishes the exact local manifest bytes at a compliant instant. */
+function tickFixture(
+  manifestPath: string,
+  auth: MemoryAuthPort,
+  over: Partial<CampaignDeps> = {},
+): { d: ReturnType<typeof deps>; opts: Parameters<typeof armCampaign>[0]; resolver: ReturnType<typeof publishedResolver> } {
+  const resolver = publishedResolver(manifestPath);
+  const d = deps({ auth, confirm: NEVER_PROMPT, resolvePublication: resolver.resolve, ...over });
+  const opts = options({ command: 'tick', manifestPath, publicationPath: publicationFile() });
+  return { d, opts, resolver };
+}
 
 test('a tick with NO armed authorization fires nothing and exits 2 — never a mock fallback, never a prompt', async () => {
   const { bytes } = buildCampaignManifest(NOW, { callCap: 800, windowForwardMs: WEEK_MS });
@@ -1332,13 +1523,12 @@ test('a tick with NO armed authorization fires nothing and exits 2 — never a m
   const manifestPath = join(dir, 'manifest.json');
   writeFileSync(manifestPath, bytes);
 
-  const d = deps({ confirm: NEVER_PROMPT });
-  const { value: code, errors } = await captured(() =>
-    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
-  );
+  const { d, opts } = tickFixture(manifestPath, new MemoryAuthPort());
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
   assert.equal(code, 2);
   assert.match(errors.join('\n'), /no live campaign authorization/);
   assert.deepEqual(d.storeCalls, [], 'the store was never touched');
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
   assert.ok(
     d.tickJournal.calls.some((c) => c.startsWith('finish:71:no_live_authorization:')),
     'the refusal is a journaled outcome the schedule halt rule will see',
@@ -1348,58 +1538,83 @@ test('a tick with NO armed authorization fires nothing and exits 2 — never a m
 test('a tick against a DISARMED campaign fires nothing and exits 2', async () => {
   const { manifestPath, auth, cohortId } = await armed();
   await auth.disarm(cohortId, new Date(NOW).toISOString());
-  const d = deps({ auth, confirm: NEVER_PROMPT });
-  const { value: code } = await captured(() =>
-    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
-  );
+  const { d, opts } = tickFixture(manifestPath, auth);
+  const { value: code } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
   assert.equal(code, 2);
   assert.deepEqual(d.unresolvedFires.calls, [], 'the latch is not consulted once the authorization already refused');
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
 });
 
 test('a tick after EXPIRY fires nothing and exits 2', async () => {
   const { manifestPath, auth } = await armed();
-  const d = deps({ auth, confirm: NEVER_PROMPT, now: () => NOW + WEEK_MS + 1 });
-  const { value: code } = await captured(() =>
-    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
-  );
+  const { d, opts } = tickFixture(manifestPath, auth, { now: () => NOW + WEEK_MS + 1 });
+  const { value: code } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
   assert.equal(code, 2);
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
 });
 
-test('a VALID armed authorization: the tick validates end to end and REFUSES to dispatch (exit 3)', async () => {
-  const { manifestPath, auth, cohortId } = await armed();
+test('a VALID armed authorization DISPATCHES: billable capability, branded publication, durable sink — and journals the healthy outcome (exit 0)', async () => {
+  const { manifestPath, auth, cohortId, evidenceRoot } = await armed();
   auth.calls.length = 0; // observe only the tick's interactions
-  const d = deps({ auth, confirm: NEVER_PROMPT });
-  const { value: code, logs, errors } = await captured(() =>
-    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
-  );
-  assert.equal(code, 3, 'a valid authorization exits 3 — NEVER 0 — while activation is disabled');
-  assert.match(logs.join('\n'), /campaign authorization VALID/);
-  assert.match(logs.join('\n'), /escalation latch CLEAR — no unresolved fire holds this cohort/);
-  const refusal = errors.join('\n');
-  assert.match(refusal, /REFUSING to dispatch/);
-  assert.match(refusal, /structurally disabled/);
-  assert.match(refusal, /No provider call was made/);
+  const { d, opts } = tickFixture(manifestPath, auth);
+  const { value: code, logs } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 0, 'a healthy dispatched tick exits 0 — the scheduler follows with another tick');
+  const output = logs.join('\n');
+  assert.match(output, /publication evidence VERIFIED/);
+  assert.match(output, /campaign authorization VALID/);
+  assert.match(output, /escalation latch CLEAR — no unresolved fire and no installed escalation evidence/);
+  assert.match(output, /dispatching up to 1 fire\(s\) \(REAL provider adapters/);
+  assert.match(output, /TICK COMPLETE — 0 fire\(s\) admitted of 0 candidate\(s\) discovered/);
   assert.deepEqual(auth.calls, [`read:${cohortId}`], 'the ONLY port interaction is the read');
-  assert.deepEqual(d.unresolvedFires.calls, [`unresolved:${cohortId}`], 'the latch read ran exactly once, for this cohort');
-  assert.deepEqual(d.storeCalls, [], 'no budget init, no claim, no dispatch-path store call');
+  assert.deepEqual(d.unresolvedFires.calls, [`unresolved:${cohortId}`], 'the tick-level composed latch read ran exactly once');
+  assert.deepEqual(d.storeCalls, [], 'the scripted tick admitted nothing — no dispatch-path store call');
+
+  // The assembled REAL tick input: a genuinely MINTED billable capability over the exact
+  // roster, the branded publication record for this cohort, the durable sink, and the
+  // store admission pins. A raw adapter map or a mock capability cannot produce these.
+  assert.equal(d.tickInputs.length, 1);
+  const input = d.tickInputs[0]!;
+  assert.equal(input.booted.cohortId, cohortId);
+  assertCohortAdapterCapability(input.capability);
+  assert.equal(input.capability.billingClass, 'billable', 'the gated producer minted REAL billing authority');
+  assert.deepEqual([...input.capability.adapters().keys()], ROSTER);
+  assert.equal(input.publication.cohortId, cohortId, 'the verified publication record is bound to this cohort');
+  assert.ok(input.sink instanceof FireArtifactSink, 'the durable artifact sink is wired');
+  assert.equal(
+    (input.sink as unknown as { baseDir: string }).baseDir,
+    evidenceRoot,
+    'the sink writes under the RECORD-BOUND root the evidence scan reads — a sink pointed elsewhere would orphan its evidence',
+  );
+  assert.equal(input.admission.expectedSchemaVersion, STORE_SCHEMA_VERSION);
+  assert.ok(input.admission.ownerId.length > 0);
+
   const at = new Date(NOW).toISOString();
   assert.deepEqual(
-    d.tickJournal.calls,
-    [`window:${cohortId}:validated_refused`, `begin:${cohortId}:${at}`, `finish:71:validated_refused:<null>:${at}`],
-    'the halt rule read the authoritative window, then the tick journaled begin and the healthy outcome',
+    d.tickJournal.calls.filter((c) => !c.startsWith('finish:')),
+    [`window:${cohortId}:dispatched`, `begin:${cohortId}:${at}`],
+    'the halt rule read the authoritative window, then the tick journaled its begin',
   );
+  const finish = d.tickJournal.finishes[0]!;
+  assert.equal(finish.entryId, 71);
+  assert.equal(finish.outcome, 'dispatched');
+  assert.deepEqual(JSON.parse(finish.detail!), {
+    discovered: 0,
+    evaluated: 0,
+    admitted: 0,
+    deferrals: {},
+    outcomes: {},
+    installed: [],
+  });
 });
 
 test('a HALTED schedule refuses the tick (exit 2) before any journal write or authorization read', async () => {
   const { manifestPath, auth, cohortId } = await armed();
   auth.calls.length = 0;
-  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { d, opts, resolver } = tickFixture(manifestPath, auth);
   d.tickJournal.windowValue = [
     { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: 'boom' },
   ];
-  const { value: code, errors } = await captured(() =>
-    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
-  );
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
   assert.equal(code, 2);
   const refusal = errors.join('\n');
   assert.match(refusal, /SCHEDULE HALTED — refusing to run/);
@@ -1407,108 +1622,104 @@ test('a HALTED schedule refuses the tick (exit 2) before any journal write or au
   assert.match(refusal, /campaign:resume/, 'the operator is told the lever');
   assert.deepEqual(
     d.tickJournal.calls,
-    [`window:${cohortId}:validated_refused`],
+    [`window:${cohortId}:dispatched`],
     'a halted tick writes no journal entry — its refusal is derived state',
   );
-  assert.deepEqual(auth.calls, [], 'the halt precedes even the authorization read');
+  assert.equal(resolver.calls.length, 0, 'the halt precedes even the publication resolution');
+  assert.deepEqual(auth.calls, [], 'and the authorization read');
   assert.deepEqual(d.unresolvedFires.calls, [], 'and the latch read');
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
 });
 
 test('a crashed tick surfaces through the AUTHORITATIVE window read even when the bounded display read no longer holds it', async () => {
   const { manifestPath, auth } = await armed();
-  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { d, opts } = tickFixture(manifestPath, auth);
   // The bounded display read holds only healthy ticks (a fast cron pushed the crash out);
   // the authoritative window still carries the stale entry — and it alone decides.
   d.tickJournal.entriesValue = [
-    { id: 60, kind: 'tick', startedAt: '2026-08-04T23:50:00.000Z', finishedAt: '2026-08-04T23:50:05.000Z', outcome: 'validated_refused', detail: null },
+    { id: 60, kind: 'tick', startedAt: '2026-08-04T23:50:00.000Z', finishedAt: '2026-08-04T23:50:05.000Z', outcome: 'dispatched', detail: null },
   ];
   d.tickJournal.windowValue = [
     { id: 3, kind: 'tick', startedAt: '2026-08-04T00:00:00.000Z', finishedAt: null, outcome: null, detail: null },
   ];
-  const { value: code, errors } = await captured(() =>
-    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
-  );
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
   assert.equal(code, 2);
   assert.match(errors.join('\n'), /tick 3 started .* never finished within the tick deadline/);
 });
 
 test('a tick that finds a STALE UNFINISHED entry (the crash shape) halts the same way', async () => {
   const { manifestPath, auth } = await armed();
-  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { d, opts } = tickFixture(manifestPath, auth);
   // Started far beyond the campaign manifest tick deadline, never finished.
   d.tickJournal.windowValue = [
     { id: 4, kind: 'tick', startedAt: '2026-08-04T00:00:00.000Z', finishedAt: null, outcome: null, detail: null },
   ];
-  const { value: code, errors } = await captured(() =>
-    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
-  );
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
   assert.equal(code, 2);
   assert.match(errors.join('\n'), /never finished within the tick deadline/);
 });
 
 test('a journal FINISH failure never changes the decided outcome — reported, and the entry left to halt the schedule', async () => {
   const { manifestPath, auth } = await armed();
-  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { d, opts } = tickFixture(manifestPath, auth);
   d.tickJournal.finish = async (): Promise<never> => {
     throw new Error('journal write lost');
   };
-  const { value: code, errors } = await captured(() =>
-    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
-  );
-  assert.equal(code, 3, 'the decided outcome stands');
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 0, 'the decided healthy outcome stands');
   assert.match(errors.join('\n'), /journal finish failed AFTER the outcome was decided/);
   assert.match(errors.join('\n'), /will halt the schedule until an operator reviews it/);
 });
 
 test('a journal BEGIN failure is LOUD — a tick that cannot reach the journal proceeds to nothing', async () => {
   const { manifestPath, auth } = await armed();
-  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { d, opts } = tickFixture(manifestPath, auth);
   d.tickJournal.begin = async (): Promise<never> => {
     throw new Error('journal begin lost');
   };
   await assert.rejects(
-    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d))),
+    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d))),
     /journal begin lost/,
   );
   assert.deepEqual(d.auth.calls.filter((c) => c.startsWith('read:')), [], 'no authorization was read');
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
 });
 
-test('a tick under a LIVE authorization but a TRIPPED escalation latch refuses (exit 2) and names the unresolved fire', async () => {
+test('a tick under a LIVE authorization but a TRIPPED escalation latch refuses (exit 2) and names the cause', async () => {
   const { manifestPath, auth, cohortId } = await armed();
-  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { d, opts } = tickFixture(manifestPath, auth);
   const fireId = 'f'.repeat(64);
   d.unresolvedFires.fires = [{ fireId, admittedAt: '2026-08-05T12:00:00.000Z' }];
-  const { value: code, logs, errors } = await captured(() =>
-    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
-  );
-  assert.equal(code, 2, 'a latched campaign must not reach the validly-armed exit 3');
+  const { value: code, logs, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 2, 'a latched campaign must not dispatch');
   assert.match(logs.join('\n'), /campaign authorization VALID/, 'the authorization itself DID validate — the latch is what refused');
   const refusal = errors.join('\n');
-  assert.match(refusal, /ESCALATION LATCH — refusing to dispatch: 1 unresolved fire\(s\)/);
-  assert.match(refusal, new RegExp(`${fireId} \\(admitted 2026-08-05T12:00:00\\.000Z\\)`));
+  assert.match(refusal, /ESCALATION LATCH — refusing to dispatch: 1 cause\(s\)/);
+  assert.match(refusal, new RegExp(`unresolved fire ${fireId} \\(admitted 2026-08-05T12:00:00\\.000Z\\)`));
   assert.match(refusal, /campaign:stop/, 'the operator is told the lever');
-  assert.doesNotMatch(refusal, /structurally disabled/, 'the latch refusal REPLACES the structural refusal, not decorates it');
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
   assert.deepEqual(d.unresolvedFires.calls, [`unresolved:${cohortId}`]);
   assert.ok(
-    d.tickJournal.calls.some((c) => c.startsWith(`finish:71:escalation_latched:${fireId}`)),
-    'the latched refusal is journaled with the unresolved fire named',
+    d.tickJournal.calls.some((c) => c.startsWith(`finish:71:escalation_latched:unresolved fire ${fireId}`)),
+    'the latched refusal is journaled with the cause named',
   );
 });
 
 test('a latch read failure fails the tick LOUD — a broken latch is never read as clear — and journals loud_failure', async () => {
   const { manifestPath, auth } = await armed();
-  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { d, opts } = tickFixture(manifestPath, auth);
   d.unresolvedFires.unresolvedFires = async (): Promise<never> => {
     throw new Error('latch read: connection reset');
   };
   await assert.rejects(
-    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d))),
+    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d))),
     /latch read: connection reset/,
   );
   assert.ok(
     d.tickJournal.calls.some((c) => c.startsWith('finish:71:loud_failure:latch read: connection reset')),
     'the loud failure is journaled best-effort before it propagates',
   );
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
 });
 
 test('resume: a schedule that is NOT halted has nothing to resume — exit 2, no write, no prompt', async () => {
@@ -1521,7 +1732,7 @@ test('resume: a schedule that is NOT halted has nothing to resume — exit 2, no
   assert.match(errors.join('\n'), /nothing to resume — the schedule is not halted/);
   assert.deepEqual(
     d.tickJournal.calls,
-    [`window:${cohortId}:validated_refused`],
+    [`window:${cohortId}:dispatched`],
     'read-only: no resume row was written',
   );
 });
@@ -1550,7 +1761,7 @@ test('resume: a HALTED schedule resumes only through the standard [Y/n] — acce
   assert.match(output, /RESUMED\./);
   const at = new Date(NOW).toISOString();
   assert.equal(d.tickJournal.calls.length, 2);
-  assert.equal(d.tickJournal.calls[0], `window:${cohortId}:validated_refused`);
+  assert.equal(d.tickJournal.calls[0], `window:${cohortId}:dispatched`);
   assert.ok(
     d.tickJournal.calls[1]!.startsWith(`resume:${cohortId}:${at}:tick 4 finished`) &&
       d.tickJournal.calls[1]!.endsWith(':70'),
@@ -1588,15 +1799,16 @@ test('a publication-verification failure journals publication_refused — the ha
 
 test("the tick's journal read failure is LOUD — a broken journal is never read as a clear schedule", async () => {
   const { manifestPath, auth } = await armed();
-  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { d, opts } = tickFixture(manifestPath, auth);
   d.tickJournal.scheduleWindow = async (): Promise<never> => {
     throw new Error('journal read: connection reset');
   };
   await assert.rejects(
-    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d))),
+    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d))),
     /journal read: connection reset/,
   );
   assert.deepEqual(auth.calls.filter((c) => c.startsWith('read:')), [], 'nothing proceeded past the broken read');
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
 });
 
 test('an unusable publication descriptor refuses BEFORE the store: no open, no journal trace', async () => {
@@ -1720,7 +1932,8 @@ test('status of a LIVE campaign: exit 0 and the full durable report, with reserv
   assert.match(output, /ticks {2}none recorded/);
   assert.match(output, /sched {2}clear — scheduling may continue/);
   assert.match(output, /next tick would AUTHORIZE/);
-  assert.match(output, /activation is structurally disabled/, 'a LIVE report must never read as "spending"');
+  assert.match(output, /activation is LIVE/);
+  assert.match(output, /which this read-only surface cannot see/, 'the verdict states the checks only the tick itself can run');
   assert.deepEqual(d.auth.calls, [`read:${cohortId}`]);
   assert.deepEqual(d.unresolvedFires.calls, [`unresolved:${cohortId}`], 'the latch read ran exactly once');
   assert.deepEqual(d.storeCalls, [], 'status performs no store write');
@@ -1761,6 +1974,7 @@ test('status renders the tick journal and a HALTED schedule, and the verdict mir
   assert.equal(code, 2);
   const output = logs.join('\n');
   assert.match(output, /ticks {2}last tick 4 started 2026-08-04T23:00:00\.000Z — finished 2026-08-04T23:00:05\.000Z \(loud_failure\)/);
+  assert.match(output, /^ {9}boom$/m, "the last tick's detail renders on its continuation line");
   assert.match(output, /sched {2}HALTED — .*campaign:resume to resume scheduling/);
   assert.match(output, /next tick would REFUSE — the schedule is halted \(operator resume required\)/);
   assert.doesNotMatch(output, /next tick would REFUSE — the escalation latch/, 'the halt owns the verdict, in the tick’s own precedence');
@@ -1951,7 +2165,7 @@ function publishedResolver(manifestPath: string, over: { bytes?: Buffer; committ
   return { resolve, calls };
 }
 
-test('a tick with VERIFIED publication evidence still refuses activation (exit 3) and names the commit', async () => {
+test('a tick with VERIFIED publication evidence proceeds to dispatch (exit 0) and names the commit', async () => {
   const { manifestPath, auth } = await armed();
   const resolver = publishedResolver(manifestPath);
   const d = deps({ auth, confirm: NEVER_PROMPT, resolvePublication: resolver.resolve });
@@ -1959,7 +2173,7 @@ test('a tick with VERIFIED publication evidence still refuses activation (exit 3
   const { value: code, logs } = await captured(() =>
     withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath, publicationPath }), d)),
   );
-  assert.equal(code, 3, 'verified evidence does not activate anything — the structural refusal stands');
+  assert.equal(code, 0, logs.join('\n'));
   const output = logs.join('\n');
   assert.match(output, /publication evidence VERIFIED/);
   assert.match(output, new RegExp(`@ ${PUBLICATION_SHA}`));
@@ -2039,14 +2253,393 @@ test('an unusable descriptor file refuses: missing, malformed JSON, or an off-sc
   }
 });
 
-test('without --publication the tick states the evidence is NOT CONFIGURED and proceeds to the structural refusal', async () => {
+test('without --publication the tick REFUSES before the store: exit 2, opens nothing, no journal trace', async () => {
   const { manifestPath, auth } = await armed();
   const d = deps({ auth, confirm: NEVER_PROMPT });
-  const { value: code, logs } = await captured(() =>
+  const { value: code, errors } = await captured(() =>
     withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
   );
-  assert.equal(code, 3);
-  assert.match(logs.join('\n'), /publication evidence NOT CONFIGURED .* required before activation/);
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /REQUIRES --publication/);
+  assert.deepEqual(d.opens, { store: 0, reads: 0 }, 'a missing descriptor never opens the store');
+  assert.deepEqual(d.tickJournal.calls, [], 'and leaves no journal trace — the documented pre-journal bound');
+  assert.equal(d.tickInputs.length, 0, 'and dispatches nothing');
+});
+
+// ===========================================================================
+// tick — the activation assembly (the latch-guarded claim port, the evidence-scan root,
+// the second-pass gated mint, the outcome classification, and the journal detail)
+// ===========================================================================
+
+test('the claim port handed to the tick is LATCH-GUARDED: an admission after the latch trips aborts as escalation_latched, and the store admit is never reached', async () => {
+  const { manifestPath, auth } = await armed();
+  const fireId = 'a1'.repeat(32);
+  const resolver = publishedResolver(manifestPath);
+  const d = deps({
+    auth,
+    confirm: NEVER_PROMPT,
+    resolvePublication: resolver.resolve,
+    runTick: async (input) => {
+      // The escalation lands AFTER the tick-level check (which read clear) and BEFORE
+      // this admission — the exact window only the per-admission guard covers.
+      d.unresolvedFires.fires = [{ fireId, admittedAt: '2026-08-05T12:30:00.000Z' }];
+      await input.claimPort.admit({ cohortId: input.booted.cohortId } as never);
+      throw new Error('unreachable — the guarded admit must throw on a tripped latch');
+    },
+  });
+  const opts = options({ command: 'tick', manifestPath, publicationPath: publicationFile() });
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /escalation latch is tripped .* refusing to admit any dispatch/);
+  assert.equal(d.unresolvedFires.calls.length, 2, 'the latch was consulted at the tick level AND at the admission');
+  assert.ok(
+    d.tickJournal.calls.some((c) => c.startsWith(`finish:71:escalation_latched:unresolved fire ${fireId}`)),
+    'the mid-tick trip is journaled as the latched refusal',
+  );
+});
+
+test('the admission guard consults the EVIDENCE half too: a sidecar installed mid-tick trips the guarded admit', async () => {
+  // The store half of the admission guard is pinned by the test above; this one proves
+  // the guard wraps the COMPOSED latch — a guard composed from the store source alone
+  // would admit here, because no unresolved fire exists.
+  const { manifestPath, auth, evidenceRoot } = await armed();
+  const resolver = publishedResolver(manifestPath);
+  const opts = options({ command: 'tick', manifestPath, publicationPath: publicationFile() });
+  const sidecarName = `fire-g9-total-${'ab'.repeat(32)}-spend.json`;
+  const d = deps({
+    auth,
+    confirm: NEVER_PROMPT,
+    resolvePublication: resolver.resolve,
+    runTick: async (input) => {
+      // The escalation evidence lands AFTER the tick-level check (which read clear) and
+      // BEFORE this admission — only an admission guard that includes the evidence scan
+      // can catch it. It lands under the RECORD-BOUND root, the only root the tick reads.
+      const cohortDir = join(evidenceRoot, input.booted.cohortId);
+      mkdirSync(cohortDir, { recursive: true });
+      writeFileSync(join(cohortDir, sidecarName), JSON.stringify({ reason: 'spend_evidence_unknown' }));
+      await input.claimPort.admit({ cohortId: input.booted.cohortId } as never);
+      throw new Error('unreachable — the guarded admit must throw on installed escalation evidence');
+    },
+  });
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 2);
+  const refusal = errors.join('\n');
+  assert.match(refusal, /escalation latch is tripped .* refusing to admit any dispatch/);
+  assert.ok(refusal.includes(sidecarName), 'the refusal names the evidence installed mid-tick');
+  assert.ok(
+    d.tickJournal.calls.some((c) => c.startsWith('finish:71:escalation_latched:installed escalation evidence')),
+    'the mid-tick evidence trip is journaled with its cause',
+  );
+});
+
+test('installed escalation evidence under the ARMED root trips the TICK-LEVEL latch even with the store shadow CLEAR (the post-recovery scenario): exit 2, nothing dispatched', async () => {
+  // The store-derived source reads clear here (no unresolved fire — the reviewed-recovery
+  // state), so the installed sidecar under the record-bound root is the ONLY signal —
+  // exactly the case the evidence half exists for.
+  const { manifestPath, auth, cohortId, evidenceRoot } = await armed();
+  const { d, opts } = tickFixture(manifestPath, auth);
+  const cohortDir = join(evidenceRoot, cohortId);
+  mkdirSync(cohortDir, { recursive: true });
+  const sidecarName = `fire-g1-moneyline-${'b2'.repeat(32)}-spend.json`;
+  writeFileSync(join(cohortDir, sidecarName), JSON.stringify({ reason: 'spend_attempt_over_reservation' }));
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 2);
+  const refusal = errors.join('\n');
+  assert.match(refusal, /ESCALATION LATCH — refusing to dispatch/);
+  assert.match(refusal, /installed escalation evidence/);
+  assert.match(refusal, /spend_attempt_over_reservation/);
+  assert.ok(refusal.includes(sidecarName), "the cause names the sidecar file under the tick's artifact root");
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
+  assert.ok(d.tickJournal.calls.some((c) => c.startsWith('finish:71:escalation_latched:')));
+});
+
+test('a dispatched fire that left UNRESOLVED spend evidence journals dispatch_unresolved and exits 2 — escalated and unsettled alike', async () => {
+  const cases = [
+    {
+      label: 'spend-guard escalation',
+      outcome: {
+        kind: 'InstalledEscalated',
+        reason: 'spend_attempt_over_reservation',
+        offenders: [],
+        sidecar: { path: 'sidecar.json', sha256: 'x'.repeat(64) },
+        install: { path: 'artifact.json' },
+      },
+      desc: 'InstalledEscalated/spend_attempt_over_reservation (0 offending attempt(s))',
+    },
+    {
+      label: 'unconfirmed settlement',
+      outcome: {
+        kind: 'Installed',
+        completion: { status: 'unsettled', reason: 'store_complete_failed' },
+        sidecar: null,
+        install: { path: 'artifact.json' },
+      },
+      desc: 'Installed/unsettled(store_complete_failed)',
+    },
+  ];
+  for (const { label, outcome, desc } of cases) {
+    const fireId = 'c3'.repeat(32);
+    const result = {
+      discoveredCount: 1,
+      dispositions: [{ gameId: 'g1', market: 'total', outcome: 'prepared' }],
+      fireOutcomes: [{ fireId, gameId: 'g1', market: 'total', outcome }],
+      admittedCount: 1,
+    } as unknown as CohortTickResult;
+    const { manifestPath, auth } = await armed();
+    const { d, opts } = tickFixture(manifestPath, auth, { runTick: async () => result });
+    const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+    assert.equal(code, 2, label);
+    assert.match(errors.join('\n'), /DISPATCH LEFT UNRESOLVED SPEND EVIDENCE — 1 fire\(s\)/, label);
+    const finish = d.tickJournal.finishes[0]!;
+    assert.equal(finish.outcome, 'dispatch_unresolved', label);
+    const detail = JSON.parse(finish.detail!) as { outcomes: Record<string, number>; installed: string[] };
+    assert.deepEqual(detail.outcomes, { [desc]: 1 }, label);
+    assert.deepEqual(detail.installed, [`${fireId} g1 total ${desc}`], label);
+  }
+});
+
+test('a healthy dispatched tick journals its detail: deferrals grouped by reason, outcome counts, and the installed fires', async () => {
+  const fireId = 'd4'.repeat(32);
+  const result = {
+    discoveredCount: 5,
+    dispositions: [
+      { gameId: 'g1', market: 'moneyline', outcome: 'defer', reason: 'opener_not_visible' },
+      { gameId: 'g2', market: 'total', outcome: 'defer', reason: 'opener_not_visible' },
+      { gameId: 'g3', market: 'total', outcome: 'defer', reason: 'quote_moved' },
+      { gameId: 'g4', market: 'moneyline', outcome: 'reject', reason: 'stale_entry' },
+      { gameId: 'g5', market: 'total', outcome: 'prepared' },
+    ],
+    fireOutcomes: [
+      {
+        fireId,
+        gameId: 'g5',
+        market: 'total',
+        outcome: { kind: 'Installed', completion: { status: 'settled' }, sidecar: null, install: { path: 'artifact.json' } },
+      },
+      // The claim shapes the SPINE actually emits (`ClaimOutcome`): a Skip carries its
+      // reason, and a cap-exhaustion refusal maps to Defer — both are HEALTHY here (the
+      // negative control: a completed campaign keeps ticking healthily on Defer until its
+      // authorization expires; only Fault/WouldAdmit outcomes are escalated).
+      {
+        fireId: 'e5'.repeat(32),
+        gameId: 'g6',
+        market: 'moneyline',
+        outcome: { kind: 'NotAdmitted', outcome: { kind: 'Skip', reason: 'all_claimed' } },
+      },
+      {
+        fireId: 'e6'.repeat(32),
+        gameId: 'g7',
+        market: 'total',
+        outcome: { kind: 'NotAdmitted', outcome: { kind: 'Defer', reason: 'spend_cap' } },
+      },
+    ],
+    admittedCount: 1,
+  } as unknown as CohortTickResult;
+  const { manifestPath, auth } = await armed();
+  const { d, opts } = tickFixture(manifestPath, auth, { runTick: async () => result });
+  const { value: code, logs } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 0, logs.join('\n'));
+  assert.match(logs.join('\n'), /TICK COMPLETE — 1 fire\(s\) admitted of 5 candidate\(s\) discovered/);
+  const finish = d.tickJournal.finishes[0]!;
+  assert.equal(finish.outcome, 'dispatched');
+  assert.deepEqual(JSON.parse(finish.detail!), {
+    discovered: 5,
+    evaluated: 3,
+    admitted: 1,
+    deferrals: { 'defer:opener_not_visible': 2, 'defer:quote_moved': 1, 'reject:stale_entry': 1 },
+    outcomes: { 'Installed/settled': 1, 'NotAdmitted/Skip(all_claimed)': 1, 'NotAdmitted/Defer(spend_cap)': 1 },
+    installed: [`${fireId} g5 total Installed/settled`],
+  });
+});
+
+test('a FAULT-class admission outcome journals dispatch_faulted and exits 2 — a dead or migrated store must halt the schedule, never tick healthily over it', async () => {
+  const cases = [
+    {
+      label: 'store schema skew',
+      outcome: { kind: 'NotAdmitted', outcome: { kind: 'Fault', reason: 'version_mismatch' } },
+      desc: 'NotAdmitted/Fault(version_mismatch)',
+    },
+    {
+      label: 'rehearsal port wired into the paid path',
+      outcome: { kind: 'NotAdmitted', outcome: { kind: 'WouldAdmit' } },
+      desc: 'NotAdmitted/WouldAdmit',
+    },
+  ];
+  for (const { label, outcome, desc } of cases) {
+    const fireId = 'f6'.repeat(32);
+    const result = {
+      discoveredCount: 1,
+      dispositions: [{ gameId: 'g1', market: 'total', outcome: 'prepared' }],
+      fireOutcomes: [{ fireId, gameId: 'g1', market: 'total', outcome }],
+      admittedCount: 0,
+    } as unknown as CohortTickResult;
+    const { manifestPath, auth } = await armed();
+    const { d, opts } = tickFixture(manifestPath, auth, { runTick: async () => result });
+    const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+    assert.equal(code, 2, label);
+    assert.match(errors.join('\n'), /DISPATCH FAULTED — 1 admission\(s\)/, label);
+    assert.match(errors.join('\n'), /store contract is not holding/, label);
+    const finish = d.tickJournal.finishes[0]!;
+    assert.equal(finish.outcome, 'dispatch_faulted', label);
+    const detail = JSON.parse(finish.detail!) as { outcomes: Record<string, number> };
+    assert.deepEqual(detail.outcomes, { [desc]: 1 }, label);
+  }
+});
+
+test("the gated mint is a SECOND independent pass: a vanished real credential refuses the tick even when the resolution's observation passes", async () => {
+  const { manifestPath, auth } = await armed();
+  // The injected observation says EVERY roster credential exists, so the resolution
+  // authorizes — only the producer's own probe of the real adapters can catch the gap.
+  const { d, opts } = tickFixture(manifestPath, auth);
+  const { value: code, errors } = await captured(() =>
+    withEnv({ ...SYNTHETIC_ENV, ANTHROPIC_API_KEY: undefined }, () => tickCampaign(opts, d)),
+  );
+  assert.equal(code, 2);
+  const refusal = errors.join('\n');
+  assert.match(refusal, /billable adapter mint REFUSED/);
+  assert.match(refusal, /no usable credential/);
+  assert.equal(d.tickInputs.length, 0, 'no tick input was assembled — nothing dispatched');
+  assert.ok(d.tickJournal.calls.some((c) => c.startsWith('finish:71:no_live_authorization:')));
+});
+
+test('missing read-seam env refuses BEFORE the store: exit 2, no open, no journal trace', async () => {
+  const { manifestPath, auth } = await armed();
+  const { d, opts } = tickFixture(manifestPath, auth);
+  const { value: code, errors } = await captured(() =>
+    withEnv({ ...SYNTHETIC_ENV, SUPABASE_URL: undefined }, () => tickCampaign(opts, d)),
+  );
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /missing env: SUPABASE_URL/);
+  assert.deepEqual(d.opens, { store: 0, reads: 0 });
+  assert.deepEqual(d.tickJournal.calls, []);
+  assert.equal(d.tickInputs.length, 0, 'and dispatches nothing');
+});
+
+test('a tick GIVEN --artifacts refuses BEFORE the store: the root is bound at arm and cannot be changed per-tick', async () => {
+  const { manifestPath, auth } = await armed();
+  const resolver = publishedResolver(manifestPath);
+  const d = deps({ auth, confirm: NEVER_PROMPT, resolvePublication: resolver.resolve });
+  const opts = options({
+    command: 'tick',
+    manifestPath,
+    publicationPath: publicationFile(),
+    artifactsPath: mkdtempSync(join(tmpdir(), 'campaign-switch-')),
+  });
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /takes no --artifacts/);
+  assert.deepEqual(d.opens, { store: 0, reads: 0 });
+  assert.deepEqual(d.tickJournal.calls, [], 'no journal trace');
+  assert.equal(d.tickInputs.length, 0, 'and dispatches nothing');
+});
+
+test('TRIPWIRE — a lost or recreated evidence root refuses the tick: an empty directory at the armed pathname is NOT the armed root', async () => {
+  // The reviewer-shaped bypass, as a permanent regression: recovery settled the store
+  // shadow (the fake reads no unresolved fire), escalation evidence had been installed
+  // under the armed root, and then the root is lost and recreated empty at the SAME
+  // pathname. Without the identity binding this read as a clear latch and dispatched.
+  const { manifestPath, auth, cohortId, evidenceRoot } = await armed();
+  const cohortDir = join(evidenceRoot, cohortId);
+  mkdirSync(cohortDir, { recursive: true });
+  writeFileSync(join(cohortDir, `fire-g1-total-${'cd'.repeat(32)}-spend.json`), JSON.stringify({ reason: 'spend_attempt_over_reservation' }));
+
+  // The mount is lost; something recreates the same pathname as an empty directory.
+  rmSync(evidenceRoot, { recursive: true, force: true });
+  mkdirSync(evidenceRoot, { recursive: true });
+
+  const { d, opts } = tickFixture(manifestPath, auth);
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 2, 'the recreated empty root must REFUSE, never read as a clear latch');
+  assert.match(errors.join('\n'), /EVIDENCE ROOT REFUSED/);
+  assert.match(errors.join('\n'), /recreated empty directory is NOT the armed root/);
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
+  assert.ok(
+    d.tickJournal.calls.some((c) => c.startsWith('finish:71:evidence_root_refused:')),
+    'the refusal is a journaled outcome the schedule halt rule sees',
+  );
+
+  // The fully-ABSENT root refuses the same way (the un-recreated mount loss).
+  rmSync(evidenceRoot, { recursive: true, force: true });
+  const second = tickFixture(manifestPath, auth);
+  const absent = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(second.opts, second.d)));
+  assert.equal(absent.value, 2);
+  assert.match(absent.errors.join('\n'), /EVIDENCE ROOT REFUSED/);
+  assert.equal(second.d.tickInputs.length, 0);
+});
+
+test('LATE WINDOW — root-identity loss between the tick-level check and an admission trips the guard: escalation_latched, inner store admit unreachable', async () => {
+  // The tick-level root verification and latch check both read CLEAR; the sabotage lands
+  // inside the dispatch loop, immediately before an admission — the window only a
+  // per-admission identity re-verification covers. The inner store's `admitDispatch`
+  // throws a DISTINCT 'must never reach' error, which would surface as loud_failure /
+  // exit 1 — so the exit-2 escalation_latched outcome proves the guard fired FIRST and
+  // the store admission boundary was never reached.
+  const sabotages: Array<{ label: string; sabotage: (root: string) => void }> = [
+    {
+      label: 'root lost and recreated empty',
+      sabotage: (root) => {
+        rmSync(root, { recursive: true, force: true });
+        mkdirSync(root, { recursive: true });
+      },
+    },
+    {
+      label: 'marker replaced with a foreign identity',
+      sabotage: (root) => {
+        writeFileSync(join(root, 'evidence-root.json'), `${JSON.stringify({ evidenceRootVersion: 1, evidenceRootId: 'foreign-late' })}\n`);
+      },
+    },
+  ];
+  for (const { label, sabotage } of sabotages) {
+    const { manifestPath, auth, evidenceRoot } = await armed();
+    const resolver = publishedResolver(manifestPath);
+    const d = deps({
+      auth,
+      confirm: NEVER_PROMPT,
+      resolvePublication: resolver.resolve,
+      runTick: async (input) => {
+        sabotage(evidenceRoot);
+        await input.claimPort.admit({ cohortId: input.booted.cohortId } as never);
+        throw new Error('unreachable — the guarded admit must throw after root-identity loss');
+      },
+    });
+    const opts = options({ command: 'tick', manifestPath, publicationPath: publicationFile() });
+    const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+    assert.equal(code, 2, label);
+    const refusal = errors.join('\n');
+    assert.match(refusal, /escalation latch is tripped .* refusing to admit any dispatch/, label);
+    assert.match(refusal, /evidence root lost/, label);
+    assert.ok(
+      d.tickJournal.calls.some((c) => c.startsWith('finish:71:escalation_latched:evidence root lost')),
+      `${label}: the late-window trip is journaled with its cause`,
+    );
+  }
+});
+
+test('TRIPWIRE — a FOREIGN identity marker at the armed pathname refuses the tick: another root\'s identity is not the armed root', async () => {
+  const { manifestPath, auth, evidenceRoot } = await armed();
+  rmSync(evidenceRoot, { recursive: true, force: true });
+  mkdirSync(evidenceRoot, { recursive: true });
+  writeFileSync(join(evidenceRoot, 'evidence-root.json'), `${JSON.stringify({ evidenceRootVersion: 1, evidenceRootId: 'a-different-root' })}\n`);
+  const { d, opts } = tickFixture(manifestPath, auth);
+  const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /not the armed\s+id/);
+  assert.equal(d.tickInputs.length, 0, 'nothing was dispatched');
+  assert.ok(d.tickJournal.calls.some((c) => c.startsWith('finish:71:evidence_root_refused:')));
+});
+
+test('a loud dispatch failure journals loud_failure best-effort and propagates', async () => {
+  const { manifestPath, auth } = await armed();
+  const { d, opts } = tickFixture(manifestPath, auth, {
+    runTick: async () => {
+      throw new Error('provider adapter exploded');
+    },
+  });
+  await assert.rejects(
+    captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d))),
+    /provider adapter exploded/,
+  );
+  assert.ok(d.tickJournal.calls.some((c) => c.startsWith('finish:71:loud_failure:provider adapter exploded')));
 });
 
 // ===========================================================================
@@ -2083,14 +2676,18 @@ test('stop disarms an armed campaign, is idempotent, and refuses an unknown coho
 });
 
 test('the recorded authorization is bound to the armed cohort and expires with the window', async () => {
-  const { manifestPath, auth, cohortId } = await armed();
+  const { manifestPath, auth, cohortId, evidenceRoot } = await armed();
   const booted = cohortBoot({ manifestBytes: readFileSync(manifestPath, 'utf8') });
   const record = auth.records.get(cohortId)!;
+  // The bound identity is whatever the arm durably installed at the root.
+  const marker = JSON.parse(readFileSync(join(evidenceRoot, 'evidence-root.json'), 'utf8')) as { evidenceRootId: string };
   const expected = buildCampaignAuthorization({
     booted,
     observedCredentialedParticipantIds: ROSTER,
     armedAtMs: NOW,
     expiresAtMs: NOW + WEEK_MS,
+    evidenceRoot,
+    evidenceRootId: marker.evidenceRootId,
   });
   assert.deepEqual(
     {
@@ -2143,7 +2740,12 @@ const PROBE_ENV = {
 
 test('spawned CLI: a piped EMPTY LINE is Enter and ACCEPTS — then the manifest installs BEFORE any authority', () => {
   const emitPath = join(mkdtempSync(join(tmpdir(), 'campaign-cli-enter-')), 'campaign-manifest.json');
-  const { status, signal, out } = runCli(['arm', '--calls', '8', '--days', '1', '--start', '2027-01-01T00:00:00Z', '--emit', emitPath], PROBE_ENV, '\n');
+  const artifactsDir = mkdtempSync(join(tmpdir(), 'campaign-cli-enter-artifacts-'));
+  const { status, signal, out } = runCli(
+    ['arm', '--calls', '8', '--days', '1', '--start', '2027-01-01T00:00:00Z', '--artifacts', artifactsDir, '--emit', emitPath],
+    PROBE_ENV,
+    '\n',
+  );
   // The exact [Y/n] prompt reached stdout through the production readline seam.
   assert.ok(
     out.includes('arm this campaign for unattended running? [Y/n]'),
@@ -2160,7 +2762,12 @@ test('spawned CLI: a piped EMPTY LINE is Enter and ACCEPTS — then the manifest
 
 test('spawned CLI: true EOF (stream closes without a line) REFUSES with nothing durable', () => {
   const emitPath = join(mkdtempSync(join(tmpdir(), 'campaign-cli-eof-')), 'campaign-manifest.json');
-  const { status, out } = runCli(['arm', '--calls', '8', '--days', '1', '--start', '2027-01-01T00:00:00Z', '--emit', emitPath], PROBE_ENV, '');
+  const artifactsDir = mkdtempSync(join(tmpdir(), 'campaign-cli-eof-artifacts-'));
+  const { status, out } = runCli(
+    ['arm', '--calls', '8', '--days', '1', '--start', '2027-01-01T00:00:00Z', '--artifacts', artifactsDir, '--emit', emitPath],
+    PROBE_ENV,
+    '',
+  );
   assert.equal(status, 2, `EOF refuses with exit 2; out=${out}`);
   assert.ok(/confirmation stream closed \(EOF\)/.test(out), `the refusal names EOF; out=${out}`);
   assert.ok(!existsSync(emitPath), 'no manifest was written');
@@ -2169,7 +2776,12 @@ test('spawned CLI: true EOF (stream closes without a line) REFUSES with nothing 
 
 test("spawned CLI: an explicit 'n' REFUSES with nothing durable", () => {
   const emitPath = join(mkdtempSync(join(tmpdir(), 'campaign-cli-n-')), 'campaign-manifest.json');
-  const { status, out } = runCli(['arm', '--calls', '8', '--days', '1', '--start', '2027-01-01T00:00:00Z', '--emit', emitPath], PROBE_ENV, 'n\n');
+  const artifactsDir = mkdtempSync(join(tmpdir(), 'campaign-cli-n-artifacts-'));
+  const { status, out } = runCli(
+    ['arm', '--calls', '8', '--days', '1', '--start', '2027-01-01T00:00:00Z', '--artifacts', artifactsDir, '--emit', emitPath],
+    PROBE_ENV,
+    'n\n',
+  );
   assert.equal(status, 2, `'n' refuses with exit 2; out=${out}`);
   assert.ok(/arming refused \(answer "n"\)/.test(out), `the refusal echoes the answer; out=${out}`);
   assert.ok(!existsSync(emitPath), 'no manifest was written');
@@ -2177,7 +2789,12 @@ test("spawned CLI: an explicit 'n' REFUSES with nothing durable", () => {
 
 test('spawned CLI: an OMITTED --start refuses before the prompt is ever shown', () => {
   const emitPath = join(mkdtempSync(join(tmpdir(), 'campaign-cli-nostart-')), 'campaign-manifest.json');
-  const { status, out } = runCli(['arm', '--calls', '8', '--days', '1', '--emit', emitPath], PROBE_ENV, '\n');
+  const artifactsDir = mkdtempSync(join(tmpdir(), 'campaign-cli-nostart-artifacts-'));
+  const { status, out } = runCli(
+    ['arm', '--calls', '8', '--days', '1', '--artifacts', artifactsDir, '--emit', emitPath],
+    PROBE_ENV,
+    '\n',
+  );
   assert.equal(status, 2, `a missing --start refuses with exit 2; out=${out}`);
   assert.ok(/requires an explicit --start/.test(out), `the refusal names the requirement; out=${out}`);
   assert.ok(!out.includes('[Y/n]'), `the prompt was never shown; out=${out}`);
@@ -2209,6 +2826,18 @@ test('spawned CLI: tick with an unusable --publication refuses (exit 2) before t
   const help = runCli(['--help'], PROBE_ENV, '');
   assert.equal(help.status, 0);
   assert.ok(help.out.includes('--publication'), `the flag is documented; out=${help.out}`);
+  assert.ok(help.out.includes('--artifacts'), `the evidence-destination flag is documented; out=${help.out}`);
+});
+
+test('spawned CLI: tick WITHOUT --publication refuses (exit 2) before touching anything', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'campaign-cli-nopub-'));
+  const manifestPath = join(dir, 'manifest.json');
+  const { bytes } = buildCampaignManifest(Date.parse('2027-01-01T00:00:00Z'), { callCap: 800, windowForwardMs: WEEK_MS });
+  writeFileSync(manifestPath, bytes);
+  const { status, out } = runCli(['tick', '--manifest', manifestPath], PROBE_ENV, '');
+  assert.equal(status, 2, `a missing descriptor refuses; out=${out}`);
+  assert.ok(/REQUIRES --publication/.test(out), `the refusal names the requirement; out=${out}`);
+  assert.ok(!/ECONNREFUSED/i.test(out), `refused before the store was ever dialed; out=${out}`);
 });
 
 test('spawned CLI: status against an unreachable store fails LOUD (exit 1), never prompts, never writes', () => {

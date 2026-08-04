@@ -58,11 +58,26 @@ export interface ScheduleEntry {
   readonly detail: string | null;
 }
 
-/** The semantic outcomes THIS build's tick can journal. `validated_refused` is the healthy
- *  outcome while activation is structurally disabled; the activation flip replaces it in
- *  {@link HEALTHY_TICK_OUTCOMES} with the real dispatched outcome. */
+/** The semantic outcomes THIS build's tick can journal. `dispatched` is the healthy
+ *  outcome of an activated tick: the dispatch loop ran and every evaluated fire either
+ *  settled cleanly or took no claim (a tick that discovered nothing eligible is healthy —
+ *  its journal detail says so). `dispatch_unresolved` is a dispatched tick that left
+ *  unresolved spend evidence — a spend-guard escalation, or an installed fire whose
+ *  settlement was refused or failed — which the tick escalates to the operator.
+ *  `dispatch_faulted` is a tick whose admissions returned a fault-class claim outcome
+ *  (store-contract skew, an uninitialized budget, a store error — non-authorizing and
+ *  spending nothing, but an unattended campaign must not keep ticking over it).
+ *  `evidence_root_refused` is a tick whose armed evidence root failed its identity
+ *  verification (a lost mount, a recreated empty directory, a foreign marker) — the
+ *  evidence half of the escalation latch cannot be read, so nothing may dispatch. A
+ *  journal written by the PRE-activation build carries `validated_refused` rows; this
+ *  build does not recognize that outcome, so such a journal halts once for operator
+ *  review when the build changes (fail closed, the deliberate direction). */
 export type CampaignTickOutcome =
-  | 'validated_refused'
+  | 'dispatched'
+  | 'dispatch_unresolved'
+  | 'dispatch_faulted'
+  | 'evidence_root_refused'
   | 'no_live_authorization'
   | 'publication_refused'
   | 'escalation_latched'
@@ -72,7 +87,7 @@ export type CampaignTickOutcome =
 export const OPERATOR_RESUMED = 'operator_resumed';
 
 /** The outcomes a scheduler may follow with another tick. Everything else halts. */
-export const HEALTHY_TICK_OUTCOMES: readonly string[] = Object.freeze(['validated_refused']);
+export const HEALTHY_TICK_OUTCOMES: readonly string[] = Object.freeze(['dispatched']);
 
 /** How many journal entries the bounded DISPLAY read returns (newest first). Display
  *  only: the halt evaluation reads the unbounded `scheduleWindow`, never this. */

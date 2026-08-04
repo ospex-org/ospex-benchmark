@@ -39,7 +39,9 @@ import type { Pool } from 'pg';
 /** The scratch Postgres the store-backed demo defaults to (mirrors the adapter conformance
  *  harness). Real environments set STORE_DATABASE_URL; nothing points at production here. */
 const DEFAULT_STORE_DATABASE_URL = 'postgres://postgres:spike@localhost:5433/store_spike';
-/** The default durable artifact output root — a scratch dir under the repo (gitignored). */
+/** The default durable artifact output root for the DEMO/rehearsal runner — a scratch dir
+ *  under the repo (gitignored). The scheduled campaign deliberately has no such default:
+ *  its evidence root is bound explicitly at arm time (`campaignMain.ts`). */
 const DEFAULT_FIRE_ARTIFACTS_DIR = './.fire-artifacts';
 
 /**
@@ -207,10 +209,10 @@ export function selfResolvePublication(manifestBytes: Uint8Array): PublicationVe
 
 /** The run options, derived from the booted manifest constants. In a rehearsal every field is
  *  consumed only at a dispatch the report-only claim never reaches; in the store-backed fire
- *  they drive the real mock dispatch. Shared by both paths so the shape is single-sourced. The
- *  dispatch clock is NOT carried here — it is the one tick clock threaded via `CohortTickInput.now`
- *  (see `LineOpenRunOptions`, which omits `nowMs`). */
-function deriveRunOptions(manifest: CohortManifestV1): LineOpenRunOptions {
+ *  and the scheduled campaign tick they drive the real dispatch. Shared by every path so the
+ *  shape is single-sourced. The dispatch clock is NOT carried here — it is the one tick clock
+ *  threaded via `CohortTickInput.now` (see `LineOpenRunOptions`, which omits `nowMs`). */
+export function deriveRunOptions(manifest: CohortManifestV1): LineOpenRunOptions {
   const baselinePolicyVersion = isBaselinePolicyVersion(manifest.baselinePolicyVersion)
     ? manifest.baselinePolicyVersion
     : undefined;
@@ -276,8 +278,9 @@ export function buildRehearsalTickInput(params: RehearsalTickParams): CohortTick
  *  runner's private `describeOutcome`): the kind plus a claim reason, completion status, or
  *  pre-claim `CoverageMiss` reason. Exhaustive switch with a `never` default — the `CoverageMiss`
  *  case is handled BEFORE any `outcome.outcome` read (a `CoverageMiss` has no `.outcome`, so the
- *  legacy `'reason' in claim` path would throw on it). */
-function describeOutcome(outcome: LineOpenFireOutcome): string {
+ *  legacy `'reason' in claim` path would throw on it). Exported for the campaign tick, whose
+ *  journal detail names outcomes with the same vocabulary this CLI prints. */
+export function describeFireOutcome(outcome: LineOpenFireOutcome): string {
   switch (outcome.kind) {
     case 'Installed':
       return outcome.completion.status === 'settled'
@@ -312,7 +315,7 @@ export function formatTickResult(result: CohortTickResult): string[] {
   }
   lines.push(`fire outcomes (${result.fireOutcomes.length}):`);
   for (const f of result.fireOutcomes) {
-    lines.push(`  fire ${f.fireId} (${f.gameId} ${f.market}): ${describeOutcome(f.outcome)}`);
+    lines.push(`  fire ${f.fireId} (${f.gameId} ${f.market}): ${describeFireOutcome(f.outcome)}`);
     // The operator report carries the durable spend evidence (path + hash): every BILLABLE
     // fire has a sidecar — an escalated one always, a clean Installed when non-null.
     // Known-zero fires carry null and print nothing (the default output is unchanged).
@@ -371,14 +374,14 @@ export function classifyStoreFireResult(
     // nonzero-exit owner for an escalation.
     return {
       ok: false,
-      reason: `the fire installed its evidence but the spend guard refused settlement: ${describeOutcome(only.outcome)}`,
+      reason: `the fire installed its evidence but the spend guard refused settlement: ${describeFireOutcome(only.outcome)}`,
     };
   }
   if (only.outcome.kind !== 'Installed') {
-    return { ok: false, reason: `the fire installed no artifact: ${describeOutcome(only.outcome)}` };
+    return { ok: false, reason: `the fire installed no artifact: ${describeFireOutcome(only.outcome)}` };
   }
   if (only.outcome.completion.status !== 'settled') {
-    return { ok: false, reason: `the fire installed but did not settle: ${describeOutcome(only.outcome)}` };
+    return { ok: false, reason: `the fire installed but did not settle: ${describeFireOutcome(only.outcome)}` };
   }
   const paths = installedArtifactPaths(result);
   if (paths.length !== 1) {

@@ -55,6 +55,8 @@ function record(cohortId: string, over: Partial<CampaignAuthorization> = {}): Ca
     maxConcurrentProviderRequests: 4,
     maxDispatchesPerTick: 1,
     maxRepairAttemptsPerArm: 1,
+    evidenceRoot: '/srv/campaign-evidence',
+    evidenceRootId: 'root-id-1',
     armedAt: '2026-08-05T00:00:00.000Z',
     expiresAt: '2026-08-12T00:00:00.000Z',
     disarmedAt: null,
@@ -341,7 +343,7 @@ async function main(): Promise<void> {
     assert.equal(latched[0]!.fireId, 'f1');
   });
 
-  const HEALTHY = ['validated_refused'];
+  const HEALTHY = ['dispatched'];
   const RULE_NOW = Date.parse('2026-08-05T12:00:00.000Z');
   const RULE_DEADLINE = 3_000_000; // the default campaign build's deadline (pinned in the pure suite)
   const ruleState = (entries: readonly ScheduleEntry[]) =>
@@ -361,10 +363,10 @@ async function main(): Promise<void> {
       'a begun entry is durably UNFINISHED — the crash shape the halt rule detects',
     );
 
-    await journal.finish(id1, 'validated_refused', null, '2026-08-05T11:59:05.000Z');
+    await journal.finish(id1, 'dispatched', null, '2026-08-05T11:59:05.000Z');
     await journal.finish(id1, 'loud_failure', 'a later racer', '2026-08-05T11:59:09.000Z');
     const rows = await journal.entries(c, 10);
-    assert.equal(rows[0]!.outcome, 'validated_refused', 'the FIRST finish stands — a later finish changes nothing');
+    assert.equal(rows[0]!.outcome, 'dispatched', 'the FIRST finish stands — a later finish changes nothing');
     assert.equal(rows[0]!.finishedAt, '2026-08-05T11:59:05.000Z');
     assert.equal(rows[0]!.detail, null);
     window = await journal.scheduleWindow(c, HEALTHY);
@@ -401,7 +403,7 @@ async function main(): Promise<void> {
     for (let i = 0; i < 51; i += 1) {
       const startIso = new Date(RULE_NOW - 60_000 * (51 - i)).toISOString();
       const id = await journal.begin(c, startIso);
-      await journal.finish(id, 'validated_refused', null, new Date(RULE_NOW - 60_000 * (51 - i) + 5_000).toISOString());
+      await journal.finish(id, 'dispatched', null, new Date(RULE_NOW - 60_000 * (51 - i) + 5_000).toISOString());
     }
     const window = await journal.scheduleWindow(c, HEALTHY);
     assert.ok(window.entries.some((e) => e.kind === 'resume'), 'the boundary row is present regardless of how much followed it');
@@ -507,6 +509,10 @@ async function main(): Promise<void> {
           observedCredentialedParticipantIds: roster,
           armedAtMs: startMs,
           expiresAtMs: startMs + weekMs,
+          // Display-only for this probe: status renders the bound root; only the TICK
+          // verifies its identity marker, and no tick runs here.
+          evidenceRoot: '/srv/campaign-evidence',
+          evidenceRootId: 'ro-conformance-root-id',
         }),
       ),
       'armed',
@@ -518,7 +524,7 @@ async function main(): Promise<void> {
     // (an empty journal would render the none-recorded branch without touching the table).
     const journal = new SqlCampaignTickJournalPort(pgStoreQuery(pool), pgStoreTransactor(pool));
     const seededTick = await journal.begin(booted.cohortId, new Date(startMs).toISOString());
-    await journal.finish(seededTick, 'validated_refused', null, new Date(startMs + 1_000).toISOString());
+    await journal.finish(seededTick, 'dispatched', null, new Date(startMs + 1_000).toISOString());
 
     // A SELECT-only role: it cannot create schemas, tables, or functions — the exact
     // capability the monitoring read must not need.
@@ -563,11 +569,15 @@ async function main(): Promise<void> {
     assert.equal(result.status, 0, `the read-only role renders the live report and exits 0; out=${out}`);
     assert.ok(out.includes('authorization LIVE'), `the report rendered; out=${out}`);
     assert.ok(
+      out.includes('root   /srv/campaign-evidence (bound at arm'),
+      `the bound evidence root renders; out=${out}`,
+    );
+    assert.ok(
       out.includes('latch  clear — no unresolved fire'),
       `the escalation-latch read ran under the SELECT-only role; out=${out}`,
     );
     assert.ok(
-      out.includes(`ticks  last tick ${seededTick} started`) && out.includes('(validated_refused)'),
+      out.includes(`ticks  last tick ${seededTick} started`) && out.includes('(dispatched)'),
       `the RO role SELECTed the real journal row; out=${out}`,
     );
     assert.ok(out.includes('sched  clear — scheduling may continue'), `the schedule state rendered; out=${out}`);

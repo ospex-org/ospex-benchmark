@@ -2,7 +2,7 @@ import type { ClaimPort } from './lineOpenClaim.js';
 import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
 
 /**
- * The durable escalation latch (docs/CAMPAIGN-ACTIVATION.md §"A durable escalation latch"):
+ * The durable escalation latch (docs/CAMPAIGN-ACTIVATION.md §"The durable escalation latch"):
  * once a spend-guard escalation exists for a cohort, no further dispatch may begin — across
  * process restarts, and independently of whether a disarm write ever succeeded.
  *
@@ -81,6 +81,17 @@ export type EscalationLatchCause =
       readonly kind: 'unverified_evidence';
       readonly path: string;
       readonly detail: string;
+    }
+  | {
+      /** The armed evidence root failed its identity verification AT THIS CHECK — a lost
+       *  mount, a recreated empty directory at the armed pathname, or a foreign marker.
+       *  Every installed sidecar under the true root is unreachable, so nothing under the
+       *  present pathname may read as clear (`campaignEvidenceRoot.ts` owns the
+       *  verification; the campaign tick wraps its evidence scan with it, so this holds
+       *  at EVERY admission, not only the tick-level check). */
+      readonly kind: 'evidence_root_lost';
+      readonly path: string;
+      readonly detail: string;
     };
 
 export type EscalationLatchVerdict =
@@ -121,6 +132,8 @@ export function describeEscalationLatchCause(cause: EscalationLatchCause): strin
       return `unreadable spend evidence ${cause.path}: ${cause.detail}`;
     case 'unverified_evidence':
       return `unverified clean-pass claim ${cause.path}: ${cause.detail}`;
+    case 'evidence_root_lost':
+      return `evidence root lost ${cause.path}: ${cause.detail}`;
     default: {
       const _exhaustive: never = cause;
       return _exhaustive;
