@@ -65,3 +65,21 @@ create table if not exists store.concurrency_leases (
   -- rows stay distinct, and one initial per (fire, arm_index) is inserted once.
   unique (cohort_id, fire_id, arm_index, attempt_kind, repair_ordinal)
 );
+
+-- ---------------------------------------------------------------------------
+-- Campaign authorizations.
+--
+-- NOT part of the `cohort_budget` contract that `store_schema_version` versions: this table
+-- is never read by admit/lease/complete, so adding it changes no admitted-money path and no
+-- conformance obligation. It records WHICH cohort an operator armed for unattended
+-- scheduled running, so a tick can resolve live intent without a prompt.
+--
+-- The JSON record is the single source of truth (the validator reads it whole); `cohort_id`
+-- is the key an operator arms and disarms by. Revocation writes `disarmedAt` INSIDE the
+-- record and never deletes the row, so the arming and the stop both stay auditable.
+-- ---------------------------------------------------------------------------
+create table if not exists store.campaign_authorizations (
+  cohort_id  text  primary key,
+  record     jsonb not null,
+  created_at timestamptz not null default clock_timestamp()
+);
