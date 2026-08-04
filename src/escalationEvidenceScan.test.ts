@@ -44,9 +44,37 @@ function freshCohortDir(): { base: string; dir: string } {
   return { base, dir };
 }
 
-test('a missing cohort directory is CLEAR — this cohort installed no evidence under this root', async () => {
+test('a missing cohort directory under a READABLE root is CLEAR — this cohort installed no evidence under this root', async () => {
   const base = mkdtempSync(join(tmpdir(), 'escalation-evidence-'));
   assert.deepEqual(await escalationEvidenceLatchSource(base).causes(COHORT), []);
+});
+
+test('a missing evidence ROOT rejects — a wrong or unmounted root must never read as "no evidence"', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'escalation-evidence-'));
+  const missingRoot = join(base, 'no-such-root');
+  await assert.rejects(
+    escalationEvidenceLatchSource(missingRoot).causes(COHORT),
+    /evidence root .* is missing or unreadable/,
+  );
+});
+
+test('seam: the root probe runs only on cohort-directory absence, and a readable root keeps that absence CLEAR', async () => {
+  const ops: string[] = [];
+  const rooted: EvidenceDirFs = {
+    readdir(dir) {
+      ops.push(`readdir:${dir}`);
+      if (dir === '/base') return []; // the root itself is readable
+      const error = new Error('ENOENT: no such file or directory') as NodeJS.ErrnoException;
+      error.code = 'ENOENT';
+      throw error; // the cohort directory is absent
+    },
+    readFile() {
+      throw new Error('unreached');
+    },
+  };
+  assert.deepEqual(await escalationEvidenceLatchSource('/base', rooted).causes(COHORT), []);
+  assert.equal(ops.length, 2, 'exactly the cohort-directory read and the root probe');
+  assert.equal(ops[1], 'readdir:/base', 'the probe reads the root verbatim');
 });
 
 test('a cohortId outside the sink path grammar throws BEFORE any filesystem operation', async () => {
@@ -127,23 +155,28 @@ test('a directory-listing failure other than ENOENT REJECTS — never read as cl
   await assert.rejects(escalationEvidenceLatchSource('/base', denied).causes(COHORT), /EACCES/);
 });
 
-test('a file-read failure latches THAT file as unreadable_evidence rather than failing or skipping the scan', async () => {
+test('a file-read failure latches THAT file as unreadable_evidence, and causes come in sorted name order even when readdir does not', async () => {
   const flaky: EvidenceDirFs = {
     readdir() {
-      return ['x-spend.json', 'y-spend.json'];
+      // Deliberately UNSORTED: the deterministic-order guarantee must come from the
+      // scan's own sort, not from whatever order the platform lists entries in.
+      return ['y-spend.json', 'x-spend.json'];
     },
     readFile(path) {
       if (path.endsWith('x-spend.json')) {
         throw new Error('EIO: i/o error');
       }
-      return Buffer.from(serializeSpendEscalationSidecar(sidecar(null)), 'utf8');
+      return Buffer.from(serializeSpendEscalationSidecar(sidecar('spend_evidence_unknown')), 'utf8');
     },
   };
   const causes = await escalationEvidenceLatchSource('/base', flaky).causes(COHORT);
-  assert.equal(causes.length, 1);
-  const cause = causes[0]!;
-  assert.equal(cause.kind, 'unreadable_evidence');
-  if (cause.kind !== 'unreadable_evidence') return;
-  assert.match(cause.detail, /read failed: EIO/);
-  assert.ok(cause.path.endsWith('x-spend.json'));
+  assert.equal(causes.length, 2);
+  const first = causes[0]!;
+  assert.equal(first.kind, 'unreadable_evidence');
+  if (first.kind !== 'unreadable_evidence') return;
+  assert.match(first.detail, /read failed: EIO/);
+  assert.ok(first.path.endsWith('x-spend.json'), 'x sorts first despite readdir listing y first');
+  const second = causes[1]!;
+  assert.equal(second.kind, 'escalation_evidence');
+  assert.ok(second.path.endsWith('y-spend.json'));
 });

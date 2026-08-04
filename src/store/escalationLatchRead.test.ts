@@ -36,6 +36,13 @@ test('the ONE statement carries the whole predicate: pending fires, minus any fi
   assert.match(sql, /status = 'pending'/);
   assert.match(sql, /not exists/);
   assert.match(sql, /store\.concurrency_leases/);
+  // The anti-join must correlate the lease to THIS fire on both key columns. Dropped or
+  // typoed, ANY live lease in the cohort would mask EVERY pending fire — an escalated
+  // fire hidden behind a concurrent healthy fire's leases, failing open in exactly the
+  // multi-fire shape the store supports. (The two-fire behavioural proof is the
+  // conformance scenario; this pins the statement.)
+  assert.match(sql, /l\.cohort_id = f\.cohort_id/);
+  assert.match(sql, /l\.fire_id = f\.fire_id/);
   // The SAME liveness filter as the store's own capacity read: a lease is live only when
   // it is unreleased AND unexpired — dropping either half would blind the latch to
   // released or expired leases.

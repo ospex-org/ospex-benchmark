@@ -271,10 +271,32 @@ async function main(): Promise<void> {
     assert.equal(latched[0]!.fireId, 'f1');
     assert.ok(!Number.isNaN(Date.parse(latched[0]!.admittedAt)), 'the admission instant round-trips as an instant');
 
+    // The correlation, behaviourally: a SECOND in-flight fire's live leases must not mask
+    // the unresolved one, and the unresolved fire's released leases must not latch the
+    // in-flight one. A dropped lease-to-fire correlation in the anti-join fails exactly
+    // here — any live lease in the cohort would read the whole cohort as clear.
+    const second = await store.admitDispatch({
+      cohortId: c,
+      fireId: 'f2',
+      ownerId: 'w1',
+      expectedSchemaVersion: STORE_SCHEMA_VERSION,
+      gameId: 'g2',
+      proposedMarkets: ['moneyline'],
+      scopeReservations: {
+        moneyline: { spendReservationUsdMicros: 800_000_000, preparedBytesDigest: sha256Hex('latch-read-second-fire') },
+      },
+    });
+    assert.equal(second.outcome, 'admitted');
+    assert.deepEqual(
+      (await latchRead.unresolvedFires(c)).map((f) => f.fireId),
+      ['f1'],
+      "the latch is per-fire: f2's live leases do not mask unresolved f1, and f1's released leases do not latch in-flight f2",
+    );
+
     assert.deepEqual(await store.completeClaim({ cohortId: c, fireId: 'f1', expectedSchemaVersion: STORE_SCHEMA_VERSION }), {
       outcome: 'completed',
     });
-    assert.deepEqual(await latchRead.unresolvedFires(c), [], 'a settled fire clears the latch');
+    assert.deepEqual(await latchRead.unresolvedFires(c), [], 'settling the unresolved fire clears the latch (f2 stays live-leased)');
   });
 
   await check('escalation-latch read: an EXPIRED never-released lease latches — the crash shape self-reports at its lease bound', async () => {

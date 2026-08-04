@@ -27,7 +27,9 @@ the refusal is not a flag, it is the absence of the paid path from the entrypoin
   every cap), and a fresh independent credential observation; checks the **durable
   escalation latch** (an unresolved fire — pending with no live lease — refuses the tick);
   and then refuses to dispatch. Exit 3 = validly armed, activation refused; exit 2 = no live
-  authorization or the escalation latch is tripped; exit 1 = loud failure. A valid
+  authorization or an unresolved fire holds the cohort (the store-derived latch signal —
+  the composed latch, evidence scan included, guards admissions at the flip); exit 1 =
+  loud failure. A valid
   authorization deliberately does **not** exit 0, so a scheduler pointed at this build
   notices instead of no-op looping.
 - **Stopping** (`campaign:stop`): stamps `disarmedAt` inside the record (first stop wins,

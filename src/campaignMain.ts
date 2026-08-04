@@ -103,8 +103,8 @@ unresolved fire — pending with no live lease, the durable state an escalated, 
 or never-settled dispatch leaves behind — refuses the tick (exit 2) until the campaign
 is stopped and investigated.
 Never prompts, never falls back to mock. Exits 3 when the authorization is valid
-(activation refused), 2 when no live authorization covers the cohort or the escalation
-latch is tripped, 1 on a loud failure.
+(activation refused), 2 when no live authorization covers the cohort or an unresolved
+fire holds it, 1 on a loud failure.
 
 STATUS (read-only, what monitoring calls): reports the campaign's durable state — the
 authorization (armed/disarmed/expired and its instants), calls reserved vs cap and
@@ -647,7 +647,8 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
       );
       printError(
         'an unresolved fire is pending with no live lease — it escalated the spend guard, crashed, or ' +
-          'never settled, and its installed artifact and spend sidecar carry the evidence. Run ' +
+          "never settled. Check the sink's cohort directory for its installed artifact and spend " +
+          'sidecar (a fire that crashed before install may have neither). Run ' +
           `campaign:stop --manifest ${options.manifestPath} and investigate; a stopped campaign is over ` +
           '(a cohort arms at most once, ever).',
       );

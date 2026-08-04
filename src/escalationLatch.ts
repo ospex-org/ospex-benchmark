@@ -17,9 +17,12 @@ import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
  *      spine's stage order: the lifecycle runner settles all leases, then production,
  *      install, and the guard). So from strictly before the moment escalation evidence can
  *      exist, the cohort durably holds a fire that is `pending` with no live lease — and a
- *      dispatch admitted through the latch-guarded port at or after that moment is refused
- *      at its own admission. This source is readable from any box that reaches the store,
- *      and it holds even when the escalation sidecar's install itself failed.
+ *      dispatch whose latch check begins at or after that moment is refused at its own
+ *      admission. The check and the admission are two operations, not one transaction, so
+ *      a dispatch already past a clear check when the escalation lands may still commit —
+ *      that residual, like a dispatch already in flight, is bounded by its own reservation
+ *      and the row-locked cohort caps. This source is readable from any box that reaches
+ *      the store, and it holds even when the escalation sidecar's install itself failed.
  *   2. The installed escalation evidence itself (`escalationEvidenceLatchSource` in
  *      `escalationEvidenceScan.ts`): a spend sidecar with a non-null `reason` in the fire
  *      artifact sink's cohort directory. This source is same-box (it reads the sink root),

@@ -57,21 +57,23 @@ import type {
  * The escalation-latch ACCEPTANCE battery — the exact sequence docs/CAMPAIGN-ACTIVATION.md
  * specifies: force an INSTALLED escalation (a real billable fire through the real spine,
  * its artifact and escalated spend sidecar durably on a real filesystem), FAIL the disarm
- * write, RESTART (every object rebuilt fresh over the same durable substrate), tick again —
- * and prove no provider call is reachable: the latch-guarded claim port refuses the
- * admission before any adapter is invoked, so the fresh tick's provider adapters are
- * tripwires that must never fire.
+ * write, RESTART (every object rebuilt fresh over the same durable substrate), then drive
+ * the next dispatch attempt through the same spine a flipped tick will drive — and prove
+ * no provider call is reachable: the latch-guarded claim port refuses the admission before
+ * any adapter is invoked, so the fresh attempt's provider adapters are tripwires that must
+ * never fire.
  *
  * The durable substrate is a real temp directory (the evidence side, scanned by the real
  * `escalationEvidenceLatchSource`) plus an in-memory store whose fires/claims/leases
- * persist across the "restart" and whose unresolved-fire read implements the SAME predicate
- * as `SqlUnresolvedFireReadPort` — pending fires with no unreleased, unexpired lease. The
- * SQL twin of that predicate is proven against real Postgres by `yarn store:campaign-auth`
- * conformance; what this battery proves is the composition: escalation → durable state →
- * restart → refused admission → zero provider contact. Controls pin the latch as the ONLY
- * refusing gate (a cleanly settled prior fire dispatches), and each source holds the latch
- * ALONE (the evidence scan after a recovery settle; the store shadow when the sidecar file
- * is gone).
+ * persist across the "restart" and whose unresolved-fire read implements the SAME
+ * predicate as `SqlUnresolvedFireReadPort`, cohort binding included — the cohort's pending
+ * fires with no unreleased, unexpired lease of that cohort and fire. The SQL twin of that
+ * predicate is proven against real Postgres by `yarn store:campaign-auth` conformance;
+ * what this battery proves is the composition: escalation → durable state → restart →
+ * refused admission → zero provider contact. Controls pin the latch as the ONLY refusing
+ * gate (a cleanly settled prior fire dispatches), and each source holds the latch ALONE
+ * (the evidence scan after a recovery settle; the store shadow when the sidecar file is
+ * gone).
  */
 
 // --- shared instants / identity (the spine fixture's boundary-safe values) ---
@@ -319,6 +321,7 @@ function tripwireAdapters(snapshot: PreparedFireSnapshot): { map: Map<string, Pr
 // --- the durable substrate: an in-memory store whose state survives the "restart" -------
 
 interface FireRow {
+  cohortId: string;
   status: 'pending' | 'completed';
   admittedAt: string;
 }
@@ -327,6 +330,7 @@ interface ClaimRow {
   status: 'pending' | 'completed';
 }
 interface LeaseRow {
+  cohortId: string;
   fireId: string;
   released: boolean;
   expiresAtMs: number;
@@ -352,13 +356,13 @@ function storeOver(state: DurableCohortState, rosterSize: number, nowMs: () => n
       if (state.fires.has(req.fireId)) throw new Error('acceptance battery: unexpected fire replay');
       const scope = req.scopeReservations[scopeKeyOf(req.proposedMarkets)];
       if (scope === undefined) throw new Error('acceptance battery: missing full-scope reservation');
-      state.fires.set(req.fireId, { status: 'pending', admittedAt: new Date(nowMs()).toISOString() });
+      state.fires.set(req.fireId, { cohortId: req.cohortId, status: 'pending', admittedAt: new Date(nowMs()).toISOString() });
       for (const market of req.proposedMarkets) {
         state.claims.set(`${req.gameId}::${market}`, { fireId: req.fireId, status: 'pending' });
       }
       const leases = Array.from({ length: rosterSize }, (_, armIndex) => {
         const leaseId = `lease-${req.fireId.slice(0, 8)}-${armIndex}`;
-        state.leases.set(leaseId, { fireId: req.fireId, released: false, expiresAtMs: nowMs() + 600_000 });
+        state.leases.set(leaseId, { cohortId: req.cohortId, fireId: req.fireId, released: false, expiresAtMs: nowMs() + 600_000 });
         return { leaseId, armIndex, expiresAt: new Date(nowMs() + 600_000).toISOString(), state: 'live' as const };
       });
       return {
@@ -388,17 +392,18 @@ function storeOver(state: DurableCohortState, rosterSize: number, nowMs: () => n
   };
 }
 
-/** The SAME predicate as `SqlUnresolvedFireReadPort`, over the durable rows: pending
- *  fires minus any fire holding an unreleased, unexpired lease. */
+/** The SAME predicate as `SqlUnresolvedFireReadPort`, over the durable rows — cohort
+ *  binding included: the queried cohort's pending fires, minus any fire holding an
+ *  unreleased, unexpired lease correlated on (cohort, fire). */
 function unresolvedFireReadOver(state: DurableCohortState, nowMs: () => number): UnresolvedFireRead {
   return {
-    async unresolvedFires(_cohortId: string): Promise<readonly UnresolvedFire[]> {
+    async unresolvedFires(cohortId: string): Promise<readonly UnresolvedFire[]> {
       const out: UnresolvedFire[] = [];
       for (const [fireId, fire] of state.fires) {
-        if (fire.status !== 'pending') continue;
+        if (fire.cohortId !== cohortId || fire.status !== 'pending') continue;
         let live = false;
         for (const lease of state.leases.values()) {
-          if (lease.fireId === fireId && !lease.released && lease.expiresAtMs > nowMs()) live = true;
+          if (lease.cohortId === cohortId && lease.fireId === fireId && !lease.released && lease.expiresAtMs > nowMs()) live = true;
         }
         if (!live) out.push({ fireId, admittedAt: fire.admittedAt });
       }
@@ -483,15 +488,22 @@ test('installed escalation + failed disarm + restart: a fresh tick cannot reach 
   // (1) Force an INSTALLED escalation through the real spine.
   const { cohortId, fireId } = await installEscalation(state, artifactRoot);
   const filesAfterEscalation = readdirSync(join(artifactRoot, cohortId)).sort();
+  // The twin's cohort binding: a DIFFERENT cohort reads clear off the same durable rows.
+  assert.deepEqual(await unresolvedFireReadOver(state, () => NOW_MS).unresolvedFires('b'.repeat(64)), []);
 
-  // (2) The disarm write FAILS — the authorization record stays live. The latch must make
-  //     this failure safe: nothing below may depend on the disarm having landed.
-  let disarmedAt: string | null = null;
-  const disarm = async (): Promise<void> => {
+  // (2) The disarm write FAILS — the standing authorization record survives untouched
+  //     (the port would stamp `disarmedAt` on success; the throw precedes the write).
+  //     Deliberately, nothing downstream consumes this record: the dispatch spine consults
+  //     no authorization, so a disarm landing or failing cannot change what follows — the
+  //     latch is the ONLY mechanism between this still-standing authority and the tripwire
+  //     adapters, which is exactly the property under test.
+  const authorization: { disarmedAt: string | null } = { disarmedAt: null };
+  const failingDisarm = async (): Promise<void> => {
     throw new Error('disarm write lost: connection reset before commit');
+    // On success this port would stamp: authorization.disarmedAt = new Date(NOW_MS).toISOString()
   };
-  await assert.rejects(disarm(), /disarm write lost/);
-  assert.equal(disarmedAt, null, 'the authorization was NOT disarmed');
+  await assert.rejects(failingDisarm(), /disarm write lost/);
+  assert.equal(authorization.disarmedAt, null, 'the authorization record still stands');
 
   // (3) RESTART: every object rebuilt fresh over the same durable substrate — no in-memory
   //     flag from the escalated run survives into this harness.
@@ -524,7 +536,8 @@ test('installed escalation + failed disarm + restart: a fresh tick cannot reach 
   assert.deepEqual([...state.fires.keys()], [fireId], 'no new fire was admitted');
   assert.deepEqual(readdirSync(join(artifactRoot, cohortId)).sort(), filesAfterEscalation, 'no new artifact or sidecar was written');
 
-  // The latch itself reports the same verdict directly (what campaign:tick surfaces).
+  // The composed latch reports the same verdict directly (campaign:tick surfaces the
+  // store-derived half of this today; the flip wires the whole composition).
   const verdict = await latch.check(cohortId);
   assert.equal(verdict.latched, true);
 });

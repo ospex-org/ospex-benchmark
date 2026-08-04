@@ -17,12 +17,15 @@ import type { EscalationLatchCause, EscalationLatchSource } from './escalationLa
  *   - a `-spend.json` file that cannot be read or decoded, or whose `reason` is anything
  *     else, is an `unreadable_evidence` cause — a file that MIGHT be escalation evidence
  *     latches until a human resolves it, never reads as clear;
- *   - a missing cohort directory is CLEAR: this cohort installed no evidence under this
- *     root. The scan answers only for the root it was given — the honest bound of a
- *     filesystem source — which is why it always composes with the store-derived
- *     unresolved-fire source, whose view of an escalation does not depend on any root.
+ *   - a missing COHORT directory under a readable root is CLEAR: this cohort installed no
+ *     evidence under this root — the one absence a filesystem source can positively read;
+ *   - a missing or unreadable ROOT rejects: a misconfigured or unmounted evidence root
+ *     must refuse dispatch loudly, never degrade the source to a silent no-op.
  *
- * Any other filesystem failure (permissions, I/O) rejects — fail closed.
+ * Any other filesystem failure (permissions, I/O) rejects — fail closed. The scan still
+ * answers only for the root it was given — the honest bound of a filesystem source — so
+ * it composes with the store-derived unresolved-fire source, whose view of an escalation
+ * does not depend on any root.
  */
 
 /** Exactly the filesystem the scan needs; injectable as a test seam. `readdir` must throw
@@ -96,8 +99,22 @@ export function escalationEvidenceLatchSource(
       try {
         names = readdir(dir);
       } catch (error) {
-        if (isEnoent(error)) return []; // no evidence directory for this cohort under this root
-        throw error; // any other filesystem failure refuses dispatch, never reads as clear
+        if (!isEnoent(error)) {
+          throw error; // any non-absence failure refuses dispatch, never reads as clear
+        }
+        // The cohort directory is absent. That is CLEAR only under a readable root — a
+        // missing root cannot distinguish "no evidence installed" from "wrong or
+        // unmounted evidence root", so probe the root itself and reject loudly when it
+        // is not there (its own failure, ENOENT included, propagates).
+        try {
+          readdir(baseDir);
+        } catch (rootError) {
+          throw new Error(
+            `escalation evidence scan: the evidence root ${baseDir} is missing or unreadable — ` +
+              `refusing to read an absent root as "no evidence": ${rootError instanceof Error ? rootError.message : String(rootError)}`,
+          );
+        }
+        return []; // no evidence directory for this cohort under a readable root
       }
       const causes: EscalationLatchCause[] = [];
       for (const name of [...names].sort()) {
