@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
-import { basename, dirname } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { buildCampaignAuthorization, classifyCampaignAuthorization, resolveCampaignIntent } from './campaignAuthorization.js';
 import type { CampaignAuthorization, CampaignAuthorizationPort } from './campaignAuthorization.js';
@@ -13,7 +13,12 @@ import { cohortBoot } from './cohortBoot.js';
 import type { BootedCohort } from './cohortBoot.js';
 import { runCohortTick } from './cohortRunner.js';
 import type { CohortTickInput, CohortTickResult } from './cohortRunner.js';
-import { DEFAULT_FIRE_ARTIFACTS_DIR, decodeManifestText, deriveRunOptions, describeFireOutcome, formatTickResult } from './cohortRunnerMain.js';
+import { decodeManifestText, deriveRunOptions, describeFireOutcome, formatTickResult } from './cohortRunnerMain.js';
+import {
+  installEvidenceRootMarker,
+  readEvidenceRootMarker,
+  verifyEvidenceRoot,
+} from './campaignEvidenceRoot.js';
 import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
@@ -104,8 +109,8 @@ import type { CampaignStatusReadPort } from './store/campaignStatusRead.js';
 class UsageError extends Error {}
 
 const USAGE = `Usage:
-  yarn campaign:arm    --calls <n> --days <n> --start <ISO> [--dispatches <n>] [--emit <path>]
-  yarn campaign:tick   --manifest <path> --publication <path> [--out <dir>]
+  yarn campaign:arm    --calls <n> --days <n> --start <ISO> --artifacts <dir> [--dispatches <n>] [--emit <path>]
+  yarn campaign:tick   --manifest <path> --publication <path>
   yarn campaign:status --manifest <path>
   yarn campaign:resume --manifest <path>
   yarn campaign:stop   --manifest <path>
@@ -113,13 +118,19 @@ const USAGE = `Usage:
 ARM (attended, once per campaign): builds a campaign manifest sized in provider CALLS,
 prints the exact terms and their cost, asks the standard [Y/n] confirmation (Enter or
 'y' proceeds; 'n', any other answer, or EOF refuses), then makes the durable writes in
-AUTHORITY ORDER: the manifest file first (published complete via a same-directory fsync'd
-temp and an atomic no-clobber hard link, parent directory sync'd where the platform
-supports it, then read back), the cohort budget next, and the durable authorization
-LAST — so a failed arm never leaves standing authority, and re-running the same arm
-reconciles any intermediate failure. --start is REQUIRED and must be an offset-qualified
-ISO-8601 instant: it is part of the campaign identity, which is what keeps the identical
-command byte-identical across retries. The manifest is written to --emit (default
+AUTHORITY ORDER: the evidence-root identity marker and the manifest file first (each
+published complete via a same-directory fsync'd temp and an atomic no-clobber hard link,
+parent directory sync'd where the platform supports it, then read back), the cohort
+budget next, and the durable authorization LAST — so a failed arm never leaves standing
+authority, and re-running the same arm reconciles any intermediate failure. --start is
+REQUIRED and must be an offset-qualified ISO-8601 instant: it is part of the campaign
+identity, which is what keeps the identical command byte-identical across retries.
+--artifacts <dir> is REQUIRED and has NO default: it is the campaign's durable evidence
+destination — resolved to an absolute path, initialized by the arm (the only creator),
+given a durable identity marker, and bound IMMUTABLY into the authorization record.
+Every tick writes its fire artifacts under it and scans it for escalation evidence; a
+tick cannot change it, and a lost or recreated root refuses to tick. Choose storage that
+survives the host lifecycle. The manifest is written to --emit (default
 ./campaign-manifest.json); every later tick and the stop must be given that same file,
 because its bytes ARE the campaign's identity. A cohort is armed at most once, ever —
 running another campaign means a new manifest (a new window gives a new cohortId).
@@ -135,13 +146,15 @@ all-zeros rehearsal commit included, refuses the tick (exit 2). A live authoriza
 additionally checked against the composed durable ESCALATION LATCH — the store's
 unresolved fires (pending with no live lease, the durable state an escalated, crashed,
 or never-settled dispatch leaves behind) AND the installed spend evidence under the
-artifact root — and the same latch guards every admission during the tick. On a clear
-latch the tick mints billable adapters through the gated producer, discovers line-open
-candidates over the real read seams (needs SUPABASE_URL + SUPABASE_ANON_KEY, and
-optionally OSPEX_API_URL), admits at most the manifest's per-tick dispatch budget
-through the store's row-locked caps, and installs durable fire artifacts + spend
-sidecars under --out (default ./.fire-artifacts, or FIRE_ARTIFACTS_DIR). Keep the SAME
-artifact root for the campaign's lifetime — it is where later ticks' evidence scans look.
+ARMED evidence root — and the same latch guards every admission during the tick. The
+root comes from the durable authorization record (bound at arm), never from a flag or
+env: the tick verifies the root's identity marker before reading any evidence, refuses
+a missing, recreated, or foreign root, and never creates it. On a clear latch the tick
+mints billable adapters through the gated producer, discovers line-open candidates over
+the real read seams (needs SUPABASE_URL + SUPABASE_ANON_KEY, and optionally
+OSPEX_API_URL), admits at most the manifest's per-tick dispatch budget through the
+store's row-locked caps, and installs durable fire artifacts + spend sidecars under the
+armed root.
 Every substantive tick writes a TWO-PHASE JOURNAL ENTRY (begin, then finish with its
 outcome; a dispatched tick's detail carries the per-fire outcomes and the deferrals
 grouped by reason), and before any journal write, authorization read, or latch read a
@@ -153,11 +166,11 @@ until an operator runs campaign:resume. A finish-write failure leaves the unfini
 entry that halts the schedule once it passes the tick deadline — failing toward review.
 Never prompts, never falls back to mock. Exits 0 on a healthy tick (including one that
 dispatched nothing eligible), 2 on any refusal — a halted schedule, a missing or failed
-publication descriptor, missing configuration (STORE_DATABASE_URL, the read-seam env, an
-unusable artifact root), no live authorization, a tripped escalation latch, a dispatched
-fire that left unresolved spend evidence, or a fault-class admission outcome (a
-non-authorizing store-contract failure; the schedule halts rather than tick over it) —
-and 1 on a loud failure.
+publication descriptor, missing configuration (STORE_DATABASE_URL, the read-seam env),
+no live authorization, an evidence root that fails its identity verification, a tripped
+escalation latch, a dispatched fire that left unresolved spend evidence, or a
+fault-class admission outcome (a non-authorizing store-contract failure; the schedule
+halts rather than tick over it) — and 1 on a loud failure.
 
 STATUS (read-only, what monitoring calls): reports the campaign's durable state — the
 authorization (armed/disarmed/expired and its instants), calls reserved vs cap and
@@ -196,9 +209,10 @@ interface CampaignOptions {
   manifestPath: string | null;
   emitPath: string;
   publicationPath: string | null;
-  /** The durable artifact root a tick installs under AND scans for escalation evidence.
-   *  `null` resolves to FIRE_ARTIFACTS_DIR, then the repo-local default. */
-  outDir: string | null;
+  /** ARM only: the durable evidence destination to bind for the campaign's lifetime.
+   *  REQUIRED for arm, with no default; a TICK given this flag refuses — the root comes
+   *  from the durable authorization record, never from an invocation. */
+  artifactsPath: string | null;
 }
 
 function parseArgs(argv: string[]): CampaignOptions {
@@ -219,7 +233,7 @@ function parseArgs(argv: string[]): CampaignOptions {
     manifestPath: null,
     emitPath: './campaign-manifest.json',
     publicationPath: null,
-    outDir: null,
+    artifactsPath: null,
   };
   for (let i = 1; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -241,7 +255,7 @@ function parseArgs(argv: string[]): CampaignOptions {
     else if (arg === '--manifest') options.manifestPath = next();
     else if (arg === '--emit') options.emitPath = next();
     else if (arg === '--publication') options.publicationPath = next();
-    else if (arg === '--out') options.outDir = next();
+    else if (arg === '--artifacts') options.artifactsPath = next();
     else if (arg === '-h' || arg === '--help') {
       printLine(USAGE);
       process.exit(0);
@@ -423,6 +437,7 @@ async function reconcileExistingAuthorization(
   authorizations: CampaignAuthorizationPort,
   booted: BootedCohort,
   deps: CampaignDeps,
+  evidenceRoot: string,
 ): Promise<number> {
   const stored = await authorizations.read(booted.cohortId);
   const resolution = resolveCampaignIntent({
@@ -432,6 +447,17 @@ async function reconcileExistingAuthorization(
     observeCredentials: deps.observeCredentials,
   });
   if (resolution.kind === 'Authorized') {
+    // The evidence root is bound for the campaign's lifetime: a retry pointed anywhere
+    // else is not the same arm, and silently keeping the original binding would leave
+    // the operator believing the new destination is live.
+    if (resolution.record.evidenceRoot !== evidenceRoot) {
+      printError(
+        `cohort ${booted.cohortId} was armed with evidence root ${resolution.record.evidenceRoot}; ` +
+          `refusing to reconcile an arm pointed at ${evidenceRoot} — the root is bound at arming ` +
+          'for the campaign\'s lifetime',
+      );
+      return 2;
+    }
     printLine('');
     printLine(
       `cohort ${booted.cohortId} was ALREADY armed; the standing authorization validates ` +
@@ -485,6 +511,33 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
     );
     return 2;
   }
+  // --artifacts is REQUIRED with NO default: the campaign's durable evidence destination
+  // is a deliberate arming decision, bound immutably into the authorization record. An
+  // implicit local default (a repo-relative scratch directory, an env fallback) is
+  // exactly the mutable root that would let a later tick read a clear latch off the
+  // wrong filesystem.
+  if (options.artifactsPath === null) {
+    printError(
+      'arm requires an explicit --artifacts <dir>: the durable evidence destination is bound at ' +
+        'arming for the campaign\'s lifetime — every tick writes fire artifacts under it and scans ' +
+        'it for escalation evidence, and no tick can change or recreate it. Choose storage that ' +
+        'survives the host lifecycle.',
+    );
+    return 2;
+  }
+  const evidenceRoot = resolve(options.artifactsPath);
+  // The root's IDENTITY candidate, read BEFORE the prompt: an existing marker is adopted
+  // (a root has one identity for its lifetime — a second campaign at the same root shares
+  // it); an absent marker gets a freshly minted id, installed durably after the
+  // confirmation; an unreadable marker refuses now.
+  const markerRead = readEvidenceRootMarker(evidenceRoot);
+  if (markerRead.kind === 'unreadable') {
+    printError(
+      `refusing to arm — the evidence root's identity marker at ${evidenceRoot} is unreadable: ${markerRead.detail}`,
+    );
+    return 2;
+  }
+  const evidenceRootId = markerRead.kind === 'present' ? markerRead.marker.evidenceRootId : randomUUID();
   const startMs = instantMs(options.startIso);
   const windowForwardMs = options.days * 24 * 3_600_000;
 
@@ -531,6 +584,8 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
       observedCredentialedParticipantIds: credentialed,
       armedAtMs,
       expiresAtMs,
+      evidenceRoot,
+      evidenceRootId,
     });
   } catch (error) {
     printError(`refusing to arm: ${messageOf(error)}`);
@@ -546,6 +601,7 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
   printLine(`  cost   ≈ ${usd(projection.observedUsdMicros)} expected at the observed rate`);
   printLine(`         ≤ ${usd(projection.conservativeUsdMicros)} at the committed conservative worst case`);
   printLine(`  bounds ${booted.manifest.constants.maxDispatchesPerTick} fire(s)/tick; every attempt hard-stopped above $100`);
+  printLine(`  root   ${evidenceRoot} (durable evidence destination — bound for the campaign's lifetime)`);
   printLine(`  expiry ${record.expiresAt} (the authorization stops on its own)`);
   printLine("  Enter or 'y' proceeds; 'n', any other answer, or EOF refuses");
 
@@ -563,12 +619,26 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
     return 2;
   }
 
-  // ---- Durable writes, in AUTHORITY ORDER. (1) The manifest file: no-clobber + fsync +
-  // read-back, BEFORE any store write, so standing authority always implies its manifest
-  // is on disk (`stop` needs that file). (2) The cohort budget: durable but NOT
+  // ---- Durable writes, in AUTHORITY ORDER. (0) The evidence root + its identity
+  // marker: the attended arm is the ONLY creator of the root — every later tick verifies
+  // this identity and refuses a root that lost it. (1) The manifest file: no-clobber +
+  // fsync + read-back, BEFORE any store write, so standing authority always implies its
+  // manifest is on disk (`stop` needs that file). (2) The cohort budget: durable but NOT
   // authorizing — a budget with no authorization arms nothing, and re-initializing with
   // identical pins reconciles. (3) The authorization record LAST: the single authorizing
   // transition. ----
+  const markerInstall = installEvidenceRootMarker(evidenceRoot, evidenceRootId);
+  if (markerInstall.kind === 'conflict') {
+    printError(markerInstall.message);
+    return 2;
+  }
+  if (markerInstall.kind === 'failed') {
+    printError(`arming FAILED before any authority was created: ${markerInstall.message}`);
+    return 1;
+  }
+  if (markerInstall.kind === 'already_installed') {
+    printLine(`evidence root ${evidenceRoot} already carries this identity — continuing`);
+  }
   const manifestBytes = Buffer.from(built.bytes, 'utf8');
   const install = installManifestNoClobber(options.emitPath, manifestBytes);
   if (install.kind === 'conflict') {
@@ -592,7 +662,7 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
     authorizing = true;
     const outcome = await opened.authorizations.arm(record);
     if (outcome === 'already_armed') {
-      return await reconcileExistingAuthorization(opened.authorizations, booted, deps);
+      return await reconcileExistingAuthorization(opened.authorizations, booted, deps, evidenceRoot);
     }
     printLine('');
     printLine('ARMED. cohort budget initialized and authorization recorded.');
@@ -699,8 +769,20 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
     return 2;
   }
 
-  // The real read seams' configuration and the durable artifact root — the remaining
-  // pre-store configuration, refused before anything opens when unusable.
+  // The evidence root is BOUND at arm time in the durable authorization record — a tick
+  // that tries to supply one is asking to re-point the latch's evidence scan, which is
+  // exactly the bypass the binding exists to kill. Refused as configuration, before
+  // anything opens.
+  if (options.artifactsPath !== null) {
+    printError(
+      'a tick takes no --artifacts: the evidence root is bound at arm time in the durable ' +
+        'authorization record and cannot be changed per-tick (docs/CAMPAIGN-ACTIVATION.md)',
+    );
+    return 2;
+  }
+
+  // The real read seams' configuration — the remaining pre-store configuration, refused
+  // before anything opens when missing.
   const supabaseUrl = envValue('SUPABASE_URL');
   const anonKey = envValue('SUPABASE_ANON_KEY');
   if (supabaseUrl === undefined || anonKey === undefined) {
@@ -712,19 +794,6 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
     return 2;
   }
   const apiUrl = envValue('OSPEX_API_URL') ?? DEFAULT_OSPEX_API_URL;
-  const outDir = options.outDir ?? envValue('FIRE_ARTIFACTS_DIR') ?? DEFAULT_FIRE_ARTIFACTS_DIR;
-  try {
-    // The tick OWNS this root — the sink is about to write under it — so creating it is
-    // initializing its own output area, and it keeps the evidence scan's missing-root
-    // refusal pointed at real faults (a root torn away mid-tick), not at a fresh
-    // campaign's first tick. Keep the SAME root for the campaign's lifetime: evidence
-    // installed under another root is invisible to this scan, while the store-derived
-    // latch source, which depends on no root, still holds every unresolved fire.
-    mkdirSync(outDir, { recursive: true });
-  } catch (error) {
-    printError(`the artifact root ${outDir} is unusable: ${messageOf(error)}`);
-    return 2;
-  }
 
   const databaseUrl = envValue('STORE_DATABASE_URL');
   if (databaseUrl === undefined) {
@@ -815,18 +884,36 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
           `(${resolution.authorization.observedCredentialedParticipantIds.length}/${resolution.authorization.participantIds.length} ` +
           `roster credentials observed now)`,
       );
+      // THE ARMED EVIDENCE ROOT, verified by IDENTITY before any evidence is read: the
+      // record binds both the absolute root and the id of the marker the arm installed.
+      // A lost mount, a recreated empty directory at the same pathname, or a foreign
+      // marker all refuse here — after a reviewed recovery settles the store shadow, the
+      // installed evidence under this root is the ONLY signal keeping the latch tripped,
+      // so an unverifiable root must never read as clear. The tick NEVER creates the
+      // root; the attended arm is the only initializer.
+      const evidenceRoot = resolution.record.evidenceRoot;
+      const rootVerdict = verifyEvidenceRoot(evidenceRoot, resolution.record.evidenceRootId);
+      if (!rootVerdict.ok) {
+        printError(`EVIDENCE ROOT REFUSED — ${rootVerdict.reason}`);
+        printError(
+          'restore the armed artifact storage (the same mount carrying the same identity marker), ' +
+            'then campaign:resume to continue scheduling, or campaign:stop to end the campaign.',
+        );
+        await finishQuietly('evidence_root_refused', rootVerdict.reason);
+        return 2;
+      }
       // The COMPOSED DURABLE ESCALATION LATCH: the store's shadow (an unresolved fire —
       // pending with no live lease — the durable state an escalated, crashed, or
       // never-settled dispatch leaves behind) AND the installed spend evidence under the
-      // SAME root the sink below writes to. The latch is DERIVED from durably retained
-      // state (never a separate write), which is what makes it hold across a failed
-      // disarm and a process restart; both sources fail CLOSED, so a source that cannot
-      // be read propagates — a loud exit 1, never read as clear. The SAME latch instance
-      // guards every admission below (`latchGuardedClaimPort`); this tick-level check is
-      // the half a scheduler and an operator see.
+      // SAME verified root the sink below writes to. The latch is DERIVED from durably
+      // retained state (never a separate write), which is what makes it hold across a
+      // failed disarm and a process restart; both sources fail CLOSED, so a source that
+      // cannot be read propagates — a loud exit 1, never read as clear. The SAME latch
+      // instance guards every admission below (`latchGuardedClaimPort`); this tick-level
+      // check is the half a scheduler and an operator see.
       const latch = composeEscalationLatch([
         unresolvedFireLatchSource(unresolvedFires),
-        escalationEvidenceLatchSource(outDir),
+        escalationEvidenceLatchSource(evidenceRoot),
       ]);
       const latchVerdict = await latch.check(booted.cohortId);
       if (latchVerdict.latched) {
@@ -876,14 +963,14 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
         readMarketEvidence: createReadMarketEvidenceFn(config),
         claimPort: latchGuardedClaimPort(new StoreClaimPort(store), latch),
         capability,
-        sink: new FireArtifactSink(outDir),
+        sink: new FireArtifactSink(evidenceRoot),
         runOptions: deriveRunOptions(booted.manifest),
         admission: { ownerId: `${hostname()}-${process.pid}-${randomUUID()}`, expectedSchemaVersion: STORE_SCHEMA_VERSION },
         now: deps.now,
       };
       printLine(
         `dispatching up to ${booted.manifest.constants.maxDispatchesPerTick} fire(s) ` +
-          `(REAL provider adapters; artifacts → ${outDir}) ...`,
+          `(REAL provider adapters; artifacts → ${evidenceRoot}) ...`,
       );
       let result: CohortTickResult;
       try {
@@ -939,7 +1026,7 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
         );
         printError(
           'the schedule halts for operator review. Inspect the installed artifact and spend sidecar ' +
-            `under ${outDir}, then campaign:resume to continue scheduling or campaign:stop to end the campaign.`,
+            `under ${evidenceRoot}, then campaign:resume to continue scheduling or campaign:stop to end the campaign.`,
         );
         await finishQuietly('dispatch_unresolved', detail);
         return 2;
@@ -1029,6 +1116,9 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
         break;
       case 'live':
         printLine(`  authorization LIVE — armed ${classification.record.armedAt}, expires ${classification.record.expiresAt}`);
+        // Display only: this read-only surface may run on a box without the artifact
+        // mount, so the root's identity is verified by the TICK, never here.
+        printLine(`  root   ${classification.record.evidenceRoot} (bound at arm; identity verified by the tick)`);
         break;
       case 'disarmed':
         printLine(

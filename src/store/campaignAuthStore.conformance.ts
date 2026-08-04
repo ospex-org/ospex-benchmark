@@ -55,6 +55,8 @@ function record(cohortId: string, over: Partial<CampaignAuthorization> = {}): Ca
     maxConcurrentProviderRequests: 4,
     maxDispatchesPerTick: 1,
     maxRepairAttemptsPerArm: 1,
+    evidenceRoot: '/srv/campaign-evidence',
+    evidenceRootId: 'root-id-1',
     armedAt: '2026-08-05T00:00:00.000Z',
     expiresAt: '2026-08-12T00:00:00.000Z',
     disarmedAt: null,
@@ -507,6 +509,10 @@ async function main(): Promise<void> {
           observedCredentialedParticipantIds: roster,
           armedAtMs: startMs,
           expiresAtMs: startMs + weekMs,
+          // Display-only for this probe: status renders the bound root; only the TICK
+          // verifies its identity marker, and no tick runs here.
+          evidenceRoot: '/srv/campaign-evidence',
+          evidenceRootId: 'ro-conformance-root-id',
         }),
       ),
       'armed',
@@ -562,6 +568,10 @@ async function main(): Promise<void> {
     const out = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
     assert.equal(result.status, 0, `the read-only role renders the live report and exits 0; out=${out}`);
     assert.ok(out.includes('authorization LIVE'), `the report rendered; out=${out}`);
+    assert.ok(
+      out.includes('root   /srv/campaign-evidence (bound at arm'),
+      `the bound evidence root renders; out=${out}`,
+    );
     assert.ok(
       out.includes('latch  clear — no unresolved fire'),
       `the escalation-latch read ran under the SELECT-only role; out=${out}`,

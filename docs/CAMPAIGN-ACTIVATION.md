@@ -10,23 +10,33 @@ Everything below states the contract that holds it.
 
 - **Arming** (`campaign:arm`, attended, once per cohort): requires an explicit
   offset-qualified `--start` — the campaign's identity anchor, which keeps the identical
-  public command byte-identical across retries. It builds a bounds-checked campaign
-  manifest sized in provider calls, prints the exact terms and cost projections, takes the
-  standard `[Y/n]` confirmation, then performs the durable writes in **authority order** —
-  the manifest file first (riding the fire-artifact sink's durable loop: a same-directory
-  fsynced exclusive temp, an atomic no-clobber hard-link publication, a parent-directory
-  sync where the platform supports one, then a final read-back), the cohort budget next
-  (durable but not authorizing), and the durable authorization record **last**, as the
-  single authorizing transition. A failed arm therefore cannot leave standing authority,
-  cleanup failures cannot falsify a decided outcome, and re-running the same arm reconciles
-  every intermediate failure — including an authorizing write whose commit status was lost.
-  A cohort is armed at most once, ever; another campaign is a new manifest and therefore a
+  public command byte-identical across retries — and an explicit `--artifacts <dir>` with
+  **no default**: the campaign's durable evidence destination, a deliberate arming
+  decision (choose storage that survives the host lifecycle). The arm resolves it to an
+  absolute path, initializes it (the arm is the ONLY creator), durably installs an
+  identity marker (`evidence-root.json`, a minted random id, through the same no-clobber
+  loop as the manifest), and binds both the root and the marker id **immutably** into the
+  authorization record. A root has one identity for its lifetime: a second campaign armed
+  at the same root adopts the existing marker; a byte-different marker refuses the arm; a
+  retry pointed at a different root refuses to reconcile. It builds a bounds-checked
+  campaign manifest sized in provider calls, prints the exact terms and cost projections,
+  takes the standard `[Y/n]` confirmation, then performs the durable writes in
+  **authority order** — the evidence-root marker and the manifest file first (each riding
+  the fire-artifact sink's durable loop: a same-directory fsynced exclusive temp, an
+  atomic no-clobber hard-link publication, a parent-directory sync where the platform
+  supports one, then a final read-back), the cohort budget next (durable but not
+  authorizing), and the durable authorization record **last**, as the single authorizing
+  transition. A failed arm therefore cannot leave standing authority, cleanup failures
+  cannot falsify a decided outcome, and re-running the same arm reconciles every
+  intermediate failure — including an authorizing write whose commit status was lost. A
+  cohort is armed at most once, ever; another campaign is a new manifest and therefore a
   new cohortId.
 - **Ticking** (`campaign:tick`, unattended): the paid path. Its gates, in order, are the
   subject of the next section. Exit 0 = a healthy dispatched tick (including one that
   found nothing eligible — the journal detail says so); exit 2 = a refusal (a halted
   schedule, missing or failed publication evidence, missing configuration — the store
-  URL, the read-seam env, an unusable artifact root — no live authorization, a tripped
+  URL, the read-seam env, or an `--artifacts` flag a tick must not carry — no live
+  authorization, an evidence root failing its identity verification, a tripped
   escalation latch, a dispatched fire that left unresolved spend evidence, or a
   fault-class admission outcome); exit 1 = loud failure.
 - **Status** (`campaign:status`, read-only): reports the durable state and the verdict the
@@ -48,13 +58,9 @@ Everything below states the contract that holds it.
    never opened, and these refusals are pinned by test to open nothing and dispatch
    nothing): `--manifest` must boot; `--publication` is **required** and must parse as a
    strict descriptor (the all-zeros rehearsal commit is rejected structurally, before any
-   resolution); the discovery read seams need `SUPABASE_URL` + `SUPABASE_ANON_KEY`; the
-   artifact root (`--out`, default `./.fire-artifacts` or `FIRE_ARTIFACTS_DIR`) must be
-   creatable — the tick initializes its own output area, which keeps the evidence scan's
-   missing-root refusal pointed at real faults rather than at a fresh campaign's first
-   tick. **Keep the same artifact root for the campaign's lifetime**: evidence installed
-   under another root is invisible to the scan, while the store-derived latch source,
-   which depends on no root, still holds every unresolved fire.
+   resolution); a tick given `--artifacts` refuses — the evidence root is bound at arm
+   time in the durable authorization record and cannot be changed per-tick; the discovery
+   read seams need `SUPABASE_URL` + `SUPABASE_ANON_KEY`.
 2. **The schedule halt rule** — evaluated before any journal write, authorization read, or
    latch read (see the scheduler contract below). A halted tick refuses (exit 2) writing
    no journal entry and touching no campaign state.
@@ -71,19 +77,26 @@ Everything below states the contract that holds it.
    capture, liveness at the tick clock, exact binding to the booted manifest (identity,
    roster, price identity, every cap), and a fresh independent credential observation.
    Refusal journals `no_live_authorization`.
-6. **The composed escalation latch** (below). A trip journals `escalation_latched`.
-7. **The gated billable mint** (`gateRealCampaignAdapterCapability`) — the second of two
+6. **The armed evidence root, verified by identity**: the record binds the absolute root
+   and the id of the marker the arm installed; the tick reads the marker back and
+   requires the exact id before reading any evidence. A missing root, a missing or
+   unreadable marker, or a foreign id journals `evidence_root_refused` (exit 2, halting
+   the schedule) — a lost mount or a recreated empty directory at the same pathname is
+   NOT the armed root and can never read as a clear latch. The tick never creates the
+   root; the attended arm is the only initializer.
+7. **The composed escalation latch** (below). A trip journals `escalation_latched`.
+8. **The gated billable mint** (`gateRealCampaignAdapterCapability`) — the second of two
    independent validation passes: the producer re-derives the cohort binding, the campaign
    bounds, and its own credential observation from the real adapters, refusing on any
    disagreement with the resolution's claim. A refusal journals `no_live_authorization`
    (exit 2), never a crash. Minting performs no network I/O.
-8. **The real tick input is assembled and dispatched** (`runCohortTick`): real discovery +
+9. **The real tick input is assembled and dispatched** (`runCohortTick`): real discovery +
    opener reads over core-api/PostgREST, the store-backed claim port wrapped in
    `latchGuardedClaimPort` (every admission consults the same composed latch), the minted
    billable capability, the durable `FireArtifactSink` under the artifact root, and the
    manifest-derived run options. At most the manifest's per-tick dispatch budget admits;
    the store's row-locked caps arbitrate every admission.
-9. **Outcome classification**: a mid-tick latch trip (`EscalationLatchedError` from the
+10. **Outcome classification**: a mid-tick latch trip (`EscalationLatchedError` from the
    guarded port) journals `escalation_latched` (exit 2); fires admitted earlier in that
    same tick are recorded durably in the store and under the artifact root —
    `campaign:status` shows them — while the journal entry records the latch causes. Any
@@ -124,7 +137,12 @@ written**, from two independent durable signals (`escalationLatch.ts`):
    clear only when it names the scanned cohort AND the offline pair verifier
    (`verifySpendEvidence`, reused wholesale — `reason-recomputed` authoritative) passes
    every named check against the paired installed artifact; a missing, unreadable,
-   foreign, or contradicted pair latches as unverified evidence.
+   foreign, or contradicted pair latches as unverified evidence. After a reviewed
+   recovery settles the store shadow, this source is the ONLY signal keeping the latch
+   tripped — which is why the root it scans is not selectable: it is bound at arm time
+   with a durable identity marker (`campaignEvidenceRoot.ts`), the tick verifies that
+   identity before every read, and an unverifiable root refuses the tick outright
+   (`evidence_root_refused`) rather than reading an empty or foreign directory as clear.
 
 Both sources fail CLOSED (a source that cannot be read rejects, never reads as clear).
 "Checked before every dispatch" is `latchGuardedClaimPort`: every dispatch begins with
@@ -195,15 +213,19 @@ proving the admission is refused and no provider call is reachable.
 
 ## Operating a campaign
 
-1. `campaign:arm --calls <n> --days <n> --start <ISO>` (attended). The manifest file it
-   emits is the campaign's identity — every later command needs that exact file.
+1. `campaign:arm --calls <n> --days <n> --start <ISO> --artifacts <dir>` (attended). The
+   manifest file it emits is the campaign's identity — every later command needs that
+   exact file. `--artifacts` is the campaign's durable evidence destination, bound for
+   its lifetime: choose storage that survives the host lifecycle (a persistent mount,
+   not ephemeral local disk), because a tick refuses to run when the root or its
+   identity marker is lost.
 2. Publish the manifest bytes to the public repository BEFORE `windowStart`, and write the
    publication descriptor JSON (`repositoryOwner`, `repositoryName`, `path`, the full
    40-hex `commitSha` of the publishing commit).
-3. Schedule `campaign:tick --manifest <path> --publication <descriptor> --out <root>` from
-   cron. Environment: `STORE_DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`
-   (optionally `OSPEX_API_URL`, `FIRE_ARTIFACTS_DIR`), and the roster's provider
-   credentials. Keep `--out` stable for the campaign's lifetime.
+3. Schedule `campaign:tick --manifest <path> --publication <descriptor>` from cron — the
+   tick takes no artifact flag; its root comes from the record. Environment:
+   `STORE_DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY` (optionally
+   `OSPEX_API_URL`), and the roster's provider credentials.
 4. Point monitoring at `campaign:status --manifest <path>` and alert on nonzero exits.
 5. On a halt: review (`campaign:status`, the journal detail, the artifact root), then
    `campaign:resume` to continue or `campaign:stop` to end the campaign. A stopped

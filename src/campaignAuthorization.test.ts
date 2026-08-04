@@ -34,6 +34,11 @@ function bootedCrossing(now = Date.parse('2026-08-05T00:00:00.000Z')): BootedCoh
 const allCredentialed = (ids: readonly string[]): ReadonlyMap<string, boolean> =>
   new Map(ids.map((id) => [id, true]));
 
+/** The bound evidence destination the fixtures arm with — `/`-rooted, so it is absolute
+ *  under both the win32 and posix path rules. */
+const EVIDENCE_ROOT = '/srv/campaign-evidence';
+const EVIDENCE_ROOT_ID = 'root-id-fixture';
+
 /** A genuine armed record for `booted`, with `over` applied for the refusal cases. */
 function armedRecord(booted: BootedCohort, over: Partial<Record<keyof CampaignAuthorization, unknown>> = {}): unknown {
   const base = buildCampaignAuthorization({
@@ -41,6 +46,8 @@ function armedRecord(booted: BootedCohort, over: Partial<Record<keyof CampaignAu
     observedCredentialedParticipantIds: ROSTER,
     armedAtMs: ARMED_MS,
     expiresAtMs: EXPIRES_MS,
+    evidenceRoot: EVIDENCE_ROOT,
+    evidenceRootId: EVIDENCE_ROOT_ID,
   });
   return { ...base, ...over };
 }
@@ -87,6 +94,24 @@ test('a live armed record resolves to the EXACT momentary canary authorization t
   });
   assert.ok(Object.isFrozen(resolution));
   assert.ok(Object.isFrozen(resolution.authorization));
+  // The campaign-only terms ride the RECORD half of the resolution: the tick reads its
+  // bound evidence root + identity from here, which the canary's narrow key set omits.
+  assert.equal(resolution.record.evidenceRoot, EVIDENCE_ROOT);
+  assert.equal(resolution.record.evidenceRootId, EVIDENCE_ROOT_ID);
+  assert.ok(Object.isFrozen(resolution.record));
+});
+
+test('a RELATIVE evidenceRoot refuses — a recorded root must not re-anchor on the invocation cwd', () => {
+  const booted = bootedCrossing();
+  const resolution = resolve(booted, armedRecord(booted, { evidenceRoot: 'relative/evidence' }));
+  assert.equal(resolution.kind, 'Refused');
+  assert.ok(violationsOf(resolution).some((v) => v.includes('must be an absolute path')), violationsOf(resolution).join('; '));
+  for (const evidenceRoot of ['', 42]) {
+    const bad = resolve(booted, armedRecord(booted, { evidenceRoot }));
+    assert.equal(bad.kind, 'Refused', JSON.stringify(evidenceRoot));
+  }
+  const badId = resolve(booted, armedRecord(booted, { evidenceRootId: '' }));
+  assert.equal(badId.kind, 'Refused');
 });
 
 test('buildCampaignAuthorization DERIVES every term from the booted manifest and starts un-disarmed', () => {
@@ -96,6 +121,8 @@ test('buildCampaignAuthorization DERIVES every term from the booted manifest and
     observedCredentialedParticipantIds: ROSTER,
     armedAtMs: ARMED_MS,
     expiresAtMs: EXPIRES_MS,
+    evidenceRoot: EVIDENCE_ROOT,
+    evidenceRootId: EVIDENCE_ROOT_ID,
   });
   assert.deepEqual(
     { ...record, participantIds: [...record.participantIds], observedCredentialedParticipantIds: [...record.observedCredentialedParticipantIds] },
@@ -112,6 +139,8 @@ test('buildCampaignAuthorization DERIVES every term from the booted manifest and
       maxConcurrentProviderRequests: 4,
       maxDispatchesPerTick: 1,
       maxRepairAttemptsPerArm: 1,
+      evidenceRoot: EVIDENCE_ROOT,
+      evidenceRootId: EVIDENCE_ROOT_ID,
       armedAt: '2026-08-05T00:00:00.000Z',
       expiresAt: '2026-08-12T00:00:00.000Z',
       disarmedAt: null,
@@ -330,6 +359,8 @@ test('arming REFUSES a cohort that does not pin the conservative guard price tab
         observedCredentialedParticipantIds: ROSTER,
         armedAtMs: ARMED_MS,
         expiresAtMs: EXPIRES_MS,
+        evidenceRoot: EVIDENCE_ROOT,
+        evidenceRootId: EVIDENCE_ROOT_ID,
       }),
     /conservative guard price table/,
   );
@@ -345,7 +376,15 @@ test('arming REFUSES a non-positive or non-finite lifetime', () => {
   ];
   for (const [armedAtMs, expiresAtMs] of bad) {
     assert.throws(
-      () => buildCampaignAuthorization({ booted, observedCredentialedParticipantIds: ROSTER, armedAtMs, expiresAtMs }),
+      () =>
+        buildCampaignAuthorization({
+          booted,
+          observedCredentialedParticipantIds: ROSTER,
+          armedAtMs,
+          expiresAtMs,
+          evidenceRoot: EVIDENCE_ROOT,
+          evidenceRootId: EVIDENCE_ROOT_ID,
+        }),
       `${armedAtMs} → ${expiresAtMs}`,
     );
   }
@@ -361,6 +400,8 @@ test('a forged (structurally-copied) booted cohort throws on BOTH the arm and re
         observedCredentialedParticipantIds: ROSTER,
         armedAtMs: ARMED_MS,
         expiresAtMs: EXPIRES_MS,
+        evidenceRoot: EVIDENCE_ROOT,
+        evidenceRootId: EVIDENCE_ROOT_ID,
       }),
     /not produced by cohortBoot/,
   );

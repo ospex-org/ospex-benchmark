@@ -1,3 +1,4 @@
+import { isAbsolute } from 'node:path';
 import { assertBootedCohort } from './cohortBoot.js';
 import type { BootedCohort } from './cohortBoot.js';
 import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
@@ -61,6 +62,15 @@ export interface CampaignAuthorization {
   readonly maxConcurrentProviderRequests: number;
   readonly maxDispatchesPerTick: number;
   readonly maxRepairAttemptsPerArm: number;
+  /** The durable evidence destination bound AT ARMING — the absolute root every tick's
+   *  artifact sink writes under AND its escalation-evidence scan reads. Immutable for the
+   *  campaign's lifetime: the tick derives the root from here and refuses any attempt to
+   *  supply a different one. */
+  readonly evidenceRoot: string;
+  /** The identity of that root — the id of the durable marker the arm installed at the
+   *  root. A tick verifies the marker before reading any evidence, so a lost mount or a
+   *  recreated empty directory at the same pathname can never read as a clear latch. */
+  readonly evidenceRootId: string;
   /** When the operator armed it (offset-qualified instant). */
   readonly armedAt: string;
   /** The HARD time bound. An authorization that outlives its campaign is a standing
@@ -88,9 +98,12 @@ export interface CampaignAuthorizationPort {
 }
 
 /** The resolution a scheduled tick acts on. There is no prompt and no mock fallback: a tick
- *  either holds a validated authorization or fires nothing and exits loudly. */
+ *  either holds a validated authorization or fires nothing and exits loudly. `Authorized`
+ *  carries BOTH the momentary canary credential the gated producer consumes AND the strict
+ *  captured record — the tick reads the campaign-only terms (the bound evidence root and
+ *  its identity) from the record, which the canary's narrow key set deliberately omits. */
 export type CampaignIntentResolution =
-  | { readonly kind: 'Authorized'; readonly authorization: CanaryAuthorization }
+  | { readonly kind: 'Authorized'; readonly authorization: CanaryAuthorization; readonly record: CampaignAuthorization }
   | { readonly kind: 'Refused'; readonly violations: readonly string[] };
 
 /** The exact enumerable own-key set a stored record must carry — no more, no fewer. */
@@ -107,6 +120,8 @@ const RECORD_KEYS = [
   'maxConcurrentProviderRequests',
   'maxDispatchesPerTick',
   'maxRepairAttemptsPerArm',
+  'evidenceRoot',
+  'evidenceRootId',
   'armedAt',
   'expiresAt',
   'disarmedAt',
@@ -152,6 +167,8 @@ function captureRecord(value: unknown): { captured: CampaignAuthorization } | { 
   const maxConcurrentProviderRequests = raw['maxConcurrentProviderRequests'];
   const maxDispatchesPerTick = raw['maxDispatchesPerTick'];
   const maxRepairAttemptsPerArm = raw['maxRepairAttemptsPerArm'];
+  const evidenceRoot = raw['evidenceRoot'];
+  const evidenceRootId = raw['evidenceRootId'];
   const armedAt = raw['armedAt'];
   const expiresAt = raw['expiresAt'];
   const disarmedAt = raw['disarmedAt'];
@@ -202,6 +219,12 @@ function captureRecord(value: unknown): { captured: CampaignAuthorization } | { 
   if (disarmedAt !== null && (typeof disarmedAt !== 'string' || !isParseableInstant(disarmedAt))) {
     violations.push('disarmedAt must be null or an offset-qualified ISO-8601 instant');
   }
+  // The bound root must be ABSOLUTE: a relative recorded root would re-anchor on whatever
+  // working directory cron happens to use — exactly the mutable-root class the binding
+  // exists to kill.
+  if (typeof evidenceRoot === 'string' && evidenceRoot.length > 0 && !isAbsolute(evidenceRoot)) {
+    violations.push(`evidenceRoot ${JSON.stringify(evidenceRoot)} must be an absolute path`);
+  }
 
   const captured: CampaignAuthorization = Object.freeze({
     campaignAuthorizationVersion: CAMPAIGN_AUTHORIZATION_VERSION,
@@ -219,6 +242,8 @@ function captureRecord(value: unknown): { captured: CampaignAuthorization } | { 
     maxConcurrentProviderRequests: requireCount('maxConcurrentProviderRequests', maxConcurrentProviderRequests),
     maxDispatchesPerTick: requireCount('maxDispatchesPerTick', maxDispatchesPerTick),
     maxRepairAttemptsPerArm: requireCount('maxRepairAttemptsPerArm', maxRepairAttemptsPerArm),
+    evidenceRoot: requireString('evidenceRoot', evidenceRoot),
+    evidenceRootId: requireString('evidenceRootId', evidenceRootId),
     armedAt: requireInstant('armedAt', armedAt),
     expiresAt: requireInstant('expiresAt', expiresAt),
     disarmedAt: typeof disarmedAt === 'string' ? disarmedAt : null,
@@ -401,14 +426,16 @@ export function resolveCampaignIntent(input: {
     maxDispatchesPerTick: record.maxDispatchesPerTick,
     maxRepairAttemptsPerArm: record.maxRepairAttemptsPerArm,
   });
-  return Object.freeze({ kind: 'Authorized' as const, authorization });
+  return Object.freeze({ kind: 'Authorized' as const, authorization, record });
 }
 
 /**
  * Build the record an ARMING act stores, from the authenticated booted cohort plus the
- * operator's chosen expiry. Every identity/cap term is DERIVED from the booted manifest —
- * never accepted from a caller — so an armed campaign cannot claim terms its cohort does not
- * actually pin. The credential observation is the caller's (the arming CLI probes the real
+ * operator's chosen expiry and evidence destination. Every identity/cap term is DERIVED
+ * from the booted manifest — never accepted from a caller — so an armed campaign cannot
+ * claim terms its cohort does not actually pin; the evidence root + its marker identity
+ * are the operator's deliberate arming choices, bound here so no later tick can vary
+ * them. The credential observation is the caller's (the arming CLI probes the real
  * adapters); every later tick re-observes and reconciles against it.
  *
  * Refuses (throws) when the guard price identity is not pinned: a billable campaign must be
@@ -420,6 +447,11 @@ export function buildCampaignAuthorization(input: {
   observedCredentialedParticipantIds: readonly string[];
   armedAtMs: number;
   expiresAtMs: number;
+  /** The durable evidence destination — resolved ABSOLUTE by the arming CLI, bound here
+   *  for the campaign's lifetime. */
+  evidenceRoot: string;
+  /** The id of the identity marker the arm installs at that root. */
+  evidenceRootId: string;
 }): CampaignAuthorization {
   assertBootedCohort(input.booted);
   const manifest = input.booted.manifest;
@@ -428,6 +460,12 @@ export function buildCampaignAuthorization(input: {
   }
   if (input.expiresAtMs <= input.armedAtMs) {
     throw new Error('campaign expiry must be strictly after the arming instant');
+  }
+  if (input.evidenceRoot.length === 0 || !isAbsolute(input.evidenceRoot)) {
+    throw new Error(`arming requires an absolute evidence root, got ${JSON.stringify(input.evidenceRoot)}`);
+  }
+  if (input.evidenceRootId.length === 0) {
+    throw new Error('arming requires the evidence root identity (the installed marker id)');
   }
   const guardDigest = modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION);
   if (
@@ -453,6 +491,8 @@ export function buildCampaignAuthorization(input: {
     maxConcurrentProviderRequests: manifest.constants.maxConcurrentProviderRequests,
     maxDispatchesPerTick: manifest.constants.maxDispatchesPerTick,
     maxRepairAttemptsPerArm: manifest.constants.maxRepairAttemptsPerArm,
+    evidenceRoot: input.evidenceRoot,
+    evidenceRootId: input.evidenceRootId,
     armedAt: new Date(input.armedAtMs).toISOString(),
     expiresAt: new Date(input.expiresAtMs).toISOString(),
     disarmedAt: null,

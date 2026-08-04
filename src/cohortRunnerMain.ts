@@ -39,10 +39,10 @@ import type { Pool } from 'pg';
 /** The scratch Postgres the store-backed demo defaults to (mirrors the adapter conformance
  *  harness). Real environments set STORE_DATABASE_URL; nothing points at production here. */
 const DEFAULT_STORE_DATABASE_URL = 'postgres://postgres:spike@localhost:5433/store_spike';
-/** The default durable artifact output root — a scratch dir under the repo (gitignored).
- *  Shared with the campaign tick (`campaignMain.ts`), which writes its fire artifacts and
- *  scans its escalation evidence under the same root. */
-export const DEFAULT_FIRE_ARTIFACTS_DIR = './.fire-artifacts';
+/** The default durable artifact output root for the DEMO/rehearsal runner — a scratch dir
+ *  under the repo (gitignored). The scheduled campaign deliberately has no such default:
+ *  its evidence root is bound explicitly at arm time (`campaignMain.ts`). */
+const DEFAULT_FIRE_ARTIFACTS_DIR = './.fire-artifacts';
 
 /**
  * The canonical line-open runner — REHEARSAL (dry-run) entrypoint. It boots a cohort

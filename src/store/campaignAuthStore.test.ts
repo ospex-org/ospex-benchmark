@@ -28,6 +28,8 @@ const RECORD: CampaignAuthorization = Object.freeze({
   maxConcurrentProviderRequests: 4,
   maxDispatchesPerTick: 1,
   maxRepairAttemptsPerArm: 1,
+  evidenceRoot: '/srv/campaign-evidence',
+  evidenceRootId: 'root-id-1',
   armedAt: '2026-08-05T00:00:00.000Z',
   expiresAt: '2026-08-12T00:00:00.000Z',
   disarmedAt: null,

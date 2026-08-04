@@ -66,14 +66,18 @@ export interface ScheduleEntry {
  *  settlement was refused or failed — which the tick escalates to the operator.
  *  `dispatch_faulted` is a tick whose admissions returned a fault-class claim outcome
  *  (store-contract skew, an uninitialized budget, a store error — non-authorizing and
- *  spending nothing, but an unattended campaign must not keep ticking over it). A journal
- *  written by the PRE-activation build carries `validated_refused` rows; this build does
- *  not recognize that outcome, so such a journal halts once for operator review when the
- *  build changes (fail closed, the deliberate direction). */
+ *  spending nothing, but an unattended campaign must not keep ticking over it).
+ *  `evidence_root_refused` is a tick whose armed evidence root failed its identity
+ *  verification (a lost mount, a recreated empty directory, a foreign marker) — the
+ *  evidence half of the escalation latch cannot be read, so nothing may dispatch. A
+ *  journal written by the PRE-activation build carries `validated_refused` rows; this
+ *  build does not recognize that outcome, so such a journal halts once for operator
+ *  review when the build changes (fail closed, the deliberate direction). */
 export type CampaignTickOutcome =
   | 'dispatched'
   | 'dispatch_unresolved'
   | 'dispatch_faulted'
+  | 'evidence_root_refused'
   | 'no_live_authorization'
   | 'publication_refused'
   | 'escalation_latched'

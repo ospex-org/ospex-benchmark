@@ -67,7 +67,7 @@ test('a latest finished HEALTHY tick is CLEAR; any non-healthy or UNKNOWN outcom
   assert.deepEqual(resolve([entry({ id: 1 })]), { kind: 'clear' });
   // `validated_refused` is the PRE-activation build's healthy outcome: unknown to this
   // build, so a journal spanning the flip halts once for operator review (fail closed).
-  for (const outcome of ['no_live_authorization', 'publication_refused', 'escalation_latched', 'dispatch_unresolved', 'dispatch_faulted', 'loud_failure', 'validated_refused', null]) {
+  for (const outcome of ['no_live_authorization', 'publication_refused', 'escalation_latched', 'dispatch_unresolved', 'dispatch_faulted', 'evidence_root_refused', 'loud_failure', 'validated_refused', null]) {
     const state = resolve([entry({ id: 1, outcome })]);
     assert.equal(state.kind, 'halted', `outcome ${String(outcome)} must halt — fail closed on anything outside the healthy set`);
     if (state.kind !== 'halted') continue;
