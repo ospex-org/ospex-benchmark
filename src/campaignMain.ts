@@ -15,6 +15,7 @@ import { runCohortTick } from './cohortRunner.js';
 import type { CohortTickInput, CohortTickResult } from './cohortRunner.js';
 import { decodeManifestText, deriveRunOptions, describeFireOutcome, formatTickResult } from './cohortRunnerMain.js';
 import {
+  identityVerifiedEvidenceLatchSource,
   installEvidenceRootMarker,
   readEvidenceRootMarker,
   verifyEvidenceRoot,
@@ -456,6 +457,19 @@ async function reconcileExistingAuthorization(
           `refusing to reconcile an arm pointed at ${evidenceRoot} — the root is bound at arming ` +
           'for the campaign\'s lifetime',
       );
+      return 2;
+    }
+    // Pathname equality is not identity: the root at that pathname must CURRENTLY carry
+    // the exact marker the standing authorization binds. A replaced or recreated root
+    // must not let the attended command report a reconciliation the next tick will
+    // refuse — the operator would walk away believing the campaign is live.
+    const liveRootVerdict = verifyEvidenceRoot(evidenceRoot, resolution.record.evidenceRootId);
+    if (!liveRootVerdict.ok) {
+      printError(
+        `cohort ${booted.cohortId} is armed, but the root at ${evidenceRoot} no longer carries the ` +
+          `armed identity — refusing to report the arm reconciled: ${liveRootVerdict.reason}`,
+      );
+      printError('the standing authorization stands unchanged; restore the armed root before ticking.');
       return 2;
     }
     printLine('');
@@ -905,15 +919,23 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
       // The COMPOSED DURABLE ESCALATION LATCH: the store's shadow (an unresolved fire —
       // pending with no live lease — the durable state an escalated, crashed, or
       // never-settled dispatch leaves behind) AND the installed spend evidence under the
-      // SAME verified root the sink below writes to. The latch is DERIVED from durably
-      // retained state (never a separate write), which is what makes it hold across a
-      // failed disarm and a process restart; both sources fail CLOSED, so a source that
-      // cannot be read propagates — a loud exit 1, never read as clear. The SAME latch
-      // instance guards every admission below (`latchGuardedClaimPort`); this tick-level
-      // check is the half a scheduler and an operator see.
+      // SAME verified root the sink below writes to. The evidence scan is WRAPPED in the
+      // root-identity verification, so the marker is re-verified as part of the same
+      // fail-closed latch operation at EVERY admission — a root lost or replaced in the
+      // late window between this tick-level check and an admission trips the guard
+      // rather than scanning an empty pathname as clear. The latch is DERIVED from
+      // durably retained state (never a separate write), which is what makes it hold
+      // across a failed disarm and a process restart; every source fails CLOSED, so a
+      // source that cannot be read propagates — a loud exit 1, never read as clear. The
+      // SAME latch instance guards every admission below (`latchGuardedClaimPort`); this
+      // tick-level check is the half a scheduler and an operator see.
       const latch = composeEscalationLatch([
         unresolvedFireLatchSource(unresolvedFires),
-        escalationEvidenceLatchSource(evidenceRoot),
+        identityVerifiedEvidenceLatchSource(
+          evidenceRoot,
+          resolution.record.evidenceRootId,
+          escalationEvidenceLatchSource(evidenceRoot),
+        ),
       ]);
       const latchVerdict = await latch.check(booted.cohortId);
       if (latchVerdict.latched) {

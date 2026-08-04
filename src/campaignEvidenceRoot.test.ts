@@ -1,16 +1,18 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import {
   EVIDENCE_ROOT_MARKER,
   evidenceRootMarkerBytes,
+  identityVerifiedEvidenceLatchSource,
   installEvidenceRootMarker,
   parseEvidenceRootMarker,
   readEvidenceRootMarker,
   verifyEvidenceRoot,
 } from './campaignEvidenceRoot.js';
+import type { EscalationLatchSource } from './escalationLatch.js';
 
 /**
  * The evidence root's durable identity, over the REAL filesystem: the strict marker
@@ -91,6 +93,36 @@ test('installEvidenceRootMarker: a relative root and a FILE at the root path bot
   const filePath = join(mkdtempSync(join(tmpdir(), 'evidence-root-installfile-')), 'occupied');
   writeFileSync(filePath, 'a file, not a directory');
   assert.equal(installEvidenceRootMarker(filePath, ID).kind, 'failed');
+});
+
+test('identityVerifiedEvidenceLatchSource: verification precedes EVERY scan — ok delegates, failure yields evidence_root_lost WITHOUT consulting the scan', async () => {
+  const root = freshRoot();
+  assert.equal(installEvidenceRootMarker(root, ID).kind, 'installed');
+  const consulted: string[] = [];
+  const scan: EscalationLatchSource = {
+    async causes(cohortId) {
+      consulted.push(cohortId);
+      return [];
+    },
+  };
+  const source = identityVerifiedEvidenceLatchSource(root, ID, scan);
+  const cohortId = 'c'.repeat(64);
+  assert.deepEqual(await source.causes(cohortId), []);
+  assert.deepEqual(consulted, [cohortId], 'a verified root delegates to the scan');
+
+  // The late window: the root is lost and recreated empty AFTER the source was composed.
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(root, { recursive: true });
+  const causes = await source.causes(cohortId);
+  assert.equal(causes.length, 1);
+  assert.equal(causes[0]!.kind, 'evidence_root_lost');
+  assert.equal(consulted.length, 1, 'the scan is NEVER consulted over an unverified root — an empty pathname must not read as clear');
+
+  // A foreign identity at the same pathname refuses the same way.
+  writeFileSync(join(root, EVIDENCE_ROOT_MARKER), evidenceRootMarkerBytes('a-foreign-identity'));
+  const foreign = await source.causes(cohortId);
+  assert.equal(foreign[0]!.kind, 'evidence_root_lost');
+  assert.equal(consulted.length, 1);
 });
 
 test('verifyEvidenceRoot: only the exact armed identity at the exact root is ok — absence, recreation, foreign markers, and garbage all refuse', () => {

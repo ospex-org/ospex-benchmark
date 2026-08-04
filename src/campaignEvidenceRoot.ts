@@ -1,6 +1,7 @@
 import { isAbsolute, join } from 'node:path';
 import { ByteDifferentCollisionError, installBytesNoClobber, nodeArtifactFs } from './fireArtifactSink.js';
 import type { ArtifactFs } from './fireArtifactSink.js';
+import type { EscalationLatchCause, EscalationLatchSource } from './escalationLatch.js';
 
 /**
  * The campaign evidence root's durable IDENTITY (docs/CAMPAIGN-ACTIVATION.md §"The
@@ -164,6 +165,34 @@ export function installEvidenceRootMarker(
   return created
     ? { kind: 'installed', evidenceRootId }
     : { kind: 'already_installed', evidenceRootId };
+}
+
+/**
+ * Wrap an evidence-scan latch source so EXACT marker verification is part of the SAME
+ * fail-closed latch operation, executed before every scan — and therefore before every
+ * admission the guarded claim port checks. A root that fails verification yields an
+ * `evidence_root_lost` cause WITHOUT running the scan (a scan of a lost or foreign root
+ * would read an empty directory as clear — the exact late-window bypass this kills: a
+ * mount torn away between the tick-level check and an admission). Verification-then-scan
+ * is itself two operations; a root vanishing between them makes the scan's own
+ * missing-root guard reject loudly — fail closed either way, never clear.
+ */
+export function identityVerifiedEvidenceLatchSource(
+  root: string,
+  expectedEvidenceRootId: string,
+  scan: EscalationLatchSource,
+  fsx: ArtifactFs = nodeArtifactFs,
+): EscalationLatchSource {
+  const scanCauses = scan.causes.bind(scan);
+  return {
+    async causes(cohortId: string): Promise<readonly EscalationLatchCause[]> {
+      const verdict = verifyEvidenceRoot(root, expectedEvidenceRootId, fsx);
+      if (!verdict.ok) {
+        return [Object.freeze({ kind: 'evidence_root_lost' as const, path: root, detail: verdict.reason })];
+      }
+      return scanCauses(cohortId);
+    },
+  };
 }
 
 export type EvidenceRootVerification = { readonly ok: true } | { readonly ok: false; readonly reason: string };

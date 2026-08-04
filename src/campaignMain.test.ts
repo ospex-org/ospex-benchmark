@@ -798,6 +798,39 @@ test('a marker RACED IN between the prompt and the durable install conflicts: re
   assert.equal(d.auth.records.size, 0, 'no authority was created');
 });
 
+test('reconciliation requires the LIVE marker to match the standing identity — a replaced or recreated root refuses instead of reporting ALREADY armed', async () => {
+  // The negative control — an intact marker still reconciles exit 0 — is pinned by the
+  // 'UNKNOWN-COMMIT convergence' and 're-running the SAME arm reconciles' tests.
+  // (i) The marker at the same pathname is replaced with a different identity.
+  {
+    const auth = new MemoryAuthPort();
+    const opts = options();
+    const first = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+    assert.equal(first.value, 0);
+    const standing = [...auth.records.values()][0]!;
+    const root = resolve(opts.artifactsPath!);
+    writeFileSync(join(root, 'evidence-root.json'), `${JSON.stringify({ evidenceRootVersion: 1, evidenceRootId: 'identity-B' })}\n`);
+    const retry = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth, now: () => NOW + 60_000 }))));
+    assert.equal(retry.value, 2, 'the attended command must not report a reconciliation the next tick will refuse');
+    assert.match(retry.errors.join('\n'), /no longer carries the\s+armed identity/);
+    assert.deepEqual([...auth.records.values()][0], standing, 'the standing record was not rewritten');
+  }
+  // (ii) The root is lost entirely and the retry finds nothing to adopt: the retry stamps
+  // a FRESH identity onto the recreated pathname (durable step 0 precedes the store read
+  // by design), but the reconciliation still refuses against the standing id.
+  {
+    const auth = new MemoryAuthPort();
+    const opts = options();
+    const first = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth }))));
+    assert.equal(first.value, 0);
+    const root = resolve(opts.artifactsPath!);
+    rmSync(root, { recursive: true, force: true });
+    const retry = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, deps({ auth, now: () => NOW + 60_000 }))));
+    assert.equal(retry.value, 2);
+    assert.match(retry.errors.join('\n'), /no longer carries the\s+armed identity/);
+  }
+});
+
 test('a RETRY pointed at a DIFFERENT --artifacts refuses to reconcile: the root is bound for the campaign\'s lifetime', async () => {
   const auth = new MemoryAuthPort();
   const opts = options();
@@ -2532,6 +2565,54 @@ test('TRIPWIRE — a lost or recreated evidence root refuses the tick: an empty 
   assert.equal(absent.value, 2);
   assert.match(absent.errors.join('\n'), /EVIDENCE ROOT REFUSED/);
   assert.equal(second.d.tickInputs.length, 0);
+});
+
+test('LATE WINDOW — root-identity loss between the tick-level check and an admission trips the guard: escalation_latched, inner store admit unreachable', async () => {
+  // The tick-level root verification and latch check both read CLEAR; the sabotage lands
+  // inside the dispatch loop, immediately before an admission — the window only a
+  // per-admission identity re-verification covers. The inner store's `admitDispatch`
+  // throws a DISTINCT 'must never reach' error, which would surface as loud_failure /
+  // exit 1 — so the exit-2 escalation_latched outcome proves the guard fired FIRST and
+  // the store admission boundary was never reached.
+  const sabotages: Array<{ label: string; sabotage: (root: string) => void }> = [
+    {
+      label: 'root lost and recreated empty',
+      sabotage: (root) => {
+        rmSync(root, { recursive: true, force: true });
+        mkdirSync(root, { recursive: true });
+      },
+    },
+    {
+      label: 'marker replaced with a foreign identity',
+      sabotage: (root) => {
+        writeFileSync(join(root, 'evidence-root.json'), `${JSON.stringify({ evidenceRootVersion: 1, evidenceRootId: 'foreign-late' })}\n`);
+      },
+    },
+  ];
+  for (const { label, sabotage } of sabotages) {
+    const { manifestPath, auth, evidenceRoot } = await armed();
+    const resolver = publishedResolver(manifestPath);
+    const d = deps({
+      auth,
+      confirm: NEVER_PROMPT,
+      resolvePublication: resolver.resolve,
+      runTick: async (input) => {
+        sabotage(evidenceRoot);
+        await input.claimPort.admit({ cohortId: input.booted.cohortId } as never);
+        throw new Error('unreachable — the guarded admit must throw after root-identity loss');
+      },
+    });
+    const opts = options({ command: 'tick', manifestPath, publicationPath: publicationFile() });
+    const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => tickCampaign(opts, d)));
+    assert.equal(code, 2, label);
+    const refusal = errors.join('\n');
+    assert.match(refusal, /escalation latch is tripped .* refusing to admit any dispatch/, label);
+    assert.match(refusal, /evidence root lost/, label);
+    assert.ok(
+      d.tickJournal.calls.some((c) => c.startsWith('finish:71:escalation_latched:evidence root lost')),
+      `${label}: the late-window trip is journaled with its cause`,
+    );
+  }
 });
 
 test('TRIPWIRE — a FOREIGN identity marker at the armed pathname refuses the tick: another root\'s identity is not the armed root', async () => {

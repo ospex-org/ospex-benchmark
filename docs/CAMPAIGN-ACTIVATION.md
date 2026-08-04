@@ -18,7 +18,9 @@ Everything below states the contract that holds it.
   loop as the manifest), and binds both the root and the marker id **immutably** into the
   authorization record. A root has one identity for its lifetime: a second campaign armed
   at the same root adopts the existing marker; a byte-different marker refuses the arm; a
-  retry pointed at a different root refuses to reconcile. It builds a bounds-checked
+  retry pointed at a different root refuses to reconcile, and so does a retry whose
+  pathname no longer carries the armed identity — the attended command never reports a
+  reconciliation the next tick would refuse. It builds a bounds-checked
   campaign manifest sized in provider calls, prints the exact terms and cost projections,
   takes the standard `[Y/n]` confirmation, then performs the durable writes in
   **authority order** — the evidence-root marker and the manifest file first (each riding
@@ -83,7 +85,10 @@ Everything below states the contract that holds it.
    unreadable marker, or a foreign id journals `evidence_root_refused` (exit 2, halting
    the schedule) — a lost mount or a recreated empty directory at the same pathname is
    NOT the armed root and can never read as a clear latch. The tick never creates the
-   root; the attended arm is the only initializer.
+   root; the attended arm is the only initializer. The same verification is also part of
+   the latch operation itself (next step), so it re-runs at every admission — a root
+   lost in the late window between this check and an admission trips the guard
+   (`evidence_root_lost`) rather than scanning an empty pathname as clear.
 7. **The composed escalation latch** (below). A trip journals `escalation_latched`.
 8. **The gated billable mint** (`gateRealCampaignAdapterCapability`) — the second of two
    independent validation passes: the producer re-derives the cohort binding, the campaign
@@ -183,7 +188,7 @@ proving the admission is refused and no provider call is reachable.
   entry leaves no journal trace: for store-class failures such a tick can reach no
   dispatch either (every dispatch path needs the same store it could not reach), and the
   pre-store configuration refusals — a missing, unusable, or all-zeros publication
-  descriptor, missing read-seam env, an unusable artifact root — are pinned by test to
+  descriptor, missing read-seam env, a tick-supplied `--artifacts` — are pinned by test to
   open nothing and dispatch nothing; repeated pre-journal failures surface only through
   the process exit code and its monitoring channel, never the journal.
 - **Resuming is attended.** `campaign:resume` clears a halted schedule with the standard

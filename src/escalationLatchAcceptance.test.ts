@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { identityVerifiedEvidenceLatchSource, installEvidenceRootMarker } from './campaignEvidenceRoot.js';
 import { cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
 import {
@@ -678,6 +679,72 @@ test('a clean pair whose ARTIFACT file is gone latches — a clean claim with no
     },
   );
   assert.equal(tripwire.touched(), 0);
+});
+
+test('LATE WINDOW at full scale: root-identity loss AFTER a clear check refuses at the admission — zero store admits, zero provider contact', async () => {
+  // The campaign tick wraps its evidence scan in the root-identity verification, so the
+  // marker is re-verified as part of the SAME latch operation the guarded claim port runs
+  // before every admission. This drives that composition through the REAL spine: the
+  // latch reads clear, then the armed root is lost (and, in the second leg, replaced by a
+  // foreign identity) BEFORE the admission — and the guard must refuse with the inner
+  // store's admit boundary never reached and the tripwire adapters never invoked.
+  const state = new DurableCohortState();
+  const artifactRoot = join(mkdtempSync(join(tmpdir(), 'escalation-latch-rootloss-')), 'root');
+  assert.equal(installEvidenceRootMarker(artifactRoot, 'armed-root-identity').kind, 'installed');
+
+  const snapshot = sealed(GAME_ID2);
+  const latch = composeEscalationLatch([
+    unresolvedFireLatchSource(unresolvedFireReadOver(state, () => NOW_MS)),
+    identityVerifiedEvidenceLatchSource(
+      artifactRoot,
+      'armed-root-identity',
+      escalationEvidenceLatchSource(artifactRoot),
+    ),
+  ]);
+  // The tick-level check reads CLEAR — the root is present with the armed identity.
+  assert.deepEqual(await latch.check(snapshot.booted.cohortId), { latched: false });
+
+  let admitReached = 0;
+  const inner = storeOver(state, snapshot.expectedArmIdentities.length, () => NOW_MS);
+  const countingStore: AtomicStore = {
+    ...inner,
+    admitDispatch: async (req: AdmitDispatchRequest) => {
+      admitReached += 1;
+      return inner.admitDispatch(req);
+    },
+  };
+  const claimPort = latchGuardedClaimPort(new StoreClaimPort(countingStore), latch);
+
+  // Leg 1: the mount is lost and the pathname recreated EMPTY between the check and the
+  // admission.
+  rmSync(artifactRoot, { recursive: true, force: true });
+  mkdirSync(artifactRoot, { recursive: true });
+  const tripwire1 = tripwireAdapters(snapshot);
+  await assert.rejects(
+    runBillableFire(state, artifactRoot, GAME_ID2, { claimPort, adapters: tripwire1.map }),
+    (error: unknown) => {
+      assert.ok(error instanceof EscalationLatchedError, `expected the latch refusal, got: ${String(error)}`);
+      assert.deepEqual(error.causes.map((c) => c.kind), ['evidence_root_lost']);
+      return true;
+    },
+  );
+  assert.equal(tripwire1.touched(), 0, 'no provider adapter was ever invoked');
+  assert.equal(admitReached, 0, 'the inner store admission boundary was never reached');
+  assert.deepEqual([...state.fires.keys()], [], 'no fire was admitted');
+
+  // Leg 2: the same pathname now carries a FOREIGN identity.
+  assert.equal(installEvidenceRootMarker(artifactRoot, 'foreign-identity').kind, 'installed');
+  const tripwire2 = tripwireAdapters(snapshot);
+  await assert.rejects(
+    runBillableFire(state, artifactRoot, GAME_ID2, { claimPort, adapters: tripwire2.map }),
+    (error: unknown) => {
+      assert.ok(error instanceof EscalationLatchedError);
+      assert.deepEqual(error.causes.map((c) => c.kind), ['evidence_root_lost']);
+      return true;
+    },
+  );
+  assert.equal(tripwire2.touched(), 0, 'no provider adapter was ever invoked');
+  assert.equal(admitReached, 0, 'the inner store admission boundary was never reached');
 });
 
 test('the store source ALONE holds the latch when the escalation sidecar file is gone', async () => {
