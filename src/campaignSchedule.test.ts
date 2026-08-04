@@ -4,7 +4,6 @@ import {
   HEALTHY_TICK_OUTCOMES,
   OPERATOR_RESUMED,
   SCHEDULE_WINDOW_LIMIT,
-  readScheduleEntries,
   resolveScheduleState,
   tickDeadlineMs,
   unreviewedInFlightTick,
@@ -159,28 +158,6 @@ test('unreviewedInFlightTick: a fresh unfinished tick blocks a resume; stale, fi
   const unreadable = unreviewedInFlightTick(args([entry({ id: 8, startedAt: 'garbage', finishedAt: null, outcome: null })]));
   assert.equal(unreadable?.id, 8, 'an unreadable age cannot prove staleness — fail closed, counts as in flight');
   assert.throws(() => unreviewedInFlightTick({ entries: [], nowMs: Number.NaN, deadlineMs: DEADLINE }), /finite clock/);
-});
-
-test('readScheduleEntries merges the recent window with the dedicated unfinished read, deduplicated by id', async () => {
-  const recent = [entry({ id: 60 }), entry({ id: 59, finishedAt: null, outcome: null })];
-  const buried = entry({ id: 3, startedAt: '2026-08-05T00:00:00.000Z', finishedAt: null, outcome: null });
-  const calls: string[] = [];
-  const journal = {
-    async entries(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
-      calls.push(`entries:${cohortId}:${limit}`);
-      return recent;
-    },
-    async unfinishedTicks(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
-      calls.push(`unfinished:${cohortId}:${limit}`);
-      return [recent[1]!, buried]; // one overlap, one entry the recent window lost
-    },
-  };
-  const merged = await readScheduleEntries(journal, 'c'.repeat(64));
-  assert.deepEqual(calls, [`entries:${'c'.repeat(64)}:${SCHEDULE_WINDOW_LIMIT}`, `unfinished:${'c'.repeat(64)}:${SCHEDULE_WINDOW_LIMIT}`]);
-  assert.deepEqual(merged.map((e) => e.id).sort((a, b) => a - b), [3, 59, 60], 'both reads contribute; the overlap appears once');
-  // The merged input is what lets the halt rule see the buried crash.
-  const state = resolveScheduleState({ entries: merged, nowMs: NOW, deadlineMs: DEADLINE, healthyOutcomes: HEALTHY_TICK_OUTCOMES });
-  assert.equal(state.kind, 'halted');
 });
 
 test('fail closed on what cannot be read: an unreadable start instant halts; a broken clock or deadline throws', () => {

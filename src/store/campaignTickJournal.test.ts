@@ -52,14 +52,28 @@ test('finish: one UPDATE guarded by `finished_at is null` — the FIRST finish w
   assert.deepEqual(params, [71, '2026-08-05T12:00:05.000Z', 'validated_refused', null]);
 });
 
-test('resume: one INSERT of an already-finished resume row carrying the operator acknowledgment', async () => {
-  const { port, calls } = scripted([]);
-  await port.resume(COHORT, '2026-08-05T13:00:00.000Z', 'reviewed the loud failure');
-  assert.equal(calls.length, 1);
-  const { sql, params } = calls[0]!;
+test('resume: a CONDITIONAL append — frontier CAS + the same per-cohort lock begin takes — mapping 1 row to resumed, 0 to frontier_moved', async () => {
+  const accepted = scripted([{ id: '9' }]);
+  assert.equal(await accepted.port.resume(COHORT, '2026-08-05T13:00:00.000Z', 'reviewed the loud failure', 8), 'resumed');
+  const { sql, params } = accepted.calls[0]!;
   assert.match(sql, /insert into store\.campaign_ticks/);
   assert.match(sql, /'resume'/);
-  assert.deepEqual(params, [COHORT, '2026-08-05T13:00:00.000Z', 'operator_resumed', 'reviewed the loud failure']);
+  // The serialization contract: the SAME advisory lock begin takes, and the frontier CAS —
+  // the append commits only while max(id) still equals the exact reviewed frontier.
+  assert.match(sql, /pg_advisory_xact_lock\(hashtext\(\$1\)\)/);
+  assert.match(sql, /where \(select coalesce\(max\(id\), 0\) from store\.campaign_ticks where cohort_id = \$1\) = \$5/);
+  assert.match(sql, /returning id/);
+  assert.deepEqual(params, [COHORT, '2026-08-05T13:00:00.000Z', 'operator_resumed', 'reviewed the loud failure', 8]);
+
+  assert.equal(await scripted([]).port.resume(COHORT, '2026-08-05T13:00:00.000Z', null, 8), 'frontier_moved');
+  await assert.rejects(scripted([]).port.resume(COHORT, '2026-08-05T13:00:00.000Z', null, -1), /reviewed journal frontier/);
+  await assert.rejects(scripted([]).port.resume(COHORT, '2026-08-05T13:00:00.000Z', null, 1.5), /reviewed journal frontier/);
+});
+
+test('begin takes the same per-cohort advisory lock the resume CAS serializes on', async () => {
+  const { port, calls } = scripted([{ id: '71' }]);
+  await port.begin(COHORT, '2026-08-05T12:00:00.000Z');
+  assert.match(calls[0]!.sql, /pg_advisory_xact_lock\(hashtext\(\$1\)\)/);
 });
 
 test('entries: newest first, bounded, exact wire mapping — Date→ISO, null finish, plain-string outcome', async () => {
@@ -110,24 +124,46 @@ test('entries: a non-positive or fractional limit is refused BEFORE any query; w
   await assert.rejects(scripted([{ ...base, kind: 'tick', outcome: 42 }]).port.entries(COHORT, 5), /neither text nor null/);
 });
 
-test('unfinishedTicks: the dedicated crash read — tick kind only, unfinished only, newest first, bounded', async () => {
-  const { port, calls } = scripted([
-    { id: '3', kind: 'tick', started_at: new Date('2026-08-05T00:00:00.000Z'), finished_at: null, outcome: null, detail: null },
-  ]);
-  assert.deepEqual(await port.unfinishedTicks(COHORT, 50), [
-    { id: 3, kind: 'tick', startedAt: '2026-08-05T00:00:00.000Z', finishedAt: null, outcome: null, detail: null },
-  ]);
+test('scheduleWindow: ONE statement, boundary-anchored, filtered and UNBOUNDED — the reads that decide clear carry no row limit', async () => {
+  const windowRow = {
+    frontier_id: '12',
+    resume_row: { id: 7, kind: 'resume', startedAt: '2026-08-05T10:00:00.000Z', finishedAt: '2026-08-05T10:00:00.000Z', outcome: 'operator_resumed', detail: 'reviewed' },
+    unfinished_rows: [
+      { id: 12, kind: 'tick', startedAt: '2026-08-05T12:00:00.000Z', finishedAt: null, outcome: null, detail: null },
+    ],
+    unhealthy_rows: [
+      { id: 9, kind: 'tick', startedAt: '2026-08-05T11:00:00.000Z', finishedAt: '2026-08-05T11:00:05.000Z', outcome: 'loud_failure', detail: 'boom' },
+    ],
+  };
+  const { port, calls } = scripted([windowRow]);
+  const window = await port.scheduleWindow(COHORT, ['validated_refused']);
+  assert.equal(window.frontierId, 12);
+  assert.deepEqual(
+    window.entries.map((e) => [e.id, e.kind, e.outcome]),
+    [[7, 'resume', 'operator_resumed'], [12, 'tick', null], [9, 'tick', 'loud_failure']],
+    'the boundary row, every unfinished tick after it, every non-healthy finished tick after it',
+  );
+  assert.equal(calls.length, 1, 'one statement — one snapshot');
   const { sql, params } = calls[0]!;
-  assert.match(sql, /kind = 'tick'/);
+  assert.match(sql, /with boundary as/);
+  assert.match(sql, /kind = 'resume'/);
+  // BOTH halt-relevant reads are anchored strictly after the durable latest-resume boundary...
+  assert.equal((sql.match(/id > \(select resume_id from boundary\)/g) ?? []).length, 2);
+  // ...and carry NO row limit: a newest-N sample cannot authoritatively decide clear.
+  assert.doesNotMatch(sql, /limit/i);
+  // The unhealthy filter fails closed on a null outcome and excludes only the healthy set.
+  assert.match(sql, /outcome is null or not \(f\.outcome = any\(\$2\)\)/);
   assert.match(sql, /finished_at is null/);
-  assert.match(sql, /order by id desc/);
-  assert.match(sql, /limit \$2/);
-  assert.deepEqual(params, [COHORT, 50]);
-  for (const limit of [0, -1]) {
-    const bad = scripted([]);
-    await assert.rejects(bad.port.unfinishedTicks(COHORT, limit), /positive entry limit/);
-    assert.equal(bad.calls.length, 0);
-  }
+  assert.match(sql, /finished_at is not null/);
+  assert.deepEqual(params, [COHORT, ['validated_refused']]);
+});
+
+test('scheduleWindow: an empty journal yields frontier 0 and no entries; malformed JSON entries are loud', async () => {
+  const { port } = scripted([{ frontier_id: '0', resume_row: null, unfinished_rows: [], unhealthy_rows: [] }]);
+  assert.deepEqual(await port.scheduleWindow(COHORT, ['validated_refused']), { frontierId: 0, entries: [] });
+
+  const bad = scripted([{ frontier_id: '1', resume_row: null, unfinished_rows: [{ id: 1, kind: 'other', startedAt: 'x' }], unhealthy_rows: [] }]);
+  await assert.rejects(bad.port.scheduleWindow(COHORT, ['validated_refused']), /neither tick nor resume/);
 });
 
 test('a query failure propagates — never an empty (clear) journal', async () => {

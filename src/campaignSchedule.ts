@@ -31,10 +31,11 @@ import type { CohortManifestV1 } from './manifest.js';
  *     premise true — a resume refuses while an in-flight entry's outcome is still
  *     pending).
  *
- * Stated bounds. Callers assemble the rule's input with {@link readScheduleEntries} — the
- * most recent `SCHEDULE_WINDOW_LIMIT` entries plus every unfinished tick — so a crashed
- * tick still inside its deadline cannot be pushed out of view by a fast cron cadence; the
- * escalation latch remains the money backstop for anything the journal window cannot see.
+ * Stated bounds. Callers take the rule's input from the journal's `scheduleWindow` read:
+ * the durable latest-resume boundary plus EVERY unfinished tick and EVERY non-healthy
+ * finished tick after it, in one snapshot — filtered, deliberately unbounded reads,
+ * because a newest-N sample of the raw journal cannot authoritatively decide that no
+ * unreviewed halt cause exists (the bounded `entries` read exists for display only).
  * A tick that fails before it can write its begin entry leaves no journal trace — such a
  * tick cannot reach a dispatch either (every dispatch path needs the same store), so it
  * is self-limiting and surfaces through its process exit code and monitoring. Staleness
@@ -80,22 +81,35 @@ export type ScheduleState =
   | { readonly kind: 'clear' }
   | { readonly kind: 'halted'; readonly why: string };
 
+/** The authoritative halt-rule input: the journal frontier the review witnessed (`max`
+ *  entry id for the cohort, 0 when empty) and the COMPLETE halt-relevant entry set — the
+ *  latest resume boundary row plus every unfinished tick and every non-healthy finished
+ *  tick after it, read in one snapshot. */
+export interface ScheduleWindow {
+  readonly frontierId: number;
+  readonly entries: readonly ScheduleEntry[];
+}
+
 /**
  * The durable journal seam (implemented over SQL in `store/campaignTickJournal.ts`).
  * `begin` appends an unfinished tick entry and returns its id; `finish` stamps outcome +
  * instant on that entry EXACTLY ONCE (the first finish wins; a later finish changes
  * nothing — so a best-effort loud-failure finish racing nothing can never rewrite a
- * decided outcome); `resume` appends the operator acknowledgment that bounds the halt
- * window; `entries` reads the newest entries first. Every failure rejects.
+ * decided outcome); `scheduleWindow` reads the authoritative halt-rule input (see
+ * {@link ScheduleWindow} — filtered and unbounded, because a newest-N sample of the raw
+ * journal cannot authoritatively decide that no unreviewed halt cause exists);
+ * `resume` is the CONDITIONAL operator acknowledgment — it commits only while the journal
+ * frontier still equals the exact `expectedFrontierId` the operator's review read, and
+ * `begin`/`resume` serialize on one per-cohort lock, so a tick can never slip below a
+ * resume boundary unseen; `entries` is a bounded newest-first read for DISPLAY only.
+ * Every failure rejects.
  */
 export interface CampaignTickJournalPort {
   begin(cohortId: string, startedAtIso: string): Promise<number>;
   finish(entryId: number, outcome: CampaignTickOutcome, detail: string | null, finishedAtIso: string): Promise<void>;
-  resume(cohortId: string, atIso: string, detail: string | null): Promise<void>;
+  resume(cohortId: string, atIso: string, detail: string | null, expectedFrontierId: number): Promise<'resumed' | 'frontier_moved'>;
+  scheduleWindow(cohortId: string, healthyOutcomes: readonly string[]): Promise<ScheduleWindow>;
   entries(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]>;
-  /** Every unfinished tick entry, newest first, same bound — the read a fast cron cannot
-   *  push a not-yet-stale crash out of (see {@link readScheduleEntries}). */
-  unfinishedTicks(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]>;
 }
 
 /**
@@ -214,20 +228,3 @@ export function unreviewedInFlightTick(input: {
   return null;
 }
 
-/**
- * Read the halt rule's inputs: the most recent {@link SCHEDULE_WINDOW_LIMIT} entries PLUS
- * every unfinished tick entry (newest first, same bound), merged by id. The dedicated
- * unfinished read is what a fast cron cannot outrun: without it, a crashed tick still
- * inside its deadline could be pushed past the recent-entries window by enough healthy
- * ticks and then never be seen again once stale. Both reads reject loudly on failure.
- */
-export async function readScheduleEntries(
-  journal: Pick<CampaignTickJournalPort, 'entries' | 'unfinishedTicks'>,
-  cohortId: string,
-): Promise<readonly ScheduleEntry[]> {
-  const recent = await journal.entries(cohortId, SCHEDULE_WINDOW_LIMIT);
-  const unfinished = await journal.unfinishedTicks(cohortId, SCHEDULE_WINDOW_LIMIT);
-  const byId = new Map<number, ScheduleEntry>();
-  for (const entry of [...recent, ...unfinished]) byId.set(entry.id, entry);
-  return [...byId.values()];
-}

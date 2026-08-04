@@ -29,6 +29,8 @@ import { SqlCampaignAuthorizationPort } from './campaignAuthStore.js';
 import { SqlCampaignStatusReadPort } from './campaignStatusRead.js';
 import { SqlUnresolvedFireReadPort } from './escalationLatchRead.js';
 import { SqlCampaignTickJournalPort } from './campaignTickJournal.js';
+import { resolveScheduleState } from '../campaignSchedule.js';
+import type { ScheduleEntry } from '../campaignSchedule.js';
 import { STORE_SCHEMA_VERSION } from './constants.js';
 import type { CampaignAuthorization } from '../campaignAuthorization.js';
 
@@ -339,42 +341,100 @@ async function main(): Promise<void> {
     assert.equal(latched[0]!.fireId, 'f1');
   });
 
-  await check('tick journal: two-phase begin/finish against real rows; the FIRST finish wins; resume appends; newest-first read', async () => {
+  const HEALTHY = ['validated_refused'];
+  const RULE_NOW = Date.parse('2026-08-05T12:00:00.000Z');
+  const RULE_DEADLINE = 3_000_000; // the default campaign build's deadline (pinned in the pure suite)
+  const ruleState = (entries: readonly ScheduleEntry[]) =>
+    resolveScheduleState({ entries, nowMs: RULE_NOW, deadlineMs: RULE_DEADLINE, healthyOutcomes: HEALTHY });
+
+  await check('tick journal: two-phase begin/finish against real rows; the FIRST finish wins; the window read is boundary-anchored', async () => {
     const c = cohortName('journal');
     const journal = new SqlCampaignTickJournalPort(pgStoreQuery(pool));
-    assert.deepEqual(await journal.entries(c, 10), [], 'a cohort that never ticked has an empty journal');
+    assert.deepEqual(await journal.scheduleWindow(c, HEALTHY), { frontierId: 0, entries: [] });
 
-    const id1 = await journal.begin(c, '2026-08-05T00:00:00.000Z');
-    let rows = await journal.entries(c, 10);
+    const id1 = await journal.begin(c, '2026-08-05T11:59:00.000Z');
+    let window = await journal.scheduleWindow(c, HEALTHY);
+    assert.equal(window.frontierId, id1);
     assert.deepEqual(
-      rows,
-      [{ id: id1, kind: 'tick', startedAt: '2026-08-05T00:00:00.000Z', finishedAt: null, outcome: null, detail: null }],
+      window.entries,
+      [{ id: id1, kind: 'tick', startedAt: '2026-08-05T11:59:00.000Z', finishedAt: null, outcome: null, detail: null }],
       'a begun entry is durably UNFINISHED — the crash shape the halt rule detects',
     );
 
-    await journal.finish(id1, 'validated_refused', null, '2026-08-05T00:00:05.000Z');
-    await journal.finish(id1, 'loud_failure', 'a later racer', '2026-08-05T00:00:09.000Z');
-    rows = await journal.entries(c, 10);
+    await journal.finish(id1, 'validated_refused', null, '2026-08-05T11:59:05.000Z');
+    await journal.finish(id1, 'loud_failure', 'a later racer', '2026-08-05T11:59:09.000Z');
+    const rows = await journal.entries(c, 10);
     assert.equal(rows[0]!.outcome, 'validated_refused', 'the FIRST finish stands — a later finish changes nothing');
-    assert.equal(rows[0]!.finishedAt, '2026-08-05T00:00:05.000Z');
+    assert.equal(rows[0]!.finishedAt, '2026-08-05T11:59:05.000Z');
     assert.equal(rows[0]!.detail, null);
+    window = await journal.scheduleWindow(c, HEALTHY);
+    assert.deepEqual(window.entries, [], 'a healthy finished tick is not halt-relevant');
+    assert.equal(window.frontierId, id1, 'the frontier still witnesses it');
+  });
 
-    const id2 = await journal.begin(c, '2026-08-05T01:00:00.000Z');
-    await journal.resume(c, '2026-08-05T02:00:00.000Z', 'reviewed the halt');
-    rows = await journal.entries(c, 10);
-    assert.deepEqual(rows.map((r) => r.kind), ['resume', 'tick', 'tick'], 'newest first');
-    assert.ok(rows[0]!.id > rows[1]!.id && rows[1]!.id > rows[2]!.id, 'the id is the append-order authority');
-    assert.equal(rows[0]!.outcome, 'operator_resumed');
-    assert.equal(rows[0]!.startedAt, '2026-08-05T02:00:00.000Z');
-    assert.equal(rows[0]!.finishedAt, '2026-08-05T02:00:00.000Z');
-    assert.equal(rows[1]!.id, id2);
-    assert.equal(rows[1]!.finishedAt, null);
+  await check('journal counterexample: 51 unfinished ticks — the window returns ALL of them, the stale oldest included, and the rule halts', async () => {
+    // A bounded newest-N read once omitted the stale oldest here and read the schedule
+    // clear; the window read is filtered and unbounded, so it cannot.
+    const c = cohortName('allunfinished');
+    const journal = new SqlCampaignTickJournalPort(pgStoreQuery(pool));
+    const staleId = await journal.begin(c, '2026-08-04T00:00:00.000Z'); // a day old — stale
+    for (let i = 0; i < 50; i += 1) {
+      await journal.begin(c, new Date(RULE_NOW - 1_000 * (50 - i)).toISOString()); // all fresh
+    }
+    const window = await journal.scheduleWindow(c, HEALTHY);
+    assert.equal(window.entries.length, 51, 'every unfinished tick is in the window — no newest-N blind spot');
+    assert.ok(window.entries.some((e) => e.id === staleId), 'the stale oldest is present');
+    const state = ruleState(window.entries);
+    assert.equal(state.kind, 'halted');
+    if (state.kind === 'halted') assert.match(state.why, new RegExp(`tick ${staleId} started`));
+  });
 
-    // The dedicated crash read: exactly the unfinished tick — never resume rows, never
-    // finished ticks — and it empties once the entry finishes.
-    assert.deepEqual((await journal.unfinishedTicks(c, 10)).map((r) => r.id), [id2]);
-    await journal.finish(id2, 'validated_refused', null, '2026-08-05T03:00:00.000Z');
-    assert.deepEqual(await journal.unfinishedTicks(c, 10), []);
+  await check('journal counterexample: reviewed crash + resume + 51 healthy ticks — the boundary is durable, the schedule stays clear', async () => {
+    // The resume row is read directly as the boundary; it can never fall out of a
+    // bounded recent window, so already-reviewed history can never re-halt the campaign.
+    const c = cohortName('durableboundary');
+    const journal = new SqlCampaignTickJournalPort(pgStoreQuery(pool));
+    const crashId = await journal.begin(c, '2026-08-04T00:00:00.000Z'); // stale crash
+    const reviewed = await journal.scheduleWindow(c, HEALTHY);
+    assert.equal(ruleState(reviewed.entries).kind, 'halted');
+    assert.equal(await journal.resume(c, '2026-08-04T02:00:00.000Z', 'reviewed the crash', reviewed.frontierId), 'resumed');
+    for (let i = 0; i < 51; i += 1) {
+      const startIso = new Date(RULE_NOW - 60_000 * (51 - i)).toISOString();
+      const id = await journal.begin(c, startIso);
+      await journal.finish(id, 'validated_refused', null, new Date(RULE_NOW - 60_000 * (51 - i) + 5_000).toISOString());
+    }
+    const window = await journal.scheduleWindow(c, HEALTHY);
+    assert.ok(window.entries.some((e) => e.kind === 'resume'), 'the boundary row is present regardless of how much followed it');
+    assert.ok(!window.entries.some((e) => e.id === crashId), 'the reviewed crash sits before the boundary');
+    assert.equal(ruleState(window.entries).kind, 'clear');
+  });
+
+  await check('journal counterexample: a tick beginning after the review moves the frontier — the stale resume is REFUSED and the raced failure still halts', async () => {
+    const c = cohortName('frontiercas');
+    const journal = new SqlCampaignTickJournalPort(pgStoreQuery(pool));
+    await journal.begin(c, '2026-08-04T00:00:00.000Z'); // the stale halt cause under review
+    const reviewed = await journal.scheduleWindow(c, HEALTHY);
+    assert.equal(ruleState(reviewed.entries).kind, 'halted');
+
+    // The race: a tick begins after the operator's review read, before the acknowledgment.
+    const racedId = await journal.begin(c, new Date(RULE_NOW - 1_000).toISOString());
+    assert.equal(
+      await journal.resume(c, '2026-08-05T11:59:00.000Z', 'reviewed the crash', reviewed.frontierId),
+      'frontier_moved',
+      'the acknowledgment is refused against a moved frontier',
+    );
+    assert.ok(!(await journal.entries(c, 10)).some((e) => e.kind === 'resume'), 'nothing was written');
+
+    // The raced tick later fails; with no resume row, its outcome is in the window and halts.
+    await journal.finish(racedId, 'loud_failure', null, new Date(RULE_NOW).toISOString());
+    const after = await journal.scheduleWindow(c, HEALTHY);
+    assert.ok(after.entries.some((e) => e.id === racedId && e.outcome === 'loud_failure'), 'the raced failure is never hidden');
+    assert.equal(ruleState(after.entries).kind, 'halted');
+
+    // A resume at the CURRENT frontier — the raced outcome reviewed too — succeeds and clears.
+    assert.equal(await journal.resume(c, '2026-08-05T12:00:30.000Z', 'reviewed both', after.frontierId), 'resumed');
+    const cleared = await journal.scheduleWindow(c, HEALTHY);
+    assert.equal(ruleState(cleared.entries).kind, 'clear');
   });
 
   await check('READ-ONLY public CLI: campaign:status runs as a SELECT-only role and rewrites NO catalog state', async () => {

@@ -111,12 +111,14 @@ function recordingStore(calls: string[]): AtomicStore {
   };
 }
 
-/** A configurable in-memory tick journal; records calls, serves `entriesValue` and
- *  `unfinishedValue`. */
+/** A configurable in-memory tick journal; `windowValue`/`frontierId` serve the
+ *  authoritative halt window, `entriesValue` the bounded display read. */
 class FakeTickJournal implements CampaignTickJournalPort {
   readonly calls: string[] = [];
   entriesValue: ScheduleEntry[] = [];
-  unfinishedValue: ScheduleEntry[] = [];
+  windowValue: ScheduleEntry[] = [];
+  frontierId = 70;
+  resumeOutcome: 'resumed' | 'frontier_moved' = 'resumed';
   nextId = 71;
   async begin(cohortId: string, startedAtIso: string): Promise<number> {
     this.calls.push(`begin:${cohortId}:${startedAtIso}`);
@@ -125,16 +127,22 @@ class FakeTickJournal implements CampaignTickJournalPort {
   async finish(entryId: number, outcome: CampaignTickOutcome, detail: string | null, finishedAtIso: string): Promise<void> {
     this.calls.push(`finish:${entryId}:${outcome}:${detail ?? '<null>'}:${finishedAtIso}`);
   }
-  async resume(cohortId: string, atIso: string, detail: string | null): Promise<void> {
-    this.calls.push(`resume:${cohortId}:${atIso}:${detail ?? '<null>'}`);
+  async resume(
+    cohortId: string,
+    atIso: string,
+    detail: string | null,
+    expectedFrontierId: number,
+  ): Promise<'resumed' | 'frontier_moved'> {
+    this.calls.push(`resume:${cohortId}:${atIso}:${detail ?? '<null>'}:${expectedFrontierId}`);
+    return this.resumeOutcome;
+  }
+  async scheduleWindow(cohortId: string, healthyOutcomes: readonly string[]): Promise<{ frontierId: number; entries: readonly ScheduleEntry[] }> {
+    this.calls.push(`window:${cohortId}:${healthyOutcomes.join('+')}`);
+    return { frontierId: this.frontierId, entries: this.windowValue };
   }
   async entries(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
     this.calls.push(`entries:${cohortId}:${limit}`);
     return this.entriesValue;
-  }
-  async unfinishedTicks(cohortId: string, limit: number): Promise<readonly ScheduleEntry[]> {
-    this.calls.push(`unfinished:${cohortId}:${limit}`);
-    return this.unfinishedValue;
   }
 }
 
@@ -1377,8 +1385,8 @@ test('a VALID armed authorization: the tick validates end to end and REFUSES to 
   const at = new Date(NOW).toISOString();
   assert.deepEqual(
     d.tickJournal.calls,
-    [`entries:${cohortId}:50`, `unfinished:${cohortId}:50`, `begin:${cohortId}:${at}`, `finish:71:validated_refused:<null>:${at}`],
-    'the halt rule read the journal (recent + unfinished), then the tick journaled begin and the healthy outcome',
+    [`window:${cohortId}:validated_refused`, `begin:${cohortId}:${at}`, `finish:71:validated_refused:<null>:${at}`],
+    'the halt rule read the authoritative window, then the tick journaled begin and the healthy outcome',
   );
 });
 
@@ -1386,7 +1394,7 @@ test('a HALTED schedule refuses the tick (exit 2) before any journal write or au
   const { manifestPath, auth, cohortId } = await armed();
   auth.calls.length = 0;
   const d = deps({ auth, confirm: NEVER_PROMPT });
-  d.tickJournal.entriesValue = [
+  d.tickJournal.windowValue = [
     { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: 'boom' },
   ];
   const { value: code, errors } = await captured(() =>
@@ -1399,22 +1407,22 @@ test('a HALTED schedule refuses the tick (exit 2) before any journal write or au
   assert.match(refusal, /campaign:resume/, 'the operator is told the lever');
   assert.deepEqual(
     d.tickJournal.calls,
-    [`entries:${cohortId}:50`, `unfinished:${cohortId}:50`],
+    [`window:${cohortId}:validated_refused`],
     'a halted tick writes no journal entry — its refusal is derived state',
   );
   assert.deepEqual(auth.calls, [], 'the halt precedes even the authorization read');
   assert.deepEqual(d.unresolvedFires.calls, [], 'and the latch read');
 });
 
-test('a crashed tick surfaces through the DEDICATED unfinished read even when the recent window no longer holds it', async () => {
+test('a crashed tick surfaces through the AUTHORITATIVE window read even when the bounded display read no longer holds it', async () => {
   const { manifestPath, auth } = await armed();
   const d = deps({ auth, confirm: NEVER_PROMPT });
-  // The recent-entries read returns only healthy ticks (a fast cron pushed the crash out);
-  // the unfinished read still carries the stale entry — the merge is what halts.
+  // The bounded display read holds only healthy ticks (a fast cron pushed the crash out);
+  // the authoritative window still carries the stale entry — and it alone decides.
   d.tickJournal.entriesValue = [
     { id: 60, kind: 'tick', startedAt: '2026-08-04T23:50:00.000Z', finishedAt: '2026-08-04T23:50:05.000Z', outcome: 'validated_refused', detail: null },
   ];
-  d.tickJournal.unfinishedValue = [
+  d.tickJournal.windowValue = [
     { id: 3, kind: 'tick', startedAt: '2026-08-04T00:00:00.000Z', finishedAt: null, outcome: null, detail: null },
   ];
   const { value: code, errors } = await captured(() =>
@@ -1428,7 +1436,7 @@ test('a tick that finds a STALE UNFINISHED entry (the crash shape) halts the sam
   const { manifestPath, auth } = await armed();
   const d = deps({ auth, confirm: NEVER_PROMPT });
   // Started far beyond the campaign manifest tick deadline, never finished.
-  d.tickJournal.entriesValue = [
+  d.tickJournal.windowValue = [
     { id: 4, kind: 'tick', startedAt: '2026-08-04T00:00:00.000Z', finishedAt: null, outcome: null, detail: null },
   ];
   const { value: code, errors } = await captured(() =>
@@ -1513,7 +1521,7 @@ test('resume: a schedule that is NOT halted has nothing to resume — exit 2, no
   assert.match(errors.join('\n'), /nothing to resume — the schedule is not halted/);
   assert.deepEqual(
     d.tickJournal.calls,
-    [`entries:${cohortId}:50`, `unfinished:${cohortId}:50`],
+    [`window:${cohortId}:validated_refused`],
     'read-only: no resume row was written',
   );
 });
@@ -1528,7 +1536,7 @@ test('resume: a HALTED schedule resumes only through the standard [Y/n] — acce
       return '';
     },
   });
-  d.tickJournal.entriesValue = [
+  d.tickJournal.windowValue = [
     { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: 'boom' },
   ];
   const { value: code, logs } = await captured(() =>
@@ -1541,12 +1549,12 @@ test('resume: a HALTED schedule resumes only through the standard [Y/n] — acce
   assert.match(output, /clears the schedule halt ONLY/);
   assert.match(output, /RESUMED\./);
   const at = new Date(NOW).toISOString();
-  assert.equal(d.tickJournal.calls.length, 3);
-  assert.equal(d.tickJournal.calls[0], `entries:${cohortId}:50`);
-  assert.equal(d.tickJournal.calls[1], `unfinished:${cohortId}:50`);
+  assert.equal(d.tickJournal.calls.length, 2);
+  assert.equal(d.tickJournal.calls[0], `window:${cohortId}:validated_refused`);
   assert.ok(
-    d.tickJournal.calls[2]!.startsWith(`resume:${cohortId}:${at}:tick 4 finished`),
-    `the acknowledgment carries the reviewed halt reason; got ${d.tickJournal.calls[2]}`,
+    d.tickJournal.calls[1]!.startsWith(`resume:${cohortId}:${at}:tick 4 finished`) &&
+      d.tickJournal.calls[1]!.endsWith(':70'),
+    `the acknowledgment carries the reviewed halt reason AND the reviewed frontier; got ${d.tickJournal.calls[1]}`,
   );
 });
 
@@ -1581,7 +1589,7 @@ test('a publication-verification failure journals publication_refused — the ha
 test("the tick's journal read failure is LOUD — a broken journal is never read as a clear schedule", async () => {
   const { manifestPath, auth } = await armed();
   const d = deps({ auth, confirm: NEVER_PROMPT });
-  d.tickJournal.entries = async (): Promise<never> => {
+  d.tickJournal.scheduleWindow = async (): Promise<never> => {
     throw new Error('journal read: connection reset');
   };
   await assert.rejects(
@@ -1609,7 +1617,7 @@ test('an unusable publication descriptor refuses BEFORE the store: no open, no j
 test('resume: refuses while an IN-FLIGHT tick has no outcome to review — nothing may be bounded out of the window unseen', async () => {
   const { manifestPath, auth } = await armed();
   const d = deps({ auth, confirm: NEVER_PROMPT });
-  d.tickJournal.entriesValue = [
+  d.tickJournal.windowValue = [
     // The halt cause the operator is reviewing...
     { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: null },
     // ...and an overlapping tick still inside its deadline, outcome pending.
@@ -1630,7 +1638,7 @@ test('resume: EOF and a negative answer both refuse without writing', async () =
   ] as const) {
     const { manifestPath, auth } = await armed();
     const d = deps({ auth, confirm });
-    d.tickJournal.entriesValue = [
+    d.tickJournal.windowValue = [
       { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: null },
     ];
     const { value: code, errors } = await captured(() =>
@@ -1741,9 +1749,9 @@ test('status renders the tick journal and a HALTED schedule, and the verdict mir
   const { manifestPath, auth } = await armed();
   const d = deps({ auth, confirm: NEVER_PROMPT });
   d.statusReads.budgetValue = { callCap: 800, callsReserved: 8, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 800_000_000 };
-  d.tickJournal.entriesValue = [
-    { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: 'boom' },
-  ];
+  const badTick: ScheduleEntry = { id: 4, kind: 'tick', startedAt: '2026-08-04T23:00:00.000Z', finishedAt: '2026-08-04T23:00:05.000Z', outcome: 'loud_failure', detail: 'boom' };
+  d.tickJournal.entriesValue = [badTick];
+  d.tickJournal.windowValue = [badTick];
   // The latch is ALSO tripped: the halted schedule must still own the verdict line — the
   // tick's own precedence checks the halt before anything else.
   d.unresolvedFires.fires = [{ fireId: 'f'.repeat(64), admittedAt: '2026-08-05T12:00:00.000Z' }];
@@ -1764,9 +1772,9 @@ test('status renders an UNFINISHED last tick distinctly', async () => {
   const d = deps({ auth, confirm: NEVER_PROMPT });
   d.statusReads.budgetValue = { callCap: 800, callsReserved: 0, spendCapUsdMicros: 80_000_000_000, spendReservedUsdMicros: 0 };
   // Fresh enough to be in-flight: the schedule stays clear, the line says unfinished.
-  d.tickJournal.entriesValue = [
-    { id: 7, kind: 'tick', startedAt: new Date(NOW - 1_000).toISOString(), finishedAt: null, outcome: null, detail: null },
-  ];
+  const inFlight: ScheduleEntry = { id: 7, kind: 'tick', startedAt: new Date(NOW - 1_000).toISOString(), finishedAt: null, outcome: null, detail: null };
+  d.tickJournal.entriesValue = [inFlight];
+  d.tickJournal.windowValue = [inFlight];
   const { value: code, logs } = await captured(() =>
     withEnv(SYNTHETIC_ENV, () => statusCampaign(options({ command: 'status', manifestPath }), d)),
   );

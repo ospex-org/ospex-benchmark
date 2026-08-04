@@ -19,7 +19,7 @@ import type { ManifestPublicationV1, ResolvedPublication } from './manifestPubli
 import { instantMs, isParseableInstant } from './time.js';
 import {
   HEALTHY_TICK_OUTCOMES,
-  readScheduleEntries,
+  SCHEDULE_WINDOW_LIMIT,
   resolveScheduleState,
   tickDeadlineMs,
   unreviewedInFlightTick,
@@ -148,10 +148,13 @@ rule the tick refuses on. Exits 0 when the next tick would hold a live authoriza
 loud failure.
 
 RESUME (attended): clears a HALTED schedule after an operator has reviewed the campaign,
-with the standard [Y/n] confirmation. Resuming appends an operator acknowledgment to the
-tick journal and grants NOTHING else — the next tick still validates the authorization,
-the publication evidence, and the escalation latch in full. A schedule that is not
-halted has nothing to resume (exit 2, no write).
+with the standard [Y/n] confirmation. The acknowledgment is CONDITIONAL: it commits only
+while the journal frontier still equals the exact state the review read — a tick that
+begins meanwhile refuses the resume (exit 2, nothing written; review again) — and it
+refuses outright while an in-flight tick's outcome is still pending. Resuming grants
+NOTHING else: the next tick still validates the authorization, the publication evidence,
+and the escalation latch in full. A schedule that is not halted has nothing to resume
+(exit 2, no write).
 
 STOP: revokes the authorization. The next tick fires nothing.
 
@@ -645,7 +648,7 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
     // halted tick writes no journal entry and touches no campaign state — its refusal is
     // derived, so repeated cron firings cannot bury the entry that needs review. A
     // journal read failure propagates (loud exit 1, never read as clear).
-    const journalEntries = await readScheduleEntries(tickJournal, booted.cohortId);
+    const { entries: journalEntries } = await tickJournal.scheduleWindow(booted.cohortId, HEALTHY_TICK_OUTCOMES);
     const schedule = resolveScheduleState({
       entries: journalEntries,
       nowMs: deps.now(),
@@ -881,10 +884,11 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
       );
     }
 
-    // The per-tick half of the monitoring surface: the durable journal, and the schedule
-    // state evaluated by the SAME pure rule the tick refuses on.
-    const journalEntries = await readScheduleEntries(tickJournal, booted.cohortId);
-    const lastTick = journalEntries.find((entry) => entry.kind === 'tick');
+    // The per-tick half of the monitoring surface: a bounded newest-first read for the
+    // DISPLAY line, and the authoritative schedule window for the SAME pure rule the tick
+    // refuses on (the display read is deliberately not the halt authority).
+    const recentEntries = await tickJournal.entries(booted.cohortId, SCHEDULE_WINDOW_LIMIT);
+    const lastTick = recentEntries.find((entry) => entry.kind === 'tick');
     if (lastTick === undefined) {
       printLine('  ticks  none recorded');
     } else if (lastTick.finishedAt === null) {
@@ -895,8 +899,9 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
           `(${String(lastTick.outcome)})`,
       );
     }
+    const { entries: windowEntries } = await tickJournal.scheduleWindow(booted.cohortId, HEALTHY_TICK_OUTCOMES);
     const schedule = resolveScheduleState({
-      entries: journalEntries,
+      entries: windowEntries,
       nowMs: deps.now(),
       deadlineMs: tickDeadlineMs(booted.manifest),
       healthyOutcomes: HEALTHY_TICK_OUTCOMES,
@@ -967,7 +972,7 @@ export async function resumeCampaign(options: CampaignOptions, deps: CampaignDep
   }
   const { tickJournal, close } = await deps.openStore(databaseUrl);
   try {
-    const journalEntries = await readScheduleEntries(tickJournal, booted.cohortId);
+    const { frontierId, entries: journalEntries } = await tickJournal.scheduleWindow(booted.cohortId, HEALTHY_TICK_OUTCOMES);
     const deadlineMs = tickDeadlineMs(booted.manifest);
     const schedule = resolveScheduleState({
       entries: journalEntries,
@@ -1010,7 +1015,18 @@ export async function resumeCampaign(options: CampaignOptions, deps: CampaignDep
       printError(`resume refused (answer ${JSON.stringify(answer)}); Enter or 'y' proceeds`);
       return 2;
     }
-    await tickJournal.resume(booted.cohortId, new Date(deps.now()).toISOString(), schedule.why);
+    // The CONDITIONAL append: commits only while the journal frontier still equals the
+    // exact frontier this review read. Any tick that began (or finished, or any other
+    // resume) in the meantime moves the frontier — nothing is written, and the operator
+    // reviews the new state instead of silently bounding it out of the halt window.
+    const outcome = await tickJournal.resume(booted.cohortId, new Date(deps.now()).toISOString(), schedule.why, frontierId);
+    if (outcome === 'frontier_moved') {
+      printError(
+        'refusing to resume: the journal advanced while you were reviewing — nothing was written. ' +
+          'Run campaign:resume again to review the current state.',
+      );
+      return 2;
+    }
     printLine('RESUMED. the schedule halt is cleared; the next tick validates in full before anything else.');
     return 0;
   } finally {

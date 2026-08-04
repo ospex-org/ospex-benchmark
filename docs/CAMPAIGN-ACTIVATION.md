@@ -142,10 +142,12 @@ the admission is refused and no provider call is reachable.
   passes the tick deadline — failing toward review. The
   healthy set in this build is exactly the structural refusal (`validated_refused`); the
   flip replaces it with the real dispatched outcome, landed together with the flip.
-  Stated bounds: the halt evaluation reads the most recent 50 journal entries since the
-  last operator resume PLUS every unfinished tick entry (a dedicated read, so a fast cron
-  cadence cannot push a not-yet-stale crash out of view; the escalation latch remains the
-  money backstop for anything the window cannot see). A tick that fails before its begin
+  Stated bounds: the halt evaluation's input is read in ONE snapshot, anchored at the
+  durable latest-resume boundary — the boundary row itself, EVERY unfinished tick after
+  it, and EVERY non-healthy finished tick after it, with deliberately no row limit: a
+  newest-N sample of the raw journal cannot authoritatively decide that no unreviewed
+  halt cause exists, so the bounded newest-first read serves display only (the escalation
+  latch remains the independent money backstop). A tick that fails before its begin
   entry leaves no journal trace: for store-class failures such a tick can reach no
   dispatch either (every dispatch path needs the same store it could not reach), and the
   pre-store configuration refusals — an unusable or all-zeros publication descriptor —
@@ -155,7 +157,11 @@ the admission is refused and no provider call is reachable.
 - **Resuming is attended.** `campaign:resume` clears a halted schedule with the standard
   `[Y/n]` confirmation, appending an operator-acknowledgment entry that bounds the halt
   window. It refuses while an in-flight tick's outcome is still pending — a resume would
-  bound that entry out of the halt window before it could ever be reviewed — and it
+  bound that entry out of the halt window before it could ever be reviewed — and the
+  append itself is CONDITIONAL: it commits only while the journal frontier still equals
+  the exact frontier the review read (tick begin and resume serialize on one per-cohort
+  lock), so a tick beginning during the attended prompt refuses the acknowledgment
+  instead of being silently bounded out. It
   grants nothing else: the next tick still validates the authorization, the publication
   evidence, and the escalation latch in full. A schedule that is not halted has nothing
   to resume.
