@@ -96,7 +96,9 @@ authorization (armed/disarmed/expired and its instants), calls reserved vs cap a
 attempts actually started, money as labeled RESERVATIONS (not invoices) plus an
 estimated invoice at the observed per-attempt rate, fires/claims/active leases — and
 the verdict the NEXT tick would reach, including a fresh credential observation.
-Performs no write of any kind. Exits 0 when the next tick would hold a live
+Performs no write of any kind: it opens its own connection with NO schema bootstrap and
+a server-enforced read-only session (a read-only role suffices to run it), so schema
+ownership stays with the mutating commands. Exits 0 when the next tick would hold a live
 authorization (which in this build still refuses to dispatch, exit 3), 2 when it would
 refuse, 1 on a loud failure. Per-tick observations (when the last tick ran, deferrals
 by reason) require the scheduler's durable journal and land with the activation slice.
@@ -223,8 +225,18 @@ const ACTIVATION_DISABLED =
 // ---------------------------------------------------------------------------
 
 export interface CampaignDeps {
+  /** The MUTATING open: applies the idempotent schema/function bootstrap and constructs the
+   *  full store. Owned by the commands that are allowed to write (arm, tick, stop). */
   readonly openStore: (databaseUrl: string) => Promise<{
     store: AtomicStore;
+    authorizations: CampaignAuthorizationPort;
+    close: () => Promise<void>;
+  }>;
+  /** The READ-ONLY open for the status surface: constructs only the read ports, applies NO
+   *  schema/function bootstrap, and (in production) forces the session read-only at the
+   *  server — so `status` structurally cannot write: its seam carries no store, and even a
+   *  regression that smuggled a statement through would be refused by PostgreSQL itself. */
+  readonly openReads: (databaseUrl: string) => Promise<{
     authorizations: CampaignAuthorizationPort;
     statusReads: CampaignStatusReadPort;
     close: () => Promise<void>;
@@ -582,7 +594,10 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
     printError('status needs STORE_DATABASE_URL');
     return 2;
   }
-  const { authorizations, statusReads, close } = await deps.openStore(databaseUrl);
+  // The READ-ONLY open: no schema bootstrap, no store, and (in production) a server-enforced
+  // read-only session. A status read against a database whose schema was never applied fails
+  // loudly — bootstrap belongs to the mutating commands, never to monitoring.
+  const { authorizations, statusReads, close } = await deps.openReads(databaseUrl);
   try {
     const manifest = booted.manifest;
     const projection = projectCampaignCost(manifest);
@@ -713,7 +728,6 @@ const PRODUCTION_DEPS: CampaignDeps = {
     const { Pool } = await import('pg');
     const { SqlAtomicStore, pgStoreQuery } = await import('./store/atomicStore.js');
     const { SqlCampaignAuthorizationPort } = await import('./store/campaignAuthStore.js');
-    const { SqlCampaignStatusReadPort } = await import('./store/campaignStatusRead.js');
     const pool = new Pool({ connectionString: databaseUrl });
     try {
       const { readFileSync: read } = await import('node:fs');
@@ -726,6 +740,21 @@ const PRODUCTION_DEPS: CampaignDeps = {
     const query = pgStoreQuery(pool);
     return {
       store: new SqlAtomicStore(query),
+      authorizations: new SqlCampaignAuthorizationPort(query),
+      close: () => pool.end(),
+    };
+  },
+  openReads: async (databaseUrl) => {
+    const { Pool } = await import('pg');
+    const { pgStoreQuery } = await import('./store/atomicStore.js');
+    const { SqlCampaignAuthorizationPort } = await import('./store/campaignAuthStore.js');
+    const { SqlCampaignStatusReadPort } = await import('./store/campaignStatusRead.js');
+    // NO schema/function bootstrap here — a monitoring read must not mutate catalog state —
+    // and the session itself is forced read-only at the SERVER, so even a statement smuggled
+    // through this path in the future is refused by PostgreSQL rather than trusted to prose.
+    const pool = new Pool({ connectionString: databaseUrl, options: '-c default_transaction_read_only=on' });
+    const query = pgStoreQuery(pool);
+    return {
       authorizations: new SqlCampaignAuthorizationPort(query),
       statusReads: new SqlCampaignStatusReadPort(query),
       close: () => pool.end(),

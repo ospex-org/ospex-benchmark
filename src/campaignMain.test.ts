@@ -135,18 +135,26 @@ class FakeStatusReads implements CampaignStatusReadPort {
 
 function deps(
   over: Partial<CampaignDeps> & { auth?: MemoryAuthPort } = {},
-): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[]; statusReads: FakeStatusReads } {
+): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[]; statusReads: FakeStatusReads; opens: { store: number; reads: number } } {
   const auth = over.auth ?? new MemoryAuthPort();
   const storeCalls: string[] = [];
   const statusReads = new FakeStatusReads();
+  const opens = { store: 0, reads: 0 };
   const base: CampaignDeps = {
-    openStore: async () => ({ store: recordingStore(storeCalls), authorizations: auth, statusReads, close: async () => {} }),
+    openStore: async () => {
+      opens.store += 1;
+      return { store: recordingStore(storeCalls), authorizations: auth, close: async () => {} };
+    },
+    openReads: async () => {
+      opens.reads += 1;
+      return { authorizations: auth, statusReads, close: async () => {} };
+    },
     observeCredentials: (ids) => new Map(ids.map((id) => [id, true])),
     confirm: async () => 'y',
     now: () => NOW,
     ...over,
   };
-  return { ...base, auth, storeCalls, statusReads };
+  return { ...base, auth, storeCalls, statusReads, opens };
 }
 
 function options(over: Record<string, unknown> = {}): Parameters<typeof armCampaign>[0] {
@@ -750,7 +758,7 @@ test('AUTHORITY ORDER: the manifest is on disk and byte-exact BEFORE the budget 
       throw new Error('unreached');
     },
   };
-  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, statusReads: new FakeStatusReads(), close: async () => {} }) });
+  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, close: async () => {} }) });
   const { value: code } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
   assert.equal(code, 0);
   assert.deepEqual(
@@ -812,7 +820,7 @@ test('a budget-init refusal fails BEFORE the authorizing step: exit 1, no author
       throw new Error('unreached');
     },
   };
-  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, statusReads: new FakeStatusReads(), close: async () => {} }) });
+  const d = deps({ auth, openStore: async () => ({ store, authorizations: auth, close: async () => {} }) });
   const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(opts, d)));
   assert.equal(code, 1);
   assert.match(errors.join('\n'), /NO standing authority was created/);
@@ -897,15 +905,19 @@ const FAILING_CLOSE = async (): Promise<void> => {
   throw new Error('simulated close failure');
 };
 
-/** deps whose store close ALWAYS rejects; the decided outcome must stand anyway. */
+/** deps whose store AND read closes ALWAYS reject; the decided outcome must stand anyway. */
 function depsWithFailingClose(
   over: Partial<CampaignDeps> & { auth?: MemoryAuthPort } = {},
-): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[]; statusReads: FakeStatusReads } {
+): ReturnType<typeof deps> {
   const base = deps(over);
   return {
     ...base,
     openStore: async () => {
       const opened = await base.openStore('unused');
+      return { ...opened, close: FAILING_CLOSE };
+    },
+    openReads: async () => {
+      const opened = await base.openReads('unused');
       return { ...opened, close: FAILING_CLOSE };
     },
   };
@@ -928,7 +940,7 @@ test('a PRE-AUTHORITY failure keeps its primary error through a close failure', 
     ...recordingStore(storeCalls),
     initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
   };
-  const d = deps({ auth, openStore: async () => ({ store: refusingStore, authorizations: auth, statusReads: new FakeStatusReads(), close: FAILING_CLOSE }) });
+  const d = deps({ auth, openStore: async () => ({ store: refusingStore, authorizations: auth, close: FAILING_CLOSE }) });
   const { value: code, errors } = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d)));
   assert.equal(code, 1);
   const output = errors.join('\n');
@@ -1049,16 +1061,20 @@ const rejectWith = (value: unknown) => async (): Promise<void> => {
   throw value;
 };
 
-/** deps whose store close rejects with `value`; everything else is the normal fake. */
+/** deps whose store AND read closes reject with `value`; everything else is the normal fake. */
 function depsWithHostileClose(
   value: unknown,
   over: Partial<CampaignDeps> & { auth?: MemoryAuthPort } = {},
-): CampaignDeps & { auth: MemoryAuthPort; storeCalls: string[]; statusReads: FakeStatusReads } {
+): ReturnType<typeof deps> {
   const base = deps(over);
   return {
     ...base,
     openStore: async () => {
       const opened = await base.openStore('unused');
+      return { ...opened, close: rejectWith(value) };
+    },
+    openReads: async () => {
+      const opened = await base.openReads('unused');
       return { ...opened, close: rejectWith(value) };
     },
   };
@@ -1145,7 +1161,7 @@ test('PRE-AUTHORITY failures keep their classification under hostile values: row
       ...recordingStore(storeCalls1),
       initCohortBudget: async () => ({ outcome: 'refused' as const, reason: 'config_mismatch' as const }),
     };
-    const d1 = deps({ auth: auth1, openStore: async () => ({ store: refusing, authorizations: auth1, statusReads: new FakeStatusReads(), close: rejectWith(value) }) });
+    const d1 = deps({ auth: auth1, openStore: async () => ({ store: refusing, authorizations: auth1, close: rejectWith(value) }) });
     const r1 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d1)));
     assert.equal(r1.value, 1, `${label} (hostile close): pre-authority failure resolves 1`);
     assert.match(r1.errors.join('\n'), /NO standing authority was created/, label);
@@ -1160,7 +1176,7 @@ test('PRE-AUTHORITY failures keep their classification under hostile values: row
         throw value;
       },
     };
-    const d2 = deps({ auth: auth2, openStore: async () => ({ store: hostileInit, authorizations: auth2, statusReads: new FakeStatusReads(), close: rejectWith(value) }) });
+    const d2 = deps({ auth: auth2, openStore: async () => ({ store: hostileInit, authorizations: auth2, close: rejectWith(value) }) });
     const r2 = await captured(() => withEnv(SYNTHETIC_ENV, () => armCampaign(options(), d2)));
     assert.equal(r2.value, 1, `${label} (hostile primary + hostile close): still resolves 1`);
     assert.match(r2.errors.join('\n'), /NO standing authority was created/, label);
@@ -1324,12 +1340,16 @@ test('status with NO armed campaign: exit 2, NOT ARMED, never-armed budget note,
   assert.deepEqual(d.auth.calls, [`read:${cohortId}`], 'the only authorization interaction is the read');
   assert.deepEqual(d.storeCalls, [], 'no budget init, no dispatch-path store call');
   assert.deepEqual(d.statusReads.calls, [`budget:${cohortId}`], 'fires are not read when no budget exists');
+  assert.deepEqual(d.opens, { store: 0, reads: 1 }, 'the mutating open is never touched by status');
 });
 
 test('status of a LIVE campaign: exit 0 and the full durable report, with reservations labeled and the estimate honest', async () => {
   const { manifestPath, auth, cohortId } = await armed();
   auth.calls.length = 0; // observe only the status call's interactions
   const d = deps({ auth, confirm: NEVER_PROMPT });
+  // Every count is PAIRWISE DISTINCT, so swapping ANY two rendered slots changes the
+  // output — a symmetric fixture once let a completed/pending swap survive as
+  // output-equivalent, which is exactly the wrong-monitoring-data class this test owns.
   d.statusReads.budgetValue = {
     callCap: 800,
     callsReserved: 16,
@@ -1337,12 +1357,12 @@ test('status of a LIVE campaign: exit 0 and the full durable report, with reserv
     spendReservedUsdMicros: 1_600_000_000,
   };
   d.statusReads.firesValue = {
-    firesAdmitted: 2,
+    firesAdmitted: 3,
     firesCompleted: 1,
-    firesPending: 1,
+    firesPending: 2,
     callsMade: 9,
-    claimsPending: 1,
-    claimsCompleted: 3,
+    claimsPending: 5,
+    claimsCompleted: 6,
     activeLeases: 4,
     lastAdmittedAt: '2026-08-05T12:00:00.000Z',
   };
@@ -1357,12 +1377,17 @@ test('status of a LIVE campaign: exit 0 and the full durable report, with reserv
   assert.match(output, /reservations \$1600\.00 of \$80000\.00 cap/);
   assert.match(output, /NOT invoices/, 'reservations are never presented as money spent');
   assert.match(output, /≈ \$0\.42 expected invoice for the started attempts at the observed rate \(an estimate\)/);
-  assert.match(output, /fires {2}2 admitted \(1 completed, 1 pending\); claims 3 completed, 1 pending; 4 active lease\(s\)/);
+  assert.match(
+    output,
+    /fires {2}3 admitted \(1 completed, 2 pending\); claims 6 completed, 5 pending; 4 active lease\(s\)/,
+    'the exact labeled slots — a swapped pair cannot render this line',
+  );
   assert.match(output, /last {3}fire admitted 2026-08-05T12:00:00\.000Z/);
   assert.match(output, /next tick would AUTHORIZE/);
   assert.match(output, /activation is structurally disabled/, 'a LIVE report must never read as "spending"');
   assert.deepEqual(d.auth.calls, [`read:${cohortId}`]);
   assert.deepEqual(d.storeCalls, [], 'status performs no store write');
+  assert.deepEqual(d.opens, { store: 0, reads: 1 }, 'status opens ONLY the read-only path — never the bootstrapping store');
 });
 
 test('status of a DISARMED and of an EXPIRED campaign: exit 2 with the dead state named', async () => {

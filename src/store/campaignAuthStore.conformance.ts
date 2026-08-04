@@ -13,9 +13,17 @@
  * (defaults to the spike's local Docker Postgres).
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Pool } from 'pg';
 import { sha256Hex } from '../canonical.js';
+import { buildCampaignAuthorization } from '../campaignAuthorization.js';
+import { buildCampaignManifest } from '../campaignProfile.js';
+import { buildCohortBudgetInitRequest } from '../cohortBudgetInit.js';
+import { cohortBoot } from '../cohortBoot.js';
 import { SqlAtomicStore, pgStoreQuery } from './atomicStore.js';
 import { SqlCampaignAuthorizationPort } from './campaignAuthStore.js';
 import { SqlCampaignStatusReadPort } from './campaignStatusRead.js';
@@ -212,6 +220,75 @@ async function main(): Promise<void> {
     const after = await reads.fires(c);
     assert.equal(after.firesCompleted, 1);
     assert.equal(after.claimsCompleted, 1);
+  });
+
+  await check('READ-ONLY public CLI: campaign:status runs as a SELECT-only role and rewrites NO catalog state', async () => {
+    // Arm a real campaign via the admin ports: manifest → budget → authorization.
+    const startMs = Date.now();
+    const weekMs = 7 * 24 * 3_600_000;
+    const built = buildCampaignManifest(startMs, { callCap: 800, windowForwardMs: weekMs });
+    const booted = cohortBoot({ manifestBytes: built.bytes });
+    const store = new SqlAtomicStore(pgStoreQuery(pool));
+    assert.deepEqual(await store.initCohortBudget(buildCohortBudgetInitRequest(booted)), { outcome: 'initialized' });
+    const roster = booted.manifest.expectedArmRoster.map((arm) => arm.participantId);
+    assert.equal(
+      await port.arm(
+        buildCampaignAuthorization({
+          booted,
+          observedCredentialedParticipantIds: roster,
+          armedAtMs: startMs,
+          expiresAtMs: startMs + weekMs,
+        }),
+      ),
+      'armed',
+    );
+    const manifestPath = join(mkdtempSync(join(tmpdir(), 'campaign-ro-status-')), 'manifest.json');
+    writeFileSync(manifestPath, built.bytes);
+
+    // A SELECT-only role: it cannot create schemas, tables, or functions — the exact
+    // capability the monitoring read must not need.
+    await pool.query('drop role if exists campaign_status_ro');
+    await pool.query("create role campaign_status_ro login password 'ro-conformance'");
+    await pool.query('grant usage on schema store to campaign_status_ro');
+    await pool.query('grant select on all tables in schema store to campaign_status_ro');
+    const roUrl = new URL(DATABASE_URL);
+    roUrl.username = 'campaign_status_ro';
+    roUrl.password = 'ro-conformance';
+
+    // Fingerprint the store-function catalog rows (oid:xmin): any CREATE OR REPLACE — even
+    // one that re-installs identical source — rewrites a row and changes this string.
+    const fingerprint = async (): Promise<string> => {
+      const { rows } = await pool.query(
+        `select coalesce(string_agg(p.oid::text || ':' || p.xmin::text, ',' order by p.oid), '') as fp
+           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+          where n.nspname = 'store'`,
+      );
+      return String(rows[0]!.fp);
+    };
+    const before = await fingerprint();
+
+    // The REAL public CLI, as the read-only role, real argv/stdin.
+    const cliPath = fileURLToPath(new URL('../campaignMain.ts', import.meta.url));
+    const result = spawnSync(process.execPath, ['--import', 'tsx', cliPath, 'status', '--manifest', manifestPath], {
+      cwd: dirname(dirname(cliPath)),
+      encoding: 'utf8',
+      timeout: 120_000,
+      input: '',
+      env: {
+        ...process.env,
+        STORE_DATABASE_URL: roUrl.toString(),
+        OPENAI_API_KEY: 'synthetic-test-credential',
+        ANTHROPIC_API_KEY: 'synthetic-test-credential',
+        GEMINI_API_KEY: 'synthetic-test-credential',
+        GOOGLE_API_KEY: '',
+        XAI_API_KEY: 'synthetic-test-credential',
+      },
+    });
+    const out = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+    assert.equal(result.status, 0, `the read-only role renders the live report and exits 0; out=${out}`);
+    assert.ok(out.includes('authorization LIVE'), `the report rendered; out=${out}`);
+    assert.ok(out.includes('next tick would AUTHORIZE'), `the verdict rendered; out=${out}`);
+    assert.equal(await fingerprint(), before, 'the monitoring read rewrote NO store-function catalog row');
   });
 
   await pool.end();
