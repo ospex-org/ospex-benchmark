@@ -152,6 +152,9 @@ function deps(
     observeCredentials: (ids) => new Map(ids.map((id) => [id, true])),
     confirm: async () => 'y',
     now: () => NOW,
+    resolvePublication: async () => {
+      throw new Error('no publication resolution was expected in this test');
+    },
     ...over,
   };
   return { ...base, auth, storeCalls, statusReads, opens };
@@ -168,6 +171,7 @@ function options(over: Record<string, unknown> = {}): Parameters<typeof armCampa
     dispatches: 1,
     manifestPath: null,
     emitPath: join(mkdtempSync(join(tmpdir(), 'campaign-')), 'campaign-manifest.json'),
+    publicationPath: null,
     ...over,
   } as Parameters<typeof armCampaign>[0];
 }
@@ -1496,6 +1500,140 @@ test('status outcomes survive close failures — normal and hostile alike', asyn
 });
 
 // ===========================================================================
+// tick — public-Git publication evidence (verified when supplied; required at activation)
+// ===========================================================================
+
+const PUBLICATION_SHA = 'ab'.repeat(20);
+
+/** Write a strict descriptor file beside the campaign fixtures and return its path. */
+function publicationFile(over: Record<string, unknown> = {}): string {
+  const path = join(mkdtempSync(join(tmpdir(), 'campaign-publication-')), 'publication.json');
+  writeFileSync(
+    path,
+    JSON.stringify({
+      repositoryOwner: 'ospex-org',
+      repositoryName: 'ospex-benchmark',
+      path: 'manifests/campaign.json',
+      commitSha: PUBLICATION_SHA,
+      ...over,
+    }),
+  );
+  return path;
+}
+
+/** A resolver fixture that publishes the EXACT local manifest bytes at a compliant instant
+ *  (strictly before the fixture manifest's windowStart, which is NOW - 1h). */
+function publishedResolver(manifestPath: string, over: { bytes?: Buffer; committedAt?: string } = {}) {
+  const calls: unknown[] = [];
+  const resolve = async (publication: unknown): Promise<{ blobBytes: Uint8Array; committerTimestamp: string }> => {
+    calls.push(publication);
+    return {
+      blobBytes: new Uint8Array(over.bytes ?? readFileSync(manifestPath)),
+      committerTimestamp: over.committedAt ?? new Date(NOW - 2 * 3_600_000).toISOString(),
+    };
+  };
+  return { resolve, calls };
+}
+
+test('a tick with VERIFIED publication evidence still refuses activation (exit 3) and names the commit', async () => {
+  const { manifestPath, auth } = await armed();
+  const resolver = publishedResolver(manifestPath);
+  const d = deps({ auth, confirm: NEVER_PROMPT, resolvePublication: resolver.resolve });
+  const publicationPath = publicationFile();
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath, publicationPath }), d)),
+  );
+  assert.equal(code, 3, 'verified evidence does not activate anything — the structural refusal stands');
+  const output = logs.join('\n');
+  assert.match(output, /publication evidence VERIFIED/);
+  assert.match(output, new RegExp(`@ ${PUBLICATION_SHA}`));
+  assert.equal(resolver.calls.length, 1, 'exactly one resolution');
+  assert.deepEqual(resolver.calls[0], {
+    repositoryOwner: 'ospex-org',
+    repositoryName: 'ospex-benchmark',
+    path: 'manifests/campaign.json',
+    commitSha: PUBLICATION_SHA,
+  });
+});
+
+test('the ALL-ZEROS rehearsal commit is refused STRUCTURALLY — before any resolution is attempted', async () => {
+  const { manifestPath, auth } = await armed();
+  auth.calls.length = 0; // observe only the tick's interactions
+  const d = deps({ auth, confirm: NEVER_PROMPT }); // the default resolver THROWS if ever called
+  const publicationPath = publicationFile({ commitSha: '0'.repeat(40) });
+  const { value: code, errors } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath, publicationPath }), d)),
+  );
+  assert.equal(code, 2);
+  assert.match(errors.join('\n'), /rehearsal commit/);
+  assert.deepEqual(d.auth.calls, [], 'refused before any authorization read');
+});
+
+test('publication failures REFUSE the tick before authorization: byte mismatch, late committer, resolver failure', async () => {
+  const cases: Array<{ label: string; resolver: (manifestPath: string) => { resolve: CampaignDeps['resolvePublication'] }; expect: RegExp }> = [
+    {
+      label: 'published blob differs from the local manifest',
+      resolver: (m) => publishedResolver(m, { bytes: Buffer.from('{"someone":"else"}', 'utf8') }),
+      expect: /differ from the local manifest bytes/,
+    },
+    {
+      label: 'committer not strictly before windowStart',
+      resolver: (m) => publishedResolver(m, { committedAt: new Date(NOW - 3_600_000).toISOString() }),
+      expect: /not strictly before windowStart/,
+    },
+    {
+      label: 'resolver failure (network)',
+      resolver: () => ({
+        resolve: async () => {
+          throw new Error('getaddrinfo ENOTFOUND api.github.com');
+        },
+      }),
+      expect: /resolve failed|ENOTFOUND/,
+    },
+  ];
+  for (const { label, resolver, expect } of cases) {
+    const { manifestPath, auth } = await armed();
+    const d = deps({ auth, confirm: NEVER_PROMPT, resolvePublication: resolver(manifestPath).resolve });
+    const publicationPath = publicationFile();
+    const { value: code, errors } = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath, publicationPath }), d)),
+    );
+    assert.equal(code, 2, label);
+    const output = errors.join('\n');
+    assert.match(output, /publication evidence REFUSED/, label);
+    assert.match(output, expect, label);
+    assert.deepEqual(auth.calls.filter((c) => c.startsWith('read:')), [], `${label}: never reached the authorization`);
+  }
+});
+
+test('an unusable descriptor file refuses: missing, malformed JSON, or an off-schema shape', async () => {
+  const { manifestPath, auth } = await armed();
+  const missing = join(mkdtempSync(join(tmpdir(), 'campaign-pub-missing-')), 'nope.json');
+  const malformed = publicationFile();
+  writeFileSync(malformed, '{not json');
+  const shortSha = publicationFile({ commitSha: 'abc123' });
+  const traversal = publicationFile({ path: '../main/package.json' }); // the sha-pin bypass class
+  for (const publicationPath of [missing, malformed, shortSha, traversal]) {
+    const d = deps({ auth, confirm: NEVER_PROMPT });
+    const { value: code, errors } = await captured(() =>
+      withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath, publicationPath }), d)),
+    );
+    assert.equal(code, 2, publicationPath);
+    assert.match(errors.join('\n'), /publication descriptor .* is unusable/, publicationPath);
+  }
+});
+
+test('without --publication the tick states the evidence is NOT CONFIGURED and proceeds to the structural refusal', async () => {
+  const { manifestPath, auth } = await armed();
+  const d = deps({ auth, confirm: NEVER_PROMPT });
+  const { value: code, logs } = await captured(() =>
+    withEnv(SYNTHETIC_ENV, () => tickCampaign(options({ command: 'tick', manifestPath }), d)),
+  );
+  assert.equal(code, 3);
+  assert.match(logs.join('\n'), /publication evidence NOT CONFIGURED .* required before activation/);
+});
+
+// ===========================================================================
 // stop
 // ===========================================================================
 
@@ -1636,6 +1774,25 @@ test('spawned CLI: --help names the status command and its read-only contract', 
   assert.ok(out.includes('campaign:status'), `the status command is listed; out=${out}`);
   assert.ok(/STATUS \(read-only/.test(out), `the read-only contract is stated; out=${out}`);
   assert.ok(/NOT invoices/.test(out.replace(/\n/g, ' ')) || /RESERVATIONS \(not invoices\)/.test(out), `the reservations caveat is stated; out=${out}`);
+});
+
+test('spawned CLI: tick with an unusable --publication refuses (exit 2) before touching anything, and --help names the flag', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'campaign-cli-pub-'));
+  const manifestPath = join(dir, 'manifest.json');
+  const { bytes } = buildCampaignManifest(Date.parse('2027-01-01T00:00:00Z'), { callCap: 800, windowForwardMs: WEEK_MS });
+  writeFileSync(manifestPath, bytes);
+  const { status, out } = runCli(
+    ['tick', '--manifest', manifestPath, '--publication', join(dir, 'missing-descriptor.json')],
+    PROBE_ENV,
+    '',
+  );
+  assert.equal(status, 2, `an unusable descriptor refuses; out=${out}`);
+  assert.ok(/publication descriptor .* is unusable/.test(out), `the refusal names the descriptor; out=${out}`);
+  assert.ok(!/ECONNREFUSED/i.test(out), `refused before the store was ever dialed; out=${out}`);
+
+  const help = runCli(['--help'], PROBE_ENV, '');
+  assert.equal(help.status, 0);
+  assert.ok(help.out.includes('--publication'), `the flag is documented; out=${help.out}`);
 });
 
 test('spawned CLI: status against an unreachable store fails LOUD (exit 1), never prompts, never writes', () => {

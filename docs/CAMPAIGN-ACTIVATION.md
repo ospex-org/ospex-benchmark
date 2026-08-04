@@ -39,12 +39,13 @@ the refusal is not a flag, it is the absence of the paid path from the entrypoin
 ### 1. Real publication evidence
 
 The cohort runner requires a `PublicationVerified` record binding the manifest bytes to a
-public-Git precommitment. The only resolver in the tree today is the **rehearsal
-self-resolver**, which supplies an all-zeros commit SHA, a synthetic path, and a manufactured
-committer timestamp. That is honest for a zero-spend rehearsal and for the single attended
-crossing fire (where a human read the terms of that exact invocation), and it is **not
-acceptable evidence for a recurring unattended paid path**: it would let every scheduled fire
-carry publication-shaped evidence no public lookup ever produced.
+public-Git precommitment. For rehearsals the tree carries the **rehearsal self-resolver**,
+which supplies an all-zeros commit SHA, a synthetic path, and a manufactured committer
+timestamp. That is honest for a zero-spend rehearsal and for the single attended crossing
+fire (where a human read the terms of that exact invocation), and it is **not acceptable
+evidence for a recurring unattended paid path**: it would let every scheduled fire carry
+publication-shaped evidence no public lookup ever produced. The real resolver now exists —
+see the status note below.
 
 Before activation, a scheduled tick must:
 
@@ -54,6 +55,21 @@ Before activation, a scheduled tick must:
   the committer-timestamp-before-`windowStart` rule;
 - **reject the zero/synthetic rehearsal descriptor with zero provider calls**, proven by
   negative tests at both the unit and public-CLI level.
+
+**Status of this piece:** the machinery exists and is wired, verification-first. The
+concrete resolver (`GitHubPublicationResolver`) reads the committer instant from the
+commits endpoint with a sha-echo substitution guard and the exact blob bytes from the raw
+host, defends the commit pin against URL canonicalization (only canonical
+repository-relative paths — no dot segments, absolute forms, backslash/control/percent
+ambiguity — may form a URL, and the effective normalized URL is asserted to still carry
+the `/{owner}/{repo}/{commitSha}/` prefix), holds one deadline across headers AND complete
+body consumption so a stalled response refuses rather than hangs, and bounds accepted
+response sizes. It feeds the pure `verifyPublication` core, and
+`campaign:tick --publication <descriptor.json>` verifies the precommitment before its
+authorization validation: any failure — including a network failure or the all-zeros
+rehearsal commit, which is rejected structurally before any resolution — refuses the tick.
+What remains for activation is exactly one tightening: the descriptor becomes **required**
+(a tick without one refuses instead of reporting "not configured").
 
 ### 2. A durable escalation latch
 
