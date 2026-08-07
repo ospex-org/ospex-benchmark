@@ -658,6 +658,7 @@ function responseSchemaVersionForRun(promptScaffoldVersion: string | null): Resp
     'shadow-smoke-v0.2': 1,
     'shadow-smoke-v0.3': 1,
     'shadow-smoke-v0.4': 2,
+    'shadow-smoke-v0.5': 2,
   };
   return byScaffold[promptScaffoldVersion] ?? CURRENT_RESPONSE_SCHEMA_VERSION;
 }

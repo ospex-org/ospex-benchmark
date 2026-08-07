@@ -13,7 +13,10 @@ import type { PreparedGameRequest } from './preparedRequest.js';
 // interpretable), response schema v2 adds the per-forecast axes / primaryAxis /
 // primaryExpectation fields, and declared provider web search replaces the
 // former no-search prohibition.
-export const PROMPT_SCAFFOLD_VERSION = 'shadow-smoke-v0.4';
+// v0.5: ASCII apostrophes replace the three U+2019 the source document carried,
+// and `primaryExpectation` is always required — with no driver it states that
+// no material movement is expected (the prompt's own instruction), never null.
+export const PROMPT_SCAFFOLD_VERSION = 'shadow-smoke-v0.5';
 
 /**
  * System prompt, VERBATIM from docs/BENCHMARK_PROMPT_V0.md ("System prompt
@@ -21,7 +24,7 @@ export const PROMPT_SCAFFOLD_VERSION = 'shadow-smoke-v0.4';
  */
 export const SYSTEM_PROMPT = `You are one participant in a preregistered sports-market decision benchmark running through Ospex.
 
-Your goal is to beat the close. Beating the close is predicting line movement, not outcomes. Only things the market isn’t potentially pricing in correctly carry weight.
+Your goal is to beat the close. Beating the close is predicting line movement, not outcomes. Only things the market isn't potentially pricing in correctly carry weight.
 
 A causal decomposition of line movement, in five axes:
 
@@ -38,7 +41,7 @@ News: a number moves because information arrives.
 News is the knowledge of the probability and likelihood of an event occurring or a change in potential rosters, lineups or player injury status. Though these things cannot be predicted, the chance of these impacting the price is very real, and relevant movement related to which players are expected to be playing in the game, and how much, may not be appropriately represented in current odds.
 
 Softness: a number moves because it was never firmly set.
-Softness is the knowledge of a number’s room to move, regardless of why. Not every line is equally defended, as a nationally televised game will have a more precise opener than a game involving teams outside the normal rotation, such as an Ivy League football matchup. Softness is the one axis that’s market-structural rather than sport-analytical and can also be quantified as a measure of difficulty and opportunity.
+Softness is the knowledge of a number's room to move, regardless of why. Not every line is equally defended, as a nationally televised game will have a more precise opener than a game involving teams outside the normal rotation, such as an Ivy League football matchup. Softness is the one axis that's market-structural rather than sport-analytical and can also be quantified as a measure of difficulty and opportunity.
 
 Valuation is fundamental disagreement, trend is momentum, consensus is flow, news is catalyst timing, softness is liquidity and attention.
 
@@ -101,7 +104,7 @@ export const TEMPLATE_PLACEHOLDERS: Record<string, string> = {
   'games[].forecasts[].primaryAxis':
     '<null | "valuation" | "trend" | "consensus" | "news" | "softness">',
   'games[].forecasts[].primaryExpectation':
-    '<"one sentence on the primary axis", or null>',
+    '"<one sentence on the primary axis, or that you expect no material movement>"',
 };
 
 export const RESPONSE_TEMPLATE = renderResponseTemplate(
@@ -131,7 +134,7 @@ Output contract:
 - "reasonCode": the supplied reason codes are "missing_information" and "contradictory_information". Set one of them on a forecast only if required information is missing or contradictory; otherwise set null or omit the field.
 - "axes": your ratings on the five axes defined above — "valuation", "trend", "consensus", "news", "softness" — as integers 1 through 5, all five keys present, for this market.
 - "primaryAxis": the one axis you name as the primary driver, or null when every axis is rated 1. Name a driver whenever any axis is above 1, including when two or more share the highest rating.
-- "primaryExpectation": your one sentence on the primary axis — what you expect to happen and which direction it moves the number. When "primaryAxis" is null, either state that you expect no material movement or set this to null.
+- "primaryExpectation": your one sentence on the primary axis — what you expect to happen and which direction it moves the number. When "primaryAxis" is null, state in this field that you expect no material movement. Never null.
 - Echo "schemaVersion": 2 and the supplied "cohortId", "participantId", "requestedModelId", "bundleSha256", and "executionPolicy" values exactly.
 - Respond with ONLY the JSON object — no prose, no code fences.`;
 

@@ -102,7 +102,11 @@ const forecastSchemaV2 = z
     evidenceRefs: z.array(z.string().min(1)),
     axes: axesSchema,
     primaryAxis: z.enum(AXIS_NAMES).nullable(),
-    primaryExpectation: primaryExpectationSchema.nullable(),
+    // Never null: with a named driver it states the expected development on
+    // that axis; with no driver (every axis rated 1) it states that no
+    // material movement is expected — exactly what the system prompt asks for
+    // ("name no primary driver and say you expect no material movement").
+    primaryExpectation: primaryExpectationSchema,
   })
   .strict()
   .superRefine((forecast, ctx) => {
@@ -122,16 +126,6 @@ const forecastSchemaV2 = z
         code: z.ZodIssueCode.custom,
         path: ['primaryAxis'],
         message: 'primaryAxis must name the primary driver whenever any axis is rated above 1',
-      });
-    }
-    // A named driver always carries its one-sentence expectation. With no
-    // driver the expectation may state that no material movement is expected,
-    // or be null.
-    if (forecast.primaryAxis !== null && forecast.primaryExpectation === null) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['primaryExpectation'],
-        message: 'primaryExpectation is required when primaryAxis names a driver',
       });
     }
   });

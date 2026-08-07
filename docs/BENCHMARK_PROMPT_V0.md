@@ -1,7 +1,7 @@
 # Canonical MLB Benchmark Prompt Contract — v0 Draft
 
 - Last updated UTC: 2026-08-07T00:00:00Z
-- Status: the system prompt below is the live contract for prompt scaffold `shadow-smoke-v0.4` (beat-the-close axes prompt, response schema v2); still not preregistered and not approved for a public cohort. The superseded pre-axes prompt is retained in the appendix.
+- Status: the system prompt below is the live contract for prompt scaffold `shadow-smoke-v0.5` (beat-the-close axes prompt, response schema v2, ASCII punctuation); still not preregistered and not approved for a public cohort. The superseded pre-axes prompt is retained in the appendix.
 - Parent methodology: [AGENT_BENCHMARK.md](AGENT_BENCHMARK.md)
 
 ## Design intent
@@ -17,7 +17,7 @@ This draft is a schema and behavior contract. The exact data fields, cutoff, rea
 ```text
 You are one participant in a preregistered sports-market decision benchmark running through Ospex.
 
-Your goal is to beat the close. Beating the close is predicting line movement, not outcomes. Only things the market isn’t potentially pricing in correctly carry weight.
+Your goal is to beat the close. Beating the close is predicting line movement, not outcomes. Only things the market isn't potentially pricing in correctly carry weight.
 
 A causal decomposition of line movement, in five axes:
 
@@ -34,7 +34,7 @@ News: a number moves because information arrives.
 News is the knowledge of the probability and likelihood of an event occurring or a change in potential rosters, lineups or player injury status. Though these things cannot be predicted, the chance of these impacting the price is very real, and relevant movement related to which players are expected to be playing in the game, and how much, may not be appropriately represented in current odds.
 
 Softness: a number moves because it was never firmly set.
-Softness is the knowledge of a number’s room to move, regardless of why. Not every line is equally defended, as a nationally televised game will have a more precise opener than a game involving teams outside the normal rotation, such as an Ivy League football matchup. Softness is the one axis that’s market-structural rather than sport-analytical and can also be quantified as a measure of difficulty and opportunity.
+Softness is the knowledge of a number's room to move, regardless of why. Not every line is equally defended, as a nationally televised game will have a more precise opener than a game involving teams outside the normal rotation, such as an Ivy League football matchup. Softness is the one axis that's market-structural rather than sport-analytical and can also be quantified as a measure of difficulty and opportunity.
 
 Valuation is fundamental disagreement, trend is momentum, consensus is flow, news is catalyst timing, softness is liquidity and attention.
 
@@ -113,7 +113,7 @@ Provider/source brands should not be displayed on user-facing decision surfaces.
             "softness": 1
           },
           "primaryAxis": "valuation | trend | consensus | news | softness | null",
-          "primaryExpectation": "one sentence, or null exactly when primaryAxis is null"
+          "primaryExpectation": "one sentence on the primary axis, or that you expect no material movement"
         }
       ]
     }
@@ -121,7 +121,7 @@ Provider/source brands should not be displayed on user-facing decision surfaces.
 }
 ```
 
-Each game must contain exactly one forecast per market it supplies — one to three of moneyline, designated spread, and designated total. Under the fixed moneyline+total policy the moneyline and total forecasts (whichever the game supplies) are marked for execution and the spread is not. For spread/total, `line` is required; for moneyline it is `null`. Win/push/loss probabilities and confidence are values from 0 through 1; probabilities sum to 1, with push set to zero for binary contracts. `evidenceRefs` carries at least one bundle evidenceRef per forecast. `reasonCode` is optional and defaults to null; it carries the supplied reason codes the system prompt refers to (`missing_information`, `contradictory_information`) when required information is missing or contradictory. `axes` carries integer 1-5 scores on exactly the five named analysis axes; `primaryAxis` names the single axis most driving the forecast (or null when none dominates) and `primaryExpectation` is one single-line sentence stating the expected development on that axis, null exactly when `primaryAxis` is null. Responses are validated by the versioned provider-neutral schema in the harness (response schema v2 = this document; v1 is the pre-axes shape retained for replay of archived records): new runs fail validation without the v2 fields, archived v1 records still parse.
+Each game must contain exactly one forecast per market it supplies — one to three of moneyline, designated spread, and designated total. Under the fixed moneyline+total policy the moneyline and total forecasts (whichever the game supplies) are marked for execution and the spread is not. For spread/total, `line` is required; for moneyline it is `null`. Win/push/loss probabilities and confidence are values from 0 through 1; probabilities sum to 1, with push set to zero for binary contracts. `evidenceRefs` lists the bundle evidenceRefs the rationale actually rests on and may be empty when the rationale rests on outside reasoning or a search the model performed (the system prompt directs the model to say so rather than cite an unsupporting ref); every present entry must name an evidenceRef in that game's bundle record. `reasonCode` is optional and defaults to null; it carries the supplied reason codes the system prompt refers to (`missing_information`, `contradictory_information`) when required information is missing or contradictory. `axes` carries integer 1-5 scores on exactly the five named analysis axes; `primaryAxis` names the single axis most driving the forecast (null exactly when every axis is rated 1) and `primaryExpectation` is one single-line sentence, never null: with a named driver it states the expected development on that axis, and with no driver it states that no material movement is expected. Responses are validated by the versioned provider-neutral schema in the harness (response schema v2 = this document; v1 is the pre-axes shape retained for replay of archived records): new runs fail validation without the v2 fields, archived v1 records still parse.
 
 ## Deterministic baseline contract
 
@@ -144,11 +144,11 @@ Generate two records without conflating them: a same-snapshot common-cutoff deci
 
 - Temperature/randomness and provider reasoning settings are explicit in the cohort manifest.
 - A syntactically invalid response may receive at most one deterministic format-repair request containing no new market information. The repair request carries NO declared tools, so it cannot search: a repair that could gather fresh information would be producing a second, independent read of the market rather than reformatting the first one.
-- The repair request may not invite a new decision; it asks only for the same choices in valid schema. The five axis ratings, the named primary driver, and its expectation are DECISION-bearing: they are bound into the decision fingerprint, so a repair that changes or supplies them is rejected as a changed decision. A response that omitted the analysis entirely therefore cannot be repaired into one that has it.
+- The repair request may not invite a new decision; it asks only for the same choices in valid schema. The five axis ratings, the named primary driver, and its expectation are DECISION-bearing: they are bound into the decision fingerprint, so a repair that changes or supplies them is rejected as a changed decision. A response that omitted the analysis entirely therefore cannot be repaired into one that has it — the runner skips the repair call outright in that case rather than paying for a request that cannot be accepted.
 - Missing games, duplicate games, wrong lines, unsupported sides, or changed decisions after repair receive preregistered invalid-output reason codes.
 - Provider outages and timeouts are recorded; retries must use the same frozen bundle and occur before the cutoff.
 - Raw sanitized response, parsed output, repair request/response, provider response ID, response-reported model, timestamps, tokens, cost, and latency are retained, along with the per-attempt web-search audit: every executed query, every result reference, the billable search count, and any reason the audit is known to be partial.
-- A response that is not a finished turn — a provider pausing its own server-side tool loop, or declining the request — is recorded as a provider outcome carrying that call's usage, never as a schema failure. Continuation of a paused turn is deliberately disabled (`maxServerToolContinuations`), because one attempt is the unit the per-attempt spend reservation bounds.
+- A response that is not a finished turn — a paused server-side tool loop, a provider refusal or safety stop, an output-cap truncation (`max_tokens` / `incomplete` / `MAX_TOKENS`), a terminated tool loop, a failed response, or any other non-final provider state — is recorded as a provider outcome carrying that call's full evidence (HTTP status, response and model ids, the partial sanitized text, usage, and search audit), never as a schema failure and never as an accepted answer. Continuation of a paused turn is deliberately disabled (`maxServerToolContinuations`), because one attempt is the unit the per-attempt spend reservation bounds.
 
 ## Execution policy draft
 

@@ -467,7 +467,10 @@ export interface ForecastOutput {
   primaryAxis?: AxisName | null | undefined;
   /**
    * Response schema v2: one sentence stating the expected development on the
-   * primary axis; null exactly when `primaryAxis` is null. Absent on v1 records.
+   * primary axis; with no driver it states that no material movement is
+   * expected. The current validator rejects null — the null arm of this type
+   * exists for replay of records whose analysis predates the requirement.
+   * Absent on v1 records.
    */
   primaryExpectation?: string | null | undefined;
 }

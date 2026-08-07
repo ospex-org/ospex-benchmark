@@ -402,16 +402,21 @@ test("the prompt's own primary-driver rule is enforced: a driver is named whenev
   const allOnes = { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 };
   const sentence = 'A starter scratch is expected to move this line toward the away side.';
 
-  // Rated axes: a driver is required, and it carries its expectation.
+  // Rated axes: a driver is required, and it carries its expectation. A null
+  // expectation fails the SHAPE gate (the field is never nullable), which
+  // preempts the superRefine driver rule — so the driver rule is probed with a
+  // present sentence, the only input where it is the discriminating check.
   assert.deepEqual(withAnalysis(rated, 'news', sentence), []);
-  assert.ok(withAnalysis(rated, null, null).some((e) => e.includes('primaryAxis')));
+  assert.ok(withAnalysis(rated, null, null).some((e) => e.includes('primaryExpectation')));
   assert.ok(withAnalysis(rated, null, sentence).some((e) => e.includes('primaryAxis')));
   assert.ok(withAnalysis(rated, 'trend', null).some((e) => e.includes('primaryExpectation')));
 
-  // Every axis 1: no driver may be named, and the expectation may either state
-  // that no material movement is expected, or be null.
-  assert.deepEqual(withAnalysis(allOnes, null, null), []);
+  // Every axis 1: no driver may be named, and the expectation is STILL
+  // required — it states that no material movement is expected. Null is
+  // rejected in both directions (the prompt says "say you expect no material
+  // movement", and the validator enforces exactly that contract).
   assert.deepEqual(withAnalysis(allOnes, null, 'No material movement is expected before close.'), []);
+  assert.ok(withAnalysis(allOnes, null, null).some((e) => e.includes('primaryExpectation')));
   assert.ok(withAnalysis(allOnes, 'softness', sentence).some((e) => e.includes('primaryAxis')));
 });
 

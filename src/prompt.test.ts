@@ -129,6 +129,16 @@ test('the superseded pre-axes prompt is retained in the doc, and is NOT the live
   assert.notEqual(superseded, SYSTEM_PROMPT.replace(/\r\n/g, '\n'));
 });
 
+test('the model-visible prompt text carries NO smart punctuation — curly quotes/apostrophes must never reach the wire', () => {
+  // The source document arrived with word-processor punctuation (U+2019). The
+  // wire text is normalized to ASCII quotes so no model ever sees a byte that
+  // renders differently across toolchains. This pins the whole smart-quote
+  // family, both directions, in both model-visible strings.
+  const smartQuotes = /[‘’“”]/;
+  assert.ok(!smartQuotes.test(SYSTEM_PROMPT), 'SYSTEM_PROMPT must be free of curly quotes/apostrophes');
+  assert.ok(!smartQuotes.test(CONTRACT_NOTES), 'CONTRACT_NOTES must be free of curly quotes/apostrophes');
+});
+
 test('the live prompt asks for exactly what the validator enforces: the five axes, one primary driver, and search-aware grounding', () => {
   // Cheap coupling check between the prompt text and the schema's own vocabulary
   // — a renamed axis in one place and not the other fails here.
