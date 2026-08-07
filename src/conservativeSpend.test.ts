@@ -603,6 +603,9 @@ test('search fees are PRICED into the derived actual, per provider, at the pinne
 test('an UNKNOWN search count is unpriceable — it throws rather than pricing the fee at zero', () => {
   // The false-zero rule applied to search: "a search ran, count unknown" must
   // escalate, exactly like an absent additive token bucket.
+  // Asserting the TYPE alone cannot tell a deliberate "count not derivable"
+  // refusal from an incidental malformed-value throw — and an operator reading
+  // the escalation needs to know which. The message is part of the contract.
   assert.throws(
     () =>
       deriveConservativeActualUsdMicros({
@@ -612,7 +615,9 @@ test('an UNKNOWN search count is unpriceable — it throws rather than pricing t
         usageRaw: { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 },
         searchCount: null,
       }),
-    ConservativeSpendUnknownError,
+    (error: unknown) =>
+      error instanceof ConservativeSpendUnknownError &&
+      /a search ran but its billable count is not derivable/.test(error.message),
   );
   // Negative control: the identical usage with a KNOWN count prices fine, and
   // an OMITTED count (a pre-search record) prices exactly as it always did.
