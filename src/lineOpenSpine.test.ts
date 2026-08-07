@@ -887,6 +887,9 @@ test('END-TO-END: an anthropic pause_turn carrying usage yields a coherent artif
   assert.equal(attempt.persistedResponseBody, '');
   assert.deepEqual(attempt.usage, pausedUsage);
   assert.deepEqual(attempt.searchAudit, pausedAudit);
+  // The structured provider completion state is digest-bound artifact evidence.
+  assert.equal(attempt.providerStopReason, 'pause_turn');
+  assert.equal(attempt.turnCompleted, false);
 
   // Sidecar side: the paused call is priced from its carried buckets + count.
   assert.equal(sink.sidecarCalls.length, 1, 'a billable fire always installs its spend evidence');

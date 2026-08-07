@@ -68,6 +68,8 @@ function attempt(overrides: Partial<AttemptRecord>): AttemptRecord {
     usageRaw: null,
     searchAudit: null,
     requestParams: null,
+    providerStopReason: null,
+    turnCompleted: true,
     requestAt: null,
     responseAt: null,
     acceptedAt: null,

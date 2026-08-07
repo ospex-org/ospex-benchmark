@@ -312,6 +312,8 @@ function emptyAttempt(): AttemptRecord {
     usageRaw: null,
     searchAudit: null,
     requestParams: null,
+    providerStopReason: null,
+    turnCompleted: null,
     requestAt: null,
     responseAt: null,
     acceptedAt: null,
@@ -375,6 +377,11 @@ async function timedChat(
       usageRaw: response.usageRaw,
       searchAudit: redactSearchAudit(response.searchAudit, redactSecrets),
       requestParams: response.requestParams,
+      // An adapter returns ONLY on its provider's final state (anything else
+      // throws the typed unfinished-turn failure), so a returned response IS a
+      // completed turn — recorded structurally, where verification reads it.
+      providerStopReason: null,
+      turnCompleted: true,
       requestAt,
       responseAt: new Date(respondedAt).toISOString(),
       // A received response is not yet ACCEPTED — acceptance is stamped in
@@ -413,6 +420,13 @@ async function timedChat(
             usageRaw: error.usageRaw,
             searchAudit: redactSearchAudit(error.searchAudit, redactSecrets),
             requestParams: error.requestParams,
+            // The STRUCTURED completion state: the provider's own non-final
+            // terminal string, and the explicit non-final flag. Provider
+            // completion status is authoritative over body shape, so this pair
+            // is what proves — durably, not in prose — that an archived body
+            // which happens to parse as valid JSON was still not an answer.
+            providerStopReason: error.stopReason,
+            turnCompleted: false,
           }
         : { httpStatus: error instanceof ProviderHttpError ? error.status : null };
     return {

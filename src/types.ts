@@ -375,6 +375,24 @@ export interface AttemptRecord {
   /** The redacted web-search audit for this attempt (`null`: no search activity). */
   searchAudit: SearchAudit | null;
   requestParams: Record<string, unknown> | null;
+  /**
+   * The provider's own terminal-state string when the response was an
+   * UNFINISHED turn (Anthropic stop_reason / Responses root status / Google
+   * finishReason — e.g. "pause_turn", "incomplete", "MAX_TOKENS"). `null` on a
+   * finished turn and when no response was received. This is the STRUCTURED
+   * completion evidence, not prose: downstream verification reads it, never
+   * `errorDetail`.
+   */
+  providerStopReason: string | null;
+  /**
+   * Whether the provider declared this attempt's turn FINISHED: `true` for a
+   * returned response (an adapter returns only on its provider's final state),
+   * `false` for a typed unfinished turn, `null` when no response was received
+   * (timeout / transport / HTTP failure). Provider completion status is
+   * AUTHORITATIVE over body shape — a `false` here is what lets an archived
+   * body that happens to parse as valid JSON be truthfully refused.
+   */
+  turnCompleted: boolean | null;
   requestAt: string | null;
   /**
    * Attempt-SETTLED instant (offset ISO): stamped on a received provider

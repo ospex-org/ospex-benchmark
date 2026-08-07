@@ -764,6 +764,38 @@ test('openai root status "incomplete" is a typed unfinished turn carrying the fu
   });
 });
 
+test('openai root status "incomplete" with a COMPLETE schema-valid JSON body is STILL a typed unfinished turn — provider status is authoritative over body shape', async () => {
+  // The reviewer-probed wire shape: the provider says the turn did not finish
+  // (e.g. it hit max_output_tokens AFTER emitting complete JSON), so the body
+  // must not be accepted however well-formed the extracted text happens to be.
+  const completeJson = '{"schemaVersion":2,"cohortId":"c","participantId":"p","requestedModelId":"m","bundleSha256":"' + 'a'.repeat(64) + '","executionPolicy":"fixed-moneyline-total","games":[]}';
+  await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, async () => {
+    await withCannedFetch(
+      () =>
+        jsonResponse({
+          id: 'resp_wire_incomplete_valid_json',
+          model: 'gpt-5.6-sol',
+          status: 'incomplete',
+          incomplete_details: { reason: 'max_output_tokens' },
+          output: [{ type: 'message', content: [{ type: 'output_text', text: completeJson }] }],
+          usage: { input_tokens: 200, output_tokens: 900, total_tokens: 1_100 },
+        }),
+      async () => {
+        await assert.rejects(
+          () => registryAdapter('openai-gpt-5.6-sol').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+          (e: unknown) => {
+            assert.ok(e instanceof ProviderUnfinishedTurnError, 'a valid-looking body must not smuggle an incomplete turn through');
+            assert.equal(e.stopReason, 'incomplete');
+            assert.equal(e.rawText, completeJson, 'the well-formed body is still carried as evidence');
+            return true;
+          },
+        );
+        return null;
+      },
+    );
+  });
+});
+
 test('xai root status "failed" is a typed unfinished turn — a provider-declared failure is never ordinary model text', async () => {
   await withEnv('XAI_API_KEY', SYNTHETIC_KEY, async () => {
     await withCannedFetch(

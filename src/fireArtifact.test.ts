@@ -67,6 +67,8 @@ function attempt(over: Partial<AttemptRecord> = {}): AttemptRecord {
     usageRaw: null,
     searchAudit: null,
     requestParams: null,
+    providerStopReason: null,
+    turnCompleted: true,
     requestAt: '2026-07-16T00:00:05.000Z',
     responseAt: '2026-07-16T00:00:06.000Z',
     acceptedAt: '2026-07-16T00:00:07.000Z',

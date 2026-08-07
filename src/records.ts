@@ -62,6 +62,11 @@ function attemptFields(attempt: AttemptRecord | null): JsonRecord {
     requestParams: attempt?.requestParams ?? null,
     rawResponse: attempt?.rawText ?? null,
     errorDetail: attempt?.errorDetail ?? null,
+    // The structured provider completion state (never prose): the non-final
+    // terminal string for an unfinished turn, and whether the provider
+    // declared the turn finished. Verification reads THESE, not errorDetail.
+    providerStopReason: attempt?.providerStopReason ?? null,
+    turnCompleted: attempt?.turnCompleted ?? null,
   };
 }
 

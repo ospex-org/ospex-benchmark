@@ -263,6 +263,17 @@ export interface PersistedAttemptV1 {
   /** Detached, redacted web-search audit — absent on pre-search attempts,
    *  explicit `null` on a new attempt that ran no search. */
   searchAudit?: SearchAudit | null | undefined;
+  /**
+   * The structured provider completion state — the provider's own NON-FINAL
+   * terminal string (stop_reason / root status / finishReason) and whether the
+   * provider declared the turn finished. OPTIONAL for the same reason as the
+   * usage extensions: absent on attempts persisted before the fields existed
+   * (their digests recompute unchanged), explicit on every new attempt, and
+   * digest-bound whenever present — so a demotion's provider verdict cannot be
+   * silently edited out of the durable evidence.
+   */
+  providerStopReason?: string | null | undefined;
+  turnCompleted?: boolean | null | undefined;
 }
 
 export const persistedAttemptSchemaV1 = z
@@ -279,6 +290,8 @@ export const persistedAttemptSchemaV1 = z
     transport: attemptTransportSchemaV1,
     usage: providerUsageSchemaV1.nullable(),
     searchAudit: searchAuditSchemaV1.nullable().optional(),
+    providerStopReason: z.string().min(1).nullable().optional(),
+    turnCompleted: z.boolean().nullable().optional(),
   })
   .strict();
 
@@ -334,6 +347,11 @@ export function toPersistedAttempts(result: ArmGameResult): readonly PersistedAt
       // activity); the runner already redacted the audit's strings. Detached
       // via structuredClone so the artifact never aliases live runner state.
       searchAudit: record.searchAudit === null ? null : structuredClone(record.searchAudit),
+      // Structured provider completion state, explicit on every new attempt
+      // and digest-bound: the durable proof (or absence of proof) that a
+      // non-valid outcome was the provider's verdict.
+      providerStopReason: record.providerStopReason,
+      turnCompleted: record.turnCompleted,
     });
   };
   mapOne(result.attempt, 1, 'initial');

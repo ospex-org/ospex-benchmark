@@ -197,6 +197,11 @@ const attemptFieldsSchema = z
     requestAt: z.string().nullable(),
     responseAt: z.string().nullable(),
     latencyMs: z.number().nullable(),
+    // Structured provider completion state (absent on archives that predate
+    // it): the non-final terminal string, and whether the provider declared
+    // the turn finished. Optional-when-absent so old evidence keeps parsing.
+    providerStopReason: z.string().nullable().optional(),
+    turnCompleted: z.boolean().nullable().optional(),
   })
   .passthrough();
 
@@ -215,6 +220,8 @@ const armResponseSchema = z
     cutoffAt: z.string().min(1),
     outcome: z.string().min(1),
     repairUsed: z.boolean(),
+    // Absent on archives that predate the per-record repair-transport stamp.
+    repairTransport: z.string().nullable().optional(),
     attempt: attemptFieldsSchema,
     repair: attemptFieldsSchema.nullable(),
   })
@@ -351,11 +358,19 @@ export interface ArchivedAttempt {
   requestAt: string | null;
   responseAt: string | null;
   latencyMs: number | null;
+  /** The provider's own non-final terminal string; `null` on a finished turn,
+   *  no response, or an archive that predates the field. */
+  providerStopReason: string | null;
+  /** Whether the provider declared the turn finished; `null` when no response
+   *  was received or the archive predates the field. */
+  turnCompleted: boolean | null;
 }
 
 export interface ArmResponseRef {
   participantId: string;
   provider: string;
+  /** The archived repair transport outcome; `null` when absent (old archives). */
+  repairTransport: string | null;
   requestedModelId: string;
   reportedModelId: string | null;
   gameId: string;
@@ -492,6 +507,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
         armResponses.push({
           participantId: response.participantId,
           provider: response.provider,
+          repairTransport: response.repairTransport ?? null,
           requestedModelId: response.requestedModelId,
           reportedModelId: response.reportedModelId,
           gameId: response.gameId,
@@ -506,6 +522,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
             requestAt: response.attempt.requestAt,
             responseAt: response.attempt.responseAt,
             latencyMs: response.attempt.latencyMs,
+            providerStopReason: response.attempt.providerStopReason ?? null,
+            turnCompleted: response.attempt.turnCompleted ?? null,
           },
           repair:
             response.repair === null
@@ -517,6 +535,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
                   requestAt: response.repair.requestAt,
                   responseAt: response.repair.responseAt,
                   latencyMs: response.repair.latencyMs,
+                  providerStopReason: response.repair.providerStopReason ?? null,
+                  turnCompleted: response.repair.turnCompleted ?? null,
                 },
           accepted: {
             reportedModelId: accepted.reportedModelId,
@@ -1307,7 +1327,17 @@ export function verifyRunIntegrity(
         continue;
       }
       const repairRaw = response.repair?.rawResponse ?? null;
-      if (response.repairUsed && repairRaw !== null) {
+      // The claim "this repair should have been valid" holds only for a repair
+      // whose transport settled ok AND whose archived provider state does not
+      // show a NON-FINAL turn: an unfinished repair turn (the provider said
+      // incomplete/paused) archives its body with turnCompleted: false, and
+      // provider completion status is authoritative over body shape — a
+      // validating body from a non-final turn is correctly refused. An absent
+      // state (a legacy archive, or an unexplained demotion) keeps the claim.
+      const repairTurnNonFinal =
+        response.repair?.turnCompleted === false && (response.repair?.providerStopReason ?? null) !== null;
+      const repairSettledOk = (response.repairTransport ?? 'ok') === 'ok';
+      if (response.repairUsed && repairRaw !== null && repairSettledOk && !repairTurnNonFinal) {
         const repairValidation = validateResponseText(
           repairRaw,
           requestBundle,
@@ -1368,18 +1398,31 @@ export function verifyRunIntegrity(
       }
       const initialRaw = response.attempt.rawResponse;
       if (initialRaw !== null) {
-        const initialValidation = validateResponseText(
-          initialRaw,
-          requestBundle,
-          game.requestSha256,
-          armSpecForValidation,
-          run.cohortId,
-          acceptedVersions,
-        );
-        if (initialValidation.errors.length === 0) {
-          violations.push(
-            `${key}: recorded provider_error but the archived initial response validates — a valid response cannot be demoted`,
+        // Provider completion status is AUTHORITATIVE over body shape: a
+        // provider can declare a turn non-final (root status "incomplete",
+        // stop_reason "max_tokens", …) even when the extracted text happens to
+        // form complete, schema-valid JSON, and the runner correctly refuses
+        // that body. The archived structured state — turnCompleted: false with
+        // the provider's own stop reason — is what proves the demotion is the
+        // provider's verdict, not the operator's. Without that proof (an
+        // absent state, or a turn recorded as finished), a validating body
+        // under provider_error stays a violation.
+        const turnRecordedNonFinal =
+          response.attempt.turnCompleted === false && response.attempt.providerStopReason !== null;
+        if (!turnRecordedNonFinal) {
+          const initialValidation = validateResponseText(
+            initialRaw,
+            requestBundle,
+            game.requestSha256,
+            armSpecForValidation,
+            run.cohortId,
+            acceptedVersions,
           );
+          if (initialValidation.errors.length === 0) {
+            violations.push(
+              `${key}: recorded provider_error but the archived initial response validates and the archived provider state does not show a non-final turn — a completed valid response cannot be demoted`,
+            );
+          }
         }
       }
     }

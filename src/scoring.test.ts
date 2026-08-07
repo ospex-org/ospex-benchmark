@@ -619,6 +619,166 @@ test('a provider_error arm whose archived body VALIDATES is refused — a valid 
   );
 });
 
+test('a provider_error whose VALIDATING body carries the structured NON-FINAL state is truthful — provider status is authoritative over body shape', () => {
+  // The blocker shape: the provider said "incomplete" while the extracted text
+  // happens to be complete valid JSON. The runner refuses it; the archived
+  // record proves the refusal was the PROVIDER's verdict via the structured
+  // state (turnCompleted: false + the provider's own stop reason). The
+  // verifier must accept exactly that record — and ONLY that record: a
+  // completed turn, a missing stop reason, or an absent state (the round-3
+  // test above) all stay unexplained demotions.
+  const build = (state: { turnCompleted?: boolean; providerStopReason?: string | null }) => {
+    const { lines, requests } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'provider_error' } });
+    const requestA = requests.find((r) => r.game.gameId === GAME_A);
+    assert.ok(requestA);
+    const game = requestA.game;
+    const ml = game.markets.moneyline!;
+    const rl = game.markets.runLine!;
+    const total = game.markets.total!;
+    const common = { probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, rationale: 'reference-price read' };
+    const validatingBody = JSON.stringify({
+      schemaVersion: 1,
+      cohortId: 'test-cohort',
+      participantId: 'timeout-arm',
+      requestedModelId: 'stub-model-2',
+      bundleSha256: requestA.requestSha256,
+      executionPolicy: 'fixed-moneyline-total',
+      games: [
+        {
+          gameId: game.gameId,
+          forecasts: [
+            { market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: ml.homeDecimal, selectedForExecution: true, evidenceRefs: [ml.evidenceRef], ...common },
+            { market: 'spread', selection: game.awayTeam, line: rl.line, observedDecimal: rl.awayDecimal, selectedForExecution: false, evidenceRefs: [rl.evidenceRef], ...common },
+            { market: 'total', selection: 'over', line: total.line, observedDecimal: total.overDecimal, selectedForExecution: true, evidenceRefs: [total.evidenceRef], ...common },
+          ],
+        },
+      ],
+    });
+    return lines.map((line) => {
+      const record = JSON.parse(line) as {
+        recordType?: string;
+        participantId?: string;
+        gameId?: string;
+        reportedModelId?: unknown;
+        attempt?: Record<string, unknown>;
+      };
+      if (record.recordType === 'arm_game_response' && record.participantId === 'timeout-arm' && record.attempt) {
+        if (record.gameId === GAME_A) record.attempt['rawResponse'] = validatingBody;
+        record.attempt['reportedModelId'] = 'stub-model-2';
+        record.reportedModelId = 'stub-model-2';
+        Object.assign(record.attempt, state);
+      }
+      return JSON.stringify(record);
+    });
+  };
+  // The truthful record: non-final state proven → the run stays scoreable.
+  assert.deepEqual(
+    verifyRunIntegrity(
+      parseRunRecords(build({ turnCompleted: false, providerStopReason: 'incomplete' })),
+      { expectedArms: FIXTURE_ARMS_WITH_TIMEOUT },
+    ),
+    [],
+    'a provider-declared non-final turn with a valid-looking body must not poison the run',
+  );
+  // Negative controls: a COMPLETED turn, and a non-final flag with no stop
+  // reason, are both unexplained demotions.
+  for (const state of [
+    { turnCompleted: true, providerStopReason: null },
+    { turnCompleted: false, providerStopReason: null },
+  ]) {
+    const violations = verifyRunIntegrity(parseRunRecords(build(state)), { expectedArms: FIXTURE_ARMS_WITH_TIMEOUT });
+    assert.ok(
+      violations.some((v) => v.includes('recorded provider_error but the archived initial response validates')),
+      `state ${JSON.stringify(state)} must stay a demotion violation, got: ${violations.join(' | ')}`,
+    );
+  }
+});
+
+test('the should-be-valid repair claim requires an ok transport AND a final repair turn — an unfinished repair is truthfully refused', () => {
+  // A repair whose provider turn did not finish can still carry a validating,
+  // fingerprint-preserving body; the runner refuses it (invalid_schema with
+  // repairTransport provider_error). The verifier must not call that record a
+  // demotion. Both gates are probed independently; the absent-state control
+  // keeps the protection against real demotions (and legacy archives).
+  const build = (over: {
+    repairTransport?: string;
+    repairState?: Record<string, unknown>;
+  }) => {
+    const { lines, requests } = fixtureRun();
+    const requestA = requests.find((r) => r.game.gameId === GAME_A);
+    assert.ok(requestA);
+    return lines
+      .map((line) => {
+        const record = JSON.parse(line) as {
+          recordType?: string;
+          participantId?: string;
+          gameId?: string;
+          outcome?: string;
+          repairUsed?: boolean;
+          repairTransport?: string;
+          attempt?: { rawResponse?: string };
+          repair?: unknown;
+        };
+        if (
+          record.recordType === 'arm_game_response' &&
+          record.participantId === 'model-arm' &&
+          record.gameId === GAME_A &&
+          record.attempt?.rawResponse !== undefined
+        ) {
+          record.outcome = 'invalid_schema';
+          record.repairUsed = true;
+          if (over.repairTransport !== undefined) record.repairTransport = over.repairTransport;
+          // The repair archives the SAME (validating, fingerprint-preserving)
+          // body the initial produced; the initial is corrupted to a wrong
+          // cohort echo so it is genuinely invalid but still fingerprints.
+          const validBody = record.attempt.rawResponse;
+          const wrongEcho = JSON.parse(validBody) as { cohortId: string };
+          wrongEcho.cohortId = 'wrong-cohort-echo';
+          record.attempt.rawResponse = JSON.stringify(wrongEcho);
+          record.repair = {
+            reportedModelId: 'stub-model-1',
+            providerResponseId: 'resp-repair',
+            rawResponse: validBody,
+            requestAt: '2026-07-12T14:07:01.001Z',
+            responseAt: '2026-07-12T14:07:01.055Z',
+            latencyMs: 54,
+            ...(over.repairState ?? {}),
+          };
+        }
+        return JSON.stringify(record);
+      })
+      .filter((line) => {
+        const record = JSON.parse(line) as { recordType?: string; participantId?: string; gameId?: string };
+        return !(record.recordType === 'decision' && record.participantId === 'model-arm' && record.gameId === GAME_A);
+      });
+  };
+  // (a) Transport gate: a repair that never settled ok cannot ground the claim.
+  assert.deepEqual(
+    verifyRunIntegrity(parseRunRecords(build({ repairTransport: 'provider_error' })), { expectedArms: FIXTURE_ARMS }),
+    [],
+    'a non-ok repair transport suppresses the should-be-valid claim',
+  );
+  // (b) Completion gate: transport ok, but the archived repair state shows a
+  // NON-FINAL turn — provider status stays authoritative.
+  assert.deepEqual(
+    verifyRunIntegrity(
+      parseRunRecords(
+        build({ repairTransport: 'ok', repairState: { turnCompleted: false, providerStopReason: 'incomplete' } }),
+      ),
+      { expectedArms: FIXTURE_ARMS },
+    ),
+    [],
+    'a provider-declared non-final repair turn suppresses the should-be-valid claim',
+  );
+  // (c) Control: ok transport with no non-final state — the demotion
+  // protection still fires.
+  const violations = verifyRunIntegrity(parseRunRecords(build({ repairTransport: 'ok' })), { expectedArms: FIXTURE_ARMS });
+  assert.ok(
+    violations.some((v) => v.includes('this response should be valid')),
+    `an unexplained refused-valid repair must stay a violation, got: ${violations.join(' | ')}`,
+  );
+});
+
 test('the would-have-repaired rule mirrors the era: a v2-era v1-shaped initial without a repair is the SKIP, not a violation', () => {
   // (0) The v2-era fixture itself is clean.
   {

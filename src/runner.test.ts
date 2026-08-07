@@ -114,6 +114,9 @@ test('a valid initial response stamps a truthful acceptedAt; the (absent) repair
   assert.equal(result.outcome, 'valid');
   assert.equal(result.repair, null);
   assert.equal(result.attempt.acceptedAt, new Date(CUTOFF_MS - 60_000).toISOString());
+  // A returned response IS a finished turn (adapters throw on anything else).
+  assert.equal(result.attempt.turnCompleted, true);
+  assert.equal(result.attempt.providerStopReason, null);
 });
 
 test('a valid repair stamps acceptedAt on the repair; the un-accepted initial stays null', async () => {
@@ -358,6 +361,10 @@ test('an unfinished turn records the FULL received-response evidence: httpStatus
     endpoint: 'https://stub.example/v1/messages',
     model: 'stub-model-1',
   });
+  // The STRUCTURED completion state — what downstream verification reads
+  // instead of parsing errorDetail prose.
+  assert.equal(result.attempt.providerStopReason, 'pause_turn');
+  assert.equal(result.attempt.turnCompleted, false);
   assert.ok(result.attempt.responseAt !== null, 'the settle instant is stamped');
   assert.match(result.attempt.errorDetail ?? '', /unfinished turn \(stop_reason: pause_turn\)/);
   // Negative control: a transport-level failure still records NO received
@@ -378,6 +385,9 @@ test('an unfinished turn records the FULL received-response evidence: httpStatus
   assert.equal(failed.attempt.rawText, null);
   assert.equal(failed.attempt.providerResponseId, null);
   assert.equal(failed.attempt.usage, null);
+  // No response was received, so no completion state exists to record.
+  assert.equal(failed.attempt.providerStopReason, null);
+  assert.equal(failed.attempt.turnCompleted, null);
 });
 
 test('repair that changes a decision is rejected even when schema-valid', async () => {
