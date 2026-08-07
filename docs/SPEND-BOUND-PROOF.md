@@ -1,15 +1,29 @@
-# Conservative spend bound: why $100/attempt dominates worst-case real cost
+# Conservative spend accounting: the $100/attempt reservation, what it bounds, and what it only detects
 
 The runtime spend guard reserves a flat **$100 per provider attempt**
-(`PROVIDER_ATTEMPT_RESERVATION_USD_MICROS`) and hard-stops a fire whose conservatively-derived
-actual cost crosses it. This document proves that, for every model on the roster, the worst-case
-cost of a single attempt priced at the conservative guard table (`prices-v2`) is **strictly below
-$100**, with substantial headroom — so the reservation is a safe over-estimate, not a value that a
-legitimate attempt can breach.
+(`PROVIDER_ATTEMPT_RESERVATION_USD_MICROS`), prices each attempt's conservatively-derived actual
+cost after the response returns, and halts the fire — and, through the escalation latch, the
+campaign — the moment that derived actual crosses the reservation. The reservation is an
+ADMINISTRATIVE accounting unit, and its backing splits into two regimes:
 
-The guard prices real cost against `prices-v2` — each model's **highest conservatively-reachable
-published tier** — precisely so this proof holds without tracking which context tier a given prompt
-lands in. `prices-v1` (the base/short-context tier) is retained for historical replay only.
+- **Token spend** is bounded before dispatch: every request carries a finite `maxOutputTokens`,
+  input is bounded by each model's context window, and the worked table below shows that the
+  worst-case token cost of one attempt at the conservative guard table is **strictly below $100**
+  for every model on the roster.
+- **Search spend** is bounded before dispatch only where the provider documents a request-side
+  search cap (OpenAI `max_tool_calls`, Anthropic `max_uses`). xAI's `max_turns` bounds turns, not
+  the tool calls a turn may run in parallel, and Google documents **no cap of any kind** — so on
+  those arms nothing in the request prevents a single call from executing more searches than the
+  declared ceiling, and the guard's role there is **priced detection and halt after the response,
+  not prevention of a single call's overage**. The $100 figure is therefore a reservation the
+  accounting enforces and a tripwire the guard prices against — not a proof that no single call
+  can invoice more.
+
+The guard prices real cost against `prices-v3` — `prices-v2`'s token rates (each model's
+**highest conservatively-reachable published tier**, so the proof below holds without tracking
+which context tier a given prompt lands in) plus the per-search fees of the declared web-search
+tool. `prices-v1` (the base/short-context tier) and `prices-v2` (no search fees) are retained for
+historical replay only.
 
 ## Bounding model
 
@@ -19,7 +33,8 @@ For one attempt the conservative cost is
 cost = input_tokens × input_rate + billable_output_tokens × output_rate
 ```
 
-priced at the `prices-v2` upper tier. Two facts bound each factor:
+priced at the conservative upper tier (token rates identical in `prices-v2` and `prices-v3`). Two
+facts bound each factor:
 
 - **Input tokens** are bounded by the model's **context window**. The dispatch always sends a finite
   `maxOutputTokens` (sourced from the required manifest constant), but `maxOutputTokens` does **not**
@@ -34,7 +49,7 @@ priced at the `prices-v2` upper tier. Two facts bound each factor:
     instead bounded by the model's overall token envelope (there is no separate documented
     thinking-budget contract to rely on), and priced at the output rate.
 
-## Per-model worst case (prices-v2, observed 2026-07-23)
+## Per-model TOKEN worst case (rates identical in prices-v2/v3, observed 2026-07-23)
 
 | Model | Ctx / max out | Tier used (in / out per M) | Worst-case attempt | Headroom to $100 |
 |---|---|---|---|---|
@@ -58,8 +73,11 @@ Notes on the worst cases that are *not* simply base input + output:
   envelope and priced at the output rate. Bounding thinking by the *full* input envelope (a deliberate
   over-estimate) leaves $24.248320 (Gemini) and $8.00 (xAI).
 
-Every model's worst-case attempt is below $100, so `roster × (1 + maxRepairsPerArm) × $100` is a
-sound per-fire ceiling and the per-attempt guard can only trip on a genuine anomaly.
+Every model's worst-case TOKEN attempt is below $100, so for token spend
+`roster × (1 + maxRepairsPerArm) × $100` is a sound per-fire ceiling and a token-driven guard trip
+indicates a genuine anomaly. Search fees sit on top of these figures and are NOT all bounded
+before dispatch — see the next section for which arms cap them and which the guard can only
+detect after the fact.
 
 ## Web-search fees (tools-v1)
 
@@ -81,28 +99,38 @@ rather than assumed:
 
 - **Google exposes no cap of any kind.** Its entire grounding tool config is a time-range filter
   and a search-type selector; the model decides how many queries to run, and Gemini 3.x bills per
-  executed query. The declared `maxSearchesPerAttempt` is therefore enforced provider-side on the
-  other three arms and OBSERVED-AND-PRICED on this one.
+  executed query. `TOO_MANY_TOOL_CALLS` exists as a provider stop, but no documentation states a
+  numeric limit it enforces, so it is not relied on as a bound.
 - **xAI documents `max_turns`, not `max_tool_calls`, as a request parameter** (`max_tool_calls`
   appears only in its response schema). Sending the undocumented field would either fail the
-  request or be silently ignored, so the declared cap rides the documented parameter.
+  request or be silently ignored, so the declared cap rides the documented parameter — and it
+  bounds TURNS: a single turn may run tool calls in parallel, so `max_turns: 5` does not cap the
+  search count itself.
 
-### Why the reservation still holds without a Google cap
+The declared `maxSearchesPerAttempt` is therefore enforced provider-side on **two** arms (OpenAI
+`max_tool_calls`, Anthropic `max_uses`) and OBSERVED-AND-PRICED on xAI and Google.
 
-The bound no longer depends on any provider bounding search volume, because the fee is priced per
-search and compared against the same per-attempt reservation as tokens. Google is both the
-uncapped arm and the most expensive per unit, so it sets the worst case: at $0.014 per query, an
-attempt would need **7,143 executed queries** for search fees alone to reach the $100 reservation —
-three orders of magnitude beyond the declared ceiling, and beyond what the response could carry
-(Google's own non-configurable `TOO_MANY_TOOL_CALLS` stop and the context window bound the loop
-first). Adding the token worst case does not change the conclusion: the largest per-attempt token
-figure above is $56.40, leaving ~$43 of headroom, i.e. ~3,100 further Google queries.
+### What the reservation does NOT bound: search volume on the uncapped arms
 
-The residual risk is therefore not spend but PARITY: Google may execute more searches than the
+For xAI and Google, no request parameter prevents a single call from running more searches than
+the declared ceiling, so the per-attempt reservation is not a pre-dispatch bound on that call's
+search fees. What the harness does instead: the response's billable search count is priced at
+`prices-v3` into the derived actual, an attempt whose derived actual crosses the reservation is a
+BREACH that refuses settlement, and the escalation latch stops the campaign from admitting any
+further dispatch. That is detection-and-halt of an overage that has already been billed — it
+limits how many such calls a campaign can make (one), not what the first one invoices.
+
+For scale, at Google's $0.014-per-query fee an attempt would need ~7,143 executed queries for
+search fees alone to reach $100 (~5,411 on top of Google's worst-case token figure above) —
+absurdly far beyond the declared ceiling of 5, but "absurd" is an expectation about model
+behavior, not a provider guarantee; nothing documented hard-stops the loop below that number
+before the spend occurs.
+
+There is also a residual PARITY asymmetry: xAI and Google may execute more searches than the
 capped arms, so the cohort cannot claim identical search budgets across arms. That is disclosed
 rather than asserted away. If strict parity is required, the remedy is a tools-v1 config change
-(drop Google's search tool), not a code change — and it would then be the only arm without search,
-which is its own parity problem.
+(drop the uncapped arms' search tools), not a code change — and they would then be the only arms
+without search, which is its own parity problem.
 
 ### Unknown counts escalate; they never read as free
 
@@ -134,14 +162,15 @@ against `total_tokens`, pricing the larger reading when no total discriminates.
 
 ## Caveats
 
-- These rates are a **dated snapshot** (published tiers observed 2026-07-23), not a claim of
-  continuous freshness. Re-reconcile the pinned `prices-v2` table against current official pricing
-  **immediately before any paid crossing**.
+- These rates are a **dated snapshot** (published token tiers observed 2026-07-23, search fees
+  2026-08-07), not a claim of continuous freshness. Re-reconcile the pinned conservative table
+  (`prices-v3`) against current official pricing **immediately before any paid crossing**.
 - Where official documentation does not explicitly state a billing detail (e.g. that a provider's
   reasoning/thinking tokens bill at the output rate), the guard adopts the **conservative** (higher)
   treatment; the derived-actual over-estimates rather than under-estimates in every such case.
-- The bound is **per attempt** — the unit the reservation encodes. A provider/price change that could
-  invalidate it is a versioned `prices-vN` edit plus a manifest re-pin, not a silent rate change.
+- The accounting unit is **per attempt** — what the reservation encodes. A provider/price change
+  that could invalidate the token table is a versioned `prices-vN` edit plus a manifest re-pin,
+  not a silent rate change.
 
 Sources (official provider documentation, observed 2026-07-24):
 
@@ -162,5 +191,5 @@ Sources (official provider documentation, observed 2026-07-24):
   <https://docs.x.ai/developers/models/grok-4.5>,
   <https://docs.x.ai/developers/model-capabilities/text/usage-tracking>
 
-Rate values live in `modelPriceTable.ts` (`prices-v2`), pinned by digest in the cohort manifest and
+Rate values live in `modelPriceTable.ts` (`prices-v3`), pinned by digest in the cohort manifest and
 recomputed at boot. Re-reconcile against current official pricing immediately before any paid crossing.

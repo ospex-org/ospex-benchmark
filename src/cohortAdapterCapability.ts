@@ -311,8 +311,9 @@ function captureCanaryAuthorization(value: unknown): CanaryAuthorization {
  *      authorization for another cohort fails even with equal caps.
  *   4. The booted manifest must CONFORM to the pinned one-fire crossing profile
  *      (`crossingPinViolations` — including the conservative guard price table
- *      `prices-v2` + recomputed digest, which the pre-claim billable price-identity
- *      gate in `runOneFire` re-checks per fire), and its spend cap must not exceed
+ *      `SPEND_GUARD_PRICE_TABLE_VERSION` + recomputed digest, which the pre-claim
+ *      billable price-identity gate in `runOneFire` re-checks per fire), and its
+ *      spend cap must not exceed
  *      the canary ceiling. This producer mints for the attended one-fire canary
  *      ONLY; any other cohort shape is refused regardless of what an authorization
  *      claims.

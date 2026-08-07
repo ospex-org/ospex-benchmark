@@ -35,12 +35,14 @@ export const MODEL_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v1';
 
 /**
  * The CONSERVATIVE table the runtime spend guard prices against, and the version a
- * billable crossing manifest MUST pin. `prices-v2` uses each model's HIGHEST
- * conservatively-reachable published tier (the "price at the highest rate reachable"
- * option), so the derived-actual guard can only ever OVER-estimate real cost — the
- * one safe direction for a per-attempt hard-stop. `prices-v1` (the base/short-context
- * tier) is retained unchanged for historical replay/validation; the default stamped
- * version stays `prices-v1` so existing manifests/cohortIds do not churn.
+ * billable crossing manifest MUST pin. `prices-v3` keeps `prices-v2`'s token rates —
+ * each model's HIGHEST conservatively-reachable published tier (the "price at the
+ * highest rate reachable" option), so the derived-actual guard can only ever
+ * OVER-estimate real token cost — and adds the per-search fees the declared web-search
+ * tool bills (`searchUsdMicrosPerSearch`), so search spend is priced instead of
+ * assumed away. `prices-v1` (base tier) and `prices-v2` (no search fees) are retained
+ * unchanged for historical replay/validation; the default stamped version stays
+ * `prices-v1` so existing manifests/cohortIds do not churn.
  */
 export const SPEND_GUARD_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v3';
 

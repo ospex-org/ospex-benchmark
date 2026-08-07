@@ -170,13 +170,13 @@ test('ceilDivUsdMicros rounds a non-divisible numerator UP (floor would under-re
 
 // ── Price identity: the passed version actually drives the rate ─────────────────
 
-test('the pinned price VERSION drives the rate — prices-v1 is cheaper than the prices-v2 guard table', () => {
+test('the pinned price VERSION drives the rate — prices-v1 is cheaper than the conservative upper-tier rates (identical in prices-v2/v3)', () => {
   const shape = { prompt_tokens: 1490, completion_tokens: 512, total_tokens: 2002 } as const;
   const v1 = deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: V1, usageRaw: { ...shape } });
   const v2 = deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: GUARD, usageRaw: { ...shape } });
   assert.equal(v1, 22_810); // 1490·5 + 512·30
   assert.equal(v2, 49_345); // 1490·12.5 + 512·60
-  assert.ok(v2 > v1, 'the guard version (prices-v2) must never price below prices-v1');
+  assert.ok(v2 > v1, 'the guard version must never price below prices-v1');
 });
 
 // ── Fail-closed edges: every ambiguity throws a typed UNKNOWN (never a sentinel 0) ──

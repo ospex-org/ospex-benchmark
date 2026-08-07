@@ -20,8 +20,9 @@ import { deepFreeze } from './freeze.js';
  *                exposes NO cap parameter — the model decides how many
  *                queries run; the audit records the executed count.
  *   - xai      → Responses API (Agent Tools) `{type: "web_search"}` with
- *                `max_tool_calls` (legacy chat-completions Live Search was
- *                retired upstream).
+ *                `max_turns` — xAI's documented request-side bound, which caps
+ *                agentic TURNS rather than searches (legacy chat-completions
+ *                Live Search was retired upstream).
  */
 
 export const TOOL_INFERENCE_CONFIG_VERSION = 'tools-v1';
@@ -29,13 +30,16 @@ export const TOOL_INFERENCE_CONFIG_VERSION = 'tools-v1';
 /**
  * The COMMON per-attempt search ceiling every arm is configured against.
  *
- * Three of the four providers enforce it themselves (`max_tool_calls` on the
- * two Responses APIs, `max_uses` on Anthropic). Google's grounding tool exposes
- * NO cap of any kind — its entire documented config is a time-range filter and
- * a search-type selector, and the model decides how many queries to run — so
- * for that arm the ceiling is a declared target that the harness OBSERVES and
- * PRICES rather than enforces. That asymmetry is disclosed, not papered over:
- * see docs/SPEND-BOUND-PROOF.md, "Web-search fees".
+ * Two of the four providers enforce it exactly (`max_tool_calls` on OpenAI,
+ * `max_uses` on Anthropic). xAI's documented request-side bound is `max_turns`,
+ * which caps agentic TURNS — one turn may run tool calls in parallel — so it
+ * bounds searches only coarsely, and the exact billable count is observed and
+ * priced from the response counter. Google's grounding tool exposes NO cap of
+ * any kind — its entire documented config is a time-range filter and a
+ * search-type selector, and the model decides how many queries to run — so for
+ * that arm the ceiling is a declared target that the harness OBSERVES and
+ * PRICES rather than enforces. Those asymmetries are disclosed, not papered
+ * over: see docs/SPEND-BOUND-PROOF.md, "Web-search fees".
  */
 export const MAX_SEARCHES_PER_ATTEMPT = 5;
 

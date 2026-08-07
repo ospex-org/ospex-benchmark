@@ -49,9 +49,17 @@ Everything below states the contract that holds it.
 - **Stopping** (`campaign:stop`): stamps `disarmedAt` inside the record (first stop wins,
   row never deleted). The next tick resolves nothing. Runnable from any box that reaches
   the store and holds a copy of the campaign manifest — it does not need the runner.
-- **The hard money bound** is independent of all of the above: the store's cohort
+- **The money bound is layered**, and independent of all of the above. The store's cohort
   call/spend caps are enforced inside a row lock (`admit_dispatch`), so even a wrong
-  authorization layer cannot spend past what arming fixed.
+  authorization layer cannot ADMIT more dispatches than arming fixed — the caps are
+  denominated in $100/attempt reservations, an accounting unit. Within one admitted
+  attempt, real spend is bounded before dispatch by `maxOutputTokens` plus the
+  provider-documented search caps where they exist (OpenAI, Anthropic); on the arms with
+  no documented request-side search cap (Google entirely; xAI capped only in turns) an
+  overage in one call is DETECTED after the response — the derived actual is priced at
+  the conservative table, a crossing refuses settlement, and the escalation latch halts
+  the campaign. Detection bounds how many such calls a campaign can make, not what the
+  first one invoices; see docs/SPEND-BOUND-PROOF.md.
 
 ## What one tick does, in order
 
