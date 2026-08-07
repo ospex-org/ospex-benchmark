@@ -216,6 +216,33 @@ proving the admission is refused and no provider call is reachable.
   the publication evidence and the artifact-root half of the latch — is stated as such in
   the verdict line rather than silently assumed.
 
+## Provider preflight (web search)
+
+Every arm runs the declared web-search tool, so three provider-side conditions can fail a
+run for reasons unrelated to the harness. Clear them with one cheap call per arm before
+arming, not on the night:
+
+1. **Anthropic** — web search can be disabled organization-wide in the Console, in which
+   case any request carrying the tool returns 400. Fable 5 additionally requires 30-day
+   data retention and is unavailable under zero-data-retention, which fails every request
+   regardless of body.
+2. **Google** — the grounding tool and this model are paid-tier only; a free-tier key fails
+   regardless of body.
+3. **All four** — confirm the declared tool block is accepted as written. The wire shapes
+   were verified against current provider documentation, but documentation is not a live
+   response: `yarn smoke:dry` exercises the harness without provider calls, so the first
+   real acceptance is the first paid call.
+
+Two behaviours to expect and NOT treat as harness faults:
+
+- An Anthropic `pause_turn` (its server-side tool loop hit its iteration limit) or a
+  provider refusal records that arm as `provider_error` with its usage retained, not as a
+  schema failure. Continuation is deliberately disabled; enabling it is a money decision
+  (`maxServerToolContinuations`, and re-deriving the per-attempt bound), not a hot fix.
+- A fire whose search accounting is incomplete — a provider proving a search ran without
+  letting the count be derived — escalates as unknown spend and halts the campaign. That is
+  the money guard working; resume after reviewing the artifact.
+
 ## Operating a campaign
 
 1. `campaign:arm --calls <n> --days <n> --start <ISO> --artifacts <dir>` (attended). The

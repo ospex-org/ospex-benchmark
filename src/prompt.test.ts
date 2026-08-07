@@ -124,8 +124,9 @@ test('the superseded pre-axes prompt is retained in the doc, and is NOT the live
   const doc = readFileSync(new URL('../docs/BENCHMARK_PROMPT_V0.md', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   const appendix = doc.match(/## Appendix: superseded pre-axes system prompt[^\n]*\n\n[\s\S]*?```text\n([\s\S]*?)\n```/);
   assert.ok(appendix, 'the superseded prompt must remain in the doc');
-  assert.ok(appendix[1].includes('Do not use memory of later events, external browsing, native provider search'));
-  assert.notEqual(appendix[1], SYSTEM_PROMPT.replace(/\r\n/g, '\n'));
+  const superseded = appendix[1] ?? '';
+  assert.ok(superseded.includes('Do not use memory of later events, external browsing, native provider search'));
+  assert.notEqual(superseded, SYSTEM_PROMPT.replace(/\r\n/g, '\n'));
 });
 
 test('the live prompt asks for exactly what the validator enforces: the five axes, one primary driver, and search-aware grounding', () => {
