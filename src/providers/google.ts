@@ -41,12 +41,14 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
           role: t.role === 'assistant' ? 'model' : 'user',
           parts: [{ text: t.content }],
         }));
+      // A repair carries no declared tools (format-only, may not search).
+      const withTools = (options?.tools ?? 'declared') === 'declared';
       const tools = [WEB_SEARCH.tool];
       const body: Record<string, unknown> = {
         systemInstruction: { parts: [{ text: system }] },
         contents,
-        tools,
       };
+      if (withTools) body['tools'] = tools;
       if (options?.maxOutputTokens !== undefined) {
         body['generationConfig'] = { maxOutputTokens: options.maxOutputTokens };
       }
@@ -99,7 +101,7 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
       const requestParams: Record<string, unknown> = {
         endpoint: url,
         model: requestedModelId,
-        tools,
+        ...(withTools ? { tools } : {}),
       };
       if (options?.maxOutputTokens !== undefined) {
         requestParams['maxOutputTokens'] = options.maxOutputTokens;

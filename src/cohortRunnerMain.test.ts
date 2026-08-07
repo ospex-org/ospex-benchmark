@@ -878,7 +878,7 @@ test('--live + full authorization mints the REAL billable capability over the CR
       assert.equal(manifest.cohortCallCap, CROSSING_PROFILE.cohortCallCap);
       assert.equal(manifest.constants.maxDispatchesPerTick, CROSSING_PROFILE.maxDispatchesPerTick);
       assert.equal(manifest.constants.maxConcurrentProviderRequests, CROSSING_PROFILE.maxConcurrentProviderRequests);
-      assert.equal(manifest.modelPriceTableVersion, 'prices-v2');
+      assert.equal(manifest.modelPriceTableVersion, 'prices-v3');
       assert.equal(captured!.runOptions.timeoutMs, 300_000, 'the crossing keeps the production provider timeout');
 
       // The capability is REAL and billable: the gated producer minted the four real adapter

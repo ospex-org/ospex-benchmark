@@ -6,7 +6,7 @@ import {
   fingerprintFromParsed,
   validateResponseText,
 } from './schema.js';
-import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
+import { ProviderHttpError, ProviderTimeoutError, ProviderUnfinishedTurnError } from './providers/errors.js';
 import { redactSearchAudit } from './providers/searchAudit.js';
 import { assertPrepared, prepareGameRequest } from './preparedRequest.js';
 import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines.js';
@@ -26,6 +26,7 @@ import type {
   AttemptRecord,
   ChatTurn,
   ProviderAdapter,
+  ProviderCallOptions,
   ProviderResponse,
   RepairTransport,
   SlateBundle,
@@ -323,6 +324,9 @@ function classifyFailure(error: unknown): 'timeout' | 'rate_limited' | 'provider
   if (error instanceof ProviderTimeoutError) return 'timeout';
   // A throttle must never be readable as a model failure.
   if (error instanceof ProviderHttpError && error.status === 429) return 'rate_limited';
+  // An unfinished turn (paused server-tool loop, or a provider refusal) is a
+  // PROVIDER outcome, never a schema verdict — the model was not given the
+  // chance to finish, so it must not be scored as producing invalid output.
   return 'provider_error';
 }
 
@@ -335,7 +339,7 @@ function classifyFailure(error: unknown): 'timeout' | 'rate_limited' | 'provider
 interface DispatchTarget {
   readonly arm: ArmSpec;
   hasCredential(): boolean;
-  chat(turns: ChatTurn[], timeoutMs: number, options?: { maxOutputTokens?: number | undefined }): Promise<ProviderResponse>;
+  chat(turns: ChatTurn[], timeoutMs: number, options?: ProviderCallOptions): Promise<ProviderResponse>;
 }
 
 async function timedChat(
@@ -345,6 +349,8 @@ async function timedChat(
   maxOutputTokens: number,
   nowMs: () => number,
   startMs: number,
+  /** `'none'` on the repair leg — a format-only repair may not search. */
+  tools: 'declared' | 'none' = 'declared',
 ): Promise<
   AttemptRecord & {
     response: ProviderResponse | null;
@@ -358,7 +364,7 @@ async function timedChat(
   const startedAt = startMs;
   const requestAt = new Date(startedAt).toISOString();
   try {
-    const response = await adapter.chat(turns, timeoutMs, { maxOutputTokens });
+    const response = await adapter.chat(turns, timeoutMs, { maxOutputTokens, tools });
     const respondedAt = nowMs();
     return {
       rawText: redactSecrets(response.rawText),
@@ -381,12 +387,27 @@ async function timedChat(
     };
   } catch (error) {
     const detail =
-      error instanceof ProviderHttpError || error instanceof ProviderTimeoutError
+      error instanceof ProviderHttpError ||
+      error instanceof ProviderTimeoutError ||
+      error instanceof ProviderUnfinishedTurnError
         ? error.message
         : describeError(error);
     const respondedAt = nowMs();
+    // An UNFINISHED turn is a paid call: it carries its own usage and search
+    // audit, and both are recorded on the failed attempt so the money guard
+    // prices the real cost instead of escalating on absent evidence. Every
+    // other failure path keeps the empty record (nothing was reported).
+    const carried =
+      error instanceof ProviderUnfinishedTurnError
+        ? {
+            usage: null,
+            usageRaw: error.usage,
+            searchAudit: redactSearchAudit(error.searchAudit as ProviderResponse['searchAudit'], redactSecrets),
+          }
+        : {};
     return {
       ...emptyAttempt(),
+      ...carried,
       httpStatus: error instanceof ProviderHttpError ? error.status : null,
       requestAt,
       responseAt: new Date(respondedAt).toISOString(),
@@ -760,6 +781,8 @@ async function dispatchArmCore(
     options.maxOutputTokens,
     nowMs,
     repairStartMs,
+    // Format-only: the repair carries NO declared tools, so it cannot search.
+    'none',
   );
   const { response: repairResponse, failure: repairFailure, ...repairRecord } = repair;
   if (repairFailure !== null || repairResponse === null) {

@@ -4,10 +4,13 @@ import { redactSecrets } from './config.js';
 import { deepFreeze } from './freeze.js';
 import { forecastFingerprint } from './schema.js';
 import type { CohortManifestV1 } from './manifest.js';
+import { AXIS_NAMES } from './types.js';
 import type {
   ArmGameResult,
   ArmOutcome,
   AttemptRecord,
+  AxesScores,
+  AxisName,
   BenchmarkResponse,
   MarketKey,
   ProviderUsage,
@@ -150,9 +153,28 @@ export interface DecisionFingerprintEntryV1 {
   confidence: number;
   wouldAbstain: boolean;
   selectedForExecution: boolean;
+  /**
+   * The v2 analysis, present exactly when the accepted body carried it (all
+   * three keys together). Absent on entries derived from a v1-shaped body — so
+   * artifacts produced before the analysis existed recompute their ORIGINAL
+   * `armDigest` unchanged, while a v2 entry binds the analysis into the digest.
+   */
+  axes?: AxesScores | undefined;
+  primaryAxis?: AxisName | null | undefined;
+  primaryExpectation?: string | null | undefined;
 }
 
 export type AcceptedDecisionFingerprintV1 = readonly DecisionFingerprintEntryV1[];
+
+const axesEntrySchemaV1 = z
+  .object({
+    valuation: z.number(),
+    trend: z.number(),
+    consensus: z.number(),
+    news: z.number(),
+    softness: z.number(),
+  })
+  .strict();
 
 export const decisionFingerprintEntrySchemaV1 = z
   .object({
@@ -165,6 +187,9 @@ export const decisionFingerprintEntrySchemaV1 = z
     confidence: z.number(),
     wouldAbstain: z.boolean(),
     selectedForExecution: z.boolean(),
+    axes: axesEntrySchemaV1.optional(),
+    primaryAxis: z.enum(AXIS_NAMES).nullable().optional(),
+    primaryExpectation: z.string().nullable().optional(),
   })
   .strict();
 
@@ -194,6 +219,12 @@ export function decisionFingerprint(parsed: BenchmarkResponse): AcceptedDecision
         confidence: fp.confidence,
         wouldAbstain: fp.wouldAbstain,
         selectedForExecution: fp.selectedForExecution,
+        // All three keys travel together, keyed on whether the accepted body
+        // carried the analysis at all (`axes === null` is the v1 discriminator;
+        // a v2 body legitimately carries a null primaryAxis when every axis is 1).
+        ...(fp.axes === null
+          ? {}
+          : { axes: fp.axes, primaryAxis: fp.primaryAxis, primaryExpectation: fp.primaryExpectation }),
       });
     }
   }

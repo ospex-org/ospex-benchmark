@@ -24,6 +24,11 @@ import type { ProviderName } from './types.js';
  *               additive bucket (Google `total = prompt + candidates + thoughts`), so it IS added;
  *               `cachedContentTokenCount` is a subset of prompt already priced at full input rate.
  *
+ * On top of tokens, every attempt that ran the declared web-search tool carries a PER-INVOCATION
+ * fee, priced from the same pinned table (`prices-v3` onward) against the attempt's billable
+ * search count. The count itself is provider-derived (each provider bills a different unit —
+ * see `searchAudit.ts`), and a count that cannot be derived is UNKNOWN, never zero.
+ *
  * Everything fails CLOSED to a typed {@link ConservativeSpendUnknownError} — never a sentinel 0.
  * An UNKNOWN spend must escalate, not read as zero.
  */
@@ -73,6 +78,15 @@ export function deriveConservativeActualUsdMicros(input: {
   requestedModelId: string;
   priceVersion: string;
   usageRaw: unknown;
+  /**
+   * The attempt's billable web-search count, or `null` when the response proved
+   * a search ran but not how many. `undefined` / omitted means no search
+   * evidence at all (a pre-search record, or an attempt that never searched).
+   *
+   * A `null` count is UNPRICEABLE, not zero: it throws, so an attempt whose
+   * search accounting is incomplete escalates instead of quietly under-counting.
+   */
+  searchCount?: number | null | undefined;
 }): number {
   const { provider, requestedModelId, priceVersion, usageRaw } = input;
   const who = `${provider}:${requestedModelId}`;
@@ -103,11 +117,48 @@ export function deriveConservativeActualUsdMicros(input: {
   const numerator =
     inputRateTokens * BigInt(price.inputUsdMicrosPerMillionTokens) +
     outputRateTokens * BigInt(price.outputUsdMicrosPerMillionTokens);
-  const derived = ceilDivUsdMicros(numerator);
+  // Token cost rounds UP on its own per-million basis; the search fee is already
+  // a whole-micro per-invocation rate, so it is added after the division rather
+  // than being folded into it.
+  const derived = ceilDivUsdMicros(numerator) + searchFeeUsdMicros(input.searchCount, price, who);
   if (derived > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new ConservativeSpendUnknownError(`${who}: derived spend ${derived} exceeds Number.MAX_SAFE_INTEGER`);
   }
   return Number(derived);
+}
+
+/**
+ * The declared web-search fee for one attempt, in USD-micros.
+ *
+ * Fails CLOSED twice over: an UNKNOWN count (`null`) cannot be priced, and a
+ * nonzero count under a price version that predates search rates cannot be
+ * priced either. Both are the same class of error the token path uses — an
+ * escalation, never an assumed zero.
+ */
+function searchFeeUsdMicros(
+  searchCount: number | null | undefined,
+  price: ModelPrice,
+  who: string,
+): bigint {
+  if (searchCount === undefined) return 0n; // no search evidence on this attempt
+  if (searchCount === null) {
+    throw new ConservativeSpendUnknownError(
+      `${who}: a search ran but its billable count is not derivable from the response — cannot price the search fee (UNKNOWN, not zero)`,
+    );
+  }
+  if (!Number.isSafeInteger(searchCount) || searchCount < 0) {
+    throw new ConservativeSpendUnknownError(
+      `${who}: searchCount is not a nonnegative safe integer (${describe(searchCount)})`,
+    );
+  }
+  if (searchCount === 0) return 0n;
+  const rate = price.searchUsdMicrosPerSearch;
+  if (rate === undefined) {
+    throw new ConservativeSpendUnknownError(
+      `${who}: ${searchCount} billable search(es) recorded, but the pinned price table carries no search rate — cannot price (UNKNOWN, not zero)`,
+    );
+  }
+  return BigInt(searchCount) * BigInt(rate);
 }
 
 /**

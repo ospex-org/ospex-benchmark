@@ -31,12 +31,42 @@ const PINNED_DIGEST = 'bbd49df2721e6cf654fc9dd9760d4cc45f53d4d25cb8c81e5f6e08128
  */
 const PINNED_DIGEST_V2 = '3d6d47a2427d21429e59094fd9cb9235473206a07b19b62b3292cde605e118c5';
 
+/**
+ * Canonical digest of prices-v3 — the guard table the code pins today: v2's token rates plus the
+ * per-search web-search fee. Its own INDEPENDENT golden, for the same reason as v2's.
+ */
+const PINNED_DIGEST_V3 = '3b6860a5b2c8dfd0df81f4c2ee4b4436dc962402cd1753ed421f6a502a322b35';
+
 /** The exact prices-v1 rates, as a literal, to re-derive the digest independently. */
 const EXPECTED_TABLE = {
   'gpt-5.6-sol': { inputUsdMicrosPerMillionTokens: 5_000_000, outputUsdMicrosPerMillionTokens: 30_000_000 },
   'claude-fable-5': { inputUsdMicrosPerMillionTokens: 10_000_000, outputUsdMicrosPerMillionTokens: 50_000_000 },
   'gemini-3.1-pro-preview': { inputUsdMicrosPerMillionTokens: 2_000_000, outputUsdMicrosPerMillionTokens: 12_000_000 },
   'grok-4.5': { inputUsdMicrosPerMillionTokens: 2_000_000, outputUsdMicrosPerMillionTokens: 6_000_000 },
+} as const;
+
+/** The exact prices-v3 (guard) rates, as a literal, to re-derive the digest independently. */
+const EXPECTED_TABLE_V3 = {
+  'gpt-5.6-sol': {
+    inputUsdMicrosPerMillionTokens: 12_500_000,
+    outputUsdMicrosPerMillionTokens: 60_000_000,
+    searchUsdMicrosPerSearch: 10_000,
+  },
+  'claude-fable-5': {
+    inputUsdMicrosPerMillionTokens: 10_000_000,
+    outputUsdMicrosPerMillionTokens: 50_000_000,
+    searchUsdMicrosPerSearch: 10_000,
+  },
+  'gemini-3.1-pro-preview': {
+    inputUsdMicrosPerMillionTokens: 4_000_000,
+    outputUsdMicrosPerMillionTokens: 18_000_000,
+    searchUsdMicrosPerSearch: 14_000,
+  },
+  'grok-4.5': {
+    inputUsdMicrosPerMillionTokens: 4_000_000,
+    outputUsdMicrosPerMillionTokens: 12_000_000,
+    searchUsdMicrosPerSearch: 5_000,
+  },
 } as const;
 
 /** The exact prices-v2 (conservative upper-tier) rates, as a literal, to re-derive independently. */
@@ -93,17 +123,18 @@ test('fail-closed API: unknown model / version / prototype-name throw distinct e
   assert.throws(() => priceForModel('__proto__'), /unknown model price: __proto__/);
   assert.throws(() => priceForModel('hasOwnProperty'), /unknown model price: hasOwnProperty/);
   assert.throws(() => priceForModel('constructor'), /unknown model price: constructor/);
-  // Unknown version at every version-taking entry point (prices-v3 is genuinely unregistered).
-  assert.throws(() => modelPriceTableForVersion('prices-v3'), /unknown model price table version: prices-v3/);
-  assert.throws(() => modelPriceTableDigest('prices-v3'), /unknown model price table version: prices-v3/);
+  // Unknown version at every version-taking entry point (prices-v99 is genuinely unregistered).
+  assert.throws(() => modelPriceTableForVersion('prices-v99'), /unknown model price table version: prices-v99/);
+  assert.throws(() => modelPriceTableDigest('prices-v99'), /unknown model price table version: prices-v99/);
   // Unknown version dominates model lookup (version resolves first).
-  assert.throws(() => priceForModel('gpt-5.6-sol', 'prices-v3'), /unknown model price table version: prices-v3/);
+  assert.throws(() => priceForModel('gpt-5.6-sol', 'prices-v99'), /unknown model price table version: prices-v99/);
 });
 
-test('known-version guard: both registered versions accepted; unrelated versions rejected', () => {
+test('known-version guard: every registered version accepted; unrelated versions rejected', () => {
   assert.equal(isModelPriceTableVersion(MODEL_PRICE_TABLE_VERSION), true);
-  assert.equal(isModelPriceTableVersion(SPEND_GUARD_PRICE_TABLE_VERSION), true); // prices-v2 is now registered
-  assert.equal(isModelPriceTableVersion('prices-v3'), false);
+  assert.equal(isModelPriceTableVersion(SPEND_GUARD_PRICE_TABLE_VERSION), true);
+  assert.equal(isModelPriceTableVersion('prices-v2'), true); // retained for replay of evidence priced under it
+  assert.equal(isModelPriceTableVersion('prices-v99'), false);
   assert.equal(isModelPriceTableVersion('market-policy-v1'), false);
   assert.ok((MODEL_PRICE_TABLE_VERSIONS as readonly string[]).includes(MODEL_PRICE_TABLE_VERSION));
   assert.ok((MODEL_PRICE_TABLE_VERSIONS as readonly string[]).includes(SPEND_GUARD_PRICE_TABLE_VERSION));
@@ -151,13 +182,13 @@ test('runtime immutability: an adversarial cast cannot mutate, replace, or add a
 });
 
 test('the exported version tuple is frozen — a casted push cannot forge a known version', () => {
-  assert.throws(() => (MODEL_PRICE_TABLE_VERSIONS as unknown as string[]).push('prices-v3'));
-  assert.equal(isModelPriceTableVersion('prices-v3'), false);
-  assert.deepEqual([...MODEL_PRICE_TABLE_VERSIONS], ['prices-v1', 'prices-v2']); // unchanged state
+  assert.throws(() => (MODEL_PRICE_TABLE_VERSIONS as unknown as string[]).push('prices-v99'));
+  assert.equal(isModelPriceTableVersion('prices-v99'), false);
+  assert.deepEqual([...MODEL_PRICE_TABLE_VERSIONS], ['prices-v1', 'prices-v2', 'prices-v3']); // unchanged state
 });
 
-test('prices-v2 content: every row equals the exact conservative upper-tier rates', () => {
-  const table = modelPriceTableForVersion(SPEND_GUARD_PRICE_TABLE_VERSION);
+test('prices-v2 content: the RETAINED table still equals the exact conservative upper-tier rates', () => {
+  const table = modelPriceTableForVersion('prices-v2');
   for (const [id, expected] of Object.entries(EXPECTED_TABLE_V2)) {
     assert.deepEqual(table[id], expected, id);
   }
@@ -202,17 +233,42 @@ test('prices-v2 is conservative: every rate >= the prices-v1 rate for the same m
   }
 });
 
-test('prices-v2 digest: deterministic, 64-hex, pinned golden, re-derivable from the literal, distinct from v1', () => {
-  const d = modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION);
-  assert.equal(d, modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION)); // deterministic
+test('prices-v2 digest: UNCHANGED by the v3 addition — evidence priced under it still re-verifies', () => {
+  const d = modelPriceTableDigest('prices-v2');
+  assert.equal(d, modelPriceTableDigest('prices-v2')); // deterministic
   assert.match(d, /^[0-9a-f]{64}$/);
   assert.equal(d, PINNED_DIGEST_V2); // INDEPENDENT golden — a silent rate edit breaks this even if EXPECTED_TABLE_V2 moves too
   assert.equal(d, sha256Hex(canonicalize(EXPECTED_TABLE_V2))); // and re-derives from the rate literal
   assert.notEqual(d, modelPriceTableDigest(MODEL_PRICE_TABLE_VERSION)); // v2 digest != v1 digest
 });
 
-test('SPEND_GUARD_PRICE_TABLE_VERSION is prices-v2, registered, and distinct from the default stamped version', () => {
-  assert.equal(SPEND_GUARD_PRICE_TABLE_VERSION, 'prices-v2');
+test('prices-v3 (the guard table): token rates equal v2, every row carries a positive search fee, digest is its own golden', () => {
+  const guard = modelPriceTableForVersion(SPEND_GUARD_PRICE_TABLE_VERSION);
+  const v2 = modelPriceTableForVersion('prices-v2');
+  for (const [id, row] of Object.entries(guard)) {
+    // The search fee is the ONLY difference from v2 — a token-rate change would
+    // be a separate, conscious decision, not a side effect of enabling search.
+    assert.equal(row.inputUsdMicrosPerMillionTokens, v2[id]!.inputUsdMicrosPerMillionTokens, id);
+    assert.equal(row.outputUsdMicrosPerMillionTokens, v2[id]!.outputUsdMicrosPerMillionTokens, id);
+    assert.ok(
+      Number.isSafeInteger(row.searchUsdMicrosPerSearch) && (row.searchUsdMicrosPerSearch ?? 0) > 0,
+      `${id} must carry a positive integer per-search fee`,
+    );
+  }
+  // ...and v2 itself carries NO search rate, which is what makes it fail closed
+  // when a nonzero search count is recorded against it.
+  for (const row of Object.values(v2)) assert.equal(row.searchUsdMicrosPerSearch, undefined);
+
+  const d = modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION);
+  assert.match(d, /^[0-9a-f]{64}$/);
+  assert.equal(d, PINNED_DIGEST_V3); // INDEPENDENT golden
+  assert.equal(d, sha256Hex(canonicalize(EXPECTED_TABLE_V3))); // re-derives from the rate literal
+  assert.notEqual(d, PINNED_DIGEST_V2);
+  assert.notEqual(d, PINNED_DIGEST);
+});
+
+test('SPEND_GUARD_PRICE_TABLE_VERSION is prices-v3, registered, and distinct from the default stamped version', () => {
+  assert.equal(SPEND_GUARD_PRICE_TABLE_VERSION, 'prices-v3');
   assert.equal(isModelPriceTableVersion(SPEND_GUARD_PRICE_TABLE_VERSION), true);
   assert.notEqual(SPEND_GUARD_PRICE_TABLE_VERSION, MODEL_PRICE_TABLE_VERSION); // guard table != default (prices-v1)
 });

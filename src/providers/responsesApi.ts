@@ -34,8 +34,16 @@ export function createResponsesApiAdapter(config: {
   maxTokensParam: string;
   /** The declared web-search tool entry (tools-v1), sent verbatim in `tools`. */
   webSearchTool: Record<string, unknown>;
-  /** The declared cap on server-side tool calls (`max_tool_calls`). */
-  maxToolCalls: number;
+  /**
+   * The provider's OWN documented request-side bound on agentic tool use —
+   * `max_tool_calls` for OpenAI, `max_turns` for xAI (whose request parameters
+   * do not include `max_tool_calls`). Registry-selected for the same reason as
+   * the output-cap field: an undocumented parameter name is a live 400 or a
+   * silently uncapped run, and keeping it explicit makes upstream drift visible
+   * in the complete-wire canned tests.
+   */
+  toolCapParam: string;
+  toolCapValue: number;
   /** Extra `include` entries (openai: web_search_call.action.sources). */
   include?: readonly string[] | undefined;
 }): ProviderAdapter {
@@ -54,14 +62,20 @@ export function createResponsesApiAdapter(config: {
       const apiKey = envValue(config.credentialEnvVar);
       if (apiKey === undefined) throw new Error(`${config.credentialEnvVar} is not set`);
       const url = `${config.baseUrl}/responses`;
+      // A repair carries no declared tools, so the tool block, its cap, and the
+      // tool-scoped `include` all drop off the wire together (an `include`
+      // naming a tool that is not declared is not a request this API accepts).
+      const withTools = (options?.tools ?? 'declared') === 'declared';
       const requestBody: Record<string, unknown> = {
         model: config.requestedModelId,
         input: turns.map((t) => ({ role: t.role, content: t.content })),
-        tools: [config.webSearchTool],
-        max_tool_calls: config.maxToolCalls,
       };
-      if (config.include !== undefined && config.include.length > 0) {
-        requestBody['include'] = [...config.include];
+      if (withTools) {
+        requestBody['tools'] = [config.webSearchTool];
+        requestBody[config.toolCapParam] = config.toolCapValue;
+        if (config.include !== undefined && config.include.length > 0) {
+          requestBody['include'] = [...config.include];
+        }
       }
       if (options?.maxOutputTokens !== undefined) {
         requestBody[config.maxTokensParam] = options.maxOutputTokens;
@@ -99,14 +113,18 @@ export function createResponsesApiAdapter(config: {
         reasoningTokens: comparable.reasoningTokens,
         billableOutputTokens: comparable.billableOutputTokens,
       };
+      // Recorded params mirror the wire exactly, so the evidence shows whether
+      // this attempt could search at all.
       const requestParams: Record<string, unknown> = {
         endpoint: url,
         model: config.requestedModelId,
-        tools: [config.webSearchTool],
-        max_tool_calls: config.maxToolCalls,
       };
-      if (config.include !== undefined && config.include.length > 0) {
-        requestParams['include'] = [...config.include];
+      if (withTools) {
+        requestParams['tools'] = [config.webSearchTool];
+        requestParams[config.toolCapParam] = config.toolCapValue;
+        if (config.include !== undefined && config.include.length > 0) {
+          requestParams['include'] = [...config.include];
+        }
       }
       if (options?.maxOutputTokens !== undefined) {
         requestParams[config.maxTokensParam] = options.maxOutputTokens;

@@ -387,7 +387,7 @@ function bodyFromPrompt(turns: ChatTurn[]): string {
     forecasts.push({ market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: game.markets.moneyline.awayDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.moneyline.evidenceRef], reasonCode: null, axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 }, primaryAxis: 'valuation', primaryExpectation: 'The away price reads rich against the implied probabilities.' });
   }
   if (game.markets.total) {
-    forecasts.push({ market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, probabilities: { win: 0.5, push: 0, loss: 0.5 }, confidence: 0.5, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.total.evidenceRef], reasonCode: null, axes: { valuation: 3, trend: 1, consensus: 5, news: 2, softness: 4 }, primaryAxis: null, primaryExpectation: null });
+    forecasts.push({ market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, probabilities: { win: 0.5, push: 0, loss: 0.5 }, confidence: 0.5, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.total.evidenceRef], reasonCode: null, axes: { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 }, primaryAxis: null, primaryExpectation: 'No material movement is expected in this total before close.' });
   }
   const body: BenchmarkResponse = {
     schemaVersion: 2,

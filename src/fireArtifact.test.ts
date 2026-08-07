@@ -130,14 +130,55 @@ test('decisionFingerprint entries bind exactly the decision fields, excluding th
   assert.ok(!('reasonCode' in entry));
 });
 
+/** A v2 forecast: the analysis fields the fingerprint now binds. */
+function analyzedForecast(over: Partial<ForecastOutput> = {}): ForecastOutput {
+  return forecast({
+    axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 },
+    primaryAxis: 'valuation',
+    primaryExpectation: 'The price reads rich against the implied probabilities.',
+    ...over,
+  });
+}
+
 test('decisionFingerprint decision fields correspond exactly to schema.ts forecastFingerprint (drift guard)', () => {
-  const ffKeys = Object.keys(forecastFingerprint(forecast())).sort();
-  const entry = first(decisionFingerprint(response([forecast()])));
+  // Compared on a v2 forecast, so BOTH sides carry the analysis fields: a field
+  // added to one owner and not the other fails here.
+  const ffKeys = Object.keys(forecastFingerprint(analyzedForecast())).sort();
+  const entry = first(decisionFingerprint(response([analyzedForecast()])));
   const entryDecisionKeys = [
     ...Object.keys(entry).filter((k) => k !== 'gameId' && k !== 'market' && k !== 'probabilities'),
     ...Object.keys(entry.probabilities),
   ].sort();
   assert.deepEqual(entryDecisionKeys, ffKeys);
+});
+
+test('the analysis fields are decision-bearing: a v2 entry binds all three, a v1 entry omits all three', () => {
+  const v2 = first(decisionFingerprint(response([analyzedForecast()])));
+  assert.deepEqual(v2.axes, { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 });
+  assert.equal(v2.primaryAxis, 'valuation');
+  assert.equal(v2.primaryExpectation, 'The price reads rich against the implied probabilities.');
+  // A v2 forecast with no dominant axis still binds all three keys (primaryAxis
+  // null is a real v2 value, not the v1 "no analysis" state).
+  const allOnes = first(
+    decisionFingerprint(
+      response([
+        analyzedForecast({
+          axes: { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 },
+          primaryAxis: null,
+          primaryExpectation: null,
+        }),
+      ]),
+    ),
+  );
+  assert.ok(Object.hasOwn(allOnes, 'axes'));
+  assert.equal(allOnes.primaryAxis, null);
+  assert.equal(allOnes.primaryExpectation, null);
+  // A pre-axes body omits the keys entirely, so its entry canonicalizes — and
+  // therefore digests — exactly as it did before the fields existed.
+  const v1 = first(decisionFingerprint(response([forecast()])));
+  for (const key of ['axes', 'primaryAxis', 'primaryExpectation']) {
+    assert.ok(!Object.hasOwn(v1, key), `a v1 entry must not carry ${key}`);
+  }
 });
 
 test('decisionFingerprint sorts entries into canonical market order regardless of input order', () => {

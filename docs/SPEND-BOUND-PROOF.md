@@ -63,30 +63,74 @@ sound per-fire ceiling and the per-attempt guard can only trip on a genuine anom
 
 ## Web-search fees (tools-v1)
 
-Every arm runs the cohort-declared provider web-search tool (`toolInferenceConfigSha256`,
-tools-v1), which adds a PER-INVOCATION fee on top of the token model above. Documented rates as
-observed 2026-08-07: openai $10 / 1,000 calls (capped at `max_tool_calls: 5` per attempt →
-≤ $0.05), anthropic $10 / 1,000 searches (capped at `max_uses: 5` → ≤ $0.05), xai $5 / 1,000
-calls (capped at `max_tool_calls: 5` → ≤ $0.025), google $14 / 1,000 queries on this model
-generation with NO provider-side cap — the model decides how many queries run. Even a pathological
-100-query google attempt adds $1.40; at the documented rates the per-attempt search fee stays well
-under the ~$44 of headroom the token worst case leaves against the $100 reservation, so the
-reservation stays a sound per-attempt ceiling.
+Every arm runs the cohort-declared web-search tool, which adds a PER-INVOCATION fee on top of
+the token model above. Those fees are now PRICED INTO the derived actual (`prices-v3`), not
+assumed away: each attempt carries a billable search count, and the guard multiplies it by the
+provider's published rate. Rates and units as observed 2026-08-07 (each provider bills a
+different unit, so each row prices the unit that provider actually bills):
 
-Two search-fee facts are deliberately NOT in the derived-actual arithmetic (a conscious exemption,
-not an oversight): the openai and google usage objects carry no per-search counter, so a search fee
-for them cannot be recomputed from durable usage evidence; anthropic
-(`server_tool_use.web_search_requests`) and xai (`server_side_tool_usage_details.web_search_calls`,
-plus its integer `cost_in_usd_ticks`) counters ARE whitelisted into the spend sidecar as evidence.
-Search-content tokens DO land in the token model (openai/anthropic bill them as ordinary tokens;
-google surfaces them as the additively-priced `toolUsePromptTokenCount` bucket).
+| arm | fee | unit | request-side bound |
+|---|---|---|---|
+| `gpt-5.6-sol` | $10.00 / 1k | search ACTION | `max_tool_calls: 5` — documented request param, bounds built-in tool calls |
+| `claude-fable-5` | $10.00 / 1k | search (one use regardless of results; errors unbilled) | `max_uses: 5` — bounds searches exactly |
+| `gemini-3.1-pro-preview` | $14.00 / 1k | executed QUERY (one prompt may run several) | **none exists** |
+| `grok-4.5` | $5.00 / 1k | successful call | `max_turns: 5` — coarse: one turn may run tools in parallel |
+
+Two provider facts are load-bearing and were verified against current official documentation
+rather than assumed:
+
+- **Google exposes no cap of any kind.** Its entire grounding tool config is a time-range filter
+  and a search-type selector; the model decides how many queries to run, and Gemini 3.x bills per
+  executed query. The declared `maxSearchesPerAttempt` is therefore enforced provider-side on the
+  other three arms and OBSERVED-AND-PRICED on this one.
+- **xAI documents `max_turns`, not `max_tool_calls`, as a request parameter** (`max_tool_calls`
+  appears only in its response schema). Sending the undocumented field would either fail the
+  request or be silently ignored, so the declared cap rides the documented parameter.
+
+### Why the reservation still holds without a Google cap
+
+The bound no longer depends on any provider bounding search volume, because the fee is priced per
+search and compared against the same per-attempt reservation as tokens. Google is both the
+uncapped arm and the most expensive per unit, so it sets the worst case: at $0.014 per query, an
+attempt would need **7,143 executed queries** for search fees alone to reach the $100 reservation —
+three orders of magnitude beyond the declared ceiling, and beyond what the response could carry
+(Google's own non-configurable `TOO_MANY_TOOL_CALLS` stop and the context window bound the loop
+first). Adding the token worst case does not change the conclusion: the largest per-attempt token
+figure above is $56.40, leaving ~$43 of headroom, i.e. ~3,100 further Google queries.
+
+The residual risk is therefore not spend but PARITY: Google may execute more searches than the
+capped arms, so the cohort cannot claim identical search budgets across arms. That is disclosed
+rather than asserted away. If strict parity is required, the remedy is a tools-v1 config change
+(drop Google's search tool), not a code change — and it would then be the only arm without search,
+which is its own parity problem.
+
+### Unknown counts escalate; they never read as free
+
+A response that proves a search ran but does not permit deriving the count — Gemini 3.x previews
+have been observed omitting `groundingMetadata` while `toolUsePromptTokenCount` shows tool use —
+yields `searchCount: null`, which the arithmetic treats as UNPRICEABLE and raises as the same typed
+UNKNOWN an absent additive token bucket raises. The fire escalates rather than settling on a fee
+assumed to be zero. Pinning a pre-search price version (`prices-v1`/`prices-v2`) while a nonzero
+search count is recorded fails closed the same way.
+
+The count is persisted per attempt in the spend sidecar, so the offline pair verifier recomputes
+the search fee from durable evidence for the two providers (OpenAI, Google) whose usage objects
+carry no search counter of their own. Anthropic and xAI additionally report counters in `usage`,
+which are whitelisted into the sidecar as independent corroboration.
+
+One documented ambiguity remains, in the safe direction: OpenAI does not state whether a single
+search action carrying several query strings bills as one call or several. The count follows the
+per-action wording (one call), while an item whose action cannot be read is counted as a search
+anyway — over-estimating rather than omitting.
+
+### Usage shapes
 
 The openai and xai arms report usage in their Responses-API shape
 (`input_tokens`/`output_tokens`/`output_tokens_details.reasoning_tokens`); the guard prices BOTH
 that shape and the legacy chat-completions shape, so archived sidecar evidence keeps re-verifying.
-For xai the Responses shape's reasoning additivity is decided per response by arithmetic against
-`total_tokens`, pricing the larger reading when no total discriminates — the over-estimate
-direction the whole module is built around.
+Reasoning is a SUBSET of output on OpenAI and Anthropic and ADDITIVE on Google and xAI; for the
+xAI Responses shape, whose docs do not state it, additivity is decided per response by arithmetic
+against `total_tokens`, pricing the larger reading when no total discriminates.
 
 ## Caveats
 

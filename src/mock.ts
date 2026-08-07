@@ -170,10 +170,11 @@ function buildForecast(
   const win = round6(pWin * (1 - push));
   const loss = round6(1 - win - push);
 
-  // Deterministic v2 analysis fields, distinct per market and pairwise
-  // distinct within each axes object (so an axis swap is never
-  // output-equivalent); the total forecast exercises the null primaryAxis /
-  // null primaryExpectation pairing.
+  // Deterministic v2 analysis, distinct per market and pairwise distinct WITHIN
+  // each rated axes object (so an axis swap is never output-equivalent). The
+  // total forecast is the all-ones case the prompt describes: no primary
+  // driver, and an expectation that states no material movement — which also
+  // exercises the null-axis / non-null-expectation combination.
   const analysis =
     market === 'moneyline'
       ? {
@@ -188,9 +189,9 @@ function buildForecast(
             primaryExpectation: 'Recent form favors the selected side on the designated run line.',
           }
         : {
-            axes: { valuation: 3, trend: 1, consensus: 5, news: 2, softness: 4 },
+            axes: { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 },
             primaryAxis: null,
-            primaryExpectation: null,
+            primaryExpectation: 'No material movement is expected in this total before close.',
           };
 
   return {

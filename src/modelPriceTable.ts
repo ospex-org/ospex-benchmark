@@ -27,7 +27,7 @@ import { deepFreeze } from './freeze.js';
  * These are a dated baseline, not a claim of continuous freshness or exact final
  * billing. Price drift is a conscious `prices-vN` edit plus a manifest re-pin.
  */
-export const MODEL_PRICE_TABLE_VERSIONS = Object.freeze(['prices-v1', 'prices-v2'] as const);
+export const MODEL_PRICE_TABLE_VERSIONS = Object.freeze(['prices-v1', 'prices-v2', 'prices-v3'] as const);
 export type ModelPriceTableVersion = (typeof MODEL_PRICE_TABLE_VERSIONS)[number];
 
 /** The price-table version the harness stamps on NEW runs. */
@@ -42,7 +42,7 @@ export const MODEL_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v1';
  * tier) is retained unchanged for historical replay/validation; the default stamped
  * version stays `prices-v1` so existing manifests/cohortIds do not churn.
  */
-export const SPEND_GUARD_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v2';
+export const SPEND_GUARD_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v3';
 
 export function isModelPriceTableVersion(value: string): value is ModelPriceTableVersion {
   return (MODEL_PRICE_TABLE_VERSIONS as readonly string[]).includes(value);
@@ -52,6 +52,14 @@ export function isModelPriceTableVersion(value: string): value is ModelPriceTabl
 export interface ModelPrice {
   readonly inputUsdMicrosPerMillionTokens: number;
   readonly outputUsdMicrosPerMillionTokens: number;
+  /**
+   * Integer USD-micros per BILLABLE web search, present only in tables that
+   * price the declared search tool (`prices-v3` onward). Absent means the table
+   * cannot price search: a version pinned without it fails CLOSED the moment an
+   * attempt reports a nonzero search count, rather than silently pricing the
+   * fee at zero.
+   */
+  readonly searchUsdMicrosPerSearch?: number | undefined;
 }
 
 /** One price table: exact model-id → its rates. Module-private. */
@@ -90,6 +98,52 @@ const MODEL_PRICE_TABLE_V2: ModelPriceTable = {
 };
 
 /**
+ * `prices-v3` — the conservative guard table WITH the web-search fee, and the version a
+ * billable manifest must pin now that every arm runs the declared search tool. Token rates
+ * are `prices-v2`'s unchanged; the addition is `searchUsdMicrosPerSearch`, each provider's
+ * published per-invocation search fee (snapshot observed 2026-08-07, reconcile again
+ * immediately before any paid run):
+ *   - `gpt-5.6-sol` ........... OpenAI: $10.00 / 1,000 calls = $0.01 per call. Billed per
+ *       search ACTION ("Search actions incur a tool call cost"); page-navigation actions
+ *       carry no documented fee. Search content tokens bill as ordinary model tokens.
+ *   - `claude-fable-5` ........ Anthropic: $10.00 / 1,000 searches = $0.01 per search. "Each
+ *       web search counts as one use, regardless of the number of results returned"; errored
+ *       searches are not billed. Search results bill as input tokens.
+ *   - `gemini-3.1-pro-preview`  Google: $14.00 / 1,000 executed QUERIES = $0.014 per query
+ *       (Gemini 3.x bills per query the model chooses to execute, not per prompt; the free
+ *       monthly allowance is deliberately NOT modeled — a guard that assumed free searches
+ *       would under-count). Retrieved context is not charged as input tokens.
+ *   - `grok-4.5` .............. xAI: $5.00 / 1,000 calls = $0.005 per call; only successful
+ *       executions bill.
+ * The unit differs per provider (call vs executed query) and each table row prices the unit
+ * that provider actually bills, which is why the count is derived per provider rather than
+ * normalized. `prices-v1`/`prices-v2` are retained UNCHANGED for replay of evidence produced
+ * under them; the default stamped version stays `prices-v1`.
+ */
+const MODEL_PRICE_TABLE_V3: ModelPriceTable = {
+  'gpt-5.6-sol': {
+    inputUsdMicrosPerMillionTokens: 12_500_000,
+    outputUsdMicrosPerMillionTokens: 60_000_000,
+    searchUsdMicrosPerSearch: 10_000,
+  },
+  'claude-fable-5': {
+    inputUsdMicrosPerMillionTokens: 10_000_000,
+    outputUsdMicrosPerMillionTokens: 50_000_000,
+    searchUsdMicrosPerSearch: 10_000,
+  },
+  'gemini-3.1-pro-preview': {
+    inputUsdMicrosPerMillionTokens: 4_000_000,
+    outputUsdMicrosPerMillionTokens: 18_000_000,
+    searchUsdMicrosPerSearch: 14_000,
+  },
+  'grok-4.5': {
+    inputUsdMicrosPerMillionTokens: 4_000_000,
+    outputUsdMicrosPerMillionTokens: 12_000_000,
+    searchUsdMicrosPerSearch: 5_000,
+  },
+};
+
+/**
  * The version→table registry, **deep-frozen** so neither the registry, the price
  * tables, nor their rate rows can be mutated at runtime. `prices-v1` therefore
  * denotes exactly one immutable table, and its digest can never go stale relative
@@ -98,6 +152,7 @@ const MODEL_PRICE_TABLE_V2: ModelPriceTable = {
 const PRICE_TABLES: Readonly<Record<ModelPriceTableVersion, ModelPriceTable>> = deepFreeze({
   'prices-v1': MODEL_PRICE_TABLE_V1,
   'prices-v2': MODEL_PRICE_TABLE_V2,
+  'prices-v3': MODEL_PRICE_TABLE_V3,
 });
 
 /** The price table for a KNOWN version; throws on an unknown version. */

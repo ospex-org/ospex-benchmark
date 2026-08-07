@@ -335,6 +335,18 @@ export interface ChatTurn {
 export interface ProviderCallOptions {
   /** Cap on generated tokens; used by preflight. Omitted = provider default. */
   maxOutputTokens?: number | undefined;
+  /**
+   * Whether this call carries the cohort's declared server-side tools.
+   * `'declared'` (the default) sends the tool configuration; `'none'` sends no
+   * tools at all.
+   *
+   * The repair attempt uses `'none'`: a repair is format-only and may carry no
+   * new market information (docs/BENCHMARK_PROMPT_V0.md, "Parsing and repair
+   * policy"). A repair that could search would let the model gather fresh
+   * information for a second, independent read of the market — which is a new
+   * decision, not a reformatting of the first one.
+   */
+  tools?: 'declared' | 'none' | undefined;
 }
 
 export interface ProviderAdapter {

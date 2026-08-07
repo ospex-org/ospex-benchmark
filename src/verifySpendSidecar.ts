@@ -8,7 +8,7 @@ import { parseFireArtifactV1, verifyFireArtifactReplay } from './fireArtifactWri
 import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import { SPEND_SIDECAR_SCHEMA_VERSION, TOKEN_FIELD_WHITELIST } from './spendEscalationSidecar.js';
 import { classifyAttemptSpend, computeFireSpendGuard } from './spendGuard.js';
-import type { GuardArmInput } from './spendGuard.js';
+import type { GuardArmInput, GuardAttemptInput } from './spendGuard.js';
 import { PROVIDER_ATTEMPT_RESERVATION_USD_MICROS } from './spendReservationPolicy.js';
 import { ARMS } from './providers/index.js';
 import { isParseableInstant } from './time.js';
@@ -96,6 +96,14 @@ const ATTEMPT_KEYS = [
   'derivedActualUsdMicros',
 ] as const;
 
+/**
+ * Keys an attempt MAY carry beyond the required set. `searchCount` was added
+ * when the declared web-search tool was enabled: sidecars written before it
+ * omit the key entirely, so accepting-when-absent is what keeps that evidence
+ * verifiable. Anything outside the required set ∪ this set is still rejected.
+ */
+const OPTIONAL_ATTEMPT_KEYS = ['searchCount'] as const;
+
 const PROVIDERS: readonly string[] = ['openai', 'anthropic', 'google', 'xai'];
 const SPEND_CLASSES: readonly string[] = ['known_zero', 'zero', 'price', 'unknown'];
 const STATUSES: readonly string[] = ['pass', 'breach', 'unknown'];
@@ -144,9 +152,13 @@ export interface SidecarVerification {
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0;
 }
-function exactKeys(value: Record<string, unknown>, expected: readonly string[]): string | null {
+function exactKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  alsoAllowed: readonly string[] = [],
+): string | null {
   const keys = Object.keys(value).sort();
-  const want = [...expected].sort();
+  const want = [...expected, ...alsoAllowed].sort();
   if (keys.length === want.length && keys.every((k, i) => k === want[i])) return null;
   return `keys [${keys.join(', ')}] != expected [${want.join(', ')}]`;
 }
@@ -210,8 +222,21 @@ function parseSidecarRecord(raw: unknown): SpendEscalationSidecarV1 {
       throw new Error(`attempts[${index}] is not a plain object`);
     }
     const attempt = entry as Record<string, unknown>;
-    const attemptKeyIssue = exactKeys(attempt, ATTEMPT_KEYS);
+    const attemptKeyIssue = exactKeys(
+      attempt,
+      ATTEMPT_KEYS,
+      OPTIONAL_ATTEMPT_KEYS.filter((key) => Object.hasOwn(attempt, key)),
+    );
     if (attemptKeyIssue !== null) throw new Error(`attempts[${index}] ${attemptKeyIssue}`);
+    if (Object.hasOwn(attempt, 'searchCount')) {
+      const searchCount = attempt['searchCount'];
+      if (
+        searchCount !== null &&
+        (typeof searchCount !== 'number' || !Number.isSafeInteger(searchCount) || searchCount < 0)
+      ) {
+        throw new Error(`attempts[${index}].searchCount must be a nonnegative safe integer or null`);
+      }
+    }
     for (const field of ['participantId', 'requestedModelId']) {
       if (!isNonEmptyString(attempt[field])) throw new Error(`attempts[${index}].${field} must be a non-empty string`);
     }
@@ -524,6 +549,10 @@ export function verifySpendEvidence(input: SpendEvidenceInput): SidecarVerificat
           requestedModelId: row.requestedModelId,
           priceVersion: SPEND_GUARD_PRICE_TABLE_VERSION,
           usageRaw: rebuilt,
+          // The persisted count is what makes the search fee recomputable
+          // offline for the providers whose usage carries no search counter.
+          // Absent (pre-search evidence) prices exactly as it always did.
+          ...(Object.hasOwn(row, 'searchCount') ? { searchCount: row.searchCount } : {}),
         });
       } catch (error) {
         if (!(error instanceof ConservativeSpendUnknownError)) throw error;
@@ -631,9 +660,10 @@ export function verifySpendEvidence(input: SpendEvidenceInput): SidecarVerificat
     const guardArms: GuardArmInput[] = artifact.expectedArmIdentities.map((identity) => {
       const initial = record.attempts.find((r) => r.participantId === identity.participantId && r.role === 'initial');
       const repair = record.attempts.find((r) => r.participantId === identity.participantId && r.role === 'repair');
-      const leg = (row: SidecarAttemptRecord | undefined): { requestAt: string | null; usageRaw: unknown } => ({
+      const leg = (row: SidecarAttemptRecord | undefined): GuardAttemptInput => ({
         requestAt: row?.requestAt ?? null,
         usageRaw: row?.usageTokens == null ? null : rebuildUsageRaw(row.usageTokens),
+        ...(row !== undefined && Object.hasOwn(row, 'searchCount') ? { searchCount: row.searchCount } : {}),
       });
       return {
         participantId: identity.participantId,

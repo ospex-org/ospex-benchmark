@@ -147,9 +147,9 @@ function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): Bench
       rationale: 'Total priced evenly at the designated line.',
       evidenceRefs: [total.evidenceRef],
       reasonCode: null,
-      axes: { valuation: 3, trend: 1, consensus: 5, news: 2, softness: 4 },
+      axes: { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 },
       primaryAxis: null,
-      primaryExpectation: null,
+      primaryExpectation: 'No material movement is expected in this total before close.',
     });
   }
   return {

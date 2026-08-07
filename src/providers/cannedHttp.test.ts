@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ProviderHttpError, ProviderTimeoutError } from './errors.js';
+import { ProviderHttpError, ProviderTimeoutError, ProviderUnfinishedTurnError } from './errors.js';
 import { ARMS, createRealAdapters } from './index.js';
 import type { ChatTurn, ProviderAdapter } from '../types.js';
 
@@ -130,7 +130,7 @@ test('openai registry adapter: COMPLETE exact request, finite output-token param
               status: 'completed',
               action: {
                 type: 'search',
-                query: 'brewers pirates probable pitchers',
+                queries: ['brewers pirates probable pitchers', 'pnc park weather'],
                 sources: ['https://news.example/one'],
               },
             },
@@ -196,13 +196,16 @@ test('openai registry adapter: COMPLETE exact request, finite output-token param
   assert.deepEqual(result.usageRaw, cannedUsage);
   // The audit trail: the executed query, the sourced URL (title-less), and the
   // titled citation; openai reports no usage-side search counter.
+  // The audit records both executed queries, the sourced URL (title-less) and
+  // the titled citation, and counts ONE billable call — the fee attaches to the
+  // search ACTION, not to each query string it carried.
   assert.deepEqual(result.searchAudit, {
-    queries: [{ query: 'brewers pirates probable pitchers' }],
+    queries: [{ query: 'brewers pirates probable pitchers' }, { query: 'pnc park weather' }],
     results: [
       { url: 'https://news.example/one', title: null },
       { url: 'https://news.example/one', title: 'Source One' },
     ],
-    searchCount: null,
+    searchCount: 1,
     incomplete: [],
   });
 });
@@ -268,7 +271,10 @@ test('xai registry adapter: COMPLETE exact request under max_output_tokens, verb
         { role: 'user', content: 'user prompt' },
       ],
       tools: [{ type: 'web_search' }],
-      max_tool_calls: 5,
+      // xAI documents max_turns as its request-side bound; max_tool_calls
+      // appears only in xAI's RESPONSE schema, so sending it would be an
+      // undocumented request field.
+      max_turns: 5,
       max_output_tokens: 16_000,
     },
   });
@@ -429,7 +435,7 @@ test('anthropic adapter: a max_uses_exceeded tool-result error object is recorde
     queries: [{ query: 'one query too many' }],
     results: [],
     searchCount: 1,
-    incomplete: ['web_search_tool_result error: max_uses_exceeded'],
+    incomplete: ['web search tool returned an error: max_uses_exceeded'],
   });
 });
 
@@ -525,12 +531,13 @@ test('google registry adapter: COMPLETE exact request, finite generationConfig c
   });
   assert.deepEqual(result.usageRaw, cannedUsage);
   assert.equal((result.usageRaw as { thoughtsTokenCount: number }).thoughtsTokenCount, 900);
-  // The audit trail: every executed query and the (redirect-URI) source chunk;
-  // google reports no usage-side search counter.
+  // The audit trail: every executed query and the (redirect-URI) source chunk.
+  // Google bills PER EXECUTED QUERY and reports no counter, so the executed-query
+  // list IS the billable count — two queries here, not one "grounded prompt".
   assert.deepEqual(result.searchAudit, {
     queries: [{ query: 'brewers pirates weather' }, { query: 'pnc park wind august 7' }],
     results: [{ url: 'https://vertexaisearch.cloud.google.com/redirect-1', title: 'weather.example' }],
-    searchCount: null,
+    searchCount: 2,
     incomplete: [],
   });
 });
@@ -554,11 +561,17 @@ test('google adapter: grounding metadata MISSING while tool-use tokens prove a s
       () => registryAdapter('google-gemini-3.1-pro-preview').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
     ),
   );
+  // Count UNKNOWN, not zero: the fee cannot be derived, so this attempt prices
+  // as unpriceable spend and escalates rather than reading as a free search.
   assert.deepEqual(result.searchAudit, {
     queries: [],
     results: [],
     searchCount: null,
-    incomplete: ['groundingMetadata missing while toolUsePromptTokenCount > 0'],
+    incomplete: [
+      'grounding metadata missing while tool-use tokens prove a search ran',
+      'grounding sources present without the executed queries',
+      'billable search count is not derivable from this response',
+    ],
   });
 });
 
@@ -598,4 +611,202 @@ test('an aborted call surfaces as ProviderTimeoutError (the timeout classificati
       },
     );
   });
+});
+
+// ---------------------------------------------------------------------------
+// unfinished turns, the tool-free repair wire, and audit honesty
+// ---------------------------------------------------------------------------
+
+test('anthropic pause_turn is a TYPED failure carrying its usage and audit — never an empty response that reads as invalid model JSON', async () => {
+  // A paused server-tool loop is HTTP 200 with (typically) no answer text. Left
+  // untyped it reaches the runner as an unparseable body and is scored as a
+  // schema failure — a protocol state misread as a model failure.
+  const cannedUsage = {
+    input_tokens: 900,
+    output_tokens: 120,
+    server_tool_use: { web_search_requests: 3 },
+  };
+  await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, async () => {
+    await withCannedFetch(
+      () =>
+        jsonResponse({
+          id: 'msg_paused_1',
+          model: 'claude-fable-5',
+          stop_reason: 'pause_turn',
+          content: [
+            { type: 'server_tool_use', id: 'srvtoolu_p1', name: 'web_search', input: { query: 'deep dive' } },
+          ],
+          usage: cannedUsage,
+        }),
+      async () => {
+        await assert.rejects(
+          () => registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+          (e: unknown) => {
+            assert.ok(e instanceof ProviderUnfinishedTurnError, 'must be the typed unfinished-turn failure');
+            assert.equal(e.stopReason, 'pause_turn');
+            // The paid call's own evidence rides on the error, so the money
+            // guard prices what it cost instead of escalating on absent usage.
+            assert.deepEqual(e.usage, cannedUsage);
+            const carried = e.searchAudit as { searchCount: number; queries: Array<{ query: string }> };
+            assert.equal(carried.searchCount, 3);
+            assert.deepEqual(carried.queries, [{ query: 'deep dive' }]);
+            return true;
+          },
+        );
+        return null;
+      },
+    );
+  });
+});
+
+test('anthropic refusal is the same typed failure — a declined request is never scored as invalid model output', async () => {
+  await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, async () => {
+    await withCannedFetch(
+      () =>
+        jsonResponse({
+          id: 'msg_refused_1',
+          model: 'claude-fable-5',
+          stop_reason: 'refusal',
+          content: [],
+          usage: { input_tokens: 700, output_tokens: 0 },
+        }),
+      async () => {
+        await assert.rejects(
+          () => registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+          (e: unknown) => e instanceof ProviderUnfinishedTurnError && e.stopReason === 'refusal',
+        );
+        return null;
+      },
+    );
+  });
+});
+
+test('a REPAIR call carries no tools on any arm — a format-only repair cannot search', async () => {
+  // openai / xai: the tool block, its cap, and the tool-scoped include all drop.
+  const responsesArms = [
+    ['openai-gpt-5.6-sol', 'OPENAI_API_KEY', 'gpt-5.6-sol'],
+    ['xai-grok-4.5', 'XAI_API_KEY', 'grok-4.5'],
+  ] as const;
+  for (const [participant, env, model] of responsesArms) {
+    const { calls } = await withEnv(env, SYNTHETIC_KEY, () =>
+      withCannedFetch(
+        () => jsonResponse({ id: 'r', model, output: [], usage: {} }),
+        () => registryAdapter(participant).chat(TURNS, 5_000, { maxOutputTokens: 16_000, tools: 'none' }),
+      ),
+    );
+    assert.deepEqual(
+      calls[0]!.body,
+      {
+        model,
+        input: [
+          { role: 'system', content: 'system prompt' },
+          { role: 'user', content: 'user prompt' },
+        ],
+        max_output_tokens: 16_000,
+      },
+      `${participant} repair body must carry no tool fields`,
+    );
+  }
+
+  // anthropic: no `tools` key at all.
+  const { calls: anthropicCalls } = await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedFetch(
+      () => jsonResponse({ id: 'm', model: 'claude-fable-5', content: [], usage: {} }),
+      () => registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, { maxOutputTokens: 16_000, tools: 'none' }),
+    ),
+  );
+  assert.deepEqual(anthropicCalls[0]!.body, {
+    model: 'claude-fable-5',
+    max_tokens: 16_000,
+    system: 'system prompt',
+    messages: [{ role: 'user', content: 'user prompt' }],
+  });
+
+  // google: no `tools` key at all.
+  const { calls: googleCalls } = await withEnv('GEMINI_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedFetch(
+      () => jsonResponse({ responseId: 'r', modelVersion: 'gemini-3.1-pro-preview', candidates: [] }),
+      () =>
+        registryAdapter('google-gemini-3.1-pro-preview').chat(TURNS, 5_000, {
+          maxOutputTokens: 16_000,
+          tools: 'none',
+        }),
+    ),
+  );
+  assert.deepEqual(googleCalls[0]!.body, {
+    systemInstruction: { parts: [{ text: 'system prompt' }] },
+    contents: [{ role: 'user', parts: [{ text: 'user prompt' }] }],
+    generationConfig: { maxOutputTokens: 16_000 },
+  });
+
+  // Negative control: the SAME adapter DOES declare tools on a normal attempt.
+  const { calls: searchCalls } = await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedFetch(
+      () => jsonResponse({ id: 'r', model: 'gpt-5.6-sol', output: [], usage: {} }),
+      () => registryAdapter('openai-gpt-5.6-sol').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+    ),
+  );
+  assert.deepEqual((searchCalls[0]!.body as { tools: unknown }).tools, [{ type: 'web_search' }]);
+});
+
+test('openai audit: the DEPRECATED singular query still parses, and an unreadable action is counted but flagged', async () => {
+  const { result } = await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedFetch(
+      () =>
+        jsonResponse({
+          id: 'resp_mixed',
+          model: 'gpt-5.6-sol',
+          output: [
+            // The deprecated singular form, still shown in OpenAI's own guide example.
+            { type: 'web_search_call', id: 'ws_1', status: 'completed', action: { type: 'search', query: 'legacy shape' } },
+            // No action object at all — documented as possible; counted as a
+            // billable search (over-estimating the fee is the safe direction).
+            { type: 'web_search_call', id: 'ws_2', status: 'completed' },
+            // A page-open action is not a billable search and carries no query.
+            { type: 'web_search_call', id: 'ws_3', status: 'completed', action: { type: 'open_page', url: 'https://e.example' } },
+          ],
+          usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+        }),
+      () => registryAdapter('openai-gpt-5.6-sol').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+    ),
+  );
+  assert.deepEqual(result.searchAudit, {
+    queries: [{ query: 'legacy shape' }],
+    results: [],
+    searchCount: 2,
+    incomplete: [
+      'search call item carried no readable query text',
+      'query text unavailable for one or more executed searches',
+    ],
+  });
+});
+
+test('a reported count that outruns the recorded queries is FLAGGED — the "false complete" shape cannot pass as complete', async () => {
+  // xAI publishes no field-level schema for its search-call item, so the query
+  // text is routinely absent while the billing counter is authoritative. The
+  // gap is recorded; the COUNT stays known, so it prices without escalating.
+  const { result } = await withEnv('XAI_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedFetch(
+      () =>
+        jsonResponse({
+          id: 'resp_xai_opaque',
+          model: 'grok-4.5',
+          output: [{ type: 'web_search_call', id: 'ws', status: 'completed' }],
+          citations: ['https://x.example/one'],
+          usage: {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            server_side_tool_usage_details: { web_search_calls: 4 },
+          },
+        }),
+      () => registryAdapter('xai-grok-4.5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+    ),
+  );
+  assert.equal(result.searchAudit?.searchCount, 4, 'the provider billing counter is authoritative');
+  assert.deepEqual(result.searchAudit?.queries, []);
+  assert.deepEqual(result.searchAudit?.incomplete, [
+    'search call item carried no readable query text',
+    'query text unavailable for one or more executed searches',
+  ]);
 });

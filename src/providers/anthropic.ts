@@ -1,5 +1,6 @@
 import { envValue } from '../config.js';
 import { postJson } from './http.js';
+import { ProviderUnfinishedTurnError } from './errors.js';
 import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractAnthropicSearchAudit } from './searchAudit.js';
@@ -39,20 +40,46 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
         .filter((t) => t.role !== 'system')
         .map((t) => ({ role: t.role, content: t.content }));
       const maxTokens = options?.maxOutputTokens ?? DEFAULT_MAX_TOKENS;
+      // A repair carries no declared tools (format-only, may not search).
+      const withTools = (options?.tools ?? 'declared') === 'declared';
       const tools = [{ ...WEB_SEARCH.tool, max_uses: WEB_SEARCH.maxUses }];
+      const body: Record<string, unknown> = {
+        model: requestedModelId,
+        max_tokens: maxTokens,
+        system,
+        messages,
+      };
+      if (withTools) body['tools'] = tools;
       const { status, json: raw } = await postJson({
         provider: 'anthropic',
         url: ANTHROPIC_URL,
         headers: { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION },
-        body: { model: requestedModelId, max_tokens: maxTokens, system, messages, tools },
+        body,
         timeoutMs,
       });
       const json = raw as {
         id?: unknown;
         model?: unknown;
+        stop_reason?: unknown;
         content?: Array<{ type?: unknown; text?: unknown }>;
         usage?: { input_tokens?: unknown; output_tokens?: unknown };
       };
+
+      // An unfinished turn is HTTP 200 with empty or partial content. Surfacing
+      // it as a typed failure — carrying this call's own usage and audit —
+      // keeps it from reading downstream as a model that emitted invalid JSON.
+      if (json.stop_reason === 'pause_turn' || json.stop_reason === 'refusal') {
+        throw new ProviderUnfinishedTurnError({
+          provider: 'anthropic',
+          stopReason: json.stop_reason,
+          detail:
+            json.stop_reason === 'pause_turn'
+              ? 'the server-side tool loop hit its iteration limit; continuation is not enabled (maxServerToolContinuations)'
+              : 'the request was declined by the provider safety classifiers',
+          usage: json.usage ?? null,
+          searchAudit: extractAnthropicSearchAudit(raw),
+        });
+      }
 
       const text = Array.isArray(json.content)
         ? json.content
@@ -84,7 +111,7 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
           model: requestedModelId,
           max_tokens: maxTokens,
           anthropic_version: ANTHROPIC_VERSION,
-          tools,
+          ...(withTools ? { tools } : {}),
         },
         searchAudit: extractAnthropicSearchAudit(raw),
       };

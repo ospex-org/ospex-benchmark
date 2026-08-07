@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { AXIS_NAMES } from './types.js';
 import type {
   ArmSpec,
+  AxesScores,
+  AxisName,
   BenchmarkResponse,
   ForecastOutput,
   GameBundle,
@@ -68,26 +70,68 @@ const axesSchema = z
   })
   .strict();
 
+/**
+ * Compactness bound on `primaryExpectation`. The prompt asks for ONE sentence;
+ * sentence COUNT is deliberately not machine-enforced, because every reliable
+ * splitter mis-fires on the abbreviations this domain actually produces ("St.
+ * Louis Cardinals"), and a false rejection costs a live arm. What is enforced
+ * is the bound that makes the field compact and single-claim: one line,
+ * non-empty, and at most this many characters.
+ */
+export const PRIMARY_EXPECTATION_MAX_CHARS = 400;
+
+const primaryExpectationSchema = z
+  .string()
+  .min(1)
+  .refine((s) => s.trim().length > 0, 'primaryExpectation must not be whitespace-only')
+  .refine((s) => !/[\r\n]/.test(s), 'primaryExpectation must be a single line')
+  .refine(
+    (s) => s.length <= PRIMARY_EXPECTATION_MAX_CHARS,
+    `primaryExpectation must be at most ${PRIMARY_EXPECTATION_MAX_CHARS} characters`,
+  );
+
 const forecastSchemaV2 = z
   .object({
     ...forecastShapeV1,
+    // v2 relaxes the v1 `.min(1)`: the system prompt directs the model to cite
+    // the bundle refs its rationale actually rests on, and to SAY SO instead of
+    // citing an unsupporting ref when the rationale rests on outside reasoning
+    // or a search it performed. Requiring one ref would force exactly the
+    // mis-citation the prompt forbids. Every PRESENT ref is still checked
+    // against the game's bundle entry in checkGame.
+    evidenceRefs: z.array(z.string().min(1)),
     axes: axesSchema,
     primaryAxis: z.enum(AXIS_NAMES).nullable(),
-    primaryExpectation: z
-      .string()
-      .min(1)
-      .refine((s) => s.trim().length > 0, 'primaryExpectation must not be whitespace-only')
-      .refine((s) => !s.includes('\n'), 'primaryExpectation must be one sentence on a single line')
-      .nullable(),
+    primaryExpectation: primaryExpectationSchema.nullable(),
   })
   .strict()
   .superRefine((forecast, ctx) => {
-    // primaryExpectation is paired to primaryAxis: null exactly when the axis is null.
-    if ((forecast.primaryAxis === null) !== (forecast.primaryExpectation === null)) {
+    // The prompt's own rule, enforced rather than left to prose: name one axis
+    // as the primary driver whenever any axis is above 1 (even when several
+    // share the highest rating), and name none when every axis is 1.
+    const allOne = AXIS_NAMES.every((axis) => forecast.axes[axis] === 1);
+    if (allOne && forecast.primaryAxis !== null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['primaryAxis'],
+        message: 'primaryAxis must be null when every axis is rated 1 (no material movement expected)',
+      });
+    }
+    if (!allOne && forecast.primaryAxis === null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['primaryAxis'],
+        message: 'primaryAxis must name the primary driver whenever any axis is rated above 1',
+      });
+    }
+    // A named driver always carries its one-sentence expectation. With no
+    // driver the expectation may state that no material movement is expected,
+    // or be null.
+    if (forecast.primaryAxis !== null && forecast.primaryExpectation === null) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['primaryExpectation'],
-        message: 'primaryExpectation must be null exactly when primaryAxis is null (and a sentence otherwise)',
+        message: 'primaryExpectation is required when primaryAxis names a driver',
       });
     }
   });
@@ -506,6 +550,16 @@ export interface ForecastFingerprint {
   confidence: number;
   wouldAbstain: boolean;
   selectedForExecution: boolean;
+  /**
+   * The v2 analysis is DECISION-BEARING, not prose: the axis ratings and the
+   * named driver are the forecast's actual read of the market, so a repair may
+   * neither change nor invent them. `axes` is `null` on a v1-shaped body — which
+   * is precisely why a response that omitted the analysis cannot be "repaired"
+   * into one that has it: the fingerprints differ and the repair is refused.
+   */
+  axes: AxesScores | null;
+  primaryAxis: AxisName | null;
+  primaryExpectation: string | null;
 }
 
 export type DecisionFingerprint = Map<string, ForecastFingerprint>;
@@ -521,7 +575,16 @@ export function forecastFingerprint(forecast: ForecastOutput): ForecastFingerpri
     confidence: forecast.confidence,
     wouldAbstain: forecast.wouldAbstain,
     selectedForExecution: forecast.selectedForExecution,
+    axes: forecast.axes ?? null,
+    primaryAxis: forecast.primaryAxis ?? null,
+    primaryExpectation: forecast.primaryExpectation ?? null,
   };
+}
+
+/** Exact equality of two axis-score sets; both absent is equal, one absent is not. */
+export function axesEqual(a: AxesScores | null, b: AxesScores | null): boolean {
+  if (a === null || b === null) return a === b;
+  return AXIS_NAMES.every((axis) => a[axis] === b[axis]);
 }
 
 /**
@@ -609,11 +672,18 @@ export function compareFingerprints(
       'confidence',
       'wouldAbstain',
       'selectedForExecution',
+      'primaryAxis',
+      'primaryExpectation',
     ];
     for (const field of fields) {
       if (a[field] !== b[field]) {
         diffs.push(`changed_decision_after_repair: ${key} ${field} changed`);
       }
+    }
+    // `axes` is the one structured field — compared per axis, with absent-vs-present
+    // counting as changed (a repair that supplies analysis the initial lacked).
+    if (!axesEqual(a.axes, b.axes)) {
+      diffs.push(`changed_decision_after_repair: ${key} axes changed`);
     }
   }
   return diffs;

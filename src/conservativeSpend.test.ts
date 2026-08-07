@@ -7,6 +7,8 @@ import {
   deriveConservativeActualUsdMicros,
 } from './conservativeSpend.js';
 import { MODEL_PRICE_TABLE_VERSION, SPEND_GUARD_PRICE_TABLE_VERSION } from './modelPriceTable.js';
+import { PROVIDER_ATTEMPT_RESERVATION_USD_MICROS } from './spendReservationPolicy.js';
+import { MAX_SEARCHES_PER_ATTEMPT } from './toolInferenceConfig.js';
 import { ARMS } from './providers/index.js';
 import type { ProviderName } from './types.js';
 
@@ -17,7 +19,9 @@ import type { ProviderName } from './types.js';
  * round UP, and fail closed to a typed UNKNOWN on any ambiguity — never a sentinel 0.
  */
 
-const V2 = SPEND_GUARD_PRICE_TABLE_VERSION; // 'prices-v2' — the conservative guard table ($10/$45, $10/$50, $4/$18, $4/$12)
+// The conservative guard table the code pins TODAY ('prices-v3'): prices-v2's token
+// rates unchanged, plus the per-search web-search fee.
+const GUARD = SPEND_GUARD_PRICE_TABLE_VERSION;
 const V1 = MODEL_PRICE_TABLE_VERSION; // 'prices-v1' — the cheaper base table
 
 // ── Exact per-provider correctness at prices-v2 ────────────────────────────────
@@ -27,7 +31,7 @@ test('openai: prices prompt·$12.50 + completion·$60; reasoning is a SUBSET, ne
   const cost = deriveConservativeActualUsdMicros({
     provider: 'openai',
     requestedModelId: 'gpt-5.6-sol',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: {
       prompt_tokens: 1490,
       completion_tokens: 512,
@@ -44,7 +48,7 @@ test('xai: reasoning is ADDITIVE — prompt·$4 + (completion + reasoning)·$12'
   const cost = deriveConservativeActualUsdMicros({
     provider: 'xai',
     requestedModelId: 'grok-4.5',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: {
       prompt_tokens: 1000,
       completion_tokens: 200,
@@ -62,7 +66,7 @@ test('anthropic: input·$10 + output·$50; cache_creation at the OUTPUT rate, ca
     deriveConservativeActualUsdMicros({
       provider: 'anthropic',
       requestedModelId: 'claude-fable-5',
-      priceVersion: V2,
+      priceVersion: GUARD,
       usageRaw: { input_tokens: 1512, output_tokens: 498 },
     }),
     40_020,
@@ -72,7 +76,7 @@ test('anthropic: input·$10 + output·$50; cache_creation at the OUTPUT rate, ca
   const cost = deriveConservativeActualUsdMicros({
     provider: 'anthropic',
     requestedModelId: 'claude-fable-5',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: {
       input_tokens: 1000,
       output_tokens: 500,
@@ -89,7 +93,7 @@ test('google: thoughtsTokenCount is a SEPARATE additive bucket — prompt·$4 + 
   const withThoughts = deriveConservativeActualUsdMicros({
     provider: 'google',
     requestedModelId: 'gemini-3.1-pro-preview',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 },
   });
   assert.equal(withThoughts, 19_828);
@@ -99,7 +103,7 @@ test('google: thoughtsTokenCount is a SEPARATE additive bucket — prompt·$4 + 
   const withoutThoughts = deriveConservativeActualUsdMicros({
     provider: 'google',
     requestedModelId: 'gemini-3.1-pro-preview',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 0, totalTokenCount: 1936 },
   });
   assert.equal(withoutThoughts, 14_338);
@@ -115,7 +119,7 @@ test('total-consistency: a reported total that disagrees with the reconstructed 
       deriveConservativeActualUsdMicros({
         provider: 'openai',
         requestedModelId: 'gpt-5.6-sol',
-        priceVersion: V2,
+        priceVersion: GUARD,
         usageRaw: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 999 },
       }),
     ConservativeSpendUnknownError,
@@ -126,7 +130,7 @@ test('total-consistency: a reported total that disagrees with the reconstructed 
       deriveConservativeActualUsdMicros({
         provider: 'xai',
         requestedModelId: 'grok-4.5',
-        priceVersion: V2,
+        priceVersion: GUARD,
         usageRaw: { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1300, completion_tokens_details: { reasoning_tokens: 50 } },
       }),
     ConservativeSpendUnknownError, // 1000+200+50 = 1250 != 1300
@@ -137,7 +141,7 @@ test('total-consistency: a reported total that disagrees with the reconstructed 
       deriveConservativeActualUsdMicros({
         provider: 'google',
         requestedModelId: 'gemini-3.1-pro-preview',
-        priceVersion: V2,
+        priceVersion: GUARD,
         usageRaw: { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2000 },
       }),
     ConservativeSpendUnknownError,
@@ -147,7 +151,7 @@ test('total-consistency: a reported total that disagrees with the reconstructed 
     deriveConservativeActualUsdMicros({
       provider: 'openai',
       requestedModelId: 'gpt-5.6-sol',
-      priceVersion: V2,
+      priceVersion: GUARD,
       usageRaw: { prompt_tokens: 1490, completion_tokens: 512 },
     }),
     49_345,
@@ -169,7 +173,7 @@ test('ceilDivUsdMicros rounds a non-divisible numerator UP (floor would under-re
 test('the pinned price VERSION drives the rate — prices-v1 is cheaper than the prices-v2 guard table', () => {
   const shape = { prompt_tokens: 1490, completion_tokens: 512, total_tokens: 2002 } as const;
   const v1 = deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: V1, usageRaw: { ...shape } });
-  const v2 = deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: V2, usageRaw: { ...shape } });
+  const v2 = deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: GUARD, usageRaw: { ...shape } });
   assert.equal(v1, 22_810); // 1490·5 + 512·30
   assert.equal(v2, 49_345); // 1490·12.5 + 512·60
   assert.ok(v2 > v1, 'the guard version (prices-v2) must never price below prices-v1');
@@ -180,15 +184,15 @@ test('the pinned price VERSION drives the rate — prices-v1 is cheaper than the
 test('fail-closed: unknown provider / unpriced model / unknown version all throw a typed UNKNOWN', () => {
   const validOpenai = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
   assert.throws(
-    () => deriveConservativeActualUsdMicros({ provider: 'bedrock' as ProviderName, requestedModelId: 'gpt-5.6-sol', priceVersion: V2, usageRaw: validOpenai }),
+    () => deriveConservativeActualUsdMicros({ provider: 'bedrock' as ProviderName, requestedModelId: 'gpt-5.6-sol', priceVersion: GUARD, usageRaw: validOpenai }),
     ConservativeSpendUnknownError,
   );
   assert.throws(
-    () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'not-a-real-model', priceVersion: V2, usageRaw: validOpenai }),
+    () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'not-a-real-model', priceVersion: GUARD, usageRaw: validOpenai }),
     ConservativeSpendUnknownError,
   );
   assert.throws(
-    () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: 'prices-v3', usageRaw: validOpenai }),
+    () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: 'prices-v99', usageRaw: validOpenai }),
     ConservativeSpendUnknownError,
   );
 });
@@ -196,7 +200,7 @@ test('fail-closed: unknown provider / unpriced model / unknown version all throw
 test('fail-closed: a non-object usageRaw (null, array, number) throws', () => {
   for (const bad of [null, undefined, 42, 'x', [1, 2, 3], [], true]) {
     assert.throws(
-      () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: V2, usageRaw: bad }),
+      () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: GUARD, usageRaw: bad }),
       ConservativeSpendUnknownError,
       `usageRaw=${String(bad)} should throw`,
     );
@@ -206,14 +210,14 @@ test('fail-closed: a non-object usageRaw (null, array, number) throws', () => {
 test('fail-closed: a missing required per-provider field throws (an inherited key does NOT satisfy it)', () => {
   // Missing prompt_tokens entirely.
   assert.throws(
-    () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: V2, usageRaw: { completion_tokens: 5 } }),
+    () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: GUARD, usageRaw: { completion_tokens: 5 } }),
     ConservativeSpendUnknownError,
   );
   // prompt_tokens present only on the PROTOTYPE — own-key check must reject it.
   const inherited = Object.create({ prompt_tokens: 100 }) as Record<string, unknown>;
   inherited['completion_tokens'] = 5;
   assert.throws(
-    () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: V2, usageRaw: inherited }),
+    () => deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: GUARD, usageRaw: inherited }),
     ConservativeSpendUnknownError,
   );
 });
@@ -225,7 +229,7 @@ test('fail-closed: out-of-domain token counts (negative, non-integer, NaN, Infin
         deriveConservativeActualUsdMicros({
           provider: 'openai',
           requestedModelId: 'gpt-5.6-sol',
-          priceVersion: V2,
+          priceVersion: GUARD,
           usageRaw: { prompt_tokens: bad as unknown as number, completion_tokens: 0 },
         }),
       ConservativeSpendUnknownError,
@@ -240,7 +244,7 @@ test('fail-closed: a present-but-non-object nested details field throws', () => 
       deriveConservativeActualUsdMicros({
         provider: 'xai',
         requestedModelId: 'grok-4.5',
-        priceVersion: V2,
+        priceVersion: GUARD,
         usageRaw: { prompt_tokens: 100, completion_tokens: 10, completion_tokens_details: 'oops' },
       }),
     ConservativeSpendUnknownError,
@@ -254,7 +258,7 @@ test('fail-closed: a derived spend exceeding Number.MAX_SAFE_INTEGER throws rath
       deriveConservativeActualUsdMicros({
         provider: 'openai',
         requestedModelId: 'gpt-5.6-sol',
-        priceVersion: V2,
+        priceVersion: GUARD,
         usageRaw: { prompt_tokens: 1_000_000_000_000_000, completion_tokens: 0 },
       }),
     ConservativeSpendUnknownError,
@@ -269,7 +273,7 @@ test('every provider path prices its own realistic shape without throwing', () =
     { provider: 'xai', requestedModelId: 'grok-4.5', usageRaw: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 130, completion_tokens_details: { reasoning_tokens: 10 } } },
   ];
   for (const c of cases) {
-    const cost = deriveConservativeActualUsdMicros({ provider: c.provider, requestedModelId: c.requestedModelId, priceVersion: V2, usageRaw: c.usageRaw });
+    const cost = deriveConservativeActualUsdMicros({ provider: c.provider, requestedModelId: c.requestedModelId, priceVersion: GUARD, usageRaw: c.usageRaw });
     assert.ok(Number.isSafeInteger(cost) && cost > 0, `${c.provider} produced ${cost}`);
   }
 });
@@ -285,7 +289,7 @@ test('fail-closed: EVERY provider throws when ITS required token field is absent
   ];
   for (const c of cases) {
     assert.throws(
-      () => deriveConservativeActualUsdMicros({ provider: c.provider, requestedModelId: c.requestedModelId, priceVersion: V2, usageRaw: c.usageRaw }),
+      () => deriveConservativeActualUsdMicros({ provider: c.provider, requestedModelId: c.requestedModelId, priceVersion: GUARD, usageRaw: c.usageRaw }),
       ConservativeSpendUnknownError,
       `${c.provider} with a missing required field should throw`,
     );
@@ -300,7 +304,7 @@ test('additive bucket absent but a corroborating total proves it zero — prices
     deriveConservativeActualUsdMicros({
       provider: 'google',
       requestedModelId: 'gemini-3.1-pro-preview',
-      priceVersion: V2,
+      priceVersion: GUARD,
       usageRaw: { promptTokenCount: 100, candidatesTokenCount: 20, totalTokenCount: 120 },
     }),
     760,
@@ -310,7 +314,7 @@ test('additive bucket absent but a corroborating total proves it zero — prices
     deriveConservativeActualUsdMicros({
       provider: 'xai',
       requestedModelId: 'grok-4.5',
-      priceVersion: V2,
+      priceVersion: GUARD,
       usageRaw: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
     }),
     640,
@@ -320,19 +324,19 @@ test('additive bucket absent but a corroborating total proves it zero — prices
 test('xAI/Google: an absent additive bucket WITHOUT a corroborating total is UNKNOWN (never assumed zero)', () => {
   // xAI: no reasoning_tokens AND no total_tokens → cannot rule out unreported (cost-dominant) reasoning.
   assert.throws(
-    () => deriveConservativeActualUsdMicros({ provider: 'xai', requestedModelId: 'grok-4.5', priceVersion: V2, usageRaw: { prompt_tokens: 100, completion_tokens: 20 } }),
+    () => deriveConservativeActualUsdMicros({ provider: 'xai', requestedModelId: 'grok-4.5', priceVersion: GUARD, usageRaw: { prompt_tokens: 100, completion_tokens: 20 } }),
     ConservativeSpendUnknownError,
   );
   // Google: no thoughtsTokenCount AND no totalTokenCount → UNKNOWN.
   assert.throws(
-    () => deriveConservativeActualUsdMicros({ provider: 'google', requestedModelId: 'gemini-3.1-pro-preview', priceVersion: V2, usageRaw: { promptTokenCount: 100, candidatesTokenCount: 20 } }),
+    () => deriveConservativeActualUsdMicros({ provider: 'google', requestedModelId: 'gemini-3.1-pro-preview', priceVersion: GUARD, usageRaw: { promptTokenCount: 100, candidatesTokenCount: 20 } }),
     ConservativeSpendUnknownError,
   );
 });
 
 test('openai fractional input ($12.50/M) makes the ceiling reachable end-to-end: 1 prompt token → 13 micros (floor would be 12)', () => {
   assert.equal(
-    deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: V2, usageRaw: { prompt_tokens: 1, completion_tokens: 0 } }),
+    deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: GUARD, usageRaw: { prompt_tokens: 1, completion_tokens: 0 } }),
     13, // 1 · 12,500,000 / 1,000,000 = 12.5 → ceil 13
   );
 });
@@ -346,11 +350,11 @@ test('provider/model coherence: every roster pair prices; a mismatched cross-pro
     { provider: 'xai', requestedModelId: 'grok-4.5', usageRaw: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 130, completion_tokens_details: { reasoning_tokens: 10 } } },
   ];
   for (const c of coherent) {
-    assert.ok(deriveConservativeActualUsdMicros({ provider: c.provider, requestedModelId: c.requestedModelId, priceVersion: V2, usageRaw: c.usageRaw }) > 0);
+    assert.ok(deriveConservativeActualUsdMicros({ provider: c.provider, requestedModelId: c.requestedModelId, priceVersion: GUARD, usageRaw: c.usageRaw }) > 0);
   }
   // The review's exact probe: identical Anthropic usage priced against the cheaper xAI row is REJECTED.
   assert.throws(
-    () => deriveConservativeActualUsdMicros({ provider: 'anthropic', requestedModelId: 'grok-4.5', priceVersion: V2, usageRaw: { input_tokens: 100, output_tokens: 20 } }),
+    () => deriveConservativeActualUsdMicros({ provider: 'anthropic', requestedModelId: 'grok-4.5', priceVersion: GUARD, usageRaw: { input_tokens: 100, output_tokens: 20 } }),
     ConservativeSpendUnknownError,
   );
   // Every off-diagonal (provider, other-provider's model) pairing throws BEFORE pricing (usage never read).
@@ -360,7 +364,7 @@ test('provider/model coherence: every roster pair prices; a mismatched cross-pro
     for (const m of providers) {
       if (p === m) continue;
       assert.throws(
-        () => deriveConservativeActualUsdMicros({ provider: p, requestedModelId: modelOf[m], priceVersion: V2, usageRaw: {} }),
+        () => deriveConservativeActualUsdMicros({ provider: p, requestedModelId: modelOf[m], priceVersion: GUARD, usageRaw: {} }),
         ConservativeSpendUnknownError,
         `${p} + ${modelOf[m]} must be rejected`,
       );
@@ -382,7 +386,7 @@ test('openai Responses shape: prices input·$12.50 + output·$60; reasoning stay
   const responsesShape = deriveConservativeActualUsdMicros({
     provider: 'openai',
     requestedModelId: 'gpt-5.6-sol',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: {
       input_tokens: 1490,
       output_tokens: 512,
@@ -398,7 +402,7 @@ test('openai Responses shape: prices input·$12.50 + output·$60; reasoning stay
       deriveConservativeActualUsdMicros({
         provider: 'openai',
         requestedModelId: 'gpt-5.6-sol',
-        priceVersion: V2,
+        priceVersion: GUARD,
         usageRaw: { input_tokens: 1490, output_tokens: 512, total_tokens: 9_999 },
       }),
     ConservativeSpendUnknownError,
@@ -410,7 +414,7 @@ test('xai Responses shape: the ADDITIVE identity prices output + reasoning; the 
   const additive = deriveConservativeActualUsdMicros({
     provider: 'xai',
     requestedModelId: 'grok-4.5',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: {
       input_tokens: 1000,
       output_tokens: 200,
@@ -424,7 +428,7 @@ test('xai Responses shape: the ADDITIVE identity prices output + reasoning; the 
   const subset = deriveConservativeActualUsdMicros({
     provider: 'xai',
     requestedModelId: 'grok-4.5',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: {
       input_tokens: 1000,
       output_tokens: 200,
@@ -441,7 +445,7 @@ test('xai Responses shape fails CLOSED: a total matching neither identity, and a
       deriveConservativeActualUsdMicros({
         provider: 'xai',
         requestedModelId: 'grok-4.5',
-        priceVersion: V2,
+        priceVersion: GUARD,
         usageRaw: {
           input_tokens: 1000,
           output_tokens: 200,
@@ -456,7 +460,7 @@ test('xai Responses shape fails CLOSED: a total matching neither identity, and a
       deriveConservativeActualUsdMicros({
         provider: 'xai',
         requestedModelId: 'grok-4.5',
-        priceVersion: V2,
+        priceVersion: GUARD,
         usageRaw: { input_tokens: 1000, output_tokens: 200 },
       }),
     ConservativeSpendUnknownError,
@@ -468,7 +472,7 @@ test('xai Responses shape with NO total: the ADDITIVE (larger) reading is priced
   const cost = deriveConservativeActualUsdMicros({
     provider: 'xai',
     requestedModelId: 'grok-4.5',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: {
       input_tokens: 1000,
       output_tokens: 200,
@@ -483,7 +487,7 @@ test('google with grounding: toolUsePromptTokenCount prices ADDITIVELY at the in
   const withoutToolUse = deriveConservativeActualUsdMicros({
     provider: 'google',
     requestedModelId: 'gemini-3.1-pro-preview',
-    priceVersion: V2,
+    priceVersion: GUARD,
     usageRaw: {
       promptTokenCount: 1465,
       candidatesTokenCount: 471,
@@ -498,7 +502,7 @@ test('google with grounding: toolUsePromptTokenCount prices ADDITIVELY at the in
     const withToolUse = deriveConservativeActualUsdMicros({
       provider: 'google',
       requestedModelId: 'gemini-3.1-pro-preview',
-      priceVersion: V2,
+      priceVersion: GUARD,
       usageRaw: {
         promptTokenCount: 1465,
         candidatesTokenCount: 471,
@@ -515,7 +519,7 @@ test('google with grounding: toolUsePromptTokenCount prices ADDITIVELY at the in
       deriveConservativeActualUsdMicros({
         provider: 'google',
         requestedModelId: 'gemini-3.1-pro-preview',
-        priceVersion: V2,
+        priceVersion: GUARD,
         usageRaw: {
           promptTokenCount: 1465,
           candidatesTokenCount: 471,
@@ -526,4 +530,144 @@ test('google with grounding: toolUsePromptTokenCount prices ADDITIVELY at the in
       }),
     ConservativeSpendUnknownError,
   );
+});
+
+// ── Web-search fees: priced, fail-closed on an unknown count ──────────────────
+
+test('search fees are PRICED into the derived actual, per provider, at the pinned rate', () => {
+  // openai $0.01/call: token cost 49,345 + 3 × 10,000 = 79,345.
+  assert.equal(
+    deriveConservativeActualUsdMicros({
+      provider: 'openai',
+      requestedModelId: 'gpt-5.6-sol',
+      priceVersion: GUARD,
+      usageRaw: { input_tokens: 1490, output_tokens: 512, total_tokens: 2002 },
+      searchCount: 3,
+    }),
+    49_345 + 30_000,
+  );
+  // google $0.014/query — the unit is the executed QUERY, not the prompt:
+  // 1465·4 + (471+305)·18 = 19,828 tokens + 2 × 14,000 = 47,828.
+  assert.equal(
+    deriveConservativeActualUsdMicros({
+      provider: 'google',
+      requestedModelId: 'gemini-3.1-pro-preview',
+      priceVersion: GUARD,
+      usageRaw: {
+        promptTokenCount: 1465,
+        candidatesTokenCount: 471,
+        thoughtsTokenCount: 305,
+        totalTokenCount: 2241,
+      },
+      searchCount: 2,
+    }),
+    19_828 + 28_000,
+  );
+  // xai $0.005/call; anthropic $0.01/search — both added on top of tokens.
+  const xaiTokens = deriveConservativeActualUsdMicros({
+    provider: 'xai',
+    requestedModelId: 'grok-4.5',
+    priceVersion: GUARD,
+    usageRaw: { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1300, completion_tokens_details: { reasoning_tokens: 100 } },
+    searchCount: 0,
+  });
+  assert.equal(
+    deriveConservativeActualUsdMicros({
+      provider: 'xai',
+      requestedModelId: 'grok-4.5',
+      priceVersion: GUARD,
+      usageRaw: { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1300, completion_tokens_details: { reasoning_tokens: 100 } },
+      searchCount: 4,
+    }),
+    xaiTokens + 20_000,
+  );
+  const anthropicTokens = deriveConservativeActualUsdMicros({
+    provider: 'anthropic',
+    requestedModelId: 'claude-fable-5',
+    priceVersion: GUARD,
+    usageRaw: { input_tokens: 1512, output_tokens: 498 },
+    searchCount: 0,
+  });
+  assert.equal(
+    deriveConservativeActualUsdMicros({
+      provider: 'anthropic',
+      requestedModelId: 'claude-fable-5',
+      priceVersion: GUARD,
+      usageRaw: { input_tokens: 1512, output_tokens: 498 },
+      searchCount: 5,
+    }),
+    anthropicTokens + 50_000,
+  );
+});
+
+test('an UNKNOWN search count is unpriceable — it throws rather than pricing the fee at zero', () => {
+  // The false-zero rule applied to search: "a search ran, count unknown" must
+  // escalate, exactly like an absent additive token bucket.
+  assert.throws(
+    () =>
+      deriveConservativeActualUsdMicros({
+        provider: 'google',
+        requestedModelId: 'gemini-3.1-pro-preview',
+        priceVersion: GUARD,
+        usageRaw: { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 },
+        searchCount: null,
+      }),
+    ConservativeSpendUnknownError,
+  );
+  // Negative control: the identical usage with a KNOWN count prices fine, and
+  // an OMITTED count (a pre-search record) prices exactly as it always did.
+  const known = deriveConservativeActualUsdMicros({
+    provider: 'google',
+    requestedModelId: 'gemini-3.1-pro-preview',
+    priceVersion: GUARD,
+    usageRaw: { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 },
+    searchCount: 0,
+  });
+  const legacy = deriveConservativeActualUsdMicros({
+    provider: 'google',
+    requestedModelId: 'gemini-3.1-pro-preview',
+    priceVersion: GUARD,
+    usageRaw: { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 },
+  });
+  assert.equal(known, legacy);
+});
+
+test('a price version with no search rate cannot price a search — pinning prices-v2 with searches recorded fails CLOSED', () => {
+  // prices-v1/v2 are retained for replay of evidence produced under them; they
+  // carry no search rate, so a nonzero count under them is UNKNOWN, not free.
+  for (const version of ['prices-v1', 'prices-v2']) {
+    assert.throws(
+      () =>
+        deriveConservativeActualUsdMicros({
+          provider: 'anthropic',
+          requestedModelId: 'claude-fable-5',
+          priceVersion: version,
+          usageRaw: { input_tokens: 1512, output_tokens: 498 },
+          searchCount: 1,
+        }),
+      ConservativeSpendUnknownError,
+      `${version} must refuse to price a search fee`,
+    );
+    // ...while ZERO searches under those versions still prices (old evidence).
+    assert.ok(
+      deriveConservativeActualUsdMicros({
+        provider: 'anthropic',
+        requestedModelId: 'claude-fable-5',
+        priceVersion: version,
+        usageRaw: { input_tokens: 1512, output_tokens: 498 },
+        searchCount: 0,
+      }) > 0,
+    );
+  }
+});
+
+test('the reservation dominates search spend by orders of magnitude — the bound does not rest on any provider cap', () => {
+  // Google is the uncapped arm and the most expensive per query ($0.014). The
+  // token-free query count that would reach the $100 per-attempt reservation:
+  const perSearch = 14_000;
+  const searchesToReachReservation = Math.ceil(PROVIDER_ATTEMPT_RESERVATION_USD_MICROS / perSearch);
+  assert.equal(searchesToReachReservation, 7_143);
+  // At the declared common ceiling the fee is a rounding error against it.
+  const atCeiling = MAX_SEARCHES_PER_ATTEMPT * perSearch;
+  assert.ok(atCeiling * 1_000 < PROVIDER_ATTEMPT_RESERVATION_USD_MICROS, 'a 1000x ceiling overrun still fits the reservation');
 });

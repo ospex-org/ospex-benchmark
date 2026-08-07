@@ -73,8 +73,9 @@ export function createRealAdapters(): Map<string, ProviderAdapter> {
       baseUrl: 'https://api.openai.com/v1',
       maxTokensParam: 'max_output_tokens',
       webSearchTool: { ...TOOL_INFERENCE_CONFIG.webSearch.openai.tool },
-      maxToolCalls: TOOL_INFERENCE_CONFIG.webSearch.openai.maxToolCalls,
-      include: ['web_search_call.action.sources'],
+      toolCapParam: TOOL_INFERENCE_CONFIG.webSearch.openai.capParam,
+      toolCapValue: TOOL_INFERENCE_CONFIG.webSearch.openai.capValue,
+      include: [...TOOL_INFERENCE_CONFIG.webSearch.openai.include],
     }),
   );
   adapters.set('anthropic-claude-fable-5', createAnthropicAdapter('claude-fable-5'));
@@ -88,7 +89,8 @@ export function createRealAdapters(): Map<string, ProviderAdapter> {
       baseUrl: 'https://api.x.ai/v1',
       maxTokensParam: 'max_output_tokens',
       webSearchTool: { ...TOOL_INFERENCE_CONFIG.webSearch.xai.tool },
-      maxToolCalls: TOOL_INFERENCE_CONFIG.webSearch.xai.maxToolCalls,
+      toolCapParam: TOOL_INFERENCE_CONFIG.webSearch.xai.capParam,
+      toolCapValue: TOOL_INFERENCE_CONFIG.webSearch.xai.capValue,
     }),
   );
   return adapters;

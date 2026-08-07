@@ -687,8 +687,22 @@ export async function runOneFire(input: RunOneFireInput): Promise<LineOpenFireOu
     billingClass,
     provider: r.arm.provider,
     requestedModelId: r.arm.requestedModelId,
-    attempt: { requestAt: r.attempt.requestAt, usageRaw: r.attempt.usageRaw },
-    repair: r.repair === null ? null : { requestAt: r.repair.requestAt, usageRaw: r.repair.usageRaw },
+    // `searchCount` stays undefined when the attempt carries no search audit at
+    // all, so a pre-search attempt prices exactly as it did before; an audit
+    // whose count is null prices as UNKNOWN and escalates.
+    attempt: {
+      requestAt: r.attempt.requestAt,
+      usageRaw: r.attempt.usageRaw,
+      ...(r.attempt.searchAudit === null ? {} : { searchCount: r.attempt.searchAudit.searchCount }),
+    },
+    repair:
+      r.repair === null
+        ? null
+        : {
+            requestAt: r.repair.requestAt,
+            usageRaw: r.repair.usageRaw,
+            ...(r.repair.searchAudit === null ? {} : { searchCount: r.repair.searchAudit.searchCount }),
+          },
   }));
   const perAttemptReservationUsdMicros = snapshot.booted.manifest.constants.providerAttemptReservationUsdMicros;
   let verdict: FireSpendVerdict;

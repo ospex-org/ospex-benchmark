@@ -26,13 +26,69 @@ import { deepFreeze } from './freeze.js';
 
 export const TOOL_INFERENCE_CONFIG_VERSION = 'tools-v1';
 
+/**
+ * The COMMON per-attempt search ceiling every arm is configured against.
+ *
+ * Three of the four providers enforce it themselves (`max_tool_calls` on the
+ * two Responses APIs, `max_uses` on Anthropic). Google's grounding tool exposes
+ * NO cap of any kind — its entire documented config is a time-range filter and
+ * a search-type selector, and the model decides how many queries to run — so
+ * for that arm the ceiling is a declared target that the harness OBSERVES and
+ * PRICES rather than enforces. That asymmetry is disclosed, not papered over:
+ * see docs/SPEND-BOUND-PROOF.md, "Web-search fees".
+ */
+export const MAX_SEARCHES_PER_ATTEMPT = 5;
+
+/**
+ * How many times a provider may pause its own server-side tool loop and be
+ * continued within ONE attempt. Zero: an attempt is exactly one billable
+ * request, which is the unit the per-attempt reservation bounds and the unit
+ * the spend proof prices. Raising this means re-deriving that bound — it is a
+ * money decision recorded in hashed configuration, not an adapter detail.
+ */
+export const MAX_SERVER_TOOL_CONTINUATIONS = 0;
+
 export const TOOL_INFERENCE_CONFIG = deepFreeze({
   version: TOOL_INFERENCE_CONFIG_VERSION,
+  maxSearchesPerAttempt: MAX_SEARCHES_PER_ATTEMPT,
+  maxServerToolContinuations: MAX_SERVER_TOOL_CONTINUATIONS,
   webSearch: {
-    openai: { tool: { type: 'web_search' }, maxToolCalls: 5, includeSources: true },
-    anthropic: { tool: { type: 'web_search_20250305', name: 'web_search' }, maxUses: 5 },
-    google: { tool: { google_search: {} } },
-    xai: { tool: { type: 'web_search' }, maxToolCalls: 5 },
+    // Each arm is capped through the parameter ITS OWN provider documents as a
+    // request field, never one borrowed from a sibling API:
+    //  - openai `max_tool_calls` — documented request param, bounds built-in
+    //    tool calls exactly. `include` requests the per-call source list; it is
+    //    an OpenAI includable and is NOT sent to xAI, whose docs define no such
+    //    value and which returns the consulted-source list in `citations` by
+    //    default.
+    //  - anthropic `max_uses` — documented on the tool object, bounds searches
+    //    exactly (a further search returns a `max_uses_exceeded` tool error).
+    //  - xai `max_turns` — the documented request-side bound. `max_tool_calls`
+    //    appears ONLY in xAI's response schema, not its request parameters, so
+    //    sending it would be an undocumented field that either 400s the call or
+    //    is silently ignored. `max_turns` bounds agentic TURNS, and one turn can
+    //    run tools in parallel, so it is a coarse bound: the exact billable
+    //    count comes from the response counter and is priced.
+    //  - google — no cap of any kind exists (its whole tool config is a
+    //    time-range filter and a search-type selector).
+    openai: {
+      tool: { type: 'web_search' },
+      capParam: 'max_tool_calls',
+      capValue: MAX_SEARCHES_PER_ATTEMPT,
+      include: ['web_search_call.action.sources'],
+      capBoundsSearchesExactly: true,
+    },
+    anthropic: {
+      tool: { type: 'web_search_20250305', name: 'web_search' },
+      maxUses: MAX_SEARCHES_PER_ATTEMPT,
+      capBoundsSearchesExactly: true,
+    },
+    google: { tool: { google_search: {} }, capBoundsSearchesExactly: false },
+    xai: {
+      tool: { type: 'web_search' },
+      capParam: 'max_turns',
+      capValue: MAX_SEARCHES_PER_ATTEMPT,
+      capBoundsSearchesExactly: false,
+    },
   },
 } as const);
 

@@ -27,14 +27,23 @@ test('a fully conformant response validates cleanly', () => {
   assert.ok(result.parsed);
 });
 
-test('empty evidenceRefs are rejected — every rationale must be grounded', () => {
+test('empty evidenceRefs are ACCEPTED under v2 (a search-derived rationale cites no bundle ref) but an unknown ref is still rejected', () => {
+  // The system prompt directs the model to say so — not to cite an unsupporting
+  // bundle ref — when a rationale rests on outside reasoning or a search it ran.
+  // Requiring at least one ref would force exactly that mis-citation.
   const request = makeRequest();
-  const response = makeValidResponse(request);
-  const forecast = response.games[0]?.forecasts[0];
-  assert.ok(forecast);
-  forecast.evidenceRefs = [];
-  const result = validate(response, request);
-  assert.ok(result.errors.some((e) => e.includes('evidenceRefs')));
+  const empty = makeValidResponse(request);
+  const emptyForecast = empty.games[0]?.forecasts[0];
+  assert.ok(emptyForecast);
+  emptyForecast.evidenceRefs = [];
+  assert.deepEqual(validate(empty, request).errors, []);
+
+  // The grounding rule that still binds: a cited ref must exist in the bundle.
+  const bogus = makeValidResponse(request);
+  const bogusForecast = bogus.games[0]?.forecasts[0];
+  assert.ok(bogusForecast);
+  bogusForecast.evidenceRefs = ['ev:not-in-this-bundle'];
+  assert.ok(validate(bogus, request).errors.some((e) => e.includes('unknown evidenceRef')));
 });
 
 test('whitespace-only rationale is rejected', () => {
@@ -374,8 +383,9 @@ test('axes scores are INTEGERS 1..5 on exactly the five named axes — range, fr
   assert.ok(mutate((a) => { delete a['news']; }).some((e) => e.includes('axes')), 'missing axis key');
 });
 
-test('primaryExpectation pairs to primaryAxis: mixed null states fail, both-null and both-set validate', () => {
-  const withPair = (
+test("the prompt's own primary-driver rule is enforced: a driver is named whenever any axis exceeds 1, and none is named when every axis is 1", () => {
+  const withAnalysis = (
+    axes: Record<string, number>,
     primaryAxis: BenchmarkResponse['games'][number]['forecasts'][number]['primaryAxis'],
     primaryExpectation: string | null,
   ): string[] => {
@@ -383,14 +393,26 @@ test('primaryExpectation pairs to primaryAxis: mixed null states fail, both-null
     const response = makeValidResponse(request);
     const forecast = response.games[0]?.forecasts[0];
     assert.ok(forecast);
+    forecast.axes = axes as NonNullable<typeof forecast.axes>;
     forecast.primaryAxis = primaryAxis;
     forecast.primaryExpectation = primaryExpectation;
     return validate(response, request).errors;
   };
-  assert.deepEqual(withPair('news', 'A starter scratch is expected to move this line.'), []);
-  assert.deepEqual(withPair(null, null), []);
-  assert.ok(withPair(null, 'sentence without an axis').some((e) => e.includes('primaryExpectation')));
-  assert.ok(withPair('trend', null).some((e) => e.includes('primaryExpectation')));
+  const rated = { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 };
+  const allOnes = { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 };
+  const sentence = 'A starter scratch is expected to move this line toward the away side.';
+
+  // Rated axes: a driver is required, and it carries its expectation.
+  assert.deepEqual(withAnalysis(rated, 'news', sentence), []);
+  assert.ok(withAnalysis(rated, null, null).some((e) => e.includes('primaryAxis')));
+  assert.ok(withAnalysis(rated, null, sentence).some((e) => e.includes('primaryAxis')));
+  assert.ok(withAnalysis(rated, 'trend', null).some((e) => e.includes('primaryExpectation')));
+
+  // Every axis 1: no driver may be named, and the expectation may either state
+  // that no material movement is expected, or be null.
+  assert.deepEqual(withAnalysis(allOnes, null, null), []);
+  assert.deepEqual(withAnalysis(allOnes, null, 'No material movement is expected before close.'), []);
+  assert.ok(withAnalysis(allOnes, 'softness', sentence).some((e) => e.includes('primaryAxis')));
 });
 
 test('primaryExpectation must be one single-line sentence — newline and whitespace-only both fail', () => {
@@ -408,13 +430,60 @@ test('primaryExpectation must be one single-line sentence — newline and whites
   assert.deepEqual(withExpectation('One sentence about the expected move.'), []);
 });
 
-test('fingerprints span versions: a v1-shaped initial is still repairable and its fingerprint equals the v2 fingerprint (axes are not decision-bearing)', () => {
+test('the analysis is DECISION-BEARING: a repair cannot invent it, cannot change it, and a format-only repair that preserves it is accepted', () => {
   const request = makeRequest();
   const v2 = makeValidResponse(request);
-  const v1 = asV1(v2);
-  const v1Fingerprint = extractDecisionFingerprint(JSON.stringify(v1), request.requestBundle);
-  assert.ok(v1Fingerprint, 'a pre-axes body must still yield a complete fingerprint (repairable)');
   const v2Validated = validate(v2, request);
   assert.ok(v2Validated.parsed);
-  assert.deepEqual(compareFingerprints(v1Fingerprint, fingerprintFromParsed(v2Validated.parsed)), []);
+  const accepted = fingerprintFromParsed(v2Validated.parsed);
+
+  // A pre-axes initial still fingerprints (so the harness can tell it apart
+  // from an unparseable one), but a repair that SUPPLIES the analysis it lacked
+  // is a new decision, not a reformatting — every forecast is flagged.
+  const v1Fingerprint = extractDecisionFingerprint(JSON.stringify(asV1(v2)), request.requestBundle);
+  assert.ok(v1Fingerprint);
+  const invented = compareFingerprints(v1Fingerprint, accepted);
+  // Every forecast is flagged on `axes`; the driver-bearing ones are flagged on
+  // primaryAxis/primaryExpectation too. Nothing OUTSIDE the analysis differs —
+  // the pick, prices, and probabilities are identical in both bodies.
+  const forecastCount = v2.games[0]?.forecasts.length ?? 0;
+  assert.equal(invented.filter((d) => d.endsWith('axes changed')).length, forecastCount);
+  assert.ok(
+    invented.every((d) =>
+      /^changed_decision_after_repair: .+ (axes|primaryAxis|primaryExpectation) changed$/.test(d),
+    ),
+    invented.join(' | '),
+  );
+
+  // Changing a single axis score, the named driver, or the expectation is also
+  // a changed decision — each names its own field.
+  const mutate = (fn: (f: NonNullable<ReturnType<typeof firstForecast>>) => void): string[] => {
+    const mutated = structuredClone(v2);
+    const forecast = firstForecast(mutated);
+    assert.ok(forecast);
+    fn(forecast);
+    const validated = validate(mutated, request);
+    assert.ok(validated.parsed, 'the mutation must stay schema-valid so the FINGERPRINT is what rejects it');
+    return compareFingerprints(accepted, fingerprintFromParsed(validated.parsed));
+  };
+  assert.ok(mutate((f) => { f.axes = { ...f.axes!, softness: 2 }; }).some((d) => d.endsWith('axes changed')));
+  assert.ok(mutate((f) => { f.primaryAxis = 'softness'; }).some((d) => d.endsWith('primaryAxis changed')));
+  assert.ok(
+    mutate((f) => { f.primaryExpectation = 'A different expectation entirely.'; }).some((d) =>
+      d.endsWith('primaryExpectation changed'),
+    ),
+  );
+
+  // Negative control: a repair that changes ONLY the format (here, the echoed
+  // cohort id is fixed) preserves every decision field and is accepted.
+  const formatOnly = extractDecisionFingerprint(
+    JSON.stringify({ ...v2, cohortId: 'wrong-cohort-echo' }),
+    request.requestBundle,
+  );
+  assert.ok(formatOnly);
+  assert.deepEqual(compareFingerprints(formatOnly, accepted), []);
 });
+
+function firstForecast(response: BenchmarkResponse) {
+  return response.games[0]?.forecasts[0];
+}

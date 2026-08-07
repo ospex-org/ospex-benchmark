@@ -151,9 +151,11 @@ export function makeValidResponse(
             rationale: 'Total priced evenly at the designated line.',
             evidenceRefs: [total.evidenceRef],
             reasonCode: null,
-            axes: { valuation: 3, trend: 1, consensus: 5, news: 2, softness: 4 },
+            // The all-ones case: no primary driver, and an expectation stating
+            // that no material movement is expected.
+            axes: { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 },
             primaryAxis: null,
-            primaryExpectation: null,
+            primaryExpectation: 'No material movement is expected in this total before close.',
           },
         ],
       },
