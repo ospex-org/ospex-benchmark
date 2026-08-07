@@ -57,10 +57,16 @@ function attemptFields(attempt: AttemptRecord | null): JsonRecord {
     reportedModelId: attempt?.reportedModelId ?? null,
     tokens: attempt?.usage ?? null,
     usageRaw: attempt?.usageRaw ?? null,
+    searchAudit: attempt?.searchAudit ?? null,
     providerResponseId: attempt?.providerResponseId ?? null,
     requestParams: attempt?.requestParams ?? null,
     rawResponse: attempt?.rawText ?? null,
     errorDetail: attempt?.errorDetail ?? null,
+    // The structured provider completion state (never prose): the non-final
+    // terminal string for an unfinished turn, and whether the provider
+    // declared the turn finished. Verification reads THESE, not errorDetail.
+    providerStopReason: attempt?.providerStopReason ?? null,
+    turnCompleted: attempt?.turnCompleted ?? null,
   };
 }
 
@@ -292,6 +298,12 @@ export function buildRecords(
           rationale: forecast.rationale,
           evidenceRefs: forecast.evidenceRefs,
           reasonCode: forecast.reasonCode ?? null,
+          // Response schema v2 analysis fields. New runs validate v2, so axes
+          // is always present here; the ?? null fallbacks only guard replay of
+          // v1-shaped parses, mirroring reasonCode above.
+          axes: forecast.axes ?? null,
+          primaryAxis: forecast.primaryAxis ?? null,
+          primaryExpectation: forecast.primaryExpectation ?? null,
           provider: result.arm.provider,
           requestedModelId: result.arm.requestedModelId,
           // Provenance of the ACCEPTED attempt: for repaired decisions this
@@ -304,6 +316,9 @@ export function buildRecords(
           latencyMs: accepted.latencyMs,
           tokens: accepted.usage,
           usageRaw: accepted.usageRaw,
+          // What the accepted attempt actually looked at: every executed
+          // search query + result reference, for after-the-fact audit.
+          searchAudit: accepted.searchAudit,
           costUsd: null,
           outcome: 'valid',
         });

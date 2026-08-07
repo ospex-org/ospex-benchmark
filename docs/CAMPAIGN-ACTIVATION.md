@@ -49,9 +49,19 @@ Everything below states the contract that holds it.
 - **Stopping** (`campaign:stop`): stamps `disarmedAt` inside the record (first stop wins,
   row never deleted). The next tick resolves nothing. Runnable from any box that reaches
   the store and holds a copy of the campaign manifest — it does not need the runner.
-- **The hard money bound** is independent of all of the above: the store's cohort
+- **The money bound is layered**, and independent of all of the above. The store's cohort
   call/spend caps are enforced inside a row lock (`admit_dispatch`), so even a wrong
-  authorization layer cannot spend past what arming fixed.
+  authorization layer cannot ADMIT more dispatches than arming fixed — the caps are
+  denominated in $100/attempt reservations, an accounting unit. Within one admitted
+  attempt, real token spend is bounded before dispatch by the model token envelopes
+  (`maxOutputTokens`, plus each model's own bound on the additive reasoning buckets that
+  `maxOutputTokens` does not cap — see docs/SPEND-BOUND-PROOF.md) and search spend by the
+  provider-documented search caps where they exist (OpenAI, Anthropic); on the arms with
+  no documented request-side search cap (Google entirely; xAI capped only in turns) an
+  overage in one call is DETECTED after the response — the derived actual is priced at
+  the conservative table, a crossing refuses settlement, and the escalation latch halts
+  the campaign. Detection bounds how many such calls a campaign can make, not what the
+  first one invoices; see docs/SPEND-BOUND-PROOF.md.
 
 ## What one tick does, in order
 
@@ -215,6 +225,33 @@ proving the admission is refused and no provider call is reachable.
   tick would reach in the tick's own precedence. What only the tick itself can check —
   the publication evidence and the artifact-root half of the latch — is stated as such in
   the verdict line rather than silently assumed.
+
+## Provider preflight (web search)
+
+Every arm runs the declared web-search tool, so three provider-side conditions can fail a
+run for reasons unrelated to the harness. Clear them with one cheap call per arm before
+arming, not on the night:
+
+1. **Anthropic** — web search can be disabled organization-wide in the Console, in which
+   case any request carrying the tool returns 400. Fable 5 additionally requires 30-day
+   data retention and is unavailable under zero-data-retention, which fails every request
+   regardless of body.
+2. **Google** — the grounding tool and this model are paid-tier only; a free-tier key fails
+   regardless of body.
+3. **All four** — confirm the declared tool block is accepted as written. The wire shapes
+   were verified against current provider documentation, but documentation is not a live
+   response: `yarn smoke:dry` exercises the harness without provider calls, so the first
+   real acceptance is the first paid call.
+
+Two behaviours to expect and NOT treat as harness faults:
+
+- An Anthropic `pause_turn` (its server-side tool loop hit its iteration limit) or a
+  provider refusal records that arm as `provider_error` with its usage retained, not as a
+  schema failure. Continuation is deliberately disabled; enabling it is a money decision
+  (`maxServerToolContinuations`, and re-deriving the per-attempt bound), not a hot fix.
+- A fire whose search accounting is incomplete — a provider proving a search ran without
+  letting the count be derived — escalates as unknown spend and halts the campaign. That is
+  the money guard working; resume after reviewing the artifact.
 
 ## Operating a campaign
 

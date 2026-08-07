@@ -11,6 +11,7 @@ import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
 import { REPAIR_POLICY_VERSION } from './repairPolicy.js';
 import { promptScaffoldSha256 } from './prompt.js';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 import { STORE_SCHEMA_VERSION } from './store/constants.js';
 import type { InitResult } from './store/contract.js';
@@ -42,7 +43,7 @@ function manifestJson(): string {
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
     })),
-    toolInferenceConfigSha256: 'b'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: REPAIR_POLICY_VERSION,
     scoringPolicyVersion: SCORING_POLICY_VERSION,

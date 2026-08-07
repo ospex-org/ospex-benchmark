@@ -6,7 +6,8 @@ import {
   fingerprintFromParsed,
   validateResponseText,
 } from './schema.js';
-import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
+import { ProviderHttpError, ProviderTimeoutError, ProviderUnfinishedTurnError } from './providers/errors.js';
+import { redactSearchAudit } from './providers/searchAudit.js';
 import { assertPrepared, prepareGameRequest } from './preparedRequest.js';
 import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
@@ -25,6 +26,7 @@ import type {
   AttemptRecord,
   ChatTurn,
   ProviderAdapter,
+  ProviderCallOptions,
   ProviderResponse,
   RepairTransport,
   SlateBundle,
@@ -308,7 +310,10 @@ function emptyAttempt(): AttemptRecord {
     httpStatus: null,
     usage: null,
     usageRaw: null,
+    searchAudit: null,
     requestParams: null,
+    providerStopReason: null,
+    turnCompleted: null,
     requestAt: null,
     responseAt: null,
     acceptedAt: null,
@@ -321,6 +326,9 @@ function classifyFailure(error: unknown): 'timeout' | 'rate_limited' | 'provider
   if (error instanceof ProviderTimeoutError) return 'timeout';
   // A throttle must never be readable as a model failure.
   if (error instanceof ProviderHttpError && error.status === 429) return 'rate_limited';
+  // An unfinished turn (paused server-tool loop, or a provider refusal) is a
+  // PROVIDER outcome, never a schema verdict — the model was not given the
+  // chance to finish, so it must not be scored as producing invalid output.
   return 'provider_error';
 }
 
@@ -333,7 +341,7 @@ function classifyFailure(error: unknown): 'timeout' | 'rate_limited' | 'provider
 interface DispatchTarget {
   readonly arm: ArmSpec;
   hasCredential(): boolean;
-  chat(turns: ChatTurn[], timeoutMs: number, options?: { maxOutputTokens?: number | undefined }): Promise<ProviderResponse>;
+  chat(turns: ChatTurn[], timeoutMs: number, options?: ProviderCallOptions): Promise<ProviderResponse>;
 }
 
 async function timedChat(
@@ -343,6 +351,8 @@ async function timedChat(
   maxOutputTokens: number,
   nowMs: () => number,
   startMs: number,
+  /** `'none'` on the repair leg — a format-only repair may not search. */
+  tools: 'declared' | 'none' = 'declared',
 ): Promise<
   AttemptRecord & {
     response: ProviderResponse | null;
@@ -356,7 +366,7 @@ async function timedChat(
   const startedAt = startMs;
   const requestAt = new Date(startedAt).toISOString();
   try {
-    const response = await adapter.chat(turns, timeoutMs, { maxOutputTokens });
+    const response = await adapter.chat(turns, timeoutMs, { maxOutputTokens, tools });
     const respondedAt = nowMs();
     return {
       rawText: redactSecrets(response.rawText),
@@ -365,7 +375,13 @@ async function timedChat(
       httpStatus: response.httpStatus,
       usage: response.usage,
       usageRaw: response.usageRaw,
+      searchAudit: redactSearchAudit(response.searchAudit, redactSecrets),
       requestParams: response.requestParams,
+      // An adapter returns ONLY on its provider's final state (anything else
+      // throws the typed unfinished-turn failure), so a returned response IS a
+      // completed turn — recorded structurally, where verification reads it.
+      providerStopReason: null,
+      turnCompleted: true,
       requestAt,
       responseAt: new Date(respondedAt).toISOString(),
       // A received response is not yet ACCEPTED — acceptance is stamped in
@@ -378,13 +394,44 @@ async function timedChat(
     };
   } catch (error) {
     const detail =
-      error instanceof ProviderHttpError || error instanceof ProviderTimeoutError
+      error instanceof ProviderHttpError ||
+      error instanceof ProviderTimeoutError ||
+      error instanceof ProviderUnfinishedTurnError
         ? error.message
         : describeError(error);
     const respondedAt = nowMs();
+    // An UNFINISHED turn is a paid, received response: the full evidence the
+    // provider returned — HTTP status, response/model ids, the (possibly
+    // empty) partial text, normalized + verbatim usage, and the search audit —
+    // is recorded on the failed attempt, redacted exactly as a returned
+    // response would be. The money guard prices the real cost, and the
+    // persisted attempt shows a received response (so usage evidence is never
+    // paired with a no-receipt record). Every other failure path keeps the
+    // empty record apart from an HTTP error's status (nothing else was
+    // reported).
+    const carried =
+      error instanceof ProviderUnfinishedTurnError
+        ? {
+            rawText: redactSecrets(error.rawText),
+            reportedModelId: error.reportedModelId,
+            providerResponseId: error.providerResponseId,
+            httpStatus: error.httpStatus,
+            usage: error.usage,
+            usageRaw: error.usageRaw,
+            searchAudit: redactSearchAudit(error.searchAudit, redactSecrets),
+            requestParams: error.requestParams,
+            // The STRUCTURED completion state: the provider's own non-final
+            // terminal string, and the explicit non-final flag. Provider
+            // completion status is authoritative over body shape, so this pair
+            // is what proves — durably, not in prose — that an archived body
+            // which happens to parse as valid JSON was still not an answer.
+            providerStopReason: error.stopReason,
+            turnCompleted: false,
+          }
+        : { httpStatus: error instanceof ProviderHttpError ? error.status : null };
     return {
       ...emptyAttempt(),
-      httpStatus: error instanceof ProviderHttpError ? error.status : null,
+      ...carried,
       requestAt,
       responseAt: new Date(respondedAt).toISOString(),
       latencyMs: respondedAt - startedAt,
@@ -662,6 +709,19 @@ async function dispatchArmCore(
     ]);
   }
 
+  // The analysis fields are decision-bearing, so a repair may not invent them:
+  // an initial that fingerprints WITHOUT them (a pre-axes v1 shape) can only be
+  // "repaired" into a body whose fingerprint differs, which the preservation
+  // check refuses. Skip the guaranteed-to-fail repair call instead of paying
+  // for it. (`axes === null` is the v1 discriminator — a v2 body legitimately
+  // carries a null primaryAxis, and that fingerprints as v2.)
+  if ([...initialFingerprint.values()].some((fp) => fp.axes === null)) {
+    return failed('invalid_schema', attemptRecord, null, false, null, [
+      ...firstValidation.errors,
+      'repair skipped: the initial response omits the decision-bearing analysis fields (axes/primaryAxis/primaryExpectation), and a repair may not invent them',
+    ]);
+  }
+
   // Capture the narrowed fingerprint: the repair sender below is a nested (hoisted)
   // function, so the null-narrowing above does not flow into it.
   const initialDecisions = initialFingerprint;
@@ -757,6 +817,8 @@ async function dispatchArmCore(
     options.maxOutputTokens,
     nowMs,
     repairStartMs,
+    // Format-only: the repair carries NO declared tools, so it cannot search.
+    'none',
   );
   const { response: repairResponse, failure: repairFailure, ...repairRecord } = repair;
   if (repairFailure !== null || repairResponse === null) {

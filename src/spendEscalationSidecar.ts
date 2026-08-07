@@ -44,6 +44,17 @@ export interface SidecarAttemptRecord {
   /** Token-count-only projection of the verbatim `usageRaw` (whitelisted finite numbers,
    *  dotted keys for nested buckets); `null` when no usage object was present. */
   readonly usageTokens: Readonly<Record<string, number>> | null;
+  /**
+   * The attempt's billable web-search count — a number when derivable, `null`
+   * when a search ran but the count is not derivable. OMITTED entirely when the
+   * attempt carries no search evidence, which is exactly the shape of every
+   * sidecar written before search existed, so old evidence keeps verifying.
+   *
+   * This is a count, not text: it is what makes the search FEE recomputable
+   * offline for the two providers (OpenAI, Google) whose usage objects carry no
+   * search counter of their own.
+   */
+  readonly searchCount?: number | null | undefined;
   readonly spendClass: AttemptSpendClass;
   readonly status: 'pass' | 'breach' | 'unknown';
   /** The conservative derived-actual for a breach; `null` otherwise. */
@@ -71,21 +82,50 @@ export interface SpendEscalationSidecarV1 {
  *  nested). Nothing outside this list is ever copied into a sidecar — and the offline
  *  pair verifier rejects any persisted key outside it (the same single source). */
 export const TOKEN_FIELD_WHITELIST: Readonly<Record<ProviderName, readonly string[]>> = Object.freeze({
+  // openai/xai carry BOTH the legacy chat-completions field names (old
+  // evidence keeps verifying) and the Responses-API names the live adapters
+  // report since provider web search moved them to /v1/responses.
   openai: Object.freeze([
     'prompt_tokens',
     'completion_tokens',
     'total_tokens',
     'completion_tokens_details.reasoning_tokens',
     'prompt_tokens_details.cached_tokens',
+    'input_tokens',
+    'output_tokens',
+    'output_tokens_details.reasoning_tokens',
+    'input_tokens_details.cached_tokens',
   ]),
-  xai: Object.freeze(['prompt_tokens', 'completion_tokens', 'total_tokens', 'completion_tokens_details.reasoning_tokens']),
-  anthropic: Object.freeze(['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']),
+  xai: Object.freeze([
+    'prompt_tokens',
+    'completion_tokens',
+    'total_tokens',
+    'completion_tokens_details.reasoning_tokens',
+    'input_tokens',
+    'output_tokens',
+    'output_tokens_details.reasoning_tokens',
+    // Search-billing evidence: successful web-search invocations (billed
+    // per call) and the provider's own integer cost counter (10^10 ticks = $1).
+    'server_side_tool_usage_details.web_search_calls',
+    'cost_in_usd_ticks',
+  ]),
+  anthropic: Object.freeze([
+    'input_tokens',
+    'output_tokens',
+    'cache_read_input_tokens',
+    'cache_creation_input_tokens',
+    'output_tokens_details.thinking_tokens',
+    // Search-billing evidence: executed searches (billed per search).
+    'server_tool_use.web_search_requests',
+  ]),
   google: Object.freeze([
     'promptTokenCount',
     'candidatesTokenCount',
     'thoughtsTokenCount',
     'totalTokenCount',
     'cachedContentTokenCount',
+    // Search-result tokens injected as tool-use prompt input (grounding).
+    'toolUsePromptTokenCount',
   ]),
 });
 
@@ -156,6 +196,9 @@ export function buildSpendEscalationSidecar(input: {
           requestAt: attempt.requestAt,
           responseAt: attempt.responseAt,
           usageTokens: redactUsageTokens(result.arm.provider, attempt.usageRaw),
+          // Count only — never the query text, which is response content and
+          // belongs in the artifact, not in the money evidence.
+          ...(attempt.searchAudit === null ? {} : { searchCount: attempt.searchAudit.searchCount }),
           spendClass: classifyAttemptSpend({
             billingClass: input.billingClass,
             requestAt: attempt.requestAt,

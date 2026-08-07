@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { test } from 'node:test';
 import { cohortBoot } from './cohortBoot.js';
 import { evaluateCandidate } from './detection.js';
@@ -88,7 +89,7 @@ function manifestJson(): string {
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
     })),
-    toolInferenceConfigSha256: 'c'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,

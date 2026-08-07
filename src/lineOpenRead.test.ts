@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -74,7 +75,7 @@ function manifestRaw(
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: a.approvedReportedModelIds,
     })),
-    toolInferenceConfigSha256: 'b'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: REPAIR_POLICY_VERSION,
     scoringPolicyVersion: SCORING_POLICY_VERSION,

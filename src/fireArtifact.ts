@@ -4,7 +4,18 @@ import { redactSecrets } from './config.js';
 import { deepFreeze } from './freeze.js';
 import { forecastFingerprint } from './schema.js';
 import type { CohortManifestV1 } from './manifest.js';
-import type { ArmGameResult, ArmOutcome, AttemptRecord, BenchmarkResponse, MarketKey, ProviderUsage } from './types.js';
+import { AXIS_NAMES } from './types.js';
+import type {
+  ArmGameResult,
+  ArmOutcome,
+  AttemptRecord,
+  AxesScores,
+  AxisName,
+  BenchmarkResponse,
+  MarketKey,
+  ProviderUsage,
+  SearchAudit,
+} from './types.js';
 
 /**
  * The fire artifact's ARM INTEGRITY CORE (SPEC-line-open-evidence-model.md
@@ -52,16 +63,42 @@ export type AttemptTransportV1 = z.infer<typeof attemptTransportSchemaV1>;
 // they must be SAFE non-negative integers: two distinct raw upstream integers above
 // Number.MAX_SAFE_INTEGER collapse to the same JS value and would collide pre-hash.
 const tokenCountSchemaV1 = z.number().int().safe().nonnegative().nullable();
+// reasoningTokens / billableOutputTokens are OPTIONAL (not nullable-required):
+// attempts persisted before the fields existed carry no key, so old artifacts
+// keep strict-parsing AND keep recomputing their original armDigest
+// (canonicalize binds only present keys). New attempts always carry both keys.
 const providerUsageSchemaV1 = z
   .object({
     inputTokens: tokenCountSchemaV1,
     outputTokens: tokenCountSchemaV1,
     totalTokens: tokenCountSchemaV1,
+    reasoningTokens: tokenCountSchemaV1.optional(),
+    billableOutputTokens: tokenCountSchemaV1.optional(),
   })
   .strict();
 // Compile-time parity: the persisted usage shape must equal the normalized ProviderUsage.
 const _usageParity: AssertEqual<z.infer<typeof providerUsageSchemaV1>, ProviderUsage> = true;
 void _usageParity;
+
+/**
+ * The persisted per-attempt web-search audit (queries + result references),
+ * OPTIONAL for the same reason as the usage extensions above: absent on
+ * attempts persisted before provider search existed (their digests recompute
+ * unchanged), explicit — `null` when a new attempt ran no search — on every
+ * new attempt, and digest-bound whenever present (a removed or tampered audit
+ * fails the armDigest recompute).
+ */
+const searchAuditSchemaV1 = z
+  .object({
+    queries: z.array(z.object({ query: z.string().min(1) }).strict()),
+    results: z
+      .array(z.object({ url: z.string().min(1), title: z.string().min(1).nullable() }).strict()),
+    searchCount: z.number().int().safe().nonnegative().nullable(),
+    incomplete: z.array(z.string().min(1)),
+  })
+  .strict();
+const _searchAuditParity: AssertEqual<z.infer<typeof searchAuditSchemaV1>, SearchAudit> = true;
+void _searchAuditParity;
 
 // ---------------------------------------------------------------------------
 // Expected-arm identity: the authenticated manifest roster-entry projection
@@ -116,9 +153,28 @@ export interface DecisionFingerprintEntryV1 {
   confidence: number;
   wouldAbstain: boolean;
   selectedForExecution: boolean;
+  /**
+   * The v2 analysis, present exactly when the accepted body carried it (all
+   * three keys together). Absent on entries derived from a v1-shaped body — so
+   * artifacts produced before the analysis existed recompute their ORIGINAL
+   * `armDigest` unchanged, while a v2 entry binds the analysis into the digest.
+   */
+  axes?: AxesScores | undefined;
+  primaryAxis?: AxisName | null | undefined;
+  primaryExpectation?: string | null | undefined;
 }
 
 export type AcceptedDecisionFingerprintV1 = readonly DecisionFingerprintEntryV1[];
+
+const axesEntrySchemaV1 = z
+  .object({
+    valuation: z.number(),
+    trend: z.number(),
+    consensus: z.number(),
+    news: z.number(),
+    softness: z.number(),
+  })
+  .strict();
 
 export const decisionFingerprintEntrySchemaV1 = z
   .object({
@@ -131,6 +187,9 @@ export const decisionFingerprintEntrySchemaV1 = z
     confidence: z.number(),
     wouldAbstain: z.boolean(),
     selectedForExecution: z.boolean(),
+    axes: axesEntrySchemaV1.optional(),
+    primaryAxis: z.enum(AXIS_NAMES).nullable().optional(),
+    primaryExpectation: z.string().nullable().optional(),
   })
   .strict();
 
@@ -160,6 +219,12 @@ export function decisionFingerprint(parsed: BenchmarkResponse): AcceptedDecision
         confidence: fp.confidence,
         wouldAbstain: fp.wouldAbstain,
         selectedForExecution: fp.selectedForExecution,
+        // All three keys travel together, keyed on whether the accepted body
+        // carried the analysis at all (`axes === null` is the v1 discriminator;
+        // a v2 body legitimately carries a null primaryAxis when every axis is 1).
+        ...(fp.axes === null
+          ? {}
+          : { axes: fp.axes, primaryAxis: fp.primaryAxis, primaryExpectation: fp.primaryExpectation }),
       });
     }
   }
@@ -195,6 +260,20 @@ export interface PersistedAttemptV1 {
   transport: AttemptTransportV1;
   /** Detached, normalized token usage for this attempt, or `null`. */
   usage: ProviderUsage | null;
+  /** Detached, redacted web-search audit — absent on pre-search attempts,
+   *  explicit `null` on a new attempt that ran no search. */
+  searchAudit?: SearchAudit | null | undefined;
+  /**
+   * The structured provider completion state — the provider's own NON-FINAL
+   * terminal string (stop_reason / root status / finishReason) and whether the
+   * provider declared the turn finished. OPTIONAL for the same reason as the
+   * usage extensions: absent on attempts persisted before the fields existed
+   * (their digests recompute unchanged), explicit on every new attempt, and
+   * digest-bound whenever present — so a demotion's provider verdict cannot be
+   * silently edited out of the durable evidence.
+   */
+  providerStopReason?: string | null | undefined;
+  turnCompleted?: boolean | null | undefined;
 }
 
 export const persistedAttemptSchemaV1 = z
@@ -210,6 +289,9 @@ export const persistedAttemptSchemaV1 = z
     responseSha256: sha256Schema.nullable(),
     transport: attemptTransportSchemaV1,
     usage: providerUsageSchemaV1.nullable(),
+    searchAudit: searchAuditSchemaV1.nullable().optional(),
+    providerStopReason: z.string().min(1).nullable().optional(),
+    turnCompleted: z.boolean().nullable().optional(),
   })
   .strict();
 
@@ -261,6 +343,15 @@ export function toPersistedAttempts(result: ArmGameResult): readonly PersistedAt
       responseSha256,
       transport: transportOf(record, kind),
       usage: record.usage === null ? null : { ...record.usage },
+      // Always an explicit key on newly persisted attempts (null = no search
+      // activity); the runner already redacted the audit's strings. Detached
+      // via structuredClone so the artifact never aliases live runner state.
+      searchAudit: record.searchAudit === null ? null : structuredClone(record.searchAudit),
+      // Structured provider completion state, explicit on every new attempt
+      // and digest-bound: the durable proof (or absence of proof) that a
+      // non-valid outcome was the provider's verdict.
+      providerStopReason: record.providerStopReason,
+      turnCompleted: record.turnCompleted,
     });
   };
   mapOne(result.attempt, 1, 'initial');

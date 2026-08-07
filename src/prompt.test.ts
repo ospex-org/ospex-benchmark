@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { z } from 'zod';
 import {
@@ -12,6 +13,7 @@ import {
   renderResponseTemplate,
   schemaLeafPaths,
 } from './schema.js';
+import { AXIS_NAMES } from './types.js';
 
 /**
  * Guards the prompt/validator contract alignment structurally, at every
@@ -104,4 +106,50 @@ test('the system prompt stays verbatim — the template lives in the harness sca
       'If required information is missing or contradictory, record the supplied reason code rather than inventing facts.',
     ),
   );
+});
+
+test('the system prompt is byte-identical to the contract doc — the doc IS the contract, not a paraphrase of it', () => {
+  // prompt.ts declares docs/BENCHMARK_PROMPT_V0.md the contract. Until now that
+  // was prose: only the first and last sentences were checked, so the entire
+  // middle of the prompt could drift from the doc silently.
+  const doc = readFileSync(new URL('../docs/BENCHMARK_PROMPT_V0.md', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const match = doc.match(/## System prompt draft\n\n```text\n([\s\S]*?)\n```/);
+  assert.ok(match, 'the contract doc must carry a "System prompt draft" text block');
+  assert.equal(match[1], SYSTEM_PROMPT.replace(/\r\n/g, '\n'));
+});
+
+test('the superseded pre-axes prompt is retained in the doc, and is NOT the live prompt', () => {
+  // Archived runs (prompt scaffold below v0.4, response schema v1) were produced
+  // under the earlier text; keeping it lets those artifacts stay interpretable.
+  const doc = readFileSync(new URL('../docs/BENCHMARK_PROMPT_V0.md', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const appendix = doc.match(/## Appendix: superseded pre-axes system prompt[^\n]*\n\n[\s\S]*?```text\n([\s\S]*?)\n```/);
+  assert.ok(appendix, 'the superseded prompt must remain in the doc');
+  const superseded = appendix[1] ?? '';
+  assert.ok(superseded.includes('Do not use memory of later events, external browsing, native provider search'));
+  assert.notEqual(superseded, SYSTEM_PROMPT.replace(/\r\n/g, '\n'));
+});
+
+test('the model-visible prompt text carries NO smart punctuation — curly quotes/apostrophes must never reach the wire', () => {
+  // The source document arrived with word-processor punctuation (U+2019). The
+  // wire text is normalized to ASCII quotes so no model ever sees a byte that
+  // renders differently across toolchains. This pins the whole smart-quote
+  // family, both directions, in both model-visible strings.
+  const smartQuotes = /[‘’“”]/;
+  assert.ok(!smartQuotes.test(SYSTEM_PROMPT), 'SYSTEM_PROMPT must be free of curly quotes/apostrophes');
+  assert.ok(!smartQuotes.test(CONTRACT_NOTES), 'CONTRACT_NOTES must be free of curly quotes/apostrophes');
+});
+
+test('the live prompt asks for exactly what the validator enforces: the five axes, one primary driver, and search-aware grounding', () => {
+  // Cheap coupling check between the prompt text and the schema's own vocabulary
+  // — a renamed axis in one place and not the other fails here.
+  for (const axis of AXIS_NAMES) {
+    assert.ok(SYSTEM_PROMPT.includes(axis), `the prompt must name the "${axis}" axis`);
+    assert.ok(CONTRACT_NOTES.includes(axis), `the contract notes must name the "${axis}" axis`);
+  }
+  assert.ok(/Rate each axis 1 to 5/.test(SYSTEM_PROMPT));
+  assert.ok(/If every axis is 1, name no primary driver/.test(SYSTEM_PROMPT));
+  // The prompt permits (and the validator now accepts) a rationale that rests on
+  // a performed search rather than a bundle ref.
+  assert.ok(/where it rests on outside reasoning or a search you performed/.test(SYSTEM_PROMPT));
+  assert.ok(/leave this array empty rather than citing a ref that does not support it/.test(CONTRACT_NOTES));
 });

@@ -94,7 +94,7 @@ test('a built campaign manifest boots, conforms, and derives its reservation cap
   assert.equal(manifest.constants.providerAttemptReservationUsdMicros, 100_000_000);
   assert.equal(manifest.constants.maxOutputTokens, 16_000);
   assert.equal(manifest.constants.providerCallTimeoutMs, 300_000);
-  assert.equal(manifest.modelPriceTableVersion, 'prices-v2');
+  assert.equal(manifest.modelPriceTableVersion, 'prices-v3');
 });
 
 test('cost projection is stated in CALLS, both at the observed rate and the committed conservative bound', () => {

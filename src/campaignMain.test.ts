@@ -579,7 +579,7 @@ test('arm prints the exact terms and, on confirmation, initializes the budget an
   assert.match(output, /ARM CAMPAIGN/);
   assert.match(output, /at most 800 provider calls \(100 fires/);
   assert.match(output, /\$37\.09 expected at the observed rate/);
-  assert.match(output, /hard-stopped above \$100/);
+  assert.match(output, /priced above \$100 halts the campaign \(detection, not a per-call cap\)/);
   assert.match(output, /expiry 2026-08-12T00:00:00\.000Z/);
 
   // The authorization was recorded, and the manifest written for later ticks.

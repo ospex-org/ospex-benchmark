@@ -6,6 +6,7 @@ import { MODEL_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTa
 import type { ModelPriceTableVersion } from './modelPriceTable.js';
 import { SOURCE_QUERY_VERSION } from './oddsHistory.js';
 import { promptScaffoldSha256 } from './prompt.js';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { CODE_MAX_REPAIRS_PER_ARM, REPAIR_POLICY_VERSION } from './repairPolicy.js';
 import {
   SCHEDULE_CHANGE_TOLERANCE_MS,
@@ -108,8 +109,9 @@ export function buildRehearsalManifest(now: number, opts: RehearsalManifestOptio
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
     })),
-    // Not yet code-validated (no module owns them at boot); any well-formed value.
-    toolInferenceConfigSha256: 'b'.repeat(64),
+    // Recomputed from the code's declared tool configuration (tools-v1:
+    // provider web search on all four arms), checked by manifestValidate.
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     // A line-open cohort fires markets independently, so it MUST declare a
     // scoped-capable baseline policy — the full-board default (v0.2) is refused
     // by the dynamic-cohort gate in `validateManifestAgainstCode`.

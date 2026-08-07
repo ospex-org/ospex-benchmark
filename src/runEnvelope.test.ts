@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { PreparedRequestError, prepareGameRequest } from './preparedRequest.js';
+import { createRealAdapters } from './providers/index.js';
 import { buildRecords } from './records.js';
 import type { RunContext } from './records.js';
 import { runSlate, sealDispatch } from './runner.js';
@@ -48,6 +49,7 @@ function stubResponse(rawText: string, reportedModelId: string): ProviderRespons
     usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
     usageRaw: { prompt_tokens: 100, completion_tokens: 50 },
     requestParams: { stub: true },
+    searchAudit: null,
   };
 }
 
@@ -326,4 +328,79 @@ test('A6: the full artifact is deterministic and passes verifyRunIntegrity', asy
     })),
   });
   assert.deepEqual(violations, []);
+});
+
+// --- The wire-to-verifier round trip for a truthful unfinished turn ----------
+
+test('END-TO-END: wire status "incomplete" with schema-valid JSON → runner records provider_error → records → verifyRunIntegrity passes with no decisions', async () => {
+  // The blocker probe, driven through the REAL Responses adapter: HTTP 200,
+  // root status "incomplete" (max_output_tokens), and an extracted body that
+  // is COMPLETE schema-valid v2 JSON. The provider's completion status is
+  // authoritative: the runner refuses the body (provider_error), the archived
+  // record carries the structured non-final state, and the offline verifier
+  // accepts the truthful record instead of declaring the run corrupt.
+  const REG_ARM: ArmSpec = {
+    participantId: 'openai-gpt-5.6-sol',
+    provider: 'openai',
+    requestedModelId: 'gpt-5.6-sol',
+    credentialEnvVar: 'OPENAI_API_KEY',
+  };
+  const request = makeRequest(CUTOFF, { gameId: ID_A });
+  const validJson = JSON.stringify(makeValidResponse(request, REG_ARM, COHORT));
+
+  const priorKey = process.env['OPENAI_API_KEY'];
+  const priorFetch = globalThis.fetch;
+  process.env['OPENAI_API_KEY'] = 'synthetic-test-credential';
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        id: 'resp_wire_incomplete_valid_json',
+        model: 'gpt-5.6-sol',
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [{ type: 'message', content: [{ type: 'output_text', text: validJson }] }],
+        usage: { input_tokens: 200, output_tokens: 900, total_tokens: 1_100 },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as typeof fetch;
+  let env: RunEnvelope;
+  try {
+    const adapter = createRealAdapters().get(REG_ARM.participantId);
+    assert.ok(adapter, 'the production registry must roster the openai arm');
+    env = await runSlate([REG_ARM], new Map([[REG_ARM.participantId, adapter]]), [request], baseOptions());
+  } finally {
+    globalThis.fetch = priorFetch;
+    if (priorKey === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = priorKey;
+  }
+
+  // Runner truth: a provider outcome carrying the structured non-final state
+  // and the (well-formed) body as evidence — never a valid decision.
+  const result = env.results[0];
+  assert.ok(result);
+  assert.equal(result.outcome, 'provider_error');
+  assert.equal(result.parsed, null, 'the valid-looking body must not become a benchmark answer');
+  assert.equal(result.attempt.rawText, validJson);
+  assert.equal(result.attempt.turnCompleted, false);
+  assert.equal(result.attempt.providerStopReason, 'incomplete');
+  assert.equal(result.attempt.httpStatus, 200);
+
+  // Records → the real offline verifier: the truthful record is scoreable.
+  const records = buildRecords(env, ctxMatching(env), buildFor([request]), NO_COLLISION);
+  assert.equal(
+    records.filter((r) => r['recordType'] === 'decision').length,
+    0,
+    'an unfinished turn emits no decisions',
+  );
+  const violations = verifyRunIntegrity(parseRunRecords(records.map((r) => JSON.stringify(r))), {
+    expectedArms: [
+      {
+        participantId: REG_ARM.participantId,
+        provider: REG_ARM.provider,
+        requestedModelId: REG_ARM.requestedModelId,
+        approvedReportedModelIds: [REG_ARM.requestedModelId],
+      },
+    ],
+  });
+  assert.deepEqual(violations, [], 'a truthful unfinished-but-valid-looking body must not read as corrupt');
 });

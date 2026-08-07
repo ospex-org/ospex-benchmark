@@ -10,16 +10,18 @@ import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
   benchmarkResponseSchema,
   compareFingerprints,
+  CURRENT_RESPONSE_SCHEMA_VERSION,
   extractDecisionFingerprint,
   extractJson,
   fingerprintFromParsed,
   validateResponseText,
 } from './schema.js';
-import { SMOKE_LABEL } from './types.js';
+import { AXIS_NAMES, SMOKE_LABEL } from './types.js';
+import type { ResponseSchemaVersion } from './schema.js';
 import type { BaselinePolicyVersion } from './baselines.js';
 import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
 import type { LadderParams, TotalsLadderResult } from './ladder.js';
-import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } from './types.js';
+import type { ArmSpec, AxisName, ClosingLineRow, MarketKey, ProviderName, SlateBundle } from './types.js';
 
 /**
  * Pure scoring assembly, no I/O: parse a run's records, VERIFY THE RUN'S
@@ -112,6 +114,7 @@ const runMetaSchema = z
     armGameResults: z.number().int().nonnegative(),
     baselineDecisionCount: z.number().int().nonnegative(),
     baselinePolicyVersion: z.string().min(1).optional(),
+    promptScaffoldVersion: z.string().min(1).optional(),
     watch: watchProvenanceSchema.optional(),
   })
   .passthrough();
@@ -194,6 +197,11 @@ const attemptFieldsSchema = z
     requestAt: z.string().nullable(),
     responseAt: z.string().nullable(),
     latencyMs: z.number().nullable(),
+    // Structured provider completion state (absent on archives that predate
+    // it): the non-final terminal string, and whether the provider declared
+    // the turn finished. Optional-when-absent so old evidence keeps parsing.
+    providerStopReason: z.string().nullable().optional(),
+    turnCompleted: z.boolean().nullable().optional(),
   })
   .passthrough();
 
@@ -212,6 +220,8 @@ const armResponseSchema = z
     cutoffAt: z.string().min(1),
     outcome: z.string().min(1),
     repairUsed: z.boolean(),
+    // Absent on archives that predate the per-record repair-transport stamp.
+    repairTransport: z.string().nullable().optional(),
     attempt: attemptFieldsSchema,
     repair: attemptFieldsSchema.nullable(),
   })
@@ -245,6 +255,21 @@ const decisionSchema = z
     confidence: z.number(),
     selectedForExecution: z.boolean(),
     wouldAbstain: z.boolean(),
+    // Response schema v2 analysis fields; absent on v1-era archives, null on
+    // records replayed from v1-shaped parses.
+    axes: z
+      .object({
+        valuation: z.number(),
+        trend: z.number(),
+        consensus: z.number(),
+        news: z.number(),
+        softness: z.number(),
+      })
+      .passthrough()
+      .nullable()
+      .optional(),
+    primaryAxis: z.enum(AXIS_NAMES).nullable().optional(),
+    primaryExpectation: z.string().nullable().optional(),
     provider: z.string().min(1),
     requestedModelId: z.string().min(1),
     reportedModelId: z.string().nullable(),
@@ -320,6 +345,10 @@ export interface SourcePick {
   echoedRequestSha256: string | null;
   echoedGameSha256: string | null;
   echoedSlateSha256: string | null;
+  /** Response schema v2 analysis fields; null on v1-era records and baselines. */
+  axes: Record<AxisName, number> | null;
+  primaryAxis: AxisName | null;
+  primaryExpectation: string | null;
 }
 
 export interface ArchivedAttempt {
@@ -329,11 +358,19 @@ export interface ArchivedAttempt {
   requestAt: string | null;
   responseAt: string | null;
   latencyMs: number | null;
+  /** The provider's own non-final terminal string; `null` on a finished turn,
+   *  no response, or an archive that predates the field. */
+  providerStopReason: string | null;
+  /** Whether the provider declared the turn finished; `null` when no response
+   *  was received or the archive predates the field. */
+  turnCompleted: boolean | null;
 }
 
 export interface ArmResponseRef {
   participantId: string;
   provider: string;
+  /** The archived repair transport outcome; `null` when absent (old archives). */
+  repairTransport: string | null;
   requestedModelId: string;
   reportedModelId: string | null;
   gameId: string;
@@ -367,6 +404,9 @@ export interface SourceRun {
   baselineDecisionCount: number;
   /** Baseline policy version stamped at write time; null on legacy archives. */
   baselinePolicyVersion: string | null;
+  /** Prompt scaffold version stamped at write time; null on legacy archives.
+   *  Selects the response-schema era the integrity checks re-validate under. */
+  promptScaffoldVersion: string | null;
   /** Watch-mode gate provenance; required (and verified) for watch runs. */
   watch: WatchProvenanceMeta | null;
   games: Map<string, SourceGame>;
@@ -467,6 +507,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
         armResponses.push({
           participantId: response.participantId,
           provider: response.provider,
+          repairTransport: response.repairTransport ?? null,
           requestedModelId: response.requestedModelId,
           reportedModelId: response.reportedModelId,
           gameId: response.gameId,
@@ -481,6 +522,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
             requestAt: response.attempt.requestAt,
             responseAt: response.attempt.responseAt,
             latencyMs: response.attempt.latencyMs,
+            providerStopReason: response.attempt.providerStopReason ?? null,
+            turnCompleted: response.attempt.turnCompleted ?? null,
           },
           repair:
             response.repair === null
@@ -492,6 +535,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
                   requestAt: response.repair.requestAt,
                   responseAt: response.repair.responseAt,
                   latencyMs: response.repair.latencyMs,
+                  providerStopReason: response.repair.providerStopReason ?? null,
+                  turnCompleted: response.repair.turnCompleted ?? null,
                 },
           accepted: {
             reportedModelId: accepted.reportedModelId,
@@ -537,6 +582,9 @@ export function parseRunRecords(lines: string[]): SourceRun {
           echoedRequestSha256: decision.bundleSha256,
           echoedGameSha256: decision.gameSha256,
           echoedSlateSha256: decision.slateSha256,
+          axes: decision.axes ?? null,
+          primaryAxis: decision.primaryAxis ?? null,
+          primaryExpectation: decision.primaryExpectation ?? null,
         });
         break;
       }
@@ -570,6 +618,9 @@ export function parseRunRecords(lines: string[]): SourceRun {
           echoedRequestSha256: baseline.requestSha256,
           echoedGameSha256: baseline.gameSha256,
           echoedSlateSha256: baseline.slateSha256,
+          axes: null,
+          primaryAxis: null,
+          primaryExpectation: null,
         });
         break;
       }
@@ -597,6 +648,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
     armGameResults: meta.armGameResults,
     baselineDecisionCount: meta.baselineDecisionCount,
     baselinePolicyVersion: meta.baselinePolicyVersion ?? null,
+    promptScaffoldVersion: meta.promptScaffoldVersion ?? null,
     watch: meta.watch ?? null,
     games,
     picks,
@@ -609,6 +661,27 @@ export function parseRunRecords(lines: string[]): SourceRun {
 // ---------------------------------------------------------------------------
 // Run integrity — a scorecard is only as trustworthy as its input
 // ---------------------------------------------------------------------------
+
+/**
+ * The response-schema era a run's archived bodies were produced under, keyed
+ * by the run_meta prompt-scaffold stamp: pre-v0.4 scaffolds prompted the v1
+ * response shape, v0.4 prompts v2. An absent stamp is a legacy pre-stamp
+ * archive (v1); an unknown (future) scaffold validates as the current
+ * version. Re-validating each run under ITS OWN era keeps both directions
+ * exact — an old valid body neither fails the new schema, nor does a new
+ * v1-shaped body (correctly refused by the runner) read as "validates".
+ */
+function responseSchemaVersionForRun(promptScaffoldVersion: string | null): ResponseSchemaVersion {
+  if (promptScaffoldVersion === null) return 1;
+  const byScaffold: Record<string, ResponseSchemaVersion> = {
+    'shadow-smoke-v0.1': 1,
+    'shadow-smoke-v0.2': 1,
+    'shadow-smoke-v0.3': 1,
+    'shadow-smoke-v0.4': 2,
+    'shadow-smoke-v0.5': 2,
+  };
+  return byScaffold[promptScaffoldVersion] ?? CURRENT_RESPONSE_SCHEMA_VERSION;
+}
 
 /**
  * The response-side markets a recorded game SUPPLIES (1-3, S3 dynamic
@@ -682,6 +755,12 @@ export function verifyRunIntegrity(
   options?: { expectedArms?: ExpectedArm[] },
 ): string[] {
   const violations: string[] = [];
+  // Archived bodies re-validate under the response-schema era THIS run was
+  // produced in (see responseSchemaVersionForRun) — never the current-only
+  // default, which is the new-run gate.
+  const acceptedVersions: readonly ResponseSchemaVersion[] = [
+    responseSchemaVersionForRun(run.promptScaffoldVersion),
+  ];
 
   // Watch runs must prove their entry-timing claim from the artifact itself:
   // a watch-v0 run without recorded, internally consistent gate provenance is
@@ -1054,6 +1133,7 @@ export function verifyRunIntegrity(
       game.requestSha256,
       armSpecForValidation,
       run.cohortId,
+      acceptedVersions,
     );
     if (revalidation.errors.length > 0 || revalidation.parsed === null) {
       violations.push(
@@ -1075,6 +1155,7 @@ export function verifyRunIntegrity(
           game.requestSha256,
           armSpecForValidation,
           run.cohortId,
+          acceptedVersions,
         );
         if (initialValidation.errors.length === 0) {
           violations.push(`${key}: repair was used but the archived initial response already validates`);
@@ -1114,6 +1195,24 @@ export function verifyRunIntegrity(
         forecast.selectedForExecution !== pick.selectedForExecution;
       if (mismatch) {
         violations.push(`${key} ${pick.market}: decision does not match the accepted provider response`);
+      }
+      // Response schema v2: the recorded decision must carry the SAME analysis
+      // fields as the accepted forecast. v1-era forecasts have none, so the
+      // check is conditional on the forecast (never on the pick, which a
+      // tampered record controls).
+      if (forecast.axes !== undefined) {
+        const axesMatch =
+          pick.axes !== null &&
+          AXIS_NAMES.every((axis: AxisName) => forecast.axes?.[axis] === pick.axes?.[axis]);
+        if (
+          !axesMatch ||
+          (forecast.primaryAxis ?? null) !== pick.primaryAxis ||
+          (forecast.primaryExpectation ?? null) !== pick.primaryExpectation
+        ) {
+          violations.push(
+            `${key} ${pick.market}: analysis fields (axes/primaryAxis/primaryExpectation) do not match the accepted provider response`,
+          );
+        }
       }
       if (
         pick.provider !== response.provider ||
@@ -1219,6 +1318,7 @@ export function verifyRunIntegrity(
         game.requestSha256,
         armSpecForValidation,
         run.cohortId,
+        acceptedVersions,
       );
       if (initialValidation.errors.length === 0) {
         violations.push(
@@ -1227,13 +1327,24 @@ export function verifyRunIntegrity(
         continue;
       }
       const repairRaw = response.repair?.rawResponse ?? null;
-      if (response.repairUsed && repairRaw !== null) {
+      // The claim "this repair should have been valid" holds only for a repair
+      // whose transport settled ok AND whose archived provider state does not
+      // show a NON-FINAL turn: an unfinished repair turn (the provider said
+      // incomplete/paused) archives its body with turnCompleted: false, and
+      // provider completion status is authoritative over body shape — a
+      // validating body from a non-final turn is correctly refused. An absent
+      // state (a legacy archive, or an unexplained demotion) keeps the claim.
+      const repairTurnNonFinal =
+        response.repair?.turnCompleted === false && (response.repair?.providerStopReason ?? null) !== null;
+      const repairSettledOk = (response.repairTransport ?? 'ok') === 'ok';
+      if (response.repairUsed && repairRaw !== null && repairSettledOk && !repairTurnNonFinal) {
         const repairValidation = validateResponseText(
           repairRaw,
           requestBundle,
           game.requestSha256,
           armSpecForValidation,
           run.cohortId,
+          acceptedVersions,
         );
         if (repairValidation.errors.length === 0 && repairValidation.parsed !== null) {
           const initialFingerprint = extractDecisionFingerprint(initialRaw, requestBundle);
@@ -1247,19 +1358,72 @@ export function verifyRunIntegrity(
           }
         }
       }
-      if (!response.repairUsed && extractDecisionFingerprint(initialRaw, requestBundle) !== null) {
-        violations.push(
-          `${key}: invalid_schema without a repair, but the initial response has a complete fingerprint — the harness would have attempted a repair`,
-        );
+      if (!response.repairUsed) {
+        const initialFingerprint = extractDecisionFingerprint(initialRaw, requestBundle);
+        // Mirror the runner's era-specific repair rules: no era repairs an
+        // unfingerprintable initial, and the v2-era runner ALSO skips a
+        // fingerprint that omits the decision-bearing analysis (a pre-axes
+        // shape a repair may not invent — the fingerprints could never match).
+        // A v1-era archive keeps the original rule: that era's runner repaired
+        // any fingerprintable initial.
+        const analysisAbsent =
+          initialFingerprint !== null &&
+          [...initialFingerprint.values()].some((fp) => fp.axes === null);
+        if (initialFingerprint !== null && !(analysisAbsent && acceptedVersions.includes(2))) {
+          violations.push(
+            `${key}: invalid_schema without a repair, but the initial response has a complete fingerprint — the harness would have attempted a repair`,
+          );
+        }
       }
     } else if (
       response.outcome === 'timeout' ||
       response.outcome === 'rate_limited' ||
-      response.outcome === 'provider_error' ||
       response.outcome === 'credential_missing'
     ) {
       if (response.attempt.rawResponse !== null || (response.repair?.rawResponse ?? null) !== null) {
         violations.push(`${key}: transport outcome ${response.outcome} cannot carry a response body`);
+      }
+    } else if (response.outcome === 'provider_error') {
+      // A provider_error initial MAY carry an archived body: an unfinished
+      // turn (paused server-tool loop, refusal, output-cap stop, or any other
+      // non-final provider state) is a RECEIVED response — HTTP 200 with
+      // empty or partial content — whose evidence the runner records. What it
+      // can never be is a VALIDATING body (a valid response cannot be demoted
+      // to a provider failure), and no repair is ever dispatched after a
+      // failed initial, so a repair body under this outcome is fabricated.
+      if ((response.repair?.rawResponse ?? null) !== null) {
+        violations.push(
+          `${key}: provider_error cannot carry a repair body — no repair is dispatched after a failed initial`,
+        );
+      }
+      const initialRaw = response.attempt.rawResponse;
+      if (initialRaw !== null) {
+        // Provider completion status is AUTHORITATIVE over body shape: a
+        // provider can declare a turn non-final (root status "incomplete",
+        // stop_reason "max_tokens", …) even when the extracted text happens to
+        // form complete, schema-valid JSON, and the runner correctly refuses
+        // that body. The archived structured state — turnCompleted: false with
+        // the provider's own stop reason — is what proves the demotion is the
+        // provider's verdict, not the operator's. Without that proof (an
+        // absent state, or a turn recorded as finished), a validating body
+        // under provider_error stays a violation.
+        const turnRecordedNonFinal =
+          response.attempt.turnCompleted === false && response.attempt.providerStopReason !== null;
+        if (!turnRecordedNonFinal) {
+          const initialValidation = validateResponseText(
+            initialRaw,
+            requestBundle,
+            game.requestSha256,
+            armSpecForValidation,
+            run.cohortId,
+            acceptedVersions,
+          );
+          if (initialValidation.errors.length === 0) {
+            violations.push(
+              `${key}: recorded provider_error but the archived initial response validates and the archived provider state does not show a non-final turn — a completed valid response cannot be demoted`,
+            );
+          }
+        }
       }
     }
     else if (response.outcome === 'cutoff_missed') {
@@ -1285,6 +1449,7 @@ export function verifyRunIntegrity(
           game.requestSha256,
           armSpecForTiming,
           run.cohortId,
+          acceptedVersions,
         );
         if (initialValidation.errors.length === 0) {
           violations.push(

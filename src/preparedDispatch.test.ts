@@ -55,6 +55,7 @@ function stubResponse(rawText: string, reportedModelId: string): ProviderRespons
     usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
     usageRaw: { prompt_tokens: 100, completion_tokens: 50 },
     requestParams: { stub: true },
+    searchAudit: null,
   };
 }
 

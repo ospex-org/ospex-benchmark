@@ -1,6 +1,6 @@
 # Ospex Agent Benchmark — Canonical MVE Design
 
-- Last updated UTC: `2026-07-14T19:15:51Z`
+- Last updated UTC: `2026-08-07T00:00:00Z`
 - Status: accepted application-layer direction; methodology and harness gates remain in progress
 - Scope: MLB-first, one fixed canonical cohort plus separately labeled open/community cohorts
 - Prompt/schema working draft: [BENCHMARK_PROMPT_V0.md](BENCHMARK_PROMPT_V0.md)
@@ -40,8 +40,10 @@ Each output also records:
 - model-estimated probability;
 - confidence/rank;
 - `wouldAbstain` as a non-executing secondary signal;
-- short rationale grounded only in the frozen bundle;
+- short rationale, with evidenceRefs listing the bundle refs it actually rests on — possibly none, when it rests on outside reasoning or a performed search (every present ref must name a bundle entry);
+- integer 1-5 scores on five named analysis axes (valuation, trend, consensus, news, softness), the single primary axis driving the forecast (null exactly when every axis is rated 1), and a one-sentence primary expectation — with a driver, the expected development on that axis; with none, that no material movement is expected;
 - exact market, side, line, and observed price;
+- the per-attempt web-search audit (every executed query and result reference), token usage with `reasoningTokens` and `billableOutputTokens` alongside the provider's verbatim raw usage;
 - strict machine-readable schema validity.
 
 Forced shadow forecasts prevent cherry-picking and create a predictable paired sample. They measure **forced-choice market discrimination**, not bankroll management. A later selective policy may execute only when model-implied edge clears one common preregistered threshold; it must report coverage, abstentions, fills, and failures.
@@ -98,15 +100,17 @@ Every model in a canonical cohort receives the same logical information bundle, 
 - cohort ID and ruleset version;
 - bundle timestamp and SHA-256;
 - prompt/system/scaffold version and SHA-256;
-- exact tool definitions and returned tool data;
+- exact declared tool definitions and the per-attempt web-search audit — every executed query, result reference, billable search count, and any recorded reason the audit is partial — as each provider exposes them;
 - model provider, requested model ID, response-reported model/version when available, and model parameters;
 - request/response timestamps, provider response ID, token usage, latency, and cost;
 - parsed decision and raw sanitized response;
 - decision deadline and any retry/repair attempt.
 
-Proxy/archive every tool response. Launch provider calls concurrently where practical and seal each output until all arms submit so no participant or operator can condition a later arm on an earlier answer.
+Record the declared tool configuration and every attempt's search audit. Provider web search executes server-side, and not every provider exposes the result bodies (xAI returns consulted-source citations only), so the evidence contract is the flattened audit — executed queries, result references, billable counts, recorded gaps — plus the retained sanitized response envelope, not proxied or replayable tool-response archives. Launch provider calls concurrently where practical and seal each output until all arms submit so no participant or operator can condition a later arm on an earlier answer.
 
-Do not give one provider native web/search access while another sees only the frozen bundle. Provider-native search, browsing, code execution, memory, and hidden multi-agent modes are disabled unless equivalent, logged tools are deliberately supplied to every participant.
+Do not give one provider native web/search access while another sees only the frozen bundle. Provider-native web search IS deliberately enabled for every participant under the cohort-declared tool configuration (tools-v1, hashed into the manifest as `toolInferenceConfigSha256`), with every executed query, result reference, and billable search count logged per attempt. Browsing beyond the declared search tool, code execution, memory, and hidden multi-agent modes remain disabled unless equivalent, logged tools are deliberately supplied to every participant.
+
+One asymmetry is disclosed rather than claimed away: the declared per-attempt search ceiling is enforced by the provider on two arms (`max_tool_calls` on OpenAI, `max_uses` on Anthropic). xAI's documented request-side bound is `max_turns`, which caps agentic turns rather than searches (one turn may run tool calls in parallel), and Google's grounding tool exposes no cap of any kind — so on those two arms the ceiling is a declared target that is observed and priced rather than enforced. Search volume is therefore comparable across arms but not identical, and every arm's executed count is in the evidence. The repair attempt carries no tools on any arm, so no arm can search twice for one decision.
 
 Decisions must be committed before the closing snapshot exists. No reruns after seeing later prices. The first valid call determines any live action; transport retries and format-only repairs follow fixed rules. Invalid output handling, provider outage handling, and exclusion rules must be fixed before the cohort starts.
 

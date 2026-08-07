@@ -652,7 +652,7 @@ to substantiate it. Each attempt records:
   `requestStartedAt ≤ requestReceivedAt ≤ acceptedAt` (the `acceptedAt` bound when present) —
   and across attempts `repair.requestStartedAt ≥ initial.requestReceivedAt`;
 - `requestSha256`, the exact persisted response body, `responseSha256`;
-- transport status, usage/token metadata, and repair linkage.
+- transport status, usage/token metadata (including the derived reasoningTokens / billableOutputTokens comparable fields on new records), the per-attempt web-search audit (executed queries + result references; digest-bound when present, absent on pre-search records), and repair linkage.
 
 **Persisted response bytes (one exact rule).**
 

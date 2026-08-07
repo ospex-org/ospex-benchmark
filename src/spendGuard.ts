@@ -65,6 +65,13 @@ function isUsagePresent(usageRaw: unknown): boolean {
 export interface GuardAttemptInput {
   readonly requestAt: string | null;
   readonly usageRaw: unknown;
+  /**
+   * The attempt's billable web-search count: a number when derivable, `null`
+   * when a search demonstrably ran but the count is not derivable (priced as
+   * UNKNOWN → escalation), and `undefined` when the attempt carries no search
+   * evidence at all.
+   */
+  readonly searchCount?: number | null | undefined;
 }
 
 /** One arm's authenticated identity + its initial and (optional) repair attempts. */
@@ -142,6 +149,7 @@ export function computeFireSpendGuard(input: {
           requestedModelId: arm.requestedModelId,
           priceVersion,
           usageRaw: att.usageRaw,
+          searchCount: att.searchCount,
         });
       } catch (error) {
         if (error instanceof ConservativeSpendUnknownError) {

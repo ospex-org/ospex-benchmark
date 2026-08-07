@@ -6,7 +6,7 @@ import { redactSecrets } from './config.js';
 import { verifyAttemptOrdering } from './attemptProvenance.js';
 import { armDigest, decisionFingerprint } from './fireArtifact.js';
 import { assertFireArtifact, fireArtifactV1Schema } from './fireArtifactProducer.js';
-import { validateResponseText } from './schema.js';
+import { RESPONSE_SCHEMA_VERSIONS, validateResponseText } from './schema.js';
 import { instantMs } from './time.js';
 import { MARKET_ORDINAL } from './fireArtifact.js';
 import type { AttemptTiming } from './attemptProvenance.js';
@@ -182,7 +182,18 @@ export function recomputeFireArtifactDigests(artifact: FireArtifactV1): string[]
           violations.push(`valid arm ${who} is missing an acceptedDecisionFingerprint`);
         } else {
           const spec = identityArm(who, arm.expectedArmIdentity.provider, arm.expectedArmIdentity.requestedModelId);
-          const { parsed, errors } = validateResponseText(body, bundle, artifact.requestSha256, spec, artifact.cohortId);
+          // Replay accepts every KNOWN schema version: the retained body's own
+          // schemaVersion selects the validator it was accepted under, so v1
+          // artifacts keep replaying after the v2 cutover. Rewriting a body to
+          // a different version changes its bytes → responseSha256 → armDigest.
+          const { parsed, errors } = validateResponseText(
+            body,
+            bundle,
+            artifact.requestSha256,
+            spec,
+            artifact.cohortId,
+            RESPONSE_SCHEMA_VERSIONS,
+          );
           if (parsed === null || errors.length > 0) {
             violations.push(`arm ${who} accepted body does not re-validate: ${errors[0] ?? 'unparseable'}`);
           } else if (canonicalize(decisionFingerprint(parsed)) !== canonicalize(arm.acceptedDecisionFingerprint)) {

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -117,7 +118,7 @@ function manifestJson(): string {
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
     })),
-    toolInferenceConfigSha256: 'c'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
@@ -224,7 +225,7 @@ function sealed(gameId: string): PreparedFireSnapshot {
 
 function validBody(participantId: string, requestedModelId: string, cohortId: string, bundleSha: string, game: GameBundle): string {
   const body: BenchmarkResponse = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     cohortId,
     participantId,
     requestedModelId,
@@ -246,6 +247,9 @@ function validBody(participantId: string, requestedModelId: string, cohortId: st
             rationale: 'r',
             evidenceRefs: [game.markets.moneyline!.evidenceRef],
             reasonCode: null,
+            axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 },
+            primaryAxis: 'valuation',
+            primaryExpectation: 'The away price reads rich against the implied probabilities.',
           },
         ],
       },
@@ -296,6 +300,7 @@ function respondingAdapters(
           usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
           usageRaw: usageRawFor(id.participantId, id.provider),
           requestParams: {},
+          searchAudit: null,
         };
       },
     });

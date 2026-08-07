@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
+import { deriveComparableUsage } from './providers/comparableUsage.js';
 import { currentOddsRowSchema, gamesEndpointRowSchema } from './wire.js';
 import type {
   BenchmarkResponse,
@@ -10,8 +11,10 @@ import type {
   GameBundle,
   GamesEndpointRow,
   ProviderAdapter,
+  ProviderName,
   ProviderResponse,
   ProviderUsage,
+  SearchAudit,
   SlateBundle,
   SlateInputs,
 } from './types.js';
@@ -167,6 +170,30 @@ function buildForecast(
   const win = round6(pWin * (1 - push));
   const loss = round6(1 - win - push);
 
+  // Deterministic v2 analysis, distinct per market and pairwise distinct WITHIN
+  // each rated axes object (so an axis swap is never output-equivalent). The
+  // total forecast is the all-ones case the prompt describes: no primary
+  // driver, and an expectation that states no material movement — which also
+  // exercises the null-axis / non-null-expectation combination.
+  const analysis =
+    market === 'moneyline'
+      ? {
+          axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 },
+          primaryAxis: 'valuation' as const,
+          primaryExpectation: `Reference price ${observedDecimal} reads rich for the selected side against the de-vig estimate.`,
+        }
+      : market === 'spread'
+        ? {
+            axes: { valuation: 2, trend: 4, consensus: 1, news: 3, softness: 5 },
+            primaryAxis: 'trend' as const,
+            primaryExpectation: 'Recent form favors the selected side on the designated run line.',
+          }
+        : {
+            axes: { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 },
+            primaryAxis: null,
+            primaryExpectation: 'No material movement is expected in this total before close.',
+          };
+
   return {
     market,
     selection,
@@ -179,6 +206,7 @@ function buildForecast(
     rationale: `Reference prices imply the selected side at ${observedDecimal}; no additional signal in the frozen bundle.`,
     evidenceRefs: [evidenceRef],
     reasonCode: null,
+    ...analysis,
   };
 }
 
@@ -187,7 +215,7 @@ function buildForecast(
  *  only in the provider envelope (text wrapping, response ids, timing). */
 export function buildValidResponse(payload: RequestPayload): BenchmarkResponse {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     cohortId: payload.cohortId,
     participantId: payload.participantId,
     requestedModelId: payload.requestedModelId,
@@ -241,6 +269,7 @@ function mockResponse(options: {
   requestedModelId: string;
   usage: ProviderUsage;
   usageRaw: unknown;
+  searchAudit: SearchAudit | null;
 }): ProviderResponse {
   return {
     rawText: options.rawText,
@@ -250,24 +279,67 @@ function mockResponse(options: {
     usage: options.usage,
     usageRaw: options.usageRaw,
     requestParams: { mock: true, model: options.requestedModelId },
+    searchAudit: options.searchAudit,
   };
 }
 
-/** Provider-realistic raw usage shapes, so the dry run proves verbatim capture. */
-const OPENAI_USAGE_RAW = {
-  prompt_tokens: 1490,
-  completion_tokens: 512,
+/** Provider-realistic raw usage shapes, so the dry run proves verbatim capture.
+ *  openai is the Responses-API shape (the live adapter's surface since web
+ *  search moved it to /v1/responses); reasoning stays a SUBSET of output. */
+export const OPENAI_USAGE_RAW = {
+  input_tokens: 1490,
+  output_tokens: 512,
   total_tokens: 2002,
-  prompt_tokens_details: { cached_tokens: 0 },
-  completion_tokens_details: { reasoning_tokens: 256 },
+  input_tokens_details: { cached_tokens: 0 },
+  output_tokens_details: { reasoning_tokens: 256 },
 };
-const ANTHROPIC_USAGE_RAW = { input_tokens: 1512, output_tokens: 498 };
-const GOOGLE_USAGE_RAW = {
+export const ANTHROPIC_USAGE_RAW = {
+  input_tokens: 1512,
+  output_tokens: 498,
+  output_tokens_details: { thinking_tokens: 120 },
+  server_tool_use: { web_search_requests: 1 },
+};
+export const GOOGLE_USAGE_RAW = {
   promptTokenCount: 1465,
   candidatesTokenCount: 471,
   thoughtsTokenCount: 305,
-  totalTokenCount: 2241,
+  // Grounded search results surface as a separate tool-use prompt bucket;
+  // the total includes it (2241 base + 210 tool-use).
+  toolUsePromptTokenCount: 210,
+  totalTokenCount: 2451,
 };
+
+/**
+ * The ONE deterministic per-(provider, game) search-audit fixture — shared by
+ * the mock and the real-shaped fake so dry-vs-real-shaped parity holds on the
+ * persisted audit byte-for-byte. Providers with a usage-side search counter
+ * (anthropic, xai) carry it; openai/google report none.
+ */
+export function buildFixtureSearchAudit(provider: ProviderName, gameId: string): SearchAudit {
+  const tail = gameId.slice(-4);
+  return {
+    queries: [{ query: `mlb game ${tail} probable pitchers injury report` }],
+    results: [
+      { url: `https://news.example/${provider}/${tail}`, title: `Fixture search result ${tail}` },
+    ],
+    searchCount: provider === 'anthropic' || provider === 'xai' ? 1 : null,
+    incomplete: [],
+  };
+}
+
+/** Normalized fixture usage: base counts + the shared derived comparable fields. */
+function fixtureUsage(
+  provider: ProviderName,
+  usageRaw: unknown,
+  base: { inputTokens: number; outputTokens: number; totalTokens: number },
+): ProviderUsage {
+  const comparable = deriveComparableUsage(provider, usageRaw);
+  return {
+    ...base,
+    reasoningTokens: comparable.reasoningTokens,
+    billableOutputTokens: comparable.billableOutputTokens,
+  };
+}
 
 export function createMockAdapters(options: {
   simulateCollision: boolean;
@@ -292,8 +364,13 @@ export function createMockAdapters(options: {
         reportedModelId: 'gpt-5.6-sol',
         responseId: `mock-openai-${gameId.slice(-4)}`,
         requestedModelId: 'gpt-5.6-sol',
-        usage: { inputTokens: 1490, outputTokens: 512, totalTokens: 2002 },
+        usage: fixtureUsage('openai', OPENAI_USAGE_RAW, {
+          inputTokens: 1490,
+          outputTokens: 512,
+          totalTokens: 2002,
+        }),
         usageRaw: OPENAI_USAGE_RAW,
+        searchAudit: buildFixtureSearchAudit('openai', gameId),
       });
     },
   });
@@ -317,8 +394,13 @@ export function createMockAdapters(options: {
         reportedModelId: 'claude-fable-5',
         responseId: `mock-anthropic-${gameId.slice(-4)}`,
         requestedModelId: 'claude-fable-5',
-        usage: { inputTokens: 1512, outputTokens: 498, totalTokens: 2010 },
+        usage: fixtureUsage('anthropic', ANTHROPIC_USAGE_RAW, {
+          inputTokens: 1512,
+          outputTokens: 498,
+          totalTokens: 2010,
+        }),
         usageRaw: ANTHROPIC_USAGE_RAW,
+        searchAudit: buildFixtureSearchAudit('anthropic', gameId),
       });
     },
   });
@@ -332,7 +414,11 @@ export function createMockAdapters(options: {
       await sleep(50);
       const { payload, isRepair, gameId } = parseRequestPayload(turns);
       const reported = options.simulateCollision ? 'gpt-5.6-sol' : 'gemini-3.1-pro-preview';
-      const usage: ProviderUsage = { inputTokens: 1465, outputTokens: 471, totalTokens: 2241 };
+      const usage = fixtureUsage('google', GOOGLE_USAGE_RAW, {
+        inputTokens: 1465,
+        outputTokens: 471,
+        totalTokens: 2451,
+      });
       if (isRepair) {
         // The repair fixes only the echo; decisions are byte-identical, so
         // the fingerprint-preservation check accepts it.
@@ -343,6 +429,7 @@ export function createMockAdapters(options: {
           requestedModelId: 'gemini-3.1-pro-preview',
           usage,
           usageRaw: GOOGLE_USAGE_RAW,
+          searchAudit: buildFixtureSearchAudit('google', gameId),
         });
       }
       // Initial attempt: complete, fingerprintable decisions wrapped in prose
@@ -357,6 +444,7 @@ export function createMockAdapters(options: {
         requestedModelId: 'gemini-3.1-pro-preview',
         usage,
         usageRaw: GOOGLE_USAGE_RAW,
+        searchAudit: buildFixtureSearchAudit('google', gameId),
       });
     },
   });

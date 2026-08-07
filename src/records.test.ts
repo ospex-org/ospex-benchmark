@@ -66,7 +66,10 @@ function attempt(overrides: Partial<AttemptRecord>): AttemptRecord {
     httpStatus: 200,
     usage: null,
     usageRaw: null,
+    searchAudit: null,
     requestParams: null,
+    providerStopReason: null,
+    turnCompleted: true,
     requestAt: null,
     responseAt: null,
     acceptedAt: null,
@@ -112,6 +115,7 @@ function stubResponse(
     usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
     usageRaw: { prompt_tokens: 100, completion_tokens: 50 },
     requestParams: { stub: true },
+    searchAudit: null,
   };
 }
 
@@ -439,4 +443,38 @@ test('every serialized byte passes secret redaction — rationale and validation
     }
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('decision records carry the v2 analysis fields and the accepted attempt search audit', async () => {
+  const build = makeBuild();
+  const ctx = makeCtx();
+  const request = build.requests[0];
+  assert.ok(request);
+  const audit = {
+    queries: [{ query: 'brewers pirates injury report' }],
+    results: [{ url: 'https://news.example/one', title: 'Injury notes' }],
+    searchCount: 1,
+    incomplete: [],
+  };
+  const env = await envFrom(build, ctx, [
+    () => ({ ...stubResponse(JSON.stringify(makeValidResponse(request))), searchAudit: audit }),
+  ]);
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
+  const decisions = records.filter((r) => r['recordType'] === 'decision');
+  assert.equal(decisions.length, 3);
+  const expected = makeValidResponse(request).games[0]!.forecasts;
+  for (const decision of decisions) {
+    const forecast = expected.find((f) => f.market === decision['market']);
+    assert.ok(forecast);
+    // The analysis fields ride the decision record verbatim...
+    assert.deepEqual(decision['axes'], forecast.axes);
+    assert.equal(decision['primaryAxis'], forecast.primaryAxis);
+    assert.equal(decision['primaryExpectation'], forecast.primaryExpectation);
+    // ...and the audit trail of what the accepted attempt looked at rides too.
+    assert.deepEqual(decision['searchAudit'], audit);
+  }
+  // The arm_game_response attempt block carries the same audit.
+  const armResponse = records.find((r) => r['recordType'] === 'arm_game_response');
+  assert.ok(armResponse);
+  assert.deepEqual((armResponse['attempt'] as Record<string, unknown>)['searchAudit'], audit);
 });

@@ -65,7 +65,10 @@ function attempt(over: Partial<AttemptRecord> = {}): AttemptRecord {
     httpStatus: 200,
     usage: null,
     usageRaw: null,
+    searchAudit: null,
     requestParams: null,
+    providerStopReason: null,
+    turnCompleted: true,
     requestAt: '2026-07-16T00:00:05.000Z',
     responseAt: '2026-07-16T00:00:06.000Z',
     acceptedAt: '2026-07-16T00:00:07.000Z',
@@ -129,14 +132,55 @@ test('decisionFingerprint entries bind exactly the decision fields, excluding th
   assert.ok(!('reasonCode' in entry));
 });
 
+/** A v2 forecast: the analysis fields the fingerprint now binds. */
+function analyzedForecast(over: Partial<ForecastOutput> = {}): ForecastOutput {
+  return forecast({
+    axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 },
+    primaryAxis: 'valuation',
+    primaryExpectation: 'The price reads rich against the implied probabilities.',
+    ...over,
+  });
+}
+
 test('decisionFingerprint decision fields correspond exactly to schema.ts forecastFingerprint (drift guard)', () => {
-  const ffKeys = Object.keys(forecastFingerprint(forecast())).sort();
-  const entry = first(decisionFingerprint(response([forecast()])));
+  // Compared on a v2 forecast, so BOTH sides carry the analysis fields: a field
+  // added to one owner and not the other fails here.
+  const ffKeys = Object.keys(forecastFingerprint(analyzedForecast())).sort();
+  const entry = first(decisionFingerprint(response([analyzedForecast()])));
   const entryDecisionKeys = [
     ...Object.keys(entry).filter((k) => k !== 'gameId' && k !== 'market' && k !== 'probabilities'),
     ...Object.keys(entry.probabilities),
   ].sort();
   assert.deepEqual(entryDecisionKeys, ffKeys);
+});
+
+test('the analysis fields are decision-bearing: a v2 entry binds all three, a v1 entry omits all three', () => {
+  const v2 = first(decisionFingerprint(response([analyzedForecast()])));
+  assert.deepEqual(v2.axes, { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 });
+  assert.equal(v2.primaryAxis, 'valuation');
+  assert.equal(v2.primaryExpectation, 'The price reads rich against the implied probabilities.');
+  // A v2 forecast with no dominant axis still binds all three keys (primaryAxis
+  // null is a real v2 value, not the v1 "no analysis" state).
+  const allOnes = first(
+    decisionFingerprint(
+      response([
+        analyzedForecast({
+          axes: { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 },
+          primaryAxis: null,
+          primaryExpectation: null,
+        }),
+      ]),
+    ),
+  );
+  assert.ok(Object.hasOwn(allOnes, 'axes'));
+  assert.equal(allOnes.primaryAxis, null);
+  assert.equal(allOnes.primaryExpectation, null);
+  // A pre-axes body omits the keys entirely, so its entry canonicalizes — and
+  // therefore digests — exactly as it did before the fields existed.
+  const v1 = first(decisionFingerprint(response([forecast()])));
+  for (const key of ['axes', 'primaryAxis', 'primaryExpectation']) {
+    assert.ok(!Object.hasOwn(v1, key), `a v1 entry must not carry ${key}`);
+  }
 });
 
 test('decisionFingerprint sorts entries into canonical market order regardless of input order', () => {
@@ -360,4 +404,107 @@ test('persisted usage token counts must be null or safe non-negative integers', 
   for (const bad of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => withToken(bad), `token count ${String(bad)} must be rejected`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// searchAudit + comparable-usage fields: backward-verifiable digest binding
+// ---------------------------------------------------------------------------
+
+test('pre-search attempts (no searchAudit, no comparable-usage keys) recompute their ORIGINAL armDigest — old artifacts stay verifiable', () => {
+  // An attempt list shaped exactly like a pre-search persisted artifact:
+  // no searchAudit key, usage without the two derived fields.
+  const legacyAttempts = [
+    {
+      attemptNumber: 1,
+      kind: 'initial' as const,
+      requestStartedAt: '2026-07-16T00:00:05.000Z',
+      requestReceivedAt: '2026-07-16T00:00:07.000Z',
+      acceptedAt: null,
+      reportedModelId: 'model-x',
+      httpStatus: 200,
+      persistedResponseBody: '{"ok":true}',
+      responseSha256: 'a'.repeat(64),
+      transport: 'ok' as const,
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+    },
+  ];
+  const legacyDigest = armDigest(digestInput({ orderedAttempts: legacyAttempts }));
+  // The same attempt with the NEW fields present digests DIFFERENTLY (they are
+  // bound), while re-parsing the legacy shape leaves the digest unchanged.
+  const enriched = [
+    {
+      ...legacyAttempts[0]!,
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, reasoningTokens: 2, billableOutputTokens: 5 },
+      searchAudit: { queries: [{ query: 'q' }], results: [], searchCount: null, incomplete: [] },
+    },
+  ];
+  const enrichedDigest = armDigest(digestInput({ orderedAttempts: enriched }));
+  assert.notEqual(enrichedDigest, legacyDigest, 'present new fields must be digest-bound');
+  assert.equal(
+    armDigest(digestInput({ orderedAttempts: legacyAttempts })),
+    legacyDigest,
+    'legacy attempts recompute byte-identically',
+  );
+});
+
+test('a PRESENT searchAudit is digest-bound: tampering a query, a result, or deleting the audit changes the armDigest', () => {
+  const base = [
+    {
+      attemptNumber: 1,
+      kind: 'initial' as const,
+      requestStartedAt: '2026-07-16T00:00:05.000Z',
+      requestReceivedAt: '2026-07-16T00:00:07.000Z',
+      acceptedAt: null,
+      reportedModelId: 'model-x',
+      httpStatus: 200,
+      persistedResponseBody: '{"ok":true}',
+      responseSha256: 'a'.repeat(64),
+      transport: 'ok' as const,
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, reasoningTokens: 2, billableOutputTokens: 5 },
+      searchAudit: {
+        queries: [{ query: 'injury report' }],
+        results: [{ url: 'https://news.example/a', title: 'A' }],
+        searchCount: 1,
+        incomplete: [],
+      },
+    },
+  ];
+  const baseline = armDigest(digestInput({ orderedAttempts: base }));
+  const tamperedQuery = structuredClone(base);
+  tamperedQuery[0]!.searchAudit.queries[0]!.query = 'different query';
+  assert.notEqual(armDigest(digestInput({ orderedAttempts: tamperedQuery })), baseline);
+  const tamperedResult = structuredClone(base);
+  tamperedResult[0]!.searchAudit.results[0]!.url = 'https://elsewhere.example/b';
+  assert.notEqual(armDigest(digestInput({ orderedAttempts: tamperedResult })), baseline);
+  const deleted = structuredClone(base) as Array<Record<string, unknown>>;
+  delete deleted[0]!['searchAudit'];
+  assert.notEqual(
+    armDigest(digestInput({ orderedAttempts: deleted as unknown as typeof base })),
+    baseline,
+    'stripping the audit off a new attempt is digest-detected',
+  );
+});
+
+test('toPersistedAttempts carries the searchAudit through detached (explicit null when the attempt ran no search)', () => {
+  const audited = armResult({
+    attempt: attempt({
+      searchAudit: { queries: [{ query: 'q1' }], results: [{ url: 'https://u.example', title: null }], searchCount: 1, incomplete: [] },
+    }),
+  });
+  const [persisted] = toPersistedAttempts(audited);
+  assert.deepEqual(persisted!.searchAudit, {
+    queries: [{ query: 'q1' }],
+    results: [{ url: 'https://u.example', title: null }],
+    searchCount: 1,
+    incomplete: [],
+  });
+  assert.notEqual(
+    persisted!.searchAudit,
+    audited.attempt.searchAudit,
+    'the persisted audit is a detached copy, never an alias of runner state',
+  );
+  const noSearch = armResult({ attempt: attempt({ searchAudit: null }) });
+  const [plain] = toPersistedAttempts(noSearch);
+  assert.equal(plain!.searchAudit, null, 'no search activity persists an explicit null, not an absent key');
+  assert.ok(Object.hasOwn(plain!, 'searchAudit'));
 });

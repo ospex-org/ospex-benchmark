@@ -84,7 +84,7 @@ The mechanism satisfying this is in the tree:
       arm, 8 max attempts, $100/attempt reservation, $800 spend cap = the
       one-fire reservation = the canary ceiling, call cap 8, concurrency 4, one
       dispatch per tick, `maxOutputTokens` 16000, provider timeout 300s,
-      conservative guard price table (`prices-v2`) + digest.
+      conservative guard price table (`prices-v3`) + digest.
 
 ## 3. Durable destinations (store + artifacts), with read-back
 
@@ -120,8 +120,9 @@ Both destinations must survive the process and be readable afterwards.
       missing key refuses before the prompt.
 - [ ] Each key belongs to an account the operator controls, with billing enabled
       and a spending limit the operator has reviewed. The expected invoice is
-      well under $1, and the committed conservative worst-case bound for the
-      whole fire is ≈$219 (§8) — set provider-side limits with that bound in
+      well under $1, and the committed conservative worst-case TOKEN bound for
+      the whole fire is ≈$219 (§8; search fees sit on top, and on Google/xAI
+      they have no pre-dispatch cap) — set provider-side limits with that in
       mind; they are an independent backstop, not part of this protocol.
 - [ ] No key material is ever committed, pasted into the execution log, or
       included in any artifact (the artifact and sidecar carry token counts and
@@ -138,12 +139,13 @@ adapters outside the cohort gate and share the same keys.
 
 ## 6. Pricing reconciliation (same day as the crossing)
 
-The runtime guard prices at the conservative table `prices-v2`
-(`src/modelPriceTable.ts`), snapshotted 2026-07-23. Its job is to only ever
+The runtime guard prices at the conservative table `prices-v3`
+(`src/modelPriceTable.ts`; token rates identical to `prices-v2`, snapshotted
+2026-07-23, plus the per-search fees snapshotted 2026-08-07). Its job is to only ever
 OVER-estimate. Reconcile it against the providers' CURRENT published pricing
 pages immediately before the crossing:
 
-| model | pinned prices-v2 (input/output per 1M tokens) | source page |
+| model | pinned conservative token rates (identical in prices-v2/v3; input/output per 1M tokens) | source page |
 |---|---|---|
 | `gpt-5.6-sol` | $12.50 / $60 | openai.com API pricing |
 | `claude-fable-5` | $10 / $50 | Anthropic API pricing |
@@ -198,14 +200,16 @@ Expected sequence — read each stage as it happens:
   roughly $0.02–$0.05 per attempt at the pinned rates, ≈ **$0.25–$0.50 for the
   whole fire**.
 - **The committed conservative worst-case bound** is the one in
-  `docs/SPEND-BOUND-PROOF.md`, at the pinned `prices-v2` rates — note that
+  `docs/SPEND-BOUND-PROOF.md`, at the pinned `prices-v3` rates — note that
   Google `thoughtsTokenCount` and xAI reasoning tokens are ADDITIVE and are NOT
   bounded by `maxOutputTokens` (their bound is the model's own output
   envelope), so the visible-output cap alone does not bound the bill. Per
   attempt: OpenAI $20.805, Anthropic $56.40, Google $24.248320, xAI $8.00 —
   each under the $100 per-attempt reservation — giving a conservative
-  full-fire bound (two attempts per model) of **$218.906640**, well under the
-  $800 reservation ceiling.
+  full-fire TOKEN bound (two attempts per model) of **$218.906640**, well
+  under the $800 reservation ceiling. Search fees are priced on top of these
+  figures and are provider-capped only on OpenAI and Anthropic (see
+  SPEND-BOUND-PROOF.md, "Web-search fees").
 - **What the $100 guard is and is not**: it is a POST-DISPATCH control. It
   prices the RETURNED usage and, on any attempt over $100 or any attempt it
   cannot price, refuses settlement — escalating with durable evidence and

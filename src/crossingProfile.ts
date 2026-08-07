@@ -57,9 +57,9 @@ export const CROSSING_PROFILE = deepFreeze({
  * capability producer (refuse at mint, trusting no upstream check). Returns a
  * violations array (empty = conformant), mirroring `validateManifestAgainstCode`.
  * Every comparison is an exact equality against the pinned profile — including
- * the conservative guard price-table identity (`prices-v2` + its recomputed
- * digest), which the billable pre-claim gate in `runOneFire` independently
- * re-checks per fire.
+ * the conservative guard price-table identity (`SPEND_GUARD_PRICE_TABLE_VERSION`
+ * + its recomputed digest), which the billable pre-claim gate in `runOneFire`
+ * independently re-checks per fire.
  */
 export function crossingPinViolations(manifest: CohortManifestV1): string[] {
   const violations: string[] = [];
@@ -110,8 +110,8 @@ export function crossingPinViolations(manifest: CohortManifestV1): string[] {
  * invocation). It flows through the same code-consistent builder — every
  * code-owned digest/version/roster field is imported from the running code — with
  * ALL crossing levers set from the pinned profile, and the conservative guard
- * price table (`prices-v2`) pinned so a billable fire passes the pre-claim price-
- * identity gate. The provider timeout stays the production 300s value (real model
+ * price table (`SPEND_GUARD_PRICE_TABLE_VERSION`) pinned so a billable fire
+ * passes the pre-claim price-identity gate. The provider timeout stays the production 300s value (real model
  * calls take minutes; the demo's 1s fast-timeout is a mock-only convenience).
  *
  * Construction is self-checking: the internal-consistency identities above

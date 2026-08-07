@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -128,6 +129,9 @@ function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): Bench
       rationale: 'Reference prices favor the away side.',
       evidenceRefs: [ml.evidenceRef],
       reasonCode: null,
+      axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 },
+      primaryAxis: 'valuation',
+      primaryExpectation: 'The away price reads rich against the implied probabilities.',
     });
   }
   if (game.markets.total) {
@@ -144,10 +148,13 @@ function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): Bench
       rationale: 'Total priced evenly at the designated line.',
       evidenceRefs: [total.evidenceRef],
       reasonCode: null,
+      axes: { valuation: 1, trend: 1, consensus: 1, news: 1, softness: 1 },
+      primaryAxis: null,
+      primaryExpectation: 'No material movement is expected in this total before close.',
     });
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     cohortId,
     participantId: arm.participantId,
     requestedModelId: arm.requestedModelId,
@@ -166,6 +173,7 @@ function stubResponse(rawText: string, reportedModelId: string): ProviderRespons
     usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
     usageRaw: { prompt_tokens: 100, completion_tokens: 50 },
     requestParams: { stub: true },
+    searchAudit: null,
   };
 }
 
@@ -199,7 +207,7 @@ function manifestJson(): string {
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
     })),
-    toolInferenceConfigSha256: 'c'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,

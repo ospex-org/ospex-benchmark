@@ -1,12 +1,14 @@
 import {
   INVALID_SCHEMA_GAME_ID,
   RATE_LIMITED_GAME_ID,
+  buildFixtureSearchAudit,
   buildSchemaInvalidResponse,
   buildValidResponse,
   parseRequestPayload,
 } from './mock.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
-import type { ProviderAdapter, ProviderResponse, ProviderUsage } from './types.js';
+import { deriveComparableUsage } from './providers/comparableUsage.js';
+import type { ProviderAdapter, ProviderResponse, ProviderUsage, SearchAudit } from './types.js';
 
 /**
  * The REAL-SHAPED, zero-network fake adapters: the same deterministic decisions and the
@@ -45,6 +47,7 @@ function response(options: {
   endpoint: string;
   usage: ProviderUsage;
   usageRaw: unknown;
+  searchAudit: SearchAudit | null;
 }): ProviderResponse {
   return {
     rawText: options.rawText,
@@ -54,6 +57,22 @@ function response(options: {
     usage: options.usage,
     usageRaw: options.usageRaw,
     requestParams: { endpoint: options.endpoint, model: options.requestedModelId },
+    searchAudit: options.searchAudit,
+  };
+}
+
+/** Normalized counts + the SAME derived comparable fields the mock computes
+ *  (both sides run the one shared derivation, so parity holds byte-for-byte). */
+function usageWith(
+  provider: 'openai' | 'anthropic' | 'google',
+  usageRaw: unknown,
+  base: { inputTokens: number; outputTokens: number; totalTokens: number },
+): ProviderUsage {
+  const comparable = deriveComparableUsage(provider, usageRaw);
+  return {
+    ...base,
+    reasoningTokens: comparable.reasoningTokens,
+    billableOutputTokens: comparable.billableOutputTokens,
   };
 }
 
@@ -75,22 +94,25 @@ export function createRealShapedFakeAdapters(options: RealShapedFakeOptions): Ma
       if (gameId === RATE_LIMITED_GAME_ID || gameId === options.rateLimitedGameId) {
         throw new ProviderHttpError('openai', 429, 'simulated throttle (real-shaped fake)');
       }
+      // usageRaw in openai's true Responses-API shape (the live adapter's
+      // surface) — reasoning is a SUBSET of output_tokens, cached a subset of
+      // input_tokens. Normalized counts IDENTICAL to the mock (parity).
+      const usageRaw = {
+        input_tokens: 1490,
+        output_tokens: 512,
+        total_tokens: 2002,
+        input_tokens_details: { cached_tokens: 128 },
+        output_tokens_details: { reasoning_tokens: 256 },
+      };
       return response({
         rawText: fenced(JSON.stringify(buildValidResponse(payload))),
         reportedModelId: 'gpt-5.6-sol',
-        responseId: `chatcmpl-fake${gameId.slice(-4)}`,
+        responseId: `resp_fake${gameId.slice(-4)}`,
         requestedModelId: 'gpt-5.6-sol',
-        endpoint: 'https://api.openai.com/v1/chat/completions',
-        // Normalized counts IDENTICAL to the mock (parity); usageRaw in openai's true
-        // shape — reasoning is a SUBSET of completion_tokens, cached a subset of prompt.
-        usage: { inputTokens: 1490, outputTokens: 512, totalTokens: 2002 },
-        usageRaw: {
-          prompt_tokens: 1490,
-          completion_tokens: 512,
-          total_tokens: 2002,
-          prompt_tokens_details: { cached_tokens: 128 },
-          completion_tokens_details: { reasoning_tokens: 256 },
-        },
+        endpoint: 'https://api.openai.com/v1/responses',
+        usage: usageWith('openai', usageRaw, { inputTokens: 1490, outputTokens: 512, totalTokens: 2002 }),
+        usageRaw,
+        searchAudit: buildFixtureSearchAudit('openai', gameId),
       });
     },
   });
@@ -106,20 +128,26 @@ export function createRealShapedFakeAdapters(options: RealShapedFakeOptions): Ma
         gameId === INVALID_SCHEMA_GAME_ID
           ? buildSchemaInvalidResponse(payload)
           : buildValidResponse(payload);
+      // Anthropic's true shape: cache fields present and ADDITIVE (outside
+      // input_tokens); thinking a read-only SUBSET breakdown of output_tokens;
+      // the search counter under usage.server_tool_use.
+      const usageRaw = {
+        input_tokens: 1512,
+        output_tokens: 498,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens_details: { thinking_tokens: 120 },
+        server_tool_use: { web_search_requests: 1 },
+      };
       return response({
         rawText: fenced(JSON.stringify(body)),
         reportedModelId: 'claude-fable-5',
         responseId: `msg_fake${gameId.slice(-4)}`,
         requestedModelId: 'claude-fable-5',
         endpoint: 'https://api.anthropic.com/v1/messages',
-        usage: { inputTokens: 1512, outputTokens: 498, totalTokens: 2010 },
-        // Anthropic's true shape: cache fields present and ADDITIVE (outside input_tokens).
-        usageRaw: {
-          input_tokens: 1512,
-          output_tokens: 498,
-          cache_creation_input_tokens: 0,
-          cache_read_input_tokens: 0,
-        },
+        usage: usageWith('anthropic', usageRaw, { inputTokens: 1512, outputTokens: 498, totalTokens: 2010 }),
+        usageRaw,
+        searchAudit: buildFixtureSearchAudit('anthropic', gameId),
       });
     },
   });
@@ -132,14 +160,21 @@ export function createRealShapedFakeAdapters(options: RealShapedFakeOptions): Ma
     async chat(turns): Promise<ProviderResponse> {
       const { payload, isRepair, gameId } = parseRequestPayload(turns);
       const reported = options.simulateCollision ? 'gpt-5.6-sol' : 'gemini-3.1-pro-preview';
-      const usage: ProviderUsage = { inputTokens: 1465, outputTokens: 471, totalTokens: 2241 };
-      // Google's true verbatim shape: thoughts are a SEPARATE ADDITIVE bucket.
+      // Google's true verbatim shape: thoughts are a SEPARATE ADDITIVE bucket,
+      // and grounded search results a separate tool-use prompt bucket the
+      // total includes (2241 base + 210 tool-use).
       const usageRaw = {
         promptTokenCount: 1465,
         candidatesTokenCount: 471,
         thoughtsTokenCount: 305,
-        totalTokenCount: 2241,
+        toolUsePromptTokenCount: 210,
+        totalTokenCount: 2451,
       };
+      const usage = usageWith('google', usageRaw, {
+        inputTokens: 1465,
+        outputTokens: 471,
+        totalTokens: 2451,
+      });
       const endpoint =
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent';
       if (isRepair) {
@@ -152,6 +187,7 @@ export function createRealShapedFakeAdapters(options: RealShapedFakeOptions): Ma
           endpoint,
           usage,
           usageRaw,
+          searchAudit: buildFixtureSearchAudit('google', gameId),
         });
       }
       // Initial attempt: the SAME wrong-cohort-echo scenario as the mock, in different prose.
@@ -164,6 +200,7 @@ export function createRealShapedFakeAdapters(options: RealShapedFakeOptions): Ma
         endpoint,
         usage,
         usageRaw,
+        searchAudit: buildFixtureSearchAudit('google', gameId),
       });
     },
   });
