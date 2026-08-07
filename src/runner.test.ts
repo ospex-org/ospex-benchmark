@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
+import { ProviderHttpError, ProviderTimeoutError, ProviderUnfinishedTurnError } from './providers/errors.js';
 import { prepareGameRequest } from './preparedRequest.js';
 import { runOneArmGame, runSlate } from './runner.js';
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
@@ -269,6 +269,110 @@ test('unparseable initial response is unrepairable: no repair call, stays invali
   assert.ok(
     result.validationErrors.some((e) => e.includes('no complete decision fingerprint')),
   );
+});
+
+test('a v1-shaped initial (no analysis fields) SKIPS the repair call: one paid call, stays invalid', async () => {
+  // Any schema-valid repair must add axes/primaryAxis/primaryExpectation, and
+  // those are decision-bearing (absent-vs-present fingerprints as changed), so
+  // the repair is guaranteed to be refused — the runner must not pay for it.
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  const v1Shaped = structuredClone(makeValidResponse(request)) as BenchmarkResponse;
+  v1Shaped.schemaVersion = 1;
+  for (const game of v1Shaped.games) {
+    for (const forecast of game.forecasts) {
+      delete forecast.axes;
+      delete forecast.primaryAxis;
+      delete forecast.primaryExpectation;
+    }
+  }
+  const adapter = stubAdapter([async () => stubResponse(JSON.stringify(v1Shaped))]);
+  const result = await runOneArmGame(
+    TEST_ARM,
+    adapter,
+    request,
+    baseOptions(() => CUTOFF_MS - 60_000),
+  );
+  assert.equal(result.outcome, 'invalid_schema');
+  assert.equal(result.repair, null);
+  assert.equal(result.repairUsed, false);
+  assert.equal(adapter.calls.length, 1, 'the guaranteed-to-fail repair must not be dispatched');
+  assert.ok(
+    result.validationErrors.some((e) =>
+      e.includes('repair skipped: the initial response omits the decision-bearing analysis fields'),
+    ),
+    `expected the skip reason, got: ${result.validationErrors.join(' | ')}`,
+  );
+});
+
+test('an unfinished turn records the FULL received-response evidence: httpStatus, ids, partial text, usage, audit', async () => {
+  const request = prepareGameRequest(makeRequest(CUTOFF));
+  const usage = {
+    inputTokens: 900,
+    outputTokens: 120,
+    totalTokens: 1_020,
+    reasoningTokens: null,
+    billableOutputTokens: 120,
+  };
+  const usageRaw = { input_tokens: 900, output_tokens: 120, server_tool_use: { web_search_requests: 2 } };
+  const searchAudit = {
+    queries: [{ query: 'probable starters tonight' }],
+    results: [],
+    searchCount: 2,
+    incomplete: ['query text unavailable for one or more executed searches'],
+  };
+  const adapter = stubAdapter([
+    async () => {
+      throw new ProviderUnfinishedTurnError({
+        provider: TEST_ARM.provider,
+        stopReason: 'pause_turn',
+        detail: 'the server-side tool loop hit its iteration limit; continuation is not enabled (maxServerToolContinuations)',
+        httpStatus: 200,
+        providerResponseId: 'msg_paused_runner_1',
+        reportedModelId: 'stub-model-1',
+        rawText: '',
+        usage,
+        usageRaw,
+        searchAudit,
+      });
+    },
+  ]);
+  const result = await runOneArmGame(
+    TEST_ARM,
+    adapter,
+    request,
+    baseOptions(() => CUTOFF_MS - 60_000),
+  );
+  // A provider outcome, never a schema verdict — and the attempt record shows a
+  // RECEIVED response: the HTTP 200, both ids, the (empty) body, and the money
+  // evidence, so usage is never paired with a no-receipt record downstream.
+  assert.equal(result.outcome, 'provider_error');
+  assert.equal(result.attempt.httpStatus, 200);
+  assert.equal(result.attempt.providerResponseId, 'msg_paused_runner_1');
+  assert.equal(result.attempt.reportedModelId, 'stub-model-1');
+  assert.equal(result.attempt.rawText, '');
+  assert.deepEqual(result.attempt.usage, usage);
+  assert.deepEqual(result.attempt.usageRaw, usageRaw);
+  assert.deepEqual(result.attempt.searchAudit, searchAudit);
+  assert.ok(result.attempt.responseAt !== null, 'the settle instant is stamped');
+  assert.match(result.attempt.errorDetail ?? '', /unfinished turn \(stop_reason: pause_turn\)/);
+  // Negative control: a transport-level failure still records NO received
+  // response — null body, null ids, and only an HTTP error's status.
+  const adapter500 = stubAdapter([
+    async () => {
+      throw new ProviderHttpError(TEST_ARM.provider, 500, 'upstream exploded');
+    },
+  ]);
+  const failed = await runOneArmGame(
+    TEST_ARM,
+    adapter500,
+    request,
+    baseOptions(() => CUTOFF_MS - 60_000),
+  );
+  assert.equal(failed.outcome, 'provider_error');
+  assert.equal(failed.attempt.httpStatus, 500);
+  assert.equal(failed.attempt.rawText, null);
+  assert.equal(failed.attempt.providerResponseId, null);
+  assert.equal(failed.attempt.usage, null);
 });
 
 test('repair that changes a decision is rejected even when schema-valid', async () => {

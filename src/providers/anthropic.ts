@@ -65,22 +65,6 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
         usage?: { input_tokens?: unknown; output_tokens?: unknown };
       };
 
-      // An unfinished turn is HTTP 200 with empty or partial content. Surfacing
-      // it as a typed failure — carrying this call's own usage and audit —
-      // keeps it from reading downstream as a model that emitted invalid JSON.
-      if (json.stop_reason === 'pause_turn' || json.stop_reason === 'refusal') {
-        throw new ProviderUnfinishedTurnError({
-          provider: 'anthropic',
-          stopReason: json.stop_reason,
-          detail:
-            json.stop_reason === 'pause_turn'
-              ? 'the server-side tool loop hit its iteration limit; continuation is not enabled (maxServerToolContinuations)'
-              : 'the request was declined by the provider safety classifiers',
-          usage: json.usage ?? null,
-          searchAudit: extractAnthropicSearchAudit(raw),
-        });
-      }
-
       const text = Array.isArray(json.content)
         ? json.content
             .filter((block) => block.type === 'text' && typeof block.text === 'string')
@@ -99,6 +83,38 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
         reasoningTokens: comparable.reasoningTokens,
         billableOutputTokens: comparable.billableOutputTokens,
       };
+
+      // Terminal state: on the Messages API only `end_turn` and `stop_sequence`
+      // are a finished turn. Everything else — `pause_turn`, `refusal`,
+      // `max_tokens`, an unknown value, or a missing field — is HTTP 200 with
+      // empty or partial content. Surfacing those as a typed failure carrying
+      // the call's full evidence (status, ids, partial text, usage, audit)
+      // keeps a truncated or paused turn from reading downstream as a model
+      // that emitted invalid JSON.
+      const stopReason = typeof json.stop_reason === 'string' ? json.stop_reason : 'missing';
+      if (stopReason !== 'end_turn' && stopReason !== 'stop_sequence') {
+        const detail =
+          stopReason === 'pause_turn'
+            ? 'the server-side tool loop hit its iteration limit; continuation is not enabled (maxServerToolContinuations)'
+            : stopReason === 'refusal'
+              ? 'the request was declined by the provider safety classifiers'
+              : stopReason === 'max_tokens'
+                ? 'the response hit its max_tokens output cap before the turn finished'
+                : `the provider reported a non-final stop_reason "${stopReason}"`;
+        throw new ProviderUnfinishedTurnError({
+          provider: 'anthropic',
+          stopReason,
+          detail,
+          httpStatus: status,
+          providerResponseId: typeof json.id === 'string' ? json.id : null,
+          reportedModelId: typeof json.model === 'string' ? json.model : null,
+          rawText: text,
+          usage,
+          usageRaw: json.usage ?? null,
+          searchAudit: extractAnthropicSearchAudit(raw),
+        });
+      }
+
       return {
         rawText: text,
         reportedModelId: typeof json.model === 'string' ? json.model : null,

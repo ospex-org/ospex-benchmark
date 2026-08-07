@@ -33,6 +33,8 @@ export const AUDIT_REASON = Object.freeze({
   COUNT_UNKNOWN: 'billable search count is not derivable from this response',
   /** The provider returned a tool error instead of results. */
   TOOL_ERROR: 'web search tool returned an error',
+  /** The provider cut its server-side tool loop short (e.g. TOO_MANY_TOOL_CALLS). */
+  TOOL_LOOP_TRUNCATED: 'the provider terminated the tool loop before it finished',
   /** Grounding evidence proves a search ran, but the metadata is absent. */
   GROUNDING_METADATA_MISSING: 'grounding metadata missing while tool-use tokens prove a search ran',
   /** Sources are present without the queries that produced them. */
@@ -205,10 +207,24 @@ export function extractGoogleSearchAudit(json: unknown): SearchAudit | null {
   if (!queriesReported && (results.length > 0 || searchRan)) {
     incomplete.push(AUDIT_REASON.GROUNDING_QUERIES_MISSING);
   }
+  // A terminated tool loop means the audit cannot claim completeness: queries
+  // may have been cut off mid-flight, so the gap is recorded on the audit
+  // itself (the adapter separately types the whole turn as unfinished).
+  if (first['finishReason'] === 'TOO_MANY_TOOL_CALLS') {
+    incomplete.push(AUDIT_REASON.TOOL_LOOP_TRUNCATED);
+  }
   // The executed-query list IS the billing unit here; without it the count is
   // unknown even when other evidence proves a search ran.
   const searchCount = queriesReported ? queries.length : null;
-  if (!queriesReported && !searchRan && results.length === 0 && grounding === null) return null;
+  if (
+    !queriesReported &&
+    !searchRan &&
+    results.length === 0 &&
+    grounding === null &&
+    incomplete.length === 0
+  ) {
+    return null;
+  }
   return audit(queries, results, searchCount, incomplete);
 }
 
@@ -243,6 +259,11 @@ export function extractResponsesSearchAudit(json: unknown): SearchAudit | null {
   for (const item of output) {
     if (!isRecord(item)) continue;
     if (item['type'] === 'web_search_call') {
+      // A failed tool invocation is a recorded gap, never smoothed over: the
+      // audit cannot claim completeness over a call the provider says failed.
+      if (item['status'] === 'failed' && !incomplete.includes(AUDIT_REASON.TOOL_ERROR)) {
+        incomplete.push(AUDIT_REASON.TOOL_ERROR);
+      }
       const action = isRecord(item['action']) ? item['action'] : undefined;
       const actionType = own(action, 'type');
       // Only `search` actions are documented as billable; page navigation

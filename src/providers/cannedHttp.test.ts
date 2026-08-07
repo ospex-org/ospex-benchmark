@@ -123,6 +123,7 @@ test('openai registry adapter: COMPLETE exact request, finite output-token param
         jsonResponse({
           id: 'resp_canned_1',
           model: 'gpt-5.6-sol',
+          status: 'completed',
           output: [
             {
               type: 'web_search_call',
@@ -233,6 +234,7 @@ test('xai registry adapter: COMPLETE exact request under max_output_tokens, verb
         jsonResponse({
           id: 'resp-canned-xai-1',
           model: 'grok-4.5',
+          status: 'completed',
           output: [
             {
               type: 'web_search_call',
@@ -324,6 +326,7 @@ test('anthropic registry adapter: COMPLETE exact request, finite max_tokens, ver
         jsonResponse({
           id: 'msg_canned_1',
           model: 'claude-fable-5',
+          stop_reason: 'end_turn',
           content: [
             {
               type: 'server_tool_use',
@@ -412,6 +415,7 @@ test('anthropic adapter: a max_uses_exceeded tool-result error object is recorde
         jsonResponse({
           id: 'msg_canned_2',
           model: 'claude-fable-5',
+          stop_reason: 'end_turn',
           content: [
             {
               type: 'server_tool_use',
@@ -446,6 +450,7 @@ test('anthropic adapter: a response with NO search activity carries searchAudit 
         jsonResponse({
           id: 'msg_canned_3',
           model: 'claude-fable-5',
+          stop_reason: 'end_turn',
           content: [{ type: 'text', text: 'no search needed' }],
           usage: { input_tokens: 10, output_tokens: 5 },
         }),
@@ -476,6 +481,7 @@ test('google registry adapter: COMPLETE exact request, finite generationConfig c
           modelVersion: 'gemini-3.1-pro-preview',
           candidates: [
             {
+              finishReason: 'STOP',
               content: {
                 parts: [
                   { text: 'internal deliberation', thought: true },
@@ -549,7 +555,7 @@ test('google adapter: grounding metadata MISSING while tool-use tokens prove a s
         jsonResponse({
           responseId: 'resp-canned-2',
           modelVersion: 'gemini-3.1-pro-preview',
-          candidates: [{ content: { parts: [{ text: 'grounded answer, metadata dropped' }] } }],
+          candidates: [{ content: { parts: [{ text: 'grounded answer, metadata dropped' }] }, finishReason: 'STOP' }],
           usageMetadata: {
             promptTokenCount: 70,
             candidatesTokenCount: 10,
@@ -644,9 +650,23 @@ test('anthropic pause_turn is a TYPED failure carrying its usage and audit — n
           (e: unknown) => {
             assert.ok(e instanceof ProviderUnfinishedTurnError, 'must be the typed unfinished-turn failure');
             assert.equal(e.stopReason, 'pause_turn');
-            // The paid call's own evidence rides on the error, so the money
-            // guard prices what it cost instead of escalating on absent usage.
-            assert.deepEqual(e.usage, cannedUsage);
+            // The paid call's FULL evidence rides on the error — HTTP status,
+            // response/model ids, the (empty) answer text, normalized AND
+            // verbatim usage, and the audit — so the persisted attempt shows a
+            // received response and the money guard prices what it cost
+            // instead of escalating on absent usage.
+            assert.equal(e.httpStatus, 200);
+            assert.equal(e.providerResponseId, 'msg_paused_1');
+            assert.equal(e.reportedModelId, 'claude-fable-5');
+            assert.equal(e.rawText, '');
+            assert.deepEqual(e.usage, {
+              inputTokens: 900,
+              outputTokens: 120,
+              totalTokens: 1_020,
+              reasoningTokens: null,
+              billableOutputTokens: 120,
+            });
+            assert.deepEqual(e.usageRaw, cannedUsage);
             const carried = e.searchAudit as { searchCount: number; queries: Array<{ query: string }> };
             assert.equal(carried.searchCount, 3);
             assert.deepEqual(carried.queries, [{ query: 'deep dive' }]);
@@ -681,6 +701,191 @@ test('anthropic refusal is the same typed failure — a declined request is neve
   });
 });
 
+test('anthropic max_tokens is the same typed failure — a truncated turn is never scored as (or accepted as) model JSON', async () => {
+  await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, async () => {
+    await withCannedFetch(
+      () =>
+        jsonResponse({
+          id: 'msg_truncated_1',
+          model: 'claude-fable-5',
+          stop_reason: 'max_tokens',
+          content: [{ type: 'text', text: '{"partial":' }],
+          usage: { input_tokens: 500, output_tokens: 16_000 },
+        }),
+      async () => {
+        await assert.rejects(
+          () => registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+          (e: unknown) => {
+            assert.ok(e instanceof ProviderUnfinishedTurnError);
+            assert.equal(e.stopReason, 'max_tokens');
+            assert.equal(e.httpStatus, 200);
+            assert.equal(e.rawText, '{"partial":', 'the partial text is carried, not discarded');
+            assert.match(e.message, /max_tokens output cap/);
+            return true;
+          },
+        );
+        return null;
+      },
+    );
+  });
+});
+
+test('openai root status "incomplete" is a typed unfinished turn carrying the full evidence — never returned as ordinary text', async () => {
+  const cannedUsage = { input_tokens: 200, output_tokens: 16_000, total_tokens: 16_200 };
+  await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, async () => {
+    await withCannedFetch(
+      () =>
+        jsonResponse({
+          id: 'resp_incomplete_1',
+          model: 'gpt-5.6-sol',
+          status: 'incomplete',
+          incomplete_details: { reason: 'max_output_tokens' },
+          output: [{ type: 'message', content: [{ type: 'output_text', text: '{"partial":' }] }],
+          usage: cannedUsage,
+        }),
+      async () => {
+        await assert.rejects(
+          () => registryAdapter('openai-gpt-5.6-sol').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+          (e: unknown) => {
+            assert.ok(e instanceof ProviderUnfinishedTurnError, 'incomplete must not come back as a normal response');
+            assert.equal(e.stopReason, 'incomplete');
+            assert.equal(e.httpStatus, 200);
+            assert.equal(e.providerResponseId, 'resp_incomplete_1');
+            assert.equal(e.reportedModelId, 'gpt-5.6-sol');
+            assert.equal(e.rawText, '{"partial":');
+            assert.deepEqual(e.usageRaw, cannedUsage);
+            assert.match(e.message, /incomplete response \(max_output_tokens\)/);
+            return true;
+          },
+        );
+        return null;
+      },
+    );
+  });
+});
+
+test('xai root status "failed" is a typed unfinished turn — a provider-declared failure is never ordinary model text', async () => {
+  await withEnv('XAI_API_KEY', SYNTHETIC_KEY, async () => {
+    await withCannedFetch(
+      () =>
+        jsonResponse({
+          id: 'resp_failed_1',
+          model: 'grok-4.5',
+          status: 'failed',
+          error: { code: 'server_error', message: 'internal tool failure' },
+          output: [],
+          usage: { input_tokens: 50, output_tokens: 0, total_tokens: 50 },
+        }),
+      async () => {
+        await assert.rejects(
+          () => registryAdapter('xai-grok-4.5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+          (e: unknown) => {
+            assert.ok(e instanceof ProviderUnfinishedTurnError);
+            assert.equal(e.stopReason, 'failed');
+            assert.equal(e.httpStatus, 200);
+            assert.match(e.message, /failed response: internal tool failure/);
+            return true;
+          },
+        );
+        return null;
+      },
+    );
+  });
+});
+
+test('google finishReason MAX_TOKENS is a typed unfinished turn — a truncated candidate is never a normal partial response', async () => {
+  await withEnv('GEMINI_API_KEY', SYNTHETIC_KEY, async () => {
+    await withCannedFetch(
+      () =>
+        jsonResponse({
+          responseId: 'resp-truncated-1',
+          modelVersion: 'gemini-3.1-pro-preview',
+          candidates: [{ content: { parts: [{ text: '{"partial":' }] }, finishReason: 'MAX_TOKENS' }],
+          usageMetadata: { promptTokenCount: 70, candidatesTokenCount: 16_000, totalTokenCount: 16_070 },
+        }),
+      async () => {
+        await assert.rejects(
+          () => registryAdapter('google-gemini-3.1-pro-preview').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+          (e: unknown) => {
+            assert.ok(e instanceof ProviderUnfinishedTurnError);
+            assert.equal(e.stopReason, 'MAX_TOKENS');
+            assert.equal(e.httpStatus, 200);
+            assert.equal(e.providerResponseId, 'resp-truncated-1');
+            assert.equal(e.rawText, '{"partial":');
+            assert.match(e.message, /maxOutputTokens cap/);
+            return true;
+          },
+        );
+        return null;
+      },
+    );
+  });
+});
+
+test('google TOO_MANY_TOOL_CALLS is a typed unfinished turn AND the carried audit records the truncated tool loop', async () => {
+  await withEnv('GEMINI_API_KEY', SYNTHETIC_KEY, async () => {
+    await withCannedFetch(
+      () =>
+        jsonResponse({
+          responseId: 'resp-toolloop-1',
+          modelVersion: 'gemini-3.1-pro-preview',
+          candidates: [{ content: { parts: [] }, finishReason: 'TOO_MANY_TOOL_CALLS' }],
+          usageMetadata: {
+            promptTokenCount: 70,
+            candidatesTokenCount: 0,
+            toolUsePromptTokenCount: 5_000,
+            totalTokenCount: 5_070,
+          },
+        }),
+      async () => {
+        await assert.rejects(
+          () => registryAdapter('google-gemini-3.1-pro-preview').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+          (e: unknown) => {
+            assert.ok(e instanceof ProviderUnfinishedTurnError);
+            assert.equal(e.stopReason, 'TOO_MANY_TOOL_CALLS');
+            const carried = e.searchAudit as { searchCount: number | null; incomplete: string[] };
+            // The audit itself records the gap — never `incomplete: []` on a
+            // truncated tool loop — and the unknowable count stays UNKNOWN.
+            assert.ok(
+              carried.incomplete.includes('the provider terminated the tool loop before it finished'),
+              `audit must record the truncation: ${JSON.stringify(carried.incomplete)}`,
+            );
+            assert.equal(carried.searchCount, null);
+            return true;
+          },
+        );
+        return null;
+      },
+    );
+  });
+});
+
+test('an openai web_search_call with status "failed" marks the audit INCOMPLETE — a tool failure never reads as a clean audit', async () => {
+  const { result } = await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedFetch(
+      () =>
+        jsonResponse({
+          id: 'resp_toolfail_1',
+          model: 'gpt-5.6-sol',
+          status: 'completed',
+          output: [
+            { type: 'web_search_call', id: 'ws_failed', status: 'failed', action: { type: 'search', queries: ['doomed query'] } },
+            { type: 'message', content: [{ type: 'output_text', text: 'answered without that search' }] },
+          ],
+          usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+        }),
+      () => registryAdapter('openai-gpt-5.6-sol').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+    ),
+  );
+  assert.ok(
+    result.searchAudit?.incomplete.includes('web search tool returned an error'),
+    `audit must record the failed call: ${JSON.stringify(result.searchAudit?.incomplete)}`,
+  );
+  // The failed call still counts toward the fee tally — over-estimating the
+  // fee is the safe direction when billing for a failed call is undocumented.
+  assert.equal(result.searchAudit?.searchCount, 1);
+});
+
 test('a REPAIR call carries no tools on any arm — a format-only repair cannot search', async () => {
   // openai / xai: the tool block, its cap, and the tool-scoped include all drop.
   const responsesArms = [
@@ -690,7 +895,7 @@ test('a REPAIR call carries no tools on any arm — a format-only repair cannot 
   for (const [participant, env, model] of responsesArms) {
     const { calls } = await withEnv(env, SYNTHETIC_KEY, () =>
       withCannedFetch(
-        () => jsonResponse({ id: 'r', model, output: [], usage: {} }),
+        () => jsonResponse({ id: 'r', model, status: 'completed', output: [], usage: {} }),
         () => registryAdapter(participant).chat(TURNS, 5_000, { maxOutputTokens: 16_000, tools: 'none' }),
       ),
     );
@@ -711,7 +916,7 @@ test('a REPAIR call carries no tools on any arm — a format-only repair cannot 
   // anthropic: no `tools` key at all.
   const { calls: anthropicCalls } = await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, () =>
     withCannedFetch(
-      () => jsonResponse({ id: 'm', model: 'claude-fable-5', content: [], usage: {} }),
+      () => jsonResponse({ id: 'm', model: 'claude-fable-5', stop_reason: 'end_turn', content: [], usage: {} }),
       () => registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, { maxOutputTokens: 16_000, tools: 'none' }),
     ),
   );
@@ -725,7 +930,12 @@ test('a REPAIR call carries no tools on any arm — a format-only repair cannot 
   // google: no `tools` key at all.
   const { calls: googleCalls } = await withEnv('GEMINI_API_KEY', SYNTHETIC_KEY, () =>
     withCannedFetch(
-      () => jsonResponse({ responseId: 'r', modelVersion: 'gemini-3.1-pro-preview', candidates: [] }),
+      () =>
+        jsonResponse({
+          responseId: 'r',
+          modelVersion: 'gemini-3.1-pro-preview',
+          candidates: [{ content: { parts: [] }, finishReason: 'STOP' }],
+        }),
       () =>
         registryAdapter('google-gemini-3.1-pro-preview').chat(TURNS, 5_000, {
           maxOutputTokens: 16_000,
@@ -742,7 +952,7 @@ test('a REPAIR call carries no tools on any arm — a format-only repair cannot 
   // Negative control: the SAME adapter DOES declare tools on a normal attempt.
   const { calls: searchCalls } = await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, () =>
     withCannedFetch(
-      () => jsonResponse({ id: 'r', model: 'gpt-5.6-sol', output: [], usage: {} }),
+      () => jsonResponse({ id: 'r', model: 'gpt-5.6-sol', status: 'completed', output: [], usage: {} }),
       () => registryAdapter('openai-gpt-5.6-sol').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
     ),
   );
@@ -756,6 +966,7 @@ test('openai audit: the DEPRECATED singular query still parses, and an unreadabl
         jsonResponse({
           id: 'resp_mixed',
           model: 'gpt-5.6-sol',
+          status: 'completed',
           output: [
             // The deprecated singular form, still shown in OpenAI's own guide example.
             { type: 'web_search_call', id: 'ws_1', status: 'completed', action: { type: 'search', query: 'legacy shape' } },
@@ -791,6 +1002,7 @@ test('a reported count that outruns the recorded queries is FLAGGED — the "fal
         jsonResponse({
           id: 'resp_xai_opaque',
           model: 'grok-4.5',
+          status: 'completed',
           output: [{ type: 'web_search_call', id: 'ws', status: 'completed' }],
           citations: ['https://x.example/one'],
           usage: {

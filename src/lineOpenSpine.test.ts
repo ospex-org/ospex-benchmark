@@ -48,6 +48,7 @@ import {
 } from './cohortAdapterCapability.js';
 import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
 import { checkProviderCollision } from './providers/family.js';
+import { ProviderUnfinishedTurnError } from './providers/errors.js';
 import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import { serializeSpendEscalationSidecar, spendEscalationSidecarSha256 } from './spendEscalationSidecar.js';
 import { verifySpendEvidence } from './verifySpendSidecar.js';
@@ -801,6 +802,108 @@ test('a CLEAN billable pass durably installs the spend sidecar and carries it on
   // Round trip: the REAL durable PAIR — the installed artifact's exact bytes plus the
   // produced record re-parsed from its canonical bytes — PASSES the offline pair verifier
   // the crossing acceptance uses, every named check green.
+  const verification = verifySpendEvidence({
+    artifactBytes: fs.readFile(outcome.install.path).toString('utf8'),
+    sidecar: JSON.parse(serializeSpendEscalationSidecar(record)),
+  });
+  assert.deepEqual(
+    verification.checks.filter((c) => !c.ok),
+    [],
+    `every verifier check passes: ${JSON.stringify(verification.checks)}`,
+  );
+  assert.equal(verification.ok, true);
+});
+
+test('END-TO-END: an anthropic pause_turn carrying usage yields a coherent artifact + sidecar pair the offline verifier PASSES', async () => {
+  // The reviewer-probed shape: a paused server-tool turn is a PAID, RECEIVED
+  // response (HTTP 200 with usage and a search audit, no answer text). The
+  // persisted attempt must therefore show a receipt — httpStatus, ids, an
+  // empty body, requestReceivedAt — alongside its usage, or the durable pair
+  // contradicts itself (the verifier refuses usage buckets on a no-receipt
+  // attempt).
+  const fs = new MemoryFs();
+  const snapshot = sealed({ manifestExtra: V2_PIN });
+  const cohortId = snapshot.booted.cohortId;
+  const game = scopedGame(GAME_ID, BOTH);
+  const store = new ScriptedStore(snapshot.expectedArmIdentities.length);
+  const googleThoughts = { promptTokenCount: 1465, candidatesTokenCount: 471, thoughtsTokenCount: 305, totalTokenCount: 2241 };
+  const { map } = validAdapters(snapshot, cohortId, game, (id) =>
+    id.provider === 'google' ? googleThoughts : pricedUsageFor(id.provider),
+  );
+  const anthropicId = snapshot.expectedArmIdentities.find((a) => a.provider === 'anthropic');
+  assert.ok(anthropicId);
+  const pausedUsage = {
+    inputTokens: 4_200,
+    outputTokens: 180,
+    totalTokens: 4_380,
+    reasoningTokens: null,
+    billableOutputTokens: 180,
+  };
+  const pausedUsageRaw = { input_tokens: 4_200, output_tokens: 180, server_tool_use: { web_search_requests: 5 } };
+  const pausedAudit = { queries: [{ query: 'late lineup news' }], results: [], searchCount: 5, incomplete: [] };
+  map.set(anthropicId.participantId, {
+    provider: 'anthropic',
+    requestedModelId: anthropicId.requestedModelId,
+    credentialEnvVar: 'ANTHROPIC_API_KEY',
+    hasCredential: () => true,
+    async chat(): Promise<ProviderResponse> {
+      throw new ProviderUnfinishedTurnError({
+        provider: 'anthropic',
+        stopReason: 'pause_turn',
+        detail: 'the server-side tool loop hit its iteration limit; continuation is not enabled (maxServerToolContinuations)',
+        httpStatus: 200,
+        providerResponseId: 'msg_paused_e2e_1',
+        reportedModelId: anthropicId.requestedModelId,
+        rawText: '',
+        usage: pausedUsage,
+        usageRaw: pausedUsageRaw,
+        searchAudit: pausedAudit,
+      });
+    },
+  });
+  const sink = countingSink(new FireArtifactSink('/base', fs));
+  const outcome = await runOneFire({
+    snapshot,
+    capability: mintInjectedAdapterCapability({ adapters: map, billingClass: 'billable' }),
+    claimPort: new StoreClaimPort(store),
+    sink,
+    runOptions: runOpts(),
+    admission: ADMISSION,
+    now: () => NOW_MS,
+  });
+  assert.equal(outcome.kind, 'Installed');
+  if (outcome.kind !== 'Installed') return;
+
+  // Artifact side: a provider outcome whose one sent attempt is a RECEIVED response.
+  const arm = outcome.artifact.arms.find((a) => a.expectedArmIdentity.provider === 'anthropic');
+  assert.ok(arm);
+  assert.equal(arm.terminalOutcome, 'provider_error');
+  assert.equal(arm.orderedAttempts.length, 1);
+  const attempt = arm.orderedAttempts[0]!;
+  assert.equal(attempt.httpStatus, 200);
+  assert.notEqual(attempt.requestReceivedAt, null, 'a paused turn IS a received response');
+  assert.equal(attempt.reportedModelId, anthropicId.requestedModelId);
+  assert.equal(attempt.persistedResponseBody, '');
+  assert.deepEqual(attempt.usage, pausedUsage);
+  assert.deepEqual(attempt.searchAudit, pausedAudit);
+
+  // Sidecar side: the paused call is priced from its carried buckets + count.
+  assert.equal(sink.sidecarCalls.length, 1, 'a billable fire always installs its spend evidence');
+  const record = sink.sidecarCalls[0]!.arg;
+  const row = record.attempts.find((a) => a.provider === 'anthropic');
+  assert.ok(row);
+  assert.deepEqual(
+    { ...row.usageTokens },
+    { input_tokens: 4_200, output_tokens: 180, 'server_tool_use.web_search_requests': 5 },
+  );
+  assert.equal(row.searchCount, 5);
+  assert.equal(row.spendClass, 'price');
+  assert.equal(row.status, 'pass');
+  assert.equal(record.reason, null, 'a priced pause_turn is evidence, not an escalation');
+
+  // The REAL durable pair round-trips the offline verifier: every named check
+  // green — in particular attempt-completeness (usage buckets WITH a receipt)
+  // and attempts-priceable (the paused call recomputes to a conservative cost).
   const verification = verifySpendEvidence({
     artifactBytes: fs.readFile(outcome.install.path).toString('utf8'),
     sidecar: JSON.parse(serializeSpendEscalationSidecar(record)),

@@ -393,22 +393,30 @@ async function timedChat(
         ? error.message
         : describeError(error);
     const respondedAt = nowMs();
-    // An UNFINISHED turn is a paid call: it carries its own usage and search
-    // audit, and both are recorded on the failed attempt so the money guard
-    // prices the real cost instead of escalating on absent evidence. Every
-    // other failure path keeps the empty record (nothing was reported).
+    // An UNFINISHED turn is a paid, received response: the full evidence the
+    // provider returned — HTTP status, response/model ids, the (possibly
+    // empty) partial text, normalized + verbatim usage, and the search audit —
+    // is recorded on the failed attempt, redacted exactly as a returned
+    // response would be. The money guard prices the real cost, and the
+    // persisted attempt shows a received response (so usage evidence is never
+    // paired with a no-receipt record). Every other failure path keeps the
+    // empty record apart from an HTTP error's status (nothing else was
+    // reported).
     const carried =
       error instanceof ProviderUnfinishedTurnError
         ? {
-            usage: null,
-            usageRaw: error.usage,
-            searchAudit: redactSearchAudit(error.searchAudit as ProviderResponse['searchAudit'], redactSecrets),
+            rawText: redactSecrets(error.rawText),
+            reportedModelId: error.reportedModelId,
+            providerResponseId: error.providerResponseId,
+            httpStatus: error.httpStatus,
+            usage: error.usage,
+            usageRaw: error.usageRaw,
+            searchAudit: redactSearchAudit(error.searchAudit, redactSecrets),
           }
-        : {};
+        : { httpStatus: error instanceof ProviderHttpError ? error.status : null };
     return {
       ...emptyAttempt(),
       ...carried,
-      httpStatus: error instanceof ProviderHttpError ? error.status : null,
       requestAt,
       responseAt: new Date(respondedAt).toISOString(),
       latencyMs: respondedAt - startedAt,
@@ -683,6 +691,19 @@ async function dispatchArmCore(
     return failed('invalid_schema', attemptRecord, null, false, null, [
       ...firstValidation.errors,
       'repair skipped: initial response yields no complete decision fingerprint, so decision preservation cannot be proved',
+    ]);
+  }
+
+  // The analysis fields are decision-bearing, so a repair may not invent them:
+  // an initial that fingerprints WITHOUT them (a pre-axes v1 shape) can only be
+  // "repaired" into a body whose fingerprint differs, which the preservation
+  // check refuses. Skip the guaranteed-to-fail repair call instead of paying
+  // for it. (`axes === null` is the v1 discriminator — a v2 body legitimately
+  // carries a null primaryAxis, and that fingerprints as v2.)
+  if ([...initialFingerprint.values()].some((fp) => fp.axes === null)) {
+    return failed('invalid_schema', attemptRecord, null, false, null, [
+      ...firstValidation.errors,
+      'repair skipped: the initial response omits the decision-bearing analysis fields (axes/primaryAxis/primaryExpectation), and a repair may not invent them',
     ]);
   }
 

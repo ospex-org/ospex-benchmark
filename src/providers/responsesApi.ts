@@ -1,5 +1,6 @@
-import { envValue } from '../config.js';
+import { envValue, redactAndTruncate } from '../config.js';
 import { postJson } from './http.js';
+import { ProviderUnfinishedTurnError } from './errors.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractResponsesSearchAudit } from './searchAudit.js';
 import type {
@@ -90,6 +91,9 @@ export function createResponsesApiAdapter(config: {
       const json = raw as {
         id?: unknown;
         model?: unknown;
+        status?: unknown;
+        incomplete_details?: { reason?: unknown };
+        error?: { code?: unknown; message?: unknown };
         output?: Array<{ type?: unknown; content?: Array<{ type?: unknown; text?: unknown }> }>;
         usage?: { input_tokens?: unknown; output_tokens?: unknown; total_tokens?: unknown };
       };
@@ -129,6 +133,39 @@ export function createResponsesApiAdapter(config: {
       if (options?.maxOutputTokens !== undefined) {
         requestParams[config.maxTokensParam] = options.maxOutputTokens;
       }
+
+      // Terminal state: the Responses API stamps a root `status`; only
+      // `completed` is a finished turn. `incomplete` (e.g. it hit
+      // max_output_tokens), `failed`, anything else, or a missing field is
+      // typed as an unfinished turn carrying the call's full evidence (status,
+      // ids, partial text, usage, audit), so a truncated or failed response is
+      // never scored as the model's invalid JSON — nor accepted as its answer.
+      const rootStatus = typeof json.status === 'string' ? json.status : 'missing';
+      if (rootStatus !== 'completed') {
+        const incompleteReason =
+          typeof json.incomplete_details?.reason === 'string' ? json.incomplete_details.reason : null;
+        const errorMessage =
+          typeof json.error?.message === 'string' ? redactAndTruncate(json.error.message, 300) : null;
+        const detail =
+          rootStatus === 'incomplete'
+            ? `the provider reported an incomplete response${incompleteReason === null ? '' : ` (${incompleteReason})`}`
+            : rootStatus === 'failed'
+              ? `the provider reported a failed response${errorMessage === null ? '' : `: ${errorMessage}`}`
+              : `the provider reported response status "${rootStatus}", not "completed"`;
+        throw new ProviderUnfinishedTurnError({
+          provider: config.provider,
+          stopReason: rootStatus,
+          detail,
+          httpStatus: status,
+          providerResponseId: typeof json.id === 'string' ? json.id : null,
+          reportedModelId: typeof json.model === 'string' ? json.model : null,
+          rawText,
+          usage,
+          usageRaw: json.usage ?? null,
+          searchAudit: extractResponsesSearchAudit(raw),
+        });
+      }
+
       return {
         rawText,
         reportedModelId: typeof json.model === 'string' ? json.model : null,
