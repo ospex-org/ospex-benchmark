@@ -61,6 +61,33 @@ Notes on the worst cases that are *not* simply base input + output:
 Every model's worst-case attempt is below $100, so `roster × (1 + maxRepairsPerArm) × $100` is a
 sound per-fire ceiling and the per-attempt guard can only trip on a genuine anomaly.
 
+## Web-search fees (tools-v1)
+
+Every arm runs the cohort-declared provider web-search tool (`toolInferenceConfigSha256`,
+tools-v1), which adds a PER-INVOCATION fee on top of the token model above. Documented rates as
+observed 2026-08-07: openai $10 / 1,000 calls (capped at `max_tool_calls: 5` per attempt →
+≤ $0.05), anthropic $10 / 1,000 searches (capped at `max_uses: 5` → ≤ $0.05), xai $5 / 1,000
+calls (capped at `max_tool_calls: 5` → ≤ $0.025), google $14 / 1,000 queries on this model
+generation with NO provider-side cap — the model decides how many queries run. Even a pathological
+100-query google attempt adds $1.40; at the documented rates the per-attempt search fee stays well
+under the ~$44 of headroom the token worst case leaves against the $100 reservation, so the
+reservation stays a sound per-attempt ceiling.
+
+Two search-fee facts are deliberately NOT in the derived-actual arithmetic (a conscious exemption,
+not an oversight): the openai and google usage objects carry no per-search counter, so a search fee
+for them cannot be recomputed from durable usage evidence; anthropic
+(`server_tool_use.web_search_requests`) and xai (`server_side_tool_usage_details.web_search_calls`,
+plus its integer `cost_in_usd_ticks`) counters ARE whitelisted into the spend sidecar as evidence.
+Search-content tokens DO land in the token model (openai/anthropic bill them as ordinary tokens;
+google surfaces them as the additively-priced `toolUsePromptTokenCount` bucket).
+
+The openai and xai arms report usage in their Responses-API shape
+(`input_tokens`/`output_tokens`/`output_tokens_details.reasoning_tokens`); the guard prices BOTH
+that shape and the legacy chat-completions shape, so archived sidecar evidence keeps re-verifying.
+For xai the Responses shape's reasoning additivity is decided per response by arithmetic against
+`total_tokens`, pricing the larger reading when no total discriminates — the over-estimate
+direction the whole module is built around.
+
 ## Caveats
 
 - These rates are a **dated snapshot** (published tiers observed 2026-07-23), not a claim of

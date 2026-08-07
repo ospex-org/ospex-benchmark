@@ -247,11 +247,61 @@ export interface ArmSpec {
   credentialEnvVar: string;
 }
 
-/** Normalized token counts (for quick reading; the raw object is canonical). */
+/**
+ * Normalized token counts (for quick reading; the raw object is canonical).
+ *
+ * `reasoningTokens` / `billableOutputTokens` are the two DERIVED comparable
+ * fields (raw usage is never normalized across providers — the raw object
+ * stays verbatim in `usageRaw`):
+ *   - `reasoningTokens`: the provider-reported reasoning/thinking token count
+ *     (openai `output_tokens_details.reasoning_tokens`, anthropic
+ *     `output_tokens_details.thinking_tokens`, google `thoughtsTokenCount`,
+ *     xai `output_tokens_details.reasoning_tokens`); `null` when the provider
+ *     reported none — never a fabricated zero.
+ *   - `billableOutputTokens`: total output-rate tokens INCLUDING reasoning,
+ *     under each provider's own semantics (openai/anthropic count reasoning
+ *     inside the output total; google/xai report it as a separate additive
+ *     bucket); `null` when it cannot be derived with confidence.
+ *
+ * Both are OPTIONAL (not `field: null`) so that records and artifacts
+ * persisted before these fields existed keep parsing and keep recomputing
+ * their original digests (canonicalize binds only present keys).
+ */
 export interface ProviderUsage {
   inputTokens: number | null;
   outputTokens: number | null;
   totalTokens: number | null;
+  reasoningTokens?: number | null | undefined;
+  billableOutputTokens?: number | null | undefined;
+}
+
+/** One executed web-search query, as reported by the provider. */
+export interface SearchAuditQuery {
+  query: string;
+}
+
+/** One result/citation reference the provider surfaced (url + title when given). */
+export interface SearchAuditResult {
+  url: string;
+  title: string | null;
+}
+
+/**
+ * The per-attempt web-search audit trail: every executed query and every
+ * result reference the provider reported, extracted verbatim from the
+ * response envelope so what each arm looked at is auditable after the fact.
+ * `searchCount` is the provider's own usage counter when one exists
+ * (anthropic `server_tool_use.web_search_requests`, xai
+ * `server_side_tool_usage_details.web_search_calls`); `null` where the
+ * provider reports none (openai, google). `incomplete` carries reasons the
+ * audit may be partial (e.g. google grounding metadata missing while tool-use
+ * tokens prove a search ran) — an empty array means no known gap.
+ */
+export interface SearchAudit {
+  queries: SearchAuditQuery[];
+  results: SearchAuditResult[];
+  searchCount: number | null;
+  incomplete: string[];
 }
 
 export interface ProviderResponse {
@@ -270,6 +320,11 @@ export interface ProviderResponse {
   usageRaw: unknown;
   /** Exact request parameters sent (model, endpoint, options) — no credentials. */
   requestParams: Record<string, unknown>;
+  /**
+   * The web-search audit extracted from this response (queries + result
+   * references), or `null` when the response carried no search activity.
+   */
+  searchAudit: SearchAudit | null;
 }
 
 export interface ChatTurn {
@@ -305,6 +360,8 @@ export interface AttemptRecord {
   httpStatus: number | null;
   usage: ProviderUsage | null;
   usageRaw: unknown;
+  /** The redacted web-search audit for this attempt (`null`: no search activity). */
+  searchAudit: SearchAudit | null;
   requestParams: Record<string, unknown> | null;
   requestAt: string | null;
   /**
@@ -363,6 +420,13 @@ export interface ArmGameResult {
 // Model output contract (mirrors docs/BENCHMARK_PROMPT_V0.md schema draft)
 // ---------------------------------------------------------------------------
 
+/** The five named analysis axes a v2 forecast scores (response schema v2). */
+export const AXIS_NAMES = ['valuation', 'trend', 'consensus', 'news', 'softness'] as const;
+export type AxisName = (typeof AXIS_NAMES)[number];
+
+/** Integer 1–5 score per named analysis axis (response schema v2). */
+export type AxesScores = Record<AxisName, number>;
+
 export interface ForecastOutput {
   market: MarketKey;
   selection: string;
@@ -379,6 +443,21 @@ export interface ForecastOutput {
    * unless required information is missing or contradictory.
    */
   reasonCode?: 'missing_information' | 'contradictory_information' | null | undefined;
+  /**
+   * Response schema v2 (REQUIRED there; absent on v1 records): integer 1–5
+   * scores on the five named analysis axes.
+   */
+  axes?: AxesScores | undefined;
+  /**
+   * Response schema v2: the single axis that most drives this forecast, or
+   * null when no axis dominates. Absent on v1 records.
+   */
+  primaryAxis?: AxisName | null | undefined;
+  /**
+   * Response schema v2: one sentence stating the expected development on the
+   * primary axis; null exactly when `primaryAxis` is null. Absent on v1 records.
+   */
+  primaryExpectation?: string | null | undefined;
 }
 
 export interface GameForecastsOutput {
@@ -387,7 +466,8 @@ export interface GameForecastsOutput {
 }
 
 export interface BenchmarkResponse {
-  schemaVersion: 1;
+  /** 1 = pre-axes records (replay only); 2 = current (axes + provider search). */
+  schemaVersion: 1 | 2;
   cohortId: string;
   participantId: string;
   requestedModelId: string;

@@ -40,6 +40,7 @@ function adapterFixture(marker: string): ProviderAdapter & { swapped?: boolean }
         usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
         usageRaw: {},
         requestParams: {},
+        searchAudit: null,
       };
     },
   };

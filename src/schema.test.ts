@@ -4,6 +4,7 @@ import {
   compareFingerprints,
   extractDecisionFingerprint,
   fingerprintFromParsed,
+  RESPONSE_SCHEMA_VERSIONS,
   validateResponseText,
 } from './schema.js';
 import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
@@ -286,4 +287,134 @@ test('fingerprint extraction: an unsupplied-market forecast or a missing supplie
     total: req2.game.markets.total,
   };
   assert.equal(extractDecisionFingerprint(JSON.stringify(resp2), req2.requestBundle), null);
+});
+
+// ---------------------------------------------------------------------------
+// Response schema v2: axes / primaryAxis / primaryExpectation + versioning
+// ---------------------------------------------------------------------------
+
+/** The same decisions as a pre-axes (v1) body: version literal 1, analysis fields stripped. */
+function asV1(response: BenchmarkResponse): BenchmarkResponse {
+  const stripped = structuredClone(response);
+  stripped.schemaVersion = 1;
+  for (const game of stripped.games) {
+    for (const forecast of game.forecasts) {
+      delete forecast.axes;
+      delete forecast.primaryAxis;
+      delete forecast.primaryExpectation;
+    }
+  }
+  return stripped;
+}
+
+test('fail-new: a v1-shaped (pre-axes) response is rejected under the new-run default', () => {
+  const request = makeRequest();
+  const result = validate(asV1(makeValidResponse(request)), request);
+  assert.ok(result.errors.length > 0, 'a pre-axes body must fail new-run validation');
+  assert.ok(
+    result.errors.some((e) => e.includes('schemaVersion') || e.includes('axes')),
+    `errors must name the version or the missing fields, got: ${result.errors.join(' | ')}`,
+  );
+});
+
+test('accept-old: the SAME v1 body validates cleanly when the caller accepts the known versions (replay contexts)', () => {
+  const request = makeRequest();
+  const v1 = asV1(makeValidResponse(request));
+  const result = validateResponseText(
+    JSON.stringify(v1),
+    request.requestBundle,
+    request.requestSha256,
+    TEST_ARM,
+    TEST_COHORT,
+    RESPONSE_SCHEMA_VERSIONS,
+  );
+  assert.deepEqual(result.errors, []);
+  assert.ok(result.parsed);
+  // Negative control: accept-old does not accept an UNKNOWN version.
+  const v3 = { ...v1, schemaVersion: 3 } as unknown as BenchmarkResponse;
+  const rejected = validateResponseText(
+    JSON.stringify(v3),
+    request.requestBundle,
+    request.requestSha256,
+    TEST_ARM,
+    TEST_COHORT,
+    RESPONSE_SCHEMA_VERSIONS,
+  );
+  assert.ok(rejected.errors.some((e) => e.includes('schemaVersion')));
+});
+
+test('a v2 response missing any one of the three analysis fields fails with a field-named error', () => {
+  for (const field of ['axes', 'primaryAxis', 'primaryExpectation'] as const) {
+    const request = makeRequest();
+    const response = makeValidResponse(request);
+    const forecast = response.games[0]?.forecasts[0];
+    assert.ok(forecast);
+    delete forecast[field];
+    const result = validate(response, request);
+    assert.ok(
+      result.errors.some((e) => e.includes(field)),
+      `dropping ${field} must produce an error naming it, got: ${result.errors.join(' | ')}`,
+    );
+  }
+});
+
+test('axes scores are INTEGERS 1..5 on exactly the five named axes — range, fraction, extra-key, and missing-key mutants all fail', () => {
+  const mutate = (fn: (axes: Record<string, number>) => void): string[] => {
+    const request = makeRequest();
+    const response = makeValidResponse(request);
+    const forecast = response.games[0]?.forecasts[0];
+    assert.ok(forecast?.axes);
+    fn(forecast.axes as unknown as Record<string, number>);
+    return validate(response, request).errors;
+  };
+  assert.ok(mutate((a) => { a['valuation'] = 0; }).some((e) => e.includes('axes')), 'below range');
+  assert.ok(mutate((a) => { a['softness'] = 6; }).some((e) => e.includes('axes')), 'above range');
+  assert.ok(mutate((a) => { a['trend'] = 2.5; }).some((e) => e.includes('axes')), 'non-integer');
+  assert.ok(mutate((a) => { a['momentum'] = 3; }).some((e) => e.includes('axes')), 'unknown axis key');
+  assert.ok(mutate((a) => { delete a['news']; }).some((e) => e.includes('axes')), 'missing axis key');
+});
+
+test('primaryExpectation pairs to primaryAxis: mixed null states fail, both-null and both-set validate', () => {
+  const withPair = (
+    primaryAxis: BenchmarkResponse['games'][number]['forecasts'][number]['primaryAxis'],
+    primaryExpectation: string | null,
+  ): string[] => {
+    const request = makeRequest();
+    const response = makeValidResponse(request);
+    const forecast = response.games[0]?.forecasts[0];
+    assert.ok(forecast);
+    forecast.primaryAxis = primaryAxis;
+    forecast.primaryExpectation = primaryExpectation;
+    return validate(response, request).errors;
+  };
+  assert.deepEqual(withPair('news', 'A starter scratch is expected to move this line.'), []);
+  assert.deepEqual(withPair(null, null), []);
+  assert.ok(withPair(null, 'sentence without an axis').some((e) => e.includes('primaryExpectation')));
+  assert.ok(withPair('trend', null).some((e) => e.includes('primaryExpectation')));
+});
+
+test('primaryExpectation must be one single-line sentence — newline and whitespace-only both fail', () => {
+  const withExpectation = (value: string): string[] => {
+    const request = makeRequest();
+    const response = makeValidResponse(request);
+    const forecast = response.games[0]?.forecasts[0];
+    assert.ok(forecast);
+    forecast.primaryAxis = 'valuation';
+    forecast.primaryExpectation = value;
+    return validate(response, request).errors;
+  };
+  assert.ok(withExpectation('two\nlines').some((e) => e.includes('primaryExpectation')));
+  assert.ok(withExpectation('   ').some((e) => e.includes('primaryExpectation')));
+  assert.deepEqual(withExpectation('One sentence about the expected move.'), []);
+});
+
+test('fingerprints span versions: a v1-shaped initial is still repairable and its fingerprint equals the v2 fingerprint (axes are not decision-bearing)', () => {
+  const request = makeRequest();
+  const v2 = makeValidResponse(request);
+  const v1 = asV1(v2);
+  const v1Fingerprint = extractDecisionFingerprint(JSON.stringify(v1), request.requestBundle);
+  assert.ok(v1Fingerprint, 'a pre-axes body must still yield a complete fingerprint (repairable)');
+  const v2Validated = validate(v2, request);
+  assert.ok(v2Validated.parsed);
+  assert.deepEqual(compareFingerprints(v1Fingerprint, fingerprintFromParsed(v2Validated.parsed)), []);
 });

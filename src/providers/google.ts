@@ -1,5 +1,8 @@
 import { googleApiKey } from '../config.js';
 import { postJson } from './http.js';
+import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
+import { deriveComparableUsage } from './comparableUsage.js';
+import { extractGoogleSearchAudit } from './searchAudit.js';
 import type {
   ChatTurn,
   ProviderAdapter,
@@ -9,6 +12,11 @@ import type {
 } from '../types.js';
 
 const GOOGLE_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+// The declared Google Search grounding tool (tools-v1). Google exposes no
+// cap parameter — the model decides how many queries run; the audit records
+// the executed queries and the tool-use token bucket evidences that one ran.
+const WEB_SEARCH = TOOL_INFERENCE_CONFIG.webSearch.google;
 
 export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
   return {
@@ -33,9 +41,11 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
           role: t.role === 'assistant' ? 'model' : 'user',
           parts: [{ text: t.content }],
         }));
+      const tools = [WEB_SEARCH.tool];
       const body: Record<string, unknown> = {
         systemInstruction: { parts: [{ text: system }] },
         contents,
+        tools,
       };
       if (options?.maxOutputTokens !== undefined) {
         body['generationConfig'] = { maxOutputTokens: options.maxOutputTokens };
@@ -69,6 +79,7 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
             .map((p) => p.text as string)
             .join('')
         : '';
+      const comparable = deriveComparableUsage('google', json.usageMetadata ?? null);
       const usage: ProviderUsage = {
         inputTokens:
           typeof json.usageMetadata?.promptTokenCount === 'number'
@@ -82,8 +93,14 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
           typeof json.usageMetadata?.totalTokenCount === 'number'
             ? json.usageMetadata.totalTokenCount
             : null,
+        reasoningTokens: comparable.reasoningTokens,
+        billableOutputTokens: comparable.billableOutputTokens,
       };
-      const requestParams: Record<string, unknown> = { endpoint: url, model: requestedModelId };
+      const requestParams: Record<string, unknown> = {
+        endpoint: url,
+        model: requestedModelId,
+        tools,
+      };
       if (options?.maxOutputTokens !== undefined) {
         requestParams['maxOutputTokens'] = options.maxOutputTokens;
       }
@@ -95,6 +112,7 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
         usage,
         usageRaw: json.usageMetadata ?? null,
         requestParams,
+        searchAudit: extractGoogleSearchAudit(raw),
       };
     },
   };

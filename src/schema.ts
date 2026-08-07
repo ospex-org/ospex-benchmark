@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { AXIS_NAMES } from './types.js';
 import type {
   ArmSpec,
   BenchmarkResponse,
@@ -13,7 +14,18 @@ import type {
  * docs/BENCHMARK_PROMPT_V0.md: a strict zod shape pass, then semantic checks
  * against the frozen bundle (exact labels, echoed lines/prices, probability
  * coherence, execution-policy marking). Prose checking is not validation.
+ *
+ * The response schema is VERSIONED (known-version rule, evidence spec §2):
+ * v1 is the pre-axes shape, kept byte-identical in semantics so archived
+ * bodies and persisted fire artifacts replay unchanged; v2 (current) adds the
+ * required per-forecast `axes` / `primaryAxis` / `primaryExpectation` fields.
+ * New runs validate against the CURRENT version only (a v1-shaped response
+ * fails); replay contexts pass the full known-version list explicitly.
  */
+
+export const RESPONSE_SCHEMA_VERSIONS = [1, 2] as const;
+export type ResponseSchemaVersion = (typeof RESPONSE_SCHEMA_VERSIONS)[number];
+export const CURRENT_RESPONSE_SCHEMA_VERSION: ResponseSchemaVersion = 2;
 
 const probabilitiesSchema = z
   .object({
@@ -23,50 +35,119 @@ const probabilitiesSchema = z
   })
   .strict();
 
-const forecastSchema = z
+const forecastShapeV1 = {
+  market: z.enum(['moneyline', 'spread', 'total']),
+  selection: z.string().min(1),
+  line: z.number().nullable(),
+  observedDecimal: z.number().gt(1),
+  probabilities: probabilitiesSchema,
+  confidence: z.number().min(0).max(1),
+  wouldAbstain: z.boolean(),
+  selectedForExecution: z.boolean(),
+  rationale: z
+    .string()
+    .min(1)
+    .refine((s) => s.trim().length > 0, 'rationale must not be whitespace-only'),
+  // Every rationale must be grounded: at least one bundle evidenceRef.
+  evidenceRefs: z.array(z.string().min(1)).min(1),
+  // The supplied reason codes the system prompt refers to. Absent or null
+  // unless required information is missing or contradictory.
+  reasonCode: z.enum(['missing_information', 'contradictory_information']).nullable().optional(),
+} as const;
+
+const forecastSchemaV1 = z.object(forecastShapeV1).strict();
+
+/** Integer 1–5 score per named analysis axis — exactly the five, no extras. */
+const axesSchema = z
   .object({
-    market: z.enum(['moneyline', 'spread', 'total']),
-    selection: z.string().min(1),
-    line: z.number().nullable(),
-    observedDecimal: z.number().gt(1),
-    probabilities: probabilitiesSchema,
-    confidence: z.number().min(0).max(1),
-    wouldAbstain: z.boolean(),
-    selectedForExecution: z.boolean(),
-    rationale: z
+    valuation: z.number().int().min(1).max(5),
+    trend: z.number().int().min(1).max(5),
+    consensus: z.number().int().min(1).max(5),
+    news: z.number().int().min(1).max(5),
+    softness: z.number().int().min(1).max(5),
+  })
+  .strict();
+
+const forecastSchemaV2 = z
+  .object({
+    ...forecastShapeV1,
+    axes: axesSchema,
+    primaryAxis: z.enum(AXIS_NAMES).nullable(),
+    primaryExpectation: z
       .string()
       .min(1)
-      .refine((s) => s.trim().length > 0, 'rationale must not be whitespace-only'),
-    // Every rationale must be grounded: at least one bundle evidenceRef.
-    evidenceRefs: z.array(z.string().min(1)).min(1),
-    // The supplied reason codes the system prompt refers to. Absent or null
-    // unless required information is missing or contradictory.
-    reasonCode: z.enum(['missing_information', 'contradictory_information']).nullable().optional(),
+      .refine((s) => s.trim().length > 0, 'primaryExpectation must not be whitespace-only')
+      .refine((s) => !s.includes('\n'), 'primaryExpectation must be one sentence on a single line')
+      .nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine((forecast, ctx) => {
+    // primaryExpectation is paired to primaryAxis: null exactly when the axis is null.
+    if ((forecast.primaryAxis === null) !== (forecast.primaryExpectation === null)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['primaryExpectation'],
+        message: 'primaryExpectation must be null exactly when primaryAxis is null (and a sentence otherwise)',
+      });
+    }
+  });
 
-const gameForecastsSchema = z
-  .object({
-    gameId: z.string().min(1),
-    // 1-3 forecasts: exactly one per market the game supplies (S3 dynamic
-    // cardinality). The exact per-game count is a semantic check against the
-    // bundle's supplied markets in checkGame, not a fixed zod length — on a
-    // full board that resolves to the historical three.
-    forecasts: z.array(forecastSchema).min(1).max(3),
-  })
-  .strict();
+function gameForecastsSchemaFor(forecast: z.ZodTypeAny) {
+  return z
+    .object({
+      gameId: z.string().min(1),
+      // 1-3 forecasts: exactly one per market the game supplies (S3 dynamic
+      // cardinality). The exact per-game count is a semantic check against the
+      // bundle's supplied markets in checkGame, not a fixed zod length — on a
+      // full board that resolves to the historical three.
+      forecasts: z.array(forecast).min(1).max(3),
+    })
+    .strict();
+}
 
-export const benchmarkResponseSchema = z
-  .object({
-    schemaVersion: z.literal(1),
-    cohortId: z.string().min(1),
-    participantId: z.string().min(1),
-    requestedModelId: z.string().min(1),
-    bundleSha256: z.string().regex(/^[0-9a-f]{64}$/),
-    executionPolicy: z.enum(['fixed-moneyline-total', 'model-choice-side-total']),
-    games: z.array(gameForecastsSchema).min(1),
-  })
-  .strict();
+function benchmarkResponseSchemaFor(schemaVersion: ResponseSchemaVersion, forecast: z.ZodTypeAny) {
+  return z
+    .object({
+      schemaVersion: z.literal(schemaVersion),
+      cohortId: z.string().min(1),
+      participantId: z.string().min(1),
+      requestedModelId: z.string().min(1),
+      bundleSha256: z.string().regex(/^[0-9a-f]{64}$/),
+      executionPolicy: z.enum(['fixed-moneyline-total', 'model-choice-side-total']),
+      games: z.array(gameForecastsSchemaFor(forecast)).min(1),
+    })
+    .strict();
+}
+
+/** The FROZEN v1 shape — replay-only; semantics byte-identical to the pre-axes validator. */
+export const benchmarkResponseSchemaV1 = benchmarkResponseSchemaFor(1, forecastSchemaV1);
+export const benchmarkResponseSchemaV2 = benchmarkResponseSchemaFor(2, forecastSchemaV2);
+
+/** The CURRENT response schema (v2) — what the prompt template renders from. */
+export const benchmarkResponseSchema = benchmarkResponseSchemaV2;
+
+function schemaForVersion(version: ResponseSchemaVersion): z.ZodTypeAny {
+  return version === 1 ? benchmarkResponseSchemaV1 : benchmarkResponseSchemaV2;
+}
+
+/**
+ * Pick which schema version to validate an extracted body against: the body's
+ * own claimed `schemaVersion` when it is one of the ACCEPTED versions,
+ * otherwise the newest accepted version (whose literal check then reports the
+ * version mismatch as an ordinary validation error).
+ */
+function pickSchemaVersion(
+  extracted: unknown,
+  accepted: readonly ResponseSchemaVersion[],
+): ResponseSchemaVersion {
+  const claimed =
+    typeof extracted === 'object' && extracted !== null && !Array.isArray(extracted)
+      ? (extracted as Record<string, unknown>)['schemaVersion']
+      : undefined;
+  const match = accepted.find((v) => v === claimed);
+  if (match !== undefined) return match;
+  return accepted.reduce((a, b) => (b > a ? b : a), accepted[0] ?? CURRENT_RESPONSE_SCHEMA_VERSION);
+}
 
 /**
  * Structural walk of the response schema, used to build the prompt's
@@ -315,19 +396,28 @@ export interface ValidationResult {
   errors: string[];
 }
 
+/**
+ * `acceptedSchemaVersions` DEFAULTS to the current version only — new runs
+ * fail-closed on a pre-axes (v1) response. Replay contexts (the scorer's
+ * re-validation of archived bodies, the fire-artifact replay) pass the full
+ * `RESPONSE_SCHEMA_VERSIONS` list explicitly so old records keep validating
+ * under the version they were produced with.
+ */
 export function validateResponseText(
   rawText: string,
   bundle: SlateBundle,
   bundleSha256: string,
   arm: ArmSpec,
   cohortId: string,
+  acceptedSchemaVersions: readonly ResponseSchemaVersion[] = [CURRENT_RESPONSE_SCHEMA_VERSION],
 ): ValidationResult {
   const extracted = extractJson(rawText);
   if (extracted === null) {
     return { parsed: null, errors: ['response is not parseable JSON'] };
   }
 
-  const shape = benchmarkResponseSchema.safeParse(extracted);
+  const version = pickSchemaVersion(extracted, acceptedSchemaVersions);
+  const shape = schemaForVersion(version).safeParse(extracted);
   if (!shape.success) {
     const errors = shape.error.issues
       .slice(0, 20)
@@ -335,7 +425,7 @@ export function validateResponseText(
     return { parsed: null, errors };
   }
 
-  const parsed = shape.data;
+  const parsed = shape.data as BenchmarkResponse;
   const errors: string[] = [];
 
   if (parsed.cohortId !== cohortId) errors.push(`cohortId must echo "${cohortId}"`);
@@ -447,13 +537,20 @@ export function extractDecisionFingerprint(
 ): DecisionFingerprint | null {
   const extracted = extractJson(rawText);
   if (extracted === null) return null;
-  const shape = benchmarkResponseSchema.safeParse(extracted);
+  // Fingerprints accept ANY known schema version: the fingerprint fields exist
+  // identically in v1 and v2, so a v1-shaped initial (e.g. missing the v2 axes)
+  // still yields a complete fingerprint — making it exactly the kind of
+  // format/completeness failure a decision-preserving repair may fix — and the
+  // scorer can re-derive fingerprints from archived v1 bodies unchanged.
+  const version = pickSchemaVersion(extracted, RESPONSE_SCHEMA_VERSIONS);
+  const shape = schemaForVersion(version).safeParse(extracted);
   if (!shape.success) return null;
+  const data = shape.data as BenchmarkResponse;
 
   const bundleGames = new Map(bundle.games.map((g) => [g.gameId, g]));
   const fingerprint: DecisionFingerprint = new Map();
   const seenGames = new Set<string>();
-  for (const game of shape.data.games) {
+  for (const game of data.games) {
     const bundleGame = bundleGames.get(game.gameId);
     if (bundleGame === undefined || seenGames.has(game.gameId)) return null;
     seenGames.add(game.gameId);

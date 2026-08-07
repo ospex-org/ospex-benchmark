@@ -6,6 +6,7 @@ import { CODE_MAX_REPAIRS_PER_ARM, isRepairPolicyVersion } from './repairPolicy.
 import { isSpendReservationPolicyVersion, spendReservationPolicyForVersion } from './spendReservationPolicy.js';
 import { isBaselinePolicyVersion, supportsScopedInput } from './baselines.js';
 import { promptScaffoldSha256 } from './prompt.js';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 
 /**
@@ -37,8 +38,8 @@ function orderedArrayEqual(a: readonly string[], b: readonly string[]): boolean 
  * pins a version or digest the runner cannot actually honor fails closed rather
  * than running a cohort whose declared policy differs from what executes.
  *
- * Deliberately NOT checked (no code module exists yet — validated when their
- * module lands): `toolInferenceConfigSha256` and `uncertaintyPolicyVersion`.
+ * Deliberately NOT checked (no code module exists yet — validated when its
+ * module lands): `uncertaintyPolicyVersion`.
  * Credential presence is a live/boot concern
  * (network), not this pure check.
  */
@@ -157,6 +158,17 @@ export function validateManifestAgainstCode(manifest: CohortManifestV1): string[
   if (manifest.promptScaffoldSha256 !== scaffold) {
     violations.push(
       `promptScaffoldSha256 mismatch: manifest "${manifest.promptScaffoldSha256}" != recomputed "${scaffold}"`,
+    );
+  }
+
+  // Tool-inference config: the manifest digest must equal the hash of the
+  // code's declared tool configuration (which server-side tools each arm runs
+  // with, and their caps) — so what a cohort declares and what its adapters
+  // actually send cannot drift apart.
+  const toolConfig = toolInferenceConfigSha256();
+  if (manifest.toolInferenceConfigSha256 !== toolConfig) {
+    violations.push(
+      `toolInferenceConfigSha256 mismatch: manifest "${manifest.toolInferenceConfigSha256}" != recomputed "${toolConfig}"`,
     );
   }
 

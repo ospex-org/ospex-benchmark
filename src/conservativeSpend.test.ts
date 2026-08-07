@@ -373,3 +373,157 @@ test('PROVIDER_BY_MODEL matches the authenticated arm roster exactly (no drift)'
   for (const arm of ARMS) fromArms[arm.requestedModelId] = arm.provider;
   assert.deepEqual({ ...PROVIDER_BY_MODEL }, fromArms);
 });
+
+// ── Responses-API usage shapes (the live openai/xai adapters since web search) ─
+
+test('openai Responses shape: prices input·$12.50 + output·$60; reasoning stays a subset; legacy chat shape still prices (old evidence)', () => {
+  // Same counts as the chat-shape case above, under the Responses field names:
+  // 1490·12.5 + 512·60 = 49,345 micros — identical, and reasoning never re-added.
+  const responsesShape = deriveConservativeActualUsdMicros({
+    provider: 'openai',
+    requestedModelId: 'gpt-5.6-sol',
+    priceVersion: V2,
+    usageRaw: {
+      input_tokens: 1490,
+      output_tokens: 512,
+      total_tokens: 2002,
+      input_tokens_details: { cached_tokens: 128 },
+      output_tokens_details: { reasoning_tokens: 256 },
+    },
+  });
+  assert.equal(responsesShape, 49_345);
+  // An inconsistent Responses total fails closed (accounting must reconcile).
+  assert.throws(
+    () =>
+      deriveConservativeActualUsdMicros({
+        provider: 'openai',
+        requestedModelId: 'gpt-5.6-sol',
+        priceVersion: V2,
+        usageRaw: { input_tokens: 1490, output_tokens: 512, total_tokens: 9_999 },
+      }),
+    ConservativeSpendUnknownError,
+  );
+});
+
+test('xai Responses shape: the ADDITIVE identity prices output + reasoning; the SUBSET identity prices output alone', () => {
+  // Additive: total = 1000 + 200 + 100 → (200+100)·12 + 1000·4 = 7,600.
+  const additive = deriveConservativeActualUsdMicros({
+    provider: 'xai',
+    requestedModelId: 'grok-4.5',
+    priceVersion: V2,
+    usageRaw: {
+      input_tokens: 1000,
+      output_tokens: 200,
+      total_tokens: 1300,
+      output_tokens_details: { reasoning_tokens: 100 },
+    },
+  });
+  assert.equal(additive, 7_600);
+  // Subset: total = 1000 + 300 with reasoning 100 <= 300 → 1000·4 + 300·12 = 7,600 too,
+  // so use distinct counts: total = 1000 + 200, reasoning 150 <= 200 → 4,000 + 2,400 = 6,400.
+  const subset = deriveConservativeActualUsdMicros({
+    provider: 'xai',
+    requestedModelId: 'grok-4.5',
+    priceVersion: V2,
+    usageRaw: {
+      input_tokens: 1000,
+      output_tokens: 200,
+      total_tokens: 1200,
+      output_tokens_details: { reasoning_tokens: 150 },
+    },
+  });
+  assert.equal(subset, 6_400);
+});
+
+test('xai Responses shape fails CLOSED: a total matching neither identity, and a missing reasoning bucket with no corroborating total', () => {
+  assert.throws(
+    () =>
+      deriveConservativeActualUsdMicros({
+        provider: 'xai',
+        requestedModelId: 'grok-4.5',
+        priceVersion: V2,
+        usageRaw: {
+          input_tokens: 1000,
+          output_tokens: 200,
+          total_tokens: 5_000,
+          output_tokens_details: { reasoning_tokens: 100 },
+        },
+      }),
+    ConservativeSpendUnknownError,
+  );
+  assert.throws(
+    () =>
+      deriveConservativeActualUsdMicros({
+        provider: 'xai',
+        requestedModelId: 'grok-4.5',
+        priceVersion: V2,
+        usageRaw: { input_tokens: 1000, output_tokens: 200 },
+      }),
+    ConservativeSpendUnknownError,
+  );
+});
+
+test('xai Responses shape with NO total: the ADDITIVE (larger) reading is priced — the guard may only over-estimate', () => {
+  // 1000·4 + (200+100)·12 = 7,600 — never the subset 6,400.
+  const cost = deriveConservativeActualUsdMicros({
+    provider: 'xai',
+    requestedModelId: 'grok-4.5',
+    priceVersion: V2,
+    usageRaw: {
+      input_tokens: 1000,
+      output_tokens: 200,
+      output_tokens_details: { reasoning_tokens: 100 },
+    },
+  });
+  assert.equal(cost, 7_600);
+});
+
+test('google with grounding: toolUsePromptTokenCount prices ADDITIVELY at the input rate, and both total identities reconcile', () => {
+  // 1465·4 + (471+305)·18 = 5,860 + 13,968 = 19,828 without tool use.
+  const withoutToolUse = deriveConservativeActualUsdMicros({
+    provider: 'google',
+    requestedModelId: 'gemini-3.1-pro-preview',
+    priceVersion: V2,
+    usageRaw: {
+      promptTokenCount: 1465,
+      candidatesTokenCount: 471,
+      thoughtsTokenCount: 305,
+      totalTokenCount: 2241,
+    },
+  });
+  assert.equal(withoutToolUse, 19_828);
+  // (1465+210)·4 + (471+305)·18 = 6,700 + 13,968 = 20,668 — the tool-use bucket
+  // is COUNTED, whichever side of totalTokenCount the provider put it on.
+  for (const totalTokenCount of [2_241, 2_451]) {
+    const withToolUse = deriveConservativeActualUsdMicros({
+      provider: 'google',
+      requestedModelId: 'gemini-3.1-pro-preview',
+      priceVersion: V2,
+      usageRaw: {
+        promptTokenCount: 1465,
+        candidatesTokenCount: 471,
+        thoughtsTokenCount: 305,
+        toolUsePromptTokenCount: 210,
+        totalTokenCount,
+      },
+    });
+    assert.equal(withToolUse, 20_668, `total ${totalTokenCount}`);
+  }
+  // A total matching NEITHER identity still fails closed.
+  assert.throws(
+    () =>
+      deriveConservativeActualUsdMicros({
+        provider: 'google',
+        requestedModelId: 'gemini-3.1-pro-preview',
+        priceVersion: V2,
+        usageRaw: {
+          promptTokenCount: 1465,
+          candidatesTokenCount: 471,
+          thoughtsTokenCount: 305,
+          toolUsePromptTokenCount: 210,
+          totalTokenCount: 9_999,
+        },
+      }),
+    ConservativeSpendUnknownError,
+  );
+});

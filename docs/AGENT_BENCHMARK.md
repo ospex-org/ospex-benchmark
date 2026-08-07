@@ -40,8 +40,10 @@ Each output also records:
 - model-estimated probability;
 - confidence/rank;
 - `wouldAbstain` as a non-executing secondary signal;
-- short rationale grounded only in the frozen bundle;
+- short rationale, with evidenceRefs grounded in the frozen bundle (search-derived context may inform it);
+- integer 1-5 scores on five named analysis axes (valuation, trend, consensus, news, softness), the single primary axis driving the forecast (or null), and a one-sentence primary expectation paired to it;
 - exact market, side, line, and observed price;
+- the per-attempt web-search audit (every executed query and result reference), token usage with `reasoningTokens` and `billableOutputTokens` alongside the provider's verbatim raw usage;
 - strict machine-readable schema validity.
 
 Forced shadow forecasts prevent cherry-picking and create a predictable paired sample. They measure **forced-choice market discrimination**, not bankroll management. A later selective policy may execute only when model-implied edge clears one common preregistered threshold; it must report coverage, abstentions, fills, and failures.
@@ -106,7 +108,7 @@ Every model in a canonical cohort receives the same logical information bundle, 
 
 Proxy/archive every tool response. Launch provider calls concurrently where practical and seal each output until all arms submit so no participant or operator can condition a later arm on an earlier answer.
 
-Do not give one provider native web/search access while another sees only the frozen bundle. Provider-native search, browsing, code execution, memory, and hidden multi-agent modes are disabled unless equivalent, logged tools are deliberately supplied to every participant.
+Do not give one provider native web/search access while another sees only the frozen bundle. Provider-native web search IS deliberately enabled for every participant under the cohort-declared tool configuration (tools-v1, hashed into the manifest as `toolInferenceConfigSha256`), with every executed query and result reference logged per attempt. Browsing beyond the declared search tool, code execution, memory, and hidden multi-agent modes remain disabled unless equivalent, logged tools are deliberately supplied to every participant.
 
 Decisions must be committed before the closing snapshot exists. No reruns after seeing later prices. The first valid call determines any live action; transport retries and format-only repairs follow fixed rules. Invalid output handling, provider outage handling, and exclusion rules must be fixed before the cohort starts.
 

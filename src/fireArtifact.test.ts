@@ -65,6 +65,7 @@ function attempt(over: Partial<AttemptRecord> = {}): AttemptRecord {
     httpStatus: 200,
     usage: null,
     usageRaw: null,
+    searchAudit: null,
     requestParams: null,
     requestAt: '2026-07-16T00:00:05.000Z',
     responseAt: '2026-07-16T00:00:06.000Z',
@@ -360,4 +361,107 @@ test('persisted usage token counts must be null or safe non-negative integers', 
   for (const bad of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => withToken(bad), `token count ${String(bad)} must be rejected`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// searchAudit + comparable-usage fields: backward-verifiable digest binding
+// ---------------------------------------------------------------------------
+
+test('pre-search attempts (no searchAudit, no comparable-usage keys) recompute their ORIGINAL armDigest — old artifacts stay verifiable', () => {
+  // An attempt list shaped exactly like a pre-search persisted artifact:
+  // no searchAudit key, usage without the two derived fields.
+  const legacyAttempts = [
+    {
+      attemptNumber: 1,
+      kind: 'initial' as const,
+      requestStartedAt: '2026-07-16T00:00:05.000Z',
+      requestReceivedAt: '2026-07-16T00:00:07.000Z',
+      acceptedAt: null,
+      reportedModelId: 'model-x',
+      httpStatus: 200,
+      persistedResponseBody: '{"ok":true}',
+      responseSha256: 'a'.repeat(64),
+      transport: 'ok' as const,
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+    },
+  ];
+  const legacyDigest = armDigest(digestInput({ orderedAttempts: legacyAttempts }));
+  // The same attempt with the NEW fields present digests DIFFERENTLY (they are
+  // bound), while re-parsing the legacy shape leaves the digest unchanged.
+  const enriched = [
+    {
+      ...legacyAttempts[0]!,
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, reasoningTokens: 2, billableOutputTokens: 5 },
+      searchAudit: { queries: [{ query: 'q' }], results: [], searchCount: null, incomplete: [] },
+    },
+  ];
+  const enrichedDigest = armDigest(digestInput({ orderedAttempts: enriched }));
+  assert.notEqual(enrichedDigest, legacyDigest, 'present new fields must be digest-bound');
+  assert.equal(
+    armDigest(digestInput({ orderedAttempts: legacyAttempts })),
+    legacyDigest,
+    'legacy attempts recompute byte-identically',
+  );
+});
+
+test('a PRESENT searchAudit is digest-bound: tampering a query, a result, or deleting the audit changes the armDigest', () => {
+  const base = [
+    {
+      attemptNumber: 1,
+      kind: 'initial' as const,
+      requestStartedAt: '2026-07-16T00:00:05.000Z',
+      requestReceivedAt: '2026-07-16T00:00:07.000Z',
+      acceptedAt: null,
+      reportedModelId: 'model-x',
+      httpStatus: 200,
+      persistedResponseBody: '{"ok":true}',
+      responseSha256: 'a'.repeat(64),
+      transport: 'ok' as const,
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, reasoningTokens: 2, billableOutputTokens: 5 },
+      searchAudit: {
+        queries: [{ query: 'injury report' }],
+        results: [{ url: 'https://news.example/a', title: 'A' }],
+        searchCount: 1,
+        incomplete: [],
+      },
+    },
+  ];
+  const baseline = armDigest(digestInput({ orderedAttempts: base }));
+  const tamperedQuery = structuredClone(base);
+  tamperedQuery[0]!.searchAudit.queries[0]!.query = 'different query';
+  assert.notEqual(armDigest(digestInput({ orderedAttempts: tamperedQuery })), baseline);
+  const tamperedResult = structuredClone(base);
+  tamperedResult[0]!.searchAudit.results[0]!.url = 'https://elsewhere.example/b';
+  assert.notEqual(armDigest(digestInput({ orderedAttempts: tamperedResult })), baseline);
+  const deleted = structuredClone(base) as Array<Record<string, unknown>>;
+  delete deleted[0]!['searchAudit'];
+  assert.notEqual(
+    armDigest(digestInput({ orderedAttempts: deleted as unknown as typeof base })),
+    baseline,
+    'stripping the audit off a new attempt is digest-detected',
+  );
+});
+
+test('toPersistedAttempts carries the searchAudit through detached (explicit null when the attempt ran no search)', () => {
+  const audited = armResult({
+    attempt: attempt({
+      searchAudit: { queries: [{ query: 'q1' }], results: [{ url: 'https://u.example', title: null }], searchCount: 1, incomplete: [] },
+    }),
+  });
+  const [persisted] = toPersistedAttempts(audited);
+  assert.deepEqual(persisted!.searchAudit, {
+    queries: [{ query: 'q1' }],
+    results: [{ url: 'https://u.example', title: null }],
+    searchCount: 1,
+    incomplete: [],
+  });
+  assert.notEqual(
+    persisted!.searchAudit,
+    audited.attempt.searchAudit,
+    'the persisted audit is a detached copy, never an alias of runner state',
+  );
+  const noSearch = armResult({ attempt: attempt({ searchAudit: null }) });
+  const [plain] = toPersistedAttempts(noSearch);
+  assert.equal(plain!.searchAudit, null, 'no search activity persists an explicit null, not an absent key');
+  assert.ok(Object.hasOwn(plain!, 'searchAudit'));
 });

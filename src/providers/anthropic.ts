@@ -1,5 +1,8 @@
 import { envValue } from '../config.js';
 import { postJson } from './http.js';
+import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
+import { deriveComparableUsage } from './comparableUsage.js';
+import { extractAnthropicSearchAudit } from './searchAudit.js';
 import type {
   ChatTurn,
   ProviderAdapter,
@@ -11,6 +14,10 @@ import type {
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
 const DEFAULT_MAX_TOKENS = 16000;
+
+// The declared web-search server tool (tools-v1): GA on the Messages API (no
+// beta header), flat block shape, capped by the provider's own `max_uses`.
+const WEB_SEARCH = TOOL_INFERENCE_CONFIG.webSearch.anthropic;
 
 export function createAnthropicAdapter(requestedModelId: string): ProviderAdapter {
   return {
@@ -32,11 +39,12 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
         .filter((t) => t.role !== 'system')
         .map((t) => ({ role: t.role, content: t.content }));
       const maxTokens = options?.maxOutputTokens ?? DEFAULT_MAX_TOKENS;
+      const tools = [{ ...WEB_SEARCH.tool, max_uses: WEB_SEARCH.maxUses }];
       const { status, json: raw } = await postJson({
         provider: 'anthropic',
         url: ANTHROPIC_URL,
         headers: { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION },
-        body: { model: requestedModelId, max_tokens: maxTokens, system, messages },
+        body: { model: requestedModelId, max_tokens: maxTokens, system, messages, tools },
         timeoutMs,
       });
       const json = raw as {
@@ -56,10 +64,13 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
         typeof json.usage?.input_tokens === 'number' ? json.usage.input_tokens : null;
       const outputTokens =
         typeof json.usage?.output_tokens === 'number' ? json.usage.output_tokens : null;
+      const comparable = deriveComparableUsage('anthropic', json.usage ?? null);
       const usage: ProviderUsage = {
         inputTokens,
         outputTokens,
         totalTokens: inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null,
+        reasoningTokens: comparable.reasoningTokens,
+        billableOutputTokens: comparable.billableOutputTokens,
       };
       return {
         rawText: text,
@@ -73,7 +84,9 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
           model: requestedModelId,
           max_tokens: maxTokens,
           anthropic_version: ANTHROPIC_VERSION,
+          tools,
         },
+        searchAudit: extractAnthropicSearchAudit(raw),
       };
     },
   };

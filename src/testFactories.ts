@@ -97,7 +97,7 @@ export function makeValidResponse(
   const rl = game.markets.runLine!;
   const total = game.markets.total!;
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     cohortId,
     participantId: arm.participantId,
     requestedModelId: arm.requestedModelId,
@@ -119,6 +119,9 @@ export function makeValidResponse(
             rationale: 'Reference prices favor the away side.',
             evidenceRefs: [ml.evidenceRef],
             reasonCode: null,
+            axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 },
+            primaryAxis: 'valuation',
+            primaryExpectation: 'The away price reads rich against the implied probabilities.',
           },
           {
             market: 'spread',
@@ -132,6 +135,9 @@ export function makeValidResponse(
             rationale: 'Half-run line at even implied odds.',
             evidenceRefs: [rl.evidenceRef],
             reasonCode: null,
+            axes: { valuation: 2, trend: 4, consensus: 1, news: 3, softness: 5 },
+            primaryAxis: 'trend',
+            primaryExpectation: 'Recent form favors the home side on the designated run line.',
           },
           {
             market: 'total',
@@ -145,6 +151,9 @@ export function makeValidResponse(
             rationale: 'Total priced evenly at the designated line.',
             evidenceRefs: [total.evidenceRef],
             reasonCode: null,
+            axes: { valuation: 3, trend: 1, consensus: 5, news: 2, softness: 4 },
+            primaryAxis: null,
+            primaryExpectation: null,
           },
         ],
       },

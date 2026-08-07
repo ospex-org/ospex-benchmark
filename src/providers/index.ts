@@ -1,7 +1,8 @@
 import { createAnthropicAdapter } from './anthropic.js';
 import { createGoogleAdapter } from './google.js';
-import { createOpenAiCompatibleAdapter } from './openaiCompatible.js';
+import { createResponsesApiAdapter } from './responsesApi.js';
 import { deepFreeze } from '../freeze.js';
+import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
 import type { ArmSpec, ProviderAdapter } from '../types.js';
 
 /**
@@ -60,26 +61,34 @@ deepFreeze(ARMS); // canonical roster — frozen so a validated preflight stays 
 
 export function createRealAdapters(): Map<string, ProviderAdapter> {
   const adapters = new Map<string, ProviderAdapter>();
+  // openai + xai run on their Responses APIs: neither serves server-side web
+  // search on chat completions for these arms, and only the Responses surface
+  // reports the executed search queries the audit trail requires.
   adapters.set(
     'openai-gpt-5.6-sol',
-    createOpenAiCompatibleAdapter({
+    createResponsesApiAdapter({
       provider: 'openai',
       requestedModelId: 'gpt-5.6-sol',
       credentialEnvVar: 'OPENAI_API_KEY',
       baseUrl: 'https://api.openai.com/v1',
-      maxTokensParam: 'max_completion_tokens',
+      maxTokensParam: 'max_output_tokens',
+      webSearchTool: { ...TOOL_INFERENCE_CONFIG.webSearch.openai.tool },
+      maxToolCalls: TOOL_INFERENCE_CONFIG.webSearch.openai.maxToolCalls,
+      include: ['web_search_call.action.sources'],
     }),
   );
   adapters.set('anthropic-claude-fable-5', createAnthropicAdapter('claude-fable-5'));
   adapters.set('google-gemini-3.1-pro-preview', createGoogleAdapter('gemini-3.1-pro-preview'));
   adapters.set(
     'xai-grok-4.5',
-    createOpenAiCompatibleAdapter({
+    createResponsesApiAdapter({
       provider: 'xai',
       requestedModelId: 'grok-4.5',
       credentialEnvVar: 'XAI_API_KEY',
       baseUrl: 'https://api.x.ai/v1',
-      maxTokensParam: 'max_tokens',
+      maxTokensParam: 'max_output_tokens',
+      webSearchTool: { ...TOOL_INFERENCE_CONFIG.webSearch.xai.tool },
+      maxToolCalls: TOOL_INFERENCE_CONFIG.webSearch.xai.maxToolCalls,
     }),
   );
   return adapters;

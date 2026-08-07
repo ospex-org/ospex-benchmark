@@ -8,6 +8,7 @@ import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import { REPAIR_POLICY_VERSION } from './repairPolicy.js';
 import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
 import { promptScaffoldSha256 } from './prompt.js';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
 
 /**
@@ -46,7 +47,7 @@ function codeConsistentRaw(): Record<string, unknown> {
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: a.approvedReportedModelIds,
     })),
-    toolInferenceConfigSha256: 'b'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     // A line-open cohort fires markets independently (a dispatch may carry a single
     // market), so a code-consistent manifest must declare a scoped-capable baseline
     // policy; the full-board default (BASELINE_POLICY_VERSION = v0.2) is refused by

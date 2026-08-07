@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -128,7 +129,7 @@ function manifestJson(extra: Record<string, unknown> = {}): string {
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
     })),
-    toolInferenceConfigSha256: 'c'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,
@@ -325,13 +326,13 @@ interface Scripted {
 function validBody(participantId: string, requestedModelId: string, cohortId: string, bundleSha: string, game: GameBundle): string {
   const forecasts: BenchmarkResponse['games'][number]['forecasts'] = [];
   if (game.markets.moneyline) {
-    forecasts.push({ market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: game.markets.moneyline.awayDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.moneyline.evidenceRef], reasonCode: null });
+    forecasts.push({ market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: game.markets.moneyline.awayDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.moneyline.evidenceRef], reasonCode: null, axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 }, primaryAxis: 'valuation', primaryExpectation: 'The away price reads rich against the implied probabilities.' });
   }
   if (game.markets.total) {
-    forecasts.push({ market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, probabilities: { win: 0.5, push: 0, loss: 0.5 }, confidence: 0.5, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.total.evidenceRef], reasonCode: null });
+    forecasts.push({ market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, probabilities: { win: 0.5, push: 0, loss: 0.5 }, confidence: 0.5, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.total.evidenceRef], reasonCode: null, axes: { valuation: 3, trend: 1, consensus: 5, news: 2, softness: 4 }, primaryAxis: null, primaryExpectation: null });
   }
   const body: BenchmarkResponse = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     cohortId,
     participantId,
     requestedModelId,
@@ -356,7 +357,7 @@ function scriptedAdapter(
     async chat(_t: ChatTurn[], _ms: number): Promise<ProviderResponse> {
       state.calls += 1;
       const body = await bodies(state.calls);
-      return { rawText: body, reportedModelId: identity.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: opts.usageRawFor ? opts.usageRawFor(state.calls) : {}, requestParams: {} };
+      return { rawText: body, reportedModelId: identity.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: opts.usageRawFor ? opts.usageRawFor(state.calls) : {}, requestParams: {}, searchAudit: null };
     },
   };
   return { adapter, get calls() { return state.calls; } } as Scripted;

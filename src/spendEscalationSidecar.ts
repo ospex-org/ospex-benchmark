@@ -71,21 +71,50 @@ export interface SpendEscalationSidecarV1 {
  *  nested). Nothing outside this list is ever copied into a sidecar — and the offline
  *  pair verifier rejects any persisted key outside it (the same single source). */
 export const TOKEN_FIELD_WHITELIST: Readonly<Record<ProviderName, readonly string[]>> = Object.freeze({
+  // openai/xai carry BOTH the legacy chat-completions field names (old
+  // evidence keeps verifying) and the Responses-API names the live adapters
+  // report since provider web search moved them to /v1/responses.
   openai: Object.freeze([
     'prompt_tokens',
     'completion_tokens',
     'total_tokens',
     'completion_tokens_details.reasoning_tokens',
     'prompt_tokens_details.cached_tokens',
+    'input_tokens',
+    'output_tokens',
+    'output_tokens_details.reasoning_tokens',
+    'input_tokens_details.cached_tokens',
   ]),
-  xai: Object.freeze(['prompt_tokens', 'completion_tokens', 'total_tokens', 'completion_tokens_details.reasoning_tokens']),
-  anthropic: Object.freeze(['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']),
+  xai: Object.freeze([
+    'prompt_tokens',
+    'completion_tokens',
+    'total_tokens',
+    'completion_tokens_details.reasoning_tokens',
+    'input_tokens',
+    'output_tokens',
+    'output_tokens_details.reasoning_tokens',
+    // Search-billing evidence: successful web-search invocations (billed
+    // per call) and the provider's own integer cost counter (10^10 ticks = $1).
+    'server_side_tool_usage_details.web_search_calls',
+    'cost_in_usd_ticks',
+  ]),
+  anthropic: Object.freeze([
+    'input_tokens',
+    'output_tokens',
+    'cache_read_input_tokens',
+    'cache_creation_input_tokens',
+    'output_tokens_details.thinking_tokens',
+    // Search-billing evidence: executed searches (billed per search).
+    'server_tool_use.web_search_requests',
+  ]),
   google: Object.freeze([
     'promptTokenCount',
     'candidatesTokenCount',
     'thoughtsTokenCount',
     'totalTokenCount',
     'cachedContentTokenCount',
+    // Search-result tokens injected as tool-use prompt input (grounding).
+    'toolUsePromptTokenCount',
   ]),
 });
 

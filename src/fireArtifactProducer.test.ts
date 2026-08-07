@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { cohortBoot } from './cohortBoot.js';
@@ -127,6 +128,9 @@ function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): Bench
       rationale: 'Reference prices favor the away side.',
       evidenceRefs: [ml.evidenceRef],
       reasonCode: null,
+      axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 },
+      primaryAxis: 'valuation',
+      primaryExpectation: 'The away price reads rich against the implied probabilities.',
     });
   }
   if (game.markets.total) {
@@ -143,10 +147,13 @@ function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): Bench
       rationale: 'Total priced evenly at the designated line.',
       evidenceRefs: [total.evidenceRef],
       reasonCode: null,
+      axes: { valuation: 3, trend: 1, consensus: 5, news: 2, softness: 4 },
+      primaryAxis: null,
+      primaryExpectation: null,
     });
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     cohortId,
     participantId: arm.participantId,
     requestedModelId: arm.requestedModelId,
@@ -165,6 +172,7 @@ function stubResponse(rawText: string, reportedModelId: string): ProviderRespons
     usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
     usageRaw: { prompt_tokens: 100, completion_tokens: 50 },
     requestParams: { stub: true },
+    searchAudit: null,
   };
 }
 
@@ -204,7 +212,7 @@ function manifestObject(over: { baselinePolicyVersion?: string; network?: string
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
     })),
-    toolInferenceConfigSha256: 'c'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: over.baselinePolicyVersion ?? 'baselines-v0.3.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: SCORING_POLICY_VERSION,

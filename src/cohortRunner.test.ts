@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -102,7 +103,7 @@ function manifestObject(overConstants: Record<string, number> = {}): Record<stri
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
     })),
-    toolInferenceConfigSha256: 'c'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',
     repairPolicyVersion: REPAIR_POLICY_VERSION,
     scoringPolicyVersion: SCORING_POLICY_VERSION,
@@ -383,13 +384,13 @@ function bodyFromPrompt(turns: ChatTurn[]): string {
   const game = payload.bundle.games[0]!;
   const forecasts: BenchmarkResponse['games'][number]['forecasts'] = [];
   if (game.markets.moneyline) {
-    forecasts.push({ market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: game.markets.moneyline.awayDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.moneyline.evidenceRef], reasonCode: null });
+    forecasts.push({ market: 'moneyline', selection: game.awayTeam, line: null, observedDecimal: game.markets.moneyline.awayDecimal, probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.moneyline.evidenceRef], reasonCode: null, axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 }, primaryAxis: 'valuation', primaryExpectation: 'The away price reads rich against the implied probabilities.' });
   }
   if (game.markets.total) {
-    forecasts.push({ market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, probabilities: { win: 0.5, push: 0, loss: 0.5 }, confidence: 0.5, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.total.evidenceRef], reasonCode: null });
+    forecasts.push({ market: 'total', selection: 'over', line: game.markets.total.line, observedDecimal: game.markets.total.overDecimal, probabilities: { win: 0.5, push: 0, loss: 0.5 }, confidence: 0.5, wouldAbstain: false, selectedForExecution: true, rationale: 'r', evidenceRefs: [game.markets.total.evidenceRef], reasonCode: null, axes: { valuation: 3, trend: 1, consensus: 5, news: 2, softness: 4 }, primaryAxis: null, primaryExpectation: null });
   }
   const body: BenchmarkResponse = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     cohortId: payload.cohortId,
     participantId: payload.participantId,
     requestedModelId: payload.requestedModelId,
@@ -411,7 +412,7 @@ function smartAdapters(
       credentialEnvVar: `${arm.participantId.replace(/[^a-z0-9]/gi, '_').toUpperCase()}_KEY`,
       hasCredential: () => true,
       async chat(turns: ChatTurn[], _ms: number): Promise<ProviderResponse> {
-        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: usageRawFor ? usageRawFor(arm) : {}, requestParams: {} };
+        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: usageRawFor ? usageRawFor(arm) : {}, requestParams: {}, searchAudit: null };
       },
     };
     map.set(arm.participantId, adapter);
@@ -682,7 +683,7 @@ test('B2-R2: the persisted dispatch start is the EXACT tick-clock value read at 
       hasCredential: () => true,
       async chat(turns: ChatTurn[], _ms: number): Promise<ProviderResponse> {
         dispatchStarts.push(emissions[emissions.length - 1]!);
-        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {} };
+        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {}, searchAudit: null };
       },
     });
   }

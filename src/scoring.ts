@@ -10,16 +10,18 @@ import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
   benchmarkResponseSchema,
   compareFingerprints,
+  CURRENT_RESPONSE_SCHEMA_VERSION,
   extractDecisionFingerprint,
   extractJson,
   fingerprintFromParsed,
   validateResponseText,
 } from './schema.js';
-import { SMOKE_LABEL } from './types.js';
+import { AXIS_NAMES, SMOKE_LABEL } from './types.js';
+import type { ResponseSchemaVersion } from './schema.js';
 import type { BaselinePolicyVersion } from './baselines.js';
 import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
 import type { LadderParams, TotalsLadderResult } from './ladder.js';
-import type { ArmSpec, ClosingLineRow, MarketKey, ProviderName, SlateBundle } from './types.js';
+import type { ArmSpec, AxisName, ClosingLineRow, MarketKey, ProviderName, SlateBundle } from './types.js';
 
 /**
  * Pure scoring assembly, no I/O: parse a run's records, VERIFY THE RUN'S
@@ -112,6 +114,7 @@ const runMetaSchema = z
     armGameResults: z.number().int().nonnegative(),
     baselineDecisionCount: z.number().int().nonnegative(),
     baselinePolicyVersion: z.string().min(1).optional(),
+    promptScaffoldVersion: z.string().min(1).optional(),
     watch: watchProvenanceSchema.optional(),
   })
   .passthrough();
@@ -245,6 +248,21 @@ const decisionSchema = z
     confidence: z.number(),
     selectedForExecution: z.boolean(),
     wouldAbstain: z.boolean(),
+    // Response schema v2 analysis fields; absent on v1-era archives, null on
+    // records replayed from v1-shaped parses.
+    axes: z
+      .object({
+        valuation: z.number(),
+        trend: z.number(),
+        consensus: z.number(),
+        news: z.number(),
+        softness: z.number(),
+      })
+      .passthrough()
+      .nullable()
+      .optional(),
+    primaryAxis: z.enum(AXIS_NAMES).nullable().optional(),
+    primaryExpectation: z.string().nullable().optional(),
     provider: z.string().min(1),
     requestedModelId: z.string().min(1),
     reportedModelId: z.string().nullable(),
@@ -320,6 +338,10 @@ export interface SourcePick {
   echoedRequestSha256: string | null;
   echoedGameSha256: string | null;
   echoedSlateSha256: string | null;
+  /** Response schema v2 analysis fields; null on v1-era records and baselines. */
+  axes: Record<AxisName, number> | null;
+  primaryAxis: AxisName | null;
+  primaryExpectation: string | null;
 }
 
 export interface ArchivedAttempt {
@@ -367,6 +389,9 @@ export interface SourceRun {
   baselineDecisionCount: number;
   /** Baseline policy version stamped at write time; null on legacy archives. */
   baselinePolicyVersion: string | null;
+  /** Prompt scaffold version stamped at write time; null on legacy archives.
+   *  Selects the response-schema era the integrity checks re-validate under. */
+  promptScaffoldVersion: string | null;
   /** Watch-mode gate provenance; required (and verified) for watch runs. */
   watch: WatchProvenanceMeta | null;
   games: Map<string, SourceGame>;
@@ -537,6 +562,9 @@ export function parseRunRecords(lines: string[]): SourceRun {
           echoedRequestSha256: decision.bundleSha256,
           echoedGameSha256: decision.gameSha256,
           echoedSlateSha256: decision.slateSha256,
+          axes: decision.axes ?? null,
+          primaryAxis: decision.primaryAxis ?? null,
+          primaryExpectation: decision.primaryExpectation ?? null,
         });
         break;
       }
@@ -570,6 +598,9 @@ export function parseRunRecords(lines: string[]): SourceRun {
           echoedRequestSha256: baseline.requestSha256,
           echoedGameSha256: baseline.gameSha256,
           echoedSlateSha256: baseline.slateSha256,
+          axes: null,
+          primaryAxis: null,
+          primaryExpectation: null,
         });
         break;
       }
@@ -597,6 +628,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
     armGameResults: meta.armGameResults,
     baselineDecisionCount: meta.baselineDecisionCount,
     baselinePolicyVersion: meta.baselinePolicyVersion ?? null,
+    promptScaffoldVersion: meta.promptScaffoldVersion ?? null,
     watch: meta.watch ?? null,
     games,
     picks,
@@ -609,6 +641,26 @@ export function parseRunRecords(lines: string[]): SourceRun {
 // ---------------------------------------------------------------------------
 // Run integrity — a scorecard is only as trustworthy as its input
 // ---------------------------------------------------------------------------
+
+/**
+ * The response-schema era a run's archived bodies were produced under, keyed
+ * by the run_meta prompt-scaffold stamp: pre-v0.4 scaffolds prompted the v1
+ * response shape, v0.4 prompts v2. An absent stamp is a legacy pre-stamp
+ * archive (v1); an unknown (future) scaffold validates as the current
+ * version. Re-validating each run under ITS OWN era keeps both directions
+ * exact — an old valid body neither fails the new schema, nor does a new
+ * v1-shaped body (correctly refused by the runner) read as "validates".
+ */
+function responseSchemaVersionForRun(promptScaffoldVersion: string | null): ResponseSchemaVersion {
+  if (promptScaffoldVersion === null) return 1;
+  const byScaffold: Record<string, ResponseSchemaVersion> = {
+    'shadow-smoke-v0.1': 1,
+    'shadow-smoke-v0.2': 1,
+    'shadow-smoke-v0.3': 1,
+    'shadow-smoke-v0.4': 2,
+  };
+  return byScaffold[promptScaffoldVersion] ?? CURRENT_RESPONSE_SCHEMA_VERSION;
+}
 
 /**
  * The response-side markets a recorded game SUPPLIES (1-3, S3 dynamic
@@ -682,6 +734,12 @@ export function verifyRunIntegrity(
   options?: { expectedArms?: ExpectedArm[] },
 ): string[] {
   const violations: string[] = [];
+  // Archived bodies re-validate under the response-schema era THIS run was
+  // produced in (see responseSchemaVersionForRun) — never the current-only
+  // default, which is the new-run gate.
+  const acceptedVersions: readonly ResponseSchemaVersion[] = [
+    responseSchemaVersionForRun(run.promptScaffoldVersion),
+  ];
 
   // Watch runs must prove their entry-timing claim from the artifact itself:
   // a watch-v0 run without recorded, internally consistent gate provenance is
@@ -1054,6 +1112,7 @@ export function verifyRunIntegrity(
       game.requestSha256,
       armSpecForValidation,
       run.cohortId,
+      acceptedVersions,
     );
     if (revalidation.errors.length > 0 || revalidation.parsed === null) {
       violations.push(
@@ -1075,6 +1134,7 @@ export function verifyRunIntegrity(
           game.requestSha256,
           armSpecForValidation,
           run.cohortId,
+          acceptedVersions,
         );
         if (initialValidation.errors.length === 0) {
           violations.push(`${key}: repair was used but the archived initial response already validates`);
@@ -1114,6 +1174,24 @@ export function verifyRunIntegrity(
         forecast.selectedForExecution !== pick.selectedForExecution;
       if (mismatch) {
         violations.push(`${key} ${pick.market}: decision does not match the accepted provider response`);
+      }
+      // Response schema v2: the recorded decision must carry the SAME analysis
+      // fields as the accepted forecast. v1-era forecasts have none, so the
+      // check is conditional on the forecast (never on the pick, which a
+      // tampered record controls).
+      if (forecast.axes !== undefined) {
+        const axesMatch =
+          pick.axes !== null &&
+          AXIS_NAMES.every((axis: AxisName) => forecast.axes?.[axis] === pick.axes?.[axis]);
+        if (
+          !axesMatch ||
+          (forecast.primaryAxis ?? null) !== pick.primaryAxis ||
+          (forecast.primaryExpectation ?? null) !== pick.primaryExpectation
+        ) {
+          violations.push(
+            `${key} ${pick.market}: analysis fields (axes/primaryAxis/primaryExpectation) do not match the accepted provider response`,
+          );
+        }
       }
       if (
         pick.provider !== response.provider ||
@@ -1219,6 +1297,7 @@ export function verifyRunIntegrity(
         game.requestSha256,
         armSpecForValidation,
         run.cohortId,
+        acceptedVersions,
       );
       if (initialValidation.errors.length === 0) {
         violations.push(
@@ -1234,6 +1313,7 @@ export function verifyRunIntegrity(
           game.requestSha256,
           armSpecForValidation,
           run.cohortId,
+          acceptedVersions,
         );
         if (repairValidation.errors.length === 0 && repairValidation.parsed !== null) {
           const initialFingerprint = extractDecisionFingerprint(initialRaw, requestBundle);
@@ -1285,6 +1365,7 @@ export function verifyRunIntegrity(
           game.requestSha256,
           armSpecForTiming,
           run.cohortId,
+          acceptedVersions,
         );
         if (initialValidation.errors.length === 0) {
           violations.push(

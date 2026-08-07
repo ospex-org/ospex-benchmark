@@ -123,24 +123,67 @@ export function ceilDivUsdMicros(numerator: bigint): bigint {
 function extractRateBuckets(provider: ProviderName, usage: Record<string, unknown>, who: string): RateBuckets {
   switch (provider) {
     case 'openai': {
-      const prompt = readRequiredCount(usage, 'prompt_tokens', who);
-      const completion = readRequiredCount(usage, 'completion_tokens', who);
-      // reasoning ⊆ completion (already counted); cached ⊆ prompt (already counted) — neither added.
-      assertTotalConsistency(usage, 'total_tokens', prompt + completion, who);
-      return { inputRateTokens: prompt, outputRateTokens: completion };
+      // Two shapes, discriminated by which key set is present: the legacy
+      // chat-completions shape (prompt/completion — old evidence keeps
+      // repricing) and the Responses-API shape (input/output — the live
+      // adapter since web search moved openai to /v1/responses). In BOTH,
+      // reasoning is a subset already inside the output total and cached
+      // tokens a subset of the input total — neither added.
+      if (Object.hasOwn(usage, 'prompt_tokens') || !Object.hasOwn(usage, 'input_tokens')) {
+        const prompt = readRequiredCount(usage, 'prompt_tokens', who);
+        const completion = readRequiredCount(usage, 'completion_tokens', who);
+        assertTotalConsistency(usage, 'total_tokens', prompt + completion, who);
+        return { inputRateTokens: prompt, outputRateTokens: completion };
+      }
+      const input = readRequiredCount(usage, 'input_tokens', who);
+      const output = readRequiredCount(usage, 'output_tokens', who);
+      assertTotalConsistency(usage, 'total_tokens', input + output, who);
+      return { inputRateTokens: input, outputRateTokens: output };
     }
     case 'xai': {
-      const prompt = readRequiredCount(usage, 'prompt_tokens', who);
-      const completion = readRequiredCount(usage, 'completion_tokens', who);
-      const details = readNestedRecord(usage, 'completion_tokens_details', who);
+      if (Object.hasOwn(usage, 'prompt_tokens') || !Object.hasOwn(usage, 'input_tokens')) {
+        // Chat-completions shape (old evidence): reasoning is ADDITIVE
+        // (total = prompt + completion + reasoning) and cost-dominant.
+        const prompt = readRequiredCount(usage, 'prompt_tokens', who);
+        const completion = readRequiredCount(usage, 'completion_tokens', who);
+        const details = readNestedRecord(usage, 'completion_tokens_details', who);
+        const reasoningPresent = Object.hasOwn(details, 'reasoning_tokens');
+        const reasoning = readOptionalCount(details, 'reasoning_tokens', `${who}.completion_tokens_details`);
+        // If it is not reported, a corroborating total MUST prove it was zero; with neither, we cannot
+        // distinguish a genuine non-thinking response from a truncated one — so it is UNKNOWN, not zero.
+        requireAdditiveCorroboration(reasoningPresent, usage, 'total_tokens', 'reasoning_tokens', who);
+        assertTotalConsistency(usage, 'total_tokens', prompt + completion + reasoning, who);
+        return { inputRateTokens: prompt, outputRateTokens: completion + reasoning };
+      }
+      // Responses-API shape (the live adapter since web search moved xai to
+      // /v1/responses). Whether output_tokens already includes reasoning is
+      // not pinned by the provider's docs, so additivity is decided by
+      // ARITHMETIC against the reported total: an additive identity prices
+      // output + reasoning, a subset identity prices output alone, and a
+      // total matching neither is inconsistent accounting — UNKNOWN. With no
+      // discriminating total at all, the ADDITIVE (larger) reading is priced
+      // — the guard may only over-estimate — and a missing reasoning bucket
+      // still requires a corroborating total to prove it zero.
+      const input = readRequiredCount(usage, 'input_tokens', who);
+      const output = readRequiredCount(usage, 'output_tokens', who);
+      const details = readNestedRecord(usage, 'output_tokens_details', who);
       const reasoningPresent = Object.hasOwn(details, 'reasoning_tokens');
-      const reasoning = readOptionalCount(details, 'reasoning_tokens', `${who}.completion_tokens_details`);
-      // reasoning is ADDITIVE for xAI (total = prompt + completion + reasoning) and cost-dominant.
-      // If it is not reported, a corroborating total MUST prove it was zero; with neither, we cannot
-      // distinguish a genuine non-thinking response from a truncated one — so it is UNKNOWN, not zero.
+      const reasoning = readOptionalCount(details, 'reasoning_tokens', `${who}.output_tokens_details`);
       requireAdditiveCorroboration(reasoningPresent, usage, 'total_tokens', 'reasoning_tokens', who);
-      assertTotalConsistency(usage, 'total_tokens', prompt + completion + reasoning, who);
-      return { inputRateTokens: prompt, outputRateTokens: completion + reasoning };
+      if (!Object.hasOwn(usage, 'total_tokens')) {
+        return { inputRateTokens: input, outputRateTokens: output + reasoning };
+      }
+      const total = asTokenCount(usage['total_tokens'], `${who}.total_tokens`);
+      if (total === input + output + reasoning) {
+        return { inputRateTokens: input, outputRateTokens: output + reasoning };
+      }
+      if (total === input + output && reasoning <= output) {
+        return { inputRateTokens: input, outputRateTokens: output };
+      }
+      throw new ConservativeSpendUnknownError(
+        `${who}: total_tokens ${total} matches neither the additive (${input + output + reasoning}) ` +
+          `nor the subset (${input + output}) identity (token accounting inconsistent)`,
+      );
     }
     case 'anthropic': {
       const inputTokens = readRequiredCount(usage, 'input_tokens', who);
@@ -157,12 +200,29 @@ function extractRateBuckets(provider: ProviderName, usage: Record<string, unknow
       const candidates = readRequiredCount(usage, 'candidatesTokenCount', who);
       const thoughtsPresent = Object.hasOwn(usage, 'thoughtsTokenCount');
       const thoughts = readOptionalCount(usage, 'thoughtsTokenCount', who); // ADDITIVE, at output rate
+      // With Google Search grounding enabled, search-result tokens surface as
+      // a separate toolUsePromptTokenCount bucket — priced at the INPUT rate,
+      // ADDITIVELY (conservative: if it is in fact a subset of prompt, this
+      // over-prices, never under).
+      const toolUse = readOptionalCount(usage, 'toolUsePromptTokenCount', who);
       // thoughtsTokenCount is additive and cost-dominant; if unreported, a corroborating total MUST
       // prove it zero. With neither the field nor a total, cost is UNKNOWN — never assumed zero.
       requireAdditiveCorroboration(thoughtsPresent, usage, 'totalTokenCount', 'thoughtsTokenCount', who);
       // cachedContentTokenCount ⊆ prompt, already priced at the full input rate (conservative) — ignored.
-      assertTotalConsistency(usage, 'totalTokenCount', prompt + candidates + thoughts, who);
-      return { inputRateTokens: prompt, outputRateTokens: candidates + thoughts };
+      // A present total must match the reconstruction WITH or WITHOUT the
+      // tool-use bucket — the provider's docs do not pin which side of
+      // totalTokenCount that bucket lands on; anything else is inconsistent.
+      if (Object.hasOwn(usage, 'totalTokenCount')) {
+        const total = asTokenCount(usage['totalTokenCount'], `${who}.totalTokenCount`);
+        const base = prompt + candidates + thoughts;
+        if (total !== base && total !== base + toolUse) {
+          throw new ConservativeSpendUnknownError(
+            `${who}: totalTokenCount ${total} != reconstructed ${base} (or ${base + toolUse} with ` +
+              `toolUsePromptTokenCount) (token accounting inconsistent)`,
+          );
+        }
+      }
+      return { inputRateTokens: prompt + toolUse, outputRateTokens: candidates + thoughts };
     }
     default: {
       const _exhaustive: never = provider;

@@ -48,6 +48,7 @@ function stubResponse(rawText: string, reportedModelId = 'stub-model-1'): Provid
     usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
     usageRaw: { prompt_tokens: 100, completion_tokens: 50 },
     requestParams: { stub: true },
+    searchAudit: null,
   };
 }
 

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { test } from 'node:test';
 import {
   PublicationError,
@@ -51,7 +52,7 @@ function validRaw(overrides: Record<string, unknown> = {}): Record<string, unkno
     expectedArmRoster: [
       { participantId: 'p1', provider: 'openai', requestedModelId: 'm1', approvedReportedModelIds: ['m1'] },
     ],
-    toolInferenceConfigSha256: 'c'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.2.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: 'scoring-v0.5.0',

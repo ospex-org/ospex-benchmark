@@ -8,7 +8,7 @@
 
 Every model receives the same logical frozen bundle and returns a forced forecast for each market the game supplies — one to three of moneyline, one designated run line, and one designated total. The cohort manifest then selects the moneyline and total (whichever the game supplies) for economic execution under either the recommended fixed moneyline+total policy or a separately labeled model-choice side+total policy.
 
-The model does not size stakes, browse, query provider-native search, or see later prices. Forced forecasts provide the common paired comparison; execution and abstention are distinct policy layers.
+The model does not size stakes or see later prices; each arm runs the cohort-declared provider web-search tool (tools-v1), and every executed query and result reference is recorded for audit. Forced forecasts provide the common paired comparison; execution and abstention are distinct policy layers.
 
 This draft is a schema and behavior contract. The exact data fields, cutoff, reasoning settings, repair policy, execution-market policy, and public wording must be frozen before a canonical cohort.
 
@@ -17,14 +17,14 @@ This draft is a schema and behavior contract. The exact data fields, cutoff, rea
 ```text
 You are one participant in a preregistered sports-market decision benchmark running through Ospex.
 
-Use only the supplied frozen information bundle and the tools explicitly declared in this request. Do not use memory of later events, external browsing, native provider search, or unstated information. Treat all reference odds as timestamped observations, not guarantees of current executable prices.
+Use the supplied frozen information bundle plus the declared provider web-search tool. You may search the web for current public context (injuries, lineups, weather, roster news, market commentary) and let what you actually retrieved inform your probabilities and axis scores. Do not use memory of later events or any tool not declared in this request, and do not invent facts you did not retrieve. Every evidenceRefs entry still cites the frozen bundle only; search-derived context belongs in your rationale, axis scores, and primaryExpectation. Treat all reference odds as timestamped observations, not guarantees of current executable prices.
 
 For every eligible game, forecast each supplied market. A game supplies one to three of the following, and you forecast exactly the markets it supplies:
 1. Select a moneyline side.
 2. Select a side on the designated spread/run line.
 3. Select over or under on the designated total.
 
-For each forecast, supply win/push/loss probabilities that sum to 1, a short grounded rationale, and whether you would ordinarily abstain. Follow the cohort's declared execution policy when marking forecasts for execution: either fixed moneyline+total (the moneyline and total forecasts, whichever the game supplies) or model-choice moneyline/spread+total.
+For each forecast, supply win/push/loss probabilities that sum to 1, a short grounded rationale, whether you would ordinarily abstain, integer 1-5 scores on the five analysis axes (valuation, trend, consensus, news, softness), and the single primary axis driving the forecast with a one-sentence expectation — or null for both when no axis dominates. Follow the cohort's declared execution policy when marking forecasts for execution: either fixed moneyline+total (the moneyline and total forecasts, whichever the game supplies) or model-choice moneyline/spread+total.
 
 Use the exact market, line, team/side labels, and observed decimal prices from the bundle. Do not size stakes. A fixed equal-risk policy is applied by the harness.
 
@@ -52,7 +52,7 @@ Provider/source brands should not be displayed on user-facing decision surfaces.
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "cohortId": "string",
   "participantId": "string",
   "requestedModelId": "string",
@@ -77,7 +77,16 @@ Provider/source brands should not be displayed on user-facing decision surfaces.
           "selectedForExecution": false,
           "rationale": "short grounded rationale",
           "evidenceRefs": ["string"],
-          "reasonCode": "missing_information | contradictory_information | null (optional)"
+          "reasonCode": "missing_information | contradictory_information | null (optional)",
+          "axes": {
+            "valuation": 1,
+            "trend": 1,
+            "consensus": 1,
+            "news": 1,
+            "softness": 1
+          },
+          "primaryAxis": "valuation | trend | consensus | news | softness | null",
+          "primaryExpectation": "one sentence, or null exactly when primaryAxis is null"
         }
       ]
     }
@@ -85,7 +94,7 @@ Provider/source brands should not be displayed on user-facing decision surfaces.
 }
 ```
 
-Each game must contain exactly one forecast per market it supplies — one to three of moneyline, designated spread, and designated total. Under the fixed moneyline+total policy the moneyline and total forecasts (whichever the game supplies) are marked for execution and the spread is not. For spread/total, `line` is required; for moneyline it is `null`. Win/push/loss probabilities and confidence are values from 0 through 1; probabilities sum to 1, with push set to zero for binary contracts. `evidenceRefs` carries at least one bundle evidenceRef per forecast. `reasonCode` is optional and defaults to null; it carries the supplied reason codes the system prompt refers to (`missing_information`, `contradictory_information`) when required information is missing or contradictory. The final implementation must enforce a provider-neutral JSON Schema rather than prose validation.
+Each game must contain exactly one forecast per market it supplies — one to three of moneyline, designated spread, and designated total. Under the fixed moneyline+total policy the moneyline and total forecasts (whichever the game supplies) are marked for execution and the spread is not. For spread/total, `line` is required; for moneyline it is `null`. Win/push/loss probabilities and confidence are values from 0 through 1; probabilities sum to 1, with push set to zero for binary contracts. `evidenceRefs` carries at least one bundle evidenceRef per forecast. `reasonCode` is optional and defaults to null; it carries the supplied reason codes the system prompt refers to (`missing_information`, `contradictory_information`) when required information is missing or contradictory. `axes` carries integer 1-5 scores on exactly the five named analysis axes; `primaryAxis` names the single axis most driving the forecast (or null when none dominates) and `primaryExpectation` is one single-line sentence stating the expected development on that axis, null exactly when `primaryAxis` is null. Responses are validated by the versioned provider-neutral schema in the harness (response schema v2 = this document; v1 is the pre-axes shape retained for replay of archived records): new runs fail validation without the v2 fields, archived v1 records still parse.
 
 ## Deterministic baseline contract
 

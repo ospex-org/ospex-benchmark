@@ -7,6 +7,7 @@ import {
   validateResponseText,
 } from './schema.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
+import { redactSearchAudit } from './providers/searchAudit.js';
 import { assertPrepared, prepareGameRequest } from './preparedRequest.js';
 import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
@@ -308,6 +309,7 @@ function emptyAttempt(): AttemptRecord {
     httpStatus: null,
     usage: null,
     usageRaw: null,
+    searchAudit: null,
     requestParams: null,
     requestAt: null,
     responseAt: null,
@@ -365,6 +367,7 @@ async function timedChat(
       httpStatus: response.httpStatus,
       usage: response.usage,
       usageRaw: response.usageRaw,
+      searchAudit: redactSearchAudit(response.searchAudit, redactSecrets),
       requestParams: response.requestParams,
       requestAt,
       responseAt: new Date(respondedAt).toISOString(),

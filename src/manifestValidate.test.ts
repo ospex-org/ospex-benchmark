@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, BASELINE_POLICY_VERSIONS, isBaselinePolicyVersion } from './baselines.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
@@ -37,7 +38,7 @@ function codeConsistentRaw(): Record<string, unknown> {
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: a.approvedReportedModelIds,
     })),
-    toolInferenceConfigSha256: 'b'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     // A line-open cohort fires markets independently, so any dispatch may be a
     // single-market fire — every such cohort needs a scoped-capable baseline
     // policy. The full-board default (BASELINE_POLICY_VERSION = v0.2) is refused
@@ -326,4 +327,9 @@ test('canonical registries are frozen — no post-preflight mutation drifts beha
   assert.deepEqual([...MARKETS], marketsBefore);
   assert.equal(cohortId(m), id0);
   assert.deepEqual(validateManifestAgainstCode(m), []);
+});
+
+test('toolInferenceConfigSha256 mismatch is flagged — the declared tool config must recompute from code', () => {
+  const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), toolInferenceConfigSha256: 'd'.repeat(64) }));
+  assert.ok(v.some((s) => /toolInferenceConfigSha256 mismatch/.test(s)), v.join('; '));
 });

@@ -8,7 +8,9 @@ import type { PreparedGameRequest } from './preparedRequest.js';
 // carries (SPEC-prepared-request.md §4 point 4). The scaffold text — and so its
 // hash — changed from v0.2; on a full board the instruction is unchanged in
 // substance (all three markets are supplied).
-export const PROMPT_SCAFFOLD_VERSION = 'shadow-smoke-v0.3';
+// v0.4: response schema v2 (per-forecast axes / primaryAxis / primaryExpectation)
+// and declared provider web search replacing the former no-search prohibition.
+export const PROMPT_SCAFFOLD_VERSION = 'shadow-smoke-v0.4';
 
 /**
  * System prompt, VERBATIM from docs/BENCHMARK_PROMPT_V0.md ("System prompt
@@ -16,14 +18,14 @@ export const PROMPT_SCAFFOLD_VERSION = 'shadow-smoke-v0.3';
  */
 export const SYSTEM_PROMPT = `You are one participant in a preregistered sports-market decision benchmark running through Ospex.
 
-Use only the supplied frozen information bundle and the tools explicitly declared in this request. Do not use memory of later events, external browsing, native provider search, or unstated information. Treat all reference odds as timestamped observations, not guarantees of current executable prices.
+Use the supplied frozen information bundle plus the declared provider web-search tool. You may search the web for current public context (injuries, lineups, weather, roster news, market commentary) and let what you actually retrieved inform your probabilities and axis scores. Do not use memory of later events or any tool not declared in this request, and do not invent facts you did not retrieve. Every evidenceRefs entry still cites the frozen bundle only; search-derived context belongs in your rationale, axis scores, and primaryExpectation. Treat all reference odds as timestamped observations, not guarantees of current executable prices.
 
 For every eligible game, forecast each supplied market. A game supplies one to three of the following, and you forecast exactly the markets it supplies:
 1. Select a moneyline side.
 2. Select a side on the designated spread/run line.
 3. Select over or under on the designated total.
 
-For each forecast, supply win/push/loss probabilities that sum to 1, a short grounded rationale, and whether you would ordinarily abstain. Follow the cohort's declared execution policy when marking forecasts for execution: either fixed moneyline+total (the moneyline and total forecasts, whichever the game supplies) or model-choice moneyline/spread+total.
+For each forecast, supply win/push/loss probabilities that sum to 1, a short grounded rationale, whether you would ordinarily abstain, integer 1-5 scores on the five analysis axes (valuation, trend, consensus, news, softness), and the single primary axis driving the forecast with a one-sentence expectation — or null for both when no axis dominates. Follow the cohort's declared execution policy when marking forecasts for execution: either fixed moneyline+total (the moneyline and total forecasts, whichever the game supplies) or model-choice moneyline/spread+total.
 
 Use the exact market, line, team/side labels, and observed decimal prices from the bundle. Do not size stakes. A fixed equal-risk policy is applied by the harness.
 
@@ -40,7 +42,7 @@ Return only JSON matching the requested schema. Do not add prose outside the JSO
  * ordinarilyAbstain) and none of them emits "confidence" unprompted.
  */
 export const TEMPLATE_PLACEHOLDERS: Record<string, string> = {
-  schemaVersion: '1',
+  schemaVersion: '2',
   cohortId: '"<echo the supplied cohortId>"',
   participantId: '"<echo the supplied participantId>"',
   requestedModelId: '"<echo the supplied requestedModelId>"',
@@ -61,6 +63,15 @@ export const TEMPLATE_PLACEHOLDERS: Record<string, string> = {
   'games[].forecasts[].evidenceRefs[]': '"<bundle evidenceRef>"',
   'games[].forecasts[].reasonCode':
     '<null | "missing_information" | "contradictory_information">',
+  'games[].forecasts[].axes.valuation': '<integer 1..5>',
+  'games[].forecasts[].axes.trend': '<integer 1..5>',
+  'games[].forecasts[].axes.consensus': '<integer 1..5>',
+  'games[].forecasts[].axes.news': '<integer 1..5>',
+  'games[].forecasts[].axes.softness': '<integer 1..5>',
+  'games[].forecasts[].primaryAxis':
+    '<null | "valuation" | "trend" | "consensus" | "news" | "softness">',
+  'games[].forecasts[].primaryExpectation':
+    '<null, or "one sentence stating the expected development on the primary axis">',
 };
 
 export const RESPONSE_TEMPLATE = renderResponseTemplate(
@@ -88,7 +99,10 @@ Output contract:
 - "probabilities": your win/push/loss estimate for the selected side at the designated line; the three values must sum to 1. Push is 0 for moneyline and for half-run lines; integer total lines may carry push > 0.
 - "evidenceRefs": at least one entry per forecast, citing only evidenceRef IDs that appear in that game's bundle entry.
 - "reasonCode": the supplied reason codes are "missing_information" and "contradictory_information". Set one of them on a forecast only if required information is missing or contradictory; otherwise set null or omit the field.
-- Echo "schemaVersion": 1 and the supplied "cohortId", "participantId", "requestedModelId", "bundleSha256", and "executionPolicy" values exactly.
+- "axes": integer scores from 1 (weak/none) through 5 (strong) on exactly five named axes for the selected side — "valuation" (how mispriced the observed price is relative to your estimate), "trend" (recent performance/momentum support), "consensus" (agreement across the bundle and anything you retrieved), "news" (impact of current news such as injuries, lineups, or weather), "softness" (how soft or stale you judge the observed price to be).
+- "primaryAxis": the ONE axis that most drives this forecast, or null when no single axis dominates.
+- "primaryExpectation": one sentence stating what you expect to happen on the primary axis; null exactly when "primaryAxis" is null.
+- Echo "schemaVersion": 2 and the supplied "cohortId", "participantId", "requestedModelId", "bundleSha256", and "executionPolicy" values exactly.
 - Respond with ONLY the JSON object — no prose, no code fences.`;
 
 /**

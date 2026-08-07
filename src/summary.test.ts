@@ -34,6 +34,7 @@ const STUB_ATTEMPT: AttemptRecord = {
   httpStatus: null,
   usage: null,
   usageRaw: null,
+  searchAudit: null,
   requestParams: null,
   requestAt: null,
   responseAt: null,

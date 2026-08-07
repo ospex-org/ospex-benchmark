@@ -4,7 +4,15 @@ import { redactSecrets } from './config.js';
 import { deepFreeze } from './freeze.js';
 import { forecastFingerprint } from './schema.js';
 import type { CohortManifestV1 } from './manifest.js';
-import type { ArmGameResult, ArmOutcome, AttemptRecord, BenchmarkResponse, MarketKey, ProviderUsage } from './types.js';
+import type {
+  ArmGameResult,
+  ArmOutcome,
+  AttemptRecord,
+  BenchmarkResponse,
+  MarketKey,
+  ProviderUsage,
+  SearchAudit,
+} from './types.js';
 
 /**
  * The fire artifact's ARM INTEGRITY CORE (SPEC-line-open-evidence-model.md
@@ -52,16 +60,42 @@ export type AttemptTransportV1 = z.infer<typeof attemptTransportSchemaV1>;
 // they must be SAFE non-negative integers: two distinct raw upstream integers above
 // Number.MAX_SAFE_INTEGER collapse to the same JS value and would collide pre-hash.
 const tokenCountSchemaV1 = z.number().int().safe().nonnegative().nullable();
+// reasoningTokens / billableOutputTokens are OPTIONAL (not nullable-required):
+// attempts persisted before the fields existed carry no key, so old artifacts
+// keep strict-parsing AND keep recomputing their original armDigest
+// (canonicalize binds only present keys). New attempts always carry both keys.
 const providerUsageSchemaV1 = z
   .object({
     inputTokens: tokenCountSchemaV1,
     outputTokens: tokenCountSchemaV1,
     totalTokens: tokenCountSchemaV1,
+    reasoningTokens: tokenCountSchemaV1.optional(),
+    billableOutputTokens: tokenCountSchemaV1.optional(),
   })
   .strict();
 // Compile-time parity: the persisted usage shape must equal the normalized ProviderUsage.
 const _usageParity: AssertEqual<z.infer<typeof providerUsageSchemaV1>, ProviderUsage> = true;
 void _usageParity;
+
+/**
+ * The persisted per-attempt web-search audit (queries + result references),
+ * OPTIONAL for the same reason as the usage extensions above: absent on
+ * attempts persisted before provider search existed (their digests recompute
+ * unchanged), explicit — `null` when a new attempt ran no search — on every
+ * new attempt, and digest-bound whenever present (a removed or tampered audit
+ * fails the armDigest recompute).
+ */
+const searchAuditSchemaV1 = z
+  .object({
+    queries: z.array(z.object({ query: z.string().min(1) }).strict()),
+    results: z
+      .array(z.object({ url: z.string().min(1), title: z.string().min(1).nullable() }).strict()),
+    searchCount: z.number().int().safe().nonnegative().nullable(),
+    incomplete: z.array(z.string().min(1)),
+  })
+  .strict();
+const _searchAuditParity: AssertEqual<z.infer<typeof searchAuditSchemaV1>, SearchAudit> = true;
+void _searchAuditParity;
 
 // ---------------------------------------------------------------------------
 // Expected-arm identity: the authenticated manifest roster-entry projection
@@ -195,6 +229,9 @@ export interface PersistedAttemptV1 {
   transport: AttemptTransportV1;
   /** Detached, normalized token usage for this attempt, or `null`. */
   usage: ProviderUsage | null;
+  /** Detached, redacted web-search audit — absent on pre-search attempts,
+   *  explicit `null` on a new attempt that ran no search. */
+  searchAudit?: SearchAudit | null | undefined;
 }
 
 export const persistedAttemptSchemaV1 = z
@@ -210,6 +247,7 @@ export const persistedAttemptSchemaV1 = z
     responseSha256: sha256Schema.nullable(),
     transport: attemptTransportSchemaV1,
     usage: providerUsageSchemaV1.nullable(),
+    searchAudit: searchAuditSchemaV1.nullable().optional(),
   })
   .strict();
 
@@ -261,6 +299,10 @@ export function toPersistedAttempts(result: ArmGameResult): readonly PersistedAt
       responseSha256,
       transport: transportOf(record, kind),
       usage: record.usage === null ? null : { ...record.usage },
+      // Always an explicit key on newly persisted attempts (null = no search
+      // activity); the runner already redacted the audit's strings. Detached
+      // via structuredClone so the artifact never aliases live runner state.
+      searchAudit: record.searchAudit === null ? null : structuredClone(record.searchAudit),
     });
   };
   mapOne(result.attempt, 1, 'initial');

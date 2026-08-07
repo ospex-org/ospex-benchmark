@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   INVALID_SCHEMA_GAME_ID,
   RATE_LIMITED_GAME_ID,
+  buildFixtureSearchAudit,
   buildSchemaInvalidResponse,
   buildValidResponse,
 } from './mock.js';
@@ -91,17 +92,24 @@ test('openai fake: the COMPLETE ProviderResponse — fenced body, ids, and verba
   assert.deepEqual(result, {
     rawText: fenced(JSON.stringify(buildValidResponse(payload))),
     reportedModelId: 'gpt-5.6-sol',
-    providerResponseId: 'chatcmpl-fakeffff',
+    providerResponseId: 'resp_fakeffff',
     httpStatus: 200,
-    usage: { inputTokens: 1490, outputTokens: 512, totalTokens: 2002 },
-    usageRaw: {
-      prompt_tokens: 1490,
-      completion_tokens: 512,
-      total_tokens: 2002,
-      prompt_tokens_details: { cached_tokens: 128 },
-      completion_tokens_details: { reasoning_tokens: 256 },
+    usage: {
+      inputTokens: 1490,
+      outputTokens: 512,
+      totalTokens: 2002,
+      reasoningTokens: 256,
+      billableOutputTokens: 512,
     },
-    requestParams: { endpoint: 'https://api.openai.com/v1/chat/completions', model: 'gpt-5.6-sol' },
+    usageRaw: {
+      input_tokens: 1490,
+      output_tokens: 512,
+      total_tokens: 2002,
+      input_tokens_details: { cached_tokens: 128 },
+      output_tokens_details: { reasoning_tokens: 256 },
+    },
+    requestParams: { endpoint: 'https://api.openai.com/v1/responses', model: 'gpt-5.6-sol' },
+    searchAudit: buildFixtureSearchAudit('openai', GAME_ID),
   });
 });
 
@@ -126,14 +134,23 @@ test('anthropic fake: the COMPLETE ProviderResponse — verbatim usageRaw with B
     reportedModelId: 'claude-fable-5',
     providerResponseId: 'msg_fakeffff',
     httpStatus: 200,
-    usage: { inputTokens: 1512, outputTokens: 498, totalTokens: 2010 },
+    usage: {
+      inputTokens: 1512,
+      outputTokens: 498,
+      totalTokens: 2010,
+      reasoningTokens: 120,
+      billableOutputTokens: 498,
+    },
     usageRaw: {
       input_tokens: 1512,
       output_tokens: 498,
       cache_creation_input_tokens: 0,
       cache_read_input_tokens: 0,
+      output_tokens_details: { thinking_tokens: 120 },
+      server_tool_use: { web_search_requests: 1 },
     },
     requestParams: { endpoint: 'https://api.anthropic.com/v1/messages', model: 'claude-fable-5' },
+    searchAudit: buildFixtureSearchAudit('anthropic', GAME_ID),
   });
 });
 
@@ -142,7 +159,13 @@ test('anthropic fake: the corruption fixture game returns the SHARED schema-inva
   const result = await fake().get('anthropic-claude-fable-5')!.chat(turnsFor(payload), 5_000);
   assert.equal(result.rawText, fenced(JSON.stringify(buildSchemaInvalidResponse(payload))));
   assert.equal(result.httpStatus, 200);
-  assert.deepEqual(result.usage, { inputTokens: 1512, outputTokens: 498, totalTokens: 2010 });
+  assert.deepEqual(result.usage, {
+    inputTokens: 1512,
+    outputTokens: 498,
+    totalTokens: 2010,
+    reasoningTokens: 120,
+    billableOutputTokens: 498,
+  });
 });
 
 test('google fake initial: the COMPLETE ProviderResponse — prose+fence wrong-cohort echo, ADDITIVE thoughts usageRaw', async () => {
@@ -154,17 +177,25 @@ test('google fake initial: the COMPLETE ProviderResponse — prose+fence wrong-c
     reportedModelId: 'gemini-3.1-pro-preview',
     providerResponseId: 'resp-fake-ffff',
     httpStatus: 200,
-    usage: { inputTokens: 1465, outputTokens: 471, totalTokens: 2241 },
+    usage: {
+      inputTokens: 1465,
+      outputTokens: 471,
+      totalTokens: 2451,
+      reasoningTokens: 305,
+      billableOutputTokens: 776,
+    },
     usageRaw: {
       promptTokenCount: 1465,
       candidatesTokenCount: 471,
       thoughtsTokenCount: 305,
-      totalTokenCount: 2241,
+      toolUsePromptTokenCount: 210,
+      totalTokenCount: 2451,
     },
     requestParams: {
       endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent',
       model: 'gemini-3.1-pro-preview',
     },
+    searchAudit: buildFixtureSearchAudit('google', GAME_ID),
   });
 });
 

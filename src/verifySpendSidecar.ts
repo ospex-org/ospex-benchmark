@@ -102,8 +102,15 @@ const STATUSES: readonly string[] = ['pass', 'breach', 'unknown'];
 const REASONS: readonly (string | null)[] = [null, 'spend_attempt_over_reservation', 'spend_evidence_unknown'];
 const DANGEROUS_SEGMENTS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
 
-/** The raw-bucket fields that count as a REASONING observation (dotted = nested). */
-const REASONING_FIELDS: readonly string[] = ['completion_tokens_details.reasoning_tokens', 'thoughtsTokenCount'];
+/** The raw-bucket fields that count as a REASONING observation (dotted = nested).
+ *  Covers both the legacy chat-completions names (old evidence) and the
+ *  Responses-API / anthropic breakdown names the live adapters report. */
+const REASONING_FIELDS: readonly string[] = [
+  'completion_tokens_details.reasoning_tokens',
+  'thoughtsTokenCount',
+  'output_tokens_details.reasoning_tokens',
+  'output_tokens_details.thinking_tokens',
+];
 
 export interface VerifiedAttempt {
   readonly participantId: string;

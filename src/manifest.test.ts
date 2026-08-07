@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { test } from 'node:test';
 import { cohortId, parseManifest } from './manifest.js';
 
@@ -25,7 +26,7 @@ function validManifest(): Record<string, unknown> {
       { participantId: 'openai-gpt', provider: 'openai', requestedModelId: 'gpt-x', approvedReportedModelIds: ['gpt-x'] },
       { participantId: 'anthropic-claude', provider: 'anthropic', requestedModelId: 'claude-x', approvedReportedModelIds: ['claude-x'] },
     ],
-    toolInferenceConfigSha256: 'b'.repeat(64),
+    toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.2.0',
     repairPolicyVersion: 'repair-v1',
     scoringPolicyVersion: 'scoring-v0.5.0',
