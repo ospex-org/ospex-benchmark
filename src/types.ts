@@ -469,8 +469,8 @@ export interface ForecastOutput {
    * Response schema v2: one sentence stating the expected development on the
    * primary axis; with no driver it states that no material movement is
    * expected. The current validator rejects null — the null arm of this type
-   * exists for replay of records whose analysis predates the requirement.
-   * Absent on v1 records.
+   * exists because replay surfaces normalize an absent v1-era field to `null`
+   * (records.ts binds `?? null`). Absent on v1 records.
    */
   primaryExpectation?: string | null | undefined;
 }

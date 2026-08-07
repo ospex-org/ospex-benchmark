@@ -412,6 +412,7 @@ async function timedChat(
             usage: error.usage,
             usageRaw: error.usageRaw,
             searchAudit: redactSearchAudit(error.searchAudit, redactSecrets),
+            requestParams: error.requestParams,
           }
         : { httpStatus: error instanceof ProviderHttpError ? error.status : null };
     return {

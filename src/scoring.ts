@@ -1328,19 +1328,59 @@ export function verifyRunIntegrity(
           }
         }
       }
-      if (!response.repairUsed && extractDecisionFingerprint(initialRaw, requestBundle) !== null) {
-        violations.push(
-          `${key}: invalid_schema without a repair, but the initial response has a complete fingerprint — the harness would have attempted a repair`,
-        );
+      if (!response.repairUsed) {
+        const initialFingerprint = extractDecisionFingerprint(initialRaw, requestBundle);
+        // Mirror the runner's era-specific repair rules: no era repairs an
+        // unfingerprintable initial, and the v2-era runner ALSO skips a
+        // fingerprint that omits the decision-bearing analysis (a pre-axes
+        // shape a repair may not invent — the fingerprints could never match).
+        // A v1-era archive keeps the original rule: that era's runner repaired
+        // any fingerprintable initial.
+        const analysisAbsent =
+          initialFingerprint !== null &&
+          [...initialFingerprint.values()].some((fp) => fp.axes === null);
+        if (initialFingerprint !== null && !(analysisAbsent && acceptedVersions.includes(2))) {
+          violations.push(
+            `${key}: invalid_schema without a repair, but the initial response has a complete fingerprint — the harness would have attempted a repair`,
+          );
+        }
       }
     } else if (
       response.outcome === 'timeout' ||
       response.outcome === 'rate_limited' ||
-      response.outcome === 'provider_error' ||
       response.outcome === 'credential_missing'
     ) {
       if (response.attempt.rawResponse !== null || (response.repair?.rawResponse ?? null) !== null) {
         violations.push(`${key}: transport outcome ${response.outcome} cannot carry a response body`);
+      }
+    } else if (response.outcome === 'provider_error') {
+      // A provider_error initial MAY carry an archived body: an unfinished
+      // turn (paused server-tool loop, refusal, output-cap stop, or any other
+      // non-final provider state) is a RECEIVED response — HTTP 200 with
+      // empty or partial content — whose evidence the runner records. What it
+      // can never be is a VALIDATING body (a valid response cannot be demoted
+      // to a provider failure), and no repair is ever dispatched after a
+      // failed initial, so a repair body under this outcome is fabricated.
+      if ((response.repair?.rawResponse ?? null) !== null) {
+        violations.push(
+          `${key}: provider_error cannot carry a repair body — no repair is dispatched after a failed initial`,
+        );
+      }
+      const initialRaw = response.attempt.rawResponse;
+      if (initialRaw !== null) {
+        const initialValidation = validateResponseText(
+          initialRaw,
+          requestBundle,
+          game.requestSha256,
+          armSpecForValidation,
+          run.cohortId,
+          acceptedVersions,
+        );
+        if (initialValidation.errors.length === 0) {
+          violations.push(
+            `${key}: recorded provider_error but the archived initial response validates — a valid response cannot be demoted`,
+          );
+        }
       }
     }
     else if (response.outcome === 'cutoff_missed') {

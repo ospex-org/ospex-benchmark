@@ -84,6 +84,14 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
         billableOutputTokens: comparable.billableOutputTokens,
       };
 
+      const requestParams: Record<string, unknown> = {
+        endpoint: ANTHROPIC_URL,
+        model: requestedModelId,
+        max_tokens: maxTokens,
+        anthropic_version: ANTHROPIC_VERSION,
+        ...(withTools ? { tools } : {}),
+      };
+
       // Terminal state: on the Messages API only `end_turn` and `stop_sequence`
       // are a finished turn. Everything else — `pause_turn`, `refusal`,
       // `max_tokens`, an unknown value, or a missing field — is HTTP 200 with
@@ -112,6 +120,7 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
           usage,
           usageRaw: json.usage ?? null,
           searchAudit: extractAnthropicSearchAudit(raw),
+          requestParams,
         });
       }
 
@@ -122,13 +131,7 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
         httpStatus: status,
         usage,
         usageRaw: json.usage ?? null,
-        requestParams: {
-          endpoint: ANTHROPIC_URL,
-          model: requestedModelId,
-          max_tokens: maxTokens,
-          anthropic_version: ANTHROPIC_VERSION,
-          ...(withTools ? { tools } : {}),
-        },
+        requestParams,
         searchAudit: extractAnthropicSearchAudit(raw),
       };
     },

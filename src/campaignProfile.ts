@@ -12,11 +12,12 @@ import type { CohortManifestV1 } from './manifest.js';
  * The crossing pinned every value exactly, because it authorized exactly one fire. A
  * campaign cannot: its size is the operator's decision. So the terms split in two.
  *
- * **Pinned exactly** — everything the committed per-attempt spend proof depends on. These
- * are not the operator's to choose, because changing them changes what "< $100 per attempt"
- * means: the roster, the repair cap, the per-attempt reservation, the conservative guard
- * price table + digest, the output-token cap, and the provider timeout. They are read from
- * the crossing profile so there is ONE definition of the priced attempt shape.
+ * **Pinned exactly** — everything the committed spend accounting depends on. These are not
+ * the operator's to choose, because changing them changes what the $100/attempt reservation
+ * and its priced detection mean: the roster, the repair cap, the per-attempt reservation,
+ * the conservative guard price table + digest, the output-token cap, and the provider
+ * timeout. They are read from the crossing profile so there is ONE definition of the priced
+ * attempt shape.
  *
  * **Bounded** — the campaign's own levers, each with a code-owned maximum so an operator
  * cannot arm an unbounded campaign by typing a large number into a manifest: the provider
@@ -41,8 +42,9 @@ import type { CohortManifestV1 } from './manifest.js';
  *  input to any guard, cap, or refusal. */
 export const OBSERVED_USD_MICROS_PER_ATTEMPT = 46_359;
 
-/** The committed conservative worst case per attempt, from `docs/SPEND-BOUND-PROOF.md`
- *  ($218.906640 for a full 8-attempt fire). Also projection only. */
+/** The committed conservative TOKEN worst case per attempt, from
+ *  `docs/SPEND-BOUND-PROOF.md` ($218.906640 for a full 8-attempt fire). Search fees sit on
+ *  top and are not all bounded before dispatch (see the proof doc). Also projection only. */
 export const CONSERVATIVE_USD_MICROS_PER_ATTEMPT = 27_363_330;
 
 export const CAMPAIGN_BOUNDS = deepFreeze({

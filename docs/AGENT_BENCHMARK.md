@@ -1,6 +1,6 @@
 # Ospex Agent Benchmark — Canonical MVE Design
 
-- Last updated UTC: `2026-07-14T19:15:51Z`
+- Last updated UTC: `2026-08-07T00:00:00Z`
 - Status: accepted application-layer direction; methodology and harness gates remain in progress
 - Scope: MLB-first, one fixed canonical cohort plus separately labeled open/community cohorts
 - Prompt/schema working draft: [BENCHMARK_PROMPT_V0.md](BENCHMARK_PROMPT_V0.md)
@@ -40,8 +40,8 @@ Each output also records:
 - model-estimated probability;
 - confidence/rank;
 - `wouldAbstain` as a non-executing secondary signal;
-- short rationale, with evidenceRefs grounded in the frozen bundle (search-derived context may inform it);
-- integer 1-5 scores on five named analysis axes (valuation, trend, consensus, news, softness), the single primary axis driving the forecast (or null), and a one-sentence primary expectation paired to it;
+- short rationale, with evidenceRefs listing the bundle refs it actually rests on — possibly none, when it rests on outside reasoning or a performed search (every present ref must name a bundle entry);
+- integer 1-5 scores on five named analysis axes (valuation, trend, consensus, news, softness), the single primary axis driving the forecast (null exactly when every axis is rated 1), and a one-sentence primary expectation — with a driver, the expected development on that axis; with none, that no material movement is expected;
 - exact market, side, line, and observed price;
 - the per-attempt web-search audit (every executed query and result reference), token usage with `reasoningTokens` and `billableOutputTokens` alongside the provider's verbatim raw usage;
 - strict machine-readable schema validity.

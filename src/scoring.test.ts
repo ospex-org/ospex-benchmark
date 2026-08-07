@@ -79,6 +79,9 @@ function fixtureRun(options?: {
   baselinePolicyVersion?: BaselinePolicyVersion;
   /** Overrides GAME_A's bundle total line (e.g. 9 for a push-capable line). */
   totalLineGameA?: number;
+  /** Builds a v2-ERA run: run_meta stamps the v0.5 scaffold, and every archived
+   *  body and decision record carries the v2 analysis fields. */
+  schemaEra2?: boolean;
 }): {
   lines: string[];
   requests: GameRequest[];
@@ -159,7 +162,20 @@ function fixtureRun(options?: {
       // records, so they correspond exactly (as the harness guarantees). The
       // flipped arm takes the opposite side of every market at its own
       // bundle-valid price.
-      const common = { probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, rationale: 'reference-price read' };
+      const common = {
+        probabilities: { win: 0.55, push: 0, loss: 0.45 },
+        confidence: 0.6,
+        wouldAbstain: false,
+        rationale: 'reference-price read',
+        // v2-era bodies carry the (decision-bearing) analysis on every forecast.
+        ...(options?.schemaEra2
+          ? {
+              axes: { valuation: 4, trend: 2, consensus: 3, news: 1, softness: 5 },
+              primaryAxis: 'valuation',
+              primaryExpectation: 'The reference price reads rich for the selected side.',
+            }
+          : {}),
+      };
       // These scenarios build full three-market boards, so every block is present.
       const ml = game.markets.moneyline!;
       const rl = game.markets.runLine!;
@@ -176,7 +192,7 @@ function fixtureRun(options?: {
             { market: 'total', selection: 'over', line: total.line, observedDecimal: total.overDecimal, selectedForExecution: true, evidenceRefs: [total.evidenceRef], ...common },
           ];
       const rawResponse = JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: options?.schemaEra2 ? 2 : 1,
         cohortId: 'test-cohort',
         participantId: arm.participantId,
         requestedModelId: arm.requestedModelId,
@@ -233,6 +249,15 @@ function fixtureRun(options?: {
           bundleSha256: request.requestSha256,
           gameSha256,
           slateSha256,
+          // v2-era decision records carry the accepted forecast's analysis, which
+          // the verifier cross-checks against the archived body.
+          ...(options?.schemaEra2
+            ? {
+                axes: (forecast as { axes?: unknown }).axes,
+                primaryAxis: (forecast as { primaryAxis?: unknown }).primaryAxis,
+                primaryExpectation: (forecast as { primaryExpectation?: unknown }).primaryExpectation,
+              }
+            : {}),
         });
       }
     }
@@ -312,6 +337,9 @@ function fixtureRun(options?: {
     // Real v0.1.0 archives predate the run_meta version stamp — emulate that
     // so the compat test exercises the legacy absent-stamp path.
     ...(baselineVersion !== 'baselines-v0.1.0' ? { baselinePolicyVersion: baselineVersion } : {}),
+    // A v2-era run is stamped with the scaffold that prompts schema v2; the
+    // absent stamp keeps the default fixtures in the legacy v1 era.
+    ...(options?.schemaEra2 ? { promptScaffoldVersion: 'shadow-smoke-v0.5' } : {}),
   });
 
   return { lines: records.map((l) => JSON.stringify(l)), requests, slateSha256 };
@@ -511,6 +539,202 @@ test('deleting an arm entirely is caught by the manifest count and cross-product
   });
   const violations = verifyRunIntegrity(parseRunRecords(withoutTimeoutArm), { expectedArms: FIXTURE_ARMS_WITH_TIMEOUT });
   assert.ok(violations.some((v) => v.includes('arm-game responses but')));
+});
+
+test('a provider_error arm carrying an archived (empty or partial) body is a coherent unfinished turn — the run stays scoreable', () => {
+  // The runner records an unfinished turn (paused tool loop / refusal /
+  // output-cap stop / any non-final provider state) as a RECEIVED response:
+  // provider_error with the body archived. The verifier accepts both the
+  // empty-body and partial-body shapes — the earlier rule refused any
+  // provider_error body, which would have made every such run unscoreable.
+  for (const body of ['', '{"schemaVersion":2,"games":[{"gameId":"']) {
+    const { lines } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'provider_error' } });
+    const mutated = lines.map((line) => {
+      const record = JSON.parse(line) as {
+        recordType?: string;
+        participantId?: string;
+        reportedModelId?: unknown;
+        attempt?: { rawResponse?: unknown; reportedModelId?: unknown; providerResponseId?: unknown };
+      };
+      if (record.recordType === 'arm_game_response' && record.participantId === 'timeout-arm' && record.attempt) {
+        record.attempt.rawResponse = body;
+        // A received response identifies its model, so the identity gate stays green.
+        record.attempt.reportedModelId = 'stub-model-2';
+        record.attempt.providerResponseId = 'resp-paused';
+        record.reportedModelId = 'stub-model-2';
+      }
+      return JSON.stringify(record);
+    });
+    const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS_WITH_TIMEOUT });
+    assert.deepEqual(violations, [], `an unfinished-turn body ${JSON.stringify(body)} must not poison the run`);
+  }
+});
+
+test('a provider_error arm whose archived body VALIDATES is refused — a valid response cannot be demoted to a provider failure', () => {
+  const { lines, requests } = fixtureRun({ extraArm: { participantId: 'timeout-arm', outcome: 'provider_error' } });
+  const requestA = requests.find((r) => r.game.gameId === GAME_A);
+  assert.ok(requestA);
+  const game = requestA.game;
+  const ml = game.markets.moneyline!;
+  const rl = game.markets.runLine!;
+  const total = game.markets.total!;
+  const common = { probabilities: { win: 0.55, push: 0, loss: 0.45 }, confidence: 0.6, wouldAbstain: false, rationale: 'reference-price read' };
+  const validatingBody = JSON.stringify({
+    schemaVersion: 1,
+    cohortId: 'test-cohort',
+    participantId: 'timeout-arm',
+    requestedModelId: 'stub-model-2',
+    bundleSha256: requestA.requestSha256,
+    executionPolicy: 'fixed-moneyline-total',
+    games: [
+      {
+        gameId: game.gameId,
+        forecasts: [
+          { market: 'moneyline', selection: game.homeTeam, line: null, observedDecimal: ml.homeDecimal, selectedForExecution: true, evidenceRefs: [ml.evidenceRef], ...common },
+          { market: 'spread', selection: game.awayTeam, line: rl.line, observedDecimal: rl.awayDecimal, selectedForExecution: false, evidenceRefs: [rl.evidenceRef], ...common },
+          { market: 'total', selection: 'over', line: total.line, observedDecimal: total.overDecimal, selectedForExecution: true, evidenceRefs: [total.evidenceRef], ...common },
+        ],
+      },
+    ],
+  });
+  const mutated = lines.map((line) => {
+    const record = JSON.parse(line) as {
+      recordType?: string;
+      participantId?: string;
+      gameId?: string;
+      reportedModelId?: unknown;
+      attempt?: { rawResponse?: unknown; reportedModelId?: unknown };
+    };
+    if (record.recordType === 'arm_game_response' && record.participantId === 'timeout-arm' && record.gameId === GAME_A && record.attempt) {
+      record.attempt.rawResponse = validatingBody;
+      record.attempt.reportedModelId = 'stub-model-2';
+      record.reportedModelId = 'stub-model-2';
+    }
+    return JSON.stringify(record);
+  });
+  const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS_WITH_TIMEOUT });
+  assert.ok(
+    violations.some((v) => v.includes('recorded provider_error but the archived initial response validates')),
+    `expected the demotion refusal, got: ${violations.join(' | ')}`,
+  );
+});
+
+test('the would-have-repaired rule mirrors the era: a v2-era v1-shaped initial without a repair is the SKIP, not a violation', () => {
+  // (0) The v2-era fixture itself is clean.
+  {
+    const { lines } = fixtureRun({ schemaEra2: true });
+    assert.deepEqual(verifyRunIntegrity(parseRunRecords(lines), { expectedArms: FIXTURE_ARMS }), []);
+  }
+  const dropDecisionsForGameA = (line: string): boolean => {
+    const record = JSON.parse(line) as { recordType?: string; participantId?: string; gameId?: string };
+    return !(record.recordType === 'decision' && record.participantId === 'model-arm' && record.gameId === GAME_A);
+  };
+  // (a) v2 era, v1-shaped initial (analysis stripped): the runner SKIPS that
+  // repair — a fingerprintable no-repair invalid_schema arm is coherent.
+  {
+    const { lines } = fixtureRun({ schemaEra2: true });
+    const mutated = lines
+      .map((line) => {
+        const record = JSON.parse(line) as {
+          recordType?: string;
+          participantId?: string;
+          gameId?: string;
+          outcome?: string;
+          attempt?: { rawResponse?: string };
+        };
+        if (
+          record.recordType === 'arm_game_response' &&
+          record.participantId === 'model-arm' &&
+          record.gameId === GAME_A &&
+          record.attempt?.rawResponse !== undefined
+        ) {
+          record.outcome = 'invalid_schema';
+          const body = JSON.parse(record.attempt.rawResponse) as {
+            schemaVersion: number;
+            games: Array<{ forecasts: Array<Record<string, unknown>> }>;
+          };
+          body.schemaVersion = 1;
+          for (const g of body.games) {
+            for (const f of g.forecasts) {
+              delete f['axes'];
+              delete f['primaryAxis'];
+              delete f['primaryExpectation'];
+            }
+          }
+          record.attempt.rawResponse = JSON.stringify(body);
+        }
+        return JSON.stringify(record);
+      })
+      .filter(dropDecisionsForGameA);
+    const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+    assert.deepEqual(violations, [], 'a skipped repair after a v1-shaped initial is the v2-era runner behavior');
+  }
+  // (b) v2 era, a v2 body that fails only its cohort echo but fingerprints WITH
+  // the analysis: that arm WOULD have been repaired — still a violation.
+  {
+    const { lines } = fixtureRun({ schemaEra2: true });
+    const mutated = lines
+      .map((line) => {
+        const record = JSON.parse(line) as {
+          recordType?: string;
+          participantId?: string;
+          gameId?: string;
+          outcome?: string;
+          attempt?: { rawResponse?: string };
+        };
+        if (
+          record.recordType === 'arm_game_response' &&
+          record.participantId === 'model-arm' &&
+          record.gameId === GAME_A &&
+          record.attempt?.rawResponse !== undefined
+        ) {
+          record.outcome = 'invalid_schema';
+          const body = JSON.parse(record.attempt.rawResponse) as { cohortId: string };
+          body.cohortId = 'wrong-cohort-echo';
+          record.attempt.rawResponse = JSON.stringify(body);
+        }
+        return JSON.stringify(record);
+      })
+      .filter(dropDecisionsForGameA);
+    const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+    assert.ok(
+      violations.some((v) => v.includes('the harness would have attempted a repair')),
+      `an analysis-carrying fingerprint must keep the rule: ${violations.join(' | ')}`,
+    );
+  }
+  // (c) v1-ERA control: that era's runner repaired ANY fingerprintable initial,
+  // so the same no-repair shape stays a violation there.
+  {
+    const { lines } = fixtureRun();
+    const mutated = lines
+      .map((line) => {
+        const record = JSON.parse(line) as {
+          recordType?: string;
+          participantId?: string;
+          gameId?: string;
+          outcome?: string;
+          attempt?: { rawResponse?: string };
+        };
+        if (
+          record.recordType === 'arm_game_response' &&
+          record.participantId === 'model-arm' &&
+          record.gameId === GAME_A &&
+          record.attempt?.rawResponse !== undefined
+        ) {
+          record.outcome = 'invalid_schema';
+          const body = JSON.parse(record.attempt.rawResponse) as { cohortId: string };
+          body.cohortId = 'wrong-cohort-echo';
+          record.attempt.rawResponse = JSON.stringify(body);
+        }
+        return JSON.stringify(record);
+      })
+      .filter(dropDecisionsForGameA);
+    const violations = verifyRunIntegrity(parseRunRecords(mutated), { expectedArms: FIXTURE_ARMS });
+    assert.ok(
+      violations.some((v) => v.includes('the harness would have attempted a repair')),
+      `the v1 era keeps its original rule: ${violations.join(' | ')}`,
+    );
+  }
 });
 
 test('deleting baseline decisions is caught by the manifest count', () => {

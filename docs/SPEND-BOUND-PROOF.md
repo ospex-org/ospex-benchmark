@@ -118,7 +118,8 @@ search fees. What the harness does instead: the response's billable search count
 `prices-v3` into the derived actual, an attempt whose derived actual crosses the reservation is a
 BREACH that refuses settlement, and the escalation latch stops the campaign from admitting any
 further dispatch. That is detection-and-halt of an overage that has already been billed — it
-limits how many such calls a campaign can make (one), not what the first one invoices.
+limits how many such calls a campaign can make — the already-admitted fire's attempts
+finish, and the latch refuses every subsequent dispatch — not what those calls invoice.
 
 For scale, at Google's $0.014-per-query fee an attempt would need ~7,143 executed queries for
 search fees alone to reach $100 (~5,411 on top of Google's worst-case token figure above) —
@@ -172,7 +173,8 @@ against `total_tokens`, pricing the larger reading when no total discriminates.
   that could invalidate the token table is a versioned `prices-vN` edit plus a manifest re-pin,
   not a silent rate change.
 
-Sources (official provider documentation, observed 2026-07-24):
+Sources (official provider documentation; token pages observed 2026-07-24, search-fee
+pages 2026-08-07):
 
 - OpenAI — pricing, priority processing, prompt caching, model card:
   <https://developers.openai.com/api/docs/pricing>,

@@ -147,6 +147,7 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
           usage,
           usageRaw: json.usageMetadata ?? null,
           searchAudit: extractGoogleSearchAudit(raw),
+          requestParams,
         });
       }
 

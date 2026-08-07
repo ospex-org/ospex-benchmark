@@ -24,10 +24,13 @@ import type { CanaryAuthorization } from './cohortAdapterCapability.js';
  * Three independent bounds hold an armed campaign, deliberately layered so no single defect
  * in this module can matter on its own:
  *
- *  1. **The store's cohort budget** — the HARD bound. `admit_dispatch` checks the call and
- *     spend caps inside a row lock, so no number of ticks, no runaway scheduler, and no two
- *     boxes ticking at once can spend past the amount fixed at arming. This holds even if
- *     everything below is wrong.
+ *  1. **The store's cohort budget** — the ADMISSION bound. `admit_dispatch` checks the call
+ *     and spend caps inside a row lock, so no number of ticks, no runaway scheduler, and no
+ *     two boxes ticking at once can ADMIT more dispatches than arming fixed — even if
+ *     everything below is wrong. The caps are denominated in $100/attempt reservations, an
+ *     accounting unit: what one admitted attempt actually invoices is bounded by the request
+ *     caps where the provider documents them and by priced detection + the escalation latch
+ *     where it does not (docs/SPEND-BOUND-PROOF.md).
  *  2. **This authorization** — the SOFT, revocable bound: it expires on its own (`expiresAt`)
  *     and can be revoked at any moment (`disarmedAt`), which is the operator's stop lever.
  *  3. **The manifest's window** — `windowEnd` ends eligibility regardless of either.

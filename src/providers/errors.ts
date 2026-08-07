@@ -40,13 +40,13 @@ export class ProviderHttpError extends Error {
  * declared tool config records that decision as configuration; raising it
  * means re-deriving the reservation, not editing an adapter.
  *
- * The call's full evidence IS carried here — the HTTP status, provider
- * response id, reported model id, the extracted (possibly empty) answer text,
- * the response's own usage (normalized and verbatim), and the search audit —
- * so the persisted attempt records what actually happened and the money guard
- * prices what the call actually cost instead of escalating on absent
- * evidence. The runner redacts the carried text/audit when it records the
- * attempt, exactly as it does for a returned response.
+ * The call's evidence IS carried here — the HTTP status, provider response
+ * id, reported model id, the extracted (possibly empty) answer text, the
+ * response's own usage (normalized and verbatim), the search audit, and the
+ * recorded request params — so the persisted attempt records what actually
+ * happened and the money guard prices what the call actually cost instead of
+ * escalating on absent evidence. The runner redacts the carried text/audit
+ * when it records the attempt, exactly as it does for a returned response.
  */
 export class ProviderUnfinishedTurnError extends Error {
   readonly stopReason: string;
@@ -57,6 +57,7 @@ export class ProviderUnfinishedTurnError extends Error {
   readonly usage: ProviderUsage;
   readonly usageRaw: unknown;
   readonly searchAudit: SearchAudit | null;
+  readonly requestParams: Record<string, unknown>;
 
   constructor(input: {
     provider: string;
@@ -69,6 +70,7 @@ export class ProviderUnfinishedTurnError extends Error {
     usage: ProviderUsage;
     usageRaw: unknown;
     searchAudit: SearchAudit | null;
+    requestParams: Record<string, unknown>;
   }) {
     super(`${input.provider} returned an unfinished turn (stop_reason: ${input.stopReason}): ${input.detail}`);
     this.name = 'ProviderUnfinishedTurnError';
@@ -80,5 +82,6 @@ export class ProviderUnfinishedTurnError extends Error {
     this.usage = input.usage;
     this.usageRaw = input.usageRaw;
     this.searchAudit = input.searchAudit;
+    this.requestParams = input.requestParams;
   }
 }

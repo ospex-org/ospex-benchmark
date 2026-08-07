@@ -75,8 +75,10 @@ const MODEL_PRICE_TABLE_V1: ModelPriceTable = {
 };
 
 /**
- * `prices-v2` — the conservative guard table: each model's HIGHEST conservatively-reachable
- * published tier (snapshot observed 2026-07-23, reconcile again immediately before any paid
+ * `prices-v2` — the conservative upper-tier token table (the guard table through prices-v2;
+ * `prices-v3` keeps these rates and adds search fees): each model's HIGHEST
+ * conservatively-reachable published tier (snapshot observed 2026-07-23, reconcile again
+ * immediately before any paid
  * crossing). A max-context prompt escalates the WHOLE request to the upper tier for the
  * two-tier models, so a table whose only job is to OVER-estimate defaults to that upper tier:
  *   - `gpt-5.6-sol` ........... OpenAI: $12.50 / $60. OUTPUT $60 = Priority Processing (a project can

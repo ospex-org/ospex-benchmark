@@ -163,6 +163,7 @@ export function createResponsesApiAdapter(config: {
           usage,
           usageRaw: json.usage ?? null,
           searchAudit: extractResponsesSearchAudit(raw),
+          requestParams,
         });
       }
 

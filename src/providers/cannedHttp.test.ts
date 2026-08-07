@@ -860,6 +860,79 @@ test('google TOO_MANY_TOOL_CALLS is a typed unfinished turn AND the carried audi
   });
 });
 
+test('the catch-all terminal states are all typed unfinished turns: safety/recitation/blocked (google), non-completed statuses (responses), unknown/missing stops (anthropic)', async () => {
+  // google: every non-STOP finishReason, and a blocked prompt with no candidate.
+  const googleShapes: Array<[string, unknown]> = [
+    ['SAFETY', { candidates: [{ content: { parts: [] }, finishReason: 'SAFETY' }] }],
+    ['RECITATION', { candidates: [{ content: { parts: [] }, finishReason: 'RECITATION' }] }],
+    ['blocked:PROHIBITED_CONTENT', { promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } }],
+    ['missing', { candidates: [{ content: { parts: [{ text: 'x' }] } }] }],
+  ];
+  for (const [expected, shape] of googleShapes) {
+    await withEnv('GEMINI_API_KEY', SYNTHETIC_KEY, async () => {
+      await withCannedFetch(
+        () => jsonResponse({ responseId: 'r', modelVersion: 'gemini-3.1-pro-preview', ...(shape as object) }),
+        async () => {
+          await assert.rejects(
+            () => registryAdapter('google-gemini-3.1-pro-preview').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+            (e: unknown) => e instanceof ProviderUnfinishedTurnError && e.stopReason === expected,
+            `google ${expected} must be a typed unfinished turn`,
+          );
+          return null;
+        },
+      );
+    });
+  }
+  // responses API: in_progress / queued / cancelled / a missing status field.
+  for (const rootStatus of ['in_progress', 'queued', 'cancelled', undefined]) {
+    await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, async () => {
+      await withCannedFetch(
+        () =>
+          jsonResponse({
+            id: 'r',
+            model: 'gpt-5.6-sol',
+            ...(rootStatus === undefined ? {} : { status: rootStatus }),
+            output: [],
+            usage: {},
+          }),
+        async () => {
+          await assert.rejects(
+            () => registryAdapter('openai-gpt-5.6-sol').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+            (e: unknown) =>
+              e instanceof ProviderUnfinishedTurnError && e.stopReason === (rootStatus ?? 'missing'),
+            `responses status ${String(rootStatus)} must be a typed unfinished turn`,
+          );
+          return null;
+        },
+      );
+    });
+  }
+  // anthropic: an unknown stop_reason and a missing one.
+  for (const stopReason of ['model_context_window_exceeded', undefined]) {
+    await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, async () => {
+      await withCannedFetch(
+        () =>
+          jsonResponse({
+            id: 'm',
+            model: 'claude-fable-5',
+            ...(stopReason === undefined ? {} : { stop_reason: stopReason }),
+            content: [{ type: 'text', text: 'partial' }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }),
+        async () => {
+          await assert.rejects(
+            () => registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+            (e: unknown) =>
+              e instanceof ProviderUnfinishedTurnError && e.stopReason === (stopReason ?? 'missing'),
+            `anthropic stop_reason ${String(stopReason)} must be a typed unfinished turn`,
+          );
+          return null;
+        },
+      );
+    });
+  }
+});
+
 test('an openai web_search_call with status "failed" marks the audit INCOMPLETE — a tool failure never reads as a clean audit', async () => {
   const { result } = await withEnv('OPENAI_API_KEY', SYNTHETIC_KEY, () =>
     withCannedFetch(

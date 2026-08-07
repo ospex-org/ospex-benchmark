@@ -858,6 +858,7 @@ test('END-TO-END: an anthropic pause_turn carrying usage yields a coherent artif
         usage: pausedUsage,
         usageRaw: pausedUsageRaw,
         searchAudit: pausedAudit,
+        requestParams: { endpoint: 'https://stub.example/v1/messages', model: anthropicId.requestedModelId },
       });
     },
   });

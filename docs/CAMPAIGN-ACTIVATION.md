@@ -53,7 +53,9 @@ Everything below states the contract that holds it.
   call/spend caps are enforced inside a row lock (`admit_dispatch`), so even a wrong
   authorization layer cannot ADMIT more dispatches than arming fixed — the caps are
   denominated in $100/attempt reservations, an accounting unit. Within one admitted
-  attempt, real spend is bounded before dispatch by `maxOutputTokens` plus the
+  attempt, real token spend is bounded before dispatch by the model token envelopes
+  (`maxOutputTokens`, plus each model's own bound on the additive reasoning buckets that
+  `maxOutputTokens` does not cap — see docs/SPEND-BOUND-PROOF.md) and search spend by the
   provider-documented search caps where they exist (OpenAI, Anthropic); on the arms with
   no documented request-side search cap (Google entirely; xAI capped only in turns) an
   overage in one call is DETECTED after the response — the derived actual is priced at

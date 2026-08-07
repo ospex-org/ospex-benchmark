@@ -120,8 +120,9 @@ Both destinations must survive the process and be readable afterwards.
       missing key refuses before the prompt.
 - [ ] Each key belongs to an account the operator controls, with billing enabled
       and a spending limit the operator has reviewed. The expected invoice is
-      well under $1, and the committed conservative worst-case bound for the
-      whole fire is ≈$219 (§8) — set provider-side limits with that bound in
+      well under $1, and the committed conservative worst-case TOKEN bound for
+      the whole fire is ≈$219 (§8; search fees sit on top, and on Google/xAI
+      they have no pre-dispatch cap) — set provider-side limits with that in
       mind; they are an independent backstop, not part of this protocol.
 - [ ] No key material is ever committed, pasted into the execution log, or
       included in any artifact (the artifact and sidecar carry token counts and
@@ -205,8 +206,10 @@ Expected sequence — read each stage as it happens:
   envelope), so the visible-output cap alone does not bound the bill. Per
   attempt: OpenAI $20.805, Anthropic $56.40, Google $24.248320, xAI $8.00 —
   each under the $100 per-attempt reservation — giving a conservative
-  full-fire bound (two attempts per model) of **$218.906640**, well under the
-  $800 reservation ceiling.
+  full-fire TOKEN bound (two attempts per model) of **$218.906640**, well
+  under the $800 reservation ceiling. Search fees are priced on top of these
+  figures and are provider-capped only on OpenAI and Anthropic (see
+  SPEND-BOUND-PROOF.md, "Web-search fees").
 - **What the $100 guard is and is not**: it is a POST-DISPATCH control. It
   prices the RETURNED usage and, on any attempt over $100 or any attempt it
   cannot price, refuses settlement — escalating with durable evidence and

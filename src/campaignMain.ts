@@ -614,7 +614,7 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
   printLine(`  size   at most ${projection.maxCalls} provider calls (${projection.maxFires} fires of 4 arms)`);
   printLine(`  cost   ≈ ${usd(projection.observedUsdMicros)} expected at the observed rate`);
   printLine(`         ≤ ${usd(projection.conservativeUsdMicros)} at the committed conservative worst case`);
-  printLine(`  bounds ${booted.manifest.constants.maxDispatchesPerTick} fire(s)/tick; every attempt hard-stopped above $100`);
+  printLine(`  bounds ${booted.manifest.constants.maxDispatchesPerTick} fire(s)/tick; an attempt priced above $100 halts the campaign (detection, not a per-call cap)`);
   printLine(`  root   ${evidenceRoot} (durable evidence destination — bound for the campaign's lifetime)`);
   printLine(`  expiry ${record.expiresAt} (the authorization stops on its own)`);
   printLine("  Enter or 'y' proceeds; 'n', any other answer, or EOF refuses");

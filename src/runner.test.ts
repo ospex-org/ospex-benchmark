@@ -333,6 +333,7 @@ test('an unfinished turn records the FULL received-response evidence: httpStatus
         usage,
         usageRaw,
         searchAudit,
+        requestParams: { endpoint: 'https://stub.example/v1/messages', model: 'stub-model-1' },
       });
     },
   ]);
@@ -353,6 +354,10 @@ test('an unfinished turn records the FULL received-response evidence: httpStatus
   assert.deepEqual(result.attempt.usage, usage);
   assert.deepEqual(result.attempt.usageRaw, usageRaw);
   assert.deepEqual(result.attempt.searchAudit, searchAudit);
+  assert.deepEqual(result.attempt.requestParams, {
+    endpoint: 'https://stub.example/v1/messages',
+    model: 'stub-model-1',
+  });
   assert.ok(result.attempt.responseAt !== null, 'the settle instant is stamped');
   assert.match(result.attempt.errorDetail ?? '', /unfinished turn \(stop_reason: pause_turn\)/);
   // Negative control: a transport-level failure still records NO received
