@@ -34,6 +34,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "pg-connection-string": "^2.14.0",
     "zod": "3.25.76"
   },
   "devDependencies": {
