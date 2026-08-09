@@ -28,6 +28,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
+import { storeConnectionConfig } from '../connection.js';
 import type { PoolClient } from 'pg';
 
 const DATABASE_URL = process.env.STORE_DATABASE_URL ?? 'postgres://postgres:spike@localhost:5433/store_spike';
@@ -272,7 +273,13 @@ async function main(): Promise<void> {
   // (the barrier checks must FAIL). connectionTimeoutMillis makes a starved pool throw
   // rather than hang, so the self-test terminates.
   const POOL_MAX = Number(process.env.STORE_POOL_MAX ?? '12');
-  const pool = new Pool({ connectionString: DATABASE_URL, max: POOL_MAX, connectionTimeoutMillis: 8000 });
+  // See atomicStore.conformance.ts: an operator-supplied URL decides the TLS
+  // question, and it is decided in one place.
+  const pool = new Pool({
+    ...storeConnectionConfig(DATABASE_URL),
+    max: POOL_MAX,
+    connectionTimeoutMillis: 8000,
+  });
   const s = storeFor((sql, params) => pool.query(sql, params));
 
   // Fresh schema each run so a rerun is deterministic.

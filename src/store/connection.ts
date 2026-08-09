@@ -13,14 +13,19 @@ import { envValue } from '../config.js';
  * is not a hypothetical default: it is what node-postgres does when no `ssl`
  * option is present and the URL carries no SSL parameter.
  *
- * So the decision is made here, once, for every call site.
+ * So the decision is made here, once, for every place the campaign store is
+ * opened: the runner's two pools, the fire runner's, and the three conformance
+ * entry points, which take the same operator-supplied variable.
  *
  * ── THE RULES ────────────────────────────────────────────────────────────────
  *
  * 1. **A local target gets nothing added.** A local PostgreSQL has no TLS, and
  *    demanding it there does not degrade — it fails outright with "The server
  *    does not support SSL connections". The default developer workflow has to
- *    keep working or this helper is a bug.
+ *    keep working or this helper is a bug. Adding NOTHING is not the same as
+ *    adding `ssl: false`: with no key the driver consults `PGSSLMODE`, so an
+ *    operator who exports it gets TLS demanded locally too. That is their
+ *    setting to make, and overriding it here would take the choice away.
  *
  * 2. **A URL that states its own SSL policy wins, and nothing is added.** When a
  *    connection string carries an SSL parameter the driver applies it OVER a
@@ -62,6 +67,10 @@ import { envValue } from '../config.js';
  *                                         test — it is an ordinary registrable
  *                                         name and the credential went to it in
  *                                         the clear
+ *   ?host=//HOST/pipe/x                   read as a unix socket by a leading
+ *                                         slash — on Windows it is a UNC name
+ *                                         and the credential went to HOST over
+ *                                         SMB, also in the clear
  *
  * So nothing here predicts what the driver will do. It calls the driver's own
  * connection-string parser — the same `pg-connection-string` module `pg` itself
@@ -76,8 +85,11 @@ import { envValue } from '../config.js';
  *                          `?host=` override applied.
  *
  * Verified by differential test against a real `pg.Client` and `pg.Pool` over a
- * generated matrix of connection strings, and by a live server with TLS off.
- * Both predicates agreed on every one; see `connection.test.ts`.
+ * generated matrix of connection strings; both predicates agreed on every one.
+ * Those sweeps are in `connection.test.ts`. The runs that need a server — a
+ * live PostgreSQL with TLS off, and a listener reading the first bytes off the
+ * socket — are recorded in the pull request, since they need a non-loopback
+ * address and cannot run in CI.
  *
  * ── WHY THERE IS NO RULE ABOUT DUPLICATE OR EMPTY SSL PARAMETERS ─────────────
  *
@@ -142,8 +154,8 @@ export class PlaintextStoreConnectionError extends Error {
 /** What the driver falls back to when neither the URL nor PGHOST names a host. */
 const DEFAULT_HOST = 'localhost';
 
-/** Hosts that name this machine, and so cannot be reached over a network. */
-const LOCAL_HOSTS = new Set(['localhost', '0.0.0.0']);
+/** Host NAMES that mean this machine. Addresses are classified below. */
+const LOCAL_HOST_NAMES = new Set(['localhost']);
 
 /** What a connection string says about TLS, as the driver reads it. */
 export type DsnTlsDecision = 'unstated' | 'encrypts' | 'plaintext';
@@ -197,25 +209,72 @@ function canonicalIpv6(host: string): string | null {
 }
 
 /**
+ * Whether an IPv6 address reaches this machine.
+ *
+ * Three families, each measured against a listener on this machine:
+ *   ::1                loopback, in every spelling
+ *   ::                 the unspecified address, the IPv6 twin of 0.0.0.0
+ *   ::ffff:127.x.x.x   IPv4-mapped loopback, and ::ffff:0.0.0.0
+ *
+ * The canonical form renders a mapped address as two hex groups, so
+ * `::ffff:127.0.0.1` is `::ffff:7f00:1` and the top byte of the first group is
+ * the first IPv4 octet. `::ffff:112.0.0.1` is `::ffff:7000:1`, which is why the
+ * test is on that byte rather than on the text.
+ */
+function isLocalIpv6(host: string): boolean {
+  const canonical = canonicalIpv6(host);
+  if (canonical === null) return false;
+  if (canonical === '::1' || canonical === '::') return true;
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
+  if (mapped === null) return false;
+  const high = Number.parseInt(mapped[1]!, 16);
+  const low = Number.parseInt(mapped[2]!, 16);
+  return high >>> 8 === 127 || (high === 0 && low === 0);
+}
+
+/**
  * Whether a host names this machine.
  *
  * Unknown answers false — a host this cannot place is treated as remote, so the
  * failure mode is a loud "the server does not support SSL connections" against
- * a local server rather than a silent plaintext send to a remote one. An exotic
- * spelling of a local address (`::ffff:127.0.0.1`) lands there.
+ * a local server rather than a silent plaintext send to a remote one. The legacy
+ * inet_aton spellings of loopback land there; see the note at the bottom.
  */
 function isLocalHost(host: string | null): boolean {
   if (host === null) return false;
-  // The driver's own domain-socket test is a leading slash, and a unix socket
-  // never leaves the machine.
-  if (host.startsWith('/')) return true;
+  // A leading slash is the driver's own domain-socket test — but only ONE.
+  // ⚠ `//HOST/pipe/x` is a UNC name on Windows, and the driver hands it
+  //   straight to `net.connect({ path })`, where the SMB redirector dials HOST
+  //   on port 445. Measured on win32: an outbound SYN to another machine, and
+  //   the StartupMessage and cleartext password delivered to a listener
+  //   addressed by a non-loopback IPv4 of this box. "A unix socket never leaves
+  //   the machine" is true on POSIX and false here, so a second slash forfeits
+  //   the local verdict and the target gets TLS. A backslash forfeits it too:
+  //   Windows treats the two separators as interchangeable, so a slash-prefixed
+  //   path carrying backslashes can denote the same UNC name. That half is a
+  //   conservative rule rather than a measured one — only the `//` form was
+  //   observed leaving the machine — and its cost is a loud failure against a
+  //   POSIX socket path with a backslash in it.
+  if (host.startsWith('/')) return !host.startsWith('//') && !host.includes('\\');
   const bracketed = /^\[(.*)\]$/.exec(host);
   const bare = (bracketed === null ? host : bracketed[1]!).toLowerCase();
-  if (LOCAL_HOSTS.has(bare)) return true;
-  // 127.0.0.0/8, but as an ADDRESS. A `127.` prefix test also accepts
-  // `127.0.0.1.evil.com`, which is a name anybody can register.
-  if (net.isIPv4(bare)) return bare.startsWith('127.');
-  if (net.isIPv6(bare)) return canonicalIpv6(bare) === '::1';
+  // One trailing dot is the root-anchored spelling of a NAME, and `localhost.`
+  // really does reach this machine — measured, it connects to a listener on
+  // 127.0.0.1. The dot is stripped for the NAME comparison only and never
+  // before an address test, because `127.0.0.1.` is not this machine: it is
+  // ENOTFOUND, a DNS name whose top-level label `1` does not exist. And
+  // `127.0.0.1.evil.com.` stays a name that is not localhost.
+  if (LOCAL_HOST_NAMES.has(bare.endsWith('.') ? bare.slice(0, -1) : bare)) return true;
+  // 127.0.0.0/8 and 0.0.0.0, but as ADDRESSES. A `127.` prefix test also
+  // accepts `127.0.0.1.evil.com`, which is a name anybody can register.
+  if (net.isIPv4(bare)) return bare.startsWith('127.') || bare === '0.0.0.0';
+  if (net.isIPv6(bare)) return isLocalIpv6(bare);
+  // Everything else is remote, INCLUDING spellings that would in fact reach
+  // this machine — the legacy inet_aton forms `0177.0.0.1`, `2130706433` and
+  // `0x7f000001` among them. Recognising those means reimplementing inet_aton,
+  // which is the kind of model this module exists to avoid. The cost is a loud
+  // failure against a local server, or a refusal that names its own way out,
+  // rather than a quiet plaintext send to a remote one.
   return false;
 }
 

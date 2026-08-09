@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Pool } from 'pg';
+import { storeConnectionConfig } from './connection.js';
 import { sha256Hex } from '../canonical.js';
 import { buildCampaignAuthorization } from '../campaignAuthorization.js';
 import { buildCampaignManifest } from '../campaignProfile.js';
@@ -77,7 +78,13 @@ async function check(name: string, fn: () => Promise<void>): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const pool = new Pool({ connectionString: DATABASE_URL, max: 4, connectionTimeoutMillis: 8000 });
+  // See atomicStore.conformance.ts: an operator-supplied URL decides the TLS
+  // question, and it is decided in one place.
+  const pool = new Pool({
+    ...storeConnectionConfig(DATABASE_URL),
+    max: 4,
+    connectionTimeoutMillis: 8000,
+  });
   await pool.query('drop schema if exists store cascade');
   await pool.query(SCHEMA_SQL);
   await pool.query(FUNCTIONS_SQL);
