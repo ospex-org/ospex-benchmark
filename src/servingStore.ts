@@ -802,16 +802,21 @@ function scoringRunPayload(run: ScoringRun): Record<string, unknown> {
 // alone cannot tell a duplicate from a miss.
 
 /**
- * The identity every write shares. Each insert is guarded by `not exists` as well
- * as ON CONFLICT, and the guard is doing real work rather than being belt and
- * braces: the conflict target can only name ONE unique index, and these tables
- * carry a second, redundant one as a composite-foreign-key target. When two
- * writes that merely SHARE a run or roster row overlap, the loser's speculative
- * insert can hit the NON-arbiter index and raise 23505, which aborts the whole
- * statement and loses the decision — measured at 3-4% of writes under a
- * four-way concurrent share, and zero when nothing is shared. The guard means
- * only the first write for a given parent inserts at all, and the retry in
- * `publish` covers the genuine race that remains.
+ * The identity every write shares.
+ *
+ * A conflict target names ONE unique index, and these tables carry a second,
+ * redundant one as a composite-foreign-key target. When two writes that merely
+ * SHARE a run or roster row overlap, the loser's speculative insert can hit the
+ * NON-arbiter index and raise 23505, aborting the whole statement and losing the
+ * child row — measured at 3-4% under a four-way concurrent share, and zero when
+ * nothing is shared.
+ *
+ * THE RETRY IN `publish` IS WHAT MAKES THAT SAFE. The `not exists` guard on each
+ * insert reduces how often it has to fire, by skipping the speculative insert
+ * entirely once the parent is committed and visible — which is every write after
+ * the first. It is an optimisation, not the correctness mechanism, and the honest
+ * bound is that only its PRESENCE is pinned: removing it turns a string test red,
+ * while the conformance suite stays green because the retry absorbs the outcome.
  */
 const IDENTITY_CTES = `
 run_ins as (
