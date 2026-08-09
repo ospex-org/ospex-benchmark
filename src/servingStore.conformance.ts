@@ -32,9 +32,10 @@
  *   yarn store:serving
  */
 import assert from 'node:assert/strict';
-import { Pool } from 'pg';
+import { Client, Pool } from 'pg';
 import { pgStoreQuery } from './store/atomicStore.js';
 import { pgStoreTransactor } from './store/campaignTickJournal.js';
+import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { ArmAttempt, AttemptFacts, DecisionSeal, PublishOutcome, RunFacts } from './servingStore.js';
 
@@ -642,6 +643,50 @@ async function main(): Promise<void> {
   });
 
   // ── negative controls: the grant is what makes the guarantees real ────────
+
+  await check('the resolver agrees with what the DRIVER actually does about TLS', async () => {
+    // Asserting the returned object is not enough and never was: the driver
+    // parses SSL out of the connection string and overrides what it is handed.
+    // This builds a real client for each shape and compares the claim against
+    // `connectionParameters.ssl`. It opens no connection.
+    const saved = { ...process.env };
+    try {
+      const cases: ReadonlyArray<readonly [string, 'tls' | 'defer' | 'refuse']> = [
+        ['', 'tls'],
+        ['?application_name=sslmode%3Ddisable', 'tls'],
+        ['?sslmode=', 'tls'],
+        ['?sslmode=disable', 'defer'],
+        ['?sslmode=no-verify', 'defer'],
+        ['?%73slmode=disable', 'defer'],
+        ['?ssl=', 'refuse'],
+        ['?sslmode=bogus', 'refuse'],
+      ];
+      for (const [query, want] of cases) {
+        const dsn = `postgresql://u:p@h.example.com:5432/db${query}`;
+        process.env['BENCHMARK_DB_URL'] = dsn;
+        process.env['BENCHMARK_DB_CA'] = 'PEM-CA';
+        delete process.env['BENCHMARK_WRITER'];
+        const resolution = resolveBenchmarkWriterConnection();
+        if (want === 'refuse') {
+          assert.equal(resolution.resolved, false, `${query || '(none)'} must be refused`);
+          continue;
+        }
+        assert.ok(resolution.resolved && resolution.connection.kind === 'dsn', query);
+        const claimed = resolution.connection.ssl;
+        const client = new Client({ connectionString: dsn, ...(claimed ? { ssl: claimed } : {}) });
+        const effective = (client as unknown as { connectionParameters: { ssl: unknown } })
+          .connectionParameters.ssl;
+        if (want === 'tls') {
+          assert.deepEqual(effective, { rejectUnauthorized: true, ca: 'PEM-CA' },
+            `${query || '(none)'}: the CA the resolver promised must be the CA the driver uses`);
+        } else {
+          assert.equal(claimed, undefined, `${query}: the resolver must promise nothing`);
+        }
+      }
+    } finally {
+      process.env = saved;
+    }
+  });
 
   await check('the role cannot UPDATE or DELETE any of the nine tables', async () => {
     for (const table of TABLES) {

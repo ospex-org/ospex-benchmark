@@ -65,7 +65,8 @@ export type UnresolvedReason =
   | 'no_credential'
   | 'no_project_url'
   | 'malformed_project_url'
-  | 'malformed_port';
+  | 'malformed_port'
+  | 'malformed_dsn_ssl';
 
 export type ConnectionResolution =
   | { readonly resolved: true; readonly connection: BenchmarkWriterConnection }
@@ -119,7 +120,9 @@ export function resolveBenchmarkWriterConnection(): ConnectionResolution {
     //   away — `sslmode=disable` in particular reported "verified TLS" for a
     //   connection with no TLS at all. Returning nothing says the true thing:
     //   the URL decides, and BENCHMARK_DB_CA does not apply to it.
-    return statesSslMode(dsn)
+    const intent = dsnSslIntent(dsn);
+    if (intent === 'malformed') return { resolved: false, reason: 'malformed_dsn_ssl' };
+    return intent === 'stated'
       ? { resolved: true, connection: { kind: 'dsn', connectionString: dsn } }
       : { resolved: true, connection: { kind: 'dsn', connectionString: dsn, ssl: tls() } };
   }
@@ -181,36 +184,69 @@ function derivedHost(): string | null | undefined {
   return `db.${match[1]!.toLowerCase()}.supabase.co`;
 }
 
+/** The `sslmode` values the driver acts on. Anything else it does not
+ *  recognise, so a DSN carrying one is not stating a policy — it is a typo. */
+const SSL_MODES: ReadonlySet<string> = new Set([
+  'disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full', 'no-verify',
+]);
+
+/** The separate boolean `ssl` parameter. The driver treats anything that is not
+ *  `true`/`1` as off, so an unrecognised value here means PLAINTEXT. */
+const SSL_BOOLEANS: ReadonlySet<string> = new Set(['true', 'false', '0', '1']);
+
+/** What a DSN says about TLS. */
+type DsnSslIntent = 'absent' | 'stated' | 'malformed';
+
 /**
- * Whether a DSN states an SSL parameter, decided the way the driver decides it.
+ * What a DSN says about TLS, decided the way the DRIVER decides it, and with
+ * three answers rather than two.
  *
- * A substring search is not good enough, and every one of these was measured
- * against a real client on the pinned driver:
+ * A substring search got four shapes wrong, each measured against a real client:
+ * `?application_name=sslmode=disable`, `/db-sslmode=disable` and
+ * `#sslmode=disable` all matched the text while stating nothing, so nothing was
+ * attached and the connection went out in PLAINTEXT; `?%73slmode=disable` did
+ * not match, so a CA was attached that the driver decoded past and discarded.
+ * `URLSearchParams` does the same decoding the driver does — values are not
+ * keys, a path is not a query, a fragment is not a query, and `%73` is `s`.
  *
- *   ?application_name=sslmode=disable   a VALUE containing the text. The
- *                                       substring matched, nothing was attached,
- *                                       and the connection went out in plaintext.
- *   /db-sslmode=disable                 the text in the PATH. Same.
- *   #sslmode=disable                    the text in a FRAGMENT. Same.
- *   ?%73slmode=disable                  percent-encoded, so the substring missed
- *                                       it — a CA was attached, and the driver
- *                                       decoded the parameter and discarded it.
+ * But presence is not intent, and the three cases genuinely differ. Measured on
+ * the pinned driver, effective `ssl` with a CA object supplied alongside:
  *
- * `URLSearchParams` gets all four right because it is doing the same decoding
- * the driver does: values are not keys, a path is not a query, a fragment is not
- * a query, and `%73` is `s`.
+ *   ?sslmode=            IGNORED by the driver — the supplied object WINS
+ *                        ({rejectUnauthorized, ca}). So an empty mode states
+ *                        nothing and TLS is attached. Deferring to it, which is
+ *                        what presence-only did, produced plaintext instead.
+ *   ?ssl=                the driver yields `""`, which is falsy, and the
+ *                        supplied object does NOT override it. Plaintext, and
+ *                        unfixable from here.
+ *   ?sslmode=bogus       the driver yields `{}` — TLS against the system trust
+ *                        store, so not a leak, but the CA is discarded and the
+ *                        handshake then fails against an endpoint whose chain
+ *                        Node does not carry.
  *
- * An unparseable DSN reports FALSE, so TLS is attached rather than silently
- * omitted. That direction is deliberate — being wrong about the report is
- * recoverable, sending the credential in clear is not — and the driver's own
- * parsing still governs what actually happens.
+ * The last two are malformed configuration, not a request for plaintext, and
+ * this refuses them: the publisher stays disabled with a nameable reason rather
+ * than sending the credential in clear or failing at a confusing handshake. A
+ * recognised value — including `sslmode=disable` and `ssl=0` — is a deliberate
+ * statement and is deferred to.
+ *
+ * An unparseable DSN reports `absent`, so TLS is attached rather than silently
+ * omitted. Being wrong about the report is recoverable; sending the credential
+ * in clear is not.
  */
-function statesSslMode(dsn: string): boolean {
+function dsnSslIntent(dsn: string): DsnSslIntent {
   let url: URL;
   try {
     url = new URL(dsn);
   } catch {
-    return false;
+    return 'absent';
   }
-  return url.searchParams.has('sslmode') || url.searchParams.has('ssl');
+  const mode = url.searchParams.get('sslmode');
+  const flag = url.searchParams.get('ssl');
+  if (mode === null && flag === null) return 'absent';
+  // An empty sslmode is discarded by the driver, so it states nothing.
+  if (mode !== null && mode !== '' && !SSL_MODES.has(mode.toLowerCase())) return 'malformed';
+  if (flag !== null && !SSL_BOOLEANS.has(flag.toLowerCase())) return 'malformed';
+  const states = (mode !== null && mode !== '') || flag !== null;
+  return states ? 'stated' : 'absent';
 }

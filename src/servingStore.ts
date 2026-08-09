@@ -893,7 +893,7 @@ function scoringRunPayload(run: ScoringRun): Record<string, unknown> {
 // alone cannot tell a duplicate from a miss.
 
 /**
- * DURABLE-FACT DRIFT, and why it is checked twice.
+ * DURABLE-FACT DRIFT.
  *
  * Every parent here is insert-once and the writer holds no UPDATE, so the first
  * write of a run, a participant or a roster row fixes its facts forever. A
@@ -907,11 +907,13 @@ function scoringRunPayload(run: ScoringRun): Record<string, unknown> {
  * So every fact the caller supplies for a parent is compared against the stored
  * one, and any disagreement both BLOCKS the write and is reported.
  *
- * The comparison here reads the statement's own snapshot, which cannot see a
- * concurrent writer that has not committed yet. `verifyDrift` re-runs it after
- * the write for exactly that case. Because these tables are append-only, a
- * post-write read is authoritative rather than merely luckier: whatever it sees
- * is final.
+ * The comparison reads the statement's own snapshot, which on its own cannot see
+ * a concurrent writer that has not committed yet. That is why a seal and an
+ * attempt take an advisory lock as a separate command first: the write then runs
+ * as a SECOND command and gets a snapshot that already contains whatever the
+ * previous lock holder committed. See LOCK_SQL. An earlier build tried to close
+ * this with a post-write re-read instead, which could relabel the outcome but
+ * could not un-commit the child it had already written.
  */
 const RUN_DRIFT = `
   select t.f

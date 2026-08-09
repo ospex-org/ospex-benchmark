@@ -214,12 +214,18 @@ without it the connection is encrypted but not authenticated, since the
 endpoint's certificate chain is not one Node trusts by default.
 
 **One exception, and it is the driver's rule rather than this repo's:** if you
-configure a full DSN that itself states an `sslmode`, that wins. The driver
+configure a full DSN that itself states a TLS policy, that wins. The driver
 parses SSL parameters out of the connection string and they override anything
 supplied alongside — including the CA — so in that case the URL is the whole
-story and `BENCHMARK_DB_CA` does not apply. Note also that the driver currently
-treats `sslmode=require` as `verify-full`; `no-verify` is the mode that means
-encrypt-without-verifying.
+story and `BENCHMARK_DB_CA` does not apply. Two parameter families count:
+`sslmode=` (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`,
+`no-verify`) and the separate boolean `ssl=` (`true`, `false`, `0`, `1`).
+
+A value outside those sets is treated as **malformed configuration and refused**
+— the publisher stays disabled with a named reason rather than quietly sending
+the credential without TLS, which is what `?ssl=` on its own would otherwise do.
+Note also that the driver currently treats `sslmode=require` as `verify-full`;
+`no-verify` is the mode that means encrypt-without-verifying.
 
 ## Published parameters (totals dispersion)
 

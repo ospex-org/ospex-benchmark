@@ -219,6 +219,49 @@ test('an SSL parameter is recognised the way the DRIVER recognises one', () => {
   assert.ok(!('ssl' in r.connection), 'a percent-encoded sslmode still defers to the DSN');
 });
 
+test('an EMPTY sslmode states nothing, so TLS is still attached', () => {
+  // Measured: the driver discards an empty mode, and a supplied ssl object wins.
+  // Treating mere presence as intent turned this into plaintext with the CA
+  // thrown away — the operator typed something, they did not ask for no TLS.
+  const dsn = 'postgresql://u:p@h.example.com:5432/db?sslmode=';
+  const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
+  assert.ok(r.resolved);
+  assert.deepEqual(r.connection.ssl, { rejectUnauthorized: true, ca: 'PEM' });
+});
+
+test('a value the driver does not recognise is malformed config, and is REFUSED', () => {
+  // `?ssl=` is the one that forced this. The driver yields "" — falsy, so
+  // plaintext — and a supplied ssl object does NOT override it, so there is no
+  // way to make it safe from here. Refusing leaves the publisher disabled with a
+  // named reason instead of sending the credential in clear.
+  for (const bad of [
+    'postgresql://u:p@h.example.com:5432/db?ssl=',
+    'postgresql://u:p@h.example.com:5432/db?ssl=yes',
+    'postgresql://u:p@h.example.com:5432/db?sslmode=bogus',
+    'postgresql://u:p@h.example.com:5432/db?sslmode=requrie',
+    'postgresql://u:p@h.example.com:5432/db?sslmode=verify-full&ssl=maybe',
+  ]) {
+    assert.deepEqual(
+      withEnv({ BENCHMARK_DB_URL: bad, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection),
+      { resolved: false, reason: 'malformed_dsn_ssl' }, bad,
+    );
+  }
+});
+
+test('every value the driver DOES recognise is deferred to, including the off ones', () => {
+  // The paired accept. Without it the refusal above would pass against a build
+  // that had simply stopped accepting DSNs. `disable` and `ssl=0` are deliberate
+  // statements and are honoured as such.
+  for (const good of ['sslmode=disable', 'sslmode=allow', 'sslmode=prefer', 'sslmode=require',
+    'sslmode=verify-ca', 'sslmode=verify-full', 'sslmode=no-verify', 'sslmode=VERIFY-FULL',
+    'ssl=true', 'ssl=false', 'ssl=0', 'ssl=1']) {
+    const dsn = `postgresql://u:p@h.example.com:5432/db?${good}`;
+    const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
+    assert.ok(r.resolved, good);
+    assert.ok(!('ssl' in r.connection), `${good}: the DSN is the whole story`);
+  }
+});
+
 test('a DSN too malformed to parse still gets TLS rather than silently none', () => {
   // The direction is deliberate: being wrong about the report is recoverable,
   // sending the credential in clear is not.
