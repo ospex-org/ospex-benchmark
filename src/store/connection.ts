@@ -143,25 +143,43 @@ const LOCAL_HOSTS = new Set(['localhost', '0.0.0.0']);
 /** What a connection string says about TLS, as the driver reads it. */
 export type DsnTlsDecision = 'unstated' | 'encrypts' | 'plaintext';
 
+/** Everything the decision needs, from ONE parse of the string. */
+interface DsnFacts {
+  /** The host the driver will dial; null when the string cannot be inspected. */
+  readonly host: string | null;
+  readonly tls: DsnTlsDecision;
+}
+
 /**
- * The parse result, or null when the string cannot be inspected.
+ * Read both facts out of the driver's own parse, once.
  *
- * `parse` reads `sslcert` / `sslkey` / `sslrootcert` off the disk and throws
- * when the path does not exist. The driver throws the same way a moment later
- * on the same string, so there is nothing to recover here — null means "cannot
- * classify", and every caller treats that as remote-and-unstated, which fails
- * toward encryption.
+ * Once, because `parse` reads `sslcert` / `sslkey` / `sslrootcert` off the disk;
+ * asking twice would read them twice. It also THROWS when such a path does not
+ * exist — the driver throws the same way a moment later on the same string, so
+ * there is nothing to recover here. A null host means "cannot classify", which
+ * every caller treats as remote, and `unstated` then attaches TLS: the failure
+ * is a driver error on connect, not a silent plaintext send.
+ *
+ * The host fallback chain mirrors the driver's own `val()`: the parsed host,
+ * else PGHOST, else `pg.defaults.host`, which is `'localhost'` and which
+ * nothing in this repo reassigns.
  */
-function inspect(databaseUrl: string): ReturnType<typeof parse> | null {
+function dsnFacts(databaseUrl: string): DsnFacts {
   // A falsy connection string is not parsed by the driver AT ALL:
   // `ConnectionParameters` only consults it when truthy, so an empty one leaves
   // the host to the environment rather than to the URL.
-  if (!databaseUrl) return null;
+  if (!databaseUrl) return { host: process.env['PGHOST'] || DEFAULT_HOST, tls: 'unstated' };
+  let parsed: ReturnType<typeof parse>;
   try {
-    return parse(databaseUrl);
+    parsed = parse(databaseUrl);
   } catch {
-    return null;
+    return { host: null, tls: 'unstated' };
   }
+  return {
+    host: parsed.host || process.env['PGHOST'] || DEFAULT_HOST,
+    // An own `ssl` key IS "the URL overrides whatever I attach" — see the header.
+    tls: !('ssl' in parsed) ? 'unstated' : parsed.ssl ? 'encrypts' : 'plaintext',
+  };
 }
 
 /** IPv6 in its canonical compressed form, so every spelling of ::1 compares equal. */
@@ -200,15 +218,10 @@ function isLocalHost(host: string | null): boolean {
  * The host node-postgres will actually dial, including a `?host=` query
  * parameter — which OVERRIDES the authority, so the authority alone is not the
  * target — and the environment fallback the driver applies when neither states
- * one.
- *
- * Null when the string cannot be inspected.
+ * one. Null when the string cannot be inspected.
  */
 export function effectiveStoreHost(databaseUrl: string): string | null {
-  if (!databaseUrl) return process.env['PGHOST'] || DEFAULT_HOST;
-  const parsed = inspect(databaseUrl);
-  if (parsed === null) return null;
-  return parsed.host || process.env['PGHOST'] || DEFAULT_HOST;
+  return dsnFacts(databaseUrl).host;
 }
 
 /**
@@ -219,14 +232,12 @@ export function effectiveStoreHost(databaseUrl: string): string | null {
  * supplied beside it.
  */
 export function dsnTlsDecision(databaseUrl: string): DsnTlsDecision {
-  const parsed = inspect(databaseUrl);
-  if (parsed === null || !('ssl' in parsed)) return 'unstated';
-  return parsed.ssl ? 'encrypts' : 'plaintext';
+  return dsnFacts(databaseUrl).tls;
 }
 
 /** True when the target is this machine, so no TLS is requested. */
 export function isLoopbackStoreHost(databaseUrl: string): boolean {
-  return isLocalHost(effectiveStoreHost(databaseUrl));
+  return isLocalHost(dsnFacts(databaseUrl).host);
 }
 
 function configuredTls(): StoreTlsOption {
@@ -242,11 +253,10 @@ function configuredTls(): StoreTlsOption {
  * opt-out is set.
  */
 export function storeConnectionConfig(databaseUrl: string): StoreConnectionConfig {
-  if (isLoopbackStoreHost(databaseUrl)) return { connectionString: databaseUrl };
-
-  const decision = dsnTlsDecision(databaseUrl);
-  if (decision === 'encrypts') return { connectionString: databaseUrl };
-  if (decision === 'plaintext') {
+  const { host, tls } = dsnFacts(databaseUrl);
+  if (isLocalHost(host)) return { connectionString: databaseUrl };
+  if (tls === 'encrypts') return { connectionString: databaseUrl };
+  if (tls === 'plaintext') {
     if (envValue('STORE_DATABASE_ALLOW_PLAINTEXT') !== '1') throw new PlaintextStoreConnectionError();
     return { connectionString: databaseUrl };
   }
