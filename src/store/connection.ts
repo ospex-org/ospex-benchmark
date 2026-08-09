@@ -15,7 +15,7 @@ import { envValue } from '../config.js';
  *
  * So the decision is made here, once, for every call site.
  *
- * ── THE RULES, IN ORDER ──────────────────────────────────────────────────────
+ * ── THE RULES ────────────────────────────────────────────────────────────────
  *
  * 1. **A local target gets nothing added.** A local PostgreSQL has no TLS, and
  *    demanding it there does not degrade — it fails outright with "The server
@@ -35,6 +35,11 @@ import { envValue } from '../config.js';
  *    `STORE_DATABASE_ALLOW_PLAINTEXT=1` says to send it in the clear on
  *    purpose. Rule 2 hands the decision to the operator; rule 4 makes them say
  *    it twice when the decision is "no encryption to another machine".
+ *
+ * Rules 1, 2 and 3 are checked in that order. Rule 4 is not a fourth branch —
+ * it is a constraint on rule 2, the case where the URL's own answer is "no
+ * encryption" and the target is not this machine, so in the code it is reached
+ * before rule 3's fallthrough.
  *
  * ── WHY THIS ASKS THE DRIVER INSTEAD OF READING THE URL ──────────────────────
  *
