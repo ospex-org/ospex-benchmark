@@ -131,6 +131,15 @@ const HOST_OVERRIDES: Fixture[] = [
   { dsn: 'postgres://u:pw@localhost:5432/store?host=/var/run/postgresql', local: true, label: 'unix socket via ?host' },
   { dsn: 'postgres://u:pw@%2Fvar%2Frun%2Fpostgresql/store', local: true, label: 'unix socket, percent-encoded' },
   { dsn: 'postgres://u:pw@localhost:5432/store?host=db.example.com&sslmode=disable', local: false, label: 'remote ?host + sslmode=disable' },
+  // IPv6 loopback in LONGHAND, and only reachable through `?host=`. In the
+  // authority the URL parser compresses `[0:0:0:0:0:0:0:1]` to `[::1]` before
+  // this module ever sees it, so the authority form does NOT discriminate: a
+  // literal `=== '::1'` comparison passes it. A query parameter is copied
+  // through verbatim, so this is the input where canonicalisation is the only
+  // thing that can produce the right answer.
+  { dsn: 'postgres://u:pw@db.example.com:5432/store?host=0:0:0:0:0:0:0:1', local: true, label: 'IPv6 loopback longhand via ?host' },
+  { dsn: 'postgres://u:pw@db.example.com:5432/store?host=::1', local: true, label: 'IPv6 loopback via ?host' },
+  { dsn: 'postgres://u:pw@db.example.com:5432/store?host=[::1]', local: true, label: 'IPv6 loopback bracketed via ?host' },
 ];
 
 const ALL: Fixture[] = [...MATRIX, ...HOST_OVERRIDES];
@@ -330,9 +339,25 @@ test('a registrable name that merely looks like loopback is remote', () => {
     assert.equal(isLoopbackStoreHost(dsn), false, host);
     assert.ok(withEnv({}, () => effective(storeConnectionConfig(dsn)).ssl), host);
   }
-  // The paired accept: real loopback addresses, including IPv6 longhand.
+  // The paired accept: real loopback addresses.
   for (const host of ['127.0.0.1', '127.0.0.5', 'localhost', '[::1]', '[0:0:0:0:0:0:0:1]']) {
     assert.equal(isLoopbackStoreHost(`postgres://u:pw@${host}:5432/store`), true, host);
+  }
+  // …and IPv6 longhand where it is NOT pre-compressed for us. In an authority
+  // the URL parser rewrites `[0:0:0:0:0:0:0:1]` to `[::1]`, so the case above
+  // is satisfied by a literal comparison and proves nothing about
+  // canonicalisation. Through `?host=` the value arrives byte-for-byte.
+  for (const host of ['0:0:0:0:0:0:0:1', '::1', '[::1]', '0000:0000:0000:0000:0000:0000:0000:0001']) {
+    const dsn = `postgres://u:pw@db.example.com:5432/store?host=${encodeURIComponent(host)}`;
+    assert.equal(effectiveStoreHost(dsn), host, `${host}: fixture is pre-normalised, so it cannot discriminate`);
+    assert.equal(isLoopbackStoreHost(dsn), true, host);
+  }
+  // The negative control for canonicalisation: a NON-loopback IPv6 address must
+  // not be swept up by it.
+  for (const host of ['::2', '2001:db8::1', '::ffff:8.8.8.8']) {
+    const dsn = `postgres://u:pw@localhost:5432/store?host=${encodeURIComponent(host)}`;
+    assert.equal(isLoopbackStoreHost(dsn), false, host);
+    assert.ok(withEnv({}, () => effective(storeConnectionConfig(dsn)).ssl), host);
   }
 });
 
