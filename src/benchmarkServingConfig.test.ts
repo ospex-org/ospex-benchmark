@@ -219,27 +219,24 @@ test('an SSL parameter is recognised the way the DRIVER recognises one', () => {
   assert.ok(!('ssl' in r.connection), 'a percent-encoded sslmode still defers to the DSN');
 });
 
-test('an EMPTY sslmode states nothing, so TLS is still attached', () => {
-  // Measured: the driver discards an empty mode, and a supplied ssl object wins.
-  // Treating mere presence as intent turned this into plaintext with the CA
-  // thrown away — the operator typed something, they did not ask for no TLS.
-  const dsn = 'postgresql://u:p@h.example.com:5432/db?sslmode=';
-  const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
-  assert.ok(r.resolved);
-  assert.deepEqual(r.connection.ssl, { rejectUnauthorized: true, ca: 'PEM' });
-});
-
-test('a value the driver does not recognise is malformed config, and is REFUSED', () => {
-  // `?ssl=` is the one that forced this. The driver yields "" — falsy, so
-  // plaintext — and a supplied ssl object does NOT override it, so there is no
-  // way to make it safe from here. Refusing leaves the publisher disabled with a
-  // named reason instead of sending the credential in clear.
+test('an EMPTY or REPEATED SSL parameter is refused', () => {
+  // Empty: the driver's handling differs by key — an empty `sslmode` is ignored
+  // while an empty `ssl` becomes "" and forces plaintext — so neither is a
+  // statement of intent, and relying on which is which is relying on a quirk.
+  //
+  // Repeated: `URLSearchParams.get()` returns the FIRST occurrence and the
+  // driver keeps the LAST, which is the one remaining way the two can disagree.
+  // Measured with a CA supplied: `?sslmode=require&sslmode=` went out in
+  // PLAINTEXT, and `?sslmode=&sslmode=require` attached a CA the driver threw
+  // away.
   for (const bad of [
+    'postgresql://u:p@h.example.com:5432/db?sslmode=',
     'postgresql://u:p@h.example.com:5432/db?ssl=',
-    'postgresql://u:p@h.example.com:5432/db?ssl=yes',
-    'postgresql://u:p@h.example.com:5432/db?sslmode=bogus',
-    'postgresql://u:p@h.example.com:5432/db?sslmode=requrie',
-    'postgresql://u:p@h.example.com:5432/db?sslmode=verify-full&ssl=maybe',
+    'postgresql://u:p@h.example.com:5432/db?sslmode=require&sslmode=',
+    'postgresql://u:p@h.example.com:5432/db?sslmode=&sslmode=require',
+    'postgresql://u:p@h.example.com:5432/db?ssl=1&ssl=',
+    'postgresql://u:p@h.example.com:5432/db?ssl=&ssl=1',
+    'postgresql://u:p@h.example.com:5432/db?sslmode=disable&sslmode=verify-full',
   ]) {
     assert.deepEqual(
       withEnv({ BENCHMARK_DB_URL: bad, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection),
@@ -248,13 +245,18 @@ test('a value the driver does not recognise is malformed config, and is REFUSED'
   }
 });
 
-test('every value the driver DOES recognise is deferred to, including the off ones', () => {
-  // The paired accept. Without it the refusal above would pass against a build
-  // that had simply stopped accepting DSNs. `disable` and `ssl=0` are deliberate
-  // statements and are honoured as such.
-  for (const good of ['sslmode=disable', 'sslmode=allow', 'sslmode=prefer', 'sslmode=require',
-    'sslmode=verify-ca', 'sslmode=verify-full', 'sslmode=no-verify', 'sslmode=VERIFY-FULL',
-    'ssl=true', 'ssl=false', 'ssl=0', 'ssl=1']) {
+test('any single non-empty value is deferred to, WITHOUT judging what it means', () => {
+  // There is no list of accepted values, because there was one twice and it was
+  // wrong both times: it rejected `ssl=no-verify`, which the driver supports,
+  // and accepted `ssl=false`, which the driver turns into the truthy string
+  // "false". Enumerating meaning is a prediction about the driver; this predicts
+  // nothing. An unrecognised mode is safe to defer to because the driver turns
+  // it into `{}` — TLS against the system trust store — never a silent
+  // downgrade.
+  for (const good of ['sslmode=disable', 'sslmode=prefer', 'sslmode=require',
+    'sslmode=verify-ca', 'sslmode=verify-full', 'sslmode=no-verify', 'sslmode=bogus',
+    'ssl=true', 'ssl=false', 'ssl=0', 'ssl=1', 'ssl=no-verify', 'ssl=yes',
+    'sslmode=verify-full&ssl=1']) {
     const dsn = `postgresql://u:p@h.example.com:5432/db?${good}`;
     const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
     assert.ok(r.resolved, good);

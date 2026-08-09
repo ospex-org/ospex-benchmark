@@ -184,16 +184,6 @@ function derivedHost(): string | null | undefined {
   return `db.${match[1]!.toLowerCase()}.supabase.co`;
 }
 
-/** The `sslmode` values the driver acts on. Anything else it does not
- *  recognise, so a DSN carrying one is not stating a policy — it is a typo. */
-const SSL_MODES: ReadonlySet<string> = new Set([
-  'disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full', 'no-verify',
-]);
-
-/** The separate boolean `ssl` parameter. The driver treats anything that is not
- *  `true`/`1` as off, so an unrecognised value here means PLAINTEXT. */
-const SSL_BOOLEANS: ReadonlySet<string> = new Set(['true', 'false', '0', '1']);
-
 /** What a DSN says about TLS. */
 type DsnSslIntent = 'absent' | 'stated' | 'malformed';
 
@@ -209,26 +199,43 @@ type DsnSslIntent = 'absent' | 'stated' | 'malformed';
  * `URLSearchParams` does the same decoding the driver does — values are not
  * keys, a path is not a query, a fragment is not a query, and `%73` is `s`.
  *
- * But presence is not intent, and the three cases genuinely differ. Measured on
- * the pinned driver, effective `ssl` with a CA object supplied alongside:
+ * ── WHY THERE IS NO LIST OF ACCEPTED VALUES ─────────────────────────────────
+ * There was one, twice, and it was wrong both times: it rejected `ssl=no-verify`
+ * which the driver genuinely supports, and accepted `ssl=false` which the driver
+ * turns into the truthy STRING `"false"`. Enumerating what a value MEANS is a
+ * prediction about the driver, and every prediction here has eventually
+ * disagreed with it. So this predicts nothing about meaning. It asks only
+ * whether the parameter is unambiguous:
  *
- *   ?sslmode=            IGNORED by the driver — the supplied object WINS
- *                        ({rejectUnauthorized, ca}). So an empty mode states
- *                        nothing and TLS is attached. Deferring to it, which is
- *                        what presence-only did, produced plaintext instead.
- *   ?ssl=                the driver yields `""`, which is falsy, and the
- *                        supplied object does NOT override it. Plaintext, and
- *                        unfixable from here.
- *   ?sslmode=bogus       the driver yields `{}` — TLS against the system trust
- *                        store, so not a leak, but the CA is discarded and the
- *                        handshake then fails against an endpoint whose chain
- *                        Node does not carry.
+ *   absent      -> attach TLS; nothing in the URL can discard it
+ *   present, appearing ONCE, non-empty
+ *               -> defer entirely. Whatever it means is the driver's business
+ *                  and the operator's choice, and attaching beside it would only
+ *                  be discarded.
+ *   anything else (empty, or repeated)
+ *               -> refuse. The publisher stays disabled with a nameable reason
+ *                  rather than guessing.
  *
- * The last two are malformed configuration, not a request for plaintext, and
- * this refuses them: the publisher stays disabled with a nameable reason rather
- * than sending the credential in clear or failing at a confusing handshake. A
- * recognised value — including `sslmode=disable` and `ssl=0` — is a deliberate
- * statement and is deferred to.
+ * DUPLICATES ARE THE REASON FOR THE COUNT. `URLSearchParams.get()` returns the
+ * FIRST occurrence and the driver keeps the LAST, so a repeated parameter is
+ * where the two can still disagree. Measured, with a CA supplied:
+ *
+ *   ?sslmode=require&sslmode=   first says require, so nothing was attached;
+ *                               the driver's empty last value made it ignore
+ *                               sslmode entirely -> PLAINTEXT.
+ *   ?sslmode=&sslmode=require   first is empty, so a CA was attached; the
+ *                               driver's last value won and discarded it -> {}.
+ *   ?ssl=1&ssl=                 first says 1, nothing attached; driver -> "".
+ *
+ * EMPTY IS REFUSED RATHER THAN IGNORED, even though an empty `sslmode` alone is
+ * measurably discarded by the driver and would be safe to attach past. Relying
+ * on that is relying on a quirk, and quirk-dependence is what produced this
+ * round. One rule, no exceptions, nothing to rot.
+ *
+ * The bound worth stating: across every shape measured, the driver acts on any
+ * non-empty `sslmode` or `ssl` — an unrecognised mode yields `{}`, which is TLS
+ * against the system trust store, never a silent downgrade. Only an empty value
+ * is ignored, and that is refused.
  *
  * An unparseable DSN reports `absent`, so TLS is attached rather than silently
  * omitted. Being wrong about the report is recoverable; sending the credential
@@ -241,12 +248,10 @@ function dsnSslIntent(dsn: string): DsnSslIntent {
   } catch {
     return 'absent';
   }
-  const mode = url.searchParams.get('sslmode');
-  const flag = url.searchParams.get('ssl');
-  if (mode === null && flag === null) return 'absent';
-  // An empty sslmode is discarded by the driver, so it states nothing.
-  if (mode !== null && mode !== '' && !SSL_MODES.has(mode.toLowerCase())) return 'malformed';
-  if (flag !== null && !SSL_BOOLEANS.has(flag.toLowerCase())) return 'malformed';
-  const states = (mode !== null && mode !== '') || flag !== null;
-  return states ? 'stated' : 'absent';
+  const values = [...url.searchParams.getAll('sslmode'), ...url.searchParams.getAll('ssl')];
+  if (values.length === 0) return 'absent';
+  if (url.searchParams.getAll('sslmode').length > 1) return 'malformed';
+  if (url.searchParams.getAll('ssl').length > 1) return 'malformed';
+  if (values.some((value) => value === '')) return 'malformed';
+  return 'stated';
 }

@@ -654,12 +654,23 @@ async function main(): Promise<void> {
       const cases: ReadonlyArray<readonly [string, 'tls' | 'defer' | 'refuse']> = [
         ['', 'tls'],
         ['?application_name=sslmode%3Ddisable', 'tls'],
-        ['?sslmode=', 'tls'],
+        ['?sslmode=', 'refuse'],
         ['?sslmode=disable', 'defer'],
         ['?sslmode=no-verify', 'defer'],
         ['?%73slmode=disable', 'defer'],
         ['?ssl=', 'refuse'],
-        ['?sslmode=bogus', 'refuse'],
+        ['?sslmode=bogus', 'defer'],
+        // Duplicates: URLSearchParams reads the FIRST, the driver keeps the LAST.
+        ['?sslmode=require&sslmode=', 'refuse'],
+        ['?sslmode=&sslmode=require', 'refuse'],
+        ['?ssl=1&ssl=', 'refuse'],
+        ['?ssl=&ssl=1', 'refuse'],
+        // Every value the ssl= family can carry, deferred to without judging it.
+        ['?ssl=true', 'defer'],
+        ['?ssl=false', 'defer'],
+        ['?ssl=0', 'defer'],
+        ['?ssl=1', 'defer'],
+        ['?ssl=no-verify', 'defer'],
       ];
       for (const [query, want] of cases) {
         const dsn = `postgresql://u:p@h.example.com:5432/db${query}`;
