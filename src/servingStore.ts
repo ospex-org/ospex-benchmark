@@ -64,6 +64,26 @@ import type { StoreQuery } from './store/atomicStore.js';
  * contention entirely, because by then the row is committed and visible to all
  * three.
  *
+ * ── WHAT THE PUBLISHER REFUSES, AND WHY IT IS NOT THE PRODUCER'S JOB ─────────
+ * Three things it will not persist, each of which reached a `published` decision
+ * before the check existed, and each of which corrupts a figure a reader derives
+ * rather than merely storing something odd:
+ *
+ *   a decision citing an attempt that was never SENT, or whose outcome is not
+ *   one that yields decisions — the attempt row exists to keep a FAILED arm in
+ *   the opportunity denominator, so a decision hanging off it turns that
+ *   denominator into a numerator and scores a call that never happened;
+ *
+ *   a decision on a market the call did not cover — `supplied_markets` IS the
+ *   per-market eligible count, so this scores a pick against an opportunity
+ *   that did not exist;
+ *
+ *   a parent whose stored facts DISAGREE with what the caller supplied. Every
+ *   parent is insert-once, so the first write fixes them and a later one is
+ *   absorbed silently. That is how a participant written as a model can be
+ *   sealed against as a baseline: the client-side pairing check reads what the
+ *   CALLER said, and only a comparison against the stored row sees the rest.
+ *
  * ── WHY EACH WRITE IS ONE STATEMENT ──────────────────────────────────────────
  * A write has to land the run, the participant, the cohort roster and its own row
  * together: the child carries composite foreign keys to all of them, and a roster
@@ -118,7 +138,8 @@ export type InvalidInputReason =
   | 'supplied_markets_malformed'
   | 'number_out_of_range'
   | 'unsent_attempt_has_response'
-  | 'refusal_reason_mismatch';
+  | 'refusal_reason_mismatch'
+  | 'not_a_boolean';
 
 /**
  * The result of one publish. Every branch is inspectable and none is authorizing,
@@ -126,18 +147,29 @@ export type InvalidInputReason =
  *
  * `published`      a row was written.
  * `duplicate`      this row's natural key was already present, so it was not
- *                  written again. Note this describes THIS row: the same
- *                  statement may still have inserted a run, participant or
- *                  roster row alongside it.
+ *                  written again. The same statement may still have inserted a
+ *                  run, participant or roster row alongside it — those are
+ *                  shared parents and their creation is not this row's news.
  * `contradiction`  a row with this natural key already exists and DISAGREES with
  *                  what was supplied, on a field that is a commitment — the
  *                  forecast digest, or the wallet a fill is joined through.
- *                  Nothing was overwritten (the writer holds no UPDATE), so the
- *                  stored value stands and this needs a human. Reported ahead of
- *                  the other branches because it is the one integrity failure a
- *                  projection of commitments exists to make visible.
+ *                  Nothing was overwritten (the writer holds no UPDATE) and
+ *                  nothing was written: the whole statement is suppressed, so a
+ *                  contradiction leaves the projection exactly as it was.
+ *                  Reported ahead of the other branches because it is the one
+ *                  integrity failure a projection of commitments exists to make
+ *                  visible.
+ * `attempt_not_eligible`
+ *                  the cited provider call EXISTS but could not have produced
+ *                  this forecast — it was never sent, its outcome is not one
+ *                  that yields decisions, or the market is not among the ones
+ *                  it covered. Distinct from `parent_missing` because
+ *                  "you published the wrong attempt" and "you published none"
+ *                  are different producer bugs. Nothing was written.
  * `parent_missing` the row this one hangs off was not visible to the statement,
- *                  so nothing was inserted. Reported rather than swallowed: an
+ *                  so nothing was inserted — and that now includes the shared
+ *                  identity rows, which an earlier build committed while saying
+ *                  it had not. Reported rather than swallowed: an
  *                  `insert ... select` over an empty source affects zero rows and
  *                  raises nothing at all. For a seal it means the attempt was
  *                  never published — see the call order above.
@@ -159,6 +191,7 @@ export type PublishOutcome =
   | { readonly outcome: 'duplicate' }
   | { readonly outcome: 'contradiction'; readonly field: string }
   | { readonly outcome: 'parent_missing' }
+  | { readonly outcome: 'attempt_not_eligible'; readonly reason: AttemptIneligibleReason }
   | { readonly outcome: 'invalid_input'; readonly reason: InvalidInputReason; readonly field: string }
   | { readonly outcome: 'refused'; readonly sqlstate: string; readonly constraint: string | null; readonly detail: string }
   | { readonly outcome: 'unavailable'; readonly detail: string }
@@ -167,6 +200,22 @@ export type PublishOutcome =
 // ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
+
+/** Why a cited provider call cannot carry the forecast being sealed. */
+export type AttemptIneligibleReason = 'unsent' | 'outcome_not_accepted' | 'market_not_supplied';
+
+/**
+ * The attempt outcomes that yield decisions.
+ *
+ * This mirrors the producer's own rule — records are emitted only for an arm
+ * whose call came back valid — and it is a real coupling, kept deliberate and
+ * greppable rather than implicit. The projection's schema puts no CHECK on
+ * `outcome`, so the database cannot enforce it and this is the only place that
+ * can. If the producer ever accepts a second outcome, add it HERE: the failure
+ * mode otherwise is every decision from that outcome reporting
+ * `attempt_not_eligible`, which is loud and systematic rather than silent.
+ */
+export const ACCEPTED_ATTEMPT_OUTCOMES: readonly string[] = Object.freeze(['valid']);
 
 /** The two networks the projection's `network` enum admits. */
 export type NetworkKey = 'polygon' | 'amoy';
@@ -521,6 +570,23 @@ function calendarDate(value: string, field: string): string {
   return value;
 }
 
+/**
+ * A boolean, checked rather than trusted. Every boolean column was previously
+ * passed through raw, so a runtime value of the wrong type — `1n`, measured —
+ * reached `JSON.stringify` and threw a TypeError straight out of a port whose
+ * headline promise is that it never throws.
+ */
+function bool(value: boolean | null, field: string): boolean | null {
+  if (value === null) return null;
+  if (typeof value !== 'boolean') refuse('not_a_boolean', field);
+  return value;
+}
+
+/** The largest value a PostgreSQL `integer` column holds. Bounded here so an
+ *  oversized count is a typed refusal naming the field, not a 22003 from the
+ *  driver quoting the value back. */
+const INT4_MAX = 2_147_483_647;
+
 function num(value: number | null, field: string, min?: number, max?: number): number | null {
   if (value === null) return null;
   if (typeof value !== 'number' || !Number.isFinite(value)) refuse('number_out_of_range', field);
@@ -529,7 +595,7 @@ function num(value: number | null, field: string, min?: number, max?: number): n
   return value;
 }
 
-function int(value: number | null, field: string, min?: number, max?: number): number | null {
+function int(value: number | null, field: string, min?: number, max = INT4_MAX): number | null {
   if (value === null) return null;
   if (!Number.isSafeInteger(value)) refuse('number_out_of_range', field);
   return num(value, field, min, max);
@@ -647,14 +713,14 @@ function attemptPayload(attempt: ArmAttempt): Record<string, unknown> {
     game_id: id(attempt.gameId, 'gameId'),
     attempt_ordinal: f.attemptOrdinal,
     supplied_markets: suppliedMarkets(f.suppliedMarkets, 'facts.suppliedMarkets'),
-    sent: f.sent,
+    sent: bool(f.sent, 'facts.sent') as boolean,
     attempt_outcome: requiredText(f.outcome, 'facts.outcome'),
     requested_model_id: text(f.requestedModelId, 'facts.requestedModelId'),
     reported_model_id: text(f.reportedModelId, 'facts.reportedModelId'),
     provider_response_id: text(f.providerResponseId, 'facts.providerResponseId'),
     http_status: int(f.httpStatus, 'facts.httpStatus', 0, 2147483647),
     provider_stop_reason: text(f.providerStopReason, 'facts.providerStopReason'),
-    turn_completed: f.turnCompleted,
+    turn_completed: bool(f.turnCompleted, 'facts.turnCompleted'),
     validation_errors: f.validationErrors === null
       ? null
       : f.validationErrors.map((e, i) => text(e, `facts.validationErrors[${i}]`)),
@@ -688,6 +754,7 @@ function sealPayload(seal: DecisionSeal): Record<string, unknown> {
     game_id: id(seal.gameId, 'gameId'),
     has_attempt: seal.attemptOrdinal !== null,
     attempt_ordinal: seal.attemptOrdinal,
+    accepted_outcomes: [...ACCEPTED_ATTEMPT_OUTCOMES],
     market: market(seal.market, 'market'),
     contest_id: text(seal.contestId, 'contestId'),
     speculation_id: text(seal.speculationId, 'speculationId'),
@@ -714,8 +781,8 @@ function revealPayload(reveal: DecisionReveal): Record<string, unknown> {
     prob_push: unit(reveal.probPush, 'probPush'),
     prob_loss: unit(reveal.probLoss, 'probLoss'),
     confidence: unit(reveal.confidence, 'confidence'),
-    would_abstain: reveal.wouldAbstain,
-    selected_for_execution: reveal.selectedForExecution,
+    would_abstain: bool(reveal.wouldAbstain, 'wouldAbstain'),
+    selected_for_execution: bool(reveal.selectedForExecution, 'selectedForExecution'),
     reason_code: text(reveal.reasonCode, 'reasonCode'),
     axis_valuation: axis(reveal.axisValuation, 'axisValuation'),
     axis_trend: axis(reveal.axisTrend, 'axisTrend'),
@@ -751,10 +818,10 @@ function scorePayload(score: DecisionScore): Record<string, unknown> {
     devig_method: text(score.devigMethod, 'devigMethod'),
     ladder_version: text(score.ladderVersion, 'ladderVersion'),
     ladder_param_version: text(score.ladderParamVersion, 'ladderParamVersion'),
-    refused: score.refused,
+    refused: bool(score.refused, 'refused') as boolean,
     refusal_reason: text(score.refusalReason, 'refusalReason'),
-    schedule_changed: score.scheduleChanged,
-    held_out_of_primary: score.heldOutOfPrimary,
+    schedule_changed: bool(score.scheduleChanged, 'scheduleChanged'),
+    held_out_of_primary: bool(score.heldOutOfPrimary, 'heldOutOfPrimary'),
     close_decimal_selected: num(score.closeDecimalSelected, 'closeDecimalSelected', 0),
     close_decimal_opposing: num(score.closeDecimalOpposing, 'closeDecimalOpposing', 0),
     close_line: num(score.closeLine, 'closeLine'),
@@ -781,9 +848,9 @@ function scoringRunPayload(run: ScoringRun): Record<string, unknown> {
     // content happens to be JSON, and `refusal_reasons ->> 'no_close'` would then
     // return nothing with no error anywhere.
     refusal_reasons: reasons,
-    ranking_allowed: run.rankingAllowed,
+    ranking_allowed: bool(run.rankingAllowed, 'rankingAllowed') as boolean,
     ranking_reason: requiredText(run.rankingReason, 'rankingReason'),
-    cost_per_pick_comparable: run.costPerPickComparable,
+    cost_per_pick_comparable: bool(run.costPerPickComparable, 'costPerPickComparable'),
     benchmark_commit: text(run.benchmarkCommit, 'benchmarkCommit'),
     scored_at: requiredInstant(run.scoredAt, 'scoredAt'),
     ...source(run.source, 'source'),
@@ -802,24 +869,89 @@ function scoringRunPayload(run: ScoringRun): Record<string, unknown> {
 // alone cannot tell a duplicate from a miss.
 
 /**
- * The identity every write shares.
+ * DURABLE-FACT DRIFT, and why it is checked twice.
  *
- * A conflict target names ONE unique index, and these tables carry a second,
- * redundant one as a composite-foreign-key target. When two writes that merely
- * SHARE a run or roster row overlap, the loser's speculative insert can hit the
- * NON-arbiter index and raise 23505, aborting the whole statement and losing the
- * child row — measured at 3-4% under a four-way concurrent share, and zero when
- * nothing is shared.
+ * Every parent here is insert-once and the writer holds no UPDATE, so the first
+ * write of a run, a participant or a roster row fixes its facts forever. A
+ * second write supplying DIFFERENT facts is absorbed by `on conflict do nothing`
+ * and the caller is told `published`. That is how a participant first written as
+ * `kind = 'model'` can later be sealed against as a baseline: the client-side
+ * `model_without_attempt` guard checks what the CALLER said, and the stored row
+ * says otherwise. Measured — the decision landed with `attempt_id` NULL under a
+ * participant PostgreSQL still calls a model.
  *
- * THE RETRY IN `publish` IS WHAT MAKES THAT SAFE. The `not exists` guard on each
- * insert reduces how often it has to fire, by skipping the speculative insert
- * entirely once the parent is committed and visible — which is every write after
- * the first. It is an optimisation, not the correctness mechanism, and the honest
- * bound is that only its PRESENCE is pinned: removing it turns a string test red,
- * while the conformance suite stays green because the retry absorbs the outcome.
+ * So every fact the caller supplies for a parent is compared against the stored
+ * one, and any disagreement both BLOCKS the write and is reported.
+ *
+ * The comparison here reads the statement's own snapshot, which cannot see a
+ * concurrent writer that has not committed yet. `verifyDrift` re-runs it after
+ * the write for exactly that case. Because these tables are append-only, a
+ * post-write read is authoritative rather than merely luckier: whatever it sees
+ * is final.
+ */
+const RUN_DRIFT = `
+  select t.f
+    from public.benchmark_runs r, input,
+         lateral unnest(
+           array['run.slateDate','run.startedAt','run.bundleSha256','run.planSha256',
+                 'run.promptScaffoldSha256','run.promptScaffoldVersion',
+                 'run.responseSchemaVersion','run.baselinePolicyVersion',
+                 'run.priceVersion','run.benchmarkCommit','run.executionPolicy'],
+           array[r.slate_date               is distinct from input.slate_date,
+                 r.started_at               is distinct from input.started_at,
+                 r.bundle_sha256            is distinct from input.run_bundle_sha256,
+                 r.plan_sha256              is distinct from input.plan_sha256,
+                 r.prompt_scaffold_sha256   is distinct from input.prompt_scaffold_sha256,
+                 r.prompt_scaffold_version  is distinct from input.prompt_scaffold_version,
+                 r.response_schema_version  is distinct from input.run_response_schema_version,
+                 r.baseline_policy_version  is distinct from input.baseline_policy_version,
+                 r.price_version            is distinct from input.run_price_version,
+                 r.benchmark_commit         is distinct from input.benchmark_commit,
+                 r.execution_policy         is distinct from input.execution_policy]
+         ) as t(f, differs)
+   where r.run_id = input.run_id and t.differs`;
+
+const PARTICIPANT_DRIFT = `
+  select t.f
+    from public.benchmark_participants p, input,
+         lateral unnest(
+           array['participant.kind','participant.labId','participant.displayName'],
+           array[p.kind         is distinct from input.kind,
+                 p.lab_id       is distinct from input.lab_id,
+                 p.display_name is distinct from input.display_name]
+         ) as t(f, differs)
+   where p.participant_id = input.participant_id and t.differs`;
+
+const ROSTER_DRIFT = `
+  select t.f
+    from public.benchmark_cohort_participants c, input,
+         lateral unnest(
+           array['roster.armId','roster.walletAddress'],
+           array[c.arm_id         is distinct from input.arm_id,
+                 c.wallet_address is distinct from input.wallet_address]
+         ) as t(f, differs)
+   where c.cohort_id = input.cohort_id
+     and c.participant_id = input.participant_id and t.differs`;
+
+const IDENTITY_DRIFT = `${RUN_DRIFT}\n  union all${PARTICIPANT_DRIFT}\n  union all${ROSTER_DRIFT}`;
+
+/**
+ * The run, participant and roster rows every write shares.
+ *
+ * Each insert is guarded three ways. `not exists` skips the speculative insert
+ * once the parent is committed and visible, which is every write after the
+ * first — an optimisation, not the correctness mechanism (the retry in `publish`
+ * is that, and removing this guard reddens only a string test). `gate.ok` is the
+ * correctness part: it suppresses every insert when a durable fact disagrees or
+ * the child cannot land, so a refused write leaves NO residue. Without it,
+ * `parent_missing` committed a run, a participant and a roster row while
+ * reporting that nothing was inserted — and the roster it left behind was
+ * immutable, so publishing the real attempt afterwards could only contradict it.
  */
 const IDENTITY_CTES = `
-run_ins as (
+gate as (
+  select not exists (select 1 from drift) and exists (select 1 from child_ready) as ok
+), run_ins as (
   insert into public.benchmark_runs
     (run_id, cohort_id, slate_date, network, deployment_round, started_at,
      bundle_sha256, plan_sha256, prompt_scaffold_sha256, prompt_scaffold_version,
@@ -829,16 +961,18 @@ run_ins as (
          run_bundle_sha256, plan_sha256, prompt_scaffold_sha256, prompt_scaffold_version,
          run_response_schema_version, baseline_policy_version, run_price_version,
          benchmark_commit, execution_policy, source_path, source_sha256
-    from input
-   where not exists (select 1 from public.benchmark_runs r where r.run_id = input.run_id)
+    from input, gate
+   where gate.ok
+     and not exists (select 1 from public.benchmark_runs r where r.run_id = input.run_id)
   on conflict (run_id) do nothing
   returning 1
 ), participant_ins as (
   insert into public.benchmark_participants
     (participant_id, kind, lab_id, display_name, source_path, source_sha256)
   select participant_id, kind, lab_id, display_name, source_path, source_sha256
-    from input
-   where not exists (select 1 from public.benchmark_participants p
+    from input, gate
+   where gate.ok
+     and not exists (select 1 from public.benchmark_participants p
                       where p.participant_id = input.participant_id)
   on conflict (participant_id) do nothing
   returning 1
@@ -846,8 +980,9 @@ run_ins as (
   insert into public.benchmark_cohort_participants
     (cohort_id, participant_id, network, arm_id, wallet_address, source_path, source_sha256)
   select cohort_id, participant_id, network, arm_id, wallet_address, source_path, source_sha256
-    from input
-   where not exists (select 1 from public.benchmark_cohort_participants c
+    from input, gate
+   where gate.ok
+     and not exists (select 1 from public.benchmark_cohort_participants c
                       where c.cohort_id = input.cohort_id
                         and c.participant_id = input.participant_id)
   -- Targets the PRIMARY KEY rather than being a bare \`do nothing\`, which would
@@ -856,20 +991,6 @@ run_ins as (
   -- maker and benchmark taker in the same run.
   on conflict (cohort_id, participant_id) do nothing
   returning 1
-), roster_conflict as (
-  -- FIRST WRITE WINS on the roster and the writer holds no UPDATE, so a later,
-  -- different wallet or arm id is not stored. Silently dropping the wallet would
-  -- kill the join from a forecast to its on-chain fill for the whole cohort, so
-  -- the disagreement is reported instead.
-  select 'roster.walletAddress' as field
-    from public.benchmark_cohort_participants c, input
-   where c.cohort_id = input.cohort_id and c.participant_id = input.participant_id
-     and c.wallet_address is distinct from input.wallet_address
-  union all
-  select 'roster.armId'
-    from public.benchmark_cohort_participants c, input
-   where c.cohort_id = input.cohort_id and c.participant_id = input.participant_id
-     and c.arm_id is distinct from input.arm_id
 )`;
 
 const ATTEMPT_SQL = `
@@ -892,6 +1013,26 @@ with input as (
     billable_search_count integer, search_evidence_status text,
     cost_usd numeric(18,6), attempt_price_version text,
     source_path text, source_sha256 text)
+), drift as (${IDENTITY_DRIFT}
+  union all
+  -- The three attempt facts the seal's eligibility test reads. A replay that
+  -- flips one of them would otherwise be absorbed while changing what the
+  -- already-published decisions are entitled to cite.
+  select t.f
+    from public.benchmark_arm_attempts a, input,
+         lateral unnest(
+           array['facts.sent','facts.outcome','facts.suppliedMarkets'],
+           array[a.sent             is distinct from input.sent,
+                 a.outcome          is distinct from input.attempt_outcome,
+                 a.supplied_markets is distinct from input.supplied_markets]
+         ) as t(f, differs)
+   where a.cohort_id = input.cohort_id and a.participant_id = input.participant_id
+     and a.game_id = input.game_id and a.attempt_ordinal = input.attempt_ordinal
+     and t.differs
+), child_ready as (
+  -- An attempt has no parent to wait for; the CTE exists so the shared identity
+  -- gate has the same shape in both statements.
+  select 1 from input
 ), ${IDENTITY_CTES}, attempt_ins as (
   insert into public.benchmark_arm_attempts
     (cohort_id, participant_id, network, game_id, attempt_ordinal, run_id,
@@ -908,22 +1049,39 @@ with input as (
          input_tokens, output_tokens, reasoning_tokens, billable_output_tokens,
          billable_search_count, search_evidence_status, cost_usd, attempt_price_version,
          source_path, source_sha256
-    from input
+    from input, gate
+   where gate.ok
   on conflict on constraint uq_benchmark_arm_attempt do nothing
   returning 1
 )
-select (select min(field) from roster_conflict)  as contradiction,
-       1                                         as parent_found,
-       (select count(*) from attempt_ins)::int   as inserted`;
+select (select min(f) from drift)             as contradiction,
+       null::text                             as ineligible_reason,
+       1                                      as parent_found,
+       (select count(*) from attempt_ins)::int as inserted`;
 
 /**
  * A forecast at seal time. The attempt is resolved by its natural key and is NOT
- * written here — publish it first. Zero rows from `attempt` therefore means the
- * call was never published, which is actionable, rather than a race whose only
- * safe reading was "try again".
+ * written here — publish it first.
  *
- * A baseline supplies no ordinal and takes the literal NULL branch, so `attempt`
- * still yields exactly one row and `parent_found` stays 1.
+ * ⚠ RESOLVING IT IS NOT ENOUGH: THE ATTEMPT MUST BE ONE THAT COULD HAVE PRODUCED
+ *   THIS FORECAST. Three ways it might not be, all measured landing a published
+ *   decision before this check existed:
+ *
+ *     sent = false            a call that never reached the provider cannot have
+ *                             returned a pick. The schema keeps the row so a
+ *                             failed arm stays in the denominator — citing it
+ *                             turns that denominator into a numerator.
+ *     outcome not accepted    only an accepted call yields decisions. A
+ *                             timed-out or non-final arm scoring 1/1 is the
+ *                             coverage figure inverted.
+ *     market not supplied     a forecast on a market the frozen bundle never
+ *                             offered. `supplied_markets` IS the per-market
+ *                             eligible denominator, so this scores a pick
+ *                             against an opportunity that did not exist.
+ *
+ *   Each is reported as `attempt_not_eligible` with the reason, distinct from
+ *   `parent_missing`, because "you published the wrong attempt" and "you did not
+ *   publish one" are different producer bugs.
  */
 const SEAL_SQL = `
 with input as (
@@ -937,47 +1095,94 @@ with input as (
     participant_id text, kind text, lab_id text, display_name text,
     arm_id text, wallet_address text,
     game_id text, has_attempt boolean, attempt_ordinal smallint,
+    accepted_outcomes text[],
     market text, contest_id text, speculation_id text, sealed_at timestamptz,
     forecast_digest text, rationale_digest text, decision_bundle_sha256 text,
     decision_response_schema_version smallint,
     source_path text, source_sha256 text)
-), ${IDENTITY_CTES}, attempt as (
-  select a.id
+), drift as (${IDENTITY_DRIFT}
+  union all
+  -- The seal IS the pregame commitment. A second seal for the same key carrying
+  -- a DIFFERENT digest is the one integrity failure this projection exists to
+  -- make visible, and \`on conflict do nothing\` alone reports it as a replay.
+  select 'forecastDigest'
+    from public.benchmark_decisions d, input
+   where d.cohort_id = input.cohort_id and d.participant_id = input.participant_id
+     and d.game_id = input.game_id and d.market = input.market
+     and d.forecast_digest is distinct from input.forecast_digest
+), cited as (
+  select a.id, a.sent, a.outcome, a.supplied_markets
     from public.benchmark_arm_attempts a, input
    where input.has_attempt
      and a.cohort_id = input.cohort_id
      and a.participant_id = input.participant_id
      and a.game_id = input.game_id
      and a.attempt_ordinal = input.attempt_ordinal
+), ineligible as (
+  select t.f
+    from cited, input,
+         lateral unnest(
+           array['unsent','outcome_not_accepted','market_not_supplied'],
+           array[not cited.sent,
+                 not (cited.outcome = any(input.accepted_outcomes)),
+                 not (input.market = any(cited.supplied_markets))]
+         ) as t(f, differs)
+   where t.differs
+), child_ready as (
+  select cited.id from cited where not exists (select 1 from ineligible)
   union all
   select null::bigint from input where not input.has_attempt
-), seal_conflict as (
-  -- The seal IS the pregame commitment. A second seal for the same key carrying a
-  -- DIFFERENT digest is the one integrity failure this projection exists to make
-  -- visible, and \`on conflict do nothing\` alone would report it as a benign replay.
-  select 'forecastDigest' as field
-    from public.benchmark_decisions d, input
-   where d.cohort_id = input.cohort_id and d.participant_id = input.participant_id
-     and d.game_id = input.game_id and d.market = input.market
-     and d.forecast_digest is distinct from input.forecast_digest
-), decision_ins as (
+), ${IDENTITY_CTES}, decision_ins as (
   insert into public.benchmark_decisions
     (cohort_id, participant_id, network, game_id, market, run_id, deployment_round,
      contest_id, speculation_id, attempt_id, sealed_at, forecast_digest,
      rationale_digest, bundle_sha256, response_schema_version, source_path, source_sha256)
   select input.cohort_id, input.participant_id, input.network, input.game_id, input.market,
          input.run_id, input.deployment_round, input.contest_id, input.speculation_id,
-         attempt.id, input.sealed_at, input.forecast_digest, input.rationale_digest,
+         child_ready.id, input.sealed_at, input.forecast_digest, input.rationale_digest,
          input.decision_bundle_sha256, input.decision_response_schema_version,
          input.source_path, input.source_sha256
-    from input, attempt
+    from input, child_ready, gate
+   where gate.ok
   on conflict on constraint uq_benchmark_decision do nothing
   returning 1
 )
-select coalesce((select min(field) from seal_conflict),
-                (select min(field) from roster_conflict)) as contradiction,
-       (select count(*) from attempt)::int                as parent_found,
-       (select count(*) from decision_ins)::int           as inserted`;
+select (select min(f) from drift)                as contradiction,
+       (select min(f) from ineligible)           as ineligible_reason,
+       (select count(*) from child_ready)::int   as parent_found,
+       (select count(*) from decision_ins)::int  as inserted`;
+
+/**
+ * The same drift comparison, as a plain read. Run AFTER the write, because the
+ * in-statement copy uses a snapshot that cannot see a concurrent writer which
+ * has not committed yet — measured: twelve concurrent seals of one key with
+ * twelve different digests did not all report the contradiction.
+ *
+ * These tables are append-only and the writer holds no UPDATE, so a row's facts
+ * never change once written. That is what makes a read-after-write authoritative
+ * here rather than just a second roll of the dice: whatever this sees is final.
+ */
+const VERIFY_IDENTITY_SQL = `
+with input as (
+  select * from jsonb_to_record($1::jsonb) as x(
+    run_id text, cohort_id text, slate_date date,
+    started_at timestamptz, run_bundle_sha256 text, plan_sha256 text,
+    prompt_scaffold_sha256 text, prompt_scaffold_version text,
+    run_response_schema_version smallint, baseline_policy_version text,
+    run_price_version text, benchmark_commit text, execution_policy text,
+    participant_id text, kind text, lab_id text, display_name text,
+    arm_id text, wallet_address text,
+    game_id text, market text, forecast_digest text)
+), drift as (${IDENTITY_DRIFT}
+  union all
+  select 'forecastDigest'
+    from public.benchmark_decisions d, input
+   where input.market is not null
+     and d.cohort_id = input.cohort_id and d.participant_id = input.participant_id
+     and d.game_id = input.game_id and d.market = input.market
+     and d.forecast_digest is distinct from input.forecast_digest
+)
+select (select min(f) from drift) as contradiction`;
 
 /**
  * The forecast, as an insert-once child. `sealed_at` is COPIED from the parent
@@ -1021,6 +1226,7 @@ with input as (
   returning 1
 )
 select null::text                          as contradiction,
+       null::text                          as ineligible_reason,
        (select count(*) from parent)::int  as parent_found,
        (select count(*) from ins)::int     as inserted`;
 
@@ -1046,6 +1252,7 @@ with input as (
   returning 1
 )
 select null::text                          as contradiction,
+       null::text                          as ineligible_reason,
        (select count(*) from parent)::int  as parent_found,
        (select count(*) from ins)::int     as inserted`;
 
@@ -1092,6 +1299,7 @@ with input as (
   returning 1
 )
 select null::text                          as contradiction,
+       null::text                          as ineligible_reason,
        (select count(*) from parent)::int  as parent_found,
        (select count(*) from ins)::int     as inserted`;
 
@@ -1120,6 +1328,7 @@ with input as (
   returning 1
 )
 select null::text                       as contradiction,
+       null::text                       as ineligible_reason,
        1                                as parent_found,
        (select count(*) from ins)::int  as inserted`;
 
@@ -1132,6 +1341,7 @@ export const SERVING_STATEMENTS = Object.freeze({
   rationale: RATIONALE_SQL,
   score: SCORE_SQL,
   scoringRun: SCORING_RUN_SQL,
+  verifyIdentity: VERIFY_IDENTITY_SQL,
 });
 
 // ---------------------------------------------------------------------------
@@ -1168,6 +1378,23 @@ const RACEABLE_CONSTRAINTS: ReadonlySet<string> = new Set([
 /** Serialization failure and deadlock: retryable by definition. */
 const RACEABLE_SQLSTATES: ReadonlySet<string> = new Set(['40001', '40P01']);
 
+/**
+ * SQLSTATE classes that mean the server could not serve this RIGHT NOW, rather
+ * than that it rejected this row. Reported as `unavailable`, because the two
+ * call for opposite responses: a refusal is a producer bug to fix, an outage is
+ * a thing to retry or drop.
+ *
+ *   08  connection exception
+ *   53  insufficient resources — including 53300 too_many_connections, which is
+ *       not exotic here: the scoped role carries CONNECTION LIMIT 5 and a
+ *       fan-out that ignores it gets this instead of a write. Measured while
+ *       chasing what looked like concurrent data loss and was in fact a probe
+ *       opening twelve connections against a limit of five.
+ *   57  operator intervention (shutdown, admin cancel, statement timeout kin)
+ *   58  system error
+ */
+const TRANSIENT_SQLSTATE_CLASSES: ReadonlySet<string> = new Set(['08', '53', '57', '58']);
+
 function isLostRace(outcome: PublishOutcome): boolean {
   if (outcome.outcome !== 'refused') return false;
   if (RACEABLE_SQLSTATES.has(outcome.sqlstate)) return true;
@@ -1187,6 +1414,7 @@ function classify(error: unknown): PublishOutcome {
   const detail = redactSecrets(raw).slice(0, DETAIL_LIMIT);
   const code: unknown = (error as { code?: unknown } | null)?.code;
   if (typeof code === 'string' && SQLSTATE.test(code)) {
+    if (TRANSIENT_SQLSTATE_CLASSES.has(code.slice(0, 2))) return { outcome: 'unavailable', detail };
     const named: unknown = (error as { constraint?: unknown }).constraint;
     return {
       outcome: 'refused',
@@ -1209,11 +1437,19 @@ function classifyRows(rows: ReadonlyArray<Record<string, unknown>>): PublishOutc
   const parentFound = row?.['parent_found'];
   const inserted = row?.['inserted'];
   const contradiction = row?.['contradiction'];
+  const ineligible = row?.['ineligible_reason'];
   if (typeof parentFound !== 'number' || typeof inserted !== 'number'
-      || (contradiction !== null && typeof contradiction !== 'string')) {
+      || (contradiction !== null && typeof contradiction !== 'string')
+      || (ineligible !== null && typeof ineligible !== 'string')) {
     return { outcome: 'unavailable', detail: `off-contract result shape (${rows.length} row(s))` };
   }
+  // Precedence, and it is deliberate: a disagreement about a commitment outranks
+  // everything, then an attempt that cannot carry the forecast, then absence.
+  // Each of the first three means NOTHING was written.
   if (typeof contradiction === 'string') return { outcome: 'contradiction', field: contradiction };
+  if (typeof ineligible === 'string') {
+    return { outcome: 'attempt_not_eligible', reason: ineligible as AttemptIneligibleReason };
+  }
   if (parentFound === 0) return { outcome: 'parent_missing' };
   if (inserted === 0) return { outcome: 'duplicate' };
   return { outcome: 'published' };
@@ -1235,11 +1471,11 @@ export class SqlBenchmarkServingPort implements BenchmarkServingPort {
   constructor(private readonly query: StoreQuery | null) {}
 
   publishAttempt(attempt: ArmAttempt): Promise<PublishOutcome> {
-    return this.publish(ATTEMPT_SQL, () => attemptPayload(attempt));
+    return this.publish(ATTEMPT_SQL, () => attemptPayload(attempt), true);
   }
 
   sealDecision(seal: DecisionSeal): Promise<PublishOutcome> {
-    return this.publish(SEAL_SQL, () => sealPayload(seal));
+    return this.publish(SEAL_SQL, () => sealPayload(seal), true);
   }
 
   revealDecision(reveal: DecisionReveal): Promise<PublishOutcome> {
@@ -1271,26 +1507,53 @@ export class SqlBenchmarkServingPort implements BenchmarkServingPort {
    * skips the insert that collided. Bounded at one so a persistent 23505 — which
    * would mean the allowlist is wrong — surfaces instead of spinning.
    */
-  private async publish(sql: string, build: () => Record<string, unknown>): Promise<PublishOutcome> {
+  private async publish(
+    sql: string,
+    build: () => Record<string, unknown>,
+    verifyDrift = false,
+  ): Promise<PublishOutcome> {
     if (this.query === null) return { outcome: 'disabled' };
-    let payload: Record<string, unknown>;
+    let parameters: readonly unknown[];
     try {
-      payload = build();
+      // SERIALISATION IS INSIDE THE BOUNDARY. It was not, and a runtime value of
+      // the wrong type — `turnCompleted: 1n`, measured — made JSON.stringify
+      // throw a TypeError straight out of a method documented never to throw.
+      // Booleans are type-checked now too, but the boundary is what makes the
+      // guarantee hold for the next value nobody anticipated.
+      parameters = [JSON.stringify(build())];
     } catch (error) {
       if (error instanceof Refusal) {
         return { outcome: 'invalid_input', reason: error.reason, field: error.field };
       }
       return classify(error);
     }
-    const parameters = [JSON.stringify(payload)];
-    const once = async (): Promise<PublishOutcome> => {
+    const run = async (statement: string): Promise<PublishOutcome> => {
       try {
-        return classifyRows(await this.query!(sql, parameters));
+        return classifyRows(await this.query!(statement, parameters));
       } catch (error) {
         return classify(error);
       }
     };
-    const first = await once();
-    return isLostRace(first) ? await once() : first;
+
+    const first = await run(sql);
+    const written = isLostRace(first) ? await run(sql) : first;
+    if (!verifyDrift || written.outcome === 'refused' || written.outcome === 'unavailable') {
+      return written;
+    }
+
+    // The in-statement drift check reads this statement's own snapshot, so it
+    // cannot see a writer that had not committed when the snapshot was taken.
+    // Re-asking after the write closes that: these tables are append-only and
+    // the writer holds no UPDATE, so a row's facts never change once written and
+    // what this read sees is final rather than merely later.
+    try {
+      const rows = await this.query(VERIFY_IDENTITY_SQL, parameters);
+      const field = rows.length === 1 ? rows[0]?.['contradiction'] : undefined;
+      if (typeof field === 'string') return { outcome: 'contradiction', field };
+    } catch {
+      // A failed second read must not turn a good write into an error. The write
+      // reported what it reported; this pass simply could not add to it.
+    }
+    return written;
   }
 }

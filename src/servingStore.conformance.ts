@@ -131,7 +131,10 @@ async function main(): Promise<void> {
 
   const pool = new Pool({
     host: HOST, port: PORT, database: NAME, user: 'benchmark_writer', password: PASSWORD,
-    max: 6, connectionTimeoutMillis: 10_000,
+    // At most 4: the scoped role carries CONNECTION LIMIT 5, and exceeding it
+    // returns 53300 rather than a write. A suite that ignores the limit measures
+    // its own pool, not the code — 29 of 36 concurrent seals 'lost' that way.
+    max: 4, connectionTimeoutMillis: 10_000,
   });
   const query = pgStoreQuery(pool);
   const port = new SqlBenchmarkServingPort(query);
@@ -238,6 +241,33 @@ async function main(): Promise<void> {
          from public.benchmark_decisions where cohort_id = $1`, [cohortId]);
     assert.equal(rows[0]!['decisions'], 3);
     assert.equal(rows[0]!['attempts'], 1, 'all three cite ONE attempt — telemetry counted once');
+  });
+
+  await check('a full arm fan-out seals concurrently with NO loss', async () => {
+    // The realistic shape at realistic width: twelve arms on one game, each with
+    // three markets, all sharing one run row — 12 concurrent attempts then 36
+    // concurrent seals. Every one must land; anything less is silent data loss
+    // on a benchmark night, which is precisely when this runs.
+    const cohortId = cohortName('fanout');
+    const ids = Array.from({ length: 12 }, (_, i) => `${cohortId}-p${i}`);
+    const attempts = await Promise.all(ids.map((participantId) =>
+      port.publishAttempt(armAttempt(cohortId, {
+        participant: { ...MODEL, participantId, labId: null },
+        facts: facts({ suppliedMarkets: ['moneyline', 'spread', 'total'] }),
+      }))));
+    assert.deepEqual([...new Set(attempts.map((o) => o.outcome))], ['published'],
+      `attempts: ${JSON.stringify(attempts)}`);
+    const markets = ['moneyline', 'spread', 'total'] as const;
+    const seals = await Promise.all(ids.flatMap((participantId, i) => markets.map((market, j) =>
+      port.sealDecision(decisionSeal(cohortId, {
+        participant: { ...MODEL, participantId, labId: null },
+        market, forecastDigest: DIGEST(0x1000 + i * 8 + j),
+      })))));
+    assert.deepEqual([...new Set(seals.map((o) => o.outcome))], ['published'],
+      `seals: ${JSON.stringify(seals.filter((o) => o.outcome !== 'published'))}`);
+    const n = await query(
+      'select count(*)::int as n from public.benchmark_decisions where cohort_id = $1', [cohortId]);
+    assert.equal(n[0]!['n'], 36, 'all 36 forecasts stored');
   });
 
   await check('four participants sharing one run row write concurrently without loss', async () => {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SERVING_STATEMENTS, SqlBenchmarkServingPort } from './servingStore.js';
+import { ACCEPTED_ATTEMPT_OUTCOMES, SERVING_STATEMENTS, SqlBenchmarkServingPort } from './servingStore.js';
 import type {
   ArmAttempt,
   AttemptFacts,
@@ -40,20 +40,31 @@ interface Call {
 /** Each invocation records the call and shifts the next canned response. */
 function scriptedQuery(
   responses: Array<ReadonlyArray<Record<string, unknown>> | Error>,
-): { query: StoreQuery; calls: Call[] } {
+  drift: string | null = null,
+): { query: StoreQuery; calls: Call[]; writes: () => number; verifications: () => number } {
   const calls: Call[] = [];
+  const isVerify = (sql: string): boolean => sql === SERVING_STATEMENTS.verifyIdentity;
   const query: StoreQuery = async (sql, params) => {
     calls.push({ sql, params });
+    // The post-write drift read is answered CLEAN automatically rather than
+    // consuming a scripted response, so a test about the write path scripts only
+    // the write. Pass `drift` to make the verification report one.
+    if (isVerify(sql)) return [{ contradiction: drift }];
     const next = responses.shift();
     if (next === undefined) throw new Error(`scripted query exhausted (call ${calls.length})`);
     if (next instanceof Error) throw next;
     return next;
   };
-  return { query, calls };
+  return {
+    query,
+    calls,
+    writes: () => calls.filter((c) => !isVerify(c.sql)).length,
+    verifications: () => calls.filter((c) => isVerify(c.sql)).length,
+  };
 }
 
 const row = (over: Record<string, unknown> = {}): ReadonlyArray<Record<string, unknown>> =>
-  [{ contradiction: null, parent_found: 1, inserted: 1, ...over }];
+  [{ contradiction: null, ineligible_reason: null, parent_found: 1, inserted: 1, ...over }];
 const OK = row();
 const DUP = row({ inserted: 0 });
 const ORPHAN = row({ parent_found: 0, inserted: 0 });
@@ -293,7 +304,7 @@ test('one statement per publish, and the row counts map to the outcome', async (
   for (const [name, call] of EVERY_METHOD) {
     const ok = scriptedQuery([OK]);
     assert.deepEqual(await call(new SqlBenchmarkServingPort(ok.query)), { outcome: 'published' }, name);
-    assert.equal(ok.calls.length, 1, `${name} issues exactly one statement`);
+    assert.equal(ok.writes(), 1, `${name} issues exactly one WRITE statement`);
 
     const dup = scriptedQuery([DUP]);
     assert.deepEqual(await call(new SqlBenchmarkServingPort(dup.query)), { outcome: 'duplicate' }, name);
@@ -331,7 +342,8 @@ test('a contradiction outranks every other branch', async () => {
   for (const [name, call] of EVERY_METHOD) {
     for (const shape of [row({ contradiction: 'forecastDigest' }),
                          row({ contradiction: 'forecastDigest', inserted: 0 }),
-                         row({ contradiction: 'roster.walletAddress', parent_found: 0, inserted: 0 })]) {
+                         row({ contradiction: 'roster.walletAddress', parent_found: 0, inserted: 0 }),
+                         row({ contradiction: 'participant.kind', ineligible_reason: 'unsent' })]) {
       const s = scriptedQuery([shape]);
       const out = await call(new SqlBenchmarkServingPort(s.query));
       assert.equal(out.outcome, 'contradiction', `${name} on ${JSON.stringify(shape[0])}`);
@@ -351,8 +363,11 @@ test('the seal statement really does compare the stored digest', async () => {
 });
 
 test('an off-contract result shape resolves to unavailable rather than throwing', async () => {
-  for (const rows of [[], [{}], [{ contradiction: null, parent_found: 'one', inserted: 1 }],
-    [{ contradiction: 7, parent_found: 1, inserted: 1 }], [OK[0]!, OK[0]!]]) {
+  for (const rows of [[], [{}],
+    [{ contradiction: null, ineligible_reason: null, parent_found: 'one', inserted: 1 }],
+    [{ contradiction: 7, ineligible_reason: null, parent_found: 1, inserted: 1 }],
+    [{ contradiction: null, ineligible_reason: 9, parent_found: 1, inserted: 1 }],
+    [OK[0]!, OK[0]!]]) {
     const s = scriptedQuery([rows]);
     const out = await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
     assert.equal(out.outcome, 'unavailable', `rows=${JSON.stringify(rows)}`);
@@ -374,7 +389,7 @@ test('a database refusal carries its SQLSTATE and constraint', async () => {
     constraint: 'fk_benchmark_decision_attempt',
     detail: 'Error: violates foreign key constraint',
   });
-  assert.equal(s.calls.length, 1, 'an integrity refusal is NOT retried');
+  assert.equal(s.writes(), 1, 'an integrity refusal is NOT retried');
 });
 
 test('detail can quote the offending value, which is why it is diagnostic and not public', async () => {
@@ -396,6 +411,26 @@ test('a privilege refusal is reported as refused, not as an outage', async () =>
   assert.equal(out.outcome, 'refused');
   assert.equal(out.outcome === 'refused' ? out.sqlstate : null, '42501');
   assert.equal(out.outcome === 'refused' ? out.constraint : 'unset', null, 'no constraint named');
+});
+
+test('an outage that DOES carry a SQLSTATE is still unavailable, not refused', async () => {
+  // 53300 too_many_connections is the one that prompted this: the scoped role
+  // carries CONNECTION LIMIT 5, and a fan-out that exceeds it gets a server
+  // error with a SQLSTATE. Reporting that as `refused` reads as "the database
+  // rejected your row" — the caller would go hunting for a producer bug that
+  // does not exist, and would not retry the thing that would have worked.
+  for (const code of ['53300', '53200', '08006', '08003', '57014', '58030']) {
+    const s = scriptedQuery([Object.assign(new Error('transient'), { code })]);
+    const out = await new SqlBenchmarkServingPort(s.query).publishScore(score());
+    assert.equal(out.outcome, 'unavailable', code);
+  }
+  // The paired accept: a genuine rejection still reports as one, so this is not
+  // a blanket downgrade of every server error.
+  for (const code of ['23505', '23503', '42501', '22008']) {
+    const s = scriptedQuery([Object.assign(new Error('rejected'), { code })]);
+    const out = await new SqlBenchmarkServingPort(s.query).publishScore(score());
+    assert.equal(out.outcome, 'refused', code);
+  }
 });
 
 test('a failure with no SQLSTATE is unavailable', async () => {
@@ -420,13 +455,13 @@ test('a lost race on a SHARED parent row is retried exactly once', async () => {
     const s = scriptedQuery([Object.assign(new Error('duplicate key'), { code: '23505', constraint }), OK]);
     assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal()),
       { outcome: 'published' }, constraint);
-    assert.equal(s.calls.length, 2, `${constraint} was retried`);
+    assert.equal(s.writes(), 2, `${constraint} was retried`);
   }
   for (const code of ['40001', '40P01']) {
     const s = scriptedQuery([Object.assign(new Error('serialization'), { code }), OK]);
     assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal()),
       { outcome: 'published' }, code);
-    assert.equal(s.calls.length, 2);
+    assert.equal(s.writes(), 2);
   }
 });
 
@@ -436,7 +471,7 @@ test('the retry is bounded at one, so a persistent race surfaces', async () => {
   const s = scriptedQuery([err(), err()]);
   const out = await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
   assert.equal(out.outcome, 'refused');
-  assert.equal(s.calls.length, 2, 'exactly two attempts, never a third');
+  assert.equal(s.writes(), 2, 'exactly two attempts, never a third');
 });
 
 test('an INTEGRITY violation is never retried — the allowlist is not "any 23505"', async () => {
@@ -446,7 +481,7 @@ test('an INTEGRITY violation is never retried — the allowlist is not "any 2350
     const s = scriptedQuery([Object.assign(new Error('violation'), { code: '23505', constraint })]);
     const out = await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
     assert.equal(out.outcome, 'refused', String(constraint));
-    assert.equal(s.calls.length, 1, `${String(constraint)} must NOT be retried`);
+    assert.equal(s.writes(), 1, `${String(constraint)} must NOT be retried`);
   }
 });
 
@@ -563,7 +598,13 @@ test('the reveal does NOT send sealed_at — the statement copies it from the pa
 
 test('every statement is an append that can never overwrite', async () => {
   for (const [name, sql] of Object.entries(SERVING_STATEMENTS)) {
-    assert.ok(/on conflict[\s\S]*?do nothing/i.test(sql), `${name} resolves a conflict by doing nothing`);
+    // The verifier is a pure read. It has no conflict to resolve, and requiring
+    // one of it would assert the wrong thing about the right statement.
+    if (name === 'verifyIdentity') {
+      assert.ok(!/\binsert\b/i.test(sql), 'the verifier writes nothing at all');
+    } else {
+      assert.ok(/on conflict[\s\S]*?do nothing/i.test(sql), `${name} resolves a conflict by doing nothing`);
+    }
     assert.ok(!/do update/i.test(sql), `${name} contains no DO UPDATE`);
     assert.ok(!/\bupdate\s+public\./i.test(sql), `${name} updates no table`);
     assert.ok(!/\bdelete\s+from\b/i.test(sql), `${name} deletes nothing`);
@@ -584,7 +625,7 @@ test('each shared parent insert is guarded by not exists as well as on conflict'
   // cover; without it every write speculatively inserts every parent row.
   for (const sql of [SERVING_STATEMENTS.attempt, SERVING_STATEMENTS.seal]) {
     for (const table of ['benchmark_runs', 'benchmark_participants', 'benchmark_cohort_participants']) {
-      assert.ok(new RegExp(`where not exists \\(select 1 from public\\.${table}\\b`).test(sql),
+      assert.ok(new RegExp(`not exists \\(select 1 from public\\.${table}\\b`).test(sql),
         `${table} insert is guarded`);
     }
   }
@@ -832,4 +873,168 @@ test('a network outside the enum is refused before the cast', async () => {
   assert.deepEqual(
     await refusal((p) => p.sealDecision(seal({ run: { ...RUN, network: 'ethereum' as never } }))),
     { outcome: 'invalid_input', reason: 'network_out_of_domain', field: 'run.network' });
+});
+
+// ---------------------------------------------------------------------------
+// Attempt eligibility - resolving an attempt is not the same as it being usable
+// ---------------------------------------------------------------------------
+
+test('an attempt that exists but cannot carry the forecast is its own outcome', async () => {
+  // Distinct from parent_missing on purpose: "you published the wrong attempt"
+  // and "you published none" are different producer bugs. All three of these
+  // landed a PUBLISHED decision before the eligibility test existed.
+  for (const reason of ['unsent', 'outcome_not_accepted', 'market_not_supplied']) {
+    const s = scriptedQuery([row({ ineligible_reason: reason, parent_found: 0, inserted: 0 })]);
+    assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal()),
+      { outcome: 'attempt_not_eligible', reason }, reason);
+  }
+});
+
+test('the seal statement tests all three eligibility conditions', () => {
+  // Anchored on the executable comparison, not the prose explaining it: a
+  // substring test for a word like "unsent" would match the comment too.
+  assert.match(SERVING_STATEMENTS.seal, /array\[not cited\.sent,/);
+  assert.match(SERVING_STATEMENTS.seal, /not \(cited\.outcome = any\(input\.accepted_outcomes\)\)/);
+  assert.match(SERVING_STATEMENTS.seal, /not \(input\.market = any\(cited\.supplied_markets\)\)/);
+});
+
+test('the accepted-outcome set is sent with the seal, not assumed by the SQL', async () => {
+  const s = scriptedQuery([OK]);
+  await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+  assert.deepEqual(sentPayload(s.calls)['accepted_outcomes'], [...ACCEPTED_ATTEMPT_OUTCOMES]);
+  assert.deepEqual([...ACCEPTED_ATTEMPT_OUTCOMES], ['valid'],
+    'widening this is a deliberate change to what may carry a decision');
+});
+
+// ---------------------------------------------------------------------------
+// Durable-fact drift, and the write suppression that goes with it
+// ---------------------------------------------------------------------------
+
+test('every durable parent fact a caller supplies is compared against the stored one', () => {
+  // A participant first written as kind=model and later sealed against as a
+  // baseline produced a published decision with attempt_id NULL under a
+  // participant the database still calls a model. The model_without_attempt
+  // guard checks what the CALLER said; only this comparison sees what is stored.
+  for (const fragment of [
+    /'participant\.kind','participant\.labId','participant\.displayName'/,
+    /p\.kind\s+is distinct from input\.kind/,
+    /'roster\.armId','roster\.walletAddress'/,
+    /'run\.slateDate','run\.startedAt'/,
+    /r\.slate_date\s+is distinct from input\.slate_date/,
+  ]) {
+    assert.match(SERVING_STATEMENTS.seal, fragment);
+    assert.match(SERVING_STATEMENTS.attempt, fragment);
+    assert.match(SERVING_STATEMENTS.verifyIdentity, fragment);
+  }
+});
+
+test('a contradiction or an unusable attempt writes NOTHING, including the parents', () => {
+  // parent_missing used to commit a run, a participant and a roster row while
+  // reporting that nothing was inserted, and the roster it left behind was
+  // immutable, so publishing the real attempt afterwards could only contradict it.
+  for (const sql of [SERVING_STATEMENTS.seal, SERVING_STATEMENTS.attempt]) {
+    assert.match(sql, /not exists \(select 1 from drift\) and exists \(select 1 from child_ready\) as ok/);
+    const inserts = sql.split('insert into public.').length - 1;
+    const gated = sql.split('where gate.ok').length - 1;
+    assert.equal(gated, inserts, `all ${inserts} inserts gated, found ${gated}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The post-write verification
+// ---------------------------------------------------------------------------
+
+test('a seal and an attempt verify after writing; the others do not', async () => {
+  // The in-statement drift check reads a snapshot that cannot see a concurrent
+  // writer which has not committed. Twelve concurrent seals of one key with
+  // twelve different digests did not all report the contradiction.
+  for (const [name, call] of EVERY_METHOD) {
+    const s = scriptedQuery([OK]);
+    await call(new SqlBenchmarkServingPort(s.query));
+    const expected = name === 'sealDecision' || name === 'publishAttempt' ? 1 : 0;
+    assert.equal(s.verifications(), expected, `${name} verifications`);
+  }
+});
+
+test('drift found only by the post-write read still becomes a contradiction', async () => {
+  const cases: ReadonlyArray<readonly [string, (p: SqlBenchmarkServingPort) => Promise<PublishOutcome>]> = [
+    ['sealDecision', (p) => p.sealDecision(seal())],
+    ['publishAttempt', (p) => p.publishAttempt(attempt())],
+  ];
+  for (const [name, call] of cases) {
+    const s = scriptedQuery([OK], 'roster.walletAddress');
+    assert.deepEqual(await call(new SqlBenchmarkServingPort(s.query)),
+      { outcome: 'contradiction', field: 'roster.walletAddress' }, name);
+  }
+});
+
+test('a failed verification leaves the write outcome standing, and still does not throw', async () => {
+  // The write already happened or did not; a second read that errors must not
+  // turn a good write into an error.
+  const seen: string[] = [];
+  const query: StoreQuery = async (sql) => {
+    seen.push(sql);
+    if (sql === SERVING_STATEMENTS.verifyIdentity) throw new Error('verification blew up');
+    return OK;
+  };
+  assert.deepEqual(await new SqlBenchmarkServingPort(query).sealDecision(seal()), { outcome: 'published' });
+  assert.equal(seen.length, 2);
+});
+
+test('the verifier reads the same payload the write sent', async () => {
+  const s = scriptedQuery([OK]);
+  await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+  assert.deepEqual(sentPayload(s.calls, 0), sentPayload(s.calls, 1),
+    'one payload, two statements, so there is no second serialisation to drift');
+});
+
+// ---------------------------------------------------------------------------
+// Fail-soft: serialisation is inside the boundary
+// ---------------------------------------------------------------------------
+
+test('a value that cannot be serialised is a typed refusal, not a thrown TypeError', async () => {
+  // Measured on the previous build: turnCompleted: 1n reached JSON.stringify
+  // outside the try and threw straight out of a method documented never to throw.
+  const s = scriptedQuery([]);
+  const out = await new SqlBenchmarkServingPort(s.query).publishAttempt(
+    attempt({ facts: { ...FACTS, turnCompleted: 1n as unknown as boolean } }));
+  assert.deepEqual(out, { outcome: 'invalid_input', reason: 'not_a_boolean', field: 'facts.turnCompleted' });
+  assert.equal(s.writes(), 0, 'it never reached the database');
+});
+
+test('every boolean field is type-checked rather than passed through', async () => {
+  const bad = 1n as unknown as boolean;
+  const cases: ReadonlyArray<readonly [string, (p: SqlBenchmarkServingPort) => Promise<PublishOutcome>]> = [
+    ['facts.sent', (p) => p.publishAttempt(attempt({ facts: { ...FACTS, sent: bad } }))],
+    ['wouldAbstain', (p) => p.revealDecision(reveal({ wouldAbstain: bad }))],
+    ['selectedForExecution', (p) => p.revealDecision(reveal({ selectedForExecution: bad }))],
+    ['scheduleChanged', (p) => p.publishScore(score({ scheduleChanged: bad }))],
+    ['heldOutOfPrimary', (p) => p.publishScore(score({ heldOutOfPrimary: bad }))],
+    ['rankingAllowed', (p) => p.publishScoringRun(scoringRun({ rankingAllowed: bad }))],
+    ['costPerPickComparable', (p) => p.publishScoringRun(scoringRun({ costPerPickComparable: bad }))],
+  ];
+  for (const [field, call] of cases) {
+    const out = await refusal(call);
+    assert.equal(out.outcome, 'invalid_input', field);
+    assert.equal(out.outcome === 'invalid_input' ? out.field : '', field);
+    assert.equal(out.outcome === 'invalid_input' ? out.reason : '', 'not_a_boolean', field);
+  }
+});
+
+test('an integer beyond a PostgreSQL int is refused here, not by the driver', async () => {
+  const over = 2_147_483_648;
+  const cases: ReadonlyArray<readonly [string, (p: SqlBenchmarkServingPort) => Promise<PublishOutcome>]> = [
+    ['facts.latencyMs', (p) => p.publishAttempt(attempt({ facts: { ...FACTS, latencyMs: over } }))],
+    ['facts.inputTokens', (p) => p.publishAttempt(attempt({ facts: { ...FACTS, inputTokens: over } }))],
+    ['eligible', (p) => p.publishScoringRun(scoringRun({ eligible: over }))],
+  ];
+  for (const [field, call] of cases) {
+    assert.deepEqual(await refusal(call),
+      { outcome: 'invalid_input', reason: 'number_out_of_range', field }, field);
+  }
+  // ...and the largest value that DOES fit is accepted, so the bound is not
+  // simply refusing everything large.
+  const s = scriptedQuery([OK]);
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).publishAttempt(
+    attempt({ facts: { ...FACTS, latencyMs: 2_147_483_647 } })), { outcome: 'published' });
 });

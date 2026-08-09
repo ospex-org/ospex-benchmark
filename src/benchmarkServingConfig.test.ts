@@ -171,6 +171,60 @@ test('the CA applies to a DSN connection too', () => {
   assert.deepEqual(r.connection.ssl, { rejectUnauthorized: true, ca: 'PEM' });
 });
 
+test('a DSN that states an sslmode gets NO ssl option beside it', () => {
+  // `pg` parses SSL parameters out of the connection string and they override a
+  // separately supplied `ssl` object. Measured on the pinned driver by building
+  // a real client: `?sslmode=disable` + `{rejectUnauthorized:true, ca}` came out
+  // as `ssl: false` — this resolver was reporting verified TLS for a connection
+  // with none. Returning nothing says the true thing: the URL decides.
+  for (const mode of ['disable', 'require', 'no-verify', 'verify-full', 'prefer']) {
+    const dsn = `postgresql://u:p@h.example.com:5432/postgres?sslmode=${mode}`;
+    const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
+    assert.ok(r.resolved);
+    assert.deepEqual(r.connection, { kind: 'dsn', connectionString: dsn }, mode);
+    assert.ok(!('ssl' in r.connection), `${mode}: no ssl key at all, not even undefined`);
+  }
+});
+
+test('a DSN with no sslmode still gets one — the paired accept', () => {
+  // Without this the test above would pass against a resolver that had simply
+  // stopped requesting TLS for every DSN.
+  const dsn = 'postgresql://u:p@h.example.com:5432/postgres?connect_timeout=10';
+  const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
+  assert.ok(r.resolved);
+  assert.deepEqual(r.connection.ssl, { rejectUnauthorized: true, ca: 'PEM' });
+});
+
+test('an sslmode inside the DSN password cannot fake one', () => {
+  const dsn = 'postgresql://u:has-sslmode=disable-inside@h.example.com:5432/postgres';
+  const r = withEnv({ BENCHMARK_DB_URL: dsn }, resolveBenchmarkWriterConnection);
+  assert.ok(r.resolved);
+  assert.deepEqual(r.connection.ssl, { rejectUnauthorized: false });
+});
+
+test('a project URL is checked for SHAPE, not just split on a dot', () => {
+  // Taking the first label of any hostname turned these into a plausible-looking
+  // Supabase database host that belongs to nobody — a connection attempt, with
+  // the credential, against a name the operator never named.
+  for (const bad of [
+    'https://project-ref.example.com',
+    'https://supabase.co',
+    'ftp://project-ref.supabase.co',
+    'http://project-ref.supabase.co',
+    'https://a.b.supabase.co',
+  ]) {
+    assert.deepEqual(
+      withEnv({ BENCHMARK_WRITER: AWKWARD, SUPABASE_URL: bad }, resolveBenchmarkWriterConnection),
+      { resolved: false, reason: 'malformed_project_url' }, bad,
+    );
+  }
+  // ...and the real shape still resolves, so the check is not simply refusing.
+  const good = withEnv({ BENCHMARK_WRITER: AWKWARD, SUPABASE_URL: 'https://Project-Ref.supabase.co' },
+    resolveBenchmarkWriterConnection);
+  assert.ok(good.resolved && good.connection.kind === 'derived');
+  assert.equal(good.connection.host, 'db.project-ref.supabase.co');
+});
+
 test('a blank value counts as absent, the way every other credential here does', () => {
   // envValue() trims and treats '' as unset; the resolver must agree, or an
   // empty line in a .env file becomes an empty password sent to the server.

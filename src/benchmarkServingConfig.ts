@@ -48,7 +48,7 @@ export interface TlsOption {
  * parser handles the raw form correctly.
  */
 export type BenchmarkWriterConnection =
-  | { readonly kind: 'dsn'; readonly connectionString: string; readonly ssl: TlsOption }
+  | { readonly kind: 'dsn'; readonly connectionString: string; readonly ssl?: TlsOption }
   | {
       readonly kind: 'derived';
       readonly host: string;
@@ -105,7 +105,23 @@ function tls(): TlsOption {
 export function resolveBenchmarkWriterConnection(): ConnectionResolution {
   const dsn = envValue('BENCHMARK_DB_URL');
   if (dsn !== undefined) {
-    return { resolved: true, connection: { kind: 'dsn', connectionString: dsn, ssl: tls() } };
+    // ⚠ A DSN THAT STATES AN sslmode IS AUTHORITATIVE, and nothing is attached
+    //   beside it. `pg` parses SSL parameters out of the connection string and
+    //   they OVERRIDE a separately supplied `ssl` object — measured on the
+    //   pinned driver, by constructing a real client rather than inspecting this
+    //   return value:
+    //
+    //     ?sslmode=disable      + ssl:{rejectUnauthorized:true, ca}  ->  ssl false
+    //     ?sslmode=require      + ssl:{rejectUnauthorized:true, ca}  ->  ssl {}
+    //     ?sslmode=verify-full  + ssl:{rejectUnauthorized:true, ca}  ->  ssl {}
+    //
+    //   So returning a CA alongside one of those was a promise the driver threw
+    //   away — `sslmode=disable` in particular reported "verified TLS" for a
+    //   connection with no TLS at all. Returning nothing says the true thing:
+    //   the URL decides, and BENCHMARK_DB_CA does not apply to it.
+    return statesSslMode(dsn)
+      ? { resolved: true, connection: { kind: 'dsn', connectionString: dsn } }
+      : { resolved: true, connection: { kind: 'dsn', connectionString: dsn, ssl: tls() } };
   }
 
   const password = envValue('BENCHMARK_WRITER');
@@ -149,13 +165,27 @@ export function resolveBenchmarkWriterConnection(): ConnectionResolution {
 function derivedHost(): string | null | undefined {
   const raw = envValue('SUPABASE_URL');
   if (raw === undefined) return undefined;
-  let hostname: string;
+  let url: URL;
   try {
-    hostname = new URL(raw).hostname;
+    url = new URL(raw);
   } catch {
     return null;
   }
-  const ref = hostname.split('.')[0];
-  if (ref === undefined || ref.length === 0 || !hostname.includes('.')) return null;
-  return `db.${ref}.supabase.co`;
+  // The shape is checked, not merely split. Taking the first label of any
+  // hostname turned `https://project-ref.example.com` and even `https://supabase.co`
+  // into a plausible-looking Supabase database host that belongs to nobody —
+  // a connection attempt, with the credential, against a name the operator
+  // never named. A self-hosted or proxied deployment sets BENCHMARK_DB_HOST.
+  const match = /^([a-z0-9-]+)\.supabase\.co$/i.exec(url.hostname);
+  if (url.protocol !== 'https:' || match === null) return null;
+  return `db.${match[1]!.toLowerCase()}.supabase.co`;
+}
+
+/** Whether a DSN states an sslmode, looked for only AFTER the userinfo so a
+ *  password containing the literal text cannot fake one. */
+function statesSslMode(dsn: string): boolean {
+  const scheme = dsn.indexOf('://');
+  if (scheme === -1) return dsn.includes('sslmode=');
+  const at = dsn.lastIndexOf('@');
+  return dsn.slice(at > scheme ? at + 1 : scheme + 3).includes('sslmode=');
 }
