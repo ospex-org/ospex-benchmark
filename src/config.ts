@@ -11,6 +11,9 @@ export const DEFAULT_OSPEX_API_URL = 'https://ospex-core-api-195f635df864.heroku
 /** All markets/games are Polygon-mainnet-scoped rows upstream. */
 export const NETWORK = 'polygon';
 
+// Every credential this process can hold. A new one belongs here BEFORE the code
+// that uses it: redactSecrets() knows nothing it is not told, so an unenrolled
+// value passes through error messages and records verbatim.
 const SECRET_ENV_VARS = [
   'OPENAI_API_KEY',
   'ANTHROPIC_API_KEY',
@@ -18,6 +21,19 @@ const SECRET_ENV_VARS = [
   'GOOGLE_API_KEY',
   'XAI_API_KEY',
   'SUPABASE_ANON_KEY',
+  // The serving publisher's database credentials. Enrolled because that
+  // publisher writes to Postgres directly and so does not pass through
+  // writeNdjson(), which redacts every line it emits. BOTH shapes are listed:
+  // the DSN takes precedence over the bare password, so a host configured that
+  // way sets no BENCHMARK_WRITER at all and enrolling only the password would
+  // leave redaction a no-op for everything the publisher touches.
+  //
+  // Note the bound: this is exact-value substitution, so it catches a whole DSN
+  // echoed into a message, not the password alone lifted out of one. The
+  // resolver deliberately never parses the DSN, so there is no parsed password
+  // to enrol.
+  'BENCHMARK_WRITER',
+  'BENCHMARK_DB_URL',
 ] as const;
 
 export function envValue(name: string): string | undefined {

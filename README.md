@@ -165,6 +165,81 @@ Output: `<runId>-scored.ndjson` (per-pick `scored_decision` records with full pr
 
 Requires only `SUPABASE_URL` + `SUPABASE_ANON_KEY` (the same public read-only anon key).
 
+## Serving projection (optional, not wired to a run)
+
+Benchmark output reaches the public today only after settlement, through a
+reviewed evidence PR. The serving projection exists to make a sealed forecast
+readable inside the gap between the decision and first pitch — on the 2026-08-07
+run that gap was 5h34m, while the artifact landed roughly 19h after the decision.
+
+`src/servingStore.ts` is the publisher for it: an append-only writer over nine
+`benchmark_*` tables, connecting as a scoped role that holds `SELECT` and
+`INSERT` and no mutating verb. A sealed forecast cannot be rewritten and a
+published pick can be neither edited nor retracted, because the privilege to do
+either is absent rather than merely unused. Every write is one statement, and
+every method returns a typed outcome instead of throwing — a benchmark night is
+never lost because a projection was unavailable.
+
+A provider call is published in its own right, before the forecasts it produced:
+
+```
+await publishAttempt(...)   // once per (participant, game, attempt ordinal)
+await sealDecision(...)     // once per market on that call
+```
+
+That ordering is part of the contract. A refused or non-final call produces an
+attempt row and no decisions, and that row is the opportunity denominator — a
+failed arm has to be representable or coverage is computed over successes only.
+
+**Nothing calls it yet.** Which producer feeds the projection is a separate
+decision, so today it ships as a library with tests and no run-path effect.
+
+```bash
+# unit tests run with the rest of the suite; they open no connection
+yarn test
+
+# the real-PostgreSQL suite, against a scratch database that already carries the
+# projection schema. It refuses a non-local host, mints a fresh cohort per run,
+# and connects as the scoped role with no owner escape hatch.
+yarn store:serving
+```
+
+Configuration is entirely optional: with no credential the publisher is disabled
+and every write returns `disabled` without touching the network. See the
+`BENCHMARK_*` entries in `.env.example`.
+
+TLS is requested explicitly, because a PostgreSQL connection with no `ssl` option
+negotiates none. Supplying `BENCHMARK_DB_CA` turns on chain verification;
+without it the connection is encrypted but not authenticated, since the
+endpoint's certificate chain is not one Node trusts by default.
+
+**One exception, and it is the driver's rule rather than this repo's:** if the
+DSN itself carries an SSL parameter — `sslmode=` or the separate `ssl=` — that
+wins. The driver parses SSL settings out of the connection string and they
+override anything supplied alongside, the CA included, so `BENCHMARK_DB_CA` does
+not apply to such a URL.
+
+The resolver does not try to interpret what a parameter *means*. It asks only
+whether it is unambiguous:
+
+| the DSN | what happens |
+|---|---|
+| carries no `sslmode` or `ssl` | the configured TLS is attached, and nothing in the URL can discard it |
+| carries exactly one, non-empty | deferred to entirely — what it means is between you and the driver |
+| carries an empty one, or the same one twice | refused as malformed (`malformed_dsn_ssl`); the publisher stays disabled rather than guess |
+
+Deferring to a value this repo does not recognise is safe rather than lax: an
+unrecognised `sslmode` makes the driver negotiate TLS against the system trust
+store, which fails loudly against an endpoint whose chain Node does not carry —
+it never downgrades quietly. The two shapes that *could* downgrade quietly are
+exactly the ones refused. An empty parameter is ignored or turned into a falsy
+value depending on which one it is, and a repeated parameter is read
+last-occurrence-wins by the driver while the obvious way to inspect it returns
+the first.
+
+Worth knowing regardless of any of this: the driver treats `sslmode=require` as
+`verify-full`, so `no-verify` is the mode that means encrypt-without-verifying.
+
 ## Published parameters (totals dispersion)
 
 `data/` holds the committed inputs and output of the MLB totals dispersion fit — the parameter the totals ladder will consume ([`docs/TOTALS_DISPERSION.md`](docs/TOTALS_DISPERSION.md) is the methodology record):
