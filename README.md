@@ -206,10 +206,20 @@ yarn store:serving
 
 Configuration is entirely optional: with no credential the publisher is disabled
 and every write returns `disabled` without touching the network. See the
-`BENCHMARK_*` entries in `.env.example`. Note that TLS is requested explicitly —
-a PostgreSQL connection with no `ssl` option negotiates none, and the endpoint's
-certificate chain is not one Node trusts by default, so the default here is
-encrypted but not authenticated until `BENCHMARK_DB_CA` supplies the CA.
+`BENCHMARK_*` entries in `.env.example`.
+
+TLS is requested explicitly, because a PostgreSQL connection with no `ssl` option
+negotiates none. Supplying `BENCHMARK_DB_CA` turns on chain verification;
+without it the connection is encrypted but not authenticated, since the
+endpoint's certificate chain is not one Node trusts by default.
+
+**One exception, and it is the driver's rule rather than this repo's:** if you
+configure a full DSN that itself states an `sslmode`, that wins. The driver
+parses SSL parameters out of the connection string and they override anything
+supplied alongside — including the CA — so in that case the URL is the whole
+story and `BENCHMARK_DB_CA` does not apply. Note also that the driver currently
+treats `sslmode=require` as `verify-full`; `no-verify` is the mode that means
+encrypt-without-verifying.
 
 ## Published parameters (totals dispersion)
 

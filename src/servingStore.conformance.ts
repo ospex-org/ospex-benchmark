@@ -34,6 +34,7 @@
 import assert from 'node:assert/strict';
 import { Pool } from 'pg';
 import { pgStoreQuery } from './store/atomicStore.js';
+import { pgStoreTransactor } from './store/campaignTickJournal.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { ArmAttempt, AttemptFacts, DecisionSeal, PublishOutcome, RunFacts } from './servingStore.js';
 
@@ -137,7 +138,7 @@ async function main(): Promise<void> {
     max: 4, connectionTimeoutMillis: 10_000,
   });
   const query = pgStoreQuery(pool);
-  const port = new SqlBenchmarkServingPort(query);
+  const port = new SqlBenchmarkServingPort({ query, transactor: pgStoreTransactor(pool) });
 
   const who = await query('select current_user as u', []);
   assert.equal(who[0]?.['u'], 'benchmark_writer', 'the suite must run as the scoped role');
@@ -241,6 +242,34 @@ async function main(): Promise<void> {
          from public.benchmark_decisions where cohort_id = $1`, [cohortId]);
     assert.equal(rows[0]!['decisions'], 3);
     assert.equal(rows[0]!['attempts'], 1, 'all three cite ONE attempt — telemetry counted once');
+  });
+
+  await check('A CONCURRENT CONTRADICTION WRITES NOTHING', async () => {
+    // The guarantee that a single statement could not provide. Its drift check
+    // reads a snapshot taken before the statement began, so a writer committing
+    // a conflicting parent in between is invisible: the gate passes and the
+    // child lands. Measured that way — 100 conflicting-wallet races all reported
+    // `contradiction` and 58 had written their child anyway.
+    //
+    // The lock is taken as its own command and the write follows as a second
+    // one, so the write reads a snapshot that already contains the winner.
+    const cohortId = cohortName('concurrent-contradiction');
+    const attempts = await Promise.all(Array.from({ length: 16 }, (_, i) =>
+      port.publishAttempt(armAttempt(cohortId, {
+        roster: { armId: 'v1', walletAddress: `0x${String(i % 10).repeat(40)}` },
+        gameId: `game-${i}`,
+      }))));
+    const published = attempts.filter((o) => o.outcome === 'published').length;
+    const kinds = [...new Set(attempts.map((o) => o.outcome))].sort();
+    assert.deepEqual(kinds, ['contradiction', 'published'],
+      `every write is one or the other: ${JSON.stringify(attempts)}`);
+    const stored = await query(
+      'select count(*)::int as n from public.benchmark_arm_attempts where cohort_id = $1', [cohortId]);
+    assert.equal(stored[0]!['n'], published,
+      'exactly the published writes left a row — a contradiction left none');
+    const rosters = await query(
+      'select count(*)::int as n from public.benchmark_cohort_participants where cohort_id = $1', [cohortId]);
+    assert.equal(rosters[0]!['n'], 1, 'one roster row, from the winner');
   });
 
   await check('a full arm fan-out seals concurrently with NO loss', async () => {

@@ -195,6 +195,39 @@ test('a DSN with no sslmode still gets one — the paired accept', () => {
   assert.deepEqual(r.connection.ssl, { rejectUnauthorized: true, ca: 'PEM' });
 });
 
+test('an SSL parameter is recognised the way the DRIVER recognises one', () => {
+  // A substring search got all four of these wrong, and each was measured
+  // against a real client. The first three contain the text but state no
+  // parameter, so TLS must still be attached — the substring version omitted it
+  // and the connection went out in plaintext. The fourth percent-encodes the
+  // key, so the driver DOES see it and discards any ssl object handed alongside;
+  // the substring version missed it and reported a verified CA that was thrown
+  // away.
+  const looksLikeButIsNot = [
+    'postgresql://u:p@h.example.com:5432/db?application_name=sslmode%3Ddisable',
+    'postgresql://u:p@h.example.com:5432/db-sslmode=disable',
+    'postgresql://u:p@h.example.com:5432/db#sslmode=disable',
+  ];
+  for (const dsn of looksLikeButIsNot) {
+    const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
+    assert.ok(r.resolved);
+    assert.deepEqual(r.connection.ssl, { rejectUnauthorized: true, ca: 'PEM' }, dsn);
+  }
+  const encoded = 'postgresql://u:p@h.example.com:5432/db?%73slmode=disable';
+  const r = withEnv({ BENCHMARK_DB_URL: encoded, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
+  assert.ok(r.resolved);
+  assert.ok(!('ssl' in r.connection), 'a percent-encoded sslmode still defers to the DSN');
+});
+
+test('a DSN too malformed to parse still gets TLS rather than silently none', () => {
+  // The direction is deliberate: being wrong about the report is recoverable,
+  // sending the credential in clear is not.
+  const r = withEnv({ BENCHMARK_DB_URL: 'not a url at all', BENCHMARK_DB_CA: 'PEM' },
+    resolveBenchmarkWriterConnection);
+  assert.ok(r.resolved);
+  assert.deepEqual(r.connection.ssl, { rejectUnauthorized: true, ca: 'PEM' });
+});
+
 test('an sslmode inside the DSN password cannot fake one', () => {
   const dsn = 'postgresql://u:has-sslmode=disable-inside@h.example.com:5432/postgres';
   const r = withEnv({ BENCHMARK_DB_URL: dsn }, resolveBenchmarkWriterConnection);

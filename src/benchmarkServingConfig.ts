@@ -181,11 +181,36 @@ function derivedHost(): string | null | undefined {
   return `db.${match[1]!.toLowerCase()}.supabase.co`;
 }
 
-/** Whether a DSN states an sslmode, looked for only AFTER the userinfo so a
- *  password containing the literal text cannot fake one. */
+/**
+ * Whether a DSN states an SSL parameter, decided the way the driver decides it.
+ *
+ * A substring search is not good enough, and every one of these was measured
+ * against a real client on the pinned driver:
+ *
+ *   ?application_name=sslmode=disable   a VALUE containing the text. The
+ *                                       substring matched, nothing was attached,
+ *                                       and the connection went out in plaintext.
+ *   /db-sslmode=disable                 the text in the PATH. Same.
+ *   #sslmode=disable                    the text in a FRAGMENT. Same.
+ *   ?%73slmode=disable                  percent-encoded, so the substring missed
+ *                                       it — a CA was attached, and the driver
+ *                                       decoded the parameter and discarded it.
+ *
+ * `URLSearchParams` gets all four right because it is doing the same decoding
+ * the driver does: values are not keys, a path is not a query, a fragment is not
+ * a query, and `%73` is `s`.
+ *
+ * An unparseable DSN reports FALSE, so TLS is attached rather than silently
+ * omitted. That direction is deliberate — being wrong about the report is
+ * recoverable, sending the credential in clear is not — and the driver's own
+ * parsing still governs what actually happens.
+ */
 function statesSslMode(dsn: string): boolean {
-  const scheme = dsn.indexOf('://');
-  if (scheme === -1) return dsn.includes('sslmode=');
-  const at = dsn.lastIndexOf('@');
-  return dsn.slice(at > scheme ? at + 1 : scheme + 3).includes('sslmode=');
+  let url: URL;
+  try {
+    url = new URL(dsn);
+  } catch {
+    return false;
+  }
+  return url.searchParams.has('sslmode') || url.searchParams.has('ssl');
 }

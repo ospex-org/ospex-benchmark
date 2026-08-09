@@ -14,6 +14,7 @@ import type {
   RunFacts,
   ScoringRun,
 } from './servingStore.js';
+import type { ServingStoreDeps } from './servingStore.js';
 import type { StoreQuery } from './store/atomicStore.js';
 
 /**
@@ -40,26 +41,27 @@ interface Call {
 /** Each invocation records the call and shifts the next canned response. */
 function scriptedQuery(
   responses: Array<ReadonlyArray<Record<string, unknown>> | Error>,
-  drift: string | null = null,
-): { query: StoreQuery; calls: Call[]; writes: () => number; verifications: () => number } {
+): { deps: ServingStoreDeps; calls: Call[]; writes: () => number; locks: () => number } {
   const calls: Call[] = [];
-  const isVerify = (sql: string): boolean => sql === SERVING_STATEMENTS.verifyIdentity;
+  const isLock = (sql: string): boolean => sql === SERVING_STATEMENTS.lock;
   const query: StoreQuery = async (sql, params) => {
     calls.push({ sql, params });
-    // The post-write drift read is answered CLEAN automatically rather than
-    // consuming a scripted response, so a test about the write path scripts only
-    // the write. Pass `drift` to make the verification report one.
-    if (isVerify(sql)) return [{ contradiction: drift }];
+    // Acquiring the lock consumes no scripted response: a test about the write
+    // path scripts only the write.
+    if (isLock(sql)) return [{ participant: null, cohort: null }];
     const next = responses.shift();
     if (next === undefined) throw new Error(`scripted query exhausted (call ${calls.length})`);
     if (next instanceof Error) throw next;
     return next;
   };
   return {
-    query,
+    // A transaction is modelled as running the callback against the same
+    // scripted query: the ORDER of statements is what the tests assert, and
+    // that a real transaction is used at all is proved by the conformance suite.
+    deps: { query, transactor: { transaction: (fn) => fn(query) } },
     calls,
-    writes: () => calls.filter((c) => !isVerify(c.sql)).length,
-    verifications: () => calls.filter((c) => isVerify(c.sql)).length,
+    writes: () => calls.filter((c) => !isLock(c.sql)).length,
+    locks: () => calls.filter((c) => isLock(c.sql)).length,
   };
 }
 
@@ -69,9 +71,10 @@ const OK = row();
 const DUP = row({ inserted: 0 });
 const ORPHAN = row({ parent_found: 0, inserted: 0 });
 
-/** The single JSON parameter a statement was handed, decoded. */
+/** The single JSON parameter a WRITE was handed, decoded. Lock statements are
+ *  skipped, so an index means the same thing whether or not the call serialised. */
 function sentPayload(calls: Call[], index = 0): Record<string, unknown> {
-  const params = calls[index]!.params;
+  const params = calls.filter((c) => c.sql !== SERVING_STATEMENTS.lock)[index]!.params;
   assert.equal(params.length, 1, 'exactly one parameter: the jsonb payload');
   return JSON.parse(params[0] as string) as Record<string, unknown>;
 }
@@ -258,7 +261,7 @@ test('every payload key matches its statement record declaration, both ways', as
   ];
   for (const [name, sql, call] of cases) {
     const s = scriptedQuery([OK]);
-    await call(new SqlBenchmarkServingPort(s.query));
+    await call(new SqlBenchmarkServingPort(s.deps));
     const declared = declaredColumns(sql).sort();
     const sent = Object.keys(sentPayload(s.calls)).sort();
     assert.deepEqual(sent, declared, `${name}: payload keys and record columns disagree`);
@@ -290,7 +293,7 @@ test('disabled short-circuits BEFORE validation — an unconfigured publisher ne
   const bad = seal({ forecastDigest: 'not-a-digest' });
   assert.deepEqual(await new SqlBenchmarkServingPort(null).sealDecision(bad), { outcome: 'disabled' });
   const s = scriptedQuery([]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(bad), {
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(bad), {
     outcome: 'invalid_input', reason: 'malformed_digest', field: 'forecastDigest',
   });
   assert.equal(s.calls.length, 0, 'a refused payload never reaches the database');
@@ -303,11 +306,11 @@ test('disabled short-circuits BEFORE validation — an unconfigured publisher ne
 test('one statement per publish, and the row counts map to the outcome', async () => {
   for (const [name, call] of EVERY_METHOD) {
     const ok = scriptedQuery([OK]);
-    assert.deepEqual(await call(new SqlBenchmarkServingPort(ok.query)), { outcome: 'published' }, name);
+    assert.deepEqual(await call(new SqlBenchmarkServingPort(ok.deps)), { outcome: 'published' }, name);
     assert.equal(ok.writes(), 1, `${name} issues exactly one WRITE statement`);
 
     const dup = scriptedQuery([DUP]);
-    assert.deepEqual(await call(new SqlBenchmarkServingPort(dup.query)), { outcome: 'duplicate' }, name);
+    assert.deepEqual(await call(new SqlBenchmarkServingPort(dup.deps)), { outcome: 'duplicate' }, name);
   }
 });
 
@@ -317,13 +320,13 @@ test('a decision the statement could not see is parent_missing, not duplicate', 
   // from a conflict if only the insert count were reported.
   for (const [name, call] of CHILD_METHODS) {
     const s = scriptedQuery([ORPHAN]);
-    assert.deepEqual(await call(new SqlBenchmarkServingPort(s.query)), { outcome: 'parent_missing' }, name);
+    assert.deepEqual(await call(new SqlBenchmarkServingPort(s.deps)), { outcome: 'parent_missing' }, name);
   }
 });
 
 test('a seal whose attempt was never published is parent_missing', async () => {
   const s = scriptedQuery([ORPHAN]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal()),
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal()),
     { outcome: 'parent_missing' });
 });
 
@@ -345,12 +348,12 @@ test('a contradiction outranks every other branch', async () => {
                          row({ contradiction: 'roster.walletAddress', parent_found: 0, inserted: 0 }),
                          row({ contradiction: 'participant.kind', ineligible_reason: 'unsent' })]) {
       const s = scriptedQuery([shape]);
-      const out = await call(new SqlBenchmarkServingPort(s.query));
+      const out = await call(new SqlBenchmarkServingPort(s.deps));
       assert.equal(out.outcome, 'contradiction', `${name} on ${JSON.stringify(shape[0])}`);
     }
   }
   const s = scriptedQuery([row({ contradiction: 'roster.armId' })]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).publishAttempt(attempt()),
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).publishAttempt(attempt()),
     { outcome: 'contradiction', field: 'roster.armId' });
 });
 
@@ -369,7 +372,7 @@ test('an off-contract result shape resolves to unavailable rather than throwing'
     [{ contradiction: null, ineligible_reason: 9, parent_found: 1, inserted: 1 }],
     [OK[0]!, OK[0]!]]) {
     const s = scriptedQuery([rows]);
-    const out = await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+    const out = await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
     assert.equal(out.outcome, 'unavailable', `rows=${JSON.stringify(rows)}`);
   }
 });
@@ -383,7 +386,7 @@ test('a database refusal carries its SQLSTATE and constraint', async () => {
     code: '23503', constraint: 'fk_benchmark_decision_attempt',
   });
   const s = scriptedQuery([err]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal()), {
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal()), {
     outcome: 'refused',
     sqlstate: '23503',
     constraint: 'fk_benchmark_decision_attempt',
@@ -398,7 +401,7 @@ test('detail can quote the offending value, which is why it is diagnostic and no
   // rather than claiming the outcome is free of input text.
   const s = scriptedQuery([Object.assign(new Error('date/time field value out of range: "2026-13-45"'),
     { code: '22008' })]);
-  const out = await new SqlBenchmarkServingPort(s.query).publishScore(score());
+  const out = await new SqlBenchmarkServingPort(s.deps).publishScore(score());
   assert.ok(out.outcome === 'refused' && out.detail.includes('2026-13-45'));
 });
 
@@ -407,7 +410,7 @@ test('a privilege refusal is reported as refused, not as an outage', async () =>
   // must be distinguishable from the database being unreachable — one is a bug in
   // the caller, the other is transient.
   const s = scriptedQuery([Object.assign(new Error('permission denied'), { code: '42501' })]);
-  const out = await new SqlBenchmarkServingPort(s.query).publishScore(score());
+  const out = await new SqlBenchmarkServingPort(s.deps).publishScore(score());
   assert.equal(out.outcome, 'refused');
   assert.equal(out.outcome === 'refused' ? out.sqlstate : null, '42501');
   assert.equal(out.outcome === 'refused' ? out.constraint : 'unset', null, 'no constraint named');
@@ -421,14 +424,14 @@ test('an outage that DOES carry a SQLSTATE is still unavailable, not refused', a
   // does not exist, and would not retry the thing that would have worked.
   for (const code of ['53300', '53200', '08006', '08003', '57014', '58030']) {
     const s = scriptedQuery([Object.assign(new Error('transient'), { code })]);
-    const out = await new SqlBenchmarkServingPort(s.query).publishScore(score());
+    const out = await new SqlBenchmarkServingPort(s.deps).publishScore(score());
     assert.equal(out.outcome, 'unavailable', code);
   }
   // The paired accept: a genuine rejection still reports as one, so this is not
   // a blanket downgrade of every server error.
   for (const code of ['23505', '23503', '42501', '22008']) {
     const s = scriptedQuery([Object.assign(new Error('rejected'), { code })]);
-    const out = await new SqlBenchmarkServingPort(s.query).publishScore(score());
+    const out = await new SqlBenchmarkServingPort(s.deps).publishScore(score());
     assert.equal(out.outcome, 'refused', code);
   }
 });
@@ -440,7 +443,7 @@ test('a failure with no SQLSTATE is unavailable', async () => {
     Object.assign(new Error('nope'), { code: 42501 }),
   ]) {
     const s = scriptedQuery([thrown]);
-    const out = await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+    const out = await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
     assert.equal(out.outcome, 'unavailable', `thrown=${String(thrown)}`);
   }
 });
@@ -453,13 +456,13 @@ test('a lost race on a SHARED parent row is retried exactly once', async () => {
   for (const constraint of ['uq_benchmark_run_identity', 'uq_benchmark_cohort_participant_network',
     'benchmark_runs_pkey', 'uq_benchmark_arm_attempt']) {
     const s = scriptedQuery([Object.assign(new Error('duplicate key'), { code: '23505', constraint }), OK]);
-    assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal()),
+    assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal()),
       { outcome: 'published' }, constraint);
     assert.equal(s.writes(), 2, `${constraint} was retried`);
   }
   for (const code of ['40001', '40P01']) {
     const s = scriptedQuery([Object.assign(new Error('serialization'), { code }), OK]);
-    assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal()),
+    assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal()),
       { outcome: 'published' }, code);
     assert.equal(s.writes(), 2);
   }
@@ -469,7 +472,7 @@ test('the retry is bounded at one, so a persistent race surfaces', async () => {
   const err = () => Object.assign(new Error('duplicate key'),
     { code: '23505', constraint: 'uq_benchmark_run_identity' });
   const s = scriptedQuery([err(), err()]);
-  const out = await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+  const out = await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
   assert.equal(out.outcome, 'refused');
   assert.equal(s.writes(), 2, 'exactly two attempts, never a third');
 });
@@ -479,7 +482,7 @@ test('an INTEGRITY violation is never retried — the allowlist is not "any 2350
   // citation are real disagreements; retrying would refuse twice and bury why.
   for (const constraint of ['uq_benchmark_cohort_wallet', 'benchmark_reveals_not_before_seal', null]) {
     const s = scriptedQuery([Object.assign(new Error('violation'), { code: '23505', constraint })]);
-    const out = await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+    const out = await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
     assert.equal(out.outcome, 'refused', String(constraint));
     assert.equal(s.writes(), 1, `${String(constraint)} must NOT be retried`);
   }
@@ -492,7 +495,7 @@ test('NO method throws, whatever the query does — the run cannot be halted her
   for (const [name, call] of EVERY_METHOD) {
     for (const err of [new Error('boom'), Object.assign(new Error('sqlstate'), { code: '08006' })]) {
       const s = scriptedQuery([err, err]);
-      const out = await call(new SqlBenchmarkServingPort(s.query));
+      const out = await call(new SqlBenchmarkServingPort(s.deps));
       assert.ok(out.outcome === 'refused' || out.outcome === 'unavailable', `${name} folded ${err.message}`);
     }
   }
@@ -500,7 +503,7 @@ test('NO method throws, whatever the query does — the run cannot be halted her
 
 test('a query that rejects with a non-Error still folds to an outcome', async () => {
   const query: StoreQuery = async () => { throw 'plain string rejection'; };
-  const out = await new SqlBenchmarkServingPort(query).sealDecision(seal());
+  const out = await new SqlBenchmarkServingPort({ query, transactor: { transaction: (fn) => fn(query) } }).sealDecision(seal());
   assert.equal(out.outcome, 'unavailable');
 });
 
@@ -513,7 +516,7 @@ test('an attempt is publishable on its own — a failed arm is representable', a
   // row and NO decisions; without a standalone write, coverage would be computed
   // over successes only.
   const s = scriptedQuery([OK]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).publishAttempt(attempt({
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).publishAttempt(attempt({
     facts: { ...FACTS, sent: false, outcome: 'credential_missing',
       providerResponseId: null, httpStatus: null, providerStopReason: null,
       turnCompleted: null, responseAt: null, latencyMs: null },
@@ -531,7 +534,7 @@ test('the seal cites an attempt by ordinal and never writes one', async () => {
     'the seal inserts no attempt');
   assert.match(SERVING_STATEMENTS.attempt, /insert into public\.benchmark_arm_attempts/);
   const s = scriptedQuery([OK]);
-  await new SqlBenchmarkServingPort(s.query).sealDecision(seal({ attemptOrdinal: 1 }));
+  await new SqlBenchmarkServingPort(s.deps).sealDecision(seal({ attemptOrdinal: 1 }));
   const payload = sentPayload(s.calls);
   assert.equal(payload['has_attempt'], true);
   assert.equal(payload['attempt_ordinal'], 1);
@@ -539,7 +542,7 @@ test('the seal cites an attempt by ordinal and never writes one', async () => {
 
 test('a baseline seals with no attempt at all', async () => {
   const s = scriptedQuery([OK]);
-  await new SqlBenchmarkServingPort(s.query).sealDecision(seal({
+  await new SqlBenchmarkServingPort(s.deps).sealDecision(seal({
     participant: BASELINE, roster: { armId: null, walletAddress: null }, attemptOrdinal: null,
   }));
   const payload = sentPayload(s.calls);
@@ -557,7 +560,7 @@ test('a MODEL forecast with no attempt is refused — it would read as a baselin
   );
   // ...and the paired accept: a baseline may, which is what makes this discriminating.
   const s = scriptedQuery([OK]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal({
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal({
     participant: BASELINE, roster: { armId: null, walletAddress: null }, attemptOrdinal: null,
   })), { outcome: 'published' });
 });
@@ -566,7 +569,7 @@ test('the refusal histogram travels as an object, not as JSON inside JSON', asyn
   // Double-encoding it stores a jsonb STRING whose content is JSON. Nothing
   // raises, the row looks populated, and every `->>` against it returns nothing.
   const s = scriptedQuery([OK]);
-  await new SqlBenchmarkServingPort(s.query).publishScoringRun(scoringRun({ refusalReasons: { no_close: 4 } }));
+  await new SqlBenchmarkServingPort(s.deps).publishScoringRun(scoringRun({ refusalReasons: { no_close: 4 } }));
   const sent = sentPayload(s.calls)['refusal_reasons'];
   assert.equal(typeof sent, 'object', 'an object, not a string');
   assert.deepEqual(sent, { no_close: 4 });
@@ -583,7 +586,7 @@ test('instants cross as the producer wrote them — microseconds are not rounded
   // A JS Date would truncate to milliseconds. The reveal compares its copied
   // sealed_at against revealed_at in a CHECK, so the two have to stay exact.
   const s = scriptedQuery([OK]);
-  await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+  await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
   assert.equal(sentPayload(s.calls)['sealed_at'], '2026-08-09T20:06:00.123456Z');
 });
 
@@ -591,17 +594,17 @@ test('the reveal does NOT send sealed_at — the statement copies it from the pa
   // Supplying it would let a pick be published stamped before the commitment it
   // belongs to, with the composite foreign key satisfied by the caller's own value.
   const s = scriptedQuery([OK]);
-  await new SqlBenchmarkServingPort(s.query).revealDecision(reveal());
+  await new SqlBenchmarkServingPort(s.deps).revealDecision(reveal());
   assert.ok(!('sealed_at' in sentPayload(s.calls)), 'sealed_at is not an input');
   assert.match(SERVING_STATEMENTS.reveal, /parent\.sealed_at/);
 });
 
 test('every statement is an append that can never overwrite', async () => {
   for (const [name, sql] of Object.entries(SERVING_STATEMENTS)) {
-    // The verifier is a pure read. It has no conflict to resolve, and requiring
-    // one of it would assert the wrong thing about the right statement.
-    if (name === 'verifyIdentity') {
-      assert.ok(!/\binsert\b/i.test(sql), 'the verifier writes nothing at all');
+    // The lock statement is a pure read. It has no conflict to resolve, and
+    // requiring one of it would assert the wrong thing about the right statement.
+    if (name === 'lock') {
+      assert.ok(!/\binsert\b/i.test(sql), 'the lock statement writes nothing at all');
     } else {
       assert.ok(/on conflict[\s\S]*?do nothing/i.test(sql), `${name} resolves a conflict by doing nothing`);
     }
@@ -643,7 +646,7 @@ test('free text is redacted before it is sent', async () => {
   process.env['XAI_API_KEY'] = 'xai-super-secret-value';
   try {
     const s = scriptedQuery([OK, OK]);
-    const port = new SqlBenchmarkServingPort(s.query);
+    const port = new SqlBenchmarkServingPort(s.deps);
     await port.publishRationale(rationale({
       rationale: 'the provider replied with xai-super-secret-value in the body',
       evidenceRefs: ['ref xai-super-secret-value'],
@@ -669,7 +672,7 @@ test('the redaction test is not vacuous — the same text is unredacted with no 
   delete process.env['XAI_API_KEY'];
   try {
     const s = scriptedQuery([OK]);
-    await new SqlBenchmarkServingPort(s.query).publishRationale(
+    await new SqlBenchmarkServingPort(s.deps).publishRationale(
       rationale({ rationale: 'the provider replied with xai-super-secret-value in the body' }),
     );
     assert.equal(sentPayload(s.calls)['rationale'],
@@ -684,7 +687,7 @@ test('an error message is redacted before it becomes a detail', async () => {
   process.env['XAI_API_KEY'] = 'xai-super-secret-value';
   try {
     const s = scriptedQuery([new Error('auth failed for xai-super-secret-value')]);
-    const out = await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+    const out = await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
     assert.equal(out.outcome, 'unavailable');
     assert.ok(!JSON.stringify(out).includes('xai-super-secret-value'), 'the credential is gone');
     assert.match(out.outcome === 'unavailable' ? out.detail : '', /\[REDACTED\]/);
@@ -696,7 +699,7 @@ test('an error message is redacted before it becomes a detail', async () => {
 
 test('a very long error detail is bounded', async () => {
   const s = scriptedQuery([new Error('x'.repeat(5000))]);
-  const out = await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+  const out = await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
   assert.ok(out.outcome === 'unavailable' && out.detail.length <= 300, 'detail is truncated');
 });
 
@@ -706,7 +709,7 @@ test('a very long error detail is bounded', async () => {
 
 async function refusal(call: (p: SqlBenchmarkServingPort) => Promise<PublishOutcome>): Promise<PublishOutcome> {
   const s = scriptedQuery([]);
-  const out = await call(new SqlBenchmarkServingPort(s.query));
+  const out = await call(new SqlBenchmarkServingPort(s.deps));
   assert.equal(s.calls.length, 0, 'a refused payload never reaches the database');
   return out;
 }
@@ -723,7 +726,7 @@ test('malformed digests are refused with the field that carried them', async () 
 
 test('a valid digest is accepted — the digest check is not refusing everything', async () => {
   const s = scriptedQuery([OK]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal()), { outcome: 'published' });
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal()), { outcome: 'published' });
 });
 
 test('naive and unparseable instants are refused', async () => {
@@ -747,7 +750,7 @@ test('a slate date must be a real calendar date, not merely the right shape', as
   for (const good of ['2026-08-09', '2024-02-29', '2000-02-29', '2026-12-31']) {
     const s = scriptedQuery([OK]);
     assert.deepEqual(
-      await new SqlBenchmarkServingPort(s.query).sealDecision(seal({ run: { ...RUN, slateDate: good } })),
+      await new SqlBenchmarkServingPort(s.deps).sealDecision(seal({ run: { ...RUN, slateDate: good } })),
       { outcome: 'published' }, `slate=${good}`);
   }
 });
@@ -771,7 +774,7 @@ test('a non-model may not carry a lab id', async () => {
   );
   // The converse is deliberately allowed: a model with no lab id is legitimate.
   const s = scriptedQuery([OK]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal({
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal({
     participant: { participantId: 'lab-alpha', kind: 'model', labId: null, displayName: 'Alpha' },
   })), { outcome: 'published' });
 });
@@ -790,7 +793,7 @@ test('supplied_markets is bounded exactly as the CHECK bounds it', async () => {
   }
   // ...and all three together are fine, so the bound is not simply refusing.
   const s = scriptedQuery([OK]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).publishAttempt(attempt({
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).publishAttempt(attempt({
     facts: { ...FACTS, suppliedMarkets: ['moneyline', 'spread', 'total'] },
   })), { outcome: 'published' });
 });
@@ -816,7 +819,7 @@ test('the attempt ordinal admits only the initial call and its repair', async ()
   // Both admitted ordinals are accepted — a repaired arm publishes two rows.
   for (const ordinal of [0, 1]) {
     const s = scriptedQuery([OK]);
-    assert.deepEqual(await new SqlBenchmarkServingPort(s.query).publishAttempt(
+    assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).publishAttempt(
       attempt({ facts: { ...FACTS, attemptOrdinal: ordinal } })), { outcome: 'published' });
   }
 });
@@ -832,7 +835,7 @@ test('probabilities and axes are bounded', async () => {
   }
   // The endpoints are inside the domain.
   const s = scriptedQuery([OK]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).revealDecision(
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).revealDecision(
     reveal({ probWin: 0, probLoss: 1, axisTrend: 1, axisSoftness: 5 })), { outcome: 'published' });
 });
 
@@ -885,7 +888,7 @@ test('an attempt that exists but cannot carry the forecast is its own outcome', 
   // landed a PUBLISHED decision before the eligibility test existed.
   for (const reason of ['unsent', 'outcome_not_accepted', 'market_not_supplied']) {
     const s = scriptedQuery([row({ ineligible_reason: reason, parent_found: 0, inserted: 0 })]);
-    assert.deepEqual(await new SqlBenchmarkServingPort(s.query).sealDecision(seal()),
+    assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal()),
       { outcome: 'attempt_not_eligible', reason }, reason);
   }
 });
@@ -900,7 +903,7 @@ test('the seal statement tests all three eligibility conditions', () => {
 
 test('the accepted-outcome set is sent with the seal, not assumed by the SQL', async () => {
   const s = scriptedQuery([OK]);
-  await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
+  await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
   assert.deepEqual(sentPayload(s.calls)['accepted_outcomes'], [...ACCEPTED_ATTEMPT_OUTCOMES]);
   assert.deepEqual([...ACCEPTED_ATTEMPT_OUTCOMES], ['valid'],
     'widening this is a deliberate change to what may carry a decision');
@@ -924,7 +927,6 @@ test('every durable parent fact a caller supplies is compared against the stored
   ]) {
     assert.match(SERVING_STATEMENTS.seal, fragment);
     assert.match(SERVING_STATEMENTS.attempt, fragment);
-    assert.match(SERVING_STATEMENTS.verifyIdentity, fragment);
   }
 });
 
@@ -944,48 +946,63 @@ test('a contradiction or an unusable attempt writes NOTHING, including the paren
 // The post-write verification
 // ---------------------------------------------------------------------------
 
-test('a seal and an attempt verify after writing; the others do not', async () => {
-  // The in-statement drift check reads a snapshot that cannot see a concurrent
-  // writer which has not committed. Twelve concurrent seals of one key with
-  // twelve different digests did not all report the contradiction.
+test('a seal and an attempt take the lock BEFORE the write; the others do not', async () => {
+  // The drift check inside a single statement reads a snapshot taken before the
+  // statement began, so a concurrent writer that has not committed is invisible
+  // — the gate passes, the child lands, and nothing checked afterwards can
+  // un-commit it. Measured before this: a hundred conflicting-wallet races all
+  // reported `contradiction` and 58 had written their child anyway.
   for (const [name, call] of EVERY_METHOD) {
     const s = scriptedQuery([OK]);
-    await call(new SqlBenchmarkServingPort(s.query));
-    const expected = name === 'sealDecision' || name === 'publishAttempt' ? 1 : 0;
-    assert.equal(s.verifications(), expected, `${name} verifications`);
+    await call(new SqlBenchmarkServingPort(s.deps));
+    const serialized = name === 'sealDecision' || name === 'publishAttempt';
+    assert.equal(s.locks(), serialized ? 1 : 0, `${name} locks`);
+    if (serialized) {
+      assert.equal(s.calls[0]!.sql, SERVING_STATEMENTS.lock, `${name}: lock comes FIRST`);
+      assert.notEqual(s.calls[1]!.sql, SERVING_STATEMENTS.lock, `${name}: then the write`);
+    }
   }
 });
 
-test('drift found only by the post-write read still becomes a contradiction', async () => {
-  const cases: ReadonlyArray<readonly [string, (p: SqlBenchmarkServingPort) => Promise<PublishOutcome>]> = [
-    ['sealDecision', (p) => p.sealDecision(seal())],
-    ['publishAttempt', (p) => p.publishAttempt(attempt())],
-  ];
-  for (const [name, call] of cases) {
-    const s = scriptedQuery([OK], 'roster.walletAddress');
-    assert.deepEqual(await call(new SqlBenchmarkServingPort(s.query)),
-      { outcome: 'contradiction', field: 'roster.walletAddress' }, name);
-  }
+test('the lock is taken on the participant and the cohort, in that order', async () => {
+  // Run and roster rows are cohort-scoped, but benchmark_participants is keyed
+  // by participant alone and shared across cohorts, so a cohort-only lock leaves
+  // a first-write race on a participant two cohorts introduce at once. A single
+  // fixed order everywhere is what makes a deadlock cycle impossible.
+  const s = scriptedQuery([OK]);
+  await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
+  assert.deepEqual(s.calls[0]!.params, ['lab-alpha', 'cohort-x']);
+  assert.match(SERVING_STATEMENTS.lock, /participant:' \|\| \$1[\s\S]*cohort:' \|\| \$2/);
 });
 
-test('a failed verification leaves the write outcome standing, and still does not throw', async () => {
-  // The write already happened or did not; a second read that errors must not
-  // turn a good write into an error.
-  const seen: string[] = [];
+test('the lock keys come from the payload that was already built', async () => {
+  // Deriving them separately would let the lock and the write disagree about
+  // which rows they cover, which is the one thing the lock exists to prevent.
+  const s = scriptedQuery([OK]);
+  await new SqlBenchmarkServingPort(s.deps).publishAttempt(attempt({
+    run: { ...RUN, cohortId: 'other-cohort' },
+    participant: { ...MODEL, participantId: 'other-participant' },
+  }));
+  const payload = sentPayload(s.calls);
+  assert.deepEqual(s.calls[0]!.params, [payload['participant_id'], payload['cohort_id']]);
+});
+
+test('a serialized write runs the lock and the statement on ONE connection', async () => {
+  // Two commands on different connections would not share the transaction, and
+  // the second would not get the post-lock snapshot the whole design rests on.
+  const seen: string[][] = [];
+  let opened = 0;
   const query: StoreQuery = async (sql) => {
-    seen.push(sql);
-    if (sql === SERVING_STATEMENTS.verifyIdentity) throw new Error('verification blew up');
+    seen[opened - 1]!.push(sql === SERVING_STATEMENTS.lock ? 'lock' : 'write');
     return OK;
   };
-  assert.deepEqual(await new SqlBenchmarkServingPort(query).sealDecision(seal()), { outcome: 'published' });
-  assert.equal(seen.length, 2);
-});
-
-test('the verifier reads the same payload the write sent', async () => {
-  const s = scriptedQuery([OK]);
-  await new SqlBenchmarkServingPort(s.query).sealDecision(seal());
-  assert.deepEqual(sentPayload(s.calls, 0), sentPayload(s.calls, 1),
-    'one payload, two statements, so there is no second serialisation to drift');
+  const deps: ServingStoreDeps = {
+    query: async () => { throw new Error('a serialized write must not use the loose query'); },
+    transactor: { transaction: async (fn) => { opened += 1; seen.push([]); return fn(query); } },
+  };
+  assert.deepEqual(await new SqlBenchmarkServingPort(deps).sealDecision(seal()), { outcome: 'published' });
+  assert.equal(opened, 1, 'one transaction');
+  assert.deepEqual(seen[0], ['lock', 'write'], 'both commands inside it, in order');
 });
 
 // ---------------------------------------------------------------------------
@@ -996,7 +1013,7 @@ test('a value that cannot be serialised is a typed refusal, not a thrown TypeErr
   // Measured on the previous build: turnCompleted: 1n reached JSON.stringify
   // outside the try and threw straight out of a method documented never to throw.
   const s = scriptedQuery([]);
-  const out = await new SqlBenchmarkServingPort(s.query).publishAttempt(
+  const out = await new SqlBenchmarkServingPort(s.deps).publishAttempt(
     attempt({ facts: { ...FACTS, turnCompleted: 1n as unknown as boolean } }));
   assert.deepEqual(out, { outcome: 'invalid_input', reason: 'not_a_boolean', field: 'facts.turnCompleted' });
   assert.equal(s.writes(), 0, 'it never reached the database');
@@ -1035,6 +1052,6 @@ test('an integer beyond a PostgreSQL int is refused here, not by the driver', as
   // ...and the largest value that DOES fit is accepted, so the bound is not
   // simply refusing everything large.
   const s = scriptedQuery([OK]);
-  assert.deepEqual(await new SqlBenchmarkServingPort(s.query).publishAttempt(
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).publishAttempt(
     attempt({ facts: { ...FACTS, latencyMs: 2_147_483_647 } })), { outcome: 'published' });
 });

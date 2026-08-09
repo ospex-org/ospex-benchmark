@@ -464,6 +464,30 @@ export interface ScoringRun {
   readonly source: SourceRef;
 }
 
+/**
+ * A one-connection transaction. Structurally the house `StoreTransactor`, so
+ * `pgStoreTransactor(pool)` satisfies it; declared here so this module still
+ * imports nothing from the campaign store.
+ */
+export interface ServingTransactor {
+  transaction<T>(fn: (query: StoreQuery) => Promise<T>): Promise<T>;
+}
+
+/**
+ * What the publisher needs to reach its database.
+ *
+ * The transactor is REQUIRED rather than optional, and that is the point. A seal
+ * and an attempt must take an advisory lock and then read in a FRESH snapshot,
+ * which needs two commands on one pinned connection. Optional would mean a
+ * caller could silently get the weaker guarantee — the shape this module had
+ * when a concurrent contradiction was reported while its child row had already
+ * been committed.
+ */
+export interface ServingStoreDeps {
+  readonly query: StoreQuery;
+  readonly transactor: ServingTransactor;
+}
+
 /** What the runner calls. Narrow on purpose: a projection has no reads. */
 export interface BenchmarkServingPort {
   publishAttempt(attempt: ArmAttempt): Promise<PublishOutcome>;
@@ -893,11 +917,14 @@ const RUN_DRIFT = `
   select t.f
     from public.benchmark_runs r, input,
          lateral unnest(
-           array['run.slateDate','run.startedAt','run.bundleSha256','run.planSha256',
+           array['run.network','run.deploymentRound','run.slateDate','run.startedAt',
+                 'run.bundleSha256','run.planSha256',
                  'run.promptScaffoldSha256','run.promptScaffoldVersion',
                  'run.responseSchemaVersion','run.baselinePolicyVersion',
                  'run.priceVersion','run.benchmarkCommit','run.executionPolicy'],
-           array[r.slate_date               is distinct from input.slate_date,
+           array[r.network                  is distinct from input.network,
+                 r.deployment_round         is distinct from input.deployment_round,
+                 r.slate_date               is distinct from input.slate_date,
                  r.started_at               is distinct from input.started_at,
                  r.bundle_sha256            is distinct from input.run_bundle_sha256,
                  r.plan_sha256              is distinct from input.plan_sha256,
@@ -992,6 +1019,35 @@ gate as (
   on conflict (cohort_id, participant_id) do nothing
   returning 1
 )`;
+
+/**
+ * SERIALISATION, and why one statement could not provide it.
+ *
+ * The drift comparison reads the stored parents, and inside a single statement
+ * that read uses a snapshot taken before the statement began. A writer who
+ * commits a conflicting parent in between is therefore invisible: the gate
+ * passes, the child lands, and nothing checked afterwards can un-commit it.
+ * Measured — a hundred conflicting-wallet races all reported `contradiction`,
+ * and 58 of them had written their child anyway. Relabelling after the fact
+ * cannot make "a contradiction writes nothing" true. Only ordering can.
+ *
+ * So both writes take this lock as their OWN command inside a transaction and
+ * run the write as a SECOND command. Measured on PostgreSQL 17.10: a statement
+ * issued after acquiring a contended advisory lock sees the row the previous
+ * holder committed. That fresh snapshot is what makes the in-statement drift
+ * check exact — and it is why the lock cannot be folded into the write as a CTE,
+ * because a statement's snapshot predates its own wait.
+ *
+ * TWO KEYS, ALWAYS IN THIS ORDER. Run and roster rows are cohort-scoped, but
+ * `benchmark_participants` is keyed by participant alone and shared across
+ * cohorts, so a cohort-only lock would leave a first-write race on a participant
+ * that two cohorts introduce at once. Every writer takes participant-then-cohort
+ * in this one statement, so the acquisition order is identical everywhere and no
+ * cycle can form.
+ */
+const LOCK_SQL = `
+select pg_advisory_xact_lock(hashtext('ospex-benchmark/participant:' || $1::text)) as participant,
+       pg_advisory_xact_lock(hashtext('ospex-benchmark/cohort:' || $2::text))      as cohort`;
 
 const ATTEMPT_SQL = `
 with input as (
@@ -1153,38 +1209,6 @@ select (select min(f) from drift)                as contradiction,
        (select count(*) from decision_ins)::int  as inserted`;
 
 /**
- * The same drift comparison, as a plain read. Run AFTER the write, because the
- * in-statement copy uses a snapshot that cannot see a concurrent writer which
- * has not committed yet — measured: twelve concurrent seals of one key with
- * twelve different digests did not all report the contradiction.
- *
- * These tables are append-only and the writer holds no UPDATE, so a row's facts
- * never change once written. That is what makes a read-after-write authoritative
- * here rather than just a second roll of the dice: whatever this sees is final.
- */
-const VERIFY_IDENTITY_SQL = `
-with input as (
-  select * from jsonb_to_record($1::jsonb) as x(
-    run_id text, cohort_id text, slate_date date,
-    started_at timestamptz, run_bundle_sha256 text, plan_sha256 text,
-    prompt_scaffold_sha256 text, prompt_scaffold_version text,
-    run_response_schema_version smallint, baseline_policy_version text,
-    run_price_version text, benchmark_commit text, execution_policy text,
-    participant_id text, kind text, lab_id text, display_name text,
-    arm_id text, wallet_address text,
-    game_id text, market text, forecast_digest text)
-), drift as (${IDENTITY_DRIFT}
-  union all
-  select 'forecastDigest'
-    from public.benchmark_decisions d, input
-   where input.market is not null
-     and d.cohort_id = input.cohort_id and d.participant_id = input.participant_id
-     and d.game_id = input.game_id and d.market = input.market
-     and d.forecast_digest is distinct from input.forecast_digest
-)
-select (select min(f) from drift) as contradiction`;
-
-/**
  * The forecast, as an insert-once child. `sealed_at` is COPIED from the parent
  * inside the statement rather than supplied: the composite foreign key pins the
  * pair, and the chronology CHECK compares the two, so a caller cannot publish a
@@ -1305,7 +1329,7 @@ select null::text                          as contradiction,
 
 /**
  * Cohort-level coverage and the publication brake. It has no parent to find, so
- * `parent_found` is a literal 1 — the outcome mapping is shared with the others
+ * `parent_found` is a literal 1 â€” the outcome mapping is shared with the others
  * and would otherwise read this as `parent_missing`.
  */
 const SCORING_RUN_SQL = `
@@ -1341,7 +1365,7 @@ export const SERVING_STATEMENTS = Object.freeze({
   rationale: RATIONALE_SQL,
   score: SCORE_SQL,
   scoringRun: SCORING_RUN_SQL,
-  verifyIdentity: VERIFY_IDENTITY_SQL,
+  lock: LOCK_SQL,
 });
 
 // ---------------------------------------------------------------------------
@@ -1468,7 +1492,7 @@ function classifyRows(rows: ReadonlyArray<Record<string, unknown>>): PublishOutc
  * makes this safe to call unconditionally from a run path.
  */
 export class SqlBenchmarkServingPort implements BenchmarkServingPort {
-  constructor(private readonly query: StoreQuery | null) {}
+  constructor(private readonly deps: ServingStoreDeps | null) {}
 
   publishAttempt(attempt: ArmAttempt): Promise<PublishOutcome> {
     return this.publish(ATTEMPT_SQL, () => attemptPayload(attempt), true);
@@ -1496,30 +1520,33 @@ export class SqlBenchmarkServingPort implements BenchmarkServingPort {
 
   /**
    * The one place a projection write can fail, and the one place that decides it
-   * never propagates. Validation runs first and outside the try that swallows —
+   * never propagates. Validation and serialisation run first, inside the try —
    * a `Refusal` is this module's own signal and must not be reported as a
-   * database problem, while anything else thrown by a payload builder is a bug
-   * here and still may not halt the run.
+   * database problem, while `JSON.stringify` is in there because a runtime value
+   * of the wrong type once threw a TypeError straight out of a method documented
+   * never to throw.
    *
-   * A lost race on a shared parent row is retried EXACTLY once. Every write is an
-   * idempotent DO NOTHING, so a retry cannot double-insert, and one is enough:
-   * the retry runs after the winner has committed, so the `not exists` guard
-   * skips the insert that collided. Bounded at one so a persistent 23505 — which
-   * would mean the allowlist is wrong — surfaces instead of spinning.
+   * `serialized` writes take the lock and then the statement, on one connection,
+   * so the statement's drift check reads a snapshot that includes every
+   * committed parent. Everything else is a lone statement with nothing to order
+   * against.
+   *
+   * A lost race on a shared parent row is retried EXACTLY once. Every write is
+   * an idempotent DO NOTHING so a retry cannot double-insert, and one is enough
+   * because the retry runs after the winner has committed. Bounded at one so a
+   * persistent 23505 — which would mean the allowlist is wrong — surfaces rather
+   * than spinning.
    */
   private async publish(
     sql: string,
     build: () => Record<string, unknown>,
-    verifyDrift = false,
+    serialized = false,
   ): Promise<PublishOutcome> {
-    if (this.query === null) return { outcome: 'disabled' };
+    const deps = this.deps;
+    if (deps === null) return { outcome: 'disabled' };
+
     let parameters: readonly unknown[];
     try {
-      // SERIALISATION IS INSIDE THE BOUNDARY. It was not, and a runtime value of
-      // the wrong type — `turnCompleted: 1n`, measured — made JSON.stringify
-      // throw a TypeError straight out of a method documented never to throw.
-      // Booleans are type-checked now too, but the boundary is what makes the
-      // guarantee hold for the next value nobody anticipated.
       parameters = [JSON.stringify(build())];
     } catch (error) {
       if (error instanceof Refusal) {
@@ -1527,33 +1554,30 @@ export class SqlBenchmarkServingPort implements BenchmarkServingPort {
       }
       return classify(error);
     }
-    const run = async (statement: string): Promise<PublishOutcome> => {
+
+    const keys = serialized ? lockKeys(parameters[0] as string) : null;
+    const run = async (): Promise<PublishOutcome> => {
       try {
-        return classifyRows(await this.query!(statement, parameters));
+        if (keys === null) return classifyRows(await deps.query(sql, parameters));
+        return await deps.transactor.transaction(async (query) => {
+          await query(LOCK_SQL, keys);
+          return classifyRows(await query(sql, parameters));
+        });
       } catch (error) {
         return classify(error);
       }
     };
 
-    const first = await run(sql);
-    const written = isLostRace(first) ? await run(sql) : first;
-    if (!verifyDrift || written.outcome === 'refused' || written.outcome === 'unavailable') {
-      return written;
-    }
-
-    // The in-statement drift check reads this statement's own snapshot, so it
-    // cannot see a writer that had not committed when the snapshot was taken.
-    // Re-asking after the write closes that: these tables are append-only and
-    // the writer holds no UPDATE, so a row's facts never change once written and
-    // what this read sees is final rather than merely later.
-    try {
-      const rows = await this.query(VERIFY_IDENTITY_SQL, parameters);
-      const field = rows.length === 1 ? rows[0]?.['contradiction'] : undefined;
-      if (typeof field === 'string') return { outcome: 'contradiction', field };
-    } catch {
-      // A failed second read must not turn a good write into an error. The write
-      // reported what it reported; this pass simply could not add to it.
-    }
-    return written;
+    const first = await run();
+    return isLostRace(first) ? await run() : first;
   }
+}
+
+/**
+ * The lock keys, read back out of the payload that was already built, so the
+ * lock and the write cannot disagree about which rows they cover.
+ */
+function lockKeys(payload: string): readonly string[] {
+  const parsed = JSON.parse(payload) as { participant_id?: unknown; cohort_id?: unknown };
+  return [String(parsed.participant_id ?? ''), String(parsed.cohort_id ?? '')];
 }
