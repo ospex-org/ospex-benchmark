@@ -295,6 +295,35 @@ test('…but loopback is exempt, and the refusal has a named way out', () => {
   );
 });
 
+test('the opt-out does NOT switch off TLS where nothing asked it to', () => {
+  // The negative control for the escape hatch. It permits a choice the URL
+  // already made; it is not a global "no TLS" switch. Without it the tests here
+  // said nothing about the opt-out's SCOPE — measured, a resolver that returned
+  // the bare DSN whenever BENCHMARK_DB_ALLOW_PLAINTEXT=1 passed all 1,676 tests
+  // in the repo while sending this role's password to a remote host in the
+  // clear. The campaign store carries the same control for the same reason.
+  const dsn = 'postgresql://u:p@h.example.com:5432/db';
+  const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM',
+    BENCHMARK_DB_ALLOW_PLAINTEXT: '1' }, resolveBenchmarkWriterConnection);
+  assert.ok(r.resolved);
+  assert.deepEqual(r.connection,
+    { kind: 'dsn', connectionString: dsn, ssl: { rejectUnauthorized: true, ca: 'PEM' } });
+  // …and the driver really connects with it, through both shapes a caller
+  // builds. Asserting the returned object alone would not have caught a
+  // resolver that promised a CA the driver then discarded.
+  const config = clientConfig(r);
+  assert.deepEqual(effectiveSsl(config), { rejectUnauthorized: true, ca: 'PEM' });
+  assert.deepEqual(effectiveSslViaPool(config), { rejectUnauthorized: true, ca: 'PEM' });
+
+  // The DERIVED path never consults the opt-out at all, and must not start: it
+  // builds discrete fields with no connection string for a URL to have an
+  // opinion about, so there is no choice for the escape hatch to permit.
+  const derived = withEnv({ BENCHMARK_WRITER: AWKWARD, BENCHMARK_DB_HOST: 'h.example.com',
+    BENCHMARK_DB_CA: 'PEM', BENCHMARK_DB_ALLOW_PLAINTEXT: '1' }, resolveBenchmarkWriterConnection);
+  assert.ok(derived.resolved && derived.connection.kind === 'derived');
+  assert.deepEqual(derived.connection.ssl, { rejectUnauthorized: true, ca: 'PEM' });
+});
+
 test('userinfo with an EMPTY host is classified by the driver, not by new URL()', () => {
   // `new URL('postgres://u:pw@/db')` throws, so the previous predicate fell
   // through to its catch and reported "nothing stated" — attaching TLS and
@@ -517,6 +546,34 @@ test('SWEEP: the resolver never attaches TLS the driver would discard, nor claim
   // Every branch must actually occur, or the property passes vacuously.
   assert.ok(attached > 0 && deferred > 0 && refused > 0,
     `attached=${attached} deferred=${deferred} refused=${refused}`);
+});
+
+test('SWEEP: the opt-out changes exactly the refusals, and nothing else', () => {
+  // The named control above states the property for one input. This states it
+  // for the whole matrix, which is what makes the SCOPE of the escape hatch a
+  // pinned fact rather than a fact about the one DSN somebody thought to try:
+  // resolve every fixture with and without the opt-out, and require the pair to
+  // be IDENTICAL except where the plain answer was a plaintext refusal.
+  let permitted = 0;
+  let unchanged = 0;
+  for (const { dsn, label } of MATRIX) {
+    const plain = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' },
+      resolveBenchmarkWriterConnection);
+    const optedOut = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM',
+      BENCHMARK_DB_ALLOW_PLAINTEXT: '1' }, resolveBenchmarkWriterConnection);
+    if (!plain.resolved) {
+      permitted += 1;
+      assert.equal(plain.reason, 'plaintext_dsn', label);
+      assert.ok(optedOut.resolved, `${label}: the opt-out must permit the refusal it names`);
+      assert.ok(!('ssl' in optedOut.connection),
+        `${label}: …by deferring to the URL, not by attaching something`);
+      continue;
+    }
+    unchanged += 1;
+    assert.deepEqual(optedOut, plain,
+      `${label}: the opt-out changed an outcome that was never a refusal`);
+  }
+  assert.ok(permitted > 0 && unchanged > 0, `permitted=${permitted} unchanged=${unchanged}`);
 });
 
 test('SWEEP: a target that is not this machine is encrypted or refused, never plaintext', () => {
