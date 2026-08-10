@@ -1,6 +1,8 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { redactSecrets } from './config.js';
+import { DEPLOYMENT_ROUND, NETWORK, redactSecrets } from './config.js';
+import { resolveBenchmarkCommit } from './benchmarkCommit.js';
+import { CURRENT_RESPONSE_SCHEMA_VERSION } from './schema.js';
 import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
 import { runBaselines } from './baselines.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
@@ -52,6 +54,13 @@ function attemptFields(attempt: AttemptRecord | null): JsonRecord {
   return {
     requestAt: attempt?.requestAt ?? null,
     responseAt: attempt?.responseAt ?? null,
+    // The truthful ACCEPTED instant, distinct from responseAt — which is also
+    // stamped on a timeout or a transport failure and so is not a receipt on
+    // its own. This is the one instant meaning "the forecast became a
+    // commitment", and the serving projection seals on it; without it in the
+    // artifact, a run republished from disk would have to substitute a
+    // plausible timestamp for a real one.
+    acceptedAt: attempt?.acceptedAt ?? null,
     latencyMs: attempt?.latencyMs ?? null,
     httpStatus: attempt?.httpStatus ?? null,
     reportedModelId: attempt?.reportedModelId ?? null,
@@ -185,6 +194,20 @@ export function buildRecords(
     slateCutoffAt: slate.cutoffAt,
     promptScaffoldVersion: PROMPT_SCAFFOLD_VERSION,
     promptScaffoldSha256: promptScaffoldSha256(),
+    // Facts the SERVING PROJECTION freezes on its run row and then compares
+    // against on every later write for that run. They are stamped here, into
+    // the artifact, rather than read from constants when publishing, because
+    // republishing a run from its file is the recovery path for a projection
+    // write that was lost — and a value re-derived at that moment (a newer
+    // commit, a bumped round) would disagree with the stored row and drop the
+    // whole write instead of completing it. Reading them back out of the file
+    // makes the recovery byte-identical to the original by construction.
+    projection: {
+      network: NETWORK,
+      deploymentRound: DEPLOYMENT_ROUND,
+      responseSchemaVersion: CURRENT_RESPONSE_SCHEMA_VERSION,
+      benchmarkCommit: resolveBenchmarkCommit(),
+    },
     timeoutMs: bound.timeoutMs,
     maxOutputTokens: bound.maxOutputTokens,
     clockMode: ctx.clockMode,
@@ -313,6 +336,10 @@ export function buildRecords(
           attemptUsed: result.repairUsed ? 'repair' : 'initial',
           requestAt: accepted.requestAt,
           responseAt: accepted.responseAt,
+          // When this forecast became a commitment: stamped after validation
+          // passed and before the decision cutoff. Carried on the decision as
+          // well as on the attempt so a reader of one line needs no join.
+          acceptedAt: accepted.acceptedAt,
           latencyMs: accepted.latencyMs,
           tokens: accepted.usage,
           usageRaw: accepted.usageRaw,

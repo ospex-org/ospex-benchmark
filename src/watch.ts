@@ -14,10 +14,12 @@ import {
   writeText,
 } from './records.js';
 import { runSlate } from './runner.js';
+import { publishRunArtifact } from './servingPublisher.js';
 import { easternCalendarDay } from './slateDate.js';
 import { buildSummaryMarkdown } from './summary.js';
 import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
+import type { BenchmarkServingPort } from './servingStore.js';
 import type {
   ArmOutcome,
   ArmSpec,
@@ -641,6 +643,12 @@ export interface FireConfig {
   nowMs: () => number;
   log: (line: string) => void;
   logError: (line: string) => void;
+  /**
+   * The serving projection. Safe to call unconditionally: with no credential
+   * configured it is a port that returns `disabled` for every write without
+   * touching the network, which is the shipped default.
+   */
+  serving: BenchmarkServingPort;
 }
 
 /**
@@ -707,6 +715,20 @@ export async function fireEligibleGame(
     join(cfg.outDir, `${ctx.runId}-summary.md`),
     buildSummaryMarkdown(env, ctx, build, collision),
   );
+
+  // Mirror the artifact onto the serving projection, from the file rather than
+  // from what is still in memory — so the canonical record is durable before
+  // any row is published, and so republishing the same file later is the same
+  // call on the same bytes. A dry run, or a run that failed the identity check,
+  // is refused by the publisher's own gate rather than by a condition here:
+  // the gate has to reach the same verdict for a backfill months from now, and
+  // only the artifact is available then.
+  //
+  // Awaited inside the fire because the point of the projection is to make a
+  // sealed forecast readable in the gap before first pitch, and because the
+  // fire's own error handling is what keeps a projection problem from
+  // escalating. It cannot fail the fire: every write resolves to an outcome.
+  await publishRunArtifact(cfg.serving, runFile, { line: cfg.log, error: cfg.logError });
 
   const armOutcomes: Record<string, ArmOutcome> = {};
   for (const result of armGameResults) {

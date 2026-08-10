@@ -43,13 +43,20 @@
  *       CREATE TABLE public.commitments (id bigint);
  */
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client, Pool } from 'pg';
 import { pgStoreQuery } from './store/atomicStore.js';
 import { pgStoreTransactor } from './store/campaignTickJournal.js';
 import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { ArmAttempt, AttemptFacts, DecisionSeal, PublishOutcome, RunFacts } from './servingStore.js';
-import { forecastDigest } from './schema.js';
+import { projectRun, publishableRun } from './servingProjection.js';
+import { publishPlan } from './servingPublisher.js';
+import { firedRun } from './servingTestRun.js';
+import { decisionDigest, forecastDigest } from './schema.js';
 import { makeOverScaleAccepted, makeOverScalePushAccepted } from './testFactories.js';
 import type { ForecastOutput } from './types.js';
 
@@ -928,6 +935,182 @@ async function main(): Promise<void> {
         (e: unknown) => (e as { code?: string }).code === '42501', `currval(${seq}) is unreachable`);
     }
   });
+
+  // ── a real fired run, projected and published end to end ──────────────────
+  //
+  // Everything above builds its payloads by hand. This section builds none: it
+  // fires a game through the runner, reads the artifact the runner wrote, and
+  // publishes it through the same function the watcher calls. That is the only
+  // check that can fail if the PROJECTOR disagrees with the schema — a bad
+  // instant format, an over-long identifier, a roster shape the constraints
+  // refuse — and because the publisher is fail-soft, the production symptom of
+  // any of those is a projection that quietly stays empty.
+
+  const artifactDir = mkdtempSync(join(tmpdir(), 'serving-conformance-'));
+  try {
+    // A fresh cohort per suite run, exactly like every check above: these
+    // tables are append-only and nothing here truncates. The date moves rather
+    // than the prefix because the publisher's gate requires the cohort to be
+    // in the runner's own namespace, and that check is worth keeping honest.
+    const stamp = `${2100 + Math.floor(Math.random() * 800)}-01-${String(1 + Math.floor(Math.random() * 28)).padStart(2, '0')}`;
+    const fired = await firedRun({ outDir: artifactDir, enrolled: true });
+    const records = fired.records.map((record) => ({
+      ...record,
+      ...(record['cohortId'] === undefined ? {} : { cohortId: `watch-v0-${stamp}` }),
+      ...(record['slateDate'] === undefined ? {} : { slateDate: stamp }),
+      ...(record['runId'] === undefined ? {} : { runId: `watch-v0-${stamp}-${randomBytes(3).toString('hex')}` }),
+    }));
+
+    const gate = publishableRun(records);
+    assert.ok(gate.publishable, `the fired run must be publishable: ${JSON.stringify(gate)}`);
+    const plan = projectRun(
+      records,
+      gate.header,
+      { sourcePath: 'conformance.ndjson', sourceSha256: null },
+      { now: () => new Date().toISOString() },
+    );
+    const silent = { line: (): void => {}, error: (message: string): void => console.log(`      ${message}`) };
+
+    await check('a projected run is accepted by the real schema, every row', async () => {
+      assert.ok(plan.attempts.length > 0, 'the fired run produced no attempts');
+      assert.ok(plan.decisions.length > 0, 'the fired run produced no decisions');
+      assert.deepEqual(plan.skipped, [], 'nothing should have been skipped');
+
+      const summary = await publishPlan(port, plan, silent);
+      // One write per attempt, plus seal + reveal for every decision, plus a
+      // rationale for each model decision. Anything refused shows up here as a
+      // shortfall rather than as a log line nobody reads.
+      const expected =
+        plan.attempts.length +
+        plan.decisions.length * 2 +
+        plan.decisions.filter((d) => d.rationale !== null).length;
+      assert.deepEqual(summary.rejected, {}, 'the schema refused something the projector built');
+      assert.equal(summary.published, expected, 'not every projected row landed');
+    });
+
+    await check('the commitment survives the round trip through the real numeric columns', async () => {
+      // The point of sealing before the game is that a reader can recompute the
+      // digest from the published reveal. That only holds if the value the
+      // producer hashed is the value PostgreSQL stored — the two round
+      // differently at the column's scale, which is why the producer quantises
+      // first. This reads the stored row back and does the reader's job.
+      const model = plan.decisions.find((d) => d.seal.participant.kind === 'model');
+      assert.ok(model, 'need a model decision');
+      const rows = await query(
+        `select r.selection, r.line, r.observed_decimal, r.prob_win, r.prob_push, r.prob_loss,
+                r.confidence, r.would_abstain, r.selected_for_execution,
+                r.axis_valuation, r.axis_trend, r.axis_consensus, r.axis_news, r.axis_softness,
+                r.primary_axis, r.primary_expectation, d.forecast_digest
+           from public.benchmark_decision_reveals r
+           join public.benchmark_decisions d on d.id = r.decision_id
+          where d.cohort_id = $1 and d.participant_id = $2 and d.game_id = $3 and d.market = $4`,
+        [model.seal.run.cohortId, model.seal.participant.participantId, model.seal.gameId, model.seal.market],
+      );
+      assert.equal(rows.length, 1, 'the reveal was not stored');
+      const row = rows[0]!;
+      const n = (value: unknown): number | null => (value === null ? null : Number(value));
+      const axes = row['axis_valuation'] === null ? null : {
+        valuation: Number(row['axis_valuation']), trend: Number(row['axis_trend']),
+        consensus: Number(row['axis_consensus']), news: Number(row['axis_news']),
+        softness: Number(row['axis_softness']),
+      };
+      assert.equal(
+        decisionDigest({
+          selection: String(row['selection']),
+          line: n(row['line']),
+          observedDecimal: n(row['observed_decimal']),
+          win: n(row['prob_win']),
+          push: n(row['prob_push']),
+          loss: n(row['prob_loss']),
+          confidence: n(row['confidence']),
+          wouldAbstain: row['would_abstain'] as boolean | null,
+          selectedForExecution: row['selected_for_execution'] as boolean | null,
+          axes,
+          primaryAxis: row['primary_axis'] as never,
+          primaryExpectation: row['primary_expectation'] as string | null,
+        }),
+        row['forecast_digest'],
+        'the stored reveal does not reproduce the commitment sealed beside it',
+      );
+    });
+
+    await check('republishing the same artifact changes nothing and reports duplicates', async () => {
+      // This is the recovery path: a write lost to a blip is recovered by
+      // running the publisher over the same file again. It has to be a no-op
+      // when nothing was lost, or recovery would be its own hazard.
+      const before = await query('select count(*)::int as n from public.benchmark_decisions where cohort_id = $1', [plan.cohortId]);
+      const summary = await publishPlan(port, plan, silent);
+      const after = await query('select count(*)::int as n from public.benchmark_decisions where cohort_id = $1', [plan.cohortId]);
+
+      assert.deepEqual(summary.rejected, {}, 'a republish must refuse nothing');
+      assert.equal(summary.published, 0, 'a republish must write nothing new');
+      assert.ok(summary.duplicate > 0, 'and must report the rows it found already present');
+      assert.equal(after[0]?.['n'], before[0]?.['n'], 'the row count moved');
+    });
+
+    await check('a decision sealed under a re-minted runId is refused, never silently split', async () => {
+      // This is the hazard that decides what recovery has to mean. The attempt
+      // key carries no run, so a second process re-firing the same game
+      // resolves the FIRST run's provider call and then tries to hang a
+      // decision citing the SECOND run off it. The composite foreign key stops
+      // that — a decision must not name a run whose provider call belongs to
+      // another one — and the refusal is the correct outcome, not a defect.
+      //
+      // Staged on a cohort of its own with only the ATTEMPTS published, because
+      // once a decision exists the whole thing is absorbed as a duplicate and
+      // the key is never evaluated. That is why re-running the publisher over
+      // an unchanged artifact is safe while re-firing the game is not.
+      const other = `${stamp.slice(0, 4)}-02-${stamp.slice(8)}`;
+      // A new run id as well as a new cohort: the run row is keyed on the id
+      // alone and its cohort is one of the thirteen facts compared on every
+      // later write, so reusing it would be refused as a contradiction long
+      // before the foreign key under test was reached.
+      const stagedRunId = `watch-v0-${other}-${randomBytes(3).toString('hex')}`;
+      const staged = records.map((record) => ({
+        ...record,
+        ...(record['cohortId'] === undefined ? {} : { cohortId: `watch-v0-${other}` }),
+        ...(record['slateDate'] === undefined ? {} : { slateDate: other }),
+        ...(record['runId'] === undefined ? {} : { runId: stagedRunId }),
+      }));
+
+      const first = publishableRun(staged);
+      assert.ok(first.publishable);
+      const attemptsOnly = projectRun(staged, first.header, { sourcePath: null, sourceSha256: null }, {
+        now: () => new Date().toISOString(),
+      });
+      const landed = await publishPlan(
+        port,
+        { ...attemptsOnly, decisions: [] },
+        { line: () => {}, error: () => {} },
+      );
+      assert.equal(landed.published, attemptsOnly.attempts.length, 'the attempts must land first');
+
+      const reMinted = staged.map((record) =>
+        record['runId'] === undefined
+          ? record
+          : { ...record, runId: `watch-v0-${other}-${randomBytes(3).toString('hex')}` },
+      );
+      const second = publishableRun(reMinted);
+      assert.ok(second.publishable);
+      const replan = projectRun(reMinted, second.header, { sourcePath: null, sourceSha256: null }, {
+        now: () => new Date().toISOString(),
+      });
+      const summary = await publishPlan(
+        port,
+        { ...replan, attempts: [] },
+        { line: () => {}, error: () => {} },
+      );
+
+      // The model decisions cite an attempt and are refused; the controls cite
+      // none, so they land under the new run and are the negative control that
+      // says the refusal is about the citation rather than about the run id.
+      const models = replan.decisions.filter((d) => d.seal.attemptOrdinal !== null).length;
+      assert.ok(models > 0, 'need a decision that cites a provider call');
+      assert.equal(summary.rejected['refused'], models, 'every citing decision must be refused');
+    });
+  } finally {
+    rmSync(artifactDir, { recursive: true, force: true });
+  }
 
   await pool.end();
 

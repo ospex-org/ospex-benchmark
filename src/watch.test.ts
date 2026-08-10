@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { buildBundle } from './bundle.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
+import { SqlBenchmarkServingPort } from './servingStore.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
 import {
   fireEligibleGame,
@@ -404,6 +405,10 @@ test('a fired game produces a run file that passes full scorer integrity verific
     nowMs,
     log: () => undefined,
     logError: () => undefined,
+    // The shipped default: no credential, so every projection write resolves to
+    // `disabled` without a socket. What the fire publishes is covered in
+    // servingProjection.test.ts against the artifact this run writes.
+    serving: new SqlBenchmarkServingPort(null),
   });
 
   assert.equal(outcome.collisionFailed, false);

@@ -20,7 +20,7 @@ import type { StoreQuery } from './store/atomicStore.js';
  *
  * 1. IT CANNOT HALT A RUN. Every method resolves to a typed outcome and none of
  *    them throws — a benchmark night must never be lost because a projection was
- *    unavailable (see .claude/rules/advisory-tooling.md). This INVERTS the house
+ *    unavailable — an advisory layer never gates the work. This INVERTS the house
  *    convention: `SqlCampaignAuthorizationPort` rejects on a driver failure, and
  *    a test pins that it does, because a money-path adapter must fail loud. The
  *    two are different on purpose. Fail-soft is only safe here because nothing

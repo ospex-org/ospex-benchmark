@@ -13,6 +13,8 @@ import {
 } from './mock.js';
 import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
 import { checkProviderCollision } from './providers/family.js';
+import { describeServingStatus, openBenchmarkServing } from './benchmarkServingClient.js';
+import { publishRunArtifact } from './servingPublisher.js';
 import {
   buildRecords,
   failuresByCode,
@@ -250,6 +252,18 @@ async function main(): Promise<number> {
     summaryPath,
     buildSummaryMarkdown(env, ctx, build, collision),
   );
+
+  // Mirror the written artifact onto the serving projection. Whether this run
+  // may be published at all is decided by reading the file — a dry run, or one
+  // that failed the identity check, is refused there — so the verdict is the
+  // same one a republish of the same file would reach later.
+  const serving = await openBenchmarkServing();
+  printLine(describeServingStatus(serving.status));
+  try {
+    await publishRunArtifact(serving.port, ndjsonPath, { line: printLine, error: printError });
+  } finally {
+    await serving.close();
+  }
 
   printLine('');
   const outcomes: ArmOutcome[] = [

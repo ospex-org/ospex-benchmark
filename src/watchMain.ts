@@ -7,6 +7,7 @@ import { loadDotEnv } from './env.js';
 import { fetchFirstBoardAppearance, fetchLiveInputs } from './fetchers.js';
 import { createFixtureClock, createMockAdapters, loadFixtureInputs } from './mock.js';
 import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
+import { describeServingStatus, openBenchmarkServing } from './benchmarkServingClient.js';
 import {
   fireEligibleGame,
   loadLedger,
@@ -96,6 +97,13 @@ async function main(): Promise<number> {
     nowMs = (): number => Date.now();
   }
 
+  // Opened once for the life of the watcher rather than per fire: the writer
+  // login carries a small connection limit and a fresh pool per game would
+  // spend it on setup. Unconfigured is the default and costs nothing — the
+  // handle is then a port that answers `disabled` without a socket.
+  const serving = await openBenchmarkServing();
+  printLine(describeServingStatus(serving.status));
+
   const fireConfig: FireConfig = {
     arms: ARMS,
     adapters,
@@ -108,6 +116,7 @@ async function main(): Promise<number> {
     nowMs,
     log: printLine,
     logError: printError,
+    serving: serving.port,
   };
 
   const ledgerDir = join(outDir, 'watch-ledger');
@@ -132,34 +141,43 @@ async function main(): Promise<number> {
     logError: printError,
   };
 
-  for (;;) {
-    // The same injected clock stamps the banner that drives enforcement and
-    // records — never a second clock.
-    const startedAt = new Date(nowMs()).toISOString();
-    let tickFailed = false;
-    try {
-      const summary = await watchTick(deps);
-      printLine(
-        `tick ${startedAt}: ${summary.gamesInWindow} in window · ${summary.watched} watched · ` +
-          `${summary.fired} fired · ${summary.late} late · ${summary.deferred} deferred · ` +
-          `${summary.failed} failed${summary.capHit ? ' · CAP HIT' : ''}`,
-      );
-      // Per-game failures are isolated inside the tick but they are still
-      // failures — and a hit spend cap left work undone. Neither is a
-      // healthy pass.
-      if (summary.failed > 0 || summary.capHit) tickFailed = true;
-    } catch (error) {
-      // A tick failure (fetch outage, transient API error) is logged and the
-      // loop keeps watching — per-game failures are already isolated inside
-      // the tick and can never reach here.
-      tickFailed = true;
-      printError(`tick ${startedAt} failed: ${describeErrorWithStack(error)}`);
+  // The pool is closed on the way out of the loop. It is NOT closed on a
+  // signal — nothing here installs a handler — and that is acceptable rather
+  // than overlooked: every artifact is already on disk when a fire returns, so
+  // a projection write an interrupt costs is recovered by republishing that
+  // file, not by flushing anything held in memory.
+  try {
+    for (;;) {
+      // The same injected clock stamps the banner that drives enforcement and
+      // records — never a second clock.
+      const startedAt = new Date(nowMs()).toISOString();
+      let tickFailed = false;
+      try {
+        const summary = await watchTick(deps);
+        printLine(
+          `tick ${startedAt}: ${summary.gamesInWindow} in window · ${summary.watched} watched · ` +
+            `${summary.fired} fired · ${summary.late} late · ${summary.deferred} deferred · ` +
+            `${summary.failed} failed${summary.capHit ? ' · CAP HIT' : ''}`,
+        );
+        // Per-game failures are isolated inside the tick but they are still
+        // failures — and a hit spend cap left work undone. Neither is a
+        // healthy pass.
+        if (summary.failed > 0 || summary.capHit) tickFailed = true;
+      } catch (error) {
+        // A tick failure (fetch outage, transient API error) is logged and the
+        // loop keeps watching — per-game failures are already isolated inside
+        // the tick and can never reach here.
+        tickFailed = true;
+        printError(`tick ${startedAt} failed: ${describeErrorWithStack(error)}`);
+      }
+      if (options.once) {
+        // External schedulers need the pass/fail distinction by exit code.
+        return tickFailed ? 1 : 0;
+      }
+      await sleep(options.pollSeconds * 1000);
     }
-    if (options.once) {
-      // External schedulers need the pass/fail distinction by exit code.
-      return tickFailed ? 1 : 0;
-    }
-    await sleep(options.pollSeconds * 1000);
+  } finally {
+    await serving.close();
   }
 }
 
