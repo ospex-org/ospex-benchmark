@@ -252,6 +252,24 @@ export interface ProjectionClock {
 }
 
 /**
+ * ── WHY A FORECAST IS REVEALED WITH THE RUN, NOT AFTER THE GAME ──────────────
+ * Recorded here because the seal-and-reveal split makes an embargo POSSIBLE and
+ * a reader can reasonably assume one was intended.
+ *
+ * It is not. Reading what each model chose, and why, before the game is the
+ * point of publishing any of this — a pick that only appears once the result is
+ * known is a claim rather than a forecast. The commitment digest is what makes
+ * that safe: it is written at seal time and recomputable from the reveal, so an
+ * early publication is still provably the pick that was made and not one edited
+ * afterwards.
+ *
+ * The cost, stated plainly rather than left implicit: the picks are visible
+ * while the market they are scored against is still open. That is accepted.
+ * Scoring is against a reference feed rather than a book a reader can move, and
+ * the alternative forfeits the reason the projection exists.
+ */
+
+/**
  * Build the plan for an artifact that has already passed `publishableRun`.
  *
  * Anything that cannot be published truthfully is skipped with a reason rather
