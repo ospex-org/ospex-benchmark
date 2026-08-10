@@ -50,7 +50,7 @@ import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { ArmAttempt, AttemptFacts, DecisionSeal, PublishOutcome, RunFacts } from './servingStore.js';
 import { forecastDigest } from './schema.js';
-import { makeOverScaleAccepted } from './testFactories.js';
+import { makeOverScaleAccepted, makeOverScalePushAccepted } from './testFactories.js';
 import type { ForecastOutput } from './types.js';
 
 const HOST = process.env['BENCHMARK_CONFORMANCE_DB_HOST'] ?? 'localhost';
@@ -492,107 +492,126 @@ async function main(): Promise<void> {
     })) assert.deepEqual(d[column], expected, `benchmark_decisions.${column} holds the wrong value`);
   });
 
-  await check('A SEALED DIGEST SURVIVES THE REVEAL ROUND TRIP, at over-scale precision', async () => {
-    // The one check that proves the commitment is worth anything: seal a real
-    // forecastDigest(), reveal the SAME forecast through the port, read the row
-    // back out of PostgreSQL, recompute the digest from what was stored, and
-    // require it to equal the seal.
-    //
-    // The forecast is deliberately over-scale: `win` and `loss` carry twelve
-    // decimals and the reveal columns hold eight, `observedDecimal` carries
-    // seven against six, `line` five against four. (`push` is 0, because the
-    // validator requires it on any non-integer line and an over-scale line is
-    // always one — so win and loss are what demonstrate the rounding here.)
-    // Hashing the raw value and storing the rounded one produced two different
-    // digests with nothing anywhere reporting a problem; that is the failure
-    // this exists to keep out. Note that the RAW values are handed to
-    // revealDecision, exactly as a producer would: the port quantises them
-    // through the same module the digest does, which is what makes the two
-    // agree without the caller having to remember anything.
-    const { forecast, errors } = makeOverScaleAccepted();
-    // The round trip only means something if it starts from input a producer
-    // could actually have been handed, so the validator's verdict is asserted
-    // rather than assumed. An earlier version of this check cast a hand-written
-    // object through `as unknown` and used probabilities summing to 1.33 — it
-    // would never have reached this code path in life.
-    assert.deepEqual(errors, [], 'the over-scale forecast must be one the validator accepts');
-    const sealed = forecastDigest(forecast);
+  // The checks that prove the commitment is worth anything: seal a real
+  // forecastDigest(), reveal the SAME forecast through the port, read the row
+  // back out of PostgreSQL, recompute the digest from what was stored, and
+  // require it to equal the seal.
+  //
+  // Both fixtures are deliberately over-scale, and it takes two of them because
+  // the validator refuses a non-zero push on any fractional line while a line is
+  // over-scale only when it is fractional — so no single forecast can exercise
+  // the rounding of BOTH the line and the push:
+  //
+  //   the spread   line, observedDecimal, win, loss and confidence all carry
+  //                more decimals than their columns hold; push is 0.
+  //   the total    a whole-number line, so push carries an over-scale value —
+  //                the only shape in which that column is ever exercised with
+  //                anything but zero.
+  //
+  // Hashing the raw value and storing the rounded one produced two different
+  // digests with nothing anywhere reporting a problem; that is the failure this
+  // exists to keep out. Note that the RAW values are handed to revealDecision,
+  // exactly as a producer would: the port quantises them through the same module
+  // the digest does, which is what makes the two agree without the caller having
+  // to remember anything.
+  const roundTrips: Array<[string, () => { forecast: ForecastOutput; errors: readonly string[] },
+                           Record<string, string>]> = [
+    ['a SPREAD over-scale in line, price, win, loss and confidence', makeOverScaleAccepted, {
+      line: '1.5000', observed_decimal: '2.053713', prob_win: '0.52312346',
+      prob_push: '0.00000000', prob_loss: '0.47687654', confidence: '0.61371235',
+    }],
+    ['a whole-number TOTAL carrying an over-scale PUSH', makeOverScalePushAccepted, {
+      line: '8.0000', observed_decimal: '1.909090', prob_win: '0.48765432',
+      prob_push: '0.06172840', prob_loss: '0.45061728', confidence: '0.55432110',
+    }],
+  ];
 
-    // The fixture is a SPREAD forecast, so the attempt, the seal and the reveal
-    // all have to be about a spread. Storing it under the default moneyline key
-    // would still pass — `market` is outside the digest and the numeric columns
-    // are shared — which is exactly why it would prove nothing: the validator's
-    // verdict would be about a different decision from the one written.
-    const market = forecast.market;
-    const cohortId = cohortName('digest-roundtrip');
-    const decision = { cohortId, participantId: `${cohortId}-alpha`, gameId: 'game-1', market };
-    await port.publishAttempt(armAttempt(cohortId, { facts: facts({ suppliedMarkets: [market] }) }));
-    expect(
-      await port.sealDecision(decisionSeal(cohortId, { market, forecastDigest: sealed })),
-      'published', 'seal'
-    );
-    expect(await port.revealDecision({
-      decision, revealedAt: '2026-08-09T20:40:00.000Z', selection: forecast.selection,
-      line: forecast.line, observedDecimal: forecast.observedDecimal,
-      probWin: forecast.probabilities.win, probPush: forecast.probabilities.push,
-      probLoss: forecast.probabilities.loss, confidence: forecast.confidence,
-      wouldAbstain: forecast.wouldAbstain, selectedForExecution: forecast.selectedForExecution,
-      reasonCode: null,
-      axisValuation: forecast.axes!.valuation, axisTrend: forecast.axes!.trend,
-      axisConsensus: forecast.axes!.consensus, axisNews: forecast.axes!.news,
-      axisSoftness: forecast.axes!.softness,
-      primaryAxis: forecast.primaryAxis!, primaryExpectation: forecast.primaryExpectation!,
-      source: NO_SOURCE,
-    }), 'published', 'reveal');
+  for (const [label, make, atColumnScale] of roundTrips) {
+    await check(`A SEALED DIGEST SURVIVES THE REVEAL ROUND TRIP: ${label}`, async () => {
+      const { forecast, errors } = make();
+      // The round trip only means something if it starts from input a producer
+      // could actually have been handed, so the validator's verdict is asserted
+      // rather than assumed. An earlier version of this check cast a hand-written
+      // object through `as unknown` and used probabilities summing to 1.33 — it
+      // would never have reached this code path in life.
+      assert.deepEqual(errors, [], 'the over-scale forecast must be one the validator accepts');
+      const sealed = forecastDigest(forecast);
 
-    const stored = (await query(
-      `select r.*, d.forecast_digest, d.market from public.benchmark_decision_reveals r
-         join public.benchmark_decisions d on d.id = r.decision_id where d.cohort_id = $1`, [cohortId]))[0]!;
-    assert.equal(stored['forecast_digest'], sealed, 'the seal did not store the digest it was given');
-    // The row written must be about the decision the validator accepted. Without
-    // this the check passes with the two out of step, since market is outside
-    // the digest and every numeric column is shared across markets.
-    assert.equal(stored['market'], forecast.market, 'stored a different market from the one validated');
+      // The attempt, the seal and the reveal all have to be about the fixture's
+      // OWN market. Storing it under the default moneyline key would still pass
+      // — `market` is outside the digest and the numeric columns are shared —
+      // which is exactly why it would prove nothing: the validator's verdict
+      // would be about a different decision from the one written.
+      const market = forecast.market;
+      const cohortId = cohortName('digest-roundtrip');
+      const decision = { cohortId, participantId: `${cohortId}-alpha`, gameId: 'game-1', market };
+      await port.publishAttempt(armAttempt(cohortId, { facts: facts({ suppliedMarkets: [market] }) }));
+      expect(
+        await port.sealDecision(decisionSeal(cohortId, { market, forecastDigest: sealed })),
+        'published', 'seal'
+      );
+      expect(await port.revealDecision({
+        decision, revealedAt: '2026-08-09T20:40:00.000Z', selection: forecast.selection,
+        line: forecast.line, observedDecimal: forecast.observedDecimal,
+        probWin: forecast.probabilities.win, probPush: forecast.probabilities.push,
+        probLoss: forecast.probabilities.loss, confidence: forecast.confidence,
+        wouldAbstain: forecast.wouldAbstain, selectedForExecution: forecast.selectedForExecution,
+        reasonCode: null,
+        axisValuation: forecast.axes!.valuation, axisTrend: forecast.axes!.trend,
+        axisConsensus: forecast.axes!.consensus, axisNews: forecast.axes!.news,
+        axisSoftness: forecast.axes!.softness,
+        primaryAxis: forecast.primaryAxis!, primaryExpectation: forecast.primaryExpectation!,
+        source: NO_SOURCE,
+      }), 'published', 'reveal');
 
-    // Rebuild the forecast from the REVEALED row and recompute.
-    const revealed = {
-      ...forecast,
-      selection: String(stored['selection']),
-      line: Number(stored['line']),
-      observedDecimal: Number(stored['observed_decimal']),
-      probabilities: {
-        win: Number(stored['prob_win']),
-        push: Number(stored['prob_push']),
-        loss: Number(stored['prob_loss']),
-      },
-      confidence: Number(stored['confidence']),
-      axes: {
-        valuation: Number(stored['axis_valuation']), trend: Number(stored['axis_trend']),
-        consensus: Number(stored['axis_consensus']), news: Number(stored['axis_news']),
-        softness: Number(stored['axis_softness']),
-      },
-      primaryAxis: stored['primary_axis'],
-      primaryExpectation: stored['primary_expectation'],
-    } as unknown as ForecastOutput;
-    assert.equal(
-      forecastDigest(revealed), sealed,
-      'the digest recomputed from the revealed row does not match the seal — the commitment is unverifiable'
-    );
+      const stored = (await query(
+        `select r.*, d.forecast_digest, d.market from public.benchmark_decision_reveals r
+           join public.benchmark_decisions d on d.id = r.decision_id where d.cohort_id = $1`, [cohortId]))[0]!;
+      assert.equal(stored['forecast_digest'], sealed, 'the seal did not store the digest it was given');
+      // The row written must be about the decision the validator accepted. Without
+      // this the check passes with the two out of step, since market is outside
+      // the digest and every numeric column is shared across markets.
+      assert.equal(stored['market'], forecast.market, 'stored a different market from the one validated');
 
-    // And the stored decimals really are at the column scale, so this passed
-    // for the right reason rather than because PostgreSQL happened to keep them.
-    assert.deepEqual(
-      {
-        line: stored['line'], observed_decimal: stored['observed_decimal'],
-        prob_win: stored['prob_win'], prob_loss: stored['prob_loss'],
-        confidence: stored['confidence'],
-      },
-      {
-        line: '1.5000', observed_decimal: '2.053713',
-        prob_win: '0.52312346', prob_loss: '0.47687654', confidence: '0.61371235',
-      }
-    );
-  });
+      // Rebuild the forecast from the REVEALED row and recompute.
+      const revealed = {
+        ...forecast,
+        selection: String(stored['selection']),
+        line: Number(stored['line']),
+        observedDecimal: Number(stored['observed_decimal']),
+        probabilities: {
+          win: Number(stored['prob_win']),
+          push: Number(stored['prob_push']),
+          loss: Number(stored['prob_loss']),
+        },
+        confidence: Number(stored['confidence']),
+        axes: {
+          valuation: Number(stored['axis_valuation']), trend: Number(stored['axis_trend']),
+          consensus: Number(stored['axis_consensus']), news: Number(stored['axis_news']),
+          softness: Number(stored['axis_softness']),
+        },
+        primaryAxis: stored['primary_axis'],
+        primaryExpectation: stored['primary_expectation'],
+      } as unknown as ForecastOutput;
+      assert.equal(
+        forecastDigest(revealed), sealed,
+        'the digest recomputed from the revealed row does not match the seal — the commitment is unverifiable'
+      );
+
+      // And the stored decimals really are at the column scale, so this passed
+      // for the right reason rather than because PostgreSQL happened to keep
+      // them. Every numeric the digest covers is read back, prob_push included:
+      // a column nobody reads back is a column that can be written wrong.
+      assert.deepEqual(
+        {
+          line: stored['line'], observed_decimal: stored['observed_decimal'],
+          prob_win: stored['prob_win'], prob_push: stored['prob_push'],
+          prob_loss: stored['prob_loss'], confidence: stored['confidence'],
+        },
+        atColumnScale
+      );
+    });
+  }
 
   await check('EVERY reveal and score column round-trips to its own column', async () => {
     const cohortId = cohortName('roundtrip-reveal');

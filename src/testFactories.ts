@@ -8,7 +8,9 @@ import type { ArmSpec, BenchmarkResponse, ForecastOutput, GameBundle, SlateBundl
 /**
  * Shared deterministic factories for unit tests: one synthetic game request
  * and a schema-conformant response for it. Test-only; not part of the runtime
- * path (nothing under src/ imports this except *.test.ts).
+ * path — the only importers under src/ are `*.test.ts` and the database
+ * conformance suites, which are run by their own scripts and not by
+ * `yarn test`.
  */
 
 export const TEST_ARM: ArmSpec = {
@@ -217,15 +219,18 @@ export function makeOverScaleAccepted(): {
   return { forecast: (accepted ?? spread) as ForecastOutput, errors: result.errors };
 }
 
-const ACCEPTANCE_GAME_ID = '00000000-0000-4000-8000-00000000t001';
+/** Exported so a caller can assert on the validator's message verbatim. */
+export const ACCEPTANCE_GAME_ID = '00000000-0000-4000-8000-00000000t001';
 const ACCEPTANCE_AWAY_TEAM = 'Milwaukee Brewers';
 const ACCEPTANCE_OBSERVED_AT = '2026-07-12T14:02:11+00:00';
 
 /**
- * The price on the side the forecast did NOT take. The validator checks only
- * the selected side's price, so nothing reads this; it is a real
- * `americanToDecimal` output (-125) rather than a round number so the board is
- * not obviously synthetic.
+ * The price on the side the forecast did NOT take: `americanToDecimal(-125)`,
+ * a price a book could post. The validator checks only the SELECTED side, so
+ * nothing reads this — and because it is the same constant on every market, the
+ * two-sided board it produces is not one any book would post. That matters to
+ * nothing here; it is written down so the next reader does not mistake this for
+ * a modelled market.
  */
 const UNSELECTED_SIDE_DECIMAL = 1.8;
 
@@ -234,8 +239,12 @@ const UNSELECTED_SIDE_DECIMAL = 1.8;
  * to the real validator.
  *
  * The game supplies only the forecast's own market — the response schema's
- * dynamic cardinality allows 1-3 — which keeps a single-forecast response
- * legal and avoids inventing two decisions nobody asked about.
+ * dynamic cardinality allows 1-3 — which keeps a single-forecast response legal
+ * and avoids inventing two decisions nobody asked about. That is a construction
+ * convenience rather than a board this repo builds: the batch producer always
+ * requests the full three-market board, and the line-open path builds
+ * single-market bundles under market policy. Nothing about the digest depends
+ * on which of those a forecast arrived in.
  */
 function bundleAround(forecast: ForecastOutput): GameBundle {
   const marketRef = `ev:${ACCEPTANCE_GAME_ID}:${forecast.market}`;
@@ -299,22 +308,36 @@ function bundleAround(forecast: ForecastOutput): GameBundle {
 
 /**
  * The real validator's verdict on a single forecast, as the list of errors it
- * reports — empty when the forecast is one a producer could have been handed.
+ * reports — empty when the forecast is INTERNALLY CONSISTENT with a bundle
+ * built to match it.
  *
  * For a fixture written as a literal (a golden preimage, say) this is how the
- * literal earns the right to be called realistic. A forecast cannot be judged
- * alone, so a matching one-game bundle is built around it and the pair goes to
- * `validateResponseText`.
+ * literal earns the right to be called realistic, because a forecast cannot be
+ * judged alone: a matching one-game bundle is built around it and the pair goes
+ * to `validateResponseText`.
  *
- * ⚠ Be precise about what that does and does not prove. The bundle is derived
- *   from the forecast, so the checks that bind a forecast to ITS BUNDLE —
- *   observedDecimal echoing the selected side's price, line echoing the
- *   designated line, evidence refs being drawn from the game — are satisfied by
- *   construction and can never fail here. What survives as a real constraint is
- *   the forecast's own internal consistency, which is exactly where a
- *   hand-written fixture goes wrong:
+ * ⚠ Be precise about what that does and does not prove. The bundle is DERIVED
+ *   from the forecast, so every check binding a forecast to its bundle is
+ *   satisfied by construction and can never fail here:
  *
- *     - push must be 0 on a half-point line, whatever line you choose
+ *     - observedDecimal echoing the selected side's price
+ *     - line echoing the designated line
+ *     - evidence refs being drawn from the game's own list
+ *     - the selection naming one of the two teams — the home team IS the
+ *       selection, so any non-empty string passes on a spread or moneyline
+ *
+ *   Nor are the numbers checked for plausibility. Every price in a real bundle
+ *   comes from `americanToDecimal`, which rounds to five decimals, and a real
+ *   line arrives from the odds row in half-point steps; this copies whatever
+ *   the forecast carries, so a price no book could post validates clean. An
+ *   empty list means coherent, not quoted.
+ *
+ *   What survives as a real constraint is the forecast's own internal
+ *   consistency, which is exactly where a hand-written fixture goes wrong:
+ *
+ *     - push must be 0 on a moneyline, which has no line at all, and on any
+ *       spread or total whose line is fractional. A whole-number line is the
+ *       only shape that admits a non-zero push.
  *     - the three probabilities must sum to 1 within 1e-6
  *     - selectedForExecution must match the market under fixed-moneyline-total
  *     - primaryAxis must be null iff every axis is rated 1
@@ -374,4 +397,50 @@ export function forecastAcceptance(
     TEST_COHORT,
     schemaVersion === 1 ? RESPONSE_SCHEMA_VERSIONS : undefined,
   ).errors;
+}
+
+/**
+ * A forecast carrying an over-scale PUSH, with the validator's verdict beside
+ * it. Lives here rather than in a test file because the digest unit test and
+ * the database conformance suite must argue about the same input.
+ *
+ * A non-zero push is refused on any fractional line, and a line is over-scale
+ * only when it is fractional, so this is the one shape that can carry a push
+ * with decimals for the reveal column to lose: a whole-number total, which is
+ * an ordinary baseball number rather than an exotic one.
+ *
+ * The values are chosen so that no plausible wrong implementation reproduces
+ * them:
+ *
+ *   - `win` sits ON the scale-8 rounding boundary. `Number(v.toFixed(8))` gives
+ *     0.48765432 and the usual `Math.round(v * 1e8) / 1e8` idiom gives
+ *     0.48765433, so swapping the quantiser's rule for that one — a plausible
+ *     cleanup — moves the digest.
+ *   - `confidence` distinguishes rounding from truncation: 0.5543211 against
+ *     0.55432109.
+ *   - `push` and `loss` are over-scale by four decimals.
+ *   - `observedDecimal` is `americanToDecimal(-110)`, five decimals, which
+ *     numeric(12,6) holds exactly — a price the bundle builder can emit.
+ */
+export function makeOverScalePushAccepted(): {
+  forecast: ForecastOutput;
+  errors: readonly string[];
+} {
+  const forecast: ForecastOutput = {
+    market: 'total',
+    selection: 'over',
+    line: 8,
+    observedDecimal: 1.90909,
+    probabilities: { win: 0.487654325, push: 0.061728395062, loss: 0.450617279938 },
+    confidence: 0.554321098765,
+    wouldAbstain: false,
+    selectedForExecution: true,
+    rationale: 'synthetic rationale, not from any model',
+    evidenceRefs: ['ref-1'],
+    reasonCode: null,
+    axes: { valuation: 2, trend: 5, consensus: 3, news: 1, softness: 4 },
+    primaryAxis: 'trend',
+    primaryExpectation: 'synthetic expectation on a whole-number total.',
+  };
+  return { forecast, errors: forecastAcceptance(forecast) };
 }
