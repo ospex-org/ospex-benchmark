@@ -1,7 +1,8 @@
 import { canonicalize, sha256Hex } from './canonical.js';
-import { validateResponseText } from './schema.js';
+import { RESPONSE_SCHEMA_VERSIONS, validateResponseText } from './schema.js';
 import { SMOKE_LABEL } from './types.js';
 import type { GameRequest } from './bundle.js';
+import type { ResponseSchemaVersion } from './schema.js';
 import type { ArmSpec, BenchmarkResponse, ForecastOutput, GameBundle, SlateBundle } from './types.js';
 
 /**
@@ -214,4 +215,163 @@ export function makeOverScaleAccepted(): {
   );
   const accepted = result.parsed?.games[0]?.forecasts.find((f) => f.market === 'spread');
   return { forecast: (accepted ?? spread) as ForecastOutput, errors: result.errors };
+}
+
+const ACCEPTANCE_GAME_ID = '00000000-0000-4000-8000-00000000t001';
+const ACCEPTANCE_AWAY_TEAM = 'Milwaukee Brewers';
+const ACCEPTANCE_OBSERVED_AT = '2026-07-12T14:02:11+00:00';
+
+/**
+ * The price on the side the forecast did NOT take. The validator checks only
+ * the selected side's price, so nothing reads this; it is a real
+ * `americanToDecimal` output (-125) rather than a round number so the board is
+ * not obviously synthetic.
+ */
+const UNSELECTED_SIDE_DECIMAL = 1.8;
+
+/**
+ * A one-game, one-market bundle built AROUND a forecast, so the pair can be put
+ * to the real validator.
+ *
+ * The game supplies only the forecast's own market — the response schema's
+ * dynamic cardinality allows 1-3 — which keeps a single-forecast response
+ * legal and avoids inventing two decisions nobody asked about.
+ */
+function bundleAround(forecast: ForecastOutput): GameBundle {
+  const marketRef = `ev:${ACCEPTANCE_GAME_ID}:${forecast.market}`;
+  const evidenceRefs = [...new Set([marketRef, ...forecast.evidenceRefs])];
+  const homeTeam = forecast.market === 'total' ? 'Pittsburgh Pirates' : forecast.selection;
+  if (homeTeam === ACCEPTANCE_AWAY_TEAM) {
+    throw new Error('forecastAcceptance: the selection collides with the away team');
+  }
+  const base = makeGameBundle({
+    gameId: ACCEPTANCE_GAME_ID,
+    homeTeam,
+    awayTeam: ACCEPTANCE_AWAY_TEAM,
+    evidenceRefs,
+  });
+  if (forecast.market === 'moneyline') {
+    return {
+      ...base,
+      markets: {
+        moneyline: {
+          awayDecimal: UNSELECTED_SIDE_DECIMAL,
+          homeDecimal: forecast.observedDecimal,
+          observedAt: ACCEPTANCE_OBSERVED_AT,
+          evidenceRef: marketRef,
+        },
+      },
+    };
+  }
+  if (forecast.line === null) {
+    throw new Error(`forecastAcceptance: a ${forecast.market} forecast needs a line`);
+  }
+  if (forecast.market === 'spread') {
+    return {
+      ...base,
+      markets: {
+        runLine: {
+          line: forecast.line,
+          awayHandicap: -forecast.line,
+          homeHandicap: forecast.line,
+          awayDecimal: UNSELECTED_SIDE_DECIMAL,
+          homeDecimal: forecast.observedDecimal,
+          observedAt: ACCEPTANCE_OBSERVED_AT,
+          evidenceRef: marketRef,
+        },
+      },
+    };
+  }
+  const over = forecast.selection === 'over';
+  return {
+    ...base,
+    markets: {
+      total: {
+        line: forecast.line,
+        overDecimal: over ? forecast.observedDecimal : UNSELECTED_SIDE_DECIMAL,
+        underDecimal: over ? UNSELECTED_SIDE_DECIMAL : forecast.observedDecimal,
+        observedAt: ACCEPTANCE_OBSERVED_AT,
+        evidenceRef: marketRef,
+      },
+    },
+  };
+}
+
+/**
+ * The real validator's verdict on a single forecast, as the list of errors it
+ * reports — empty when the forecast is one a producer could have been handed.
+ *
+ * For a fixture written as a literal (a golden preimage, say) this is how the
+ * literal earns the right to be called realistic. A forecast cannot be judged
+ * alone, so a matching one-game bundle is built around it and the pair goes to
+ * `validateResponseText`.
+ *
+ * ⚠ Be precise about what that does and does not prove. The bundle is derived
+ *   from the forecast, so the checks that bind a forecast to ITS BUNDLE —
+ *   observedDecimal echoing the selected side's price, line echoing the
+ *   designated line, evidence refs being drawn from the game — are satisfied by
+ *   construction and can never fail here. What survives as a real constraint is
+ *   the forecast's own internal consistency, which is exactly where a
+ *   hand-written fixture goes wrong:
+ *
+ *     - push must be 0 on a half-point line, whatever line you choose
+ *     - the three probabilities must sum to 1 within 1e-6
+ *     - selectedForExecution must match the market under fixed-moneyline-total
+ *     - primaryAxis must be null iff every axis is rated 1
+ *     - a moneyline forecast's line must be null, a total's selection over/under
+ *
+ * The forecast is placed on the HOME side of the board, so a fixture cannot
+ * express "the away side was taken"; nothing here depends on that.
+ *
+ * `schemaVersion` 1 strips the three v2 analysis fields and validates against
+ * the frozen v1 schema, the way replay contexts do.
+ */
+export function forecastAcceptance(
+  forecast: ForecastOutput,
+  schemaVersion: ResponseSchemaVersion = 2,
+): readonly string[] {
+  const game = bundleAround(forecast);
+  const requestBundle: SlateBundle = {
+    schemaVersion: 1,
+    label: SMOKE_LABEL,
+    league: 'mlb',
+    slateDate: '2026-07-12',
+    bundleTimestamp: '2026-07-12T14:05:00+00:00',
+    cutoffAt: game.scheduledStartUtc,
+    games: [game],
+  };
+  const bundleSha256 = sha256Hex(canonicalize(requestBundle));
+  const body =
+    schemaVersion === 1
+      ? {
+          market: forecast.market,
+          selection: forecast.selection,
+          line: forecast.line,
+          observedDecimal: forecast.observedDecimal,
+          probabilities: forecast.probabilities,
+          confidence: forecast.confidence,
+          wouldAbstain: forecast.wouldAbstain,
+          selectedForExecution: forecast.selectedForExecution,
+          rationale: forecast.rationale,
+          evidenceRefs: forecast.evidenceRefs,
+          reasonCode: forecast.reasonCode,
+        }
+      : forecast;
+  const response = {
+    schemaVersion,
+    cohortId: TEST_COHORT,
+    participantId: TEST_ARM.participantId,
+    requestedModelId: TEST_ARM.requestedModelId,
+    bundleSha256,
+    executionPolicy: 'fixed-moneyline-total',
+    games: [{ gameId: ACCEPTANCE_GAME_ID, forecasts: [body] }],
+  };
+  return validateResponseText(
+    JSON.stringify(response),
+    requestBundle,
+    bundleSha256,
+    TEST_ARM,
+    TEST_COHORT,
+    schemaVersion === 1 ? RESPONSE_SCHEMA_VERSIONS : undefined,
+  ).errors;
 }

@@ -5,10 +5,9 @@ import {
   forecastDigest,
   forecastFingerprint,
   projectionFingerprint,
-  validateResponseText,
 } from './schema.js';
 import { PROJECTION_SCALES, quantizeForProjection } from './projectionNumeric.js';
-import { makeOverScaleAccepted } from './testFactories.js';
+import { forecastAcceptance, makeOverScaleAccepted } from './testFactories.js';
 import type { ForecastOutput } from './types.js';
 
 /**
@@ -38,25 +37,57 @@ import type { ForecastOutput } from './types.js';
  * every digest already stored is now unverifiable. That is a decision to make
  * deliberately — with a plan for the rows already written — not a number to
  * update until the test passes.
+ *
+ * ── THE FIXTURES ─────────────────────────────────────────────────────────────
+ *
+ * Every fixture here is a forecast the real validator ACCEPTS, and the first
+ * test below proves it rather than asserting it in prose. A fixture that could
+ * not occur is regression evidence for a case that never happens; worse, the
+ * values that make it impossible are usually the ones that would have
+ * discriminated a wrong implementation from a right one.
+ *
+ * Which forces the fixture set into the shape it has. The validator will not
+ * accept a non-zero push on a half-point line, and a line is over-scale only
+ * when it is not a whole number, so ONE forecast cannot carry both an
+ * over-scale line and a push worth hashing:
+ *
+ *   V2 / V1        a half-run-line spread, within scale, push 0. The primary
+ *                  golden; quantising it is a no-op, which is the ordinary case.
+ *   OVERSCALE      a spread whose line, price, win, loss and confidence all
+ *                  carry more decimals than their columns hold. Push is 0 there,
+ *                  because its line is fractional.
+ *   OVERSCALE_PUSH a whole-number total, the only shape in which a push may be
+ *                  non-zero, carrying an over-scale one.
+ *
+ * The perturbations further down are deliberately NOT held to that standard:
+ * they probe the hash function, not the pipeline, and requiring each to
+ * validate would rule out the ones worth probing (a spread with a null line, a
+ * market swap). It is the fixtures they are derived from that must be real.
  */
 
 /**
  * A v2 body: the analysis fields present. Synthetic; from no model.
  *
- * Every float carries four decimals ON PURPOSE. With round values like 0.61 and
+ * The floats carry four decimals ON PURPOSE. With round values like 0.61 and
  * 2.05, a mutation that rounds a probability before hashing is a no-op on the
  * fixture and survives the golden — measured, it did. Precision here makes the
- * golden itself discriminate.
+ * golden itself discriminate. `observedDecimal` is `americanToDecimal(-111)`,
+ * so it is a price the bundle builder can actually emit and not just a number
+ * with the right number of digits.
+ *
+ * `push` is 0 and `selectedForExecution` is false because this is a spread on a
+ * half-run line: the validator requires both, and an earlier version of this
+ * fixture violated both.
  */
 const V2: ForecastOutput = {
   market: 'spread',
   selection: 'St. Louis Cardinals',
   line: -1.5,
-  observedDecimal: 2.0537,
-  probabilities: { win: 0.5231, push: 0.0104, loss: 0.4665 },
+  observedDecimal: 1.9009,
+  probabilities: { win: 0.5231, push: 0, loss: 0.4769 },
   confidence: 0.6137,
   wouldAbstain: false,
-  selectedForExecution: true,
+  selectedForExecution: false,
   rationale: 'synthetic rationale, not from any model',
   evidenceRefs: ['ref-1', 'ref-2'],
   reasonCode: null,
@@ -70,47 +101,65 @@ const V1: ForecastOutput = {
   market: 'spread',
   selection: 'St. Louis Cardinals',
   line: -1.5,
-  observedDecimal: 2.0537,
-  probabilities: { win: 0.5231, push: 0.0104, loss: 0.4665 },
+  observedDecimal: 1.9009,
+  probabilities: { win: 0.5231, push: 0, loss: 0.4769 },
   confidence: 0.6137,
   wouldAbstain: false,
-  selectedForExecution: true,
+  selectedForExecution: false,
   rationale: 'synthetic rationale, not from any model',
   evidenceRefs: ['ref-1', 'ref-2'],
   reasonCode: null,
 };
 
 /**
- * An over-scale forecast THE REAL VALIDATOR ACCEPTS, built through the same
- * factories the rest of the suite uses and checked below before it is trusted.
+ * An over-scale forecast, built through the same factories the rest of the
+ * suite uses and shared with the database conformance suite so both argue about
+ * one input.
  *
- * The first version of this fixture was hand-written and would have been
- * rejected outright — its probabilities summed to 1.33 — so it was regression
- * evidence for a case that could never occur. The cross-field rules that make
- * this one real: probabilities must sum to 1 within 1e-6, `observedDecimal`
- * must EQUAL the bundle price for the selected side, `line` must echo the
- * bundle, and `push` must be 0 whenever the line is not an integer, which an
- * over-scale line always is. So the bundle carries the over-scale price too.
- *
- * V2 above cannot stand in for this: every one of its values is already within
+ * V2 above cannot stand in for it: every one of V2's values is already within
  * scale, so quantising it changes nothing and a build that skipped quantisation
- * entirely would pass every golden. This fixture is the one that discriminates.
+ * entirely would pass every golden.
  */
-function overScaleFixture(): ForecastOutput {
-  const { forecast, errors } = makeOverScaleAccepted();
-  // The fixture is only worth something if a producer could actually have
-  // received it. Asserted here rather than assumed — the first version of this
-  // fixture summed its probabilities to 1.33 and would have been rejected.
-  assert.deepEqual(errors, [], 'the over-scale fixture must be a response the validator accepts');
-  return forecast;
-}
+const OVERSCALE_ACCEPTANCE = makeOverScaleAccepted();
+const OVERSCALE: ForecastOutput = OVERSCALE_ACCEPTANCE.forecast;
 
-const OVERSCALE: ForecastOutput = overScaleFixture();
+/**
+ * The case OVERSCALE structurally cannot reach: an over-scale PUSH.
+ *
+ * `isHalfLine()` is `!Number.isInteger`, so the validator zeroes push on every
+ * fractional line — and a line with decimals to lose is fractional by
+ * definition. A push worth hashing therefore only exists on a whole-number
+ * line, which is an ordinary baseball total (8 runs, push if the game lands
+ * exactly there) rather than an exotic one.
+ *
+ * It matters because `push` is model-emitted, and the response schema bounds
+ * the probabilities by RANGE and never by precision: a model that puts one
+ * chance in sixteen on the push returns 0.0625, and one that derives it returns
+ * as many decimals as its arithmetic produced. Without this fixture, a build
+ * that hashed push raw while storing it rounded passed every test here.
+ */
+const OVERSCALE_PUSH: ForecastOutput = {
+  market: 'total',
+  selection: 'over',
+  line: 8,
+  // americanToDecimal(-110); five decimals, which numeric(12,6) holds exactly.
+  observedDecimal: 1.90909,
+  probabilities: { win: 0.487654321098, push: 0.061728395062, loss: 0.45061728384 },
+  confidence: 0.554321098765,
+  wouldAbstain: false,
+  selectedForExecution: true,
+  rationale: 'synthetic rationale, not from any model',
+  evidenceRefs: ['ref-1'],
+  reasonCode: null,
+  axes: { valuation: 2, trend: 5, consensus: 3, news: 1, softness: 4 },
+  primaryAxis: 'trend',
+  primaryExpectation: 'synthetic expectation on a whole-number total.',
+};
 
+const V2_DIGEST = 'cd280a6bc15e7894cc036aef94ad70903545ea643468990e06b8a34c1c13ba5d';
+const V1_DIGEST = 'fd0c68896bcb5d4d991c63d286839ea26ab954f1719a9109bb76328ba8a098b2';
 const OVERSCALE_DIGEST = '57cc317eacd24a9c8fb9bf55936b255e73f69790b88675a99c608d750f50e21b';
-
-const V2_DIGEST = '4945761adc3f2829b1b51fb6b6515a77d7f88d887d08df2e7c4779755e6b5348';
-const V1_DIGEST = 'ff97a0f00a489a328d7637ee144df8ef3904c2a00bed2587ee51714187263878';
+const OVERSCALE_PUSH_DIGEST = 'a80aeeb97174dc866e3c8b0b8b61e5519e020b539e590ab1b6ff7575eaa35a5c';
 
 /** The column's CHECK, copied from the projection schema. */
 const DIGEST_CHECK = /^[0-9a-f]{64}$/;
@@ -118,6 +167,29 @@ const DIGEST_CHECK = /^[0-9a-f]{64}$/;
 function withForecast(patch: Partial<ForecastOutput>): ForecastOutput {
   return { ...V2, ...patch };
 }
+
+// ─── the fixtures are real ───────────────────────────────────────────────────
+
+test('every fixture in this file is a response the validator accepts', () => {
+  assert.deepEqual(forecastAcceptance(V2), [], 'V2');
+  assert.deepEqual(forecastAcceptance(V1, 1), [], 'V1 against the frozen v1 schema');
+  assert.deepEqual(forecastAcceptance(OVERSCALE_PUSH), [], 'OVERSCALE_PUSH');
+  assert.deepEqual(OVERSCALE_ACCEPTANCE.errors, [], 'OVERSCALE');
+});
+
+test('…and that check has teeth: the impossible fixture this file used to carry is refused', () => {
+  // The negative control, and a regression test for the defect itself. An
+  // earlier version of V2 was a half-run-line spread carrying push = 0.0104 —
+  // an internally contradictory forecast that would have been rejected long
+  // before any digest was taken of it. Without this assertion, an acceptance
+  // helper that returned [] unconditionally would leave the test above green.
+  const impossible = withForecast({
+    probabilities: { win: 0.5231, push: 0.0104, loss: 0.4665 },
+  });
+  const errors = forecastAcceptance(impossible);
+  assert.equal(errors.length, 1, `expected exactly one error, got ${JSON.stringify(errors)}`);
+  assert.match(errors[0]!, /spread: push probability must be 0 on a half-run line/);
+});
 
 // ─── the commitment itself ───────────────────────────────────────────────────
 
@@ -132,9 +204,9 @@ test('GOLDEN: the bytes that are hashed are the twelve fingerprint fields, sorte
   assert.equal(
     canonicalize(forecastFingerprint(V2)),
     '{"axes":{"consensus":2,"news":1,"softness":5,"trend":3,"valuation":4},' +
-      '"confidence":0.6137,"line":-1.5,"loss":0.4665,"observedDecimal":2.0537,' +
+      '"confidence":0.6137,"line":-1.5,"loss":0.4769,"observedDecimal":1.9009,' +
       '"primaryAxis":"valuation","primaryExpectation":"synthetic expectation.",' +
-      '"push":0.0104,"selectedForExecution":true,"selection":"St. Louis Cardinals",' +
+      '"push":0,"selectedForExecution":false,"selection":"St. Louis Cardinals",' +
       '"win":0.5231,"wouldAbstain":false}'
   );
   // Exactly twelve, so a thirteenth cannot arrive unnoticed.
@@ -148,7 +220,7 @@ test('GOLDEN: the bytes that are hashed are the twelve fingerprint fields, sorte
 });
 
 test('the digest satisfies the column CHECK', () => {
-  for (const forecast of [V1, V2]) {
+  for (const forecast of [V1, V2, OVERSCALE, OVERSCALE_PUSH]) {
     const digest = forecastDigest(forecast);
     assert.match(digest, DIGEST_CHECK);
     assert.equal(digest, digest.toLowerCase());
@@ -161,18 +233,18 @@ test('the digest satisfies the column CHECK', () => {
 test('every decision-bearing field changes the digest', () => {
   // The property that makes the commitment worth anything. A digest that does
   // not move when the decision moves would let a different forecast be revealed
-  // against a stored seal.
+  // against a stored seal. One field at a time, and none of them may collide.
   const perturbations: Array<[string, ForecastOutput]> = [
     ['selection', withForecast({ selection: 'Chicago Cubs' })],
     ['line', withForecast({ line: -2.5 })],
     ['line -> null', withForecast({ line: null })],
-    ['observedDecimal', withForecast({ observedDecimal: 2.0538 })],
-    ['win', withForecast({ probabilities: { win: 0.5232, push: 0.0104, loss: 0.4665 } })],
-    ['push', withForecast({ probabilities: { win: 0.5231, push: 0.0105, loss: 0.4665 } })],
-    ['loss', withForecast({ probabilities: { win: 0.5231, push: 0.0104, loss: 0.4666 } })],
+    ['observedDecimal', withForecast({ observedDecimal: 1.901 })],
+    ['win', withForecast({ probabilities: { win: 0.5232, push: 0, loss: 0.4769 } })],
+    ['push', withForecast({ probabilities: { win: 0.5231, push: 0.0001, loss: 0.4769 } })],
+    ['loss', withForecast({ probabilities: { win: 0.5231, push: 0, loss: 0.477 } })],
     ['confidence', withForecast({ confidence: 0.6138 })],
     ['wouldAbstain', withForecast({ wouldAbstain: true })],
-    ['selectedForExecution', withForecast({ selectedForExecution: false })],
+    ['selectedForExecution', withForecast({ selectedForExecution: true })],
     ['primaryAxis', withForecast({ primaryAxis: 'trend' })],
     ['primaryExpectation', withForecast({ primaryExpectation: 'a different expectation.' })],
   ];
@@ -224,8 +296,8 @@ test('a change AT the published scale changes the digest', () => {
   // golden until the fixture stopped using values that were already round.
   for (const [label, rounded] of [
     ['confidence', withForecast({ confidence: 0.61 })],
-    ['observedDecimal', withForecast({ observedDecimal: 2.05 })],
-    ['probabilities', withForecast({ probabilities: { win: 0.52, push: 0.01, loss: 0.47 } })],
+    ['observedDecimal', withForecast({ observedDecimal: 1.9 })],
+    ['probabilities', withForecast({ probabilities: { win: 0.52, push: 0, loss: 0.48 } })],
   ] as Array<[string, ForecastOutput]>) {
     assert.notEqual(forecastDigest(rounded), V2_DIGEST, `${label}: rounding did not change the digest`);
   }
@@ -240,11 +312,11 @@ test('the digest is stable across key order and object identity', () => {
     reasonCode: null,
     evidenceRefs: ['ref-1', 'ref-2'],
     rationale: 'synthetic rationale, not from any model',
-    selectedForExecution: true,
+    selectedForExecution: false,
     wouldAbstain: false,
     confidence: 0.6137,
-    probabilities: { loss: 0.4665, push: 0.0104, win: 0.5231 },
-    observedDecimal: 2.0537,
+    probabilities: { loss: 0.4769, push: 0, win: 0.5231 },
+    observedDecimal: 1.9009,
     line: -1.5,
     selection: 'St. Louis Cardinals',
     market: 'spread',
@@ -310,6 +382,38 @@ test('GOLDEN: an over-scale forecast commits to the values the projection stores
   );
 });
 
+test('GOLDEN: an over-scale PUSH is committed at the published scale too', () => {
+  // The field the fixture above cannot reach, and the one most likely to arrive
+  // over-scale in life: `push` is model-emitted and bounded only by range.
+  // 0.061728395062 is stored as 0.06172840 by numeric(9,8), so a digest over the
+  // raw value is unverifiable against the reveal in exactly the way the
+  // over-scale spread demonstrated for win, loss and confidence.
+  assert.equal(forecastDigest(OVERSCALE_PUSH), OVERSCALE_PUSH_DIGEST);
+  assert.equal(
+    canonicalize(projectionFingerprint(OVERSCALE_PUSH)),
+    '{"axes":{"consensus":3,"news":1,"softness":4,"trend":5,"valuation":2},' +
+      '"confidence":0.5543211,"line":8,"loss":0.45061728,"observedDecimal":1.90909,' +
+      '"primaryAxis":"trend","primaryExpectation":' +
+      '"synthetic expectation on a whole-number total.",' +
+      '"push":0.0617284,"selectedForExecution":true,"selection":"over",' +
+      '"win":0.48765432,"wouldAbstain":false}'
+  );
+  // The quantisation is what the golden is pinning: raw and quantised differ,
+  // and the difference is push itself.
+  assert.notEqual(
+    sha256Hex(canonicalize(forecastFingerprint(OVERSCALE_PUSH))),
+    forecastDigest(OVERSCALE_PUSH)
+  );
+  assert.notEqual(
+    projectionFingerprint(OVERSCALE_PUSH).push,
+    OVERSCALE_PUSH.probabilities.push
+  );
+  assert.equal(
+    projectionFingerprint(OVERSCALE_PUSH).push,
+    quantizeForProjection(OVERSCALE_PUSH.probabilities.push, PROJECTION_SCALES.probability)
+  );
+});
+
 test('the digest is taken over the QUANTISED fingerprint, not the raw one', () => {
   // The two differ for this fixture, which is what makes the golden above a
   // real assertion rather than a restatement.
@@ -327,21 +431,24 @@ test('ROUND TRIP: re-quantising a revealed value reproduces the sealed digest', 
   // seal. The equivalent check against a REAL PostgreSQL, using the projection's
   // column types, lives in servingStore.conformance.ts — this is the part that
   // can run in CI.
-  const sealed = forecastDigest(OVERSCALE);
-  const fingerprint = projectionFingerprint(OVERSCALE);
-  const revealed: ForecastOutput = {
-    ...OVERSCALE,
-    line: fingerprint.line,
-    observedDecimal: fingerprint.observedDecimal,
-    probabilities: { win: fingerprint.win, push: fingerprint.push, loss: fingerprint.loss },
-    confidence: fingerprint.confidence,
-  };
-  assert.equal(forecastDigest(revealed), sealed);
+  for (const fixture of [OVERSCALE, OVERSCALE_PUSH]) {
+    const sealed = forecastDigest(fixture);
+    const fingerprint = projectionFingerprint(fixture);
+    const revealed: ForecastOutput = {
+      ...fixture,
+      line: fingerprint.line,
+      observedDecimal: fingerprint.observedDecimal,
+      probabilities: { win: fingerprint.win, push: fingerprint.push, loss: fingerprint.loss },
+      confidence: fingerprint.confidence,
+    };
+    assert.equal(forecastDigest(revealed), sealed);
+  }
   // Quantising is idempotent, which is the property that makes the above hold.
   for (const [value, scale] of [
     [1.50004, PROJECTION_SCALES.line],
     [2.0537127, PROJECTION_SCALES.observedDecimal],
     [1 / 3, PROJECTION_SCALES.probability],
+    [0.061728395062, PROJECTION_SCALES.probability],
     [0.613712345, PROJECTION_SCALES.confidence],
   ] as Array<[number, number]>) {
     const once = quantizeForProjection(value, scale);
@@ -362,4 +469,19 @@ test('a difference below the projection scale does NOT change the digest', () =>
   assert.equal(forecastDigest(nudged), OVERSCALE_DIGEST);
   // …but a difference AT the scale still does.
   assert.notEqual(forecastDigest({ ...OVERSCALE, confidence: 0.61371236 }), OVERSCALE_DIGEST);
+  // Same boundary on the push fixture, where the field under test is push.
+  assert.equal(
+    forecastDigest({
+      ...OVERSCALE_PUSH,
+      probabilities: { ...OVERSCALE_PUSH.probabilities, push: 0.0617283951 },
+    }),
+    OVERSCALE_PUSH_DIGEST
+  );
+  assert.notEqual(
+    forecastDigest({
+      ...OVERSCALE_PUSH,
+      probabilities: { ...OVERSCALE_PUSH.probabilities, push: 0.06172841 },
+    }),
+    OVERSCALE_PUSH_DIGEST
+  );
 });
