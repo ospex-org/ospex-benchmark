@@ -175,6 +175,12 @@ test('every fixture in this file is a response the validator accepts', () => {
   assert.deepEqual(forecastAcceptance(V1, 1), [], 'V1 against the frozen v1 schema');
   assert.deepEqual(forecastAcceptance(OVERSCALE_PUSH), [], 'OVERSCALE_PUSH');
   assert.deepEqual(OVERSCALE_ACCEPTANCE.errors, [], 'OVERSCALE');
+  // The same decision replayed as a v1 body. V1 above is already v1-shaped, so
+  // it never exercises the helper's field stripping — measured: a build that
+  // skipped the stripping entirely left the three assertions above green. This
+  // one goes red, because the v1 schema is strict and would reject V2's three
+  // analysis keys.
+  assert.deepEqual(forecastAcceptance(V2, 1), [], 'V2 replayed as a v1 body');
 });
 
 test('…and that check has teeth: the impossible fixture this file used to carry is refused', () => {
