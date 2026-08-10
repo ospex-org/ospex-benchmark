@@ -34,6 +34,11 @@ const SECRET_ENV_VARS = [
   // to enrol.
   'BENCHMARK_WRITER',
   'BENCHMARK_DB_URL',
+  // The campaign store's connection string, which carries that database's
+  // password in its userinfo. Enrolled for the same reason as the two above:
+  // the store path builds a driver config from it and reports driver errors,
+  // and an unenrolled value passes through those messages verbatim.
+  'STORE_DATABASE_URL',
 ] as const;
 
 export function envValue(name: string): string | undefined {

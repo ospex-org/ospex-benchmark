@@ -1398,7 +1398,8 @@ const PRODUCTION_DEPS: CampaignDeps = {
     const { SqlAtomicStore, pgStoreQuery } = await import('./store/atomicStore.js');
     const { SqlCampaignAuthorizationPort } = await import('./store/campaignAuthStore.js');
     const { SqlUnresolvedFireReadPort } = await import('./store/escalationLatchRead.js');
-    const pool = new Pool({ connectionString: databaseUrl });
+    const { storeConnectionConfig } = await import('./store/connection.js');
+    const pool = new Pool(storeConnectionConfig(databaseUrl));
     try {
       const { readFileSync: read } = await import('node:fs');
       await pool.query(read(new URL('./store/schema.sql', import.meta.url), 'utf8'));
@@ -1426,7 +1427,11 @@ const PRODUCTION_DEPS: CampaignDeps = {
     // NO schema/function bootstrap here — a monitoring read must not mutate catalog state —
     // and the session itself is forced read-only at the SERVER, so even a statement smuggled
     // through this path in the future is refused by PostgreSQL rather than trusted to prose.
-    const pool = new Pool({ connectionString: databaseUrl, options: '-c default_transaction_read_only=on' });
+    const { storeConnectionConfig } = await import('./store/connection.js');
+    const pool = new Pool({
+      ...storeConnectionConfig(databaseUrl),
+      options: '-c default_transaction_read_only=on',
+    });
     const query = pgStoreQuery(pool);
     const { SqlCampaignTickJournalPort, pgStoreTransactor } = await import('./store/campaignTickJournal.js');
     return {

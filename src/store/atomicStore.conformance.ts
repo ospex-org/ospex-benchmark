@@ -19,6 +19,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { Pool } from 'pg';
+import { storeConnectionConfig } from './connection.js';
 import type { PoolClient } from 'pg';
 import { sha256Hex } from '../canonical.js';
 import { SqlAtomicStore, pgStoreQuery } from './atomicStore.js';
@@ -149,7 +150,14 @@ async function withGate<A, B>(
 async function main(): Promise<void> {
   // max 12 gives headroom for the 8-worker stress + the 3-client barriers; connectionTimeout
   // so a starved pool throws rather than hangs.
-  const pool = new Pool({ connectionString: DATABASE_URL, max: 12, connectionTimeoutMillis: 8000 });
+  // Through storeConnectionConfig, not a bare connectionString: this reads an
+  // operator-supplied STORE_DATABASE_URL, and the runbook sanctions pointing it
+  // at a managed instance. A bare Pool sends the password there in cleartext.
+  const pool = new Pool({
+    ...storeConnectionConfig(DATABASE_URL),
+    max: 12,
+    connectionTimeoutMillis: 8000,
+  });
   await pool.query('drop schema if exists store cascade');
   await pool.query(SCHEMA_SQL);
   await pool.query(FUNCTIONS_SQL);

@@ -95,7 +95,10 @@ Both destinations must survive the process and be readable afterwards.
       example `ospex_crossing` on a local or managed Postgres — NOT the scratch
       conformance default). Set `STORE_DATABASE_URL` to it explicitly. The runner
       applies the store schema idempotently on boot (no destructive drop). This
-      database is retained after the crossing as part of the evidence.
+      database is retained after the crossing as part of the evidence. A managed
+      target is connected to over TLS automatically, and one that would end up
+      unencrypted is refused — see `STORE_DATABASE_URL` in `.env.example` for the
+      rules and the opt-out.
 - [ ] **Artifacts**: choose an explicit durable directory OUTSIDE the repository
       scratch default and pass it via `--out` (or `FIRE_ARTIFACTS_DIR`). Verify
       you can create and read back a file in it before the crossing.

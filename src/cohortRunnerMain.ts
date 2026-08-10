@@ -444,7 +444,8 @@ const PRODUCTION_STORE_FIRE_DEPS: StoreFireDeps = {
     // `pg` is imported dynamically so the rehearsal path (and the importable pure helpers) never
     // pull a database driver; only the store-backed branch constructs a Pool.
     const { Pool } = await import('pg');
-    const pool: Pool = new Pool({ connectionString: databaseUrl });
+    const { storeConnectionConfig } = await import('./store/connection.js');
+    const pool: Pool = new Pool(storeConnectionConfig(databaseUrl));
     try {
       // Make the store self-contained: apply the idempotent DDL (no drop) before wrapping it.
       await applyStoreSchema(pool);
