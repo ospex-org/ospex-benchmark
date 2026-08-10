@@ -498,11 +498,14 @@ async function main(): Promise<void> {
     // back out of PostgreSQL, recompute the digest from what was stored, and
     // require it to equal the seal.
     //
-    // The forecast is deliberately over-scale — `push` is one third, which is
-    // what a model returns for one chance in three, and the reveal columns hold
-    // 8 decimals. Hashing the raw value and storing the rounded one produced two
-    // different digests with nothing anywhere reporting a problem; that is the
-    // failure this exists to keep out. Note that the RAW values are handed to
+    // The forecast is deliberately over-scale: `win` and `loss` carry twelve
+    // decimals and the reveal columns hold eight, `observedDecimal` carries
+    // seven against six, `line` five against four. (`push` is 0, because the
+    // validator requires it on any non-integer line and an over-scale line is
+    // always one — so win and loss are what demonstrate the rounding here.)
+    // Hashing the raw value and storing the rounded one produced two different
+    // digests with nothing anywhere reporting a problem; that is the failure
+    // this exists to keep out. Note that the RAW values are handed to
     // revealDecision, exactly as a producer would: the port quantises them
     // through the same module the digest does, which is what makes the two
     // agree without the caller having to remember anything.
@@ -515,10 +518,19 @@ async function main(): Promise<void> {
     assert.deepEqual(errors, [], 'the over-scale forecast must be one the validator accepts');
     const sealed = forecastDigest(forecast);
 
+    // The fixture is a SPREAD forecast, so the attempt, the seal and the reveal
+    // all have to be about a spread. Storing it under the default moneyline key
+    // would still pass — `market` is outside the digest and the numeric columns
+    // are shared — which is exactly why it would prove nothing: the validator's
+    // verdict would be about a different decision from the one written.
+    const market = forecast.market;
     const cohortId = cohortName('digest-roundtrip');
-    const decision = { cohortId, participantId: `${cohortId}-alpha`, gameId: 'game-1', market: 'moneyline' as const };
-    await port.publishAttempt(armAttempt(cohortId));
-    expect(await port.sealDecision(decisionSeal(cohortId, { forecastDigest: sealed })), 'published', 'seal');
+    const decision = { cohortId, participantId: `${cohortId}-alpha`, gameId: 'game-1', market };
+    await port.publishAttempt(armAttempt(cohortId, { facts: facts({ suppliedMarkets: [market] }) }));
+    expect(
+      await port.sealDecision(decisionSeal(cohortId, { market, forecastDigest: sealed })),
+      'published', 'seal'
+    );
     expect(await port.revealDecision({
       decision, revealedAt: '2026-08-09T20:40:00.000Z', selection: forecast.selection,
       line: forecast.line, observedDecimal: forecast.observedDecimal,
@@ -534,9 +546,13 @@ async function main(): Promise<void> {
     }), 'published', 'reveal');
 
     const stored = (await query(
-      `select r.*, d.forecast_digest from public.benchmark_decision_reveals r
+      `select r.*, d.forecast_digest, d.market from public.benchmark_decision_reveals r
          join public.benchmark_decisions d on d.id = r.decision_id where d.cohort_id = $1`, [cohortId]))[0]!;
     assert.equal(stored['forecast_digest'], sealed, 'the seal did not store the digest it was given');
+    // The row written must be about the decision the validator accepted. Without
+    // this the check passes with the two out of step, since market is outside
+    // the digest and every numeric column is shared across markets.
+    assert.equal(stored['market'], forecast.market, 'stored a different market from the one validated');
 
     // Rebuild the forecast from the REVEALED row and recompute.
     const revealed = {
