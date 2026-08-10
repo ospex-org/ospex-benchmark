@@ -198,7 +198,7 @@ const MONEYLINE: ForecastOutput = {
 const V2_DIGEST = 'cd280a6bc15e7894cc036aef94ad70903545ea643468990e06b8a34c1c13ba5d';
 const V1_DIGEST = 'fd0c68896bcb5d4d991c63d286839ea26ab954f1719a9109bb76328ba8a098b2';
 const OVERSCALE_DIGEST = '57cc317eacd24a9c8fb9bf55936b255e73f69790b88675a99c608d750f50e21b';
-const OVERSCALE_PUSH_DIGEST = 'a80aeeb97174dc866e3c8b0b8b61e5519e020b539e590ab1b6ff7575eaa35a5c';
+const OVERSCALE_PUSH_DIGEST = '009fc2cb19ccbde2e0f19431cf816bd1dabc3e51d25b00b11b4595a05856be43';
 const MONEYLINE_DIGEST = 'a068d2ee767addf8be567440872a47c394766b1d3d39593884d8b8ffcf4fc05a';
 
 /** The column's CHECK, copied from the projection schema. */
@@ -225,7 +225,7 @@ test('every fixture in this file is a response the validator accepts', () => {
   assert.deepEqual(forecastAcceptance(OVERSCALE_PUSH, 1), [], 'OVERSCALE_PUSH as a v1 body');
 });
 
-test('…and that check has teeth: the two shapes that must be refused, are', () => {
+test('…and that check has teeth: the three shapes that must be refused, are', () => {
   // The negative control, and a regression test for the defect itself. An
   // earlier version of V2 was a half-run-line spread carrying push = 0.0104 —
   // an internally contradictory forecast that would have been rejected long
@@ -245,6 +245,22 @@ test('…and that check has teeth: the two shapes that must be refused, are', ()
   assert.deepEqual(
     forecastAcceptance({ ...OVERSCALE_PUSH, line: 8.5 }),
     [`game ${ACCEPTANCE_GAME_ID} total: push probability must be 0 on a half-point total`]
+  );
+  // A forecast wrong in TWO ways, because a single-error case cannot tell a
+  // faithful helper from one that reports only the validator's first complaint
+  // — measured: with only the two cases above, truncating the verdict to
+  // `.slice(0, 1)` left this test green.
+  //
+  // ⚠ Do not delete this as redundant with the first case. It is, at the time of
+  //   writing, the ONLY assertion in the whole suite that pins the validator's
+  //   probability-sum rule: replacing that rule's condition with `false` leaves
+  //   every other test in the repo green and reddens this one alone.
+  assert.deepEqual(
+    forecastAcceptance(withForecast({ probabilities: { win: 0.9, push: 0.0104, loss: 0.4665 } })),
+    [
+      `game ${ACCEPTANCE_GAME_ID} spread: push probability must be 0 on a half-run line`,
+      `game ${ACCEPTANCE_GAME_ID} spread: probabilities must sum to 1`,
+    ]
   );
 });
 
@@ -442,7 +458,7 @@ test('GOLDEN: an over-scale forecast commits to the values the projection stores
 test('GOLDEN: an over-scale PUSH is committed at the published scale too', () => {
   // The field the fixture above cannot reach, and the one most likely to arrive
   // over-scale in life: `push` is model-emitted and bounded only by range.
-  // 0.061728395062 is stored as 0.06172840 by numeric(9,8), so a digest over the
+  // 0.061728395 lands in the reveal column as 0.06172839, so a digest over the
   // raw value is unverifiable against the reveal in exactly the way the
   // over-scale spread demonstrated for win, loss and confidence.
   assert.equal(forecastDigest(OVERSCALE_PUSH), OVERSCALE_PUSH_DIGEST);
@@ -452,7 +468,7 @@ test('GOLDEN: an over-scale PUSH is committed at the published scale too', () =>
       '"confidence":0.5543211,"line":8,"loss":0.45061728,"observedDecimal":1.90909,' +
       '"primaryAxis":"trend","primaryExpectation":' +
       '"synthetic expectation on a whole-number total.",' +
-      '"push":0.0617284,"selectedForExecution":true,"selection":"over",' +
+      '"push":0.06172839,"selectedForExecution":true,"selection":"over",' +
       '"win":0.48765432,"wouldAbstain":false}'
   );
   // The quantisation is what the golden is pinning: raw and quantised differ,
@@ -544,7 +560,7 @@ test('ROUND TRIP: re-quantising a revealed value reproduces the sealed digest', 
     [1.50004, PROJECTION_SCALES.line],
     [2.0537127, PROJECTION_SCALES.observedDecimal],
     [1 / 3, PROJECTION_SCALES.probability],
-    [0.061728395062, PROJECTION_SCALES.probability],
+    [0.061728395, PROJECTION_SCALES.probability],
     [0.613712345, PROJECTION_SCALES.confidence],
   ] as Array<[number, number]>) {
     const once = quantizeForProjection(value, scale);
@@ -569,14 +585,14 @@ test('a difference below the projection scale does NOT change the digest', () =>
   assert.equal(
     forecastDigest({
       ...OVERSCALE_PUSH,
-      probabilities: { ...OVERSCALE_PUSH.probabilities, push: 0.0617283951 },
+      probabilities: { ...OVERSCALE_PUSH.probabilities, push: 0.0617283899 },
     }),
     OVERSCALE_PUSH_DIGEST
   );
   assert.notEqual(
     forecastDigest({
       ...OVERSCALE_PUSH,
-      probabilities: { ...OVERSCALE_PUSH.probabilities, push: 0.06172841 },
+      probabilities: { ...OVERSCALE_PUSH.probabilities, push: 0.0617284 },
     }),
     OVERSCALE_PUSH_DIGEST
   );

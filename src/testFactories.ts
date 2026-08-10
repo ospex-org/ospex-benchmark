@@ -410,17 +410,31 @@ export function forecastAcceptance(
  * an ordinary baseball number rather than an exotic one.
  *
  * The values are chosen so that no plausible wrong implementation reproduces
- * them:
+ * them. Three of them sit ON a rounding boundary at their column's scale, where
+ * `Number(v.toFixed(8))` and PostgreSQL's own numeric rounding DISAGREE —
+ * measured against PostgreSQL 17 with these exact column types:
  *
- *   - `win` sits ON the scale-8 rounding boundary. `Number(v.toFixed(8))` gives
- *     0.48765432 and the usual `Math.round(v * 1e8) / 1e8` idiom gives
- *     0.48765433, so swapping the quantiser's rule for that one — a plausible
- *     cleanup — moves the digest.
- *   - `confidence` distinguishes rounding from truncation: 0.5543211 against
- *     0.55432109.
- *   - `push` and `loss` are over-scale by four decimals.
- *   - `observedDecimal` is `americanToDecimal(-110)`, five decimals, which
- *     numeric(12,6) holds exactly — a price the bundle builder can emit.
+ *              value           toFixed(8)    numeric(9,8)
+ *     win      0.487654325     0.48765432    0.48765433
+ *     push     0.061728395     0.06172839    0.06172840
+ *     conf     0.554321105     0.55432110    0.55432111
+ *
+ * That is what makes the serving port's quantisation load-bearing rather than
+ * decorative: hand PostgreSQL the raw value for any of those three and it
+ * stores a different number from the one the digest committed to, so the
+ * conformance suite's round trip reddens. `line` cannot join them — a
+ * whole-number line has nothing to round — and `observedDecimal` is left as
+ * `americanToDecimal(-110)`, a price the bundle builder can actually emit,
+ * which is worth more here than a fourth boundary value.
+ *
+ * `win` also straddles the boundary between `toFixed` and the usual
+ * `Math.round(v * 1e8) / 1e8` idiom (0.48765432 against 0.48765433), so
+ * swapping the quantiser's rule for that one — a plausible cleanup — moves the
+ * digest instead of silently redefining it.
+ *
+ * `loss` is over-scale by four decimals. The three probabilities sum to 1 to
+ * within 6.2e-11, comfortably inside the validator's 1e-6 tolerance, and not
+ * exactly 1 — which is what a model's arithmetic actually produces.
  */
 export function makeOverScalePushAccepted(): {
   forecast: ForecastOutput;
@@ -431,8 +445,8 @@ export function makeOverScalePushAccepted(): {
     selection: 'over',
     line: 8,
     observedDecimal: 1.90909,
-    probabilities: { win: 0.487654325, push: 0.061728395062, loss: 0.450617279938 },
-    confidence: 0.554321098765,
+    probabilities: { win: 0.487654325, push: 0.061728395, loss: 0.450617279938 },
+    confidence: 0.554321105,
     wouldAbstain: false,
     selectedForExecution: true,
     rationale: 'synthetic rationale, not from any model',

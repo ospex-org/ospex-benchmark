@@ -522,7 +522,7 @@ async function main(): Promise<void> {
     }],
     ['a whole-number TOTAL carrying an over-scale PUSH', makeOverScalePushAccepted, {
       line: '8.0000', observed_decimal: '1.909090', prob_win: '0.48765432',
-      prob_push: '0.06172840', prob_loss: '0.45061728', confidence: '0.55432110',
+      prob_push: '0.06172839', prob_loss: '0.45061728', confidence: '0.55432110',
     }],
   ];
 
@@ -602,6 +602,14 @@ async function main(): Promise<void> {
       // for the right reason rather than because PostgreSQL happened to keep
       // them. Every numeric the digest covers is read back, prob_push included:
       // a column nobody reads back is a column that can be written wrong.
+      //
+      // What this pins, measured by removing the port's quantiser one column at
+      // a time: prob_win, prob_push and confidence all redden, because the total
+      // fixture's values for those three sit where `toFixed` and PostgreSQL's own
+      // numeric rounding disagree. line, observed_decimal and prob_loss do not —
+      // their values round identically under both rules, and making them
+      // straddle too would cost either a whole-number line (impossible), a
+      // producible price, or the probabilities summing to 1.
       assert.deepEqual(
         {
           line: stored['line'], observed_decimal: stored['observed_decimal'],
