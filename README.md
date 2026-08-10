@@ -214,28 +214,37 @@ without it the connection is encrypted but not authenticated, since the
 endpoint's certificate chain is not one Node trusts by default.
 
 **One exception, and it is the driver's rule rather than this repo's:** if the
-DSN itself carries an SSL parameter — `sslmode=` or the separate `ssl=` — that
-wins. The driver parses SSL settings out of the connection string and they
-override anything supplied alongside, the CA included, so `BENCHMARK_DB_CA` does
-not apply to such a URL.
-
-The resolver does not try to interpret what a parameter *means*. It asks only
-whether it is unambiguous:
+DSN itself states an SSL policy, that wins. The driver parses SSL settings out of
+the connection string and applies them over anything supplied alongside, the CA
+included, so `BENCHMARK_DB_CA` does not apply to such a URL.
 
 | the DSN | what happens |
 |---|---|
-| carries no `sslmode` or `ssl` | the configured TLS is attached, and nothing in the URL can discard it |
-| carries exactly one, non-empty | deferred to entirely — what it means is between you and the driver |
-| carries an empty one, or the same one twice | refused as malformed (`malformed_dsn_ssl`); the publisher stays disabled rather than guess |
+| states nothing about SSL | the configured TLS is attached, and nothing in the URL can discard it |
+| asks for TLS | deferred to entirely — what the setting means is between you and the driver |
+| disables TLS | refused as `plaintext_dsn`, unless the target is loopback or `BENCHMARK_DB_ALLOW_PLAINTEXT=1` |
+
+The third row is the only place this repo overrides the URL, and it is the same
+rule the campaign store applies to `STORE_DATABASE_URL`: the role's password is
+inside the connection string, so a plaintext connection to another machine puts
+it on the wire in the clear. Loopback is exempt, because a local PostgreSQL has
+no TLS and demanding it there fails outright rather than degrading.
+
+**Which parameters count is not a list kept here.** The question "does this URL
+state its own SSL policy?" is put to the driver's own connection-string parser
+rather than answered by inspecting parameter names, so `sslnegotiation`,
+`sslrootcert`, `sslcert` and `sslkey` are covered without being named, and a
+repeated or empty parameter resolves to whatever the driver resolves it to. Two
+earlier versions of this modelled the parser instead — one with a substring
+search, one with `URLSearchParams` — and both were wrong in ways that reported an
+encrypted connection for one the driver made in plaintext. A differential sweep
+over a generated matrix of connection strings checks the resolver's output
+against a real `pg.Client` on every one.
 
 Deferring to a value this repo does not recognise is safe rather than lax: an
 unrecognised `sslmode` makes the driver negotiate TLS against the system trust
 store, which fails loudly against an endpoint whose chain Node does not carry —
-it never downgrades quietly. The two shapes that *could* downgrade quietly are
-exactly the ones refused. An empty parameter is ignored or turned into a falsy
-value depending on which one it is, and a repeated parameter is read
-last-occurrence-wins by the driver while the obvious way to inspect it returns
-the first.
+it never downgrades quietly.
 
 Worth knowing regardless of any of this: the driver treats `sslmode=require` as
 `verify-full`, so `no-verify` is the mode that means encrypt-without-verifying.

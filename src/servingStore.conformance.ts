@@ -794,24 +794,28 @@ async function main(): Promise<void> {
     // `connectionParameters.ssl`. It opens no connection.
     const saved = { ...process.env };
     try {
+      // The host is h.example.com throughout, so every `refuse` below is the
+      // plaintext-to-another-machine rule and not something else.
       const cases: ReadonlyArray<readonly [string, 'tls' | 'defer' | 'refuse']> = [
         ['', 'tls'],
         ['?application_name=sslmode%3Ddisable', 'tls'],
-        ['?sslmode=', 'refuse'],
-        ['?sslmode=disable', 'defer'],
+        ['?sslmode=', 'tls'], //                  empty: the driver ignores it entirely
+        ['?sslmode=disable', 'refuse'], //        the credential would go out in clear
         ['?sslmode=no-verify', 'defer'],
-        ['?%73slmode=disable', 'defer'],
-        ['?ssl=', 'refuse'],
+        ['?%73slmode=disable', 'refuse'], //      the driver decodes the key
+        ['?ssl=', 'refuse'], //                   empty ssl= becomes "" -> no TLS
         ['?sslmode=bogus', 'defer'],
-        // Duplicates: URLSearchParams reads the FIRST, the driver keeps the LAST.
-        ['?sslmode=require&sslmode=', 'refuse'],
-        ['?sslmode=&sslmode=require', 'refuse'],
-        ['?ssl=1&ssl=', 'refuse'],
-        ['?ssl=&ssl=1', 'refuse'],
+        // Not named anywhere in the resolver: it asks the driver's parser.
+        ['?sslnegotiation=direct', 'defer'],
+        // Duplicates: the driver keeps the LAST, and that is the answer used.
+        ['?sslmode=require&sslmode=', 'tls'], //  last is empty -> ignored
+        ['?sslmode=&sslmode=require', 'defer'], //last wins -> {}
+        ['?ssl=1&ssl=', 'refuse'], //             last wins -> "" -> no TLS
+        ['?ssl=&ssl=1', 'defer'], //              last wins -> true
         // Every value the ssl= family can carry, deferred to without judging it.
         ['?ssl=true', 'defer'],
-        ['?ssl=false', 'defer'],
-        ['?ssl=0', 'defer'],
+        ['?ssl=false', 'defer'], //               the truthy STRING "false"
+        ['?ssl=0', 'refuse'], //                  genuinely falsy -> no TLS
         ['?ssl=1', 'defer'],
         ['?ssl=no-verify', 'defer'],
       ];
@@ -820,9 +824,13 @@ async function main(): Promise<void> {
         process.env['BENCHMARK_DB_URL'] = dsn;
         process.env['BENCHMARK_DB_CA'] = 'PEM-CA';
         delete process.env['BENCHMARK_WRITER'];
+        // Both would move a case between branches if the shell exported them.
+        delete process.env['BENCHMARK_DB_ALLOW_PLAINTEXT'];
+        delete process.env['PGHOST'];
         const resolution = resolveBenchmarkWriterConnection();
         if (want === 'refuse') {
-          assert.equal(resolution.resolved, false, `${query || '(none)'} must be refused`);
+          assert.deepEqual(resolution, { resolved: false, reason: 'plaintext_dsn' },
+            `${query || '(none)'} must be refused as plaintext`);
           continue;
         }
         assert.ok(resolution.resolved && resolution.connection.kind === 'dsn', query);

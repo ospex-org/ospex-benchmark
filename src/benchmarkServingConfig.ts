@@ -1,4 +1,5 @@
 import { envValue } from './config.js';
+import { dsnFacts, isLocalHost } from './dsnFacts.js';
 
 /**
  * How the benchmark serving publisher reaches its database.
@@ -29,6 +30,21 @@ import { envValue } from './config.js';
  * BENCHMARK_DB_CA exists — supply the project's CA certificate and verification
  * turns on. The default is chosen because the only alternative that works out of
  * the box is plaintext, which is worse on every axis.
+ *
+ * ── AND WHEN THE DSN HAS ITS OWN OPINION ─────────────────────────────────────
+ * Three outcomes, decided by asking the driver's own parser (`dsnFacts.ts`)
+ * rather than by reading the URL here:
+ *
+ *   the URL states nothing   the configured TLS is attached, and nothing in the
+ *                            URL can discard it
+ *   the URL asks for TLS     deferred to entirely, with no `ssl` key beside it.
+ *                            BENCHMARK_DB_CA does not apply to such a URL.
+ *   the URL disables TLS     REFUSED as `plaintext_dsn`, unless the target is
+ *                            loopback or BENCHMARK_DB_ALLOW_PLAINTEXT=1. This
+ *                            role's password is in the connection string, so a
+ *                            plaintext connection to another machine puts it on
+ *                            the wire in the clear. The campaign store refuses
+ *                            the same shape for the same reason.
  */
 
 /** What TLS to negotiate. `ca` present means the chain is verified against it. */
@@ -66,7 +82,7 @@ export type UnresolvedReason =
   | 'no_project_url'
   | 'malformed_project_url'
   | 'malformed_port'
-  | 'malformed_dsn_ssl';
+  | 'plaintext_dsn';
 
 export type ConnectionResolution =
   | { readonly resolved: true; readonly connection: BenchmarkWriterConnection }
@@ -79,7 +95,7 @@ export const BENCHMARK_WRITER_ROLE = 'benchmark_writer';
 const DEFAULT_PORT = 5432;
 const DEFAULT_DATABASE = 'postgres';
 
-function tls(): TlsOption {
+function configuredTls(): TlsOption {
   const ca = envValue('BENCHMARK_DB_CA');
   return ca === undefined ? { rejectUnauthorized: false } : { rejectUnauthorized: true, ca };
 }
@@ -106,25 +122,42 @@ function tls(): TlsOption {
 export function resolveBenchmarkWriterConnection(): ConnectionResolution {
   const dsn = envValue('BENCHMARK_DB_URL');
   if (dsn !== undefined) {
-    // ⚠ A DSN THAT STATES AN sslmode IS AUTHORITATIVE, and nothing is attached
-    //   beside it. `pg` parses SSL parameters out of the connection string and
-    //   they OVERRIDE a separately supplied `ssl` object — measured on the
-    //   pinned driver, by constructing a real client rather than inspecting this
-    //   return value:
+    // ⚠ A DSN THAT STATES ITS OWN SSL POLICY IS AUTHORITATIVE, and nothing is
+    //   attached beside it. `pg` parses SSL parameters out of the connection
+    //   string and applies them OVER a separately supplied `ssl` object —
+    //   measured on the pinned driver, by constructing a real client rather
+    //   than inspecting this return value:
     //
-    //     ?sslmode=disable      + ssl:{rejectUnauthorized:true, ca}  ->  ssl false
     //     ?sslmode=require      + ssl:{rejectUnauthorized:true, ca}  ->  ssl {}
     //     ?sslmode=verify-full  + ssl:{rejectUnauthorized:true, ca}  ->  ssl {}
+    //     ?sslnegotiation=direct+ ssl:{rejectUnauthorized:true, ca}  ->  ssl true
     //
-    //   So returning a CA alongside one of those was a promise the driver threw
-    //   away — `sslmode=disable` in particular reported "verified TLS" for a
-    //   connection with no TLS at all. Returning nothing says the true thing:
-    //   the URL decides, and BENCHMARK_DB_CA does not apply to it.
-    const intent = dsnSslIntent(dsn);
-    if (intent === 'malformed') return { resolved: false, reason: 'malformed_dsn_ssl' };
-    return intent === 'stated'
-      ? { resolved: true, connection: { kind: 'dsn', connectionString: dsn } }
-      : { resolved: true, connection: { kind: 'dsn', connectionString: dsn, ssl: tls() } };
+    //   So returning a CA alongside one of those is a promise the driver throws
+    //   away. Returning nothing says the true thing: the URL decides, and
+    //   BENCHMARK_DB_CA does not apply to it.
+    //
+    //   Which parameters count is NOT enumerated here. `dsnFacts` asks the
+    //   driver's own parser, so `sslnegotiation`, `sslrootcert`, `sslcert` and
+    //   `sslkey` are covered without being named, and a duplicated or empty
+    //   parameter resolves to whatever the driver resolves it to rather than to
+    //   a guess. The previous version modelled this with `new URL()` and
+    //   `URLSearchParams` and got both classes wrong.
+    const { host, tls } = dsnFacts(dsn);
+    // The one case the URL is NOT allowed to decide alone. `?sslmode=disable`
+    // and `?ssl=0` put this role's password on the wire in the clear, and the
+    // campaign store already refuses that shape for the same reason. Loopback
+    // is exempt: a local PostgreSQL has no TLS, and demanding it there fails
+    // outright rather than degrading.
+    if (
+      tls === 'plaintext' &&
+      !isLocalHost(host) &&
+      envValue('BENCHMARK_DB_ALLOW_PLAINTEXT') !== '1'
+    ) {
+      return { resolved: false, reason: 'plaintext_dsn' };
+    }
+    return tls === 'unstated'
+      ? { resolved: true, connection: { kind: 'dsn', connectionString: dsn, ssl: configuredTls() } }
+      : { resolved: true, connection: { kind: 'dsn', connectionString: dsn } };
   }
 
   const password = envValue('BENCHMARK_WRITER');
@@ -153,7 +186,7 @@ export function resolveBenchmarkWriterConnection(): ConnectionResolution {
       user: envValue('BENCHMARK_DB_USER') ?? BENCHMARK_WRITER_ROLE,
       database: envValue('BENCHMARK_DB_NAME') ?? DEFAULT_DATABASE,
       password,
-      ssl: tls(),
+      ssl: configuredTls(),
     },
   };
 }
@@ -182,76 +215,4 @@ function derivedHost(): string | null | undefined {
   const match = /^([a-z0-9-]+)\.supabase\.co$/i.exec(url.hostname);
   if (url.protocol !== 'https:' || match === null) return null;
   return `db.${match[1]!.toLowerCase()}.supabase.co`;
-}
-
-/** What a DSN says about TLS. */
-type DsnSslIntent = 'absent' | 'stated' | 'malformed';
-
-/**
- * What a DSN says about TLS, decided the way the DRIVER decides it, and with
- * three answers rather than two.
- *
- * A substring search got four shapes wrong, each measured against a real client:
- * `?application_name=sslmode=disable`, `/db-sslmode=disable` and
- * `#sslmode=disable` all matched the text while stating nothing, so nothing was
- * attached and the connection went out in PLAINTEXT; `?%73slmode=disable` did
- * not match, so a CA was attached that the driver decoded past and discarded.
- * `URLSearchParams` does the same decoding the driver does — values are not
- * keys, a path is not a query, a fragment is not a query, and `%73` is `s`.
- *
- * ── WHY THERE IS NO LIST OF ACCEPTED VALUES ─────────────────────────────────
- * There was one, twice, and it was wrong both times: it rejected `ssl=no-verify`
- * which the driver genuinely supports, and accepted `ssl=false` which the driver
- * turns into the truthy STRING `"false"`. Enumerating what a value MEANS is a
- * prediction about the driver, and every prediction here has eventually
- * disagreed with it. So this predicts nothing about meaning. It asks only
- * whether the parameter is unambiguous:
- *
- *   absent      -> attach TLS; nothing in the URL can discard it
- *   present, appearing ONCE, non-empty
- *               -> defer entirely. Whatever it means is the driver's business
- *                  and the operator's choice, and attaching beside it would only
- *                  be discarded.
- *   anything else (empty, or repeated)
- *               -> refuse. The publisher stays disabled with a nameable reason
- *                  rather than guessing.
- *
- * DUPLICATES ARE THE REASON FOR THE COUNT. `URLSearchParams.get()` returns the
- * FIRST occurrence and the driver keeps the LAST, so a repeated parameter is
- * where the two can still disagree. Measured, with a CA supplied:
- *
- *   ?sslmode=require&sslmode=   first says require, so nothing was attached;
- *                               the driver's empty last value made it ignore
- *                               sslmode entirely -> PLAINTEXT.
- *   ?sslmode=&sslmode=require   first is empty, so a CA was attached; the
- *                               driver's last value won and discarded it -> {}.
- *   ?ssl=1&ssl=                 first says 1, nothing attached; driver -> "".
- *
- * EMPTY IS REFUSED RATHER THAN IGNORED, even though an empty `sslmode` alone is
- * measurably discarded by the driver and would be safe to attach past. Relying
- * on that is relying on a quirk, and quirk-dependence is what produced this
- * round. One rule, no exceptions, nothing to rot.
- *
- * The bound worth stating: across every shape measured, the driver acts on any
- * non-empty `sslmode` or `ssl` — an unrecognised mode yields `{}`, which is TLS
- * against the system trust store, never a silent downgrade. Only an empty value
- * is ignored, and that is refused.
- *
- * An unparseable DSN reports `absent`, so TLS is attached rather than silently
- * omitted. Being wrong about the report is recoverable; sending the credential
- * in clear is not.
- */
-function dsnSslIntent(dsn: string): DsnSslIntent {
-  let url: URL;
-  try {
-    url = new URL(dsn);
-  } catch {
-    return 'absent';
-  }
-  const values = [...url.searchParams.getAll('sslmode'), ...url.searchParams.getAll('ssl')];
-  if (values.length === 0) return 'absent';
-  if (url.searchParams.getAll('sslmode').length > 1) return 'malformed';
-  if (url.searchParams.getAll('ssl').length > 1) return 'malformed';
-  if (values.some((value) => value === '')) return 'malformed';
-  return 'stated';
 }
