@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
-import { forecastDigest, forecastFingerprint, projectionFingerprint } from './schema.js';
+import {
+  forecastDigest,
+  forecastFingerprint,
+  projectionFingerprint,
+  validateResponseText,
+} from './schema.js';
 import { PROJECTION_SCALES, quantizeForProjection } from './projectionNumeric.js';
+import { makeOverScaleAccepted } from './testFactories.js';
 import type { ForecastOutput } from './types.js';
 
 /**
@@ -14,12 +20,19 @@ import type { ForecastOutput } from './types.js';
  * CHECK, still stores without complaint — and is silently unverifiable against
  * every reveal that follows. There is no runtime signal for getting it wrong.
  *
+ * The commitment is taken over `projectionFingerprint()` — the twelve fields
+ * rounded to the scale of the columns the reveal lands in — and NOT over the
+ * raw `forecastFingerprint()`. Hashing unrounded floats while the database
+ * stores rounded ones makes the seal unreproducible from the reveal; that was
+ * measured against a real PostgreSQL, and `projectionNumeric.ts` carries the
+ * numbers.
+ *
  * Hence the golden values below. They are not a restatement of the
  * implementation: asserting `forecastDigest(f) === sha256Hex(canonicalize(
- * forecastFingerprint(f)))` would pass no matter what any of those three
+ * projectionFingerprint(f)))` would pass no matter what any of those three
  * functions did. A frozen literal is the only assertion that notices when
  * `canonicalize` changes its serialisation, or when a thirteenth field joins
- * `forecastFingerprint`.
+ * the fingerprint.
  *
  * IF ONE OF THESE GOES RED, the definition of the commitment has changed and
  * every digest already stored is now unverifiable. That is a decision to make
@@ -68,23 +81,33 @@ const V1: ForecastOutput = {
 };
 
 /**
- * A forecast the response validator accepts whose numerics carry MORE decimals
- * than the reveal columns hold. `push` is one third, which is what a model
- * returns when it computes one chance in three — this is an ordinary output.
+ * An over-scale forecast THE REAL VALIDATOR ACCEPTS, built through the same
+ * factories the rest of the suite uses and checked below before it is trusted.
+ *
+ * The first version of this fixture was hand-written and would have been
+ * rejected outright — its probabilities summed to 1.33 — so it was regression
+ * evidence for a case that could never occur. The cross-field rules that make
+ * this one real: probabilities must sum to 1 within 1e-6, `observedDecimal`
+ * must EQUAL the bundle price for the selected side, `line` must echo the
+ * bundle, and `push` must be 0 whenever the line is not an integer, which an
+ * over-scale line always is. So the bundle carries the over-scale price too.
  *
  * V2 above cannot stand in for this: every one of its values is already within
  * scale, so quantising it changes nothing and a build that skipped quantisation
  * entirely would pass every golden. This fixture is the one that discriminates.
  */
-const OVERSCALE: ForecastOutput = {
-  ...V2,
-  line: 1.50004, //             numeric(10,4) holds 4
-  observedDecimal: 2.0537127, // numeric(12,6) holds 6
-  probabilities: { win: 0.523123456, push: 1 / 3, loss: 0.476876544 },
-  confidence: 0.613712345, //   numeric(9,8) holds 8
-};
+function overScaleFixture(): ForecastOutput {
+  const { forecast, errors } = makeOverScaleAccepted();
+  // The fixture is only worth something if a producer could actually have
+  // received it. Asserted here rather than assumed — the first version of this
+  // fixture summed its probabilities to 1.33 and would have been rejected.
+  assert.deepEqual(errors, [], 'the over-scale fixture must be a response the validator accepts');
+  return forecast;
+}
 
-const OVERSCALE_DIGEST = '8d9da895d849241bf5728f137152128d38464bd657afca6ff6ddfb5c34cb6b0f';
+const OVERSCALE: ForecastOutput = overScaleFixture();
+
+const OVERSCALE_DIGEST = '57cc317eacd24a9c8fb9bf55936b255e73f69790b88675a99c608d750f50e21b';
 
 const V2_DIGEST = '4945761adc3f2829b1b51fb6b6515a77d7f88d887d08df2e7c4779755e6b5348';
 const V1_DIGEST = 'ff97a0f00a489a328d7637ee144df8ef3904c2a00bed2587ee51714187263878';
@@ -190,12 +213,15 @@ test('fields outside the fingerprint do not change the digest', () => {
   }
 });
 
-test('the committed value is the exact float, not a rounded approximation', () => {
-  // Rounding "to tidy up" before hashing is a plausible edit that still yields a
-  // valid digest, and it silently decouples the commitment from the exact values
-  // in the retained body — so the reveal can never reproduce it. Named here
-  // because a mutant that rounded confidence survived the golden until the
-  // fixture stopped using values that were already round.
+test('a change AT the published scale changes the digest', () => {
+  // The contract binds the projection's precision, so this is the half of it
+  // that must still move: rounding away digits the reveal columns DO hold
+  // changes the committed decision and must change the digest. Its counterpart
+  // — a change below the published scale, which must NOT change it — is the test
+  // further down. Between them they say where the boundary is.
+  //
+  // Kept because a mutant that rounded confidence before hashing survived the
+  // golden until the fixture stopped using values that were already round.
   for (const [label, rounded] of [
     ['confidence', withForecast({ confidence: 0.61 })],
     ['observedDecimal', withForecast({ observedDecimal: 2.05 })],
@@ -275,10 +301,11 @@ test('GOLDEN: an over-scale forecast commits to the values the projection stores
   assert.equal(forecastDigest(OVERSCALE), OVERSCALE_DIGEST);
   assert.equal(
     canonicalize(projectionFingerprint(OVERSCALE)),
-    '{"axes":{"consensus":2,"news":1,"softness":5,"trend":3,"valuation":4},' +
+    '{"axes":{"consensus":1,"news":3,"softness":5,"trend":4,"valuation":2},' +
       '"confidence":0.61371235,"line":1.5,"loss":0.47687654,"observedDecimal":2.053713,' +
-      '"primaryAxis":"valuation","primaryExpectation":"synthetic expectation.",' +
-      '"push":0.33333333,"selectedForExecution":true,"selection":"St. Louis Cardinals",' +
+      '"primaryAxis":"trend","primaryExpectation":' +
+      '"Recent form favors the home side on the designated run line.",' +
+      '"push":0,"selectedForExecution":false,"selection":"Pittsburgh Pirates",' +
       '"win":0.52312346,"wouldAbstain":false}'
   );
 });

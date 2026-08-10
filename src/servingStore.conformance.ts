@@ -50,6 +50,7 @@ import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { ArmAttempt, AttemptFacts, DecisionSeal, PublishOutcome, RunFacts } from './servingStore.js';
 import { forecastDigest } from './schema.js';
+import { makeOverScaleAccepted } from './testFactories.js';
 import type { ForecastOutput } from './types.js';
 
 const HOST = process.env['BENCHMARK_CONFORMANCE_DB_HOST'] ?? 'localhost';
@@ -505,22 +506,13 @@ async function main(): Promise<void> {
     // revealDecision, exactly as a producer would: the port quantises them
     // through the same module the digest does, which is what makes the two
     // agree without the caller having to remember anything.
-    const forecast = {
-      market: 'moneyline',
-      selection: 'SELECTION',
-      line: 1.50004,
-      observedDecimal: 2.0537127,
-      probabilities: { win: 0.523123456, push: 1 / 3, loss: 0.476876544 },
-      confidence: 0.613712345,
-      wouldAbstain: false,
-      selectedForExecution: true,
-      rationale: 'synthetic rationale',
-      evidenceRefs: ['ref-1'],
-      reasonCode: null,
-      axes: { valuation: 4, trend: 3, consensus: 2, news: 1, softness: 5 },
-      primaryAxis: 'valuation',
-      primaryExpectation: 'PRIMARY-EXPECTATION',
-    } as unknown as ForecastOutput;
+    const { forecast, errors } = makeOverScaleAccepted();
+    // The round trip only means something if it starts from input a producer
+    // could actually have been handed, so the validator's verdict is asserted
+    // rather than assumed. An earlier version of this check cast a hand-written
+    // object through `as unknown` and used probabilities summing to 1.33 — it
+    // would never have reached this code path in life.
+    assert.deepEqual(errors, [], 'the over-scale forecast must be one the validator accepts');
     const sealed = forecastDigest(forecast);
 
     const cohortId = cohortName('digest-roundtrip');
@@ -576,9 +568,13 @@ async function main(): Promise<void> {
     assert.deepEqual(
       {
         line: stored['line'], observed_decimal: stored['observed_decimal'],
-        prob_push: stored['prob_push'], confidence: stored['confidence'],
+        prob_win: stored['prob_win'], prob_loss: stored['prob_loss'],
+        confidence: stored['confidence'],
       },
-      { line: '1.5000', observed_decimal: '2.053713', prob_push: '0.33333333', confidence: '0.61371235' }
+      {
+        line: '1.5000', observed_decimal: '2.053713',
+        prob_win: '0.52312346', prob_loss: '0.47687654', confidence: '0.61371235',
+      }
     );
   });
 

@@ -14,7 +14,9 @@
  *
  * Hashing the unrounded value and storing the rounded one makes the commitment
  * unverifiable. Measured against PostgreSQL 16 with the projection's exact
- * column types, on a forecast the response validator accepts:
+ * column types. The response validator does accept an over-scale forecast —
+ * `forecastDigest.test.ts` builds one through the real factories and asserts it
+ * validates cleanly before using it — and these are the values it stores:
  *
  *   line             1.50004      -> 1.5000       numeric(10,4)
  *   observedDecimal  2.0537127    -> 2.053713     numeric(12,6)

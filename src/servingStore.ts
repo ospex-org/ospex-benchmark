@@ -349,9 +349,11 @@ export interface ArmAttempt {
  *
  * ⚠ `forecastDigest` is supplied, not derived — this port takes the value and
  *   checks only its shape. Compute it with `forecastDigest()` from `schema.ts`,
- *   which is the documented composition
- *   (`sha256Hex(canonicalize(forecastFingerprint(f)))`) and the only one that can
- *   be recomputed from the later reveal. A digest arrived at any other way still
+ *   which is `sha256Hex(canonicalize(projectionFingerprint(f)))` and the only
+ *   composition that can be recomputed from the later reveal. Note the
+ *   PROJECTION fingerprint, not the raw one: the reveal columns hold fixed
+ *   scale, so a digest over unrounded floats cannot be reproduced from what
+ *   this table publishes. See projectionNumeric.ts. A digest arrived at any other way still
  *   passes the hex check here and still stores; it is simply unverifiable
  *   forever after, with no runtime signal that anything is wrong. Note in
  *   particular that `decisionFingerprint()` in `fireArtifact.ts` carries the same

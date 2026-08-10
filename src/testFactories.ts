@@ -1,7 +1,8 @@
 import { canonicalize, sha256Hex } from './canonical.js';
+import { validateResponseText } from './schema.js';
 import { SMOKE_LABEL } from './types.js';
 import type { GameRequest } from './bundle.js';
-import type { ArmSpec, BenchmarkResponse, GameBundle, SlateBundle } from './types.js';
+import type { ArmSpec, BenchmarkResponse, ForecastOutput, GameBundle, SlateBundle } from './types.js';
 
 /**
  * Shared deterministic factories for unit tests: one synthetic game request
@@ -161,4 +162,56 @@ export function makeValidResponse(
       },
     ],
   };
+}
+
+/**
+ * An OVER-SCALE forecast the response validator accepts, with the validator's
+ * verdict returned alongside so every caller can assert on it rather than trust
+ * this comment.
+ *
+ * Every numeric carries more decimals than the serving projection's reveal
+ * columns hold (`line numeric(10,4)`, `observed_decimal numeric(12,6)`,
+ * probabilities and `confidence numeric(9,8)`), which is the case that made a
+ * digest over unrounded floats unreproducible from the reveal.
+ *
+ * Producing one that is genuinely valid is fiddlier than it looks, which is why
+ * it lives here instead of being retyped: probabilities must sum to 1 within
+ * 1e-6, `observedDecimal` must EQUAL the bundle price for the selected side,
+ * `line` must echo the bundle, and `push` must be 0 whenever the line is not an
+ * integer — which an over-scale line always is. So the bundle carries the
+ * over-scale price too.
+ */
+export function makeOverScaleAccepted(): {
+  forecast: ForecastOutput;
+  errors: readonly string[];
+} {
+  const base = makeRequest();
+  const request = makeRequest('2026-07-12T16:15:00+00:00', {
+    markets: {
+      ...base.game.markets,
+      runLine: {
+        ...base.game.markets.runLine!,
+        line: 1.50004,
+        homeHandicap: 1.50004,
+        awayHandicap: -1.50004,
+        homeDecimal: 2.0537127,
+      },
+    },
+  } as never);
+  const response = makeValidResponse(request);
+  const spread = response.games[0]!.forecasts.find((f) => f.market === 'spread')!;
+  spread.line = 1.50004; //              numeric(10,4) holds 4
+  spread.observedDecimal = 2.0537127; // numeric(12,6) holds 6
+  spread.probabilities = { win: 0.523123456789, push: 0, loss: 0.476876543211 };
+  spread.confidence = 0.613712345678; // numeric(9,8) holds 8
+
+  const result = validateResponseText(
+    JSON.stringify(response),
+    request.requestBundle,
+    request.requestSha256,
+    TEST_ARM,
+    TEST_COHORT
+  );
+  const accepted = result.parsed?.games[0]?.forecasts.find((f) => f.market === 'spread');
+  return { forecast: (accepted ?? spread) as ForecastOutput, errors: result.errors };
 }
