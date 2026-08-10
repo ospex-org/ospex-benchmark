@@ -8,12 +8,7 @@ import { runBaselines } from './baselines.js';
 import { DEPLOYMENT_ROUND, NETWORK } from './config.js';
 import { forecastDigest } from './schema.js';
 import { ARMS } from './providers/index.js';
-import {
-  ENROLLED_ARM_IDS,
-  enrolledLabs,
-  PROJECTION_PARTICIPANTS,
-  projectionParticipant,
-} from './servingIdentity.js';
+import { enrolledLabs, PROJECTION_PARTICIPANTS, projectionParticipant } from './servingIdentity.js';
 import type { ProjectionParticipant } from './servingIdentity.js';
 import { asEnrolled, firedRun, fullBoardInputs, TEST_SLATE_DATE } from './servingTestRun.js';
 import { projectRun, publishableRun, revealMatchesSeal } from './servingProjection.js';
@@ -575,10 +570,10 @@ test('every arm the runner can dispatch is enrolled, by construction', () => {
   // Derived from the frozen roster rather than restated, so a fifth arm — a
   // second model from a lab already present, say — fails here instead of
   // silently never reaching the projection.
-  for (const armId of ENROLLED_ARM_IDS) {
-    assert.ok(projectionParticipant(armId), `arm ${armId} is not enrolled`);
+  for (const arm of ARMS) {
+    assert.ok(projectionParticipant(arm.participantId), `arm ${arm.participantId} is not enrolled`);
   }
-  assert.equal(ENROLLED_ARM_IDS.length, 4);
+  assert.equal(ARMS.length, 4);
 });
 
 test('the run identity the artifact stamps is the frozen literal, spelled out here', async () => {

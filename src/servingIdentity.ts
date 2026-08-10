@@ -1,4 +1,3 @@
-import { ARMS } from './providers/index.js';
 import type { ParticipantKind } from './servingStore.js';
 
 /**
@@ -211,5 +210,3 @@ export function enrolledLabs(): string[] {
   return [...labs].sort();
 }
 
-/** The runner's roster, for a test that must not restate the arm list. */
-export const ENROLLED_ARM_IDS: readonly string[] = ARMS.map((arm) => arm.participantId);
