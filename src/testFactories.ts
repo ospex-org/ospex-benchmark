@@ -183,6 +183,31 @@ export function makeValidResponse(
  * `line` must echo the bundle, and `push` must be 0 whenever the line is not an
  * integer — which an over-scale line always is. So the bundle carries the
  * over-scale price too.
+ *
+ * ── EVERY VALUE SITS ON A ROUNDING BOUNDARY, AND THAT IS THE POINT ───────────
+ *
+ * Each numeric below is chosen so `Number(v.toFixed(scale))` and PostgreSQL's
+ * own `numeric` rounding DISAGREE — measured against PostgreSQL 17 with these
+ * exact column types:
+ *
+ *              value            toFixed()     stored as
+ *     line     1.52345          1.5234        1.5235      numeric(10,4)
+ *     price    2.0537145        2.053714      2.053715    numeric(12,6)
+ *     win      0.523123465      0.52312346    0.52312347  numeric(9,8)
+ *     loss     0.476876535      0.47687653    0.47687654  numeric(9,8)
+ *     conf     0.613712355      0.61371235    0.61371236  numeric(9,8)
+ *
+ * That is what makes the serving port's quantiser provable per column: hand
+ * PostgreSQL the raw value for any of them and it stores a different number
+ * from the one the digest committed to, so the conformance round trip reddens.
+ * A fixture whose values round the same way under both rules cannot tell a
+ * publisher that quantises from one that does not — measured, three columns
+ * were in exactly that state and their quantisers could be deleted with the
+ * whole suite staying green.
+ *
+ * `push` is the one this fixture cannot carry: the validator refuses a non-zero
+ * push on a fractional line, and an over-scale line is fractional by definition.
+ * `makeOverScalePushAccepted` exists for it.
  */
 export function makeOverScaleAccepted(): {
   forecast: ForecastOutput;
@@ -194,19 +219,19 @@ export function makeOverScaleAccepted(): {
       ...base.game.markets,
       runLine: {
         ...base.game.markets.runLine!,
-        line: 1.50004,
-        homeHandicap: 1.50004,
-        awayHandicap: -1.50004,
-        homeDecimal: 2.0537127,
+        line: 1.52345,
+        homeHandicap: 1.52345,
+        awayHandicap: -1.52345,
+        homeDecimal: 2.0537145,
       },
     },
   } as never);
   const response = makeValidResponse(request);
   const spread = response.games[0]!.forecasts.find((f) => f.market === 'spread')!;
-  spread.line = 1.50004; //              numeric(10,4) holds 4
-  spread.observedDecimal = 2.0537127; // numeric(12,6) holds 6
-  spread.probabilities = { win: 0.523123456789, push: 0, loss: 0.476876543211 };
-  spread.confidence = 0.613712345678; // numeric(9,8) holds 8
+  spread.line = 1.52345; //              numeric(10,4) holds 4
+  spread.observedDecimal = 2.0537145; // numeric(12,6) holds 6
+  spread.probabilities = { win: 0.523123465, push: 0, loss: 0.476876535 };
+  spread.confidence = 0.613712355; //    numeric(9,8) holds 8
 
   const result = validateResponseText(
     JSON.stringify(response),
@@ -410,31 +435,40 @@ export function forecastAcceptance(
  * an ordinary baseball number rather than an exotic one.
  *
  * The values are chosen so that no plausible wrong implementation reproduces
- * them. Three of them sit ON a rounding boundary at their column's scale, where
+ * them. All FOUR of its scale-8 numerics sit ON a rounding boundary, where
  * `Number(v.toFixed(8))` and PostgreSQL's own numeric rounding DISAGREE —
  * measured against PostgreSQL 17 with these exact column types:
  *
  *              value           toFixed(8)    numeric(9,8)
  *     win      0.487654325     0.48765432    0.48765433
  *     push     0.061728395     0.06172839    0.06172840
+ *     loss     0.450617285     0.45061728    0.45061729
  *     conf     0.554321105     0.55432110    0.55432111
  *
  * That is what makes the serving port's quantisation load-bearing rather than
- * decorative: hand PostgreSQL the raw value for any of those three and it
- * stores a different number from the one the digest committed to, so the
- * conformance suite's round trip reddens. `line` cannot join them — a
- * whole-number line has nothing to round — and `observedDecimal` is left as
- * `americanToDecimal(-110)`, a price the bundle builder can actually emit,
- * which is worth more here than a fourth boundary value.
+ * decorative: hand PostgreSQL the raw value for any of the four and it stores a
+ * different number from the one the digest committed to, so the conformance
+ * round trip reddens.
+ *
+ * ⚠ `loss` READS as though it could not be one of them, and an earlier version
+ *   of this comment said exactly that: three probabilities must sum to 1, so
+ *   the third looks like whatever the first two leave. They sum to 1 WITHIN
+ *   1e-6, not exactly — 0.487654325 + 0.061728395 + 0.450617285 is 1.000000005,
+ *   five parts in a billion outside, and accepted. That slack is enough to put
+ *   the third value wherever it needs to be. While the constraint was believed
+ *   exact, the `prob_loss` quantiser could be deleted with the whole suite
+ *   green.
+ *
+ * `line` and `observedDecimal` genuinely cannot join them HERE: a whole-number
+ * line has nothing to round, and the price is `americanToDecimal(-110)`, which
+ * is worth more than a boundary value because it is one the bundle builder can
+ * actually emit. Both are covered on the spread fixture instead, so between the
+ * two every quantised column is pinned.
  *
  * `win` also straddles the boundary between `toFixed` and the usual
  * `Math.round(v * 1e8) / 1e8` idiom (0.48765432 against 0.48765433), so
  * swapping the quantiser's rule for that one — a plausible cleanup — moves the
  * digest instead of silently redefining it.
- *
- * `loss` is over-scale by four decimals. The three probabilities sum to 1 to
- * within 6.2e-11, comfortably inside the validator's 1e-6 tolerance, and not
- * exactly 1 — which is what a model's arithmetic actually produces.
  */
 export function makeOverScalePushAccepted(): {
   forecast: ForecastOutput;
@@ -445,7 +479,7 @@ export function makeOverScalePushAccepted(): {
     selection: 'over',
     line: 8,
     observedDecimal: 1.90909,
-    probabilities: { win: 0.487654325, push: 0.061728395, loss: 0.450617279938 },
+    probabilities: { win: 0.487654325, push: 0.061728395, loss: 0.450617285 },
     confidence: 0.554321105,
     wouldAbstain: false,
     selectedForExecution: true,
