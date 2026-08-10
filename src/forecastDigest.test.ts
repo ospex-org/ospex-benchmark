@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
-import { forecastDigest, forecastFingerprint } from './schema.js';
+import { forecastDigest, forecastFingerprint, projectionFingerprint } from './schema.js';
+import { PROJECTION_SCALES, quantizeForProjection } from './projectionNumeric.js';
 import type { ForecastOutput } from './types.js';
 
 /**
@@ -65,6 +66,25 @@ const V1: ForecastOutput = {
   evidenceRefs: ['ref-1', 'ref-2'],
   reasonCode: null,
 };
+
+/**
+ * A forecast the response validator accepts whose numerics carry MORE decimals
+ * than the reveal columns hold. `push` is one third, which is what a model
+ * returns when it computes one chance in three — this is an ordinary output.
+ *
+ * V2 above cannot stand in for this: every one of its values is already within
+ * scale, so quantising it changes nothing and a build that skipped quantisation
+ * entirely would pass every golden. This fixture is the one that discriminates.
+ */
+const OVERSCALE: ForecastOutput = {
+  ...V2,
+  line: 1.50004, //             numeric(10,4) holds 4
+  observedDecimal: 2.0537127, // numeric(12,6) holds 6
+  probabilities: { win: 0.523123456, push: 1 / 3, loss: 0.476876544 },
+  confidence: 0.613712345, //   numeric(9,8) holds 8
+};
+
+const OVERSCALE_DIGEST = '8d9da895d849241bf5728f137152128d38464bd657afca6ff6ddfb5c34cb6b0f';
 
 const V2_DIGEST = '4945761adc3f2829b1b51fb6b6515a77d7f88d887d08df2e7c4779755e6b5348';
 const V1_DIGEST = 'ff97a0f00a489a328d7637ee144df8ef3904c2a00bed2587ee51714187263878';
@@ -242,4 +262,77 @@ test('it is NOT the fire artifact fingerprint shape, which hashes differently', 
     probabilities: { win: fp.win, push: fp.push, loss: fp.loss },
   };
   assert.notEqual(sha256Hex(canonicalize(nestedOnly)), forecastDigest(V2));
+});
+
+// ─── the commitment must bind what the reveal can actually carry ─────────────
+
+test('GOLDEN: an over-scale forecast commits to the values the projection stores', () => {
+  // Measured against PostgreSQL 16 with the projection's exact column types:
+  // storing the RAW values rounds them, and a digest recomputed from the stored
+  // row did not match the digest sealed before the game. The preimage is
+  // therefore quantised to each column's scale, so the database never rounds
+  // and the round trip is exact by construction.
+  assert.equal(forecastDigest(OVERSCALE), OVERSCALE_DIGEST);
+  assert.equal(
+    canonicalize(projectionFingerprint(OVERSCALE)),
+    '{"axes":{"consensus":2,"news":1,"softness":5,"trend":3,"valuation":4},' +
+      '"confidence":0.61371235,"line":1.5,"loss":0.47687654,"observedDecimal":2.053713,' +
+      '"primaryAxis":"valuation","primaryExpectation":"synthetic expectation.",' +
+      '"push":0.33333333,"selectedForExecution":true,"selection":"St. Louis Cardinals",' +
+      '"win":0.52312346,"wouldAbstain":false}'
+  );
+});
+
+test('the digest is taken over the QUANTISED fingerprint, not the raw one', () => {
+  // The two differ for this fixture, which is what makes the golden above a
+  // real assertion rather than a restatement.
+  const raw = sha256Hex(canonicalize(forecastFingerprint(OVERSCALE)));
+  assert.notEqual(raw, forecastDigest(OVERSCALE));
+  // …and for a forecast already within scale they agree, so nothing changed for
+  // the ordinary case.
+  assert.equal(sha256Hex(canonicalize(forecastFingerprint(V2))), forecastDigest(V2));
+  assert.deepEqual(projectionFingerprint(V2), forecastFingerprint(V2));
+});
+
+test('ROUND TRIP: re-quantising a revealed value reproduces the sealed digest', () => {
+  // What the database does to a value already at scale is nothing, so replaying
+  // the fingerprint's own numerics back through the forecast must reproduce the
+  // seal. The equivalent check against a REAL PostgreSQL, using the projection's
+  // column types, lives in servingStore.conformance.ts — this is the part that
+  // can run in CI.
+  const sealed = forecastDigest(OVERSCALE);
+  const fingerprint = projectionFingerprint(OVERSCALE);
+  const revealed: ForecastOutput = {
+    ...OVERSCALE,
+    line: fingerprint.line,
+    observedDecimal: fingerprint.observedDecimal,
+    probabilities: { win: fingerprint.win, push: fingerprint.push, loss: fingerprint.loss },
+    confidence: fingerprint.confidence,
+  };
+  assert.equal(forecastDigest(revealed), sealed);
+  // Quantising is idempotent, which is the property that makes the above hold.
+  for (const [value, scale] of [
+    [1.50004, PROJECTION_SCALES.line],
+    [2.0537127, PROJECTION_SCALES.observedDecimal],
+    [1 / 3, PROJECTION_SCALES.probability],
+    [0.613712345, PROJECTION_SCALES.confidence],
+  ] as Array<[number, number]>) {
+    const once = quantizeForProjection(value, scale);
+    assert.equal(quantizeForProjection(once, scale), once);
+    // and the decimal it prints as is the one the column will hold
+    assert.ok(String(once).split('.')[1] === undefined || String(once).split('.')[1]!.length <= scale);
+  }
+});
+
+test('a difference below the projection scale does NOT change the digest', () => {
+  // The honest consequence of the rule, stated so nobody is surprised by it: the
+  // commitment binds the published precision, not the model's full output. Full
+  // precision stays bound by responseSha256 over the retained body.
+  const nudged: ForecastOutput = {
+    ...OVERSCALE,
+    confidence: 0.6137123451, // differs from the fixture in the 10th decimal
+  };
+  assert.equal(forecastDigest(nudged), OVERSCALE_DIGEST);
+  // …but a difference AT the scale still does.
+  assert.notEqual(forecastDigest({ ...OVERSCALE, confidence: 0.61371236 }), OVERSCALE_DIGEST);
 });

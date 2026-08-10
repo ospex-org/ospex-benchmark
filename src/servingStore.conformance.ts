@@ -30,6 +30,17 @@
  *     -e POSTGRES_DB=ospex_serving_scratch -p 5436:5432 postgres:17-alpine
  *   # apply the benchmark serving-projection migrations and create the writer
  *   yarn store:serving
+ *
+ * Two prerequisites a bare PostgreSQL does not have, both of which stop a run:
+ *
+ *   - the projection's tables reference the protocol's own `public.network`
+ *     enum, so it has to exist before the migration applies:
+ *       CREATE TYPE public.network AS ENUM ('polygon', 'amoy');
+ *   - the last check asserts the writer is REFUSED on protocol state, which
+ *     needs a `public.commitments` relation the role has no grant on. Absent
+ *     entirely, the query fails 42P01 instead of 42501 and the check reports a
+ *     failure that says nothing about the code:
+ *       CREATE TABLE public.commitments (id bigint);
  */
 import assert from 'node:assert/strict';
 import { Client, Pool } from 'pg';
@@ -38,6 +49,8 @@ import { pgStoreTransactor } from './store/campaignTickJournal.js';
 import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { ArmAttempt, AttemptFacts, DecisionSeal, PublishOutcome, RunFacts } from './servingStore.js';
+import { forecastDigest } from './schema.js';
+import type { ForecastOutput } from './types.js';
 
 const HOST = process.env['BENCHMARK_CONFORMANCE_DB_HOST'] ?? 'localhost';
 const PORT = Number(process.env['BENCHMARK_CONFORMANCE_DB_PORT'] ?? '5436');
@@ -476,6 +489,97 @@ async function main(): Promise<void> {
       rationale_digest: DIGEST(0xd2), bundle_sha256: DIGEST(0xd3), response_schema_version: 9,
       source_path: 'DECISION-PATH', source_sha256: DIGEST(0xd4), market: 'moneyline',
     })) assert.deepEqual(d[column], expected, `benchmark_decisions.${column} holds the wrong value`);
+  });
+
+  await check('A SEALED DIGEST SURVIVES THE REVEAL ROUND TRIP, at over-scale precision', async () => {
+    // The one check that proves the commitment is worth anything: seal a real
+    // forecastDigest(), reveal the SAME forecast through the port, read the row
+    // back out of PostgreSQL, recompute the digest from what was stored, and
+    // require it to equal the seal.
+    //
+    // The forecast is deliberately over-scale — `push` is one third, which is
+    // what a model returns for one chance in three, and the reveal columns hold
+    // 8 decimals. Hashing the raw value and storing the rounded one produced two
+    // different digests with nothing anywhere reporting a problem; that is the
+    // failure this exists to keep out. Note that the RAW values are handed to
+    // revealDecision, exactly as a producer would: the port quantises them
+    // through the same module the digest does, which is what makes the two
+    // agree without the caller having to remember anything.
+    const forecast = {
+      market: 'moneyline',
+      selection: 'SELECTION',
+      line: 1.50004,
+      observedDecimal: 2.0537127,
+      probabilities: { win: 0.523123456, push: 1 / 3, loss: 0.476876544 },
+      confidence: 0.613712345,
+      wouldAbstain: false,
+      selectedForExecution: true,
+      rationale: 'synthetic rationale',
+      evidenceRefs: ['ref-1'],
+      reasonCode: null,
+      axes: { valuation: 4, trend: 3, consensus: 2, news: 1, softness: 5 },
+      primaryAxis: 'valuation',
+      primaryExpectation: 'PRIMARY-EXPECTATION',
+    } as unknown as ForecastOutput;
+    const sealed = forecastDigest(forecast);
+
+    const cohortId = cohortName('digest-roundtrip');
+    const decision = { cohortId, participantId: `${cohortId}-alpha`, gameId: 'game-1', market: 'moneyline' as const };
+    await port.publishAttempt(armAttempt(cohortId));
+    expect(await port.sealDecision(decisionSeal(cohortId, { forecastDigest: sealed })), 'published', 'seal');
+    expect(await port.revealDecision({
+      decision, revealedAt: '2026-08-09T20:40:00.000Z', selection: forecast.selection,
+      line: forecast.line, observedDecimal: forecast.observedDecimal,
+      probWin: forecast.probabilities.win, probPush: forecast.probabilities.push,
+      probLoss: forecast.probabilities.loss, confidence: forecast.confidence,
+      wouldAbstain: forecast.wouldAbstain, selectedForExecution: forecast.selectedForExecution,
+      reasonCode: null,
+      axisValuation: forecast.axes!.valuation, axisTrend: forecast.axes!.trend,
+      axisConsensus: forecast.axes!.consensus, axisNews: forecast.axes!.news,
+      axisSoftness: forecast.axes!.softness,
+      primaryAxis: forecast.primaryAxis!, primaryExpectation: forecast.primaryExpectation!,
+      source: NO_SOURCE,
+    }), 'published', 'reveal');
+
+    const stored = (await query(
+      `select r.*, d.forecast_digest from public.benchmark_decision_reveals r
+         join public.benchmark_decisions d on d.id = r.decision_id where d.cohort_id = $1`, [cohortId]))[0]!;
+    assert.equal(stored['forecast_digest'], sealed, 'the seal did not store the digest it was given');
+
+    // Rebuild the forecast from the REVEALED row and recompute.
+    const revealed = {
+      ...forecast,
+      selection: String(stored['selection']),
+      line: Number(stored['line']),
+      observedDecimal: Number(stored['observed_decimal']),
+      probabilities: {
+        win: Number(stored['prob_win']),
+        push: Number(stored['prob_push']),
+        loss: Number(stored['prob_loss']),
+      },
+      confidence: Number(stored['confidence']),
+      axes: {
+        valuation: Number(stored['axis_valuation']), trend: Number(stored['axis_trend']),
+        consensus: Number(stored['axis_consensus']), news: Number(stored['axis_news']),
+        softness: Number(stored['axis_softness']),
+      },
+      primaryAxis: stored['primary_axis'],
+      primaryExpectation: stored['primary_expectation'],
+    } as unknown as ForecastOutput;
+    assert.equal(
+      forecastDigest(revealed), sealed,
+      'the digest recomputed from the revealed row does not match the seal — the commitment is unverifiable'
+    );
+
+    // And the stored decimals really are at the column scale, so this passed
+    // for the right reason rather than because PostgreSQL happened to keep them.
+    assert.deepEqual(
+      {
+        line: stored['line'], observed_decimal: stored['observed_decimal'],
+        prob_push: stored['prob_push'], confidence: stored['confidence'],
+      },
+      { line: '1.5000', observed_decimal: '2.053713', prob_push: '0.33333333', confidence: '0.61371235' }
+    );
   });
 
   await check('EVERY reveal and score column round-trips to its own column', async () => {

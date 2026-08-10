@@ -1,4 +1,5 @@
 import { redactSecrets } from './config.js';
+import { PROJECTION_SCALES, quantizeForProjection } from './projectionNumeric.js';
 import { isParseableInstant } from './time.js';
 import type { MarketKey } from './types.js';
 import type { StoreQuery } from './store/atomicStore.js';
@@ -612,6 +613,11 @@ function bool(value: boolean | null, field: string): boolean | null {
  *  driver quoting the value back. */
 const INT4_MAX = 2_147_483_647;
 
+/** A validated numeric at the projection's scale; null passes through. */
+function scaled(value: number | null, scale: number): number | null {
+  return value === null ? null : quantizeForProjection(value, scale);
+}
+
 function num(value: number | null, field: string, min?: number, max?: number): number | null {
   if (value === null) return null;
   if (typeof value !== 'number' || !Number.isFinite(value)) refuse('number_out_of_range', field);
@@ -800,12 +806,20 @@ function revealPayload(reveal: DecisionReveal): Record<string, unknown> {
     ...decisionRef(reveal.decision, 'decision'),
     revealed_at: requiredInstant(reveal.revealedAt, 'revealedAt'),
     selection: requiredText(reveal.selection, 'selection'),
-    line: num(reveal.line, 'line'),
-    observed_decimal: num(reveal.observedDecimal, 'observedDecimal', 0),
-    prob_win: unit(reveal.probWin, 'probWin'),
-    prob_push: unit(reveal.probPush, 'probPush'),
-    prob_loss: unit(reveal.probLoss, 'probLoss'),
-    confidence: unit(reveal.confidence, 'confidence'),
+    // Quantised to the column's own scale before it is sent, so PostgreSQL
+    // never rounds and the stored value is byte-for-byte what the seal
+    // committed to. `forecastDigest()` hashes the same quantisation through the
+    // same module; that shared step is the only reason a reveal can be checked
+    // against its seal at all. See projectionNumeric.ts.
+    line: scaled(num(reveal.line, 'line'), PROJECTION_SCALES.line),
+    observed_decimal: scaled(
+      num(reveal.observedDecimal, 'observedDecimal', 0),
+      PROJECTION_SCALES.observedDecimal
+    ),
+    prob_win: scaled(unit(reveal.probWin, 'probWin'), PROJECTION_SCALES.probability),
+    prob_push: scaled(unit(reveal.probPush, 'probPush'), PROJECTION_SCALES.probability),
+    prob_loss: scaled(unit(reveal.probLoss, 'probLoss'), PROJECTION_SCALES.probability),
+    confidence: scaled(unit(reveal.confidence, 'confidence'), PROJECTION_SCALES.confidence),
     would_abstain: bool(reveal.wouldAbstain, 'wouldAbstain'),
     selected_for_execution: bool(reveal.selectedForExecution, 'selectedForExecution'),
     reason_code: text(reveal.reasonCode, 'reasonCode'),
