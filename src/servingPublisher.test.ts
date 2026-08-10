@@ -346,10 +346,21 @@ test('a port that NEVER SETTLES cannot hold the run open', async () => {
   // handled: a typed outcome answers a database that says no, and does nothing
   // about one that says nothing at all. `yarn watch` awaits this inside the
   // fire, so an unbounded wait is a stalled tick and a night that stops.
+  //
+  // Deliberately ONE attempt and ONE decision, and no deadline. An earlier
+  // version ran the whole plan and leaned on the publication budget to bring it
+  // back, which made the case's own termination depend on a guard other cases
+  // mutate — three unrelated mutants hung here and scored as findings they were
+  // not. What is under test is the PER-WRITE bound, so nothing else may be load
+  // bearing in getting this function to return.
+  const single: ProjectionPlan = {
+    ...plan,
+    attempts: plan.attempts.slice(0, 1),
+    decisions: plan.decisions.slice(0, 1),
+  };
   const started = Date.now();
-  const summary = await publishPlan(hanging, plan, collector().log, {
+  const summary = await publishPlan(hanging, single, collector().log, {
     perWriteTimeoutMs: 20,
-    deadlineMs: 400,
   });
   const elapsed = Date.now() - started;
 
