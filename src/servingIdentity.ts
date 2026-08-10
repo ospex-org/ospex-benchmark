@@ -209,4 +209,3 @@ export function enrolledLabs(): string[] {
   }
   return [...labs].sort();
 }
-

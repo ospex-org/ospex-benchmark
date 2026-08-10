@@ -1,7 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { sha256Hex } from './canonical.js';
-import { parseRunArtifact, projectRun, publishableRun, revealMatchesSeal } from './servingProjection.js';
+import { describeError } from './config.js';
+import {
+  parseRunArtifact,
+  projectRun,
+  publishableRun,
+  revealMatchesSeal,
+  verifyArtifactIntegrity,
+} from './servingProjection.js';
 import type { ProjectedDecision, ProjectionPlan } from './servingProjection.js';
 import type { BenchmarkServingPort, PublishOutcome, SourceRef } from './servingStore.js';
 
@@ -40,6 +47,82 @@ export interface PublishSummary {
   readonly skipped: readonly string[];
   /** True when the publisher was not configured, so nothing was attempted. */
   readonly disabled: boolean;
+  /**
+   * Set when the artifact was refused before anything was sent — a dry run, a
+   * failed identity check, a file that does not pass its own integrity check.
+   *
+   * Distinct from an empty `rejected`, and the distinction matters to a caller
+   * that exists only to publish: nothing being written because there was
+   * nothing to write is success, while nothing being written because the file
+   * was turned away is not.
+   */
+  readonly gateRefusal: string | null;
+}
+
+/**
+ * How long the whole publication may take before it gives up.
+ *
+ * The projection is documented as unable to halt a run, and a bounded failure
+ * is the only version of that which is true. Returning a typed outcome instead
+ * of throwing covers a database that says no; it does nothing about one that
+ * says nothing at all, and an unbounded await inside a fire is a stalled fire,
+ * a stalled watch tick, and a night that quietly stops.
+ *
+ * The deadline is generous against the real shape of the work — a fire is on
+ * the order of forty writes at four in flight — and small against the fire's
+ * own timeout, so a projection that has stopped answering costs one tick's
+ * delay rather than the night. Racing does not cancel the underlying request;
+ * it stops this module waiting on it, which is the property being bought.
+ */
+export const PUBLICATION_DEADLINE_MS = 45_000;
+
+/** No single write may hold the whole budget. */
+export const PER_WRITE_TIMEOUT_MS = 10_000;
+
+/**
+ * The clock and the bounds, injectable so the suite can prove them.
+ *
+ * A deadline no test exercises is a comment, and this one is load-bearing: it
+ * is the difference between "the projection cannot halt a run" being a property
+ * and being a wish.
+ */
+export interface PublishTiming {
+  readonly nowMs?: () => number;
+  readonly deadlineMs?: number;
+  readonly perWriteTimeoutMs?: number;
+}
+
+class Timeout extends Error {}
+
+/**
+ * Run one write, and answer for it whatever happens.
+ *
+ * A port that rejects and a port that never settles are both reported as
+ * `unavailable`, which is what they are from here — the row did not land and
+ * the run must continue. The documented port never rejects; this does not rely
+ * on that being true of every implementation, because the cost of being wrong
+ * is a benchmark night.
+ */
+async function settle(
+  write: () => Promise<PublishOutcome>,
+  timeoutMs: number,
+): Promise<PublishOutcome> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      write(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Timeout('write did not settle')), timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    return {
+      outcome: 'unavailable',
+      detail: error instanceof Timeout ? `no answer within ${timeoutMs}ms` : describeError(error),
+    };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /**
@@ -65,6 +148,7 @@ class Tally {
   readonly rejected: Record<string, number> = {};
   readonly skipped: string[] = [];
   disabled = false;
+  gateRefusal: string | null = null;
 
   /** Records an outcome, and returns whether the write landed (or already had). */
   record(outcome: PublishOutcome, what: string, log: PublishLog): boolean {
@@ -95,6 +179,7 @@ class Tally {
       rejected: { ...this.rejected },
       skipped: [...this.skipped],
       disabled: this.disabled,
+      gateRefusal: this.gateRefusal,
     };
   }
 }
@@ -135,18 +220,46 @@ export async function publishPlan(
   port: BenchmarkServingPort,
   plan: ProjectionPlan,
   log: PublishLog,
+  timing: PublishTiming = {},
 ): Promise<PublishSummary> {
+  const nowMs = timing.nowMs ?? Date.now;
+  const deadlineMs = timing.deadlineMs ?? PUBLICATION_DEADLINE_MS;
+  const perWriteTimeoutMs = timing.perWriteTimeoutMs ?? PER_WRITE_TIMEOUT_MS;
   const tally = new Tally();
   tally.skipped.push(...plan.skipped);
 
+  // One budget for the whole publication, checked before each write rather
+  // than only per call: forty writes that each answer just inside the per-write
+  // timeout would otherwise still stall the fire for minutes.
+  const expiresAt = nowMs() + deadlineMs;
+  let abandoned = 0;
+  const outOfTime = (): boolean => {
+    if (nowMs() < expiresAt) return false;
+    abandoned += 1;
+    return true;
+  };
+
   await inBatches(plan.attempts, async (attempt) => {
+    if (outOfTime()) return;
     const what = `attempt ${attempt.participant.participantId} / ${attempt.gameId} / ordinal ${attempt.facts.attemptOrdinal}`;
-    tally.record(await port.publishAttempt(attempt), what, log);
+    tally.record(await settle(() => port.publishAttempt(attempt), perWriteTimeoutMs), what, log);
   });
 
   await inBatches(plan.decisions, async (decision) => {
-    await publishDecision(port, decision, tally, log);
+    if (outOfTime()) return;
+    await publishDecision(port, decision, tally, log, perWriteTimeoutMs);
   });
+
+  if (abandoned > 0) {
+    // Loud, and recoverable: everything the projection did not take is still in
+    // the artifact, and republishing that file is a no-op for the rows that did
+    // land. Silence here would read as a complete publication.
+    const reason =
+      `${abandoned} write(s) abandoned — the projection did not finish within ` +
+      `${deadlineMs}ms. Republish this run's artifact to complete it.`;
+    tally.skipped.push(reason);
+    log.error(`serving projection: ${reason}`);
+  }
 
   return tally.summary();
 }
@@ -156,6 +269,7 @@ async function publishDecision(
   decision: ProjectedDecision,
   tally: Tally,
   log: PublishLog,
+  perWriteTimeoutMs: number,
 ): Promise<void> {
   const { seal, reveal, rationale } = decision;
   const what = `${seal.participant.participantId} / ${seal.gameId} / ${seal.market}`;
@@ -175,10 +289,10 @@ async function publishDecision(
     return;
   }
 
-  if (!tally.record(await port.sealDecision(seal), `seal ${what}`, log)) return;
-  tally.record(await port.revealDecision(reveal), `reveal ${what}`, log);
+  if (!tally.record(await settle(() => port.sealDecision(seal), perWriteTimeoutMs), `seal ${what}`, log)) return;
+  tally.record(await settle(() => port.revealDecision(reveal), perWriteTimeoutMs), `reveal ${what}`, log);
   if (rationale !== null) {
-    tally.record(await port.publishRationale(rationale), `rationale ${what}`, log);
+    tally.record(await settle(() => port.publishRationale(rationale), perWriteTimeoutMs), `rationale ${what}`, log);
   }
 }
 
@@ -203,14 +317,39 @@ export async function publishRunArtifact(
   runFile: string,
   log: PublishLog,
 ): Promise<PublishSummary> {
-  const text = readFileSync(runFile, 'utf8');
-  const records = parseRunArtifact(text);
+  const refuse = (reason: string): PublishSummary => {
+    log.line(`serving projection: skipped this run (${reason})`);
+    return {
+      published: 0,
+      duplicate: 0,
+      rejected: {},
+      skipped: [reason],
+      disabled: false,
+      gateRefusal: reason,
+    };
+  };
+
+  let text: string;
+  try {
+    text = readFileSync(runFile, 'utf8');
+  } catch (error) {
+    return refuse(`the artifact could not be read (${describeError(error)})`);
+  }
+
+  // Integrity BEFORE anything else reads the file, and answered by the scorer's
+  // own reader rather than by this module's. See verifyArtifactIntegrity.
+  const broken = verifyArtifactIntegrity(text);
+  if (broken !== null) return refuse(broken);
+
+  let records: readonly Parameters<typeof publishableRun>[0][number][];
+  try {
+    records = parseRunArtifact(text);
+  } catch (error) {
+    return refuse(describeError(error));
+  }
 
   const gate = publishableRun(records);
-  if (!gate.publishable) {
-    log.line(`serving projection: skipped this run (${gate.reason})`);
-    return { published: 0, duplicate: 0, rejected: {}, skipped: [gate.reason], disabled: false };
-  }
+  if (!gate.publishable) return refuse(gate.reason);
 
   const source: SourceRef = {
     // The basename, never the full path: an absolute path here is an

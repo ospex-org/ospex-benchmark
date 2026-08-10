@@ -264,7 +264,18 @@ export interface RunFacts {
   readonly executionPolicy: string | null;
 }
 
-/** Durable participant identity, stable across model versions. */
+/**
+ * Durable participant identity: ONE PARTICIPANT PER COMPETING CONFIGURATION.
+ *
+ * An arm, not a lab and not a model line. Two models from one lab, and the
+ * same model at two settings, are things being compared against each other, so
+ * each is its own participant — every key here is scoped by this id, and
+ * sharing one would make the second arm's roster row contradict the first's,
+ * its provider call collide, and its decisions be refused.
+ *
+ * Group by `labId` for a lab-level view. That rollup is always computable;
+ * the distinction, once discarded at write time, is not.
+ */
 export interface ParticipantFacts {
   readonly participantId: string;
   readonly kind: ParticipantKind;

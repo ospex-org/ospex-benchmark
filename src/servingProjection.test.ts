@@ -279,7 +279,7 @@ test('a repaired arm publishes both calls, and the seal cites the one that was a
   for (const { seal } of models) assert.equal(seal.attemptOrdinal, 1, 'the seal cites the repair');
 });
 
-test('the participant is the durable lab and the version lives on the roster', async () => {
+test('the participant is the ARM, with the lab and the model in their own fields', async () => {
   const run = await fire();
   const enrolled = ARMS[1]!.participantId; // anthropic-claude-fable-5
   const plan = planOf(asEnrolled(run.records, 1));

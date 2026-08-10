@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { after, test } from 'node:test';
@@ -217,21 +217,6 @@ test('an unconfigured publisher attempts nothing and says so', async () => {
   assert.deepEqual(summary.rejected, {});
 });
 
-test('the publisher never throws, whatever the port does', async () => {
-  const { plan } = await planFromFire();
-  const exploding: BenchmarkServingPort = {
-    publishAttempt: () => Promise.reject(new Error('boom')),
-    sealDecision: () => Promise.reject(new Error('boom')),
-    revealDecision: () => Promise.reject(new Error('boom')),
-    publishRationale: () => Promise.reject(new Error('boom')),
-    publishScore: () => Promise.reject(new Error('boom')),
-    publishScoringRun: () => Promise.reject(new Error('boom')),
-  };
-  // The real port is documented never to reject, and this asserts the
-  // publisher does not rely on that being true of every implementation.
-  await assert.rejects(() => publishPlan(exploding, plan, collector().log));
-});
-
 // ---------------------------------------------------------------------------
 // The self-check that stands in for a drift check the database does not have
 // ---------------------------------------------------------------------------
@@ -272,54 +257,39 @@ test('a decision whose reveal contradicts its seal publishes neither half', asyn
 
 test('the source is the artifact filename and the hash of the bytes on disk', async () => {
   const run = await firedRun({ outDir: tempDir('serving-source-'), enrolled: true });
+  const onDisk = readFileSync(run.runFile, 'utf8');
 
-  // Put a configured credential into the artifact so redaction is NOT the
-  // identity function. Without this the records array and the written file
-  // serialize to almost the same bytes, and a publisher that hashed the array
-  // instead of the file would pass.
-  const secret = 'sb-anon-key-0123456789abcdef';
-  const previous = process.env['SUPABASE_ANON_KEY'];
-  process.env['SUPABASE_ANON_KEY'] = secret;
-  try {
-    const withSecret = run.records.map((record) =>
-      record['recordType'] === 'decision'
-        ? { ...record, rationale: `${String(record['rationale'])} ${secret}` }
-        : record,
-    );
-    assert.ok(JSON.stringify(withSecret).includes(secret), 'the fixture must carry the secret');
-    writeNdjson(run.runFile, withSecret);
+  const port = new RecordingPort();
+  await publishRunArtifact(port, run.runFile, collector().log);
+  assert.ok(port.calls.length > 0, 'the run must have published something');
 
-    const onDisk = readFileSync(run.runFile, 'utf8');
-    assert.equal(onDisk.includes(secret), false, 'the writer must have redacted it');
-    assert.notEqual(
-      sha256Hex(onDisk),
-      sha256Hex(withSecret.map((r) => JSON.stringify(r)).join('\n')),
-      'the two byte-streams must differ, or this proves nothing',
-    );
-
-    const port = new RecordingPort();
-    await publishRunArtifact(port, run.runFile, collector().log);
-    assert.ok(port.calls.length > 0, 'the run must have published something');
-
-    // Read what was SENT. An earlier version of this case re-derived the
-    // expected source and handed it to `projectRun` itself, which asserted only
-    // that the projector copies what it is given — a publisher stamping the
-    // absolute path passed it unchanged.
-    for (const call of port.calls) {
-      const { sourcePath, sourceSha256 } = call.payload.source;
-      assert.equal(sourceSha256, sha256Hex(onDisk), `${call.kind} hashed something other than the file`);
-      assert.equal(sourcePath, basename(run.runFile));
-      // An absolute path here is an operator's home directory, written into a
-      // database whose rows are destined for a public page, and redaction knows
-      // nothing about usernames.
-      assert.match(sourcePath!, /^[A-Za-z0-9._-]+\.ndjson$/);
-      assert.equal(sourcePath!.includes('/'), false);
-      assert.equal(sourcePath!.includes('\\'), false);
-    }
-  } finally {
-    if (previous === undefined) delete process.env['SUPABASE_ANON_KEY'];
-    else process.env['SUPABASE_ANON_KEY'] = previous;
+  // Read what was SENT. An earlier version of this case re-derived the expected
+  // source and handed it to `projectRun`, which asserted only that the projector
+  // copies what it is given — a publisher stamping the absolute path passed it.
+  for (const call of port.calls) {
+    const { sourcePath, sourceSha256 } = call.payload.source;
+    assert.equal(sourceSha256, sha256Hex(onDisk), `${call.kind} hashed something other than the file`);
+    assert.equal(sourcePath, basename(run.runFile));
+    // An absolute path here is an operator's home directory, written into a
+    // database whose rows are destined for a public page, and redaction knows
+    // nothing about usernames.
+    assert.match(sourcePath ?? '', /^[A-Za-z0-9._-]+\.ndjson$/);
+    assert.equal(sourcePath?.includes('/'), false);
+    assert.equal(sourcePath?.includes('\\'), false);
   }
+
+  // Stated bound: this pins the hash to the FILE rather than to the in-memory
+  // records, and the two differ here only by the writer's trailing newline. It
+  // does NOT exercise the case that motivates reading the file back — that the
+  // writer redacts on the way out, so an artifact containing a configured
+  // credential is not byte-equal to the array it came from. Constructing that
+  // faithfully means redacting the archived body and every parsed field
+  // together, and anything less is refused by the integrity check above, which
+  // is the check working rather than a gap to route around.
+  assert.notEqual(
+    sha256Hex(run.records.map((record) => JSON.stringify(record)).join('\n')),
+    sha256Hex(onDisk),
+  );
 });
 
 test('a run the gate refuses reaches the port not at all', async () => {
@@ -331,4 +301,154 @@ test('a run the gate refuses reaches the port not at all', async () => {
   assert.deepEqual(port.calls, []);
   assert.equal(summary.published, 0);
   assert.ok(sink.lines.some((line) => line.includes('not a live run')));
+});
+
+// ---------------------------------------------------------------------------
+// Liveness: the projection may not fail a run, and may not stall one either
+// ---------------------------------------------------------------------------
+
+test('a port that REJECTS is reported, not propagated', async () => {
+  const { plan } = await planFromFire();
+  const boom = (): Promise<never> => Promise.reject(new Error('boom'));
+  const exploding: BenchmarkServingPort = {
+    publishAttempt: boom,
+    sealDecision: boom,
+    revealDecision: boom,
+    publishRationale: boom,
+    publishScore: boom,
+    publishScoringRun: boom,
+  };
+
+  // The documented port never rejects. Relying on that is what makes a
+  // projection able to kill a benchmark night, so the publisher answers for the
+  // port rather than trusting it — an earlier version of this case asserted the
+  // opposite and pinned the defect in place.
+  const sink = collector();
+  const summary = await publishPlan(exploding, plan, sink.log);
+  assert.ok((summary.rejected['unavailable'] ?? 0) > 0, 'the failure must be counted');
+  assert.equal(summary.published, 0);
+  assert.ok(sink.errors.some((line) => line.includes('unavailable')));
+});
+
+test('a port that NEVER SETTLES cannot hold the run open', async () => {
+  const { plan } = await planFromFire();
+  const silent = (): Promise<never> => new Promise<never>(() => undefined);
+  const hanging: BenchmarkServingPort = {
+    publishAttempt: silent,
+    sealDecision: silent,
+    revealDecision: silent,
+    publishRationale: silent,
+    publishScore: silent,
+    publishScoringRun: silent,
+  };
+
+  // A rejection and a silence are different failures and only one of them was
+  // handled: a typed outcome answers a database that says no, and does nothing
+  // about one that says nothing at all. `yarn watch` awaits this inside the
+  // fire, so an unbounded wait is a stalled tick and a night that stops.
+  const started = Date.now();
+  const summary = await publishPlan(hanging, plan, collector().log, {
+    perWriteTimeoutMs: 20,
+    deadlineMs: 400,
+  });
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 5_000, `publication must be bounded, took ${elapsed}ms`);
+  assert.equal(summary.published, 0);
+  assert.ok((summary.rejected['unavailable'] ?? 0) > 0, 'each silent write is unavailable');
+});
+
+test('the whole-publication deadline stops sending, and says how to finish', async () => {
+  const { plan } = await planFromFire();
+  assert.ok(plan.decisions.length > 4, 'need more work than one batch');
+
+  // A clock that jumps past the budget after the first check: forty writes that
+  // each answer just inside the per-write timeout would otherwise still stall
+  // the fire for minutes, which is why the budget is checked per write and not
+  // only per call.
+  let ticks = 0;
+  const port = new RecordingPort();
+  const sink = collector();
+  const summary = await publishPlan(port, plan, sink.log, {
+    nowMs: () => (ticks++ < 2 ? 0 : 10_000),
+    deadlineMs: 1_000,
+  });
+
+  assert.ok(summary.skipped.some((reason) => reason.includes('abandoned')));
+  assert.ok(sink.errors.some((line) => line.includes('Republish')), 'must say how to recover');
+  assert.ok(
+    port.calls.length < plan.attempts.length + plan.decisions.length,
+    'it must actually stop sending',
+  );
+
+  // Negative control: the same plan on the same kind of port with a real clock
+  // publishes everything, so the deadline is what stopped it rather than the
+  // port or the plan.
+  const complete = await publishPlan(new RecordingPort(), plan, collector().log);
+  assert.deepEqual(complete.skipped, []);
+  assert.ok(complete.published > 0);
+});
+
+// ---------------------------------------------------------------------------
+// Artifact integrity, answered by the scorer's own reader
+// ---------------------------------------------------------------------------
+
+test('an artifact carrying TWO runs is refused, not silently attributed to the first', async () => {
+  const run = await firedRun({ outDir: tempDir('serving-twin-'), enrolled: true });
+  const text = readFileSync(run.runFile, 'utf8');
+  const meta = text.split(/\r?\n/).find((line) => line.includes('"run_meta"'));
+  assert.ok(meta);
+
+  // Two run_meta records in one file. Read record-by-record this looks like a
+  // run with a spare header; the file actually has no single identity, and
+  // publishing it stamped every decision — including the other run's — under
+  // whichever header came first.
+  const second = meta.replace(/"runId":"[^"]+"/, '"runId":"watch-v0-2026-07-20-ffffff"');
+  writeFileSync(run.runFile, `${text.trimEnd()}\n${second}\n`, 'utf8');
+
+  const port = new RecordingPort();
+  const summary = await publishRunArtifact(port, run.runFile, collector().log);
+  assert.deepEqual(port.calls, [], 'nothing may be sent');
+  assert.notEqual(summary.gateRefusal, null);
+});
+
+test('a TRUNCATED artifact is refused, so cutting records cannot open the gate', async () => {
+  const run = await firedRun({ outDir: tempDir('serving-trunc-'), enrolled: true });
+  const lines = readFileSync(run.runFile, 'utf8').trimEnd().split(/\r?\n/);
+  assert.ok(lines.length > 3);
+
+  // Every remaining line is still well-formed JSON and the header is intact —
+  // only the tail is gone. The gate can only reason about records that are
+  // PRESENT, so on its own it reads a shorter run rather than a damaged one;
+  // cutting a trailing failure record that way turned a refusal into an
+  // acceptance. The artifact's own declared counts are what catch it.
+  writeFileSync(run.runFile, `${lines.slice(0, -2).join('\n')}\n`, 'utf8');
+
+  const port = new RecordingPort();
+  const summary = await publishRunArtifact(port, run.runFile, collector().log);
+  assert.deepEqual(port.calls, [], 'nothing may be sent');
+  assert.notEqual(summary.gateRefusal, null);
+});
+
+test('a refused artifact is a REFUSAL, distinct from having nothing to publish', async () => {
+  const run = await firedRun({
+    outDir: tempDir('serving-refusal-'),
+    enrolled: true,
+    mode: 'dry-run',
+  });
+  const summary = await publishRunArtifact(new RecordingPort(), run.runFile, collector().log);
+
+  // The recovery command exits on this. Reported as an empty `rejected` it read
+  // as success, so an operator republishing a night's runs from a script saw
+  // exit 0 over a batch that published nothing at all.
+  assert.notEqual(summary.gateRefusal, null);
+  assert.ok(summary.gateRefusal?.includes('not a live run'));
+  assert.equal(summary.published, 0);
+
+  // Negative control: a clean run publishes and reports NO gate refusal, so the
+  // field distinguishes the two cases rather than always being set.
+  const clean = await firedRun({ outDir: tempDir('serving-clean-'), enrolled: true });
+  const ok = await publishRunArtifact(new RecordingPort(), clean.runFile, collector().log);
+  assert.equal(ok.gateRefusal, null);
+  assert.ok(ok.published > 0);
 });

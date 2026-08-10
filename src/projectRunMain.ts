@@ -59,7 +59,7 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  let refused = 0;
+  let failed = 0;
   try {
     for (const file of files) {
       printLine(`— ${file}`);
@@ -67,17 +67,29 @@ async function main(): Promise<number> {
         line: printLine,
         error: printError,
       });
-      refused += Object.values(summary.rejected).reduce((total, count) => total + count, 0);
+      // Two ways this command fails, and BOTH have to reach the exit code.
+      //
+      // A row the projection refused is the obvious one. The other is a file
+      // the gate turned away — a dry run, a failed identity check, an artifact
+      // that does not pass its own integrity check. That path writes nothing
+      // and previously reported nothing, so an operator recovering a night's
+      // runs from a script saw `exit 0` over a batch that published not one
+      // row. Silence on the second is worse than on the first, because a
+      // refusal at least printed a SQLSTATE.
+      failed += Object.values(summary.rejected).reduce((total, count) => total + count, 0);
+      if (summary.gateRefusal !== null) {
+        printError(`${file}: nothing was published — ${summary.gateRefusal}`);
+        failed += 1;
+      }
     }
   } finally {
     await serving.close();
   }
 
-  // Unlike a benchmark run, this command exists only to publish — so a refusal
-  // IS its failure, and an operator running it from a script needs to see that
-  // in the exit code. Nothing else in the repo treats a projection problem this
-  // way, and nothing else should.
-  return refused > 0 ? 1 : 0;
+  // Unlike a benchmark run, this command exists only to publish — so failing to
+  // publish IS its failure. Nothing else in the repo treats a projection
+  // problem this way, and nothing else should.
+  return failed > 0 ? 1 : 0;
 }
 
 main()

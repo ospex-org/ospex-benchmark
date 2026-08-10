@@ -2,6 +2,8 @@ import { PROJECTION_SCALES, quantizeForProjection } from './projectionNumeric.js
 import { armIdFor, projectionParticipant } from './servingIdentity.js';
 import { baselineDigest, decisionDigest, forecastDigest, suppliedMarkets } from './schema.js';
 import { sha256Hex } from './canonical.js';
+import { describeError } from './config.js';
+import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
 import type { AxisName, AxesScores, GameBundle, MarketKey } from './types.js';
 import type { ProjectionParticipant } from './servingIdentity.js';
 import type { RevealedFingerprint } from './schema.js';
@@ -77,6 +79,70 @@ export function parseRunArtifact(text: string): readonly JsonRecord[] {
     records.push(parsed as JsonRecord);
   }
   return records;
+}
+
+/**
+ * Put the artifact through the SCORER's own reader before publishing any of it.
+ *
+ * The projector below has its own reader, and it has to: the canonical one
+ * drops the provider telemetry a projection needs. But a second reader is a
+ * second opinion about what a valid artifact is, and the weaker of the two
+ * decides what gets published. Measured, on files this module used to accept:
+ *
+ *   two run_meta records — the canonical reader refuses the file outright as
+ *   ambiguous, while this module took the first and published every decision in
+ *   the file under that run's identity, including decisions belonging to the
+ *   other one;
+ *
+ *   a truncated file — cutting a trailing `run_failure` record turned a run the
+ *   gate REFUSES into one it accepts, because the gate can only see the records
+ *   that are present. The canonical verifier cross-checks the counts run_meta
+ *   declares against the records that follow it, so a file missing anything is
+ *   caught by the artifact disagreeing with itself.
+ *
+ * So integrity is answered once, by the reader that already owns the question,
+ * and this module's reader only ever runs on a file that reader accepted.
+ */
+export function verifyArtifactIntegrity(text: string): string | null {
+  let run: ReturnType<typeof parseRunRecords>;
+  try {
+    run = parseRunRecords(text.split(/\r?\n/));
+  } catch (error) {
+    return `the artifact is not a well-formed run file (${describeError(error)})`;
+  }
+
+  // ONE check is deliberately scoped out: conformance to the CURRENT frozen arm
+  // roster. Left at its default the verifier compares the run against whichever
+  // arms this build ships, which is right at scoring time and wrong here — the
+  // day a fifth arm is enrolled, every artifact written before it becomes
+  // unpublishable, and republishing an artifact is the only way to recover a
+  // write this fail-soft publisher lost. Recovery must not expire because the
+  // roster grew.
+  //
+  // So the expected roster is taken from the artifact, which makes that one
+  // comparison vacuous and leaves every other check live: the declared counts
+  // against the records present, the archived bodies against their bundles, the
+  // watch entry-timing claim, the hashes. Who is ALLOWED to be published is a
+  // separate question with a separate answer — the frozen registry, which skips
+  // any participant it does not know rather than inventing a name for it.
+  const declared = new Map(
+    run.armResponses.map((response) => [
+      response.participantId,
+      {
+        participantId: response.participantId,
+        provider: response.provider,
+        requestedModelId: response.requestedModelId,
+        approvedReportedModelIds:
+          response.reportedModelId === null ? [] : [response.reportedModelId],
+      },
+    ]),
+  );
+
+  const violations = verifyRunIntegrity(run, { expectedArms: [...declared.values()] });
+  if (violations.length > 0) {
+    return `the artifact fails its own integrity check: ${violations.join('; ')}`;
+  }
+  return null;
 }
 
 const str = (record: JsonRecord, key: string): string | null =>
