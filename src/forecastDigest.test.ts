@@ -1,0 +1,245 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { canonicalize, sha256Hex } from './canonical.js';
+import { forecastDigest, forecastFingerprint } from './schema.js';
+import type { ForecastOutput } from './types.js';
+
+/**
+ * `forecast_digest`, the pregame commitment the serving projection stores.
+ *
+ * This is a CONTRACT, not an implementation detail. The digest is written at
+ * seal time and a later reveal is checked against it, so a digest computed any
+ * other way still produces 64 hex characters, still satisfies the column's
+ * CHECK, still stores without complaint — and is silently unverifiable against
+ * every reveal that follows. There is no runtime signal for getting it wrong.
+ *
+ * Hence the golden values below. They are not a restatement of the
+ * implementation: asserting `forecastDigest(f) === sha256Hex(canonicalize(
+ * forecastFingerprint(f)))` would pass no matter what any of those three
+ * functions did. A frozen literal is the only assertion that notices when
+ * `canonicalize` changes its serialisation, or when a thirteenth field joins
+ * `forecastFingerprint`.
+ *
+ * IF ONE OF THESE GOES RED, the definition of the commitment has changed and
+ * every digest already stored is now unverifiable. That is a decision to make
+ * deliberately — with a plan for the rows already written — not a number to
+ * update until the test passes.
+ */
+
+/**
+ * A v2 body: the analysis fields present. Synthetic; from no model.
+ *
+ * Every float carries four decimals ON PURPOSE. With round values like 0.61 and
+ * 2.05, a mutation that rounds a probability before hashing is a no-op on the
+ * fixture and survives the golden — measured, it did. Precision here makes the
+ * golden itself discriminate.
+ */
+const V2: ForecastOutput = {
+  market: 'spread',
+  selection: 'St. Louis Cardinals',
+  line: -1.5,
+  observedDecimal: 2.0537,
+  probabilities: { win: 0.5231, push: 0.0104, loss: 0.4665 },
+  confidence: 0.6137,
+  wouldAbstain: false,
+  selectedForExecution: true,
+  rationale: 'synthetic rationale, not from any model',
+  evidenceRefs: ['ref-1', 'ref-2'],
+  reasonCode: null,
+  axes: { valuation: 4, trend: 3, consensus: 2, news: 1, softness: 5 },
+  primaryAxis: 'valuation',
+  primaryExpectation: 'synthetic expectation.',
+};
+
+/** The same decision on a v1 body: the three analysis keys absent, not null. */
+const V1: ForecastOutput = {
+  market: 'spread',
+  selection: 'St. Louis Cardinals',
+  line: -1.5,
+  observedDecimal: 2.0537,
+  probabilities: { win: 0.5231, push: 0.0104, loss: 0.4665 },
+  confidence: 0.6137,
+  wouldAbstain: false,
+  selectedForExecution: true,
+  rationale: 'synthetic rationale, not from any model',
+  evidenceRefs: ['ref-1', 'ref-2'],
+  reasonCode: null,
+};
+
+const V2_DIGEST = '4945761adc3f2829b1b51fb6b6515a77d7f88d887d08df2e7c4779755e6b5348';
+const V1_DIGEST = 'ff97a0f00a489a328d7637ee144df8ef3904c2a00bed2587ee51714187263878';
+
+/** The column's CHECK, copied from the projection schema. */
+const DIGEST_CHECK = /^[0-9a-f]{64}$/;
+
+function withForecast(patch: Partial<ForecastOutput>): ForecastOutput {
+  return { ...V2, ...patch };
+}
+
+// ─── the commitment itself ───────────────────────────────────────────────────
+
+test('GOLDEN: the digest of a fixed forecast is a frozen value', () => {
+  assert.equal(forecastDigest(V2), V2_DIGEST);
+  assert.equal(forecastDigest(V1), V1_DIGEST);
+});
+
+test('GOLDEN: the bytes that are hashed are the twelve fingerprint fields, sorted', () => {
+  // Pinned one level below the digest, so a red golden above says WHICH part
+  // moved: the serialisation, or the field set.
+  assert.equal(
+    canonicalize(forecastFingerprint(V2)),
+    '{"axes":{"consensus":2,"news":1,"softness":5,"trend":3,"valuation":4},' +
+      '"confidence":0.6137,"line":-1.5,"loss":0.4665,"observedDecimal":2.0537,' +
+      '"primaryAxis":"valuation","primaryExpectation":"synthetic expectation.",' +
+      '"push":0.0104,"selectedForExecution":true,"selection":"St. Louis Cardinals",' +
+      '"win":0.5231,"wouldAbstain":false}'
+  );
+  // Exactly twelve, so a thirteenth cannot arrive unnoticed.
+  assert.equal(Object.keys(forecastFingerprint(V2)).length, 12);
+  // …and a v1 body carries the analysis keys as null rather than dropping them.
+  // `canonicalize` omits `undefined` members, so the difference between "absent"
+  // and "null" is a different digest — `forecastFingerprint` normalises it.
+  const v1Keys = Object.keys(forecastFingerprint(V1)).sort();
+  assert.deepEqual(v1Keys, Object.keys(forecastFingerprint(V2)).sort());
+  assert.equal(canonicalize(forecastFingerprint(V1)).includes('"axes":null'), true);
+});
+
+test('the digest satisfies the column CHECK', () => {
+  for (const forecast of [V1, V2]) {
+    const digest = forecastDigest(forecast);
+    assert.match(digest, DIGEST_CHECK);
+    assert.equal(digest, digest.toLowerCase());
+    assert.equal(digest.length, 64);
+  }
+});
+
+// ─── it must MOVE when the decision moves ────────────────────────────────────
+
+test('every decision-bearing field changes the digest', () => {
+  // The property that makes the commitment worth anything. A digest that does
+  // not move when the decision moves would let a different forecast be revealed
+  // against a stored seal.
+  const perturbations: Array<[string, ForecastOutput]> = [
+    ['selection', withForecast({ selection: 'Chicago Cubs' })],
+    ['line', withForecast({ line: -2.5 })],
+    ['line -> null', withForecast({ line: null })],
+    ['observedDecimal', withForecast({ observedDecimal: 2.0538 })],
+    ['win', withForecast({ probabilities: { win: 0.5232, push: 0.0104, loss: 0.4665 } })],
+    ['push', withForecast({ probabilities: { win: 0.5231, push: 0.0105, loss: 0.4665 } })],
+    ['loss', withForecast({ probabilities: { win: 0.5231, push: 0.0104, loss: 0.4666 } })],
+    ['confidence', withForecast({ confidence: 0.6138 })],
+    ['wouldAbstain', withForecast({ wouldAbstain: true })],
+    ['selectedForExecution', withForecast({ selectedForExecution: false })],
+    ['primaryAxis', withForecast({ primaryAxis: 'trend' })],
+    ['primaryExpectation', withForecast({ primaryExpectation: 'a different expectation.' })],
+  ];
+  // Each of the five axis scores is decision-bearing on its own.
+  for (const axis of ['valuation', 'trend', 'consensus', 'news', 'softness'] as const) {
+    const axes = { ...V2.axes! , [axis]: V2.axes![axis] === 5 ? 1 : 5 };
+    perturbations.push([`axes.${axis}`, withForecast({ axes })]);
+  }
+
+  const seen = new Map<string, string>([[V2_DIGEST, 'the unperturbed forecast']]);
+  for (const [label, forecast] of perturbations) {
+    const digest = forecastDigest(forecast);
+    assert.notEqual(digest, V2_DIGEST, `${label}: changed the decision but not the digest`);
+    const clash = seen.get(digest);
+    assert.equal(clash, undefined, `${label}: collides with ${clash}`);
+    seen.set(digest, label);
+  }
+  // 12 named + 5 axis scores, and the axes object as a whole via v1 vs v2.
+  assert.equal(perturbations.length, 17);
+  assert.notEqual(forecastDigest(V1), forecastDigest(V2), 'a v1 and a v2 body must not share a digest');
+});
+
+// ─── and must NOT move for anything else ─────────────────────────────────────
+
+test('fields outside the fingerprint do not change the digest', () => {
+  // The paired negative control. These are excluded on purpose: a format-only
+  // repair may rewrite them, and they stay bound through the retained body and
+  // responseSha256. If they entered the digest, a legal repair would break the
+  // seal.
+  for (const [label, forecast] of [
+    ['rationale', withForecast({ rationale: 'an entirely different rationale' })],
+    ['evidenceRefs', withForecast({ evidenceRefs: ['ref-9'] })],
+    ['reasonCode', withForecast({ reasonCode: 'missing_information' })],
+    // `market` is part of the decision KEY (run, game, market), not the digest.
+    ['market', withForecast({ market: 'total' })],
+  ] as Array<[string, ForecastOutput]>) {
+    assert.equal(forecastDigest(forecast), V2_DIGEST, `${label}: must not affect the digest`);
+  }
+});
+
+test('the committed value is the exact float, not a rounded approximation', () => {
+  // Rounding "to tidy up" before hashing is a plausible edit that still yields a
+  // valid digest, and it silently decouples the commitment from the exact values
+  // in the retained body — so the reveal can never reproduce it. Named here
+  // because a mutant that rounded confidence survived the golden until the
+  // fixture stopped using values that were already round.
+  for (const [label, rounded] of [
+    ['confidence', withForecast({ confidence: 0.61 })],
+    ['observedDecimal', withForecast({ observedDecimal: 2.05 })],
+    ['probabilities', withForecast({ probabilities: { win: 0.52, push: 0.01, loss: 0.47 } })],
+  ] as Array<[string, ForecastOutput]>) {
+    assert.notEqual(forecastDigest(rounded), V2_DIGEST, `${label}: rounding did not change the digest`);
+  }
+});
+
+test('the digest is stable across key order and object identity', () => {
+  // Same logical forecast, built in a different order and from fresh objects.
+  const reordered: ForecastOutput = {
+    primaryExpectation: 'synthetic expectation.',
+    primaryAxis: 'valuation',
+    axes: { softness: 5, news: 1, consensus: 2, trend: 3, valuation: 4 },
+    reasonCode: null,
+    evidenceRefs: ['ref-1', 'ref-2'],
+    rationale: 'synthetic rationale, not from any model',
+    selectedForExecution: true,
+    wouldAbstain: false,
+    confidence: 0.6137,
+    probabilities: { loss: 0.4665, push: 0.0104, win: 0.5231 },
+    observedDecimal: 2.0537,
+    line: -1.5,
+    selection: 'St. Louis Cardinals',
+    market: 'spread',
+  };
+  assert.equal(forecastDigest(reordered), V2_DIGEST);
+  assert.equal(forecastDigest(structuredClone(V2)), V2_DIGEST);
+  // Repeated calls do not drift.
+  assert.equal(forecastDigest(V2), forecastDigest(V2));
+});
+
+// ─── the lookalike that would be wrong ───────────────────────────────────────
+
+test('it is NOT the fire artifact fingerprint shape, which hashes differently', () => {
+  // fireArtifact.ts `decisionFingerprint()` carries the same facts in a
+  // different shape: probabilities nested, gameId/market added, and the three
+  // analysis keys DROPPED on a v1 body rather than carried as null. Hashing
+  // that instead would store fine and pass the CHECK, and every reveal checked
+  // against it would fail for a reason nobody would look for here.
+  const fp = forecastFingerprint(V2);
+  const artifactShape = {
+    gameId: 'g1',
+    market: 'spread',
+    selection: fp.selection,
+    line: fp.line,
+    observedDecimal: fp.observedDecimal,
+    probabilities: { win: fp.win, push: fp.push, loss: fp.loss },
+    confidence: fp.confidence,
+    wouldAbstain: fp.wouldAbstain,
+    selectedForExecution: fp.selectedForExecution,
+    axes: fp.axes,
+    primaryAxis: fp.primaryAxis,
+    primaryExpectation: fp.primaryExpectation,
+  };
+  assert.notEqual(sha256Hex(canonicalize(artifactShape)), forecastDigest(V2));
+  // Nesting the probabilities is enough on its own to diverge.
+  const nestedOnly = {
+    ...fp,
+    win: undefined,
+    push: undefined,
+    loss: undefined,
+    probabilities: { win: fp.win, push: fp.push, loss: fp.loss },
+  };
+  assert.notEqual(sha256Hex(canonicalize(nestedOnly)), forecastDigest(V2));
+});

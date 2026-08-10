@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { canonicalize, sha256Hex } from './canonical.js';
 import { AXIS_NAMES } from './types.js';
 import type {
   ArmSpec,
@@ -573,6 +574,33 @@ export function forecastFingerprint(forecast: ForecastOutput): ForecastFingerpri
     primaryAxis: forecast.primaryAxis ?? null,
     primaryExpectation: forecast.primaryExpectation ?? null,
   };
+}
+
+/**
+ * The pregame commitment stored as `benchmark_decisions.forecast_digest`.
+ *
+ * EXACTLY `sha256Hex(canonicalize(forecastFingerprint(f)))`, over the twelve
+ * decision-bearing fields above and nothing else. The serving projection writes
+ * this at seal time — before the game starts — and a later reveal is checked
+ * against it, so the composition is a CONTRACT rather than an implementation
+ * detail. Any other composition still produces 64 hex characters, still passes
+ * the column's CHECK, still stores without complaint, and is silently
+ * unverifiable against every reveal that follows. That is why it lives here,
+ * beside the fingerprint it commits to, and why a golden value pins it.
+ *
+ * ⚠ It is NOT `decisionFingerprint()` from fireArtifact.ts, which carries the
+ *   same facts in a different SHAPE and therefore hashes differently: that one
+ *   nests win/push/loss under `probabilities`, adds `gameId`/`market`, and DROPS
+ *   the three analysis keys on a v1 body instead of carrying them as null.
+ *   Hashing that shape by mistake is the failure this note exists to prevent;
+ *   `forecastDigest.test.ts` pins the two apart.
+ *
+ * Deliberately does not cover rationale, evidence refs or reason codes: a
+ * format-only repair may rewrite those, and they stay bound through the
+ * retained body and `responseSha256`.
+ */
+export function forecastDigest(forecast: ForecastOutput): string {
+  return sha256Hex(canonicalize(forecastFingerprint(forecast)));
 }
 
 /** Exact equality of two axis-score sets; both absent is equal, one absent is not. */

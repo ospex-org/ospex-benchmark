@@ -346,14 +346,15 @@ export interface ArmAttempt {
  * satisfy it and the row would then read as a baseline whose telemetry never
  * existed. That pairing is refused client-side.
  *
- * ⚠ `forecastDigest` is supplied, not derived. The schema documents it as the
- *   SHA-256 of this repo's `forecastFingerprint()` over its twelve
- *   decision-bearing fields — i.e. `sha256Hex(canonicalize(forecastFingerprint(f)))`
- *   using the helpers in `canonical.ts`. Nothing composes that today, so whoever
- *   wires a producer must, and must use exactly that composition: a digest
- *   computed any other way still passes the hex check here and still stores, but
- *   it cannot be recomputed from the later reveal, which is the column's only
- *   purpose.
+ * ⚠ `forecastDigest` is supplied, not derived — this port takes the value and
+ *   checks only its shape. Compute it with `forecastDigest()` from `schema.ts`,
+ *   which is the documented composition
+ *   (`sha256Hex(canonicalize(forecastFingerprint(f)))`) and the only one that can
+ *   be recomputed from the later reveal. A digest arrived at any other way still
+ *   passes the hex check here and still stores; it is simply unverifiable
+ *   forever after, with no runtime signal that anything is wrong. Note in
+ *   particular that `decisionFingerprint()` in `fireArtifact.ts` carries the same
+ *   facts in a different SHAPE and hashes differently.
  */
 export interface DecisionSeal {
   readonly run: RunFacts;
