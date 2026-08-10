@@ -11,7 +11,7 @@ import { ARMS } from './providers/index.js';
 import { PROJECTION_PARTICIPANTS, projectionParticipant } from './servingIdentity.js';
 import { asEnrolled, firedRun, fullBoardInputs, TEST_SLATE_DATE } from './servingTestRun.js';
 import { projectRun, publishableRun, revealMatchesSeal } from './servingProjection.js';
-import type { FiredRun } from './servingTestRun.js';
+import type { FiredRun, FireOptions } from './servingTestRun.js';
 import type { JsonRecord, ProjectionPlan } from './servingProjection.js';
 
 /**
@@ -39,12 +39,8 @@ after(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
 });
 
-const NOW_MS = Date.parse('2026-07-20T12:00:30.000Z');
-
 /** One real fired game, written to a temp dir this file cleans up. */
-async function fire(
-  options: { enrolled?: boolean; mode?: 'live' | 'dry-run' } = {},
-): Promise<FiredRun> {
+async function fire(options: Omit<FireOptions, 'outDir'> = {}): Promise<FiredRun> {
   return firedRun({ outDir: tempDir('serving-projection-'), ...options });
 }
 
@@ -212,6 +208,76 @@ test('an arm that made one call publishes exactly ordinal 0, marked sent', async
   assert.ok(typeof attempt.facts.responseAt === 'string', 'a received response has a receipt');
 });
 
+test('an arm that never sent publishes the denominator row, and claims no response', async () => {
+  // The whole reason a failed call gets a row: without it every rate is
+  // computed over successes alone. And the row has to be honest about what did
+  // not happen — the attempt's settle instant is stamped on timeouts and
+  // transport failures too, so publishing it raw would have every failure
+  // claiming a response it never received.
+  const plan = planOf((await fire({ enrolled: true, behaviour: 'unsent' })).records);
+
+  assert.equal(plan.attempts.length, 1, 'the failed arm must still occupy its opportunity');
+  const facts = plan.attempts[0]!.facts;
+  assert.equal(facts.sent, false);
+  assert.equal(facts.outcome, 'credential_missing');
+  assert.equal(facts.requestAt, null);
+  assert.equal(facts.responseAt, null);
+  assert.equal(facts.httpStatus, null);
+  assert.equal(facts.reportedModelId, null);
+  // …while the markets it never got to forecast are still its denominator.
+  assert.deepEqual([...facts.suppliedMarkets], ['moneyline', 'spread', 'total']);
+  // Negative control: no decisions, because nothing came back to seal.
+  assert.equal(plan.decisions.filter((d) => d.seal.participant.kind === 'model').length, 0);
+});
+
+test('an attempt that was sent and got nothing back claims no receipt', async () => {
+  // The discriminating case, and the only one: the runner stamps the attempt's
+  // settle instant on a transport failure as well as on a real response, so
+  // publishing that field raw would have every timeout and every dropped
+  // connection claiming a reply it never received. An arm that never SENT
+  // cannot show this — its response fields are already null, so the guard and
+  // its absence agree.
+  const plan = planOf((await fire({ enrolled: true, behaviour: 'transport-failure' })).records);
+
+  assert.equal(plan.attempts.length, 1);
+  const facts = plan.attempts[0]!.facts;
+  assert.equal(facts.sent, true, 'the request did go out');
+  assert.ok(facts.requestAt !== null);
+  assert.notEqual(facts.outcome, 'valid');
+  // What the runner recorded, and what the projection publishes, differ here —
+  // deliberately.
+  const leg = plan.attempts[0]!;
+  assert.equal(facts.httpStatus, null, 'nothing came back');
+  assert.equal(facts.responseAt, null, 'so there is no receipt to publish');
+  assert.ok(facts.latencyMs !== null, 'the attempt still took time, and that is measured');
+  void leg;
+
+  // Negative control: the successful run publishes a receipt, so the rule is
+  // "withhold when nothing arrived" rather than "never publish".
+  const ok = planOf((await fire({ enrolled: true })).records);
+  assert.ok(ok.attempts[0]!.facts.responseAt !== null);
+});
+
+test('a repaired arm publishes both calls, and the seal cites the one that was accepted', async () => {
+  const plan = planOf((await fire({ enrolled: true, behaviour: 'repaired' })).records);
+
+  const ordinals = plan.attempts.map((a) => a.facts.attemptOrdinal).sort();
+  assert.deepEqual(ordinals, [0, 1], 'the initial call and its repair are separate rows');
+
+  // Response-level facts are repeated on the repair row by design, so either
+  // row alone describes the opportunity — and pinning a denominator to ordinal
+  // 0 stays correct for an arm that was repaired to valid.
+  const initial = plan.attempts.find((a) => a.facts.attemptOrdinal === 0);
+  const repair = plan.attempts.find((a) => a.facts.attemptOrdinal === 1);
+  assert.ok(initial && repair);
+  assert.equal(initial.facts.outcome, repair.facts.outcome);
+  assert.deepEqual([...initial.facts.suppliedMarkets], [...repair.facts.suppliedMarkets]);
+
+  const models = plan.decisions.filter((d) => d.seal.participant.kind === 'model');
+  assert.ok(models.length > 0, 'the repair must have produced forecasts');
+  for (const { seal } of models) assert.equal(seal.attemptOrdinal, 1, 'the seal cites the repair');
+});
+
 test('the participant is the durable lab and the version lives on the roster', async () => {
   const run = await fire();
   const enrolled = ARMS[1]!.participantId; // anthropic-claude-fable-5
@@ -235,7 +301,22 @@ test('the participant is the durable lab and the version lives on the roster', a
 
 test("a model's published digest is exactly forecastDigest() of the forecast it came from", async () => {
   const run = await fire();
-  const rewritten = asEnrolled(run.records);
+  // Over-scale on purpose. The response schema bounds these fields by range and
+  // never by precision — a model that computes one chance in three returns
+  // sixteen decimals — while the reveal columns hold four, six and eight. A
+  // fixture already within scale cannot tell a build that quantises before
+  // hashing from one that does not, and the difference is a commitment no
+  // reader can ever check.
+  const rewritten = asEnrolled(run.records).map((record) =>
+    record['recordType'] === 'decision'
+      ? {
+          ...record,
+          observedDecimal: 2.0537145,
+          confidence: 0.613712355,
+          probabilities: { win: 0.523123465, push: 0, loss: 0.476876535 },
+        }
+      : record,
+  );
   const plan = planOf(rewritten);
 
   const models = plan.decisions.filter((d) => d.seal.participant.kind === 'model');

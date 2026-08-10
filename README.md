@@ -165,7 +165,7 @@ Output: `<runId>-scored.ndjson` (per-pick `scored_decision` records with full pr
 
 Requires only `SUPABASE_URL` + `SUPABASE_ANON_KEY` (the same public read-only anon key).
 
-## Serving projection (optional, not wired to a run)
+## Serving projection
 
 Benchmark output reaches the public today only after settlement, through a
 reviewed evidence PR. The serving projection exists to make a sealed forecast
@@ -191,8 +191,42 @@ That ordering is part of the contract. A refused or non-final call produces an
 attempt row and no decisions, and that row is the opportunity denominator — a
 failed arm has to be representable or coverage is computed over successes only.
 
-**Nothing calls it yet.** Which producer feeds the projection is a separate
-decision, so today it ships as a library with tests and no run-path effect.
+### What feeds it
+
+`yarn watch` and `yarn smoke`. A fire writes its NDJSON, then reads that file
+back and publishes what it says — so **the projection is a view of the artifact
+rather than a second thing the runner emits.** Every value the projection
+freezes is a pure function of bytes already on disk, which is what makes
+recovery possible: the publisher cannot fail a run, so a write lost to a network
+blip is lost quietly, and republishing the same file is the only way back.
+
+```bash
+# publish a run that is already on disk — recovery, and runs that predate the
+# wiring. Idempotent: rows already present report as duplicates and nothing is
+# changed, so re-running it, or running it over a whole directory, is safe.
+yarn project out/watch-v0-2026-08-11-a1b2c3.ndjson
+```
+
+Each fire writes, per game: one run row, a participant and roster row per
+participant, one attempt row per provider call (**including calls that failed** —
+that row is the opportunity denominator), and a seal + reveal for every forecast.
+Model rationales are written too; they are withheld from every read role, and
+the digest sealed beside them is what lets one be published later and still be
+provably the original.
+
+**A run is refused, with a reason, when the artifact says** it was a dry run
+(mock adapters return fabricated forecasts under the real model ids), that it
+used a synthetic clock, that it recorded an identity or provider-collision
+failure (such a run is permanently unscoreable, so its seals could never be
+revealed), that its cohort is outside the `watch-v0-` / `smoke-v0-` namespace, or
+that it predates the projection stamp. A participant that is not in the frozen
+registry is skipped rather than given a name minted at write time — these rows
+are insert-once and there is no `UPDATE`.
+
+**Not published from here:** scores and the per-cohort coverage summary. Both
+belong to the scorer, which runs later from a different artifact once the
+closing lines land. The campaign path is also out — its fires are per-market,
+which does not fit the projection's per-call grain.
 
 ```bash
 # unit tests run with the rest of the suite; they open no connection
@@ -204,9 +238,11 @@ yarn test
 yarn store:serving
 ```
 
-Configuration is entirely optional: with no credential the publisher is disabled
-and every write returns `disabled` without touching the network. See the
-`BENCHMARK_*` entries in `.env.example`.
+Configuration is entirely optional, and unconfigured is the shipped default
+rather than a staging mode: with no credential the publisher is disabled and
+every write returns `disabled` without touching the network. Turning it on is
+setting `BENCHMARK_DB_URL` (or `BENCHMARK_WRITER`) — there is no second code
+path and no call site to change. See the `BENCHMARK_*` entries in `.env.example`.
 
 TLS is requested explicitly, because a PostgreSQL connection with no `ssl` option
 negotiates none. Supplying `BENCHMARK_DB_CA` turns on chain verification;

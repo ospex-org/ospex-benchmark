@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
 import {
+  baselineDigest,
+  decisionDigest,
   forecastDigest,
   forecastFingerprint,
   projectionFingerprint,
@@ -600,4 +602,83 @@ test('a difference below the projection scale does NOT change the digest', () =>
     }),
     OVERSCALE_PUSH_DIGEST
   );
+});
+
+// ---------------------------------------------------------------------------
+// The control's commitment
+// ---------------------------------------------------------------------------
+//
+// A deterministic baseline states a side, the line it took and the price that
+// side was quoted, and nothing else. `baselineDigest` commits to the other nine
+// fields AS THE NULLS a reveal row will carry, so one reader routine recomputes
+// either kind of participant from a stored reveal without dispatching on kind —
+// which is exactly what the column's documented composition asks for.
+//
+// The fixture's two numerics both carry MORE decimals than the columns they
+// land in hold. That is the whole point of the values: a control's real line
+// (1.5, 8.5) and its real price (five decimals, from americanToDecimal) are both
+// already within scale, so a tidy fixture cannot tell a missing quantiser from a
+// present one. These can.
+
+const BASELINE_PICK = { selection: 'over', line: 1.52345, observedDecimal: 2.0537145 };
+const BASELINE_DIGEST = 'c2beb0c8b144b0eed66669bb2dbb490778d90a87de723d23eb451a0b69ca05f6';
+
+test('GOLDEN: a control commits to its three fields and to the nine it does not have', () => {
+  assert.equal(baselineDigest(BASELINE_PICK), BASELINE_DIGEST);
+
+  // The preimage, spelled out, so a verifier holding only a reveal row can
+  // reproduce it. Twelve keys, nine of them null, canonicalized and hashed.
+  assert.equal(
+    canonicalize({
+      selection: 'over',
+      line: 1.5234,
+      observedDecimal: 2.053714,
+      win: null,
+      push: null,
+      loss: null,
+      confidence: null,
+      wouldAbstain: null,
+      selectedForExecution: null,
+      axes: null,
+      primaryAxis: null,
+      primaryExpectation: null,
+    }),
+    '{"axes":null,"confidence":null,"line":1.5234,"loss":null,' +
+      '"observedDecimal":2.053714,"primaryAxis":null,"primaryExpectation":null,' +
+      '"push":null,"selectedForExecution":null,"selection":"over","win":null,' +
+      '"wouldAbstain":null}'
+  );
+});
+
+test('and that check has teeth: each quantiser moves the digest on its own', () => {
+  const nulls = {
+    win: null, push: null, loss: null, confidence: null,
+    wouldAbstain: null, selectedForExecution: null,
+    axes: null, primaryAxis: null, primaryExpectation: null,
+  } as const;
+
+  // Neither numeric may be hashed raw: the reveal column would round it and the
+  // commitment would then be unverifiable against what was published.
+  assert.notEqual(decisionDigest({ ...BASELINE_PICK, ...nulls }), BASELINE_DIGEST);
+  // …and each one alone is enough to change the answer, so a build that dropped
+  // only one of the two cannot pass.
+  assert.notEqual(
+    decisionDigest({ ...BASELINE_PICK, line: 1.5234, ...nulls }),
+    BASELINE_DIGEST
+  );
+  assert.notEqual(
+    decisionDigest({ ...BASELINE_PICK, observedDecimal: 2.053714, ...nulls }),
+    BASELINE_DIGEST
+  );
+
+  // A null line is a moneyline control, and it is a different commitment from
+  // any priced line rather than an absent field the hash skips.
+  assert.notEqual(
+    baselineDigest({ selection: 'over', line: null, observedDecimal: 2.0537145 }),
+    BASELINE_DIGEST
+  );
+
+  // The two spaces cannot collide: a model's win/push/loss are always numbers,
+  // so no model forecast ever hashes to a control's preimage.
+  assert.notEqual(baselineDigest(BASELINE_PICK), forecastDigest(V2));
 });

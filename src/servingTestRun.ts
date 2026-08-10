@@ -76,15 +76,56 @@ export function fullBoardInputs(): SlateInputs {
   };
 }
 
-function stubAdapter(build: BuildResult, cohortId: string): ProviderAdapter {
+/**
+ * How the stub arm behaves.
+ *
+ * `unsent` and `repaired` exist because a fixture where every call succeeds on
+ * the first try cannot discriminate several of the projector's rules from their
+ * absence: an attempt is only provably marked unsent when one never was, an
+ * instant is only provably withheld when nothing came back, and ordinal 1 only
+ * appears when a repair ran.
+ */
+export type StubBehaviour = 'ok' | 'unsent' | 'transport-failure' | 'repaired';
+
+function stubAdapter(
+  build: BuildResult,
+  cohortId: string,
+  behaviour: StubBehaviour,
+): ProviderAdapter {
+  const valid = (): string => JSON.stringify(makeValidResponse(build.requests[0]!, TEST_ARM, cohortId));
+  let call = 0;
   return {
     provider: TEST_ARM.provider,
     requestedModelId: TEST_ARM.requestedModelId,
     credentialEnvVar: TEST_ARM.credentialEnvVar,
-    hasCredential: () => true,
+    // No credential is the one refusal that happens before any clock is read,
+    // so the attempt it produces carries neither a request instant nor any
+    // response field — exactly the shape the projection's unsent rule describes.
+    hasCredential: () => behaviour !== 'unsent',
     chat(): Promise<ProviderResponse> {
+      call += 1;
+      // Sent, and nothing came back. The runner stamps the attempt's settle
+      // instant on this path too, so it is the ONLY input that discriminates a
+      // truthful receipt from the raw field — an arm that never sent has every
+      // response field null already and cannot tell the two apart.
+      if (behaviour === 'transport-failure') {
+        return Promise.reject(new Error('synthetic transport failure'));
+      }
+      // The repair is offered only when the initial body yields a complete
+      // decision fingerprint, so that the repair can be proved to preserve it —
+      // an unparseable or shape-invalid first body is refused outright and no
+      // repair is sent. This one is fully shape-valid and identical in every
+      // forecast; it fails on the envelope's cohort, which the fingerprint does
+      // not cover. The repair then returns the same forecasts correctly framed.
+      const rawText =
+        behaviour === 'repaired' && call === 1
+          ? JSON.stringify({
+              ...makeValidResponse(build.requests[0]!, TEST_ARM, cohortId),
+              cohortId: 'not-the-cohort-this-run-authenticated',
+            })
+          : valid();
       return Promise.resolve({
-        rawText: JSON.stringify(makeValidResponse(build.requests[0]!, TEST_ARM, cohortId)),
+        rawText,
         reportedModelId: 'stub-model-1',
         providerResponseId: 'stub-response',
         httpStatus: 200,
@@ -114,6 +155,7 @@ export interface FireOptions {
    */
   readonly enrolled?: boolean;
   readonly mode?: 'live' | 'dry-run';
+  readonly behaviour?: StubBehaviour;
 }
 
 export async function firedRun(options: FireOptions): Promise<FiredRun> {
@@ -128,7 +170,9 @@ export async function firedRun(options: FireOptions): Promise<FiredRun> {
   let clock = NOW_MS;
   const outcome = await fireEligibleGame(build, inputs, TEST_SLATE_DATE, provenance, {
     arms: [TEST_ARM],
-    adapters: new Map([[TEST_ARM.participantId, stubAdapter(build, TEST_COHORT_ID)]]),
+    adapters: new Map([
+      [TEST_ARM.participantId, stubAdapter(build, TEST_COHORT_ID, options.behaviour ?? 'ok')],
+    ]),
     approvedReportedModelIds: () => ['stub-model-1'],
     outDir: options.outDir,
     timeoutMs: 60_000,

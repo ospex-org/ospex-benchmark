@@ -18,6 +18,7 @@ import type {
   DecisionSeal,
   PublishOutcome,
   ScoringRun,
+  SourceRef,
 } from './servingStore.js';
 import { firedRun } from './servingTestRun.js';
 
@@ -46,35 +47,37 @@ after(() => {
 // A port that records what it was asked to do
 // ---------------------------------------------------------------------------
 
-type Call = { readonly kind: string; readonly key: string };
+/** The payload as well as the key: a case that re-derives what it expected
+ *  instead of reading what was SENT proves nothing about the sender. */
+type Call = { readonly kind: string; readonly key: string; readonly payload: { source: SourceRef } };
 
 class RecordingPort implements BenchmarkServingPort {
   readonly calls: Call[] = [];
   /** Outcome per call kind; anything unset resolves `published`. */
   constructor(private readonly outcomes: Partial<Record<string, PublishOutcome>> = {}) {}
 
-  private answer(kind: string, key: string): Promise<PublishOutcome> {
-    this.calls.push({ kind, key });
+  private answer(kind: string, key: string, payload: { source: SourceRef }): Promise<PublishOutcome> {
+    this.calls.push({ kind, key, payload });
     return Promise.resolve(this.outcomes[kind] ?? { outcome: 'published' });
   }
 
   publishAttempt(a: ArmAttempt): Promise<PublishOutcome> {
-    return this.answer('attempt', `${a.participant.participantId}/${a.gameId}`);
+    return this.answer('attempt', `${a.participant.participantId}/${a.gameId}`, a);
   }
   sealDecision(s: DecisionSeal): Promise<PublishOutcome> {
-    return this.answer('seal', `${s.participant.participantId}/${s.gameId}/${s.market}`);
+    return this.answer('seal', `${s.participant.participantId}/${s.gameId}/${s.market}`, s);
   }
   revealDecision(r: DecisionReveal): Promise<PublishOutcome> {
-    return this.answer('reveal', `${r.decision.participantId}/${r.decision.gameId}/${r.decision.market}`);
+    return this.answer('reveal', `${r.decision.participantId}/${r.decision.gameId}/${r.decision.market}`, r);
   }
   publishRationale(r: DecisionRationale): Promise<PublishOutcome> {
-    return this.answer('rationale', `${r.decision.participantId}/${r.decision.gameId}/${r.decision.market}`);
+    return this.answer('rationale', `${r.decision.participantId}/${r.decision.gameId}/${r.decision.market}`, r);
   }
   publishScore(s: DecisionScore): Promise<PublishOutcome> {
-    return this.answer('score', s.decision.participantId);
+    return this.answer('score', s.decision.participantId, s);
   }
   publishScoringRun(r: ScoringRun): Promise<PublishOutcome> {
-    return this.answer('scoringRun', r.cohortId);
+    return this.answer('scoringRun', r.cohortId, r);
   }
 }
 
@@ -296,25 +299,23 @@ test('the source is the artifact filename and the hash of the bytes on disk', as
 
     const port = new RecordingPort();
     await publishRunArtifact(port, run.runFile, collector().log);
+    assert.ok(port.calls.length > 0, 'the run must have published something');
 
-    const records = parseRunArtifact(onDisk);
-    const gate = publishableRun(records);
-    assert.ok(gate.publishable);
-    const plan = projectRun(records, gate.header, { sourcePath: null, sourceSha256: null }, {
-      now: () => 'x',
-    });
-    assert.ok(plan.attempts.length > 0);
-
-    // Re-derive what publishRunArtifact should have stamped, and check it
-    // against the file rather than against the array it was built from.
-    const expected = { sourcePath: basename(run.runFile), sourceSha256: sha256Hex(onDisk) };
-    const republished = projectRun(records, gate.header, expected, { now: () => 'x' });
-    assert.equal(republished.attempts[0]!.source.sourceSha256, sha256Hex(onDisk));
-    assert.match(republished.attempts[0]!.source.sourcePath!, /^[A-Za-z0-9._-]+\.ndjson$/);
-    // An absolute path here would be an operator's home directory, written
-    // into a database whose rows are destined for a public page.
-    assert.equal(republished.attempts[0]!.source.sourcePath!.includes('/'), false);
-    assert.equal(republished.attempts[0]!.source.sourcePath!.includes('\\'), false);
+    // Read what was SENT. An earlier version of this case re-derived the
+    // expected source and handed it to `projectRun` itself, which asserted only
+    // that the projector copies what it is given — a publisher stamping the
+    // absolute path passed it unchanged.
+    for (const call of port.calls) {
+      const { sourcePath, sourceSha256 } = call.payload.source;
+      assert.equal(sourceSha256, sha256Hex(onDisk), `${call.kind} hashed something other than the file`);
+      assert.equal(sourcePath, basename(run.runFile));
+      // An absolute path here is an operator's home directory, written into a
+      // database whose rows are destined for a public page, and redaction knows
+      // nothing about usernames.
+      assert.match(sourcePath!, /^[A-Za-z0-9._-]+\.ndjson$/);
+      assert.equal(sourcePath!.includes('/'), false);
+      assert.equal(sourcePath!.includes('\\'), false);
+    }
   } finally {
     if (previous === undefined) delete process.env['SUPABASE_ANON_KEY'];
     else process.env['SUPABASE_ANON_KEY'] = previous;
