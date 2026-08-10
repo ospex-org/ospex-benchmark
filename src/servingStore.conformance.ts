@@ -517,8 +517,8 @@ async function main(): Promise<void> {
   const roundTrips: Array<[string, () => { forecast: ForecastOutput; errors: readonly string[] },
                            Record<string, string>]> = [
     ['a SPREAD over-scale in line, price, win, loss and confidence', makeOverScaleAccepted, {
-      line: '1.5000', observed_decimal: '2.053713', prob_win: '0.52312346',
-      prob_push: '0.00000000', prob_loss: '0.47687654', confidence: '0.61371235',
+      line: '1.5234', observed_decimal: '2.053714', prob_win: '0.52312346',
+      prob_push: '0.00000000', prob_loss: '0.47687653', confidence: '0.61371235',
     }],
     ['a whole-number TOTAL carrying an over-scale PUSH', makeOverScalePushAccepted, {
       line: '8.0000', observed_decimal: '1.909090', prob_win: '0.48765432',
@@ -604,12 +604,19 @@ async function main(): Promise<void> {
       // a column nobody reads back is a column that can be written wrong.
       //
       // What this pins, measured by removing the port's quantiser one column at
-      // a time: prob_win, prob_push and confidence all redden, because the total
-      // fixture's values for those three sit where `toFixed` and PostgreSQL's own
-      // numeric rounding disagree. line, observed_decimal and prob_loss do not —
-      // their values round identically under both rules, and making them
-      // straddle too would cost either a whole-number line (impossible), a
-      // producible price, or the probabilities summing to 1.
+      // a time: ALL SIX redden. Every fixture value sits where `toFixed` and
+      // PostgreSQL's own numeric rounding disagree — the spread carries line,
+      // observed_decimal, win, loss and confidence; the total carries push,
+      // which only a whole-number line admits.
+      //
+      // An earlier version of this comment claimed three of them could not be
+      // pinned: a whole-number line has nothing to round, a boundary price could
+      // not stay one americanToDecimal emits, and the third probability was
+      // fixed by the other two summing to 1. The first two are true OF THE TOTAL
+      // FIXTURE and were quietly generalised to both; the third was simply
+      // wrong, since the validator's tolerance is 1e-6 and not zero. While that
+      // was believed, the line, observed_decimal and prob_loss quantisers could
+      // each be deleted with all 27 checks still passing.
       assert.deepEqual(
         {
           line: stored['line'], observed_decimal: stored['observed_decimal'],
@@ -620,6 +627,56 @@ async function main(): Promise<void> {
       );
     });
   }
+
+  await check('EVERY quantised column has a fixture PostgreSQL rounds differently', async () => {
+    // The round trips above only pin the port's quantiser for a column when the
+    // fixture value for it sits where `toFixed` and PostgreSQL's own numeric
+    // rounding DISAGREE. Where they agree, deleting that column's quantiser
+    // changes nothing and the check stays green — measured, three columns were
+    // in exactly that state.
+    //
+    // So the property is asserted here rather than left to whoever picked the
+    // numbers. Tidy a fixture value and this goes red naming the column, which
+    // is a far better failure than a quantiser quietly ceasing to be tested.
+    const columns = [
+      ['line', 'numeric(10,4)', 4],
+      ['observed_decimal', 'numeric(12,6)', 6],
+      ['prob_win', 'numeric(9,8)', 8],
+      ['prob_push', 'numeric(9,8)', 8],
+      ['prob_loss', 'numeric(9,8)', 8],
+      ['confidence', 'numeric(9,8)', 8],
+    ] as const;
+    const rawValues = (f: ForecastOutput): Record<string, number | null> => ({
+      line: f.line,
+      observed_decimal: f.observedDecimal,
+      prob_win: f.probabilities.win,
+      prob_push: f.probabilities.push,
+      prob_loss: f.probabilities.loss,
+      confidence: f.confidence,
+    });
+    const fixtures = [
+      ['spread', rawValues(makeOverScaleAccepted().forecast)],
+      ['total', rawValues(makeOverScalePushAccepted().forecast)],
+    ] as const;
+
+    const unpinned: string[] = [];
+    const pinnedBy: string[] = [];
+    for (const [column, type, scale] of columns) {
+      const discriminating: string[] = [];
+      for (const [fixture, values] of fixtures) {
+        const value = values[column];
+        if (value === null || value === undefined) continue;
+        const stored = (await query(`select ($1::${type})::text as v`, [String(value)]))[0]!['v'];
+        if (Number(stored) !== Number(value.toFixed(scale))) discriminating.push(fixture);
+      }
+      if (discriminating.length === 0) unpinned.push(column);
+      else pinnedBy.push(`${column}<-${discriminating.join('+')}`);
+    }
+    assert.deepEqual(unpinned, [],
+      `these columns' quantisers are not pinned by any fixture — their values round the ` +
+      `same way in JavaScript and in PostgreSQL, so removing the quantiser would change ` +
+      `nothing. Pinned: ${pinnedBy.join(', ')}`);
+  });
 
   await check('EVERY reveal and score column round-trips to its own column', async () => {
     const cohortId = cohortName('roundtrip-reveal');

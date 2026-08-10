@@ -18,10 +18,10 @@
  * `forecastDigest.test.ts` builds one through the real factories and asserts it
  * validates cleanly before using it — and these are the values it stores:
  *
- *   line             1.50004      -> 1.5000       numeric(10,4)
- *   observedDecimal  2.0537127    -> 2.053713     numeric(12,6)
- *   probability      0.523123456  -> 0.52312346   numeric(9,8)
- *   confidence       0.613712345  -> 0.61371235   numeric(9,8)
+ *   line             1.52345      -> 1.5234       numeric(10,4)
+ *   observedDecimal  2.0537145    -> 2.053714     numeric(12,6)
+ *   probability      0.523123465  -> 0.52312346   numeric(9,8)
+ *   confidence       0.613712355  -> 0.61371235   numeric(9,8)
  *
  * The digest sealed before the game and the digest recomputed from the revealed
  * row did not match, and nothing anywhere reported a problem.

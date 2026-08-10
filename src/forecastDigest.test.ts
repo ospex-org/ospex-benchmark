@@ -197,7 +197,7 @@ const MONEYLINE: ForecastOutput = {
 
 const V2_DIGEST = 'cd280a6bc15e7894cc036aef94ad70903545ea643468990e06b8a34c1c13ba5d';
 const V1_DIGEST = 'fd0c68896bcb5d4d991c63d286839ea26ab954f1719a9109bb76328ba8a098b2';
-const OVERSCALE_DIGEST = '57cc317eacd24a9c8fb9bf55936b255e73f69790b88675a99c608d750f50e21b';
+const OVERSCALE_DIGEST = '8b87f694ba4c0b3e25b4d9180ab883fc2519b40ddf9d3f03cbc537f71e3fa801';
 const OVERSCALE_PUSH_DIGEST = '009fc2cb19ccbde2e0f19431cf816bd1dabc3e51d25b00b11b4595a05856be43';
 const MONEYLINE_DIGEST = 'a068d2ee767addf8be567440872a47c394766b1d3d39593884d8b8ffcf4fc05a';
 
@@ -447,12 +447,16 @@ test('GOLDEN: an over-scale forecast commits to the values the projection stores
   assert.equal(
     canonicalize(projectionFingerprint(OVERSCALE)),
     '{"axes":{"consensus":1,"news":3,"softness":5,"trend":4,"valuation":2},' +
-      '"confidence":0.61371235,"line":1.5,"loss":0.47687654,"observedDecimal":2.053713,' +
+      '"confidence":0.61371235,"line":1.5234,"loss":0.47687653,"observedDecimal":2.053714,' +
       '"primaryAxis":"trend","primaryExpectation":' +
       '"Recent form favors the home side on the designated run line.",' +
       '"push":0,"selectedForExecution":false,"selection":"Pittsburgh Pirates",' +
       '"win":0.52312346,"wouldAbstain":false}'
   );
+  // Every one of those five sits where `toFixed` and PostgreSQL's own numeric
+  // rounding DISAGREE, which is what makes the serving port's quantiser
+  // provable per column rather than in aggregate. testFactories.ts carries the
+  // measured table.
 });
 
 test('GOLDEN: an over-scale PUSH is committed at the published scale too', () => {
@@ -557,11 +561,11 @@ test('ROUND TRIP: re-quantising a revealed value reproduces the sealed digest', 
   }
   // Quantising is idempotent, which is the property that makes the above hold.
   for (const [value, scale] of [
-    [1.50004, PROJECTION_SCALES.line],
-    [2.0537127, PROJECTION_SCALES.observedDecimal],
+    [1.52345, PROJECTION_SCALES.line],
+    [2.0537145, PROJECTION_SCALES.observedDecimal],
     [1 / 3, PROJECTION_SCALES.probability],
     [0.061728395, PROJECTION_SCALES.probability],
-    [0.613712345, PROJECTION_SCALES.confidence],
+    [0.613712355, PROJECTION_SCALES.confidence],
   ] as Array<[number, number]>) {
     const once = quantizeForProjection(value, scale);
     assert.equal(quantizeForProjection(once, scale), once);
@@ -576,7 +580,7 @@ test('a difference below the projection scale does NOT change the digest', () =>
   // precision stays bound by responseSha256 over the retained body.
   const nudged: ForecastOutput = {
     ...OVERSCALE,
-    confidence: 0.6137123451, // differs from the fixture in the 10th decimal
+    confidence: 0.6137123549, // differs from the fixture in the 10th decimal
   };
   assert.equal(forecastDigest(nudged), OVERSCALE_DIGEST);
   // …but a difference AT the scale still does.
