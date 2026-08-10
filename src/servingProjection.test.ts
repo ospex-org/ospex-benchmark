@@ -8,7 +8,13 @@ import { runBaselines } from './baselines.js';
 import { DEPLOYMENT_ROUND, NETWORK } from './config.js';
 import { forecastDigest } from './schema.js';
 import { ARMS } from './providers/index.js';
-import { PROJECTION_PARTICIPANTS, projectionParticipant } from './servingIdentity.js';
+import {
+  ENROLLED_ARM_IDS,
+  enrolledLabs,
+  PROJECTION_PARTICIPANTS,
+  projectionParticipant,
+} from './servingIdentity.js';
+import type { ProjectionParticipant } from './servingIdentity.js';
 import { asEnrolled, firedRun, fullBoardInputs, TEST_SLATE_DATE } from './servingTestRun.js';
 import { projectRun, publishableRun, revealMatchesSeal } from './servingProjection.js';
 import type { FiredRun, FireOptions } from './servingTestRun.js';
@@ -284,14 +290,15 @@ test('the participant is the durable lab and the version lives on the roster', a
   const plan = planOf(asEnrolled(run.records, 1));
   const attempt = plan.attempts[0]!;
 
-  assert.equal(attempt.participant.participantId, 'lab-anthropic');
+  assert.equal(attempt.participant.participantId, enrolled);
   assert.equal(attempt.participant.kind, 'model');
   assert.equal(attempt.participant.labId, 'anthropic');
-  assert.equal(attempt.participant.displayName, 'Anthropic');
-  // The version-scoped id is the runner's own participant id, and it is the
-  // ONLY place the model version appears. A model deprecation mints a new one
-  // of these under the same participant.
-  assert.equal(attempt.roster.armId, enrolled);
+  assert.equal(attempt.participant.displayName, 'Claude Fable 5');
+  // The roster records the exact model string requested this cohort, which is
+  // not the participant id: the participant names the arm across every cohort
+  // it runs in, and the lab is its own column so a second OpenAI or Anthropic
+  // arm is simply a second participant.
+  assert.equal(attempt.roster.armId, 'claude-fable-5');
   assert.equal(attempt.roster.walletAddress, null);
 });
 
@@ -508,13 +515,6 @@ test('a decision whose accepted attempt has no acceptedAt is skipped, not given 
 // ---------------------------------------------------------------------------
 
 test('every arm and every control the runner can emit is enrolled', () => {
-  for (const arm of ARMS) {
-    assert.ok(
-      projectionParticipant(arm.participantId),
-      `arm ${arm.participantId} is not enrolled — it would be silently unpublishable`,
-    );
-  }
-
   // Derived by RUNNING the baseline policy rather than by restating a list, so
   // a new control added to the policy fails here instead of vanishing from the
   // projection.
@@ -526,27 +526,59 @@ test('every arm and every control the runner can emit is enrolled', () => {
   }
 });
 
-test('the registry obeys the rules the projection enforces', () => {
-  const labs = new Set<string>();
+test('a participant is one ARM, so a lab may field several', () => {
+  // The property that makes multiple models per lab possible, asserted directly
+  // rather than left to follow from the current roster happening to have one
+  // arm each. Every key in the projection is scoped by participant — the
+  // roster, the provider call, the decision — so a participant that named the
+  // LAB would make two of its models collide on all three.
   for (const [runnerId, entry] of Object.entries(PROJECTION_PARTICIPANTS)) {
+    assert.equal(entry.participantId, runnerId, `${runnerId} is not its own participant`);
     assert.ok(entry.displayName.length > 0, `${runnerId} has no display name`);
     if (entry.kind === 'model') {
+      // The vendor lives in its own column, which is what a lab-level view
+      // groups on. Discarding it at write time would be unrecoverable; a
+      // GROUP BY never is.
       assert.ok(entry.labId !== null, `${runnerId} is a model with no lab`);
-      assert.equal(entry.participantId, `lab-${entry.labId}`);
-      assert.equal(entry.armId, runnerId, 'a model carries its version-scoped id');
-      // One participant per lab. The roster is keyed (cohort, participant), so
-      // the day one lab fields two arms in one cohort they would collide —
-      // this is the assertion that says so before the data does.
-      assert.equal(labs.has(entry.labId), false, `two arms share lab ${entry.labId}`);
-      labs.add(entry.labId);
+      assert.ok(runnerId.startsWith(`${entry.labId}-`), `${runnerId} does not name its lab`);
+      assert.ok(entry.armId !== null, 'a model records the exact string it requested');
     } else {
       // The projection refuses a non-model carrying a lab: a leaderboard
       // grouped by lab must never bucket a deterministic control under a vendor.
       assert.equal(entry.labId, null, `${runnerId} is not a model but carries a lab`);
-      assert.equal(entry.participantId, runnerId, 'a control id is already durable');
       assert.equal(entry.armId, null, 'a control takes its version from the run');
     }
   }
+
+  // And the concrete consequence, on a roster that does not yet exercise it:
+  // two arms sharing a lab are two participants, with two roster rows, two
+  // provider calls and two sets of picks. Nothing in the registry or the
+  // schema treats the shared lab as a collision — the conformance suite proves
+  // the database agrees.
+  // Three arms of one lab: two different models, and two VARIANTS of one of
+  // them. The variants are the hard case — same lab, same model, differing only
+  // in a setting — and they are exactly as distinct as anything else, because
+  // identity comes from the arm the runner dispatched and not from the model.
+  const oneLab: ProjectionParticipant[] = [
+    { participantId: 'openai-gpt-5.6-sol-low', kind: 'model', labId: 'openai', displayName: 'GPT-5.6 Sol (low)', armId: 'gpt-5.6-sol' },
+    { participantId: 'openai-gpt-5.6-sol-high', kind: 'model', labId: 'openai', displayName: 'GPT-5.6 Sol (high)', armId: 'gpt-5.6-sol' },
+    { participantId: 'openai-gpt-5.7-x', kind: 'model', labId: 'openai', displayName: 'GPT-5.7 X', armId: 'gpt-5.7-x' },
+  ];
+  assert.equal(new Set(oneLab.map((p) => p.labId)).size, 1, 'all three share a lab');
+  assert.equal(new Set(oneLab.map((p) => p.armId)).size, 2, 'two of them share a model');
+  assert.equal(new Set(oneLab.map((p) => p.participantId)).size, 3, 'and all three are distinct participants');
+
+  assert.deepEqual(enrolledLabs(), ['anthropic', 'google', 'openai', 'xai']);
+});
+
+test('every arm the runner can dispatch is enrolled, by construction', () => {
+  // Derived from the frozen roster rather than restated, so a fifth arm — a
+  // second model from a lab already present, say — fails here instead of
+  // silently never reaching the projection.
+  for (const armId of ENROLLED_ARM_IDS) {
+    assert.ok(projectionParticipant(armId), `arm ${armId} is not enrolled`);
+  }
+  assert.equal(ENROLLED_ARM_IDS.length, 4);
 });
 
 test('the run identity the artifact stamps is the frozen literal, spelled out here', async () => {
@@ -577,10 +609,10 @@ test('display names are literals, not a derivation of the id', () => {
       Object.values(PROJECTION_PARTICIPANTS).map((e) => [e.participantId, e.displayName]),
     ),
     {
-      'lab-openai': 'OpenAI',
-      'lab-anthropic': 'Anthropic',
-      'lab-google': 'Google',
-      'lab-xai': 'xAI',
+      'openai-gpt-5.6-sol': 'GPT-5.6 Sol',
+      'anthropic-claude-fable-5': 'Claude Fable 5',
+      'google-gemini-3.1-pro-preview': 'Gemini 3.1 Pro Preview',
+      'xai-grok-4.5': 'Grok 4.5',
       'baseline-favorite-ml': 'Moneyline favorite',
       'baseline-underdog-ml': 'Moneyline underdog',
       'baseline-home-ml': 'Moneyline home',

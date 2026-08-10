@@ -988,6 +988,71 @@ async function main(): Promise<void> {
       assert.equal(summary.published, expected, 'not every projected row landed');
     });
 
+    await check('ONE LAB, TWO MODELS, AND TWO VARIANTS OF ONE OF THEM, all in one cohort', async () => {
+      // The requirement that decides the whole identity model, checked against
+      // the database rather than against the registry that happens to satisfy
+      // it today. Every key here is scoped by participant — the roster is
+      // (cohort, participant), a provider call adds (game, ordinal), a decision
+      // adds (game, market) — so a participant naming the LAB would make the
+      // second arm's roster row contradict the first's, its call collide with
+      // the first's, and its picks be refused.
+      //
+      // Three arms rather than two, because the hard case is not two different
+      // models: it is the SAME model at two settings, which shares the lab and
+      // the base model and differs only in configuration. If anything ever
+      // derives identity from the model rather than from the arm, those two are
+      // what breaks first.
+      const [first] = plan.attempts;
+      assert.ok(first, 'need a published attempt to vary');
+
+      const sibling = (participantId: string, displayName: string, armId: string): ArmAttempt => ({
+        ...first,
+        participant: { participantId, kind: 'model', labId: 'sameco', displayName },
+        roster: { armId, walletAddress: null },
+      });
+
+      const arms: Array<[id: string, name: string, arm: string]> = [
+        ['sameco-m1-low', 'M1 (low)', 'm1'],
+        ['sameco-m1-high', 'M1 (high)', 'm1'],
+        ['sameco-m2', 'M2', 'm2'],
+      ];
+      for (const [id, name, arm] of arms) {
+        expect(await port.publishAttempt(sibling(id, name, arm)), 'published', `arm ${id}`);
+      }
+
+      const rows = await query(
+        `select p.participant_id, p.display_name, r.arm_id
+           from public.benchmark_participants p
+           join public.benchmark_cohort_participants r using (participant_id)
+          where p.lab_id = 'sameco' and r.cohort_id = $1
+          order by p.participant_id`,
+        [first.run.cohortId],
+      );
+      assert.deepEqual(
+        rows.map((row) => [row['participant_id'], row['arm_id']]),
+        [['sameco-m1-high', 'm1'], ['sameco-m1-low', 'm1'], ['sameco-m2', 'm2']],
+        'each arm needs its own roster row, including the two sharing a model',
+      );
+
+      // Each also gets its own provider call, which is what keeps their
+      // coverage denominators separate rather than one overwriting another.
+      const calls = await query(
+        `select count(*)::int as n from public.benchmark_arm_attempts
+          where cohort_id = $1 and participant_id = any($2)`,
+        [first.run.cohortId, arms.map(([id]) => id)],
+      );
+      assert.equal(calls[0]?.['n'], 3, 'three arms, three calls');
+
+      // …and a lab-level view is a GROUP BY away, which is the thing the
+      // discarded-at-write-time alternative could never recover.
+      const grouped = await query(
+        `select lab_id, count(*)::int as arms from public.benchmark_participants
+          where lab_id = 'sameco' group by lab_id`,
+        [],
+      );
+      assert.deepEqual(grouped, [{ lab_id: 'sameco', arms: 3 }]);
+    });
+
     await check('the commitment survives the round trip through the real numeric columns', async () => {
       // The point of sealing before the game is that a reader can recompute the
       // digest from the published reveal. That only holds if the value the
