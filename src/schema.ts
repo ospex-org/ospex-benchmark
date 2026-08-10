@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { canonicalize, sha256Hex } from './canonical.js';
+import { PROJECTION_SCALES, quantizeForProjection } from './projectionNumeric.js';
 import { AXIS_NAMES } from './types.js';
 import type {
   ArmSpec,
@@ -573,6 +575,71 @@ export function forecastFingerprint(forecast: ForecastOutput): ForecastFingerpri
     primaryAxis: forecast.primaryAxis ?? null,
     primaryExpectation: forecast.primaryExpectation ?? null,
   };
+}
+
+/**
+ * The twelve decision-bearing fields AS THE SERVING PROJECTION WILL PUBLISH
+ * THEM: identical to `forecastFingerprint()` except that each numeric is
+ * rounded to the scale of the column it lands in.
+ *
+ * Kept separate from `forecastFingerprint()` on purpose. That one binds the
+ * repair-preservation check and the fire artifact, where the model's exact
+ * output is the thing being compared and rounding would be wrong. This one
+ * exists because a commitment can only bind what a reader can later check, and
+ * what a reader can later check is the reveal row. See `projectionNumeric.ts`
+ * for the measurement that forced the distinction.
+ */
+export function projectionFingerprint(forecast: ForecastOutput): ForecastFingerprint {
+  const fingerprint = forecastFingerprint(forecast);
+  return {
+    ...fingerprint,
+    line:
+      fingerprint.line === null
+        ? null
+        : quantizeForProjection(fingerprint.line, PROJECTION_SCALES.line),
+    observedDecimal: quantizeForProjection(
+      fingerprint.observedDecimal,
+      PROJECTION_SCALES.observedDecimal
+    ),
+    win: quantizeForProjection(fingerprint.win, PROJECTION_SCALES.probability),
+    push: quantizeForProjection(fingerprint.push, PROJECTION_SCALES.probability),
+    loss: quantizeForProjection(fingerprint.loss, PROJECTION_SCALES.probability),
+    confidence: quantizeForProjection(fingerprint.confidence, PROJECTION_SCALES.confidence),
+  };
+}
+
+/**
+ * The pregame commitment stored as `benchmark_decisions.forecast_digest`.
+ *
+ * EXACTLY `sha256Hex(canonicalize(projectionFingerprint(f)))`, over the twelve
+ * decision-bearing fields above and nothing else. The serving projection writes
+ * this at seal time — before the game starts — and a later reveal is checked
+ * against it, so the composition is a CONTRACT rather than an implementation
+ * detail. Any other composition still produces 64 hex characters, still passes
+ * the column's CHECK, still stores without complaint, and is silently
+ * unverifiable against every reveal that follows. That is why it lives here,
+ * beside the fingerprint it commits to, and why a golden value pins it.
+ *
+ * ⚠ The preimage is the QUANTISED fingerprint, not the raw one. The response
+ *   schema bounds these fields by range and not by precision, so a model may
+ *   return more decimals than the reveal columns hold; hashing the unrounded
+ *   value and storing the rounded one makes the commitment unverifiable, which
+ *   was measured against a real database before this was written. Full
+ *   precision stays bound by `responseSha256` over the retained body.
+ *
+ * ⚠ It is NOT `decisionFingerprint()` from fireArtifact.ts, which carries the
+ *   same facts in a different SHAPE and therefore hashes differently: that one
+ *   nests win/push/loss under `probabilities`, adds `gameId`/`market`, and DROPS
+ *   the three analysis keys on a v1 body instead of carrying them as null.
+ *   Hashing that shape by mistake is the failure this note exists to prevent;
+ *   `forecastDigest.test.ts` pins the two apart.
+ *
+ * Deliberately does not cover rationale, evidence refs or reason codes: a
+ * format-only repair may rewrite those, and they stay bound through the
+ * retained body and `responseSha256`.
+ */
+export function forecastDigest(forecast: ForecastOutput): string {
+  return sha256Hex(canonicalize(projectionFingerprint(forecast)));
 }
 
 /** Exact equality of two axis-score sets; both absent is equal, one absent is not. */
