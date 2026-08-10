@@ -21,10 +21,13 @@ const VARS = [
   'BENCHMARK_DB_URL', 'BENCHMARK_WRITER', 'SUPABASE_URL', 'BENCHMARK_DB_HOST',
   'BENCHMARK_DB_PORT', 'BENCHMARK_DB_NAME', 'BENCHMARK_DB_USER', 'BENCHMARK_DB_CA',
   'BENCHMARK_DB_ALLOW_PLAINTEXT',
-  // Not the resolver's own, but the driver's: PGHOST is the fallback when a DSN
-  // names no host, so a developer who exports it would otherwise move a fixture
-  // between the local and remote halves of the sweep.
-  'PGHOST',
+  // Not the resolver's own, but the driver's, and the sweeps below build real
+  // clients. PGHOST is the fallback when a DSN names no host, so exporting it
+  // would move a fixture between the local and remote halves. The other two are
+  // the only variables measured to change `connectionParameters.ssl` at all:
+  // with an ssl option attached nothing moves it, and with none attached
+  // PGSSLMODE and PGSSLNEGOTIATION both do.
+  'PGHOST', 'PGSSLMODE', 'PGSSLNEGOTIATION',
 ] as const;
 
 /** Run `fn` with exactly `env` set and every other resolver variable cleared, so
@@ -295,33 +298,75 @@ test('…but loopback is exempt, and the refusal has a named way out', () => {
   );
 });
 
+/**
+ * Every environment input the DSN branch reads, and the states of each that can
+ * change an outcome. The controls below run over the full cross product rather
+ * than fixing a column.
+ *
+ * That is not fastidiousness — it is where two review rounds went. First the
+ * opt-out was only ever set beside a DSN that already disabled TLS, so a global
+ * "no TLS" switch passed everything. Then it was only ever set with a CA
+ * configured, so a switch that fired only when `BENCHMARK_DB_CA` was unset
+ * passed everything. Both put this role's password on the wire in the clear
+ * while 1,678 tests stayed green. A fixed column is an untested dimension.
+ *
+ * ADDING AN INPUT TO THE RESOLVER MEANS ADDING ITS STATES HERE. `PGHOST` is in
+ * the table because `dsnFacts` reads it, even though no fixture in the matrix
+ * can be affected by it: every one names a host, so the invariant it carries is
+ * "this must change nothing", which is exactly the assertion that catches code
+ * consulting it where it should not.
+ */
+interface EnvState {
+  readonly label: string;
+  readonly env: Partial<Record<(typeof VARS)[number], string>>;
+  /** The TLS option the resolver must attach in this state. A frozen literal:
+   *  deriving it from the input would move with a broken `configuredTls`. */
+  readonly attached: { readonly rejectUnauthorized: boolean; readonly ca?: string };
+}
+
+const ENV_STATES: readonly EnvState[] = [
+  { label: 'no CA', env: {}, attached: { rejectUnauthorized: false } },
+  { label: 'no CA, PGHOST set', env: { PGHOST: 'db.elsewhere.example.com' },
+    attached: { rejectUnauthorized: false } },
+  { label: 'CA supplied', env: { BENCHMARK_DB_CA: 'PEM' },
+    attached: { rejectUnauthorized: true, ca: 'PEM' } },
+  { label: 'CA supplied, PGHOST set', env: { BENCHMARK_DB_CA: 'PEM', PGHOST: 'db.elsewhere.example.com' },
+    attached: { rejectUnauthorized: true, ca: 'PEM' } },
+];
+
 test('the opt-out does NOT switch off TLS where nothing asked it to', () => {
   // The negative control for the escape hatch. It permits a choice the URL
-  // already made; it is not a global "no TLS" switch. Without it the tests here
-  // said nothing about the opt-out's SCOPE — measured, a resolver that returned
-  // the bare DSN whenever BENCHMARK_DB_ALLOW_PLAINTEXT=1 passed all 1,676 tests
-  // in the repo while sending this role's password to a remote host in the
-  // clear. The campaign store carries the same control for the same reason.
+  // already made; it is not a global "no TLS" switch. The campaign store
+  // carries the same control for the same reason — and this one runs in every
+  // environment state, because the first version of it ran in one and a
+  // CA-conditional mutation walked straight through.
   const dsn = 'postgresql://u:p@h.example.com:5432/db';
-  const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM',
-    BENCHMARK_DB_ALLOW_PLAINTEXT: '1' }, resolveBenchmarkWriterConnection);
-  assert.ok(r.resolved);
-  assert.deepEqual(r.connection,
-    { kind: 'dsn', connectionString: dsn, ssl: { rejectUnauthorized: true, ca: 'PEM' } });
-  // …and the driver really connects with it, through both shapes a caller
-  // builds. Asserting the returned object alone would not have caught a
-  // resolver that promised a CA the driver then discarded.
-  const config = clientConfig(r);
-  assert.deepEqual(effectiveSsl(config), { rejectUnauthorized: true, ca: 'PEM' });
-  assert.deepEqual(effectiveSslViaPool(config), { rejectUnauthorized: true, ca: 'PEM' });
+  for (const { label, env, attached } of ENV_STATES) {
+    // Everything runs INSIDE withEnv, the client constructions included. The
+    // driver reads PGSSLMODE and PGSSLNEGOTIATION when nothing is attached, so
+    // building a client after the environment has been restored would let a
+    // developer's shell decide what this test measures.
+    withEnv({ ...env, BENCHMARK_DB_URL: dsn, BENCHMARK_DB_ALLOW_PLAINTEXT: '1' }, () => {
+      const r = resolveBenchmarkWriterConnection();
+      assert.ok(r.resolved, label);
+      assert.deepEqual(r.connection, { kind: 'dsn', connectionString: dsn, ssl: attached }, label);
+      // …and the driver really connects with it, through both shapes a caller
+      // builds. Asserting the returned object alone would not have caught a
+      // resolver that promised a CA the driver then discarded.
+      const config = clientConfig(r);
+      assert.deepEqual(effectiveSsl(config), attached, `${label}: client`);
+      assert.deepEqual(effectiveSslViaPool(config), attached, `${label}: pool`);
+    });
 
-  // The DERIVED path never consults the opt-out at all, and must not start: it
-  // builds discrete fields with no connection string for a URL to have an
-  // opinion about, so there is no choice for the escape hatch to permit.
-  const derived = withEnv({ BENCHMARK_WRITER: AWKWARD, BENCHMARK_DB_HOST: 'h.example.com',
-    BENCHMARK_DB_CA: 'PEM', BENCHMARK_DB_ALLOW_PLAINTEXT: '1' }, resolveBenchmarkWriterConnection);
-  assert.ok(derived.resolved && derived.connection.kind === 'derived');
-  assert.deepEqual(derived.connection.ssl, { rejectUnauthorized: true, ca: 'PEM' });
+    // The DERIVED path never consults the opt-out at all, and must not start: it
+    // builds discrete fields with no connection string for a URL to have an
+    // opinion about, so there is no choice for the escape hatch to permit.
+    const derived = withEnv({ ...env, BENCHMARK_WRITER: AWKWARD,
+      BENCHMARK_DB_HOST: 'h.example.com', BENCHMARK_DB_ALLOW_PLAINTEXT: '1' },
+      resolveBenchmarkWriterConnection);
+    assert.ok(derived.resolved && derived.connection.kind === 'derived', label);
+    assert.deepEqual(derived.connection.ssl, attached, `${label}: derived path`);
+  }
 });
 
 test('userinfo with an EMPTY host is classified by the driver, not by new URL()', () => {
@@ -516,31 +561,39 @@ test('SWEEP: the resolver never attaches TLS the driver would discard, nor claim
   let attached = 0;
   let deferred = 0;
   let refused = 0;
-  for (const { dsn, local, label } of MATRIX) {
-    const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
-    const sentinel = { rejectUnauthorized: false, ca: 'PEM' };
-    const withSentinel = effectiveSsl({ connectionString: dsn, ssl: sentinel } as ClientConfig);
-    const survives = withSentinel === sentinel;
+  for (const state of ENV_STATES) {
+    for (const { dsn, local, label: fixture } of MATRIX) {
+      const label = `${fixture} [${state.label}]`;
+      // Resolution AND the driver comparison inside one withEnv, so both see the
+      // same environment — see the note on the named control above.
+      withEnv({ ...state.env, BENCHMARK_DB_URL: dsn }, () => {
+        const r = resolveBenchmarkWriterConnection();
+        const sentinel = { rejectUnauthorized: false, ca: 'PEM' };
+        const withSentinel = effectiveSsl({ connectionString: dsn, ssl: sentinel } as ClientConfig);
+        const survives = withSentinel === sentinel;
 
-    if (!r.resolved) {
-      refused += 1;
-      assert.equal(r.reason, 'plaintext_dsn', `${label}: refused for an unexpected reason`);
-      assert.equal(local, false, `${label}: a local target must never be refused`);
-      assert.ok(!withSentinel, `${label}: refused a connection the driver would have encrypted`);
-      continue;
-    }
-    const config = clientConfig(r);
-    if ('ssl' in config) {
-      attached += 1;
-      assert.ok(survives, `${label}: attached an ssl option the driver discards`);
-      assert.ok(effectiveSsl(config), `${label}: attached TLS and the driver has none`);
-      assert.deepEqual(effectiveSslViaPool(config), effectiveSsl(config), `${label}: pool and client disagree`);
-    } else {
-      deferred += 1;
-      assert.ok(!survives, `${label}: attached nothing where the driver would have kept it`);
-      if (!effectiveSsl(config)) {
-        assert.ok(local, `${label}: deferred to a plaintext URL for a host that is not this machine`);
-      }
+        if (!r.resolved) {
+          refused += 1;
+          assert.equal(r.reason, 'plaintext_dsn', `${label}: refused for an unexpected reason`);
+          assert.equal(local, false, `${label}: a local target must never be refused`);
+          assert.ok(!withSentinel, `${label}: refused a connection the driver would have encrypted`);
+          return;
+        }
+        const config = clientConfig(r);
+        if ('ssl' in config) {
+          attached += 1;
+          assert.ok(survives, `${label}: attached an ssl option the driver discards`);
+          assert.deepEqual(config.ssl, state.attached, `${label}: attached the wrong TLS option`);
+          assert.deepEqual(effectiveSsl(config), state.attached, `${label}: the driver got something else`);
+          assert.deepEqual(effectiveSslViaPool(config), effectiveSsl(config), `${label}: pool and client disagree`);
+        } else {
+          deferred += 1;
+          assert.ok(!survives, `${label}: attached nothing where the driver would have kept it`);
+          if (!effectiveSsl(config)) {
+            assert.ok(local, `${label}: deferred to a plaintext URL for a host that is not this machine`);
+          }
+        }
+      });
     }
   }
   // Every branch must actually occur, or the property passes vacuously.
@@ -556,22 +609,25 @@ test('SWEEP: the opt-out changes exactly the refusals, and nothing else', () => 
   // be IDENTICAL except where the plain answer was a plaintext refusal.
   let permitted = 0;
   let unchanged = 0;
-  for (const { dsn, label } of MATRIX) {
-    const plain = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' },
-      resolveBenchmarkWriterConnection);
-    const optedOut = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM',
-      BENCHMARK_DB_ALLOW_PLAINTEXT: '1' }, resolveBenchmarkWriterConnection);
-    if (!plain.resolved) {
-      permitted += 1;
-      assert.equal(plain.reason, 'plaintext_dsn', label);
-      assert.ok(optedOut.resolved, `${label}: the opt-out must permit the refusal it names`);
-      assert.ok(!('ssl' in optedOut.connection),
-        `${label}: …by deferring to the URL, not by attaching something`);
-      continue;
+  for (const state of ENV_STATES) {
+    for (const { dsn, label: fixture } of MATRIX) {
+      const label = `${fixture} [${state.label}]`;
+      const plain = withEnv({ ...state.env, BENCHMARK_DB_URL: dsn },
+        resolveBenchmarkWriterConnection);
+      const optedOut = withEnv({ ...state.env, BENCHMARK_DB_URL: dsn,
+        BENCHMARK_DB_ALLOW_PLAINTEXT: '1' }, resolveBenchmarkWriterConnection);
+      if (!plain.resolved) {
+        permitted += 1;
+        assert.equal(plain.reason, 'plaintext_dsn', label);
+        assert.ok(optedOut.resolved, `${label}: the opt-out must permit the refusal it names`);
+        assert.ok(!('ssl' in optedOut.connection),
+          `${label}: …by deferring to the URL, not by attaching something`);
+        continue;
+      }
+      unchanged += 1;
+      assert.deepEqual(optedOut, plain,
+        `${label}: the opt-out changed an outcome that was never a refusal`);
     }
-    unchanged += 1;
-    assert.deepEqual(optedOut, plain,
-      `${label}: the opt-out changed an outcome that was never a refusal`);
   }
   assert.ok(permitted > 0 && unchanged > 0, `permitted=${permitted} unchanged=${unchanged}`);
 });
@@ -581,10 +637,22 @@ test('SWEEP: a target that is not this machine is encrypted or refused, never pl
   // the parity check above.
   const remote = MATRIX.filter((fixture) => !fixture.local);
   assert.ok(remote.length >= 100, `got ${remote.length}`);
-  for (const { dsn, label } of remote) {
-    const r = withEnv({ BENCHMARK_DB_URL: dsn, BENCHMARK_DB_CA: 'PEM' }, resolveBenchmarkWriterConnection);
-    if (!r.resolved) continue;
-    assert.ok(effectiveSsl(clientConfig(r)),
-      `${label}: the driver would connect with NO TLS to a host that is not this machine`);
+  for (const state of ENV_STATES) {
+    for (const optOut of [{}, { BENCHMARK_DB_ALLOW_PLAINTEXT: '1' }]) {
+      for (const { dsn, label } of remote) {
+        withEnv({ ...state.env, ...optOut, BENCHMARK_DB_URL: dsn }, () => {
+          const r = resolveBenchmarkWriterConnection();
+          if (!r.resolved) return;
+          const config = clientConfig(r);
+          const plaintext = !effectiveSsl(config);
+          // With the opt-out set, a plaintext remote connection is permitted —
+          // but ONLY where the URL itself asked for it, which is the property
+          // the sweep above pins. Everything else must still be encrypted.
+          const permitted = 'BENCHMARK_DB_ALLOW_PLAINTEXT' in optOut && !('ssl' in config);
+          assert.ok(!plaintext || permitted,
+            `${label} [${state.label}]: the driver would connect with NO TLS to a host that is not this machine`);
+        });
+      }
+    }
   }
 });
