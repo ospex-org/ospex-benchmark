@@ -212,10 +212,9 @@ def main():
     dirty = subprocess.run(['git', 'status', '--porcelain', '--'] + sorted({m[1] for m in MUTANTS}),
                            cwd=REPO, capture_output=True, text=True).stdout.strip()
     if dirty:
-        print('REFUSING: uncommitted changes in files this battery mutates.
-'
-              'Restoring a mutant discards them. Commit first.
-' + dirty)
+        print('REFUSING: uncommitted changes in files this battery mutates.')
+        print('Restoring a mutant discards them. Commit first.')
+        print(dirty)
         return 2
 
     baseline = run_suite()
