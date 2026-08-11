@@ -6,6 +6,7 @@ import {
   SqlBenchmarkServingPort,
   UNNAMED_DRIFT_FIELD,
 } from './servingStore.js';
+import { sha256Hex } from './canonical.js';
 import {
   MAX_ENTRANT_IDENTIFIER_BYTES,
   canonicalConfigurationText,
@@ -1388,4 +1389,35 @@ test('the identifier pair is bounded too, so the entrant-key CHECK is unreachabl
     { outcome: 'published' },
     'exactly at the ceiling is accepted',
   );
+});
+
+test('the rationale digest is taken from the REDACTED bytes, not the caller\'s input', async () => {
+  // The store redacts on the way in, so hashing the raw value would commit to a
+  // preimage the table does not hold — and the one thing a reader does with
+  // this digest is recompute it from the stored prose.
+  //
+  // ⚠ THE FIXTURE HAS TO CONTAIN SOMETHING REDACTION ACTUALLY CHANGES. Every
+  //   earlier case used tidy prose, so redacting it was a no-op and hashing
+  //   before or after gave the same answer — a mutant taking the digest from
+  //   the raw input survived the whole suite.
+  const SECRET = 'sk-probe-0123456789';
+  const saved = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = SECRET;
+  try {
+    const raw = `the number looks soft, per ${SECRET}`;
+    const { deps, calls } = scriptedQuery([OK]);
+    await new SqlBenchmarkServingPort(deps).publishRationale({
+      decision: REF, rationale: raw, evidenceRefs: [], source: NO_SOURCE,
+    });
+    const sent = sentPayload(calls);
+    const stored = String(sent['rationale']);
+    assert.notEqual(stored, raw, 'the fixture must be redacted, or it cannot discriminate');
+    assert.equal(sent['rationale_digest'], sha256Hex(stored),
+      'the digest must describe the bytes that are stored');
+    assert.notEqual(sent['rationale_digest'], sha256Hex(raw),
+      'and NOT the bytes the caller handed over');
+  } finally {
+    if (saved === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = saved;
+  }
 });

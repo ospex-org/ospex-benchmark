@@ -28,6 +28,10 @@ import type { ArmAttempt } from './servingStore.js';
  *   stale     the database reports an OLDER capability than this build needs -
  *             the lookalike-schema case a column-name check used to accept.
  *             MUST refuse to open, and MUST exit.
+ *   bogus     the database answers, but with no version in it. MUST refuse to
+ *             open: an unreadable answer is version 0, and a build that turned
+ *             it into NaN instead would compare `NaN < 2`, get false, and OPEN.
+ *             A mutant did exactly that and survived until this mode existed.
  *   enabled   the readiness probe IS answered, so the publisher opens for real;
  *             then one attempt — the path that pins a client for a lock plus a
  *             statement — never answers, and the handle's own `close()` runs.
@@ -91,7 +95,7 @@ function resultSet(column: string, values: readonly string[], oid = TEXT_OID): B
  * exited promptly for a reason that had nothing to do with the code under test,
  * and a build with the fix removed passed identically.
  */
-function fakePostgres(capability: number | null): Promise<{ port: number; sawQuery: () => boolean }> {
+function fakePostgres(answer: number | 'silent' | 'bogus'): Promise<{ port: number; sawQuery: () => boolean }> {
   let sawQuery = false;
   const server = createServer((socket) => {
     let sawStartup = false;
@@ -114,12 +118,15 @@ function fakePostgres(capability: number | null): Promise<{ port: number; sawQue
         return;
       }
       sawQuery = true;
-      if (capability !== null && !answered) {
+      if (answer !== 'silent' && !answered) {
         answered = true;
-        // The readiness probe asks what the schema says it can serve. An
-        // int4 column, because the publisher requires a real integer and a
-        // text lookalike must not satisfy it.
-        socket.write(resultSet('version', [String(capability)], INT4_OID));
+        // The readiness probe asks what the schema says it can serve. An int4
+        // column, because the publisher requires a real integer; `bogus`
+        // answers with a differently named one, which is what a schema that
+        // has the table but not the contract looks like.
+        socket.write(answer === 'bogus'
+          ? resultSet('capability_version', ['2'])
+          : resultSet('version', [String(answer)], INT4_OID));
         return;
       }
       // Saying nothing is the entire point of this server.
@@ -185,8 +192,11 @@ function probeAttempt(): ArmAttempt {
 
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? 'held';
-  const capability = mode === 'enabled' ? 2 : mode === 'stale' ? 1 : null;
-  const { port, sawQuery } = await fakePostgres(capability);
+  const answer = mode === 'enabled' ? 2
+    : mode === 'stale' ? 1
+    : mode === 'bogus' ? 'bogus' as const
+    : 'silent' as const;
+  const { port, sawQuery } = await fakePostgres(answer);
   // `sslmode=disable` is LOAD-BEARING, not tidiness. With no CA configured the
   // resolver attaches `ssl: { rejectUnauthorized: false }`, `pg` opens with an
   // SSLRequest, this server refuses it, and the connection dies before a query

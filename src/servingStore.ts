@@ -390,7 +390,12 @@ export interface ArmAttempt {
 
 /**
  * A forecast at SEAL time: identity and digests, and nothing of the pick itself.
- * The forecast lands separately, and the absence of that reveal IS the embargo.
+ *
+ * The pick lands in a separate table, so the schema CAN hold a sealed forecast
+ * back. This publisher deliberately does not: it writes both, with the run.
+ * Keeping picks secret was never a requirement here, and the reasoning is
+ * recorded once, beside `ProjectionClock` in servingProjection.ts, rather than
+ * restated at each site that could imply otherwise.
  *
  * `attemptOrdinal` names the already-published provider call this forecast came
  * from, or is null for a deterministic baseline that made none. A participant of

@@ -200,7 +200,7 @@ const PROBE_DEADLINE_MS = 12_000;
  * through the handle a run holds — a different call site, and until this case
  * existed nothing in the suite reached it.
  */
-for (const mode of ['held', 'stale', 'enabled'] as const) {
+for (const mode of ['held', 'stale', 'bogus', 'enabled'] as const) {
   test(`a process whose database stopped answering still EXITS (${mode})`, { timeout: 60_000 }, async () => {
     // THE guarantee of this module, and the one no promise-level assertion can
     // make: `close()` resolving says nothing about whether Node can drain its

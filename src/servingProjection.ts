@@ -355,9 +355,22 @@ export interface ProjectionClock {
  * afterwards.
  *
  * The cost, stated plainly rather than left implicit: the picks are visible
- * while the market they are scored against is still open. That is accepted.
- * Scoring is against a reference feed rather than a book a reader can move, and
- * the alternative forfeits the reason the projection exists.
+ * while the market they are scored against is still open. That is accepted, and
+ * it has been asked twice, so the reasoning is written down rather than left to
+ * be re-derived.
+ *
+ * KEEPING THE PICKS SECRET WAS NEVER A REQUIREMENT. Not for the maker, not for
+ * anyone. Scoring is against a reference feed rather than a book a reader can
+ * move, so the measurement cannot be gamed by publication; and beyond that
+ * there is no audience to game it — no users, no volume, nobody reading. The
+ * one residual worry anyone has raised is models copying each other, which is
+ * remote and is accepted too.
+ *
+ * That is a judgement about the current state of the world rather than a
+ * property of the code, and it is the maintainer's to revisit. The schema keeps
+ * the seal and the reveal in separate tables, so holding picks back later is a
+ * scheduling change here and not a migration. If measured downstream effects
+ * ever appear, this is the paragraph to come back to.
  */
 
 /**
