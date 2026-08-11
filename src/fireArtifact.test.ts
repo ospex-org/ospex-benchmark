@@ -80,7 +80,7 @@ function attempt(over: Partial<AttemptRecord> = {}): AttemptRecord {
 
 function armResult(over: Partial<ArmGameResult> = {}): ArmGameResult {
   return {
-    arm: { participantId: 'p1', provider: 'openai', requestedModelId: 'model-1', credentialEnvVar: 'OPENAI_API_KEY' },
+    arm: { participantId: 'p1', provider: 'openai', requestedModelId: 'model-1', credentialEnvVar: 'OPENAI_API_KEY', configuration: {} },
     gameId: 'game-1',
     requestSha256: SHA,
     cutoffAt: '2026-07-16T01:00:00.000Z',
@@ -101,6 +101,7 @@ const ROSTER_ENTRY = {
   provider: 'openai',
   requestedModelId: 'model-1',
   approvedReportedModelIds: ['model-x', 'model-y'],
+  configuration: {},
 };
 
 function digestInput(over: Partial<ArmDigestInputV1> = {}): ArmDigestInputV1 {
@@ -226,6 +227,26 @@ test('expectedArmIdentity is exactly the manifest roster-entry projection, order
   assert.ok(Object.isFrozen(id.approvedReportedModelIds));
   approved.push('mutated'); // detached: mutating the source array must not leak in
   assert.equal(id.approvedReportedModelIds.length, 3);
+  // The v1 identity carries NO configuration — see the refusal below for why
+  // that is a refusal rather than an omission.
+  assert.ok(!('configuration' in id));
+});
+
+test('expectedArmIdentity REFUSES a roster entry that declares a configuration', () => {
+  // Dropping it silently would publish a decision under the wrong entrant: two
+  // arms running one model at two settings project to the byte-identical
+  // identity and hash to the same armDigest, and nothing downstream could tell
+  // — the two are supposed to look alike everywhere except there.
+  assert.throws(
+    () => expectedArmIdentity({ ...ROSTER_ENTRY, configuration: { reasoning: { effort: 'high' } } }),
+    /has no field for a participant configuration, and p1 declares one/,
+  );
+});
+
+test('expectedArmIdentity accepts the empty configuration', () => {
+  // The negative control: a build that refused EVERY roster entry would also
+  // satisfy the test above, and would take the line-open path down with it.
+  assert.doesNotThrow(() => expectedArmIdentity({ ...ROSTER_ENTRY, configuration: {} }));
 });
 
 // --- toPersistedAttempts (attempt mapping, §5) ---

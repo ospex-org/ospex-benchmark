@@ -4,6 +4,8 @@ import { ProviderUnfinishedTurnError } from './errors.js';
 import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractGoogleSearchAudit } from './searchAudit.js';
+import { buildRequestPlan } from './requestPlan.js';
+import type { ProviderRequestPlan } from './requestPlan.js';
 import type {
   ChatTurn,
   ProviderAdapter,
@@ -18,6 +20,52 @@ const GOOGLE_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 // cap parameter — the model decides how many queries run; the audit records
 // the executed queries and the tool-use token bucket evidences that one ran.
 const WEB_SEARCH = TOOL_INFERENCE_CONFIG.webSearch.google;
+
+/**
+ * The request this adapter would send, built without sending it. See
+ * `anthropicRequestPlan` for why the builder is exported.
+ *
+ * Note the shape of the evidence this produces: `maxOutputTokens` is recorded
+ * where it actually lives on the wire, inside `generationConfig`, rather than
+ * re-flattened to a top-level key it never had. That nesting is also what
+ * makes `generationConfig` usable by a configuration — a participant may add
+ * `generationConfig.thinkingConfig` beside the cohort's cap, and is refused if
+ * it tries to set the cap itself.
+ */
+export function googleRequestPlan(args: {
+  requestedModelId: string;
+  turns: ChatTurn[];
+  options?: ProviderCallOptions | undefined;
+}): ProviderRequestPlan {
+  const system = args.turns.find((t) => t.role === 'system')?.content ?? '';
+  const contents = args.turns
+    .filter((t) => t.role !== 'system')
+    .map((t) => ({
+      role: t.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: t.content }],
+    }));
+  // A repair carries no declared tools (format-only, may not search).
+  const withTools = (args.options?.tools ?? 'declared') === 'declared';
+  const body: Record<string, unknown> = {
+    systemInstruction: { parts: [{ text: system }] },
+    contents,
+  };
+  if (withTools) body['tools'] = [WEB_SEARCH.tool];
+  if (args.options?.maxOutputTokens !== undefined) {
+    body['generationConfig'] = { maxOutputTokens: args.options.maxOutputTokens };
+  }
+  return buildRequestPlan({
+    // Key travels in a header, never in the URL, so it cannot leak into
+    // recorded request params or error messages.
+    endpoint: `${GOOGLE_BASE}/${args.requestedModelId}:generateContent`,
+    body,
+    configuration: args.options?.configuration ?? {},
+    promptKeys: ['systemInstruction', 'contents'],
+    // Gemini names the model in the URL rather than the body; it is recorded
+    // because which model was asked for is the point of the record.
+    recordedNonBody: { model: args.requestedModelId },
+  });
+}
 
 export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
   return {
@@ -35,32 +83,13 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
     ): Promise<ProviderResponse> {
       const apiKey = googleApiKey();
       if (apiKey === undefined) throw new Error('GEMINI_API_KEY / GOOGLE_API_KEY is not set');
-      const system = turns.find((t) => t.role === 'system')?.content ?? '';
-      const contents = turns
-        .filter((t) => t.role !== 'system')
-        .map((t) => ({
-          role: t.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: t.content }],
-        }));
-      // A repair carries no declared tools (format-only, may not search).
-      const withTools = (options?.tools ?? 'declared') === 'declared';
-      const tools = [WEB_SEARCH.tool];
-      const body: Record<string, unknown> = {
-        systemInstruction: { parts: [{ text: system }] },
-        contents,
-      };
-      if (withTools) body['tools'] = tools;
-      if (options?.maxOutputTokens !== undefined) {
-        body['generationConfig'] = { maxOutputTokens: options.maxOutputTokens };
-      }
-      // Key travels in a header, never in the URL, so it cannot leak into
-      // recorded request params or error messages.
-      const url = `${GOOGLE_BASE}/${requestedModelId}:generateContent`;
+      const plan = googleRequestPlan({ requestedModelId, turns, options });
+      const url = plan.endpoint;
       const { status, json: raw } = await postJson({
         provider: 'google',
         url,
         headers: { 'x-goog-api-key': apiKey },
-        body,
+        body: plan.body,
         timeoutMs,
       });
       const json = raw as {
@@ -103,14 +132,7 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
         reasoningTokens: comparable.reasoningTokens,
         billableOutputTokens: comparable.billableOutputTokens,
       };
-      const requestParams: Record<string, unknown> = {
-        endpoint: url,
-        model: requestedModelId,
-        ...(withTools ? { tools } : {}),
-      };
-      if (options?.maxOutputTokens !== undefined) {
-        requestParams['maxOutputTokens'] = options.maxOutputTokens;
-      }
+      const requestParams = plan.requestParams;
 
       // Terminal state: only `finishReason: "STOP"` on the first candidate is a
       // finished turn. `MAX_TOKENS`, `TOO_MANY_TOOL_CALLS`, safety/recitation

@@ -32,12 +32,14 @@ const ARM_A: ArmSpec = {
   provider: 'openai',
   requestedModelId: 'model-a',
   credentialEnvVar: 'STUB_A_KEY',
+  configuration: {},
 };
 const ARM_B: ArmSpec = {
   participantId: 'arm-b',
   provider: 'anthropic',
   requestedModelId: 'model-b',
   credentialEnvVar: 'STUB_B_KEY',
+  configuration: {},
 };
 
 function stubResponse(rawText: string, reportedModelId: string): ProviderResponse {
@@ -325,6 +327,7 @@ test('A6: the full artifact is deterministic and passes verifyRunIntegrity', asy
       provider: arm.provider,
       requestedModelId: arm.requestedModelId,
       approvedReportedModelIds: [arm.requestedModelId],
+      configuration: {},
     })),
   });
   assert.deepEqual(violations, []);
@@ -344,6 +347,7 @@ test('END-TO-END: wire status "incomplete" with schema-valid JSON → runner rec
     provider: 'openai',
     requestedModelId: 'gpt-5.6-sol',
     credentialEnvVar: 'OPENAI_API_KEY',
+    configuration: {},
   };
   const request = makeRequest(CUTOFF, { gameId: ID_A });
   const validJson = JSON.stringify(makeValidResponse(request, REG_ARM, COHORT));
@@ -399,6 +403,7 @@ test('END-TO-END: wire status "incomplete" with schema-valid JSON → runner rec
         provider: REG_ARM.provider,
         requestedModelId: REG_ARM.requestedModelId,
         approvedReportedModelIds: [REG_ARM.requestedModelId],
+        configuration: {},
       },
     ],
   });

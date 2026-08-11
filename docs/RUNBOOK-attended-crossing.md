@@ -248,7 +248,7 @@ decision, never a retry.
       `Installed/settled`; exactly one installed artifact path.
 - [ ] **Artifact read-back**: open the installed `fire-*.json` from the durable
       directory. It parses; its `cohortId`/`fireId` equal the console report;
-      all four arms are present with terminal outcomes; every attempt carries
+      every arm in the roster is present with a terminal outcome; every attempt carries
       normalized usage; no credential material appears anywhere in it.
 - [ ] **Sidecar**: the `*-spend.json` exists beside the artifact (every billable
       fire installs one — §0); recompute its SHA-256 and confirm it equals the

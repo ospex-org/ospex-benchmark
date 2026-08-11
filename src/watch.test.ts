@@ -420,6 +420,7 @@ test('a fired game produces a run file that passes full scorer integrity verific
         provider: TEST_ARM.provider,
         requestedModelId: TEST_ARM.requestedModelId,
         approvedReportedModelIds: ['stub-model-1'],
+        configuration: {},
       },
     ],
   });
@@ -449,6 +450,7 @@ test('a fired game produces a run file that passes full scorer integrity verific
         provider: TEST_ARM.provider,
         requestedModelId: TEST_ARM.requestedModelId,
         approvedReportedModelIds: ['stub-model-1'],
+        configuration: {},
       },
     ],
   });
@@ -466,6 +468,7 @@ test('a fired game produces a run file that passes full scorer integrity verific
         provider: TEST_ARM.provider,
         requestedModelId: TEST_ARM.requestedModelId,
         approvedReportedModelIds: ['stub-model-1'],
+        configuration: {},
       },
     ],
   });
@@ -477,6 +480,7 @@ test('a fired game produces a run file that passes full scorer integrity verific
       provider: TEST_ARM.provider,
       requestedModelId: TEST_ARM.requestedModelId,
       approvedReportedModelIds: ['stub-model-1'],
+      configuration: {},
     },
   ];
 

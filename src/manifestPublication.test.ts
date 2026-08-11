@@ -50,7 +50,7 @@ function validRaw(overrides: Record<string, unknown> = {}): Record<string, unkno
     marketPolicyDigest: 'a'.repeat(64),
     promptScaffoldSha256: 'b'.repeat(64),
     expectedArmRoster: [
-      { participantId: 'p1', provider: 'openai', requestedModelId: 'm1', approvedReportedModelIds: ['m1'] },
+      { participantId: 'p1', provider: 'openai', requestedModelId: 'm1', approvedReportedModelIds: ['m1'], configuration: {} },
     ],
     toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.2.0',

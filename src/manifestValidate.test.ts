@@ -37,6 +37,7 @@ function codeConsistentRaw(): Record<string, unknown> {
       provider: a.provider,
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: a.approvedReportedModelIds,
+      configuration: a.configuration,
     })),
     toolInferenceConfigSha256: toolInferenceConfigSha256(),
     // A line-open cohort fires markets independently, so any dispatch may be a
@@ -241,7 +242,7 @@ test('scoringPolicyVersion mismatch is flagged', () => {
 test('an unknown roster participant is flagged', () => {
   const raw = codeConsistentRaw();
   const roster = raw.expectedArmRoster as Array<Record<string, unknown>>;
-  roster.push({ participantId: 'ghost', provider: 'openai', requestedModelId: 'x', approvedReportedModelIds: ['x'] });
+  roster.push({ participantId: 'ghost', provider: 'openai', requestedModelId: 'x', approvedReportedModelIds: ['x'], configuration: {} });
   (raw.constants as Record<string, unknown>).maxConcurrentProviderRequests = roster.length; // keep capacity valid
   const v = validateManifestAgainstCode(parse(raw));
   assert.ok(v.some((s) => /"ghost" is not a code-supported participant/.test(s)), v.join('; '));
@@ -332,4 +333,172 @@ test('canonical registries are frozen — no post-preflight mutation drifts beha
 test('toolInferenceConfigSha256 mismatch is flagged — the declared tool config must recompute from code', () => {
   const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), toolInferenceConfigSha256: 'd'.repeat(64) }));
   assert.ok(v.some((s) => /toolInferenceConfigSha256 mismatch/.test(s)), v.join('; '));
+});
+
+// ---------------------------------------------------------------------------
+// Participant configuration
+// ---------------------------------------------------------------------------
+
+/** A manifest whose FIRST roster arm declares `configuration`, everything else intact. */
+function withFirstArmConfiguration(configuration: Record<string, unknown>): ReturnType<typeof parseManifest> {
+  const raw = codeConsistentRaw();
+  const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  roster[0] = { ...roster[0]!, configuration };
+  return parse({ ...raw, expectedArmRoster: roster });
+}
+
+test('a roster configuration that disagrees with the code is flagged, by digest', () => {
+  const violations = validateManifestAgainstCode(
+    withFirstArmConfiguration({ reasoning: { effort: 'high' } }),
+  );
+  assert.ok(
+    violations.some((v) => /configuration [0-9a-f]{64} != code [0-9a-f]{64}/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('the code-consistent roster passes the configuration check', () => {
+  // The negative control: without it, a build that flagged EVERY configuration
+  // would satisfy the test above.
+  assert.ok(!validateManifestAgainstCode(parse(codeConsistentRaw())).some((v) => /configuration/.test(v)));
+});
+
+test('a configuration that could not be merged into the request is flagged', () => {
+  // `max_output_tokens` is the cohort's own output cap on the Responses API,
+  // and the first code arm is an openai arm. A manifest declaring it would
+  // move spend past what a fire reserved, so it is refused at boot rather than
+  // thrown mid-fire with provider calls already committed.
+  const violations = validateManifestAgainstCode(
+    withFirstArmConfiguration({ max_output_tokens: 999_999 }),
+  );
+  assert.ok(
+    violations.some((v) => /configuration cannot be merged into the initial leg/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a configuration colliding on ONE leg only is still flagged', () => {
+  // The reason the legs are enumerated rather than sampled: a repair carries
+  // no tool block, so this collides on the initial leg and not on the repair.
+  // A check that looked only at the repair would pass it.
+  const violations = validateManifestAgainstCode(withFirstArmConfiguration({ tools: [] }));
+  assert.ok(
+    violations.some((v) => /cannot be merged into the initial leg/.test(v)),
+    JSON.stringify(violations),
+  );
+  assert.ok(!violations.some((v) => /cannot be merged into the repair leg/.test(v)));
+});
+
+test('an additive configuration is NOT flagged as unmergeable', () => {
+  // The positive control for the two tests above. If adding were refused too,
+  // both would still pass and the feature would be unusable.
+  const violations = validateManifestAgainstCode(
+    withFirstArmConfiguration({ reasoning: { effort: 'high' } }),
+  );
+  assert.ok(
+    !violations.some((v) => /cannot be merged/.test(v)),
+    `an added key must merge cleanly: ${JSON.stringify(violations)}`,
+  );
+});
+
+test('a configuration carrying a live credential is refused - the manifest is published', () => {
+  const priorKey = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = 'sk-synthetic-value-generated-for-this-test-only';
+  try {
+    const violations = validateManifestAgainstCode(
+      withFirstArmConfiguration({ note: process.env['OPENAI_API_KEY'] }),
+    );
+    assert.ok(
+      violations.some((v) => /contains a value matching a credential in this environment/.test(v)),
+      JSON.stringify(violations),
+    );
+    // And the refusal must not quote the value it is refusing.
+    for (const violation of violations) {
+      assert.ok(!violation.includes('sk-synthetic'), 'the refusal must not echo the credential');
+    }
+  } finally {
+    if (priorKey === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = priorKey;
+  }
+});
+
+test('an ordinary configuration is not mistaken for a credential', () => {
+  // Negative control for the check above: it must key on the actual secret
+  // VALUE, not on a key name that looks sensitive.
+  const priorKey = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = 'sk-synthetic-value-generated-for-this-test-only';
+  try {
+    const violations = validateManifestAgainstCode(
+      withFirstArmConfiguration({ api_key_style: 'bearer', token_budget: 8192 }),
+    );
+    assert.ok(!violations.some((v) => /matching a credential/.test(v)), JSON.stringify(violations));
+  } finally {
+    if (priorKey === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = priorKey;
+  }
+});
+
+test('two roster arms that are the same ENTRANT are refused at boot', () => {
+  // The post-run identity gate already refuses this, but it runs on RESPONSES:
+  // the refusal arrives after a full night of provider spend and arrives as a
+  // permanently unscoreable artifact. It is decidable from the roster alone.
+  const raw = codeConsistentRaw();
+  const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  roster.push({ ...roster[0]!, participantId: 'openai-gpt-5.6-sol-again' });
+  const violations = validateManifestAgainstCode(parse({ ...raw, expectedArmRoster: roster }));
+  assert.ok(
+    violations.some((v) => /are the same entrant: model .* under the identical configuration/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('two roster arms of one model at DIFFERENT configurations are not the same entrant', () => {
+  // The negative control. Both entries also trip the code-comparison checks
+  // (neither matches a code arm's configuration), so this asserts the ABSENCE
+  // of the entrant violation specifically rather than an empty result.
+  const raw = codeConsistentRaw();
+  const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  roster[0] = { ...roster[0]!, configuration: { reasoning: { effort: 'low' } } };
+  roster.push({
+    ...roster[0]!,
+    participantId: 'openai-gpt-5.6-sol-high',
+    configuration: { reasoning: { effort: 'high' } },
+  });
+  const violations = validateManifestAgainstCode(parse({ ...raw, expectedArmRoster: roster }));
+  assert.ok(!violations.some((v) => /are the same entrant/.test(v)), JSON.stringify(violations));
+});
+
+test('the credential check runs on an entry the other roster guards would skip', () => {
+  // Both the duplicate-id and unknown-participant guards `continue`, and the
+  // configuration checks used to sit after them — so exactly the two entries a
+  // hand-edited roster produces got a schema complaint and no word about what
+  // was in the file. The diagnostic is the whole value of that check.
+  const priorKey = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = 'sk-synthetic-value-generated-for-this-test-only';
+  try {
+    const raw = codeConsistentRaw();
+    const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+    roster.push({
+      participantId: 'ghost',
+      provider: 'openai',
+      requestedModelId: 'x',
+      approvedReportedModelIds: ['x'],
+      configuration: { note: process.env['OPENAI_API_KEY'] },
+    });
+    const violations = validateManifestAgainstCode(parse({ ...raw, expectedArmRoster: roster }));
+    assert.ok(
+      violations.some((v) => /is not a code-supported participant/.test(v)),
+      'the unknown-participant guard still fires',
+    );
+    assert.ok(
+      violations.some((v) => /matching a credential in this environment/.test(v)),
+      `and the credential is still reported: ${JSON.stringify(violations)}`,
+    );
+    for (const violation of violations) {
+      assert.ok(!violation.includes('sk-synthetic'), 'the refusal must not echo the credential');
+    }
+  } finally {
+    if (priorKey === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = priorKey;
+  }
 });

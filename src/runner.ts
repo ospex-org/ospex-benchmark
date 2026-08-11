@@ -267,7 +267,7 @@ export interface SlateRunOptions {
    * (the dry run a synthetic clock anchored to the fixture).
    */
   nowMs?: (() => number) | undefined;
-  /** Called after each game's four arms have all settled (sealed per game). */
+  /** Called after each game's arms have ALL settled (sealed per game). */
   onGameComplete?: ((line: string) => void) | undefined;
 }
 
@@ -345,7 +345,10 @@ interface DispatchTarget {
 }
 
 async function timedChat(
-  adapter: Pick<DispatchTarget, 'chat'>,
+  // The whole target, not just its `chat`: the configuration sent with a call
+  // has to come from the same authenticated arm the result is recorded under,
+  // and taking both from one value is what makes that true by construction.
+  adapter: Pick<DispatchTarget, 'chat' | 'arm'>,
   turns: ChatTurn[],
   timeoutMs: number,
   maxOutputTokens: number,
@@ -366,7 +369,13 @@ async function timedChat(
   const startedAt = startMs;
   const requestAt = new Date(startedAt).toISOString();
   try {
-    const response = await adapter.chat(turns, timeoutMs, { maxOutputTokens, tools });
+    const response = await adapter.chat(turns, timeoutMs, {
+      maxOutputTokens,
+      tools,
+      // The repair leg carries the SAME configuration: it is the same entrant
+      // reformatting its own answer, not a second competitor.
+      configuration: adapter.arm.configuration,
+    });
     const respondedAt = nowMs();
     return {
       rawText: redactSecrets(response.rawText),
@@ -883,10 +892,10 @@ async function dispatchArmCore(
 
 /**
  * Per-game dispatch: games run SEQUENTIALLY in cutoff order (the earliest
- * first pitch is always served first); within each game the four arms run
+ * first pitch is always served first); within each game the arms run
  * CONCURRENTLY against that game's identical frozen request. One game's
  * failure affects only that game. Outputs stay sealed per game — nothing is
- * reported until all four arms for that game have settled, so no arm can be
+ * reported until every arm for that game has settled, so no arm can be
  * conditioned on another's answer.
  *
  * Every request is put through the prepared-request boundary BEFORE any arm is
@@ -1123,6 +1132,13 @@ export async function runAuthorizedDispatch(
           provider: facade.provider as ArmSpec['provider'],
           requestedModelId: facade.requestedModelId,
           credentialEnvVar: facade.credentialEnvVar,
+          // Empty, and provably so rather than by omission: the authenticated
+          // roster this facade was built from cannot carry a configuration
+          // (`expectedArmIdentity` refuses a roster entry that declares one),
+          // so on this path every arm competes at its provider's defaults.
+          // Reading one off the facade instead would be reading it from
+          // somewhere the authorization gate never checked.
+          configuration: {},
         },
         // The facades' bound methods — captured before the claim, never re-read from a map.
         hasCredential: () => facade.hasCredential(),

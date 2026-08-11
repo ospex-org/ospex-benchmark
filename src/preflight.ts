@@ -97,6 +97,12 @@ async function main(): Promise<number> {
     try {
       const response = await adapter.chat(turns, args.timeoutSeconds * 1000, {
         maxOutputTokens: args.maxOutputTokens,
+        // The arm's real configuration, so this billable call exercises the
+        // request the cohort will actually send. A preflight that sent the
+        // provider defaults would green-light a setting the provider might
+        // reject, and finding that out on a game night is the failure this
+        // command exists to prevent.
+        configuration: arm.configuration,
       });
       const latency = Date.now() - startedAt;
       const failures: string[] = [];

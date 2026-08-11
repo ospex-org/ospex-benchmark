@@ -8,6 +8,14 @@ import { isBaselinePolicyVersion, supportsScopedInput } from './baselines.js';
 import { promptScaffoldSha256 } from './prompt.js';
 import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { SCORING_POLICY_VERSION, defaultExpectedArms } from './scoring.js';
+import { describeError, redactSecrets } from './config.js';
+import { ARMS, planArmRequest } from './providers/index.js';
+import {
+  canonicalConfigurationText,
+  configurationSha256,
+} from './participantConfiguration.js';
+import type { ParticipantConfiguration } from './participantConfiguration.js';
+import type { ChatTurn, ProviderCallOptions } from './types.js';
 
 /**
  * The sports this benchmark's read / discovery / scoring path supports —
@@ -187,8 +195,43 @@ export function validateManifestAgainstCode(manifest: CohortManifestV1): string[
   // at scoring. When the roster threads through dispatch + scoring, this can relax
   // to allow a precommitted subset.
   const codeArms = new Map(defaultExpectedArms().map((a) => [a.participantId, a]));
+  // A duplicate id in the CODE roster would collapse in that Map, so the
+  // missing-arm sweep below could not see it. Dispatch throws on one, but only
+  // after boot and publication have both passed.
+  if (codeArms.size !== defaultExpectedArms().length) {
+    violations.push('the code arm registry contains a duplicate participantId');
+  }
+
+  // Two entrants that are byte-identical are one competitor entered twice, and
+  // the post-run identity gate already refuses that — but it runs on RESPONSES,
+  // which means the refusal arrives after a full night of provider spend, and
+  // arrives as a permanently unscoreable artifact. It is decidable here, from
+  // the roster alone. Same reasoning as `mergeabilityViolations`: a refused
+  // boot beats a mid-fire discovery.
+  const byEntrant = new Map<string, string>();
+  for (const arm of manifest.expectedArmRoster) {
+    const key = JSON.stringify([arm.requestedModelId, configurationSha256(arm.configuration)]);
+    const prior = byEntrant.get(key);
+    if (prior !== undefined && prior !== arm.participantId) {
+      violations.push(
+        `roster arms "${prior}" and "${arm.participantId}" are the same entrant: model "${arm.requestedModelId}" under the identical configuration`,
+      );
+      continue;
+    }
+    byEntrant.set(key, arm.participantId);
+  }
+
   const seen = new Set<string>();
   for (const arm of manifest.expectedArmRoster) {
+    // The configuration checks run for EVERY entry, before any `continue`.
+    // They used to sit after the duplicate-id and unknown-participant guards,
+    // which skipped them for exactly the two entries most likely to be a
+    // hand-edited addition — so a roster carrying a credential in a "ghost"
+    // arm was refused for the wrong reason and never said what was in the
+    // file. The diagnostic is the whole value of that check.
+    for (const violation of configurationViolationsFor(arm)) {
+      violations.push(`roster arm "${arm.participantId}" ${violation}`);
+    }
     if (seen.has(arm.participantId)) {
       violations.push(`duplicate roster participantId "${arm.participantId}"`);
       continue;
@@ -212,6 +255,18 @@ export function validateManifestAgainstCode(manifest: CohortManifestV1): string[
     if (!sameStringSet(arm.approvedReportedModelIds, code.approvedReportedModelIds)) {
       violations.push(`roster arm "${arm.participantId}" approvedReportedModelIds do not match code`);
     }
+    // The configuration is compared BY DIGEST against the code's, for the same
+    // reason as everything above it and with more at stake. Without this a
+    // manifest could precommit to a setting the adapters would never send: the
+    // digest would be published, hashed into cohortId, and describe a request
+    // that did not happen. Falsifiability is the whole point of publishing it.
+    const declared = configurationSha256(arm.configuration);
+    const inCode = configurationSha256(code.configuration);
+    if (declared !== inCode) {
+      violations.push(
+        `roster arm "${arm.participantId}" configuration ${declared} != code ${inCode}`,
+      );
+    }
   }
   for (const participantId of codeArms.keys()) {
     if (!seen.has(participantId)) {
@@ -228,6 +283,100 @@ export function validateManifestAgainstCode(manifest: CohortManifestV1): string[
     );
   }
 
+  return violations;
+}
+
+/**
+ * Everything about ONE roster entry's configuration that can be checked
+ * without knowing whether the entry is otherwise well-formed.
+ *
+ * Split out so it can run before the duplicate-id and unknown-participant
+ * guards, which both `continue`. Those are exactly the entries a hand-edited
+ * roster produces, and skipping the credential check on them meant the
+ * operator got a schema complaint and no word about what was in the file.
+ */
+function configurationViolationsFor(arm: CohortManifestV1['expectedArmRoster'][number]): string[] {
+  const violations: string[] = [];
+
+  // This manifest is published verbatim to a public Git repository, and
+  // `configuration` is the one field in it that accepts names this schema has
+  // never seen. Compare the canonical text against its redacted form and
+  // refuse on any difference; the check never names or emits the value.
+  //
+  // ITS BOUND, because a clean result here is weaker than it looks: this is
+  // exact-substring matching against the secrets THIS PROCESS holds, so it is
+  // a property of the validating environment and not of the manifest. It
+  // cannot see a credential this shell did not export, one belonging to a
+  // provider not enrolled in the secret registry, one shorter than the
+  // registry's floor, or one split across two keys. And it runs at BOOT — the
+  // publication it protects has already happened by then, so it refuses to
+  // RUN rather than preventing disclosure. The gate that prevents disclosure
+  // is the pre-commit scan, and it lives outside this program.
+  const canonicalText = canonicalConfigurationText(arm.configuration);
+  if (redactSecrets(canonicalText) !== canonicalText) {
+    violations.push(
+      'configuration contains a value matching a credential in this environment — a manifest is published verbatim, so treat it as already disclosed and rotate',
+    );
+  }
+
+  // Can it actually be merged? `planArmRequest` builds the real request body
+  // through the adapters' own builders and throws if the configuration
+  // collides with something the cohort already sets, or names something the
+  // per-attempt record carries from outside the body. Proving it here means a
+  // bad configuration costs a refused boot rather than a mid-fire throw with
+  // provider spend already committed.
+  violations.push(...mergeabilityViolations(arm.participantId, arm.configuration));
+  return violations;
+}
+
+/**
+ * Two synthetic turns, enough to build a request and never sent anywhere.
+ * `planArmRequest` returns the body the adapters would have built; nothing in
+ * this file touches the network.
+ */
+const MERGEABILITY_PROBE_TURNS: ChatTurn[] = [
+  { role: 'system', content: 'mergeability probe' },
+  { role: 'user', content: 'mergeability probe' },
+];
+
+/**
+ * Whether an arm's configuration can be merged into every request this cohort
+ * will make with it.
+ *
+ * The legs are ENUMERATED, not sampled, because the body differs between them
+ * and so does what a configuration can collide with. A repair carries no tool
+ * block, so a configuration touching `tools` collides on the initial leg only;
+ * Gemini creates `generationConfig` only when a token cap is supplied, so a
+ * configuration touching `generationConfig.maxOutputTokens` collides on the
+ * capped legs only. Checking one leg would pass a configuration that throws on
+ * the call it first applies to — mid-fire, with provider spend committed.
+ */
+function mergeabilityViolations(
+  participantId: string,
+  configuration: ParticipantConfiguration,
+): string[] {
+  const codeArm = ARMS.find((a) => a.participantId === participantId);
+  // Not a code arm — already reported by the roster check; do not report twice.
+  if (codeArm === undefined) return [];
+  // The MANIFEST's configuration against the code arm's provider and model:
+  // this function validates the document, and a manifest declaring something
+  // the adapters could not send is exactly the defect it exists to catch. When
+  // the two configurations agree, which the digest check above requires, this
+  // is the same thing either way.
+  const spec = { ...codeArm, configuration };
+  const legs: Array<{ label: string; options: ProviderCallOptions }> = [
+    { label: 'the initial leg', options: { tools: 'declared', maxOutputTokens: 16_000 } },
+    { label: 'the repair leg', options: { tools: 'none', maxOutputTokens: 16_000 } },
+    { label: 'a leg with no token cap', options: { tools: 'declared' } },
+  ];
+  const violations: string[] = [];
+  for (const leg of legs) {
+    try {
+      planArmRequest(spec, MERGEABILITY_PROBE_TURNS, leg.options);
+    } catch (error) {
+      violations.push(`configuration cannot be merged into ${leg.label}: ${describeError(error)}`);
+    }
+  }
   return violations;
 }
 

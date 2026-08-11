@@ -118,9 +118,16 @@ export function parseFireArtifactV1(bytes: string): FireArtifactV1 {
 // ---------------------------------------------------------------------------
 
 function identityArm(participantId: string, provider: string, requestedModelId: string): ArmSpec {
-  // credentialEnvVar is unused by validateResponseText (it checks the response's
-  // echoed cohort/participant/model/bundle, not credentials).
-  return { participantId, provider: provider as ProviderName, requestedModelId, credentialEnvVar: '' };
+  // credentialEnvVar and configuration are unused by validateResponseText (it
+  // checks the response's echoed cohort/participant/model/bundle, and no
+  // provider echoes a configuration back at all).
+  return {
+    participantId,
+    provider: provider as ProviderName,
+    requestedModelId,
+    credentialEnvVar: '',
+    configuration: {},
+  };
 }
 
 /**

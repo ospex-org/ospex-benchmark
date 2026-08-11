@@ -611,7 +611,7 @@ export async function armCampaign(options: CampaignOptions, deps: CampaignDeps):
   printLine(`  cohortId ${booted.cohortId}`);
   printLine(`  sports ${booted.manifest.sportAllowList.join(', ')}`);
   printLine(`  window ${booted.manifest.windowStart} → ${booted.manifest.windowEnd}`);
-  printLine(`  size   at most ${projection.maxCalls} provider calls (${projection.maxFires} fires of 4 arms)`);
+  printLine(`  size   at most ${projection.maxCalls} provider calls (${projection.maxFires} fires of ${booted.manifest.expectedArmRoster.length} arms)`);
   printLine(`  cost   ≈ ${usd(projection.observedUsdMicros)} expected at the observed rate`);
   printLine(`         ≤ ${usd(projection.conservativeUsdMicros)} at the committed conservative worst case`);
   printLine(`  bounds ${booted.manifest.constants.maxDispatchesPerTick} fire(s)/tick; an attempt priced above $100 halts the campaign (detection, not a per-call cap)`);
@@ -1124,7 +1124,7 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
     printLine(`CAMPAIGN STATUS — cohort ${booted.cohortId}`);
     printLine(`  sports ${manifest.sportAllowList.join(', ')}`);
     printLine(`  window ${manifest.windowStart} → ${manifest.windowEnd}`);
-    printLine(`  size   at most ${projection.maxCalls} provider calls (${projection.maxFires} fires of 4 arms)`);
+    printLine(`  size   at most ${projection.maxCalls} provider calls (${projection.maxFires} fires of ${booted.manifest.expectedArmRoster.length} arms)`);
 
     // The durable authorization, classified by the SAME strict validator the tick uses.
     const stored = await authorizations.read(booted.cohortId);

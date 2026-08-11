@@ -126,10 +126,33 @@ export const expectedArmIdentitySchemaV1 = z
  * `approvedReportedModelIds` IN ORDER. Excludes credential locations, observed
  * reported IDs, roster index, and the cohort/fire/run domain (separate `armDigest`
  * fields). The result is detached (defensive array copy) and deep-frozen.
+ *
+ * It also excludes the entry's `configuration`, and REFUSES rather than drops
+ * one — see the guard below.
  */
 export function expectedArmIdentity(
   entry: CohortManifestV1['expectedArmRoster'][number],
 ): ExpectedArmIdentityV1 {
+  // A dropped configuration here would be a decision published under the wrong
+  // entrant. Two arms running one model at two settings project to the
+  // BYTE-IDENTICAL identity, hash to the same `armDigest`, and become
+  // indistinguishable in the very artifact that exists to distinguish them —
+  // and nothing downstream could notice, because the two are supposed to look
+  // alike everywhere except here.
+  //
+  // Carrying it properly means adding a field to a `.strict()` v1 schema that
+  // sits inside `armDigest` -> `preparedSnapshotDigest` -> `fireId` -> `runId`.
+  // That makes every retained fire artifact both unparseable and unreplayable,
+  // so it is a deliberate schema-version change and belongs to the slice that
+  // first enrols a configured arm — which is a money decision anyway, since the
+  // per-fire reservation is derived from the roster size. Until then the
+  // line-open path runs the all-defaults roster it was proved on, and says so
+  // out loud instead of quietly running something else.
+  if (Object.keys(entry.configuration).length > 0) {
+    throw new Error(
+      `the v1 expected-arm identity has no field for a participant configuration, and ${entry.participantId} declares one — enrolling a configured arm on the line-open path requires versioning the fire identity`,
+    );
+  }
   return deepFreeze({
     participantId: entry.participantId,
     provider: entry.provider,

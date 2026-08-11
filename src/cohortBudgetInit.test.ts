@@ -42,6 +42,7 @@ function manifestJson(): string {
       provider: a.provider,
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
+      configuration: a.configuration,
     })),
     toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',

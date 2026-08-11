@@ -9,7 +9,7 @@ import { deepFreeze } from './freeze.js';
  * manifestValidate) read — so what a cohort declares and what its requests
  * actually send cannot drift apart.
  *
- * tools-v1 enables provider web search on all four arms, each through the
+ * tools-v1 enables provider web search on every arm, each through the
  * provider's own current mechanism:
  *   - openai   → Responses API server tool `{type: "web_search"}` with the
  *                top-level `max_tool_calls` cap and

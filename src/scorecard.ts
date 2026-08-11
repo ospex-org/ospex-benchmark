@@ -317,7 +317,7 @@ export function buildScorecardMarkdown(
   lines.push('');
   lines.push('- One reference source: this is reference-closing CLV, not a market consensus close.');
   lines.push(
-    '- The four models saw the same games, so participant rows are not independent samples; uncertainty intervals are out of scope for the smoke.',
+    '- Every participant saw the same games, so participant rows are not independent samples; uncertainty intervals are out of scope for the smoke.',
   );
   lines.push('- No execution layer existed: decision CLV only, no fills, no execution CLV.');
   lines.push('');

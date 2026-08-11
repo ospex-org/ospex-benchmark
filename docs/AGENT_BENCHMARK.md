@@ -120,7 +120,7 @@ Two benchmark families are useful and must remain distinct:
 
 ### Cross-lab flagship cohort
 
-Use one broadly available flagship single-model route from each lab, with exact model IDs and explicit provider-native reasoning settings recorded. The first candidate cohort as of 2026-07-11 is:
+Compare broadly available flagship single-model routes across labs, with exact model IDs and explicit provider-native reasoning settings recorded. A cohort entry is a PARTICIPANT — one competing configuration — not a lab and not a model line, so a lab may enter more than one model and a model may enter at more than one reasoning setting; two entries that name the same model must differ in their configuration. The first candidate cohort as of 2026-07-11 entered one model per lab, each at its provider's defaults:
 
 - OpenAI `gpt-5.6-sol`;
 - Anthropic `claude-fable-5`;
@@ -129,11 +129,11 @@ Use one broadly available flagship single-model route from each lab, with exact 
 
 Direct provider APIs are preferred over consumer-subscription/OAuth aliases for public reproducibility, usage accounting, and stable request metadata. A preview or moving alias must be disclosed; if a fixed snapshot is unavailable, bound the cohort by exact dates and preserve response metadata.
 
-Provider reasoning controls are not perfectly equivalent. Canonical v1 compares each lab's documented high-capability **single-model** configuration, records the differences, and does not claim equal compute. OpenAI multi-agent `ultra` and analogous managed multi-agent modes are separate experiments.
+Provider reasoning controls are not perfectly equivalent, and this benchmark does not pretend otherwise: each participant records its settings in its OWN lab's vocabulary, verbatim, and nothing maps them onto a shared effort scale. Canonical v1 compares each lab's documented high-capability **single-model** configuration, records the differences, and does not claim equal compute. What is verifiable is that the recorded configuration is the one that went out on the wire; no provider echoes a reasoning setting back, so whether a lab honoured it is not verifiable from a response. OpenAI multi-agent `ultra` and analogous managed multi-agent modes are separate experiments.
 
 ### Within-family cost/capability cohort
 
-A separate OpenAI-family cohort may compare `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and a frozen baseline such as `gpt-5.5`. This is useful for price/performance analysis but is not provider diversity.
+An OpenAI-family comparison — `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, a frozen baseline such as `gpt-5.5`, or one model at two reasoning settings — is useful for price/performance analysis but is NOT provider diversity, and the distinction is the reader's to keep whether the entries share a cohort or not. Same-lab entries no longer require a separate cohort: they are separate participants.
 
 Never swap a model during a cohort. A newly released model starts a new cohort or a clearly versioned extension.
 
@@ -144,12 +144,12 @@ Every economic participant has one dedicated wallet identity for the cohort. A w
 Minimum canonical topology after live-wallet gates pass:
 
 - two dedicated maker wallets;
-- four dedicated benchmark-taker wallets, one per lab model participant;
+- one dedicated benchmark-taker wallet per model PARTICIPANT (four in the candidate cohort above; a second configuration of one model is a second participant and needs its own wallet, not a shared one);
 - eight dedicated deterministic-policy wallets, one per baseline participant;
 - Vince's separate user wallet;
 - optional separate creator/postgame/operator wallet where operationally useful.
 
-This produces 15 public/economic fishbowl participants before support roles: two makers, four lab-model agents, eight deterministic baselines, and Vince.
+With the candidate cohort that is 15 public/economic fishbowl participants before support roles: two makers, four lab-model agents, eight deterministic baselines, and Vince. Enrolling a further model participant moves that count and the wallet topology with it.
 
 Creating keystores and role manifests is separate from funding. Wallets should be created and dry-verified before funding; funding and approvals remain bounded and staged. No benchmark key or provider credential enters public docs/artifacts.
 

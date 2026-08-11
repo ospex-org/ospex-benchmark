@@ -106,7 +106,11 @@ CohortManifestV1 {
   // Model-facing configuration
   promptScaffoldSha256,
   expectedArmRoster: [
-    { participantId, provider, requestedModelId, approvedReportedModelIds }
+    // `configuration` is the participant's own provider-native settings, verbatim
+    // in its lab's vocabulary; `{}` means "sets no knobs" and is a real value.
+    // A cohort entry is one competing configuration, so two entries may name the
+    // same model when their configurations differ.
+    { participantId, provider, requestedModelId, approvedReportedModelIds, configuration }
   ],
   toolInferenceConfigSha256,       // tool permissions + sampling/inference config
   baselinePolicyVersion,
@@ -687,7 +691,12 @@ and unique strictly-increasing attempt numbers; any violation fails arm/fire int
 
 - a successful response requires an **approved reported model ID**
   (`approvedReportedModelIds`);
-- same-family substitution, model drift, and arm-family collision **fail integrity**;
+- same-family substitution, model drift, and an ENTRANT collision — two arms
+  reporting the same model under the same configuration — **fail integrity**
+  (two arms from one lab, and one model at two settings, do not: that is what a
+  participant is);
+- a run's arm-roster stamp must recompute, must match the precommitted roster,
+  and must be corroborated by each attempt's recorded request parameters;
 - **at most one** repair attempt (`maxRepairAttemptsPerArm = 1`);
 - a repair may fix **schema/format only** and must **preserve the initial decision
   fingerprint**;

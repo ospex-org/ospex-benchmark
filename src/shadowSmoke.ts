@@ -13,6 +13,7 @@ import {
 } from './mock.js';
 import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
 import { checkProviderCollision } from './providers/family.js';
+import { configurationSha256 } from './participantConfiguration.js';
 import {
   buildRecords,
   failuresByCode,
@@ -32,7 +33,7 @@ import type { ArmOutcome, SlateInputs } from './types.js';
  *
  * Fetches an MLB slate with reference odds from the existing public read
  * path, freezes a content-hashed single-game bundle per game, dispatches the
- * four arms concurrently per game (games sequential, outputs sealed per
+ * the cohort's arms concurrently per game (games sequential, outputs sealed per
  * game), validates every forecast against the strict output schema, records
  * everything with provenance, and stops. No scoring, no wallets, no chain
  * access, no SSE.
@@ -237,6 +238,7 @@ async function main(): Promise<number> {
       provider: arm.provider,
       requestedModelId: arm.requestedModelId,
       approvedReportedModelIds: approvedReportedModelIds(arm.participantId),
+      configurationSha256: configurationSha256(arm.configuration),
       reportedModelIds: reportedByArm.get(arm.participantId) ?? [],
       unidentifiedResponses: unidentifiedByArm.get(arm.participantId) ?? 0,
     })),

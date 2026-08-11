@@ -37,12 +37,14 @@ const ARM_A: ArmSpec = {
   provider: 'openai',
   requestedModelId: 'model-a',
   credentialEnvVar: 'STUB_A_KEY',
+  configuration: {},
 };
 const ARM_B: ArmSpec = {
   participantId: 'arm-b',
   provider: 'anthropic',
   requestedModelId: 'model-b',
   credentialEnvVar: 'STUB_B_KEY',
+  configuration: {},
 };
 const ARMS: ArmSpec[] = [ARM_A, ARM_B];
 
@@ -448,6 +450,7 @@ test('a post-preparation mutation of the build slate cannot split the artifact',
         provider: ARM_A.provider,
         requestedModelId: ARM_A.requestedModelId,
         approvedReportedModelIds: [ARM_A.requestedModelId],
+        configuration: {},
       },
     ],
   });

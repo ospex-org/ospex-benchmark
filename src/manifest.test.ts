@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { test } from 'node:test';
 import { cohortId, parseManifest } from './manifest.js';
+import { MAX_CONFIGURATION_CANONICAL_BYTES } from './participantConfiguration.js';
 
 /**
  * CohortManifestV1 structural-parse tests: a valid fixture round-trips, cohortId
@@ -23,8 +24,8 @@ function validManifest(): Record<string, unknown> {
     marketPolicyDigest: 'aa6f24ddc0758d8366449b0ae4803898079cee1cfdfa36575a67da9751509dcd',
     promptScaffoldSha256: 'a'.repeat(64),
     expectedArmRoster: [
-      { participantId: 'openai-gpt', provider: 'openai', requestedModelId: 'gpt-x', approvedReportedModelIds: ['gpt-x'] },
-      { participantId: 'anthropic-claude', provider: 'anthropic', requestedModelId: 'claude-x', approvedReportedModelIds: ['claude-x'] },
+      { participantId: 'openai-gpt', provider: 'openai', requestedModelId: 'gpt-x', approvedReportedModelIds: ['gpt-x'], configuration: {} },
+      { participantId: 'anthropic-claude', provider: 'anthropic', requestedModelId: 'claude-x', approvedReportedModelIds: ['claude-x'], configuration: {} },
     ],
     toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.2.0',
@@ -268,4 +269,93 @@ test('manifest integers must be JS-safe — unsafe magnitudes are rejected (clos
       /invalid cohort manifest/,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Participant configuration
+// ---------------------------------------------------------------------------
+
+function rosterArm(over: Record<string, unknown>): Record<string, unknown> {
+  const raw = validManifest() as Record<string, unknown>;
+  const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  roster[0] = { ...roster[0]!, ...over };
+  return { ...raw, expectedArmRoster: roster };
+}
+
+test('a roster arm that OMITS its configuration is rejected', () => {
+  // This manifest exists to precommit, and an omission is not a precommitment.
+  // Defaulting the field would read a forgotten line as "this arm sets no
+  // knobs" — a claim nobody made, published to public Git and hashed into the
+  // cohort identity.
+  const omitted = validManifest() as Record<string, unknown>;
+  const roster = [...(omitted['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  const { configuration: _dropped, ...withoutConfiguration } = roster[0]!;
+  roster[0] = withoutConfiguration;
+  assert.throws(
+    () => parseManifest({ ...omitted, expectedArmRoster: roster }),
+    /expectedArmRoster\.0\.configuration/,
+  );
+});
+
+test('an explicit empty configuration is accepted, and IS the value', () => {
+  // The negative control for the test above: `{}` is not an absence.
+  const parsed = parseManifest(rosterArm({ configuration: {} }));
+  assert.deepEqual(parsed.expectedArmRoster[0]?.configuration, {});
+});
+
+test('a configuration changes cohortId — a methodology change mints a new cohort', () => {
+  const base = cohortId(parseManifest(rosterArm({ configuration: {} })));
+  const tuned = cohortId(parseManifest(rosterArm({ configuration: { reasoning: { effort: 'high' } } })));
+  assert.notEqual(base, tuned);
+  // ...and nothing else about the manifest moved.
+  assert.equal(base, cohortId(parseManifest(rosterArm({ configuration: {} }))));
+});
+
+test('the configuration value space is enforced at PARSE, before cohortId can hash it', () => {
+  // `canonicalize` throws on a non-finite number, and `cohortId` re-parses
+  // defensively before hashing — so a value that reached the hash would be a
+  // crash at boot from a stack that does not name the field.
+  assert.throws(() => parseManifest(rosterArm({ configuration: { a: Number.POSITIVE_INFINITY } })));
+  assert.throws(() => parseManifest(rosterArm({ configuration: { a: Number.NaN } })));
+  assert.throws(() => parseManifest(rosterArm({ configuration: 'not-an-object' })));
+  assert.throws(() => parseManifest(rosterArm({ configuration: [] })));
+});
+
+test('an oversized configuration is refused at parse, in bytes', () => {
+  // Refused here rather than at publication: a roster that cannot be written
+  // is a night of provider spend producing an unpublishable artifact, and the
+  // roster is known before the first call.
+  const tooBig = { k: 'x'.repeat(MAX_CONFIGURATION_CANONICAL_BYTES) };
+  assert.throws(() => parseManifest(rosterArm({ configuration: tooBig })), /canonical bytes, over the/);
+});
+
+test('a __proto__ key anywhere in the RAW manifest is refused', () => {
+  // An earlier version of this test measured that zod SILENTLY DROPS such a
+  // key and called it a curiosity. It is not: this document is a public
+  // precommitment whose raw bytes are compared at publication, and `cohortId`
+  // hashes the PARSED value. Dropping the key lets two different published
+  // byte sequences boot as the SAME cohort while the run stamps a
+  // configuration that is not the one published — and it skips the post-parse
+  // configuration checks, because by then the key is gone.
+  const hostile = JSON.parse('{"__proto__": {"polluted": true}}') as Record<string, unknown>;
+  assert.throws(
+    () => parseManifest(rosterArm({ configuration: hostile })),
+    /uses the reserved key "__proto__"/,
+  );
+  // Anywhere, not just in a configuration — `.strict()` cannot catch it either,
+  // because the key is gone before the unknown-key check runs.
+  const topLevel = JSON.parse('{"__proto__": {"polluted": true}}') as Record<string, unknown>;
+  assert.throws(() => parseManifest({ ...validManifest(), ...topLevel }), /__proto__/);
+  assert.equal(({} as Record<string, unknown>)['polluted'], undefined);
+});
+
+test('the refusal names WHERE the key is, and an ordinary manifest still parses', () => {
+  // The negative control: a build that refused every manifest would satisfy
+  // the test above.
+  assert.ok(parseManifest(validManifest()));
+  const hostile = JSON.parse('{"__proto__": 1}') as Record<string, unknown>;
+  assert.throws(
+    () => parseManifest(rosterArm({ configuration: hostile })),
+    /expectedArmRoster\[0\]\.configuration\.__proto__/,
+  );
 });

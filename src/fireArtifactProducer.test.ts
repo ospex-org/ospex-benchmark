@@ -73,6 +73,7 @@ const ARMS: ArmSpec[] = CODE_ARMS.map((a) => ({
   provider: a.provider as ProviderName,
   requestedModelId: a.requestedModelId,
   credentialEnvVar: `${a.participantId.replace(/[^a-z0-9]/gi, '_').toUpperCase()}_KEY`,
+  configuration: {},
 }));
 
 // --- game / request / response fixtures (scoped to a market subset) ---------
@@ -211,6 +212,7 @@ function manifestObject(over: { baselinePolicyVersion?: string; network?: string
       provider: a.provider,
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
+      configuration: a.configuration,
     })),
     toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: over.baselinePolicyVersion ?? 'baselines-v0.3.0',

@@ -5,9 +5,12 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
+import { configurationSha256 } from './participantConfiguration.js';
+import type { ParticipantConfiguration } from './participantConfiguration.js';
 import { CLOSE_QUALITY_REASONS } from './clv.js';
 import { buildScorecardMarkdown } from './scorecard.js';
 import type { BaselinePolicyVersion } from './baselines.js';
+import type { ExpectedArm } from './scoring.js';
 import {
   aggregateByParticipant,
   closeQuoteFromRow,
@@ -49,6 +52,7 @@ const FIXTURE_ARMS = [
     provider: 'openai',
     requestedModelId: 'stub-model-1',
     approvedReportedModelIds: ['stub-model-1'],
+    configuration: {},
   },
 ];
 const TIMEOUT_ARM = {
@@ -56,6 +60,7 @@ const TIMEOUT_ARM = {
   provider: 'xai',
   requestedModelId: 'stub-model-2',
   approvedReportedModelIds: ['stub-model-2'],
+  configuration: {},
 };
 const FIXTURE_ARMS_WITH_TIMEOUT = [...FIXTURE_ARMS, TIMEOUT_ARM];
 const SECOND_MODEL_ARM = {
@@ -63,6 +68,7 @@ const SECOND_MODEL_ARM = {
   provider: 'anthropic',
   requestedModelId: 'stub-model-3',
   approvedReportedModelIds: ['stub-model-3'],
+  configuration: {},
 };
 
 /**
@@ -1564,6 +1570,7 @@ function syntheticScored(
     ...scheduleOverrides,
     kind: 'baseline',
     participantId: 'synthetic-policy',
+    configurationSha256: null,
     gameId,
     market: 'total',
     selection: 'over',
@@ -3517,4 +3524,425 @@ test('B1 NEGATIVE CONTROL: with an untagged scoreable pick the CLI prints NO not
     else process.env['SUPABASE_ANON_KEY'] = priorKey;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// The arm-roster stamp
+// ---------------------------------------------------------------------------
+
+/**
+ * A NON-EMPTY configuration on purpose. An all-defaults roster cannot
+ * discriminate here: every digest would be the empty one, so a build that
+ * dropped the configuration entirely would produce the same bytes as a build
+ * that carried it, and every assertion below would stay green.
+ */
+const STAMP_CONFIG = { reasoning: { effort: 'high' } };
+const STAMP_DIGEST = configurationSha256(STAMP_CONFIG);
+const STAMP_ARMS: ExpectedArm[] = [{ ...FIXTURE_ARMS[0]!, configuration: STAMP_CONFIG }];
+
+type JsonRecordish = Record<string, unknown>;
+
+/** The default fixture, upgraded to a run that stamps its arm roster. */
+function stampedRun(mutate?: (records: JsonRecordish[]) => void): string[] {
+  const records = fixtureRun().lines.map((line) => JSON.parse(line) as JsonRecordish);
+  for (const record of records) {
+    if (record['recordType'] === 'run_meta') {
+      record['armRoster'] = [
+        {
+          participantId: 'model-arm',
+          provider: 'openai',
+          requestedModelId: 'stub-model-1',
+          configuration: STAMP_CONFIG,
+          configurationSha256: STAMP_DIGEST,
+          configurationDigestVersion: 1,
+        },
+      ];
+    }
+    if (record['recordType'] === 'arm_game_response') {
+      record['configurationSha256'] = STAMP_DIGEST;
+      for (const leg of ['attempt', 'repair']) {
+        const attempt = record[leg] as JsonRecordish | null | undefined;
+        if (attempt === null || attempt === undefined) continue;
+        attempt['requestParams'] = { endpoint: 'e', model: 'stub-model-1', reasoning: { effort: 'high' } };
+      }
+    }
+    if (record['recordType'] === 'decision') record['configurationSha256'] = STAMP_DIGEST;
+  }
+  mutate?.(records);
+  return records.map((record) => JSON.stringify(record));
+}
+
+function rosterEntry(records: JsonRecordish[]): JsonRecordish {
+  const meta = records.find((r) => r['recordType'] === 'run_meta')!;
+  return (meta['armRoster'] as JsonRecordish[])[0]!;
+}
+
+function stampViolations(mutate?: (records: JsonRecordish[]) => void): string[] {
+  return verifyRunIntegrity(parseRunRecords(stampedRun(mutate)), { expectedArms: STAMP_ARMS });
+}
+
+test('a correctly stamped run verifies', () => {
+  assert.deepEqual(stampViolations(), []);
+});
+
+test('an unstamped run still verifies - the stamp postdates the archives', () => {
+  // The negative control for every case below: absence is legacy, not a fault.
+  // Without this, a build that refused every stamp would pass them all.
+  assert.deepEqual(
+    verifyRunIntegrity(parseRunRecords(fixtureRun().lines), { expectedArms: FIXTURE_ARMS }),
+    [],
+  );
+});
+
+test('a stamped digest that does not recompute is refused', () => {
+  const violations = stampViolations((records) => {
+    rosterEntry(records)['configuration'] = { reasoning: { effort: 'low' } };
+  });
+  assert.ok(
+    violations.some((v) => /stamped configuration digest .* does not recompute/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a stamp that disagrees with the precommitted roster is refused', () => {
+  // Both halves stay self-consistent, so ONLY the comparison against the
+  // precommitted roster can catch this - a run cannot vouch for its own
+  // distinctness.
+  const other = { reasoning: { effort: 'low' } };
+  const violations = stampViolations((records) => {
+    const entry = rosterEntry(records);
+    entry['configuration'] = other;
+    entry['configurationSha256'] = configurationSha256(other);
+    for (const record of records) {
+      if (record['recordType'] === 'arm_game_response') {
+        record['configurationSha256'] = configurationSha256(other);
+      }
+      if (record['recordType'] !== 'arm_game_response') continue;
+      for (const leg of ['attempt', 'repair']) {
+        const attempt = record[leg] as JsonRecordish | null | undefined;
+        if (attempt === null || attempt === undefined) continue;
+        attempt['requestParams'] = { endpoint: 'e', reasoning: { effort: 'low' } };
+      }
+    }
+  });
+  assert.ok(
+    violations.some((v) => /ran configuration .* precommitted /.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a stamp missing an expected arm is refused', () => {
+  const violations = stampViolations((records) => {
+    const entry = rosterEntry(records);
+    const meta = records.find((r) => r['recordType'] === 'run_meta')!;
+    meta['armRoster'] = [{ ...entry, participantId: 'someone-else' }];
+  });
+  assert.ok(
+    violations.some((v) => /arm roster omits expected arm model-arm/.test(v)),
+    JSON.stringify(violations),
+  );
+  assert.ok(violations.some((v) => /stamps someone-else, which is not an expected arm/.test(v)));
+});
+
+test('a stamp naming one arm twice is refused', () => {
+  const violations = stampViolations((records) => {
+    const entry = rosterEntry(records);
+    const meta = records.find((r) => r['recordType'] === 'run_meta')!;
+    meta['armRoster'] = [entry, { ...entry }];
+  });
+  assert.ok(
+    violations.some((v) => /stamps model-arm more than once/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a digest version this build cannot recompute is refused, and not double-reported', () => {
+  const violations = stampViolations((records) => {
+    rosterEntry(records)['configurationDigestVersion'] = 99;
+  });
+  assert.ok(violations.some((v) => /digest version 99 is not 1/.test(v)), JSON.stringify(violations));
+  assert.ok(
+    !violations.some((v) => /does not recompute/.test(v)),
+    'a digest under an unknown rule must not also be reported as failing to recompute',
+  );
+});
+
+test('a response attributed to a configuration the arm did not run is refused', () => {
+  const violations = stampViolations((records) => {
+    const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+    response['configurationSha256'] = 'f'.repeat(64);
+  });
+  assert.ok(violations.some((v) => /is not this arm/.test(v)), JSON.stringify(violations));
+});
+
+test('a stamped run whose responses carry no digest is refused', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] === 'arm_game_response') delete record['configurationSha256'];
+    }
+  });
+  assert.ok(
+    violations.some((v) =>
+      /stamps an arm roster but this response carries no configuration digest/.test(v),
+    ),
+    JSON.stringify(violations),
+  );
+});
+
+test('an attempt that did not send the declared configuration is refused', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] !== 'arm_game_response') continue;
+      const attempt = record['attempt'] as JsonRecordish;
+      attempt['requestParams'] = { endpoint: 'e', model: 'stub-model-1' };
+    }
+  });
+  assert.ok(
+    violations.some((v) => /"reasoning\.effort" is absent from the recorded request parameters/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('an attempt that sent a DIFFERENT configuration is refused', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] !== 'arm_game_response') continue;
+      const attempt = record['attempt'] as JsonRecordish;
+      attempt['requestParams'] = { endpoint: 'e', reasoning: { effort: 'low' } };
+    }
+  });
+  assert.ok(
+    violations.some((v) => /was recorded as "low", not "high"/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('an attempt that never reached the provider is not evidence either way', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] !== 'arm_game_response') continue;
+      (record['attempt'] as JsonRecordish)['requestParams'] = null;
+    }
+  });
+  assert.ok(
+    !violations.some((v) => /declared configuration/.test(v)),
+    `a null request record carries no evidence: ${JSON.stringify(violations)}`,
+  );
+});
+
+/**
+ * A run whose SECOND arm reports the FIRST arm's model — one model entered
+ * twice. Which of the two it is, a legitimate pair of entrants or the same
+ * competitor counted twice, is decided entirely by their configurations.
+ *
+ * Built by rewriting the two-arm fixture rather than by adding a fixture
+ * option, because the only thing that has to change is the reported id.
+ */
+function sameModelRun(configurations: [ParticipantConfiguration, ParticipantConfiguration]): {
+  lines: string[];
+  expectedArms: ExpectedArm[];
+} {
+  const records = fixtureRun({ secondModelArm: true }).lines.map(
+    (line) => JSON.parse(line) as JsonRecordish,
+  );
+  for (const record of records) {
+    if (record['recordType'] !== 'arm_game_response') continue;
+    if (record['participantId'] !== 'model-arm-2') continue;
+    record['reportedModelId'] = 'stub-model-1';
+    for (const leg of ['attempt', 'repair']) {
+      const attempt = record[leg] as JsonRecordish | null | undefined;
+      if (attempt === null || attempt === undefined) continue;
+      if (attempt['reportedModelId'] !== null) attempt['reportedModelId'] = 'stub-model-1';
+    }
+  }
+  const [first, second] = configurations;
+  return {
+    lines: records.map((record) => JSON.stringify(record)),
+    expectedArms: [
+      { ...FIXTURE_ARMS[0]!, configuration: first },
+      {
+        ...SECOND_MODEL_ARM,
+        requestedModelId: 'stub-model-1',
+        approvedReportedModelIds: ['stub-model-1'],
+        configuration: second,
+      },
+    ],
+  };
+}
+
+test('two arms of one model at DIFFERENT configurations pass the recomputed identity gate', () => {
+  const { lines, expectedArms } = sameModelRun([
+    { reasoning: { effort: 'low' } },
+    { reasoning: { effort: 'high' } },
+  ]);
+  const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms });
+  assert.deepEqual(
+    violations.filter((v) => /recomputed identity gate/.test(v)),
+    [],
+    `two settings of one model are two entrants: ${JSON.stringify(violations)}`,
+  );
+});
+
+test('two arms of one model at the SAME configuration fail the recomputed identity gate', () => {
+  // The negative control, and the reason the pair exists: without it, a scorer
+  // that passed an empty digest for every arm — collapsing both entrants onto
+  // one key — would satisfy the test above by never distinguishing anything.
+  const shared = { reasoning: { effort: 'low' } };
+  const { lines, expectedArms } = sameModelRun([shared, shared]);
+  const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms });
+  assert.ok(
+    violations.some(
+      (v) =>
+        /recomputed identity gate/.test(v) &&
+        /identical model ID "stub-model-1" under the identical configuration/.test(v),
+    ),
+    `one competitor entered twice must be refused: ${JSON.stringify(violations)}`,
+  );
+});
+
+// --- gaps found by the adversarial pass ------------------------------------
+
+test('a stamped provider or model that disagrees with the precommitment is refused', () => {
+  // Both were WRITE-ONLY before: the stamp is what says who a decision belongs
+  // to, and only one of its three identity fields was being checked, so a stamp
+  // could name a different lab and model than every response in the file.
+  const provider = stampViolations((records) => {
+    rosterEntry(records)['provider'] = 'anthropic';
+  });
+  assert.ok(
+    provider.some((v) => /stamped provider "anthropic", precommitted "openai"/.test(v)),
+    JSON.stringify(provider),
+  );
+  const model = stampViolations((records) => {
+    rosterEntry(records)['requestedModelId'] = 'some-other-model';
+  });
+  assert.ok(
+    model.some((v) => /stamped requestedModelId "some-other-model", precommitted "stub-model-1"/.test(v)),
+    JSON.stringify(model),
+  );
+});
+
+test('a DECISION attributed to a configuration the arm did not run is refused', () => {
+  // The digest a publisher keys a participant row on. It was written by the
+  // producer and read by nobody, so editing it attributed a published pick to
+  // a competitor that never made it while the run verified clean.
+  const violations = stampViolations((records) => {
+    const decision = records.find((r) => r['recordType'] === 'decision')!;
+    decision['configurationSha256'] = 'f'.repeat(64);
+  });
+  assert.ok(
+    violations.some((v) => /decision configuration f{64} is not this arm's /.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a stamped run whose decisions carry no digest is refused', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] === 'decision') delete record['configurationSha256'];
+    }
+  });
+  assert.ok(
+    violations.some((v) =>
+      /stamps an arm roster but this decision carries no configuration digest/.test(v),
+    ),
+    JSON.stringify(violations),
+  );
+});
+
+test('the REPAIR leg is held to the declared configuration too', () => {
+  // The repair branch of the evidence loop had no coverage at all: every
+  // fixture had `repair: null`, so deleting the branch changed nothing. A
+  // repair is the same entrant reformatting its own answer, and a repair that
+  // dropped the setting would be a second, cheaper call published under it.
+  const violations = stampViolations((records) => {
+    const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+    response['repairUsed'] = true;
+    response['repair'] = {
+      reportedModelId: 'stub-model-1',
+      providerResponseId: 'repair-1',
+      rawResponse: null,
+      requestAt: null,
+      responseAt: null,
+      latencyMs: null,
+      providerStopReason: null,
+      turnCompleted: true,
+      // The initial leg carries it; this one does not.
+      requestParams: { endpoint: 'e', model: 'stub-model-1' },
+    };
+  });
+  assert.ok(
+    violations.some((v) => /:repair: declared configuration "reasoning\.effort" is absent/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a response-bearing attempt with NO recorded request is refused', () => {
+  // Erasing one field from an accepted response removed every configuration
+  // guarantee from the run while it still verified clean — the evidence gate
+  // skipped a null `requestParams` unconditionally, so it was opt-out.
+  const violations = stampViolations((records) => {
+    const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+    (response['attempt'] as JsonRecordish)['requestParams'] = null;
+  });
+  assert.ok(
+    violations.some((v) => /a response was received but no request parameters were recorded/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('ANY single sign that a response came back is enough to require the request record', () => {
+  // Swept rather than sampled. The obvious fixture carries all three signals
+  // at once, so no one of them is load-bearing and a build that consulted only
+  // two would pass — a mutation battery caught exactly that. Each case below
+  // leaves ONE signal standing, so each disjunct is the only thing that can
+  // produce the refusal.
+  const signals = ['rawResponse', 'reportedModelId', 'providerResponseId'] as const;
+  for (const kept of signals) {
+    const violations = stampViolations((records) => {
+      const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+      const attempt = response['attempt'] as JsonRecordish;
+      attempt['requestParams'] = null;
+      for (const signal of signals) {
+        if (signal !== kept) attempt[signal] = null;
+      }
+    });
+    assert.ok(
+      violations.some((v) => /a response was received but no request parameters were recorded/.test(v)),
+      `${kept} alone must still require a request record: ${JSON.stringify(violations)}`,
+    );
+  }
+});
+
+test('an attempt that genuinely never reached the provider is still not evidence', () => {
+  // The negative control, and the reason the previous version of this test was
+  // wrong: it nulled `requestParams` on an ACCEPTED response and called that
+  // "never reached the provider". A real one has no response id, no reported
+  // model, and no body — there is nothing to have recorded.
+  const violations = stampViolations((records) => {
+    const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+    const attempt = response['attempt'] as JsonRecordish;
+    attempt['requestParams'] = null;
+    attempt['rawResponse'] = null;
+    attempt['reportedModelId'] = null;
+    attempt['providerResponseId'] = null;
+  });
+  assert.ok(
+    !violations.some((v) => /no request parameters were recorded/.test(v)),
+    `a leg with no response evidence carries no request evidence either: ${JSON.stringify(violations)}`,
+  );
+});
+
+test('an UNSTAMPED archive is not held to the request-evidence rule', () => {
+  // Backward compatibility keyed on the stamp, which only new builds write.
+  const records = fixtureRun().lines.map((line) => JSON.parse(line) as JsonRecordish);
+  for (const record of records) {
+    if (record['recordType'] !== 'arm_game_response') continue;
+    (record['attempt'] as JsonRecordish)['requestParams'] = null;
+  }
+  const violations = verifyRunIntegrity(
+    parseRunRecords(records.map((r) => JSON.stringify(r))),
+    { expectedArms: FIXTURE_ARMS },
+  );
+  assert.deepEqual(violations, []);
 });
