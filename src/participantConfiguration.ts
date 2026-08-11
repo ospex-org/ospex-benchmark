@@ -161,6 +161,16 @@ function walkJson(value: unknown, path: string, violations: string[]): void {
         violations.push(`${where} uses the reserved key "${FORBIDDEN_KEY}"`);
         continue;
       }
+      if (key.includes('.')) {
+        // `configurationLeaves` joins with `.` and the evidence check splits on
+        // it, so a key containing one is not round-trippable: a flat `{"a.b":1}`
+        // is looked for at nested `a → b`, reported absent, and the run becomes
+        // unscoreable with a message blaming the adapter. The inverse pairing is
+        // worse — a flat declaration is SATISFIED by a nested record, so two
+        // configurations with different digests satisfy the same evidence.
+        violations.push(`${where} key "${key}" contains a dot, which is the evidence path separator`);
+        continue;
+      }
       walkJson(value[key], path === '' ? key : `${path}.${key}`, violations);
     }
     return;
@@ -187,14 +197,24 @@ export class ConfigurationCollisionError extends Error {
 /**
  * Merge a participant's configuration into a provider request body.
  *
- * The rule is one-directional and it is the whole safety story of this
- * feature: **a configuration may add to a request, never override it.** Any
- * leaf the cohort's frozen policy already set — the model, the prompt turns,
- * the declared tool block and its cap, the output-token cap — is a collision
- * and throws. So a per-participant setting cannot quietly raise the token cap
- * (which would move spend past what the fire reserved), cannot disable the
- * tool policy the cohort precommitted to, and cannot swap the model out from
- * under its own identity check.
+ * The rule is one-directional: **a configuration may add to a request, never
+ * override it.** Any leaf the cohort's frozen policy already set — the model,
+ * the prompt turns, the declared tool block and its cap, the output-token cap
+ * — is a collision and throws.
+ *
+ * STATE THE SCOPE, because the obvious reading of that is too strong. The rule
+ * protects exactly the keys the adapter's own body sets. It says nothing about
+ * a provider parameter the cohort does not set, and there are ones that
+ * matter: no adapter sets `tool_choice`, so nothing HERE stops a configuration
+ * adding it and competing with search off, and none sets `service_tier`,
+ * `candidateCount` or `background`. What actually bounds spend is the
+ * per-attempt reservation and the context envelope it was priced against, not
+ * this function; what binds the tool policy is the manifest's
+ * `toolInferenceConfigSha256` plus the tool block recorded on every attempt.
+ * The merge rule's real guarantee is narrower and still worth having: a
+ * configuration cannot silently REPLACE something the cohort precommitted to,
+ * so a reader comparing the artifact to the manifest is comparing like with
+ * like.
  *
  * Objects merge recursively, which is what makes a nested provider namespace
  * usable: a configuration may add `generationConfig.thinkingConfig` beside an

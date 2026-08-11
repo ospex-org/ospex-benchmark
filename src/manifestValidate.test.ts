@@ -437,3 +437,68 @@ test('an ordinary configuration is not mistaken for a credential', () => {
     else process.env['OPENAI_API_KEY'] = priorKey;
   }
 });
+
+test('two roster arms that are the same ENTRANT are refused at boot', () => {
+  // The post-run identity gate already refuses this, but it runs on RESPONSES:
+  // the refusal arrives after a full night of provider spend and arrives as a
+  // permanently unscoreable artifact. It is decidable from the roster alone.
+  const raw = codeConsistentRaw();
+  const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  roster.push({ ...roster[0]!, participantId: 'openai-gpt-5.6-sol-again' });
+  const violations = validateManifestAgainstCode(parse({ ...raw, expectedArmRoster: roster }));
+  assert.ok(
+    violations.some((v) => /are the same entrant: model .* under the identical configuration/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('two roster arms of one model at DIFFERENT configurations are not the same entrant', () => {
+  // The negative control. Both entries also trip the code-comparison checks
+  // (neither matches a code arm's configuration), so this asserts the ABSENCE
+  // of the entrant violation specifically rather than an empty result.
+  const raw = codeConsistentRaw();
+  const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  roster[0] = { ...roster[0]!, configuration: { reasoning: { effort: 'low' } } };
+  roster.push({
+    ...roster[0]!,
+    participantId: 'openai-gpt-5.6-sol-high',
+    configuration: { reasoning: { effort: 'high' } },
+  });
+  const violations = validateManifestAgainstCode(parse({ ...raw, expectedArmRoster: roster }));
+  assert.ok(!violations.some((v) => /are the same entrant/.test(v)), JSON.stringify(violations));
+});
+
+test('the credential check runs on an entry the other roster guards would skip', () => {
+  // Both the duplicate-id and unknown-participant guards `continue`, and the
+  // configuration checks used to sit after them — so exactly the two entries a
+  // hand-edited roster produces got a schema complaint and no word about what
+  // was in the file. The diagnostic is the whole value of that check.
+  const priorKey = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = 'sk-synthetic-value-generated-for-this-test-only';
+  try {
+    const raw = codeConsistentRaw();
+    const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+    roster.push({
+      participantId: 'ghost',
+      provider: 'openai',
+      requestedModelId: 'x',
+      approvedReportedModelIds: ['x'],
+      configuration: { note: process.env['OPENAI_API_KEY'] },
+    });
+    const violations = validateManifestAgainstCode(parse({ ...raw, expectedArmRoster: roster }));
+    assert.ok(
+      violations.some((v) => /is not a code-supported participant/.test(v)),
+      'the unknown-participant guard still fires',
+    );
+    assert.ok(
+      violations.some((v) => /matching a credential in this environment/.test(v)),
+      `and the credential is still reported: ${JSON.stringify(violations)}`,
+    );
+    for (const violation of violations) {
+      assert.ok(!violation.includes('sk-synthetic'), 'the refusal must not echo the credential');
+    }
+  } finally {
+    if (priorKey === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = priorKey;
+  }
+});

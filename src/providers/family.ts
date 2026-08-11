@@ -87,6 +87,16 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
   const byEntrant = new Map<string, CollisionCheckInput>();
 
   for (const arm of arms) {
+    // Fail closed on the key itself. This field decides whether two arms are
+    // one entrant, and it arrives as a bare string from three call sites; a
+    // per-arm-unique non-digest — an empty string is the benign direction, a
+    // participantId the dangerous one — would make every arm distinct and turn
+    // the whole check into a permanent no-op that nothing downstream notices.
+    if (!/^[0-9a-f]{64}$/.test(arm.configurationSha256)) {
+      failures.push(
+        `MODEL_IDENTITY: ${arm.participantId} was checked with a configuration digest that is not a SHA-256 — entrant distinctness cannot be decided`,
+      );
+    }
     if (arm.unidentifiedResponses > 0) {
       failures.push(
         `MODEL_IDENTITY: ${arm.participantId} returned ${arm.unidentifiedResponses} response(s) without a reported model ID — accepted decisions require verified identity`,

@@ -2,6 +2,12 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { canonicalize } from './canonical.js';
 import { ARMS, planArmRequest } from './providers/index.js';
+import { createMockAdapters } from './mock.js';
+import { createRealShapedFakeAdapters } from './realShapedFake.js';
+import { buildUserMessage } from './prompt.js';
+import { prepareGameRequest } from './preparedRequest.js';
+import { makeRequest } from './testFactories.js';
+import { ConfigurationRecordCollisionError } from './providers/requestPlan.js';
 import {
   ConfigurationCollisionError,
   configurationEvidenceViolations,
@@ -344,4 +350,85 @@ test('planArmRequest reaches the right builder for each provider', () => {
   // openai and xai share a builder but not their cap parameter.
   assert.ok('max_tool_calls' in planArmRequest(arm('openai'), TURNS, DECLARED).body);
   assert.ok('max_turns' in planArmRequest(arm('xai'), TURNS, DECLARED).body);
+});
+
+// --- record-only names ------------------------------------------------------
+
+test('a configuration may not name a value the record carries from OUTSIDE the body', () => {
+  // These are not body keys, so `applyConfiguration` did not collide on them —
+  // and the derivation loop then overwrote the record entry that was supposed
+  // to describe them. The published evidence named an endpoint that was never
+  // dialled, a model that was never requested, or an API version that was
+  // never sent, and the declared-versus-sent check CONFIRMED it, because the
+  // record faithfully echoed the configuration.
+  const cases: Array<[ProviderName, string, ParticipantConfiguration]> = [
+    ['openai', 'endpoint', { endpoint: 'https://evil.invalid/responses' }],
+    ['anthropic', 'endpoint', { endpoint: 'https://evil.invalid/messages' }],
+    ['anthropic', 'anthropic_version', { anthropic_version: '2099-01-01' }],
+    // gemini names the model in the URL, so it is the one provider where
+    // `model` is NOT a body key and therefore was not previously refused.
+    ['google', 'model', { model: 'gemini-2.0-flash' }],
+  ];
+  for (const [provider, path, configuration] of cases) {
+    assert.throws(
+      () => planArmRequest(arm(provider, configuration), TURNS, DECLARED),
+      (error: unknown) => {
+        assert.ok(error instanceof ConfigurationRecordCollisionError, `${provider}/${path}`);
+        assert.equal(error.path, path);
+        return true;
+      },
+      `${provider} must refuse a configuration naming "${path}"`,
+    );
+  }
+});
+
+test('the record-only refusal does not fire on an ordinary configuration', () => {
+  // The negative control: a build that refused every configuration would
+  // satisfy the test above and make the feature unusable.
+  assert.ok(planArmRequest(arm('google', { top_p: 0.95 }), TURNS, DECLARED).body);
+  assert.ok(planArmRequest(arm('anthropic', { top_k: 40 }), TURNS, DECLARED).body);
+});
+
+// --- the rehearsal path -----------------------------------------------------
+
+test('the dry-run and rehearsal adapters record the configuration the runner passed', async () => {
+  // Without this, one arm declaring a configuration makes every dry-run
+  // artifact fail the declared-versus-sent gate on every arm x game — so the
+  // rehearsal path that exists to prove an artifact verifies before a live
+  // night could never again do so for the feature it is rehearsing.
+  const configuration: ParticipantConfiguration = { reasoning: { effort: 'high' } };
+  // Real turns, built the way the runner builds them, because the canned
+  // adapters parse the request payload out of the user message.
+  const request = prepareGameRequest(makeRequest());
+  const turns: ChatTurn[] = [
+    { role: 'system', content: 'system' },
+    {
+      role: 'user',
+      content: buildUserMessage({
+        cohortId: 'probe-cohort',
+        participantId: 'openai-gpt-5.6-sol',
+        requestedModelId: 'gpt-5.6-sol',
+        executionPolicy: 'fixed-moneyline-total',
+        request,
+      }),
+    },
+  ];
+  const maps = [
+    ['mock', createMockAdapters({ simulateCollision: false })],
+    ['real-shaped fake', createRealShapedFakeAdapters({ simulateCollision: false })],
+  ] as const;
+  for (const [label, adapters] of maps) {
+    const adapter = adapters.get('openai-gpt-5.6-sol');
+    assert.ok(adapter, `${label} has the openai arm`);
+    const response = await adapter.chat(turns, 5_000, { maxOutputTokens: 16_000, configuration });
+    assert.deepEqual(
+      configurationEvidenceViolations(configuration, response.requestParams),
+      [],
+      `${label} must record what it was told to send`,
+    );
+    // Negative control: with no configuration the canned record is untouched,
+    // so this is not a wrapper that invents evidence.
+    const plain = await adapter.chat(turns, 5_000, { maxOutputTokens: 16_000 });
+    assert.ok(!('reasoning' in plain.requestParams));
+  }
 });

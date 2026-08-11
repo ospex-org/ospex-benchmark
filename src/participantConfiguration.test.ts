@@ -333,3 +333,18 @@ test('evidence compares by canonical value, so key order in the record does not 
     [],
   );
 });
+
+test('a key containing a dot is refused — it is the evidence path separator', () => {
+  // `configurationLeaves` joins with `.` and `configurationEvidenceViolations`
+  // splits on it, so a dotted key is not round-trippable. Both directions are
+  // wrong and the second is the dangerous one: a flat declaration is SATISFIED
+  // by a nested record, so two configurations with different digests satisfy
+  // the same evidence.
+  assert.match(configurationViolations({ 'a.b': 1 })[0] ?? '', /contains a dot/);
+  assert.match(configurationViolations({ x: { 'a.b': 1 } })[0] ?? '', /contains a dot/);
+  assert.deepEqual(configurationViolations({ a: { b: 1 } }), []);
+
+  // The ambiguity itself, recorded so the refusal is not mistaken for fussiness.
+  assert.deepEqual(configurationEvidenceViolations({ 'a.b': 1 }, { a: { b: 1 } }), []);
+  assert.equal(configurationEvidenceViolations({ 'a.b': 1 }, { 'a.b': 1 }).length, 1);
+});

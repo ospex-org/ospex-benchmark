@@ -134,3 +134,19 @@ test('an arm with no successful response at all is a loud warning, not a failure
   assert.deepEqual(result.failures, []);
   assert.ok(result.warnings.some((w) => w.includes('provider identity unverified')));
 });
+
+test('a configuration digest that is not a SHA-256 fails closed', () => {
+  // The field decides whether two arms are one entrant and arrives as a bare
+  // string from three call sites. A per-arm-unique non-digest — a
+  // participantId, say — would make every arm distinct and turn the entire
+  // check into a permanent no-op that nothing downstream notices.
+  for (const bad of ['', 'openai-arm', 'F'.repeat(64), 'a'.repeat(63)]) {
+    const result = checkProviderCollision([arm({ configurationSha256: bad })]);
+    assert.ok(
+      result.failures.some((f) => /not a SHA-256 — entrant distinctness cannot be decided/.test(f)),
+      `expected a fail-closed refusal for ${JSON.stringify(bad)}, got ${JSON.stringify(result.failures)}`,
+    );
+  }
+  // Negative control: a real digest is not flagged.
+  assert.deepEqual(checkProviderCollision([arm({})]).failures, []);
+});

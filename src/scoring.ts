@@ -284,6 +284,11 @@ const decisionSchema = z
     runId: z.string().min(1),
     cohortId: z.string().min(1),
     participantId: z.string().min(1),
+    // Which entrant made this decision. Optional on an archive predating the
+    // stamp; verified against the run's roster when present, because this is
+    // the field a publisher keys a participant row on and it was previously
+    // written by the producer and read by nobody.
+    configurationSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
     gameId: z.string().min(1),
     market: z.enum(['moneyline', 'spread', 'total']),
     selection: z.string().min(1),
@@ -366,6 +371,9 @@ export interface SourceGame {
 export interface SourcePick {
   kind: 'model' | 'baseline';
   participantId: string;
+  /** The entrant this decision is attributed to; `null` on a baseline and on
+   *  an archive written before the arm-roster stamp existed. */
+  configurationSha256: string | null;
   gameId: string;
   market: MarketKey;
   selection: string;
@@ -619,6 +627,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
         picks.push({
           kind: 'model',
           participantId: decision.participantId,
+          configurationSha256: decision.configurationSha256 ?? null,
           gameId: decision.gameId,
           market: decision.market,
           selection: decision.selection,
@@ -654,6 +663,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
         });
         picks.push({
           kind: 'baseline',
+          configurationSha256: null,
           participantId: baseline.participantId,
           gameId: baseline.gameId,
           market: baseline.market,
@@ -1623,6 +1633,21 @@ export function verifyRunIntegrity(
           `arm roster ${arm.participantId}: ran configuration ${entry.configurationSha256}, precommitted ${expectedDigest}`,
         );
       }
+      // The other two thirds of the entrant key. The serving table identifies a
+      // participant by `(lab_id, model_id, configuration)`, and a stamp is what
+      // says who a decision belongs to — so checking only the configuration
+      // left the lab and the model write-only, free to disagree with every
+      // response in the file and with the precommitment.
+      if (entry.provider !== arm.provider) {
+        violations.push(
+          `arm roster ${arm.participantId}: stamped provider "${entry.provider}", precommitted "${arm.provider}"`,
+        );
+      }
+      if (entry.requestedModelId !== arm.requestedModelId) {
+        violations.push(
+          `arm roster ${arm.participantId}: stamped requestedModelId "${entry.requestedModelId}", precommitted "${arm.requestedModelId}"`,
+        );
+      }
     }
     for (const participantId of stamped.keys()) {
       if (!expectedArms.some((arm) => arm.participantId === participantId)) {
@@ -1641,6 +1666,25 @@ export function verifyRunIntegrity(
       if (response.configurationSha256 !== entry.configurationSha256) {
         violations.push(
           `${response.participantId}:${response.gameId}: response configuration ${response.configurationSha256} is not this arm's ${entry.configurationSha256}`,
+        );
+      }
+    }
+    // And the decisions themselves. This is the field a publisher keys a
+    // participant row on, so it is the one place where getting it wrong
+    // attributes a published pick to a competitor that did not make it.
+    for (const pick of run.picks) {
+      if (pick.kind !== 'model') continue;
+      const entry = stamped.get(pick.participantId);
+      if (entry === undefined) continue; // already reported above
+      if (pick.configurationSha256 === null) {
+        violations.push(
+          `${pick.participantId}:${pick.gameId}:${pick.market}: the run stamps an arm roster but this decision carries no configuration digest`,
+        );
+        continue;
+      }
+      if (pick.configurationSha256 !== entry.configurationSha256) {
+        violations.push(
+          `${pick.participantId}:${pick.gameId}:${pick.market}: decision configuration ${pick.configurationSha256} is not this arm's ${entry.configurationSha256}`,
         );
       }
     }

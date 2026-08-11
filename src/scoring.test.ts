@@ -1570,6 +1570,7 @@ function syntheticScored(
     ...scheduleOverrides,
     kind: 'baseline',
     participantId: 'synthetic-policy',
+    configurationSha256: null,
     gameId,
     market: 'total',
     selection: 'over',
@@ -3565,6 +3566,7 @@ function stampedRun(mutate?: (records: JsonRecordish[]) => void): string[] {
         attempt['requestParams'] = { endpoint: 'e', model: 'stub-model-1', reasoning: { effort: 'high' } };
       }
     }
+    if (record['recordType'] === 'decision') record['configurationSha256'] = STAMP_DIGEST;
   }
   mutate?.(records);
   return records.map((record) => JSON.stringify(record));
@@ -3795,5 +3797,82 @@ test('two arms of one model at the SAME configuration fail the recomputed identi
         /identical model ID "stub-model-1" under the identical configuration/.test(v),
     ),
     `one competitor entered twice must be refused: ${JSON.stringify(violations)}`,
+  );
+});
+
+// --- gaps found by the adversarial pass ------------------------------------
+
+test('a stamped provider or model that disagrees with the precommitment is refused', () => {
+  // Both were WRITE-ONLY before: the stamp is what says who a decision belongs
+  // to, and only one of its three identity fields was being checked, so a stamp
+  // could name a different lab and model than every response in the file.
+  const provider = stampViolations((records) => {
+    rosterEntry(records)['provider'] = 'anthropic';
+  });
+  assert.ok(
+    provider.some((v) => /stamped provider "anthropic", precommitted "openai"/.test(v)),
+    JSON.stringify(provider),
+  );
+  const model = stampViolations((records) => {
+    rosterEntry(records)['requestedModelId'] = 'some-other-model';
+  });
+  assert.ok(
+    model.some((v) => /stamped requestedModelId "some-other-model", precommitted "stub-model-1"/.test(v)),
+    JSON.stringify(model),
+  );
+});
+
+test('a DECISION attributed to a configuration the arm did not run is refused', () => {
+  // The digest a publisher keys a participant row on. It was written by the
+  // producer and read by nobody, so editing it attributed a published pick to
+  // a competitor that never made it while the run verified clean.
+  const violations = stampViolations((records) => {
+    const decision = records.find((r) => r['recordType'] === 'decision')!;
+    decision['configurationSha256'] = 'f'.repeat(64);
+  });
+  assert.ok(
+    violations.some((v) => /decision configuration f{64} is not this arm's /.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a stamped run whose decisions carry no digest is refused', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] === 'decision') delete record['configurationSha256'];
+    }
+  });
+  assert.ok(
+    violations.some((v) =>
+      /stamps an arm roster but this decision carries no configuration digest/.test(v),
+    ),
+    JSON.stringify(violations),
+  );
+});
+
+test('the REPAIR leg is held to the declared configuration too', () => {
+  // The repair branch of the evidence loop had no coverage at all: every
+  // fixture had `repair: null`, so deleting the branch changed nothing. A
+  // repair is the same entrant reformatting its own answer, and a repair that
+  // dropped the setting would be a second, cheaper call published under it.
+  const violations = stampViolations((records) => {
+    const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+    response['repairUsed'] = true;
+    response['repair'] = {
+      reportedModelId: 'stub-model-1',
+      providerResponseId: 'repair-1',
+      rawResponse: null,
+      requestAt: null,
+      responseAt: null,
+      latencyMs: null,
+      providerStopReason: null,
+      turnCompleted: true,
+      // The initial leg carries it; this one does not.
+      requestParams: { endpoint: 'e', model: 'stub-model-1' },
+    };
+  });
+  assert.ok(
+    violations.some((v) => /:repair: declared configuration "reasoning\.effort" is absent/.test(v)),
+    JSON.stringify(violations),
   );
 });

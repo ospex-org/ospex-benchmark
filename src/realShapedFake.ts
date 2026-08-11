@@ -9,6 +9,7 @@ import {
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { deriveComparableUsage } from './providers/comparableUsage.js';
 import type { ProviderAdapter, ProviderResponse, ProviderUsage, SearchAudit } from './types.js';
+import { applyConfiguration } from './participantConfiguration.js';
 
 /**
  * The REAL-SHAPED, zero-network fake adapters: the same deterministic decisions and the
@@ -79,6 +80,36 @@ function usageWith(
 /** Wrap a body the way chat models actually deliver JSON: a fenced block with a preamble. */
 function fenced(json: string): string {
   return `\`\`\`json\n${json}\n\`\`\``;
+}
+
+/**
+ * Record the participant configuration the runner passed, the way a real
+ * adapter does — it merges the configuration into the body it sends and
+ * derives its recorded parameters from that body.
+ *
+ * A canned adapter has no body to derive from, so it merges into the recorded
+ * parameters directly, under the SAME add-only rule: a mock whose canned
+ * parameters collide with a configuration is as much a defect as a real
+ * adapter that would have overwritten the cohort's own.
+ *
+ * Without this, one arm declaring a configuration makes every dry-run artifact
+ * fail the declared-versus-sent gate on every arm × game, and the rehearsal
+ * path that exists to prove an artifact verifies before a live night can never
+ * again do so.
+ */
+function recordingConfiguration(adapter: ProviderAdapter): ProviderAdapter {
+  return {
+    ...adapter,
+    async chat(turns, timeoutMs, options): Promise<ProviderResponse> {
+      const response = await adapter.chat(turns, timeoutMs, options);
+      const configuration = options?.configuration ?? {};
+      if (Object.keys(configuration).length === 0) return response;
+      return {
+        ...response,
+        requestParams: applyConfiguration(response.requestParams, configuration),
+      };
+    },
+  };
 }
 
 export function createRealShapedFakeAdapters(options: RealShapedFakeOptions): Map<string, ProviderAdapter> {
@@ -217,5 +248,8 @@ export function createRealShapedFakeAdapters(options: RealShapedFakeOptions): Ma
     },
   });
 
+  for (const [participantId, adapter] of [...adapters]) {
+    adapters.set(participantId, recordingConfiguration(adapter));
+  }
   return adapters;
 }

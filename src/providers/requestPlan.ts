@@ -2,6 +2,25 @@ import { applyConfiguration } from '../participantConfiguration.js';
 import type { ParticipantConfiguration } from '../participantConfiguration.js';
 
 /**
+ * Raised when a configuration names something the per-attempt record carries
+ * from OUTSIDE the body — the endpoint, a header-borne API version, a
+ * model that travels in the URL. Setting it would put a value in the evidence
+ * that never described the request.
+ */
+export class ConfigurationRecordCollisionError extends Error {
+  readonly path: string;
+
+  constructor(path: string) {
+    super(
+      `participant configuration may not set "${path}": the recorded request evidence carries it from outside the body ` +
+        '(the endpoint, a header, or the URL), so a body member of that name would describe a request that was never made',
+    );
+    this.name = 'ConfigurationRecordCollisionError';
+    this.path = path;
+  }
+}
+
+/**
  * A provider request and the evidence recorded for it, built ONCE.
  *
  * Each adapter used to write its request body and its `requestParams` record
@@ -51,6 +70,23 @@ export interface RequestPlanSpec {
  * body, so it cannot drift from a hand-maintained list of reserved names.
  */
 export function buildRequestPlan(spec: RequestPlanSpec): ProviderRequestPlan {
+  // `applyConfiguration` guards keys the BODY already has, and these are not
+  // body keys on the providers that record them: the endpoint is a URL,
+  // anthropic's API version is a header, gemini's model is in the path. So a
+  // configuration naming one of them merged cleanly and then, in the loop
+  // below, overwrote the record entry that was supposed to describe it —
+  // publishing an endpoint that was never dialled or a model that was never
+  // requested, with `configurationEvidenceViolations` confirming it, because
+  // the record faithfully echoed the configuration.
+  //
+  // Refused rather than resolved by precedence: for these names the wire fact
+  // lives outside the body, so there is no reading under which a body member
+  // is the better answer.
+  const recordOnly = new Set(['endpoint', ...Object.keys(spec.recordedNonBody ?? {})]);
+  for (const key of Object.keys(spec.configuration)) {
+    if (recordOnly.has(key)) throw new ConfigurationRecordCollisionError(key);
+  }
+
   const body = applyConfiguration(spec.body, spec.configuration);
   const prompt = new Set(spec.promptKeys);
   const requestParams: Record<string, unknown> = { endpoint: spec.endpoint };
@@ -58,8 +94,6 @@ export function buildRequestPlan(spec: RequestPlanSpec): ProviderRequestPlan {
     requestParams[key] = value;
   }
   for (const key of Object.keys(body)) {
-    // The body wins a name clash with a recorded non-body parameter: what went
-    // on the wire is the fact, and the other entry is a description of it.
     if (!prompt.has(key)) requestParams[key] = body[key];
   }
   return { endpoint: spec.endpoint, body, requestParams };
