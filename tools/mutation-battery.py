@@ -147,9 +147,12 @@ MUTANTS = [
     ('the integrity check uses the CURRENT roster', 'src/servingProjection.ts',
      "  const violations = verifyRunIntegrity(run, { expectedArms });",
      "  const violations = verifyRunIntegrity(run);"),
+    # Reverts ALL THREE identity fields. An earlier version reverted only
+    # two, so the approved-reported-id check still refused the forgery and
+    # the mutant survived on a technicality rather than on coverage.
     ('artifact identity is approved from the artifact itself', 'src/servingProjection.ts',
-     "      provider: entry?.provider ?? '',\n      requestedModelId: entry?.armId ?? '',",
-     "      provider: run.armResponses.find((r) => r.participantId === id)?.provider ?? '',\n      requestedModelId: run.armResponses.find((r) => r.participantId === id)?.requestedModelId ?? '',"),
+     "    const entry = projectionParticipant(id);",
+     "    const s = run.armResponses.find((r) => r.participantId === id);    const entry = s === undefined ? null : { provider: s.provider, armId: s.requestedModelId, approvedReportedModelIds: s.reportedModelId === null ? [] : [s.reportedModelId] };"),
     ('an unenrolled arm is waved through instead of refused', 'src/servingProjection.ts',
      "  if (unknown.length > 0) {",
      "  if (false && unknown.length > 0) {"),
@@ -168,6 +171,12 @@ MUTANTS = [
     ('status line names the target', 'src/benchmarkServingClient.ts',
      "  if (status.enabled) return 'serving projection: enabled';",
      "  if (status.enabled) return `serving projection: enabled (${process.env['BENCHMARK_DB_URL'] ?? ''})`;"),
+    # The two latch mutants below are OUT OF THIS BATTERY'S REACH and report
+    # SURVIVED. `openBenchmarkServing` opens a real pool, so the latch can
+    # only be exercised against a real database — it is pinned in
+    # `yarn store:serving` instead, against a genuinely pre-migration schema,
+    # with the negative control that adding the columns lets it open. Left
+    # here so the gap is visible rather than absent.
     ('the schema latch never fires', 'src/benchmarkServingClient.ts',
      "  if (missing.length > 0) {",
      "  if (false && missing.length > 0) {"),
