@@ -236,3 +236,81 @@ test('a query failure propagates — never an empty (clear) journal', async () =
   };
   await assert.rejects(new SqlCampaignTickJournalPort(failing, neverTransacts).entries(COHORT, 5), /connection reset/);
 });
+
+test('pgStoreTransactor releases WITH the error, because that is what destroys the client', async () => {
+  // `pg-pool` reads a truthy first argument to `release` as "destroy this
+  // client" and puts one released without it back in the idle set. A client
+  // whose statement is still in flight is poisoned, and the next checkout
+  // queues behind a query that may never return — measured as a process that
+  // could not exit at all.
+  //
+  // Asserting on what `release` RECEIVED rather than that it was called: the
+  // old test logged the string 'release' and would have stayed green through
+  // this entire change.
+  const received: unknown[] = [];
+  const clientOf = (failOn?: string): PgTransactionClient => ({
+    async query(sql: string) {
+      if (failOn !== undefined && sql === failOn) throw new Error(`boom on ${sql}`);
+      return { rows: [{ ok: 1 }] };
+    },
+    release(destroyBecause?: unknown) {
+      received.push(destroyBecause);
+    },
+  });
+
+  const happy = pgStoreTransactor({ connect: async () => clientOf() });
+  await happy.transaction(async (query) => query('select 1', []));
+  assert.deepEqual(received, [undefined],
+    'a committed transaction leaves a healthy connection — destroying it would churn the pool');
+
+  received.length = 0;
+  const failing = pgStoreTransactor({ connect: async () => clientOf('select 1') });
+  await assert.rejects(failing.transaction(async (query) => query('select 1', [])));
+  assert.equal(received.length, 1);
+  const destroyBecause = received[0] as object | undefined;
+  assert.ok(destroyBecause instanceof Error,
+    `release must get the error itself, got ${String(destroyBecause)}`);
+  assert.match(destroyBecause.message, /boom on select 1/);
+});
+
+test('a rollback that never answers cannot stop the client being released', async () => {
+  // The second place this could hang, and the one that used to. If the
+  // transaction failed because a statement never came back, `rollback` is
+  // queued BEHIND that statement and waits exactly as long — so the `finally`
+  // that hands the connection back is never reached.
+  let released: unknown = null;
+  const client: PgTransactionClient = {
+    async query(sql: string) {
+      if (sql === 'rollback') return new Promise<never>(() => { /* never settles */ });
+      if (sql === 'select 1') throw new Error('the primary fault');
+      return { rows: [] };
+    },
+    release(destroyBecause?: unknown) { released = destroyBecause; },
+  };
+  const transactor = pgStoreTransactor({ connect: async () => client }, { rollbackTimeoutMs: 20 });
+
+  await assert.rejects(
+    transactor.transaction(async (query) => query('select 1', [])),
+    /the primary fault/,
+    'the primary error still wins — abandoning the rollback must not replace it',
+  );
+  assert.ok(released instanceof Error, 'the client was released, and released with the error');
+
+  // NEGATIVE CONTROL: a rollback that DOES answer is still awaited, so the
+  // bound is a deadline rather than a blanket refusal to wait.
+  const seen: string[] = [];
+  const prompt: PgTransactionClient = {
+    async query(sql: string) {
+      seen.push(sql);
+      if (sql === 'select 1') throw new Error('fault');
+      return { rows: [] };
+    },
+    release() { seen.push('release'); },
+  };
+  await assert.rejects(
+    pgStoreTransactor({ connect: async () => prompt }, { rollbackTimeoutMs: 20 })
+      .transaction(async (query) => query('select 1', [])),
+  );
+  assert.deepEqual(seen,
+    ['begin isolation level read committed', 'select 1', 'rollback', 'release']);
+});

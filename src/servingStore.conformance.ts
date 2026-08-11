@@ -47,8 +47,16 @@ import { Client, Pool } from 'pg';
 import { pgStoreQuery } from './store/atomicStore.js';
 import { pgStoreTransactor } from './store/campaignTickJournal.js';
 import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
-import { SqlBenchmarkServingPort } from './servingStore.js';
-import type { ArmAttempt, AttemptFacts, DecisionSeal, PublishOutcome, RunFacts } from './servingStore.js';
+import { SERVING_STATEMENTS, SqlBenchmarkServingPort } from './servingStore.js';
+import {
+  CONFIGURATION_DIGEST_VERSION,
+  canonicalConfigurationText,
+  configurationSha256,
+} from './participantConfiguration.js';
+import type { ParticipantConfiguration } from './participantConfiguration.js';
+import type {
+  ArmAttempt, AttemptFacts, DecisionSeal, ParticipantFacts, PublishOutcome, RunFacts,
+} from './servingStore.js';
 import { forecastDigest } from './schema.js';
 import { makeOverScaleAccepted, makeOverScalePushAccepted } from './testFactories.js';
 import type { ForecastOutput } from './types.js';
@@ -63,6 +71,7 @@ const TABLES = [
   'benchmark_runs', 'benchmark_participants', 'benchmark_cohort_participants',
   'benchmark_arm_attempts', 'benchmark_decisions', 'benchmark_decision_reveals',
   'benchmark_decision_rationales', 'benchmark_scores', 'benchmark_scoring_runs',
+  'benchmark_schema_capability',
 ];
 
 const results: Array<{ name: string; ok: boolean }> = [];
@@ -104,13 +113,56 @@ const facts = (over: Partial<AttemptFacts> = {}): AttemptFacts => ({
   costUsd: 5.411942, priceVersion: 'prices-v1', ...over,
 });
 
-const MODEL = { participantId: 'alpha', kind: 'model' as const, labId: 'alpha', displayName: 'Alpha' };
+/**
+ * A configuration no plausible normalisation leaves alone.
+ *
+ * All four shipped arms declare `{}` today, and `{}` cannot catch a
+ * normalisation bug: it has no keys to reorder, no number to round and no
+ * character to re-encode. Each hazard here has something to damage — and the
+ * key set is chosen so RFC 8785 order (aa, b, e-acute) differs from
+ * PostgreSQL's jsonb order (b, aa, e-acute, by length then bytes). That is
+ * what makes the round-trip below prove the VALUE survives rather than the
+ * text, which is the only property the digest can rest on.
+ */
+const AWKWARD_CONFIGURATION = Object.freeze({
+  b: 1,
+  aa: { nested: true, list: [1, 2] },
+  'é': 0.30000000000000004,
+});
+
+/**
+ * A model entrant.
+ *
+ * ⚠ `modelId` DERIVES FROM THE PARTICIPANT ID, and that is not decoration.
+ *   The entrant key `(lab_id, model_id, configuration)` is unique among
+ *   models with NULLS NOT DISTINCT, and it is GLOBAL and insert-once - not
+ *   scoped to a cohort. A shared literal here means the second check to run
+ *   collides with the first, and a second RUN of this suite collides with
+ *   the first run. Measured: 19 of 28 checks failed 23505 on exactly that.
+ *   That the index bites this hard is the point; it is proved on purpose
+ *   further down rather than worked around here.
+ */
+const model = (participantId: string, over: Partial<ParticipantFacts> = {}): ParticipantFacts => ({
+  participantId,
+  kind: 'model',
+  labId: 'alpha',
+  displayName: 'Alpha',
+  modelId: `${participantId}-v1`,
+  configuration: AWKWARD_CONFIGURATION,
+  ...over,
+});
+
+/** A deterministic control. The database refuses one carrying either half of
+ *  a model identity, and so does the port — in both directions. */
+const CONTROL = {
+  kind: 'baseline' as const, labId: null, modelId: null, configuration: null,
+};
 
 function armAttempt(cohortId: string, over: Partial<ArmAttempt> = {}): ArmAttempt {
   return {
     run: runFacts(cohortId),
-    participant: { ...MODEL, participantId: `${cohortId}-alpha` },
-    roster: { armId: 'alpha-v1', walletAddress: null },
+    participant: model(`${cohortId}-alpha`),
+    roster: { walletAddress: null },
     gameId: 'game-1', facts: facts(), source: NO_SOURCE, ...over,
   };
 }
@@ -118,8 +170,8 @@ function armAttempt(cohortId: string, over: Partial<ArmAttempt> = {}): ArmAttemp
 function decisionSeal(cohortId: string, over: Partial<DecisionSeal> = {}): DecisionSeal {
   return {
     run: runFacts(cohortId),
-    participant: { ...MODEL, participantId: `${cohortId}-alpha` },
-    roster: { armId: 'alpha-v1', walletAddress: null },
+    participant: model(`${cohortId}-alpha`),
+    roster: { walletAddress: null },
     gameId: 'game-1', attemptOrdinal: 0, market: 'moneyline', sealedAt: SEALED,
     forecastDigest: DIGEST(1), rationaleDigest: null, bundleSha256: null,
     responseSchemaVersion: 2, contestId: null, speculationId: null, source: NO_SOURCE, ...over,
@@ -177,7 +229,9 @@ async function main(): Promise<void> {
     const cohortId = cohortName('attempt');
     expect(await port.publishAttempt(armAttempt(cohortId)), 'published', 'attempt');
     const rows = await query(
-      `select a.attempt_ordinal, a.cost_usd, r.run_id, p.kind, c.arm_id
+      `select a.attempt_ordinal, a.cost_usd, r.run_id, p.kind, c.wallet_address,
+              p.model_id, p.configuration, p.configuration_sha256,
+              p.configuration_digest_version
          from public.benchmark_arm_attempts a
          join public.benchmark_runs r on r.run_id = a.run_id
          join public.benchmark_participants p on p.participant_id = a.participant_id
@@ -186,6 +240,26 @@ async function main(): Promise<void> {
         where a.cohort_id = $1`, [cohortId]);
     assert.equal(rows.length, 1, 'all four rows exist and join');
     assert.equal(rows[0]!['cost_usd'], '5.411942', 'the cost survived the jsonb hop exactly');
+
+    // THE ENTRANT IDENTITY, READ BACK OUT OF THE DATABASE.
+    //
+    // The digest is recomputed from the PARSED row rather than compared against
+    // a rendering of it, and that distinction is the whole test: jsonb re-sorts
+    // keys by length then bytes, so `configuration::text` is NOT the canonical
+    // text the digest was taken over, and a check that compared strings would
+    // fail on a correct implementation. What has to hold is that the VALUE
+    // survives, so that a reader recomputing the digest from the stored row
+    // arrives back at the stored digest.
+    const stored = rows[0]!['configuration'] as ParticipantConfiguration;
+    assert.equal(rows[0]!['model_id'], `${cohortId}-alpha-v1`);
+    assert.equal(rows[0]!['configuration_digest_version'], CONFIGURATION_DIGEST_VERSION);
+    assert.equal(configurationSha256(stored), rows[0]!['configuration_sha256'],
+      'the stored digest recomputes from the stored configuration');
+    assert.equal(configurationSha256(stored), configurationSha256(AWKWARD_CONFIGURATION),
+      'and it is the digest of what was sent, so the entrant is the one that ran');
+    assert.notEqual(canonicalConfigurationText(stored), JSON.stringify(stored),
+      'the fixture must be one where jsonb key order differs from canonical order, ' +
+      'or this check cannot tell a value round-trip from a text round-trip');
   });
 
   await check('A FAILED ARM IS PUBLISHABLE, with no decision anywhere', async () => {
@@ -271,7 +345,7 @@ async function main(): Promise<void> {
     const cohortId = cohortName('concurrent-contradiction');
     const attempts = await Promise.all(Array.from({ length: 16 }, (_, i) =>
       port.publishAttempt(armAttempt(cohortId, {
-        roster: { armId: 'v1', walletAddress: `0x${String(i % 10).repeat(40)}` },
+        roster: { walletAddress: `0x${String(i % 10).repeat(40)}` },
         gameId: `game-${i}`,
       }))));
     const published = attempts.filter((o) => o.outcome === 'published').length;
@@ -296,7 +370,7 @@ async function main(): Promise<void> {
     const ids = Array.from({ length: 12 }, (_, i) => `${cohortId}-p${i}`);
     const attempts = await Promise.all(ids.map((participantId) =>
       port.publishAttempt(armAttempt(cohortId, {
-        participant: { ...MODEL, participantId, labId: null },
+        participant: model(participantId, { labId: null }),
         facts: facts({ suppliedMarkets: ['moneyline', 'spread', 'total'] }),
       }))));
     assert.deepEqual([...new Set(attempts.map((o) => o.outcome))], ['published'],
@@ -304,7 +378,7 @@ async function main(): Promise<void> {
     const markets = ['moneyline', 'spread', 'total'] as const;
     const seals = await Promise.all(ids.flatMap((participantId, i) => markets.map((market, j) =>
       port.sealDecision(decisionSeal(cohortId, {
-        participant: { ...MODEL, participantId, labId: null },
+        participant: model(participantId, { labId: null }),
         market, forecastDigest: DIGEST(0x1000 + i * 8 + j),
       })))));
     assert.deepEqual([...new Set(seals.map((o) => o.outcome))], ['published'],
@@ -321,7 +395,7 @@ async function main(): Promise<void> {
     const cohortId = cohortName('sharedrun');
     const outcomes = await Promise.all([0, 1, 2, 3].map((i) =>
       port.publishAttempt(armAttempt(cohortId, {
-        participant: { ...MODEL, participantId: `${cohortId}-p${i}`, labId: `lab${i}` },
+        participant: model(`${cohortId}-p${i}`, { labId: `lab${i}` }),
         gameId: `game-${i}`,
       }))));
     assert.deepEqual(outcomes.map((o) => o.outcome), ['published', 'published', 'published', 'published'],
@@ -331,8 +405,8 @@ async function main(): Promise<void> {
   await check('a baseline seals with a NULL attempt_id and mints no attempt', async () => {
     const cohortId = cohortName('baseline');
     expect(await port.sealDecision(decisionSeal(cohortId, {
-      participant: { participantId: `${cohortId}-fav`, kind: 'baseline', labId: null, displayName: 'Favourite' },
-      roster: { armId: null, walletAddress: null }, attemptOrdinal: null,
+      participant: { ...CONTROL, participantId: `${cohortId}-fav`, displayName: 'Favourite' },
+      roster: { walletAddress: null }, attemptOrdinal: null,
       market: 'spread', forecastDigest: DIGEST(5),
     })), 'published', 'baseline seal');
     const rows = await query(
@@ -377,7 +451,7 @@ async function main(): Promise<void> {
     const cohortId = cohortName('wallet-late');
     expect(await port.publishAttempt(armAttempt(cohortId)), 'published', 'no wallet');
     const out = await port.publishAttempt(armAttempt(cohortId, {
-      roster: { armId: 'alpha-v1', walletAddress: `0x${'4'.repeat(40)}` },
+      roster: { walletAddress: `0x${'4'.repeat(40)}` },
       facts: facts({ attemptOrdinal: 1 }),
     }));
     expect(out, 'contradiction', 'wallet arriving late');
@@ -391,12 +465,12 @@ async function main(): Promise<void> {
     const cohortId = cohortName('wallet-share');
     const wallet = `0x${'2'.repeat(40)}`;
     expect(await port.publishAttempt(armAttempt(cohortId, {
-      participant: { ...MODEL, participantId: `${cohortId}-a`, labId: 'a' },
-      roster: { armId: 'v1', walletAddress: wallet },
+      participant: model(`${cohortId}-a`, { labId: 'a' }),
+      roster: { walletAddress: wallet },
     })), 'published', 'first participant');
     const out = await port.publishAttempt(armAttempt(cohortId, {
-      participant: { ...MODEL, participantId: `${cohortId}-b`, labId: 'b' },
-      roster: { armId: 'v1', walletAddress: wallet }, gameId: 'game-2',
+      participant: model(`${cohortId}-b`, { labId: 'b' }),
+      roster: { walletAddress: wallet }, gameId: 'game-2',
     }));
     expect(out, 'refused', 'second participant on the same wallet');
     assert.equal(out.outcome === 'refused' ? out.constraint : null, 'uq_benchmark_cohort_wallet');
@@ -428,7 +502,7 @@ async function main(): Promise<void> {
     // comparison kills the whole class at once.
     const cohortId = cohortName('roundtrip-attempt');
     await port.publishAttempt(armAttempt(cohortId, {
-      roster: { armId: 'ARM-ID', walletAddress: null },
+      roster: { walletAddress: null },
       facts: facts({
         attemptOrdinal: 1, suppliedMarkets: ['spread'], sent: true, outcome: 'OUTCOME',
         requestedModelId: 'REQUESTED', reportedModelId: 'REPORTED', providerResponseId: 'RESPONSE-ID',
@@ -843,6 +917,149 @@ async function main(): Promise<void> {
   });
 
   // ── negative controls: the grant is what makes the guarantees real ────────
+
+  await check('ONE ENTRANT PER (lab, model, configuration), and the index is what says so', async () => {
+    // The rule the whole identity model rests on. Two participant ids carrying
+    // the same three values are the same competitor, and the database keeps one
+    // of them - forever, because these rows are insert-once with no UPDATE.
+    //
+    // Proved deliberately, because the fixture helper above WORKS AROUND it by
+    // deriving `modelId` from the participant id. A suite that only avoids
+    // tripping a constraint has not shown the constraint is there.
+    const cohortId = cohortName('entrant-collision');
+    const shared = {
+      labId: 'collide',
+      modelId: `${cohortId}-same`,
+      configuration: AWKWARD_CONFIGURATION,
+    };
+    expect(await port.publishAttempt(armAttempt(cohortId, {
+      participant: model(`${cohortId}-first`, shared),
+    })), 'published', 'the first entrant');
+
+    const out = await port.publishAttempt(armAttempt(cohortId, {
+      participant: model(`${cohortId}-second`, shared), gameId: 'game-2',
+    }));
+    expect(out, 'refused', 'a second participant id with the same entrant key');
+    assert.equal(out.outcome === 'refused' ? out.constraint : null,
+      'uq_benchmark_participant_entrant');
+  });
+
+  await check('THE SAME MODEL AT TWO SETTINGS IS TWO ENTRANTS, and both land', async () => {
+    // The converse of the check above, and the capability the column exists
+    // for. A schema that could not hold this would make "compare one model at
+    // two reasoning levels" unrepresentable, which is the comparison the
+    // identity model was extended to support.
+    const cohortId = cohortName('two-settings');
+    const sharedModel = `${cohortId}-shared-model`;
+    for (const [suffix, configuration] of [
+      ['low', { reasoning: { effort: 'low' } }],
+      ['high', { reasoning: { effort: 'high' } }],
+    ] as const) {
+      expect(await port.publishAttempt(armAttempt(cohortId, {
+        participant: model(`${cohortId}-${suffix}`, {
+          labId: 'twoway', modelId: sharedModel, configuration,
+        }),
+        gameId: `game-${suffix}`,
+      })), 'published', `the ${suffix} setting`);
+    }
+    const rows = await query(
+      `select count(*)::int as n, count(distinct configuration_sha256)::int as digests
+         from public.benchmark_participants where model_id = $1`, [sharedModel]);
+    assert.equal(rows[0]!['n'], 2, 'two entrants share one model');
+    assert.equal(rows[0]!['digests'], 2, 'and the configuration digest is what tells them apart');
+  });
+
+  await check('a changed configuration for a live entrant is a CONTRADICTION, not a silent replay', async () => {
+    // A participant row is insert-once, so a second write declaring different
+    // settings is absorbed by `on conflict do nothing` unless something compares
+    // it. Without the drift check the caller is told `published` while the
+    // stored row still describes the old setting, and every later decision is
+    // attributed to a configuration that did not produce it.
+    const cohortId = cohortName('config-drift');
+    const participantId = `${cohortId}-drifter`;
+    expect(await port.publishAttempt(armAttempt(cohortId, {
+      participant: model(participantId),
+    })), 'published', 'the original configuration');
+
+    const out = await port.publishAttempt(armAttempt(cohortId, {
+      participant: model(participantId, {
+        configuration: { b: 2, aa: { nested: true, list: [1, 2] } },
+      }),
+      facts: facts({ attemptOrdinal: 1 }),
+    }));
+    expect(out, 'contradiction', 'a different configuration under the same participant');
+    assert.match(String(out.outcome === 'contradiction' ? out.field : ''),
+      /^participant\.configuration/);
+    const rows = await query(
+      'select count(*)::int as n from public.benchmark_arm_attempts where cohort_id = $1', [cohortId]);
+    assert.equal(rows[0]!['n'], 1, 'and the contradicting write left nothing behind');
+  });
+
+  await check('a MISMATCHED drift array is a contradiction, never a duplicate', async () => {
+    // The defect this check exists to catch on the NEXT edit rather than in
+    // production. `unnest(text[], boolean[])` pads the shorter array with NULLs.
+    // One predicate more than labels gives a differing row whose label is NULL,
+    // `min(f)` drops NULLs, and the caller was told `duplicate` - a write the
+    // gate had suppressed, reported as a benign repeat and therefore as success.
+    //
+    // Growing PARTICIPANT_DRIFT is exactly the edit that produces it, and this
+    // change grew it by four entries. So the statement is mismatched on purpose
+    // here and run against the real database.
+    const cohortId = cohortName('drift-mismatch');
+    // Capture what the port actually SENDS rather than rebuilding a forty-key
+    // payload beside it: a fixture that supplies its own expected value proves
+    // only that the code copies.
+    let sent: readonly unknown[] | null = null;
+    const recording = new SqlBenchmarkServingPort({
+      query,
+      transactor: {
+        transaction: (fn) => pgStoreTransactor(pool).transaction(async (inner) => fn(
+          async (sql, params) => {
+            if (sql === SERVING_STATEMENTS.attempt) sent = params;
+            return inner(sql, params);
+          },
+        )),
+      },
+    });
+    expect(await recording.publishAttempt(armAttempt(cohortId)), 'published', 'the entrant exists');
+    assert.notEqual(sent, null, 'the attempt statement was never seen, so nothing below is testing it');
+
+    const MARKER = 'is distinct from input.configuration_digest_version]';
+    assert.equal(SERVING_STATEMENTS.attempt.split(MARKER).length - 1, 1,
+      'the injection point must be unique, or this is mutating something else');
+    const mismatched = SERVING_STATEMENTS.attempt.replace(
+      MARKER, 'is distinct from input.configuration_digest_version, true]');
+
+    const [row] = await query(mismatched, sent!);
+    assert.equal(row!['drift_rows'], 1, 'the unlabelled predicate still fires');
+    assert.equal(row!['inserted'], 0, 'and the gate still suppresses the write');
+    assert.equal(row!['contradiction'], 'drift.unlabelled',
+      'and the coalesce names it, so min() cannot drop it');
+    assert.equal(row!['parent_found'], 0,
+      'parent_found reports the gate, so it cannot claim a parent for a suppressed write');
+
+    // NEGATIVE CONTROL, and the point of the check: strip the coalesce and the
+    // contradiction goes back to NULL, which is what the caller reads as
+    // `duplicate`. Two independent layers now have to be defeated for the old
+    // failure to return, and this shows each carries its own weight.
+    // EVERY occurrence, not the first. This statement carries four coalesced
+    // drift labels (run, participant, roster, attempt facts) and the injected
+    // predicate is in the participant one — a `replace` strips only the run's,
+    // leaves the participant's standing, and the control then "fails" by
+    // reporting a correctly named contradiction. That is a mutation that never
+    // applied, which is the one outcome a negative control must never score as
+    // a result.
+    const COALESCED = "coalesce(t.f, 'drift.unlabelled') as f";
+    const labelSites = mismatched.split(COALESCED).length - 1;
+    assert.equal(labelSites, 4, 'the attempt statement labels four drift sources');
+    const unnamed = mismatched.replaceAll(COALESCED, 't.f');
+    assert.equal(unnamed.split(COALESCED).length - 1, 0, 'and the mutation removed all of them');
+    const [bare] = await query(unnamed, sent!);
+    assert.equal(bare!['contradiction'], null,
+      'without the coalesce the disagreement is nameless - this is the old defect');
+    assert.equal(bare!['drift_rows'], 1,
+      'and drift_rows is what still catches it, independently of any label');
+  });
 
   await check('the resolver agrees with what the DRIVER actually does about TLS', async () => {
     // Asserting the returned object is not enough and never was: the driver

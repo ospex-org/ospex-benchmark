@@ -1,0 +1,199 @@
+import { existsSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { describeServingStatus, openBenchmarkServing } from './benchmarkServingClient.js';
+import { describeErrorWithStack } from './config.js';
+import { loadDotEnv } from './env.js';
+import { printError, printLine } from './console.js';
+import { publishRunArtifact } from './servingPublisher.js';
+import type { BenchmarkServingHandle } from './benchmarkServingClient.js';
+import type { PublishLog, PublishSummary } from './servingPublisher.js';
+import type { BenchmarkServingPort } from './servingStore.js';
+
+/**
+ * Publish a run artifact that is already on disk.
+ *
+ * ── WHY THIS IS NOT A ONE-OFF IMPORT TOOL ────────────────────────────────────
+ * The publisher cannot fail a run, which means a projection write lost to a
+ * network blip is lost quietly. This command is the only thing that gets it
+ * back, and it is therefore part of the design rather than a migration aid: the
+ * projection is a view of the artifacts, and this is what re-derives the view.
+ *
+ * It runs the same code the runner does, over the same bytes, so republishing
+ * is not a second implementation that has to be kept in step. Every write is
+ * idempotent — a row that already landed reports `duplicate` and nothing is
+ * altered — so running it twice, or over a whole directory, is safe.
+ *
+ * It is also how runs that predate the wiring reach the projection, subject to
+ * the same gate as a live fire: a run that was a dry run, or that failed its
+ * identity check, is refused here too.
+ */
+
+const USAGE = `usage: yarn project <run-file.ndjson> [more.ndjson ...]
+
+Publish written run artifacts onto the benchmark serving projection.
+
+Every write is idempotent, so re-running is safe: rows already present are
+reported as duplicates and nothing is changed. Runs that were dry runs, used a
+synthetic clock, recorded an identity or collision failure, or predate the
+projection stamp are skipped with a reason.
+
+Exit codes:
+  0  every row in every file is published or already present
+  1  publication was attempted and something did not land
+  2  usage — no files given, or a named file does not exist
+  3  no serving credential is configured, so nothing was attempted
+  4  configured, but the publisher was refused (bad connection settings, or a
+     schema that cannot yet record what an entrant is)
+  5  the command itself failed`;
+
+/**
+ * Every way this command can end, named so a test asserts a meaning rather than
+ * a number.
+ *
+ * ⚠ NOT ENABLED IS NOT SUCCESS HERE. This command exists only to publish, so
+ *   being unable to publish IS its failure — `yarn project run.ndjson && ...`
+ *   must not run the second half when nothing was written. An earlier build
+ *   returned 0 for every disabled reason, including a configured publisher held
+ *   back by the schema: an operator asked for publication, was refused, and the
+ *   shell said it worked.
+ *
+ * ⚠ THE OPPOSITE IS CORRECT FOR `watch` AND `smoke`. There the projection is a
+ *   side effect of a benchmark run, unconfigured is the shipped default, and a
+ *   missing credential must never fail a night. Do not carry this rule across.
+ *
+ * `unconfigured` is kept distinct from `refused` so an automation that treats
+ * "publication was never set up on this host" as benign can say so explicitly,
+ * without also swallowing "I tried and could not".
+ */
+export const PROJECT_EXIT = Object.freeze({
+  ok: 0,
+  publishFailed: 1,
+  usage: 2,
+  unconfigured: 3,
+  refused: 4,
+  crashed: 5,
+});
+
+/**
+ * Everything the command reaches for, injected so every terminal state in the
+ * table above is reachable from a unit test.
+ *
+ * An exit-code contract that can only be exercised by spawning a process
+ * against a real database is an exit-code contract with one case tested and
+ * the rest asserted in prose — and the case that shipped wrong was one of the
+ * ones that needed a database to reach.
+ */
+export interface ProjectMainDeps {
+  readonly argv: readonly string[];
+  readonly exists: (file: string) => boolean;
+  readonly open: () => Promise<BenchmarkServingHandle>;
+  readonly publish: (
+    port: BenchmarkServingPort,
+    runFile: string,
+    log: PublishLog,
+  ) => Promise<PublishSummary>;
+  readonly log: PublishLog;
+}
+
+export async function runProjectMain(deps: ProjectMainDeps): Promise<number> {
+  const files = deps.argv.filter((argument) => !argument.startsWith('-'));
+  const { line: printLine, error: printError } = deps.log;
+  if (deps.argv.includes('--help') || deps.argv.includes('-h') || files.length === 0) {
+    printLine(USAGE);
+    return files.length === 0 ? PROJECT_EXIT.usage : PROJECT_EXIT.ok;
+  }
+
+  const missing = files.filter((file) => !deps.exists(file));
+  if (missing.length > 0) {
+    printError(`no such run file: ${missing.join(', ')}`);
+    return PROJECT_EXIT.usage;
+  }
+
+  const serving = await deps.open();
+  printLine(describeServingStatus(serving.status));
+  if (!serving.status.enabled) {
+    await serving.close();
+    // Whichever it is, nothing was published, so neither is a success. The two
+    // are reported apart because they call for different responses: one is a
+    // host that was never set up, the other is a setup that was rejected.
+    return serving.status.reason === 'no_credential'
+      ? PROJECT_EXIT.unconfigured
+      : PROJECT_EXIT.refused;
+  }
+
+  let failed = 0;
+  try {
+    for (const file of files) {
+      printLine(`— ${file}`);
+      const summary = await deps.publish(serving.port, file, deps.log);
+      // FOUR ways this command fails, and every one of them has to reach the
+      // exit code. Its whole contract is that it exists only to publish, so
+      // anything short of publishing the artifact is a failure — and a partial
+      // success is the most dangerous of them, because it looks like a success
+      // to a script and leaves a gap nobody goes looking for.
+      //
+      //   rejected      the projection would not take a row.
+      //   gateRefusal   the file was turned away before anything was sent.
+      //   skipped       rows this side declined — an unenrolled participant, a
+      //                 reveal that did not reproduce its seal, work abandoned
+      //                 at the deadline. Measured: a run published 16 rows,
+      //                 silently omitted an entire model, and exited 0.
+      //   nothing       an enabled publisher that wrote no row and found none
+      //                 already present did not do the one thing it is for.
+      const rejected = Object.values(summary.rejected).reduce((total, count) => total + count, 0);
+      failed += rejected + summary.skipped.length;
+      if (summary.gateRefusal !== null) {
+        printError(`${file}: nothing was published — ${summary.gateRefusal}`);
+        failed += 1;
+      } else if (summary.published === 0 && summary.duplicate === 0) {
+        printError(`${file}: the publisher is enabled but wrote nothing and found nothing`);
+        failed += 1;
+      } else if (summary.skipped.length > 0) {
+        printError(
+          `${file}: PARTIAL — ${summary.published} written, ${summary.skipped.length} not sent. ` +
+            'The projection does not hold this run in full.',
+        );
+      }
+    }
+  } finally {
+    await serving.close();
+  }
+
+  // Unlike a benchmark run, this command exists only to publish — so failing to
+  // publish IS its failure. Nothing else in the repo treats a projection
+  // problem this way, and nothing else should.
+  return failed > 0 ? PROJECT_EXIT.publishFailed : PROJECT_EXIT.ok;
+}
+
+/** The same guard the other entry points use: importing this module for its
+ *  exit-code contract must not run the command. */
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  try {
+    return pathToFileURL(entry).href === import.meta.url;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  loadDotEnv();
+  runProjectMain({
+    argv: process.argv.slice(2),
+    exists: existsSync,
+    open: openBenchmarkServing,
+    publish: publishRunArtifact,
+    log: { line: printLine, error: printError },
+  })
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error: unknown) => {
+      // Distinct from `publishFailed`: that one means rows did not land and
+      // the answer is to republish; this one means the command broke and the
+      // answer is to read the stack.
+      printError(describeErrorWithStack(error));
+      process.exitCode = PROJECT_EXIT.crashed;
+    });
+}

@@ -11,6 +11,24 @@ export const DEFAULT_OSPEX_API_URL = 'https://ospex-core-api-195f635df864.heroku
 /** All markets/games are Polygon-mainnet-scoped rows upstream. */
 export const NETWORK = 'polygon';
 
+/**
+ * The protocol deployment these runs are measured against.
+ *
+ * Required and non-empty on every projected run, and part of the composite
+ * foreign key a decision uses to reach its provider call — so it is a frozen
+ * literal rather than an environment read. A variable mis-set halfway through a
+ * slate would make every subsequent seal fail that key, and the publisher is
+ * fail-soft, so the loss would be silent.
+ *
+ * It is also the only thing that separates two rounds' data: R5 restarted the
+ * contest-id counter, so a contest id is not comparable across rounds and this
+ * label is what says which deployment a row belongs to.
+ *
+ * ⚠ An R6 redeploy must change this deliberately. A test pins the literal so
+ *   the change is a decision someone makes, not one that drifts in.
+ */
+export const DEPLOYMENT_ROUND = 'R5';
+
 // Every credential this process can hold. A new one belongs here BEFORE the code
 // that uses it: redactSecrets() knows nothing it is not told, so an unenrolled
 // value passes through error messages and records verbatim.
