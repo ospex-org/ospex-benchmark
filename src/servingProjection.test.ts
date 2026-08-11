@@ -10,7 +10,7 @@ import { forecastDigest } from './schema.js';
 import { ARMS } from './providers/index.js';
 import { enrolledLabs, PROJECTION_PARTICIPANTS, projectionParticipant } from './servingIdentity.js';
 import type { ProjectionParticipant } from './servingIdentity.js';
-import { asEnrolled, firedRun, fullBoardInputs, TEST_SLATE_DATE } from './servingTestRun.js';
+import { firedRun, fullBoardInputs, TEST_SLATE_DATE, withContradictoryModel } from './servingTestRun.js';
 import { projectRun, publishableRun, revealMatchesSeal } from './servingProjection.js';
 import type { FiredRun, FireOptions } from './servingTestRun.js';
 import type { JsonRecord, ProjectionPlan } from './servingProjection.js';
@@ -139,7 +139,7 @@ test('the controls DO publish, because they are enrolled', async () => {
 // ---------------------------------------------------------------------------
 
 test('a full board publishes all three, with the run line named "spread"', async () => {
-  const plan = planOf(asEnrolled((await fire()).records));
+  const plan = planOf((await fire({ enrolled: true })).records);
   assert.ok(plan.attempts.length > 0);
   for (const attempt of plan.attempts) {
     // The bundle stores the run line under `runLine`; the response and the
@@ -153,7 +153,7 @@ test('suppliedMarkets states what the BUNDLE offered, not what came back', async
   // leaving all three forecasts in the response. Derived from the response the
   // answer is three — the denominator equal to the numerator, every coverage
   // figure reading 100%. Derived from the bundle it is two.
-  const records = asEnrolled((await fire()).records).map((record) => {
+  const records = (await fire({ enrolled: true })).records.map((record) => {
     if (record['recordType'] !== 'bundle_game') return record;
     const bundle = record['bundle'] as JsonRecord;
     const markets = { ...(bundle['markets'] as JsonRecord) };
@@ -172,7 +172,7 @@ test('suppliedMarkets states what the BUNDLE offered, not what came back', async
 });
 
 test('an attempt whose game has no recorded bundle is skipped, not given a guess', async () => {
-  const records = asEnrolled((await fire()).records).filter(
+  const records = (await fire({ enrolled: true })).records.filter(
     (record) => record['recordType'] !== 'bundle_game',
   );
   const plan = planOf(records);
@@ -185,9 +185,7 @@ test('an attempt whose game has no recorded bundle is skipped, not given a guess
 // ---------------------------------------------------------------------------
 
 test('an arm that made one call publishes exactly ordinal 0, marked sent', async () => {
-  const run = await fire();
-  const rewritten = asEnrolled(run.records);
-  const plan = planOf(rewritten);
+  const plan = planOf((await fire({ enrolled: true })).records);
 
   assert.equal(plan.attempts.length, 1);
   const attempt = plan.attempts[0]!;
@@ -195,7 +193,7 @@ test('an arm that made one call publishes exactly ordinal 0, marked sent', async
   assert.equal(attempt.facts.sent, true);
   assert.equal(attempt.facts.outcome, 'valid');
   assert.equal(attempt.facts.httpStatus, 200);
-  assert.equal(attempt.facts.reportedModelId, 'stub-model-1');
+  assert.equal(attempt.facts.reportedModelId, ARMS[0]!.requestedModelId);
   assert.equal(attempt.facts.inputTokens, 100);
   assert.equal(attempt.facts.outputTokens, 50);
   // The adapter reports no comparable-usage split and no search audit at all.
@@ -280,20 +278,20 @@ test('a repaired arm publishes both calls, and the seal cites the one that was a
 });
 
 test('the participant is the ARM, with the lab and the model in their own fields', async () => {
-  const run = await fire();
-  const enrolled = ARMS[1]!.participantId; // anthropic-claude-fable-5
-  const plan = planOf(asEnrolled(run.records, 1));
+  const run = await fire({ enrolled: true });
+  const enrolled = ARMS[0]!;
+  const plan = planOf(run.records);
   const attempt = plan.attempts[0]!;
 
-  assert.equal(attempt.participant.participantId, enrolled);
+  assert.equal(attempt.participant.participantId, enrolled.participantId);
   assert.equal(attempt.participant.kind, 'model');
-  assert.equal(attempt.participant.labId, 'anthropic');
-  assert.equal(attempt.participant.displayName, 'Claude Fable 5');
+  assert.equal(attempt.participant.labId, 'openai');
+  assert.equal(attempt.participant.displayName, 'GPT-5.6 Sol');
   // The roster records the exact model string requested this cohort, which is
   // not the participant id: the participant names the arm across every cohort
   // it runs in, and the lab is its own column so a second OpenAI or Anthropic
   // arm is simply a second participant.
-  assert.equal(attempt.roster.armId, 'claude-fable-5');
+  assert.equal(attempt.roster.armId, enrolled.requestedModelId);
   assert.equal(attempt.roster.walletAddress, null);
 });
 
@@ -302,14 +300,14 @@ test('the participant is the ARM, with the lab and the model in their own fields
 // ---------------------------------------------------------------------------
 
 test("a model's published digest is exactly forecastDigest() of the forecast it came from", async () => {
-  const run = await fire();
+  const run = await fire({ enrolled: true });
   // Over-scale on purpose. The response schema bounds these fields by range and
   // never by precision — a model that computes one chance in three returns
   // sixteen decimals — while the reveal columns hold four, six and eight. A
   // fixture already within scale cannot tell a build that quantises before
   // hashing from one that does not, and the difference is a commitment no
   // reader can ever check.
-  const rewritten = asEnrolled(run.records).map((record) =>
+  const rewritten = run.records.map((record) =>
     record['recordType'] === 'decision'
       ? {
           ...record,
@@ -360,8 +358,8 @@ test("a model's published digest is exactly forecastDigest() of the forecast it 
 });
 
 test('every reveal reproduces its own seal, for both kinds of participant', async () => {
-  const run = await fire();
-  const rewritten = asEnrolled(run.records);
+  const run = await fire({ enrolled: true });
+  const rewritten = run.records;
   const plan = planOf(rewritten);
 
   const kinds = new Set(plan.decisions.map((d) => d.seal.participant.kind));
@@ -370,8 +368,8 @@ test('every reveal reproduces its own seal, for both kinds of participant', asyn
 });
 
 test('the reveal check catches a transposition the database would accept', async () => {
-  const run = await fire();
-  const rewritten = asEnrolled(run.records);
+  const run = await fire({ enrolled: true });
+  const rewritten = run.records;
   const plan = planOf(rewritten);
 
   const model = plan.decisions.find(
@@ -405,7 +403,7 @@ test('the reveal check catches a transposition the database would accept', async
 // ---------------------------------------------------------------------------
 
 test('the plan is a pure function of the artifact, whatever the build thinks today', async () => {
-  const run = await fire();
+  const run = await fire({ enrolled: true });
   const gate = publishableRun(run.records);
   assert.ok(gate.publishable);
 
@@ -431,7 +429,7 @@ test('the plan is a pure function of the artifact, whatever the build thinks tod
 });
 
 test("the run's frozen identity comes from the artifact's stamp, not from this build", async () => {
-  const run = await fire();
+  const run = await fire({ enrolled: true });
   const meta = run.records.find((record) => record['recordType'] === 'run_meta');
   assert.ok(meta);
 
@@ -465,8 +463,8 @@ test("the run's frozen identity comes from the artifact's stamp, not from this b
 });
 
 test('a control seals at the run\'s open, and no later than any model in it', async () => {
-  const run = await fire();
-  const rewritten = asEnrolled(run.records);
+  const run = await fire({ enrolled: true });
+  const rewritten = run.records;
   const plan = planOf(rewritten);
   const runOpenedAt = rewritten.find((r) => r['recordType'] === 'run_meta')?.['createdAt'];
   assert.equal(typeof runOpenedAt, 'string');
@@ -554,10 +552,14 @@ test('a participant is one ARM, so a lab may field several', () => {
   // them. The variants are the hard case — same lab, same model, differing only
   // in a setting — and they are exactly as distinct as anything else, because
   // identity comes from the arm the runner dispatched and not from the model.
+  const arm = (participantId: string, displayName: string, armId: string): ProjectionParticipant => ({
+    participantId, kind: 'model', labId: 'openai', displayName, armId,
+    provider: 'openai', approvedReportedModelIds: [armId],
+  });
   const oneLab: ProjectionParticipant[] = [
-    { participantId: 'openai-gpt-5.6-sol-low', kind: 'model', labId: 'openai', displayName: 'GPT-5.6 Sol (low)', armId: 'gpt-5.6-sol' },
-    { participantId: 'openai-gpt-5.6-sol-high', kind: 'model', labId: 'openai', displayName: 'GPT-5.6 Sol (high)', armId: 'gpt-5.6-sol' },
-    { participantId: 'openai-gpt-5.7-x', kind: 'model', labId: 'openai', displayName: 'GPT-5.7 X', armId: 'gpt-5.7-x' },
+    arm('openai-gpt-5.6-sol-low', 'GPT-5.6 Sol (low)', 'gpt-5.6-sol'),
+    arm('openai-gpt-5.6-sol-high', 'GPT-5.6 Sol (high)', 'gpt-5.6-sol'),
+    arm('openai-gpt-5.7-x', 'GPT-5.7 X', 'gpt-5.7-x'),
   ];
   assert.equal(new Set(oneLab.map((p) => p.labId)).size, 1, 'all three share a lab');
   assert.equal(new Set(oneLab.map((p) => p.armId)).size, 2, 'two of them share a model');

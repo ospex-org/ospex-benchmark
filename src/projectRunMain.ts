@@ -67,19 +67,33 @@ async function main(): Promise<number> {
         line: printLine,
         error: printError,
       });
-      // Two ways this command fails, and BOTH have to reach the exit code.
+      // FOUR ways this command fails, and every one of them has to reach the
+      // exit code. Its whole contract is that it exists only to publish, so
+      // anything short of publishing the artifact is a failure — and a partial
+      // success is the most dangerous of them, because it looks like a success
+      // to a script and leaves a gap nobody goes looking for.
       //
-      // A row the projection refused is the obvious one. The other is a file
-      // the gate turned away — a dry run, a failed identity check, an artifact
-      // that does not pass its own integrity check. That path writes nothing
-      // and previously reported nothing, so an operator recovering a night's
-      // runs from a script saw `exit 0` over a batch that published not one
-      // row. Silence on the second is worse than on the first, because a
-      // refusal at least printed a SQLSTATE.
-      failed += Object.values(summary.rejected).reduce((total, count) => total + count, 0);
+      //   rejected      the projection would not take a row.
+      //   gateRefusal   the file was turned away before anything was sent.
+      //   skipped       rows this side declined — an unenrolled participant, a
+      //                 reveal that did not reproduce its seal, work abandoned
+      //                 at the deadline. Measured: a run published 16 rows,
+      //                 silently omitted an entire model, and exited 0.
+      //   nothing       an enabled publisher that wrote no row and found none
+      //                 already present did not do the one thing it is for.
+      const rejected = Object.values(summary.rejected).reduce((total, count) => total + count, 0);
+      failed += rejected + summary.skipped.length;
       if (summary.gateRefusal !== null) {
         printError(`${file}: nothing was published — ${summary.gateRefusal}`);
         failed += 1;
+      } else if (summary.published === 0 && summary.duplicate === 0) {
+        printError(`${file}: the publisher is enabled but wrote nothing and found nothing`);
+        failed += 1;
+      } else if (summary.skipped.length > 0) {
+        printError(
+          `${file}: PARTIAL — ${summary.published} written, ${summary.skipped.length} not sent. ` +
+            'The projection does not hold this run in full.',
+        );
       }
     }
   } finally {

@@ -463,3 +463,90 @@ test('a refused artifact is a REFUSAL, distinct from having nothing to publish',
   assert.equal(ok.gateRefusal, null);
   assert.ok(ok.published > 0);
 });
+
+test('a self-consistent artifact claiming the WRONG MODEL for a real arm is refused', async () => {
+  const run = await firedRun({ outDir: tempDir('serving-forge-'), enrolled: true });
+  const text = readFileSync(run.runFile, 'utf8');
+
+  // The forgery: keep a real participant id, change the model it declares. The
+  // file stays internally consistent, so nothing about it is self-evidently
+  // wrong — which is exactly why the check cannot be allowed to derive the
+  // expected identity FROM the file. It did, and this passed, and the projector
+  // published the contradictory identity.
+  const forged = text
+    .split(/\r?\n/)
+    .filter((line) => line.trim() !== '')
+    .map((line) => line.replace(/"requestedModelId":"[^"]+"/g, '"requestedModelId":"not-this-arms-model"'))
+    .join('\n');
+  writeFileSync(run.runFile, `${forged}\n`, 'utf8');
+
+  const port = new RecordingPort();
+  const summary = await publishRunArtifact(port, run.runFile, collector().log);
+  assert.deepEqual(port.calls, [], 'nothing may be sent');
+  assert.notEqual(summary.gateRefusal, null);
+});
+
+test('an artifact naming an arm the registry never enrolled is refused outright', async () => {
+  // Not skipped-per-participant: refused. The registry is append-only, so an
+  // arm it has never seen is not an old arm — it is one nobody enrolled, and a
+  // file asserting otherwise has no claim on being partly published.
+  const run = await firedRun({ outDir: tempDir('serving-unknown-'), enrolled: true });
+  const text = readFileSync(run.runFile, 'utf8');
+  writeFileSync(
+    run.runFile,
+    text.replace(/"participantId":"openai-gpt-5\.6-sol"/g, '"participantId":"nobody-enrolled-this"'),
+    'utf8',
+  );
+
+  const port = new RecordingPort();
+  const summary = await publishRunArtifact(port, run.runFile, collector().log);
+  assert.deepEqual(port.calls, []);
+  assert.ok(summary.gateRefusal?.includes('never enrolled'));
+});
+
+test('an honest enrolled artifact still publishes — the control for both refusals', async () => {
+  const run = await firedRun({ outDir: tempDir('serving-honest-'), enrolled: true });
+  const port = new RecordingPort();
+  const summary = await publishRunArtifact(port, run.runFile, collector().log);
+  assert.equal(summary.gateRefusal, null);
+  assert.ok(summary.published > 0);
+  assert.ok(port.calls.some((call) => call.kind === 'attempt'));
+});
+
+// ---------------------------------------------------------------------------
+// The whole-publication deadline binds every write, not every group of them
+// ---------------------------------------------------------------------------
+
+test('the deadline binds a decision\'s reveal and rationale, not just its seal', async () => {
+  const { plan } = await planFromFire();
+  const one: ProjectionPlan = { ...plan, attempts: [], decisions: plan.decisions.slice(0, 1) };
+
+  // Checked only before each decision, a seal admitted one millisecond inside
+  // the budget still gets its own full timeout — and so do the reveal and the
+  // rationale behind it. Measured at twelve times the configured deadline with
+  // nothing reported as abandoned.
+  let now = 0;
+  const slow = (): Promise<PublishOutcome> =>
+    new Promise((resolve) => {
+      now += 20;
+      setTimeout(() => resolve({ outcome: 'published' }), 1);
+    });
+  const port: BenchmarkServingPort = {
+    publishAttempt: slow,
+    sealDecision: slow,
+    revealDecision: slow,
+    publishRationale: slow,
+    publishScore: slow,
+    publishScoringRun: slow,
+  };
+
+  const summary = await publishPlan(port, one, collector().log, {
+    nowMs: () => now,
+    deadlineMs: 5,
+    perWriteTimeoutMs: 1_000,
+  });
+
+  // The seal is admitted; the reveal and rationale are past the line.
+  assert.ok(summary.published <= 1, `expected at most the seal, got ${summary.published}`);
+  assert.ok(summary.skipped.some((reason) => reason.includes('abandoned')));
+});

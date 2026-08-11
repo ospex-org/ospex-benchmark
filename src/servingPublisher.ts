@@ -95,6 +95,37 @@ export interface PublishTiming {
 class Timeout extends Error {}
 
 /**
+ * What is left of the publication's time, and how much of it one write may have.
+ *
+ * A budget consulted only at the top of a unit of work is not a budget: the last
+ * unit admitted still runs to its own timeout, and a decision is three writes
+ * deep. Measured at twelve times the configured deadline, with nothing reported
+ * as abandoned. `slice()` hands out no more than remains, so the deadline binds
+ * the final write as tightly as the first.
+ */
+class Budget {
+  abandoned = 0;
+
+  constructor(
+    private readonly nowMs: () => number,
+    private readonly expiresAt: number,
+    private readonly perWrite: number,
+  ) {}
+
+  /** True once the budget is gone, counting the work being turned away. */
+  spent(): boolean {
+    if (this.nowMs() < this.expiresAt) return false;
+    this.abandoned += 1;
+    return true;
+  }
+
+  /** The timeout for the next write: the per-write bound, or the remainder. */
+  slice(): number {
+    return Math.max(1, Math.min(this.perWrite, this.expiresAt - this.nowMs()));
+  }
+}
+
+/**
  * Run one write, and answer for it whatever happens.
  *
  * A port that rejects and a port that never settles are both reported as
@@ -228,27 +259,22 @@ export async function publishPlan(
   const tally = new Tally();
   tally.skipped.push(...plan.skipped);
 
-  // One budget for the whole publication, checked before each write rather
-  // than only per call: forty writes that each answer just inside the per-write
-  // timeout would otherwise still stall the fire for minutes.
-  const expiresAt = nowMs() + deadlineMs;
-  let abandoned = 0;
-  const outOfTime = (): boolean => {
-    if (nowMs() < expiresAt) return false;
-    abandoned += 1;
-    return true;
-  };
+  // One budget for the whole publication, and it has to bind EVERY write rather
+  // than every group of them.
+  const budget = new Budget(nowMs, nowMs() + deadlineMs, perWriteTimeoutMs);
 
   await inBatches(plan.attempts, async (attempt) => {
-    if (outOfTime()) return;
+    if (budget.spent()) return;
     const what = `attempt ${attempt.participant.participantId} / ${attempt.gameId} / ordinal ${attempt.facts.attemptOrdinal}`;
-    tally.record(await settle(() => port.publishAttempt(attempt), perWriteTimeoutMs), what, log);
+    tally.record(await settle(() => port.publishAttempt(attempt), budget.slice()), what, log);
   });
 
   await inBatches(plan.decisions, async (decision) => {
-    if (outOfTime()) return;
-    await publishDecision(port, decision, tally, log, perWriteTimeoutMs);
+    if (budget.spent()) return;
+    await publishDecision(port, decision, tally, log, budget);
   });
+
+  const abandoned = budget.abandoned;
 
   if (abandoned > 0) {
     // Loud, and recoverable: everything the projection did not take is still in
@@ -269,7 +295,7 @@ async function publishDecision(
   decision: ProjectedDecision,
   tally: Tally,
   log: PublishLog,
-  perWriteTimeoutMs: number,
+  budget: Budget,
 ): Promise<void> {
   const { seal, reveal, rationale } = decision;
   const what = `${seal.participant.participantId} / ${seal.gameId} / ${seal.market}`;
@@ -289,10 +315,17 @@ async function publishDecision(
     return;
   }
 
-  if (!tally.record(await settle(() => port.sealDecision(seal), perWriteTimeoutMs), `seal ${what}`, log)) return;
-  tally.record(await settle(() => port.revealDecision(reveal), perWriteTimeoutMs), `reveal ${what}`, log);
+  // The budget binds each of the three, not just the decision as a whole.
+  if (!tally.record(await settle(() => port.sealDecision(seal), budget.slice()), `seal ${what}`, log)) return;
+  if (budget.spent()) return;
+  tally.record(await settle(() => port.revealDecision(reveal), budget.slice()), `reveal ${what}`, log);
   if (rationale !== null) {
-    tally.record(await settle(() => port.publishRationale(rationale), perWriteTimeoutMs), `rationale ${what}`, log);
+    if (budget.spent()) return;
+    tally.record(
+      await settle(() => port.publishRationale(rationale), budget.slice()),
+      `rationale ${what}`,
+      log,
+    );
   }
 }
 

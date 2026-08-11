@@ -6,6 +6,7 @@ import { ARMS } from './providers/index.js';
 import { parseRunArtifact } from './servingProjection.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { JsonRecord } from './servingProjection.js';
+import type { ArmSpec } from './types.js';
 import type { BuildResult } from './bundle.js';
 import type { WatchGateProvenance } from './watch.js';
 import type {
@@ -91,13 +92,14 @@ function stubAdapter(
   build: BuildResult,
   cohortId: string,
   behaviour: StubBehaviour,
+  arm: ArmSpec,
 ): ProviderAdapter {
-  const valid = (): string => JSON.stringify(makeValidResponse(build.requests[0]!, TEST_ARM, cohortId));
+  const valid = (): string => JSON.stringify(makeValidResponse(build.requests[0]!, arm, cohortId));
   let call = 0;
   return {
-    provider: TEST_ARM.provider,
-    requestedModelId: TEST_ARM.requestedModelId,
-    credentialEnvVar: TEST_ARM.credentialEnvVar,
+    provider: arm.provider,
+    requestedModelId: arm.requestedModelId,
+    credentialEnvVar: arm.credentialEnvVar,
     // No credential is the one refusal that happens before any clock is read,
     // so the attempt it produces carries neither a request instant nor any
     // response field — exactly the shape the projection's unsent rule describes.
@@ -120,13 +122,15 @@ function stubAdapter(
       const rawText =
         behaviour === 'repaired' && call === 1
           ? JSON.stringify({
-              ...makeValidResponse(build.requests[0]!, TEST_ARM, cohortId),
+              ...makeValidResponse(build.requests[0]!, arm, cohortId),
               cohortId: 'not-the-cohort-this-run-authenticated',
             })
           : valid();
       return Promise.resolve({
         rawText,
-        reportedModelId: 'stub-model-1',
+        // The body must report the id the arm is APPROVED for, or the
+        // artifact contradicts itself and the identity gate refuses it.
+        reportedModelId: arm.requestedModelId,
         providerResponseId: 'stub-response',
         httpStatus: 200,
         usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
@@ -168,12 +172,27 @@ export async function firedRun(options: FireOptions): Promise<FiredRun> {
     lateThresholdMinutes: 60,
   };
   let clock = NOW_MS;
+  // Dispatch the ENROLLED arm when one is asked for, so the archived body, the
+  // recorded ids and the registry all agree from the moment the file is
+  // written. TEST_ARM stays the default because "not enrolled" is itself under
+  // test.
+  const enrolled = ARMS[0]!;
+  const arm: ArmSpec =
+    options.enrolled === true
+      ? {
+          ...TEST_ARM,
+          participantId: enrolled.participantId,
+          provider: enrolled.provider,
+          requestedModelId: enrolled.requestedModelId,
+        }
+      : TEST_ARM;
+
   const outcome = await fireEligibleGame(build, inputs, TEST_SLATE_DATE, provenance, {
-    arms: [TEST_ARM],
+    arms: [arm],
     adapters: new Map([
-      [TEST_ARM.participantId, stubAdapter(build, TEST_COHORT_ID, options.behaviour ?? 'ok')],
+      [arm.participantId, stubAdapter(build, TEST_COHORT_ID, options.behaviour ?? 'ok', arm)],
     ]),
-    approvedReportedModelIds: () => ['stub-model-1'],
+    approvedReportedModelIds: () => [arm.requestedModelId],
     outDir: options.outDir,
     timeoutMs: 60_000,
     maxOutputTokens: 16000,
@@ -186,20 +205,27 @@ export async function firedRun(options: FireOptions): Promise<FiredRun> {
     serving: new SqlBenchmarkServingPort(null),
   });
 
-  const raw = parseRunArtifact(readFileSync(outcome.runFile, 'utf8'));
   return {
     runFile: outcome.runFile,
-    records: options.enrolled === true ? asEnrolled(raw) : raw,
+    records: parseRunArtifact(readFileSync(outcome.runFile, 'utf8')),
     cohortId: TEST_COHORT_ID,
   };
 }
 
-/** Rewrite the fired arm's id to a registered one, leaving every other byte. */
-export function asEnrolled(records: readonly JsonRecord[], index = 0): JsonRecord[] {
-  const enrolled = ARMS[index]!.participantId;
+/**
+ * Forge a contradictory identity: a record naming an enrolled arm while
+ * declaring a model that arm does not run.
+ *
+ * Exists ONLY for the case that asserts such an artifact is refused. The honest
+ * way to get enrolled output is `firedRun({ enrolled: true })`, which dispatches
+ * the real arm so the archived body agrees with the records — a record-level
+ * relabel cannot, because the body echoes the participant id and the accepted
+ * model id and the verifier re-validates it.
+ */
+export function withContradictoryModel(records: readonly JsonRecord[]): JsonRecord[] {
   return records.map((record) =>
-    record['participantId'] === TEST_ARM.participantId
-      ? { ...record, participantId: enrolled }
-      : record,
+    record['requestedModelId'] === undefined
+      ? record
+      : { ...record, requestedModelId: 'not-the-model-this-arm-runs' },
   );
 }

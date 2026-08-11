@@ -111,34 +111,43 @@ export function verifyArtifactIntegrity(text: string): string | null {
     return `the artifact is not a well-formed run file (${describeError(error)})`;
   }
 
-  // ONE check is deliberately scoped out: conformance to the CURRENT frozen arm
-  // roster. Left at its default the verifier compares the run against whichever
-  // arms this build ships, which is right at scoring time and wrong here — the
-  // day a fifth arm is enrolled, every artifact written before it becomes
-  // unpublishable, and republishing an artifact is the only way to recover a
-  // write this fail-soft publisher lost. Recovery must not expire because the
-  // roster grew.
+  // The expected roster comes from the APPEND-ONLY REGISTRY, filtered to the
+  // participants this artifact contains. Both halves matter, and I have now got
+  // each one wrong in turn:
   //
-  // So the expected roster is taken from the artifact, which makes that one
-  // comparison vacuous and leaves every other check live: the declared counts
-  // against the records present, the archived bodies against their bundles, the
-  // watch entry-timing claim, the hashes. Who is ALLOWED to be published is a
-  // separate question with a separate answer — the frozen registry, which skips
-  // any participant it does not know rather than inventing a name for it.
-  const declared = new Map(
-    run.armResponses.map((response) => [
-      response.participantId,
-      {
-        participantId: response.participantId,
-        provider: response.provider,
-        requestedModelId: response.requestedModelId,
-        approvedReportedModelIds:
-          response.reportedModelId === null ? [] : [response.reportedModelId],
-      },
-    ]),
-  );
+  //   taking the roster from the artifact's own records made the check
+  //   SELF-APPROVING. A self-consistent file naming a real participant while
+  //   declaring an arbitrary requested model passed, and the projector then
+  //   published that contradictory identity. Nothing can verify itself.
+  //
+  //   leaving the verifier at its default compares the run against whichever
+  //   arms THIS BUILD ships, so the day a fifth arm is enrolled every artifact
+  //   written before it becomes unpublishable — and republishing an artifact is
+  //   the only way to recover a write this fail-soft publisher lost. Recovery
+  //   must not expire because the roster grew.
+  //
+  // Filtering an append-only registry to the participants present resolves the
+  // two: an old artifact is judged against exactly the arms it ran, by the
+  // registry's record of what those arms ARE, not by its own claims about them.
+  // An arm the registry has never heard of is refused outright, because the
+  // registry only ever grows — so an unknown arm is not an old one.
+  const observed = new Set(run.armResponses.map((response) => response.participantId));
+  const unknown = [...observed].filter((id) => projectionParticipant(id) === null);
+  if (unknown.length > 0) {
+    return `the artifact names arms the registry has never enrolled: ${unknown.sort().join(', ')}`;
+  }
 
-  const violations = verifyRunIntegrity(run, { expectedArms: [...declared.values()] });
+  const expectedArms = [...observed].map((id) => {
+    const entry = projectionParticipant(id);
+    return {
+      participantId: id,
+      provider: entry?.provider ?? '',
+      requestedModelId: entry?.armId ?? '',
+      approvedReportedModelIds: [...(entry?.approvedReportedModelIds ?? [])],
+    };
+  });
+
+  const violations = verifyRunIntegrity(run, { expectedArms });
   if (violations.length > 0) {
     return `the artifact fails its own integrity check: ${violations.join('; ')}`;
   }

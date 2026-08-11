@@ -110,6 +110,20 @@ export interface ProjectionParticipant {
    * baseline policy the run derived them under. Resolve with `armIdFor`.
    */
   readonly armId: string | null;
+  /**
+   * The provider that serves this arm, and the response-reported model ids that
+   * are acceptable from it.
+   *
+   * Here so an artifact's identity can be checked against something OTHER THAN
+   * ITSELF. The scorer's integrity verifier needs an expected roster, and
+   * deriving that roster from the very records it verifies makes the check
+   * self-approving: a file declaring an arbitrary requested model under a real
+   * participant id passed, and the contradictory identity was published.
+   *
+   * Null on a control, which makes no provider call.
+   */
+  readonly provider: string | null;
+  readonly approvedReportedModelIds: readonly string[];
 }
 
 /**
@@ -119,10 +133,10 @@ export interface ProjectionParticipant {
  * and the conformance suite proves the database admits it.
  */
 const MODELS: Readonly<Record<string, ProjectionParticipant>> = Object.freeze({
-  'openai-gpt-5.6-sol': model('openai', 'GPT-5.6 Sol', 'gpt-5.6-sol'),
-  'anthropic-claude-fable-5': model('anthropic', 'Claude Fable 5', 'claude-fable-5'),
-  'google-gemini-3.1-pro-preview': model('google', 'Gemini 3.1 Pro Preview', 'gemini-3.1-pro-preview'),
-  'xai-grok-4.5': model('xai', 'Grok 4.5', 'grok-4.5'),
+  'openai-gpt-5.6-sol': model('openai', 'GPT-5.6 Sol', 'gpt-5.6-sol', 'openai', ['gpt-5.6-sol']),
+  'anthropic-claude-fable-5': model('anthropic', 'Claude Fable 5', 'claude-fable-5', 'anthropic', ['claude-fable-5']),
+  'google-gemini-3.1-pro-preview': model('google', 'Gemini 3.1 Pro Preview', 'gemini-3.1-pro-preview', 'google', ['gemini-3.1-pro-preview']),
+  'xai-grok-4.5': model('xai', 'Grok 4.5', 'grok-4.5', 'xai', ['grok-4.5']),
 });
 
 /**
@@ -153,8 +167,22 @@ const CONTROLS: readonly (readonly [id: string, displayName: string])[] = [
  * `participantId` is filled in from the key by `PROJECTION_PARTICIPANTS` below,
  * so a durable id can never disagree with the key it is stored under.
  */
-function model(labId: string, displayName: string, armId: string): ProjectionParticipant {
-  return Object.freeze({ participantId: '', kind: 'model' as const, labId, displayName, armId });
+function model(
+  labId: string,
+  displayName: string,
+  armId: string,
+  provider: string,
+  approvedReportedModelIds: readonly string[],
+): ProjectionParticipant {
+  return Object.freeze({
+    participantId: '',
+    kind: 'model' as const,
+    labId,
+    displayName,
+    armId,
+    provider,
+    approvedReportedModelIds: Object.freeze([...approvedReportedModelIds]),
+  });
 }
 
 /** Every participant the projection admits, keyed on the runner's id — which
@@ -171,6 +199,10 @@ export const PROJECTION_PARTICIPANTS: Readonly<Record<string, ProjectionParticip
           labId: null,
           displayName,
           armId: null,
+          // A control makes no provider call, so it has no provider identity to
+          // check and never appears in an integrity roster.
+          provider: null,
+          approvedReportedModelIds: Object.freeze([]),
         }),
       ]),
     ]) as Record<string, ProjectionParticipant>,
