@@ -316,9 +316,20 @@ MUTANTS = [
      '        client.release(failure);',
      '        client.release();',
      ['src/store/campaignTickJournal.test.ts']),
-    ('M60-rollback-effectively-unbounded', 'src/store/campaignTickJournal.ts',
-     "              timer = setTimeout(() => reject(new Error('rollback did not answer')), rollbackTimeoutMs);",
-     "              timer = setTimeout(() => reject(new Error('rollback did not answer')), 3_600_000);",
+    # Removes the bound rather than lengthening it. A mutant that sets the
+    # deadline to an hour is UNSCOREABLE: the timer is ref'd (deliberately, so a
+    # short one cannot let Node exit mid-await), so an hour-long one holds the
+    # process and the battery reports HUNG instead of a verdict. Deleting the
+    # race leaves nothing ref'd, so the suite fails on its own timeout and the
+    # process still drains.
+    ('M60-rollback-unbounded', 'src/store/campaignTickJournal.ts',
+     "          await Promise.race([\n"
+     "            client.query('rollback', []),\n"
+     "            new Promise((_, reject) => {\n"
+     "              timer = setTimeout(() => reject(new Error('rollback did not answer')), rollbackTimeoutMs);\n"
+     "            }),\n"
+     "          ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });",
+     "          await client.query('rollback', []);",
      ['src/store/campaignTickJournal.test.ts']),
     ('M61-no-driver-read-timeout', 'src/benchmarkServingClient.ts',
      '    query_timeout: QUERY_TIMEOUT_MS,',

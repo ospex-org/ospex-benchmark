@@ -815,7 +815,27 @@ function configurationPayload(participant: ParticipantFacts): Record<string, unk
   // The same grammar the artifact stamp is held to. Refused here rather than
   // left to the database because the database can only answer with a 22P02 or a
   // CHECK name, neither of which says which key was wrong.
-  const violations = configurationViolations(participant.configuration);
+  //
+  // ⚠ THE LAB AND MODEL ARE PASSED IN, and that is what makes the database's
+  //   own bound unreachable rather than merely unlikely. The entrant-key CHECK
+  //   counts `octet_length(lab_id) + octet_length(model_id) +
+  //   octet_length(configuration::text)` against 1024, and the third term is
+  //   PostgreSQL's OWN rendering, which is longer than the canonical text this
+  //   module hashes — jsonb writes ": " and ", " where RFC 8785 writes ":" and
+  //   ",", so it costs one byte per key and one per separator.
+  //
+  //   Measured on PostgreSQL 17.10, densest shapes first: an array of
+  //   single-character elements expands 1.493x (507 canonical -> 757 rendered),
+  //   which is the worst case and approaches 1.5 asymptotically; many tiny
+  //   pairs 1.251x; a long string 1.002x. So 512 canonical bytes can never
+  //   render past 768, and with the identifier pair bounded at 128 the whole
+  //   key is under 896. Without this argument the identifiers are unbounded
+  //   here and the CHECK is reachable — as a named 23514, not silently, but
+  //   reachable.
+  const violations = configurationViolations(participant.configuration, {
+    labId: participant.labId ?? undefined,
+    modelId: participant.modelId ?? undefined,
+  });
   if (violations.length > 0) refuse('malformed_configuration', `participant.${violations[0]!}`);
 
   const configuration = participant.configuration as ParticipantConfiguration;
@@ -1063,13 +1083,19 @@ const RUN_DRIFT = `
 /**
  * ⚠ THE TWO ARRAYS IN EVERY `unnest` BELOW MUST BE THE SAME LENGTH.
  *
- * `unnest(array[names], array[flags])` pads the shorter one with NULLs, so a
- * name with no flag is silently never checked, and a flag with no name yields a
- * differing row whose label is NULL — which `min(f)` then drops, reporting no
- * contradiction while the gate suppresses the write anyway. `drift_rows` exists
- * so that second case is still reported (see the outcome mapping), and
- * `servingStore.test.ts` parses these statements and asserts every pair matches,
- * so adding to one array alone reddens the suite.
+ * `unnest(array[names], array[flags])` pads the shorter one with NULLs, and
+ * both directions of a mismatch were wrong before this. A flag with no name
+ * gave a differing row whose label was NULL, which `min(f)` dropped: no
+ * contradiction reported while the gate suppressed the write, so a refusal
+ * read as a duplicate. A name with no flag gave `differs = NULL`, which the
+ * WHERE filtered out, so that field was never compared again.
+ *
+ * Three things close it. `coalesce(t.f, ...)` labels the first case so `min()`
+ * keeps it. `coalesce(t.differs, true)` fails the second CLOSED, which is loud
+ * rather than silent — every later write for that parent is reported as a
+ * contradiction until the arrays are fixed. And `drift_rows` decides the
+ * outcome from the COUNT rather than from the label. `servingStore.test.ts`
+ * also parses these statements and requires each pair to match in length.
  */
 const PARTICIPANT_DRIFT = `
   select coalesce(t.f, 'drift.unlabelled') as f
@@ -1657,10 +1683,11 @@ function classifyRows(rows: ReadonlyArray<Record<string, unknown>>): PublishOutc
 /**
  * Reported when a drift row exists but the statement could not name the field.
  *
- * Reachable only from a statement whose drift `unnest` arrays are different
- * lengths, which is a bug in the SQL above rather than anything a caller did.
- * Named rather than blank so it is greppable in a log, and reported as a
- * contradiction rather than swallowed because the write really was suppressed.
+ * Unreachable from the statements above as they stand, because every drift
+ * source labels its padded row. It is the second layer, for a drift source
+ * added later WITHOUT that label — a bug in the SQL rather than anything a
+ * caller did. Named rather than blank so it is greppable, and reported as a
+ * contradiction rather than swallowed, because the write really was suppressed.
  */
 export const UNNAMED_DRIFT_FIELD = 'unnamed (a drift check in this statement is misconfigured)';
 

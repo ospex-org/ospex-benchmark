@@ -98,7 +98,15 @@ export function pgStoreTransactor(pool: PgPoolLike, options: TransactorOptions =
         await client.query('commit', []);
         return result;
       } catch (error) {
-        failure = error ?? new Error('the transaction failed without a reason');
+        // TRUTHY, not merely non-nullish. `pg-pool` decides whether to destroy
+        // the client on the truthiness of this value, so `throw 0` or `throw ''`
+        // would satisfy a `??` and still return a poisoned client to the idle
+        // set. Nothing in this repo throws a falsy value today; the guard costs
+        // a line and removes the class.
+        failure = error === undefined || error === null || error === false
+          || error === 0 || error === ''
+          ? new Error(`the transaction failed with a falsy value: ${String(error)}`)
+          : error;
         try {
           let timer: ReturnType<typeof setTimeout> | undefined;
           // NOT unref'd, deliberately. The rule is: unref a timer you never

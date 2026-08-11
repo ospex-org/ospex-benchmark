@@ -193,35 +193,74 @@ function probeExits(mode: string, deadlineMs: number): Promise<{ exited: boolean
 // real deadline. Generous, because the assertion is "bounded", not "fast".
 const PROBE_DEADLINE_MS = 12_000;
 
-test('a process whose database stopped answering still EXITS', { timeout: 60_000 }, async () => {
-  // THE guarantee of this module, and the one no promise-level assertion can
-  // make: `close()` resolving says nothing about whether Node can drain its
-  // event loop. Every earlier version returned promptly on a timer and then
-  // held an open socket forever.
-  const closed = await probeExits('close', PROBE_DEADLINE_MS);
-  assert.ok(
-    closed.exited,
-    `the probe never exited (${closed.ms}ms). Output:\n${closed.out}`,
-  );
-  // A child that died on an import error also "exits", and would pass the line
-  // above while proving nothing. Require evidence it got all the way through.
-  assert.match(closed.out, /close: returned/,
-    `the probe exited without reaching its close. Output:\n${closed.out}`);
-  assert.match(closed.out, /close: status=/,
-    `the probe exited before opening the publisher. Output:\n${closed.out}`);
-});
+/**
+ * The two shapes a run can be in when the database goes quiet, and the close
+ * each one takes. `held` closes from the schema-latch branch; `enabled` closes
+ * through the handle a run holds — a different call site, and until this case
+ * existed nothing in the suite reached it.
+ */
+for (const mode of ['held', 'enabled'] as const) {
+  test(`a process whose database stopped answering still EXITS (${mode})`, { timeout: 60_000 }, async () => {
+    // THE guarantee of this module, and the one no promise-level assertion can
+    // make: `close()` resolving says nothing about whether Node can drain its
+    // event loop. Every earlier version returned promptly on a timer and then
+    // held an open socket forever.
+    const closed = await probeExits(mode, PROBE_DEADLINE_MS);
+    assert.ok(closed.exited, `the probe never exited (${closed.ms}ms). Output:
+${closed.out}`);
+
+    // ⚠ AND IT MUST EXIT BEFORE THE DRIVER'S OWN TIMEOUT COULD HAVE DONE IT.
+    //   Without this bound the test passed on a build with the handle destroy
+    //   removed: `query_timeout` rejected at 9s, `pool.query` released with the
+    //   error, and the pool destroyed the client — so the process exited for a
+    //   reason that had nothing to do with the code under test. Measured by a
+    //   mutant that survived until this line existed.
+    assert.ok(
+      closed.ms < QUERY_TIMEOUT_MS,
+      `the probe took ${closed.ms}ms, long enough that query_timeout ` +
+        `(${QUERY_TIMEOUT_MS}ms) could be what ended it rather than the close. Output:
+${closed.out}`,
+    );
+
+    // A child that died on an import error also "exits". These require evidence
+    // it got all the way through, and — the assertion that was missing — that
+    // it reached the server at all: the probe used to fail TLS negotiation and
+    // die in milliseconds without ever sending a query, so there was no hung
+    // connection for the close to deal with.
+    assert.match(closed.out, new RegExp(`${mode}: reachedServer=true`),
+      `the probe never got a query to the server. Output:
+${closed.out}`);
+    assert.match(closed.out, new RegExp(`${mode}: close returned`),
+      `the probe exited without reaching its close. Output:
+${closed.out}`);
+    assert.match(closed.out, new RegExp(`${mode}: status=${mode === 'enabled' ? 'enabled' : 'schema_not_ready'}`),
+      `the probe took the wrong branch. Output:
+${closed.out}`);
+    if (mode === 'enabled') {
+      // And the write really was left in flight on a pinned client, rather than
+      // refused client-side before it ever opened one.
+      assert.match(closed.out, /enabled: write=abandoned/,
+        `the write never reached the database, so no client was pinned. Output:
+${closed.out}`);
+    }
+  });
+}
 
 test('NEGATIVE CONTROL: the close this replaced does NOT exit', { timeout: 60_000 }, async () => {
-  // Without this, the test above passes on a build with no fix at all — a fake
+  // Without this, the tests above pass on a build with no fix at all — a fake
   // server that hung up, or a pool that never connected, would let the process
-  // exit for reasons that have nothing to do with destroying a live handle.
-  // This runs the OLD close (race `pool.end()` against a timer, hand back)
-  // against the same silent server, and it must hang.
+  // exit for reasons unrelated to destroying a live handle. This runs the OLD
+  // close (race `pool.end()` against a timer, hand back) against the same
+  // silent server, and it must hang.
   const held = await probeExits('hold', PROBE_DEADLINE_MS);
+  assert.match(held.out, /hold: reachedServer=true/,
+    `the control did not reach the server either, so it proves nothing. Output:
+${held.out}`);
   assert.equal(
     held.exited,
     false,
     `the negative control exited in ${held.ms}ms, so this suite can no longer tell a bounded ` +
-      `process from an unbounded one and the test above proves nothing. Output:\n${held.out}`,
+      `process from an unbounded one and the tests above prove nothing. Output:
+${held.out}`,
   );
 });

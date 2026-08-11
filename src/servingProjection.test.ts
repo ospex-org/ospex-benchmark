@@ -10,6 +10,7 @@ import { forecastDigest } from './schema.js';
 import { ARMS } from './providers/index.js';
 import { enrolledLabs, entrantKey, PROJECTION_PARTICIPANTS, projectionParticipant } from './servingIdentity.js';
 import type { ProjectionParticipant } from './servingIdentity.js';
+import { configurationSha256 } from './participantConfiguration.js';
 import type { ParticipantConfiguration } from './participantConfiguration.js';
 import { firedRun, fullBoardInputs, TEST_SLATE_DATE, withContradictoryModel } from './servingTestRun.js';
 import { projectRun, publishableRun, revealMatchesSeal } from './servingProjection.js';
@@ -595,14 +596,53 @@ test('a participant is one ARM, so a lab may field several', () => {
   assert.deepEqual(enrolledLabs(), ['anthropic', 'google', 'openai', 'xai']);
 });
 
-test('every arm the runner can dispatch is enrolled, by construction', () => {
-  // Derived from the frozen roster rather than restated, so a fifth arm — a
-  // second model from a lab already present, say — fails here instead of
-  // silently never reaching the projection.
+test('every arm the runner dispatches is enrolled AS THE SAME ARM', () => {
+  // Two registries describe the same four competitors: `ARMS`, which the runner
+  // dispatches, and the projection registry, which is append-only so that a
+  // months-old artifact is judged against the arms it actually ran. They cannot
+  // be derived from each other without losing that property, so they are held
+  // together here instead.
+  //
+  // ⚠ IDENTITY, NOT JUST PRESENCE. `verifyArtifactIntegrity` builds its expected
+  //   roster from the registry and compares it against the run's own stamp, so
+  //   a registry that disagrees with `ARMS` on the provider, the model string or
+  //   the configuration does not fail here — it makes the NEXT night's artifact
+  //   unpublishable, and republishing is the only way to recover a write the
+  //   fail-soft publisher lost. Measured before this test existed: changing one
+  //   arm's configuration in `ARMS` reddened nothing.
+  //
+  //   Changing what an arm competes at is a NEW participant id, never an edit to
+  //   an existing one — the database enforces the same rule with a unique index
+  //   over (lab_id, model_id, configuration).
   for (const arm of ARMS) {
-    assert.ok(projectionParticipant(arm.participantId), `arm ${arm.participantId} is not enrolled`);
+    const enrolled = projectionParticipant(arm.participantId);
+    assert.ok(enrolled, `arm ${arm.participantId} is not enrolled`);
+    assert.equal(enrolled.provider, arm.provider, `${arm.participantId}: provider`);
+    assert.equal(enrolled.modelId, arm.requestedModelId, `${arm.participantId}: model`);
+    assert.equal(
+      configurationSha256(enrolled.configuration ?? {}),
+      configurationSha256(arm.configuration),
+      `${arm.participantId}: the registry and ARMS disagree about what it competes at`,
+    );
   }
   assert.equal(ARMS.length, 4);
+});
+
+test('two entries can never be the same entrant', () => {
+  // `(lab_id, model_id, configuration)` is unique among models with NULLS NOT
+  // DISTINCT, so two registry entries colliding on it are two participant ids
+  // the database will only ever hold one of — and the second one's every write
+  // is refused, silently, because the publisher is fail-soft.
+  const seen = new Map<string, string>();
+  for (const entry of Object.values(PROJECTION_PARTICIPANTS)) {
+    if (entry.kind !== 'model') continue;
+    const key = entrantKey(entry);
+    const first = seen.get(key);
+    assert.equal(first, undefined,
+      `${entry.participantId} and ${String(first)} are the same entrant`);
+    seen.set(key, entry.participantId);
+  }
+  assert.equal(seen.size, ARMS.length);
 });
 
 test('the run identity the artifact stamps is the frozen literal, spelled out here', async () => {

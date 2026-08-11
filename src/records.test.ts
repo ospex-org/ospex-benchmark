@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
+import { DEPLOYMENT_ROUND, NETWORK } from './config.js';
+import { CURRENT_RESPONSE_SCHEMA_VERSION } from './schema.js';
+import { isParseableInstant } from './time.js';
 import {
   CONFIGURATION_DIGEST_VERSION,
   configurationSha256,
@@ -485,6 +488,116 @@ test('decision records carry the v2 analysis fields and the accepted attempt sea
   const armResponse = records.find((r) => r['recordType'] === 'arm_game_response');
   assert.ok(armResponse);
   assert.deepEqual((armResponse['attempt'] as Record<string, unknown>)['searchAudit'], audit);
+});
+
+// ---------------------------------------------------------------------------
+// The projection stamp and the acceptance instant
+//
+// Both are what a REPUBLISHED artifact re-derives its identity from, and the
+// serving run row is insert-once — a value that is wrong here is permanent, and
+// one that is missing drops the write it was supposed to complete. So they are
+// asserted against the constants the code reads, not against a re-derivation.
+// ---------------------------------------------------------------------------
+
+test('run_meta stamps the projection facts the serving run row freezes', async () => {
+  const build = makeBuild();
+  const ctx = makeCtx();
+  const request = build.requests[0];
+  assert.ok(request);
+  const env = await envFrom(build, ctx, [
+    () => stubResponse(JSON.stringify(makeValidResponse(request))),
+  ]);
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
+  const runMeta = records.find((r) => r['recordType'] === 'run_meta');
+  assert.ok(runMeta);
+  const projection = runMeta['projection'] as Record<string, unknown>;
+  assert.ok(projection, 'run_meta carries the projection stamp');
+
+  // The frozen literals from config, not a value derived at write time: the
+  // whole reason they are stamped is that re-deriving them when republishing
+  // (a bumped round, a newer commit) would disagree with the stored row.
+  assert.equal(projection['network'], NETWORK);
+  assert.equal(projection['deploymentRound'], DEPLOYMENT_ROUND);
+  assert.equal(projection['responseSchemaVersion'], CURRENT_RESPONSE_SCHEMA_VERSION);
+
+  // Advisory by construction — null when git cannot be reached — so the shape
+  // is asserted rather than a value. `in` rather than a truthiness check: the
+  // key must be PRESENT even when the value is null, because the projection
+  // reads it off the stamp.
+  assert.ok('benchmarkCommit' in projection);
+  const commit = projection['benchmarkCommit'];
+  assert.ok(
+    commit === null || (typeof commit === 'string' && /^[0-9a-f]{40}(-dirty)?$/.test(commit)),
+    `benchmarkCommit is a sha or null, got ${JSON.stringify(commit)}`,
+  );
+
+  // Enumerated, because adding a field to a stamp that a later write is
+  // COMPARED against is a decision someone makes, not one that drifts in.
+  assert.deepEqual(Object.keys(projection).sort(), [
+    'benchmarkCommit',
+    'deploymentRound',
+    'network',
+    'responseSchemaVersion',
+  ]);
+});
+
+test('the accepted attempt and every decision it produced carry the same acceptedAt', async () => {
+  const build = makeBuild();
+  const ctx = makeCtx();
+  const request = build.requests[0];
+  assert.ok(request);
+  const env = await envFrom(build, ctx, [
+    () => stubResponse(JSON.stringify(makeValidResponse(request))),
+  ]);
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
+
+  const armResponse = records.find((r) => r['recordType'] === 'arm_game_response');
+  assert.ok(armResponse);
+  const acceptedAt = (armResponse['attempt'] as Record<string, unknown>)['acceptedAt'];
+  assert.equal(typeof acceptedAt, 'string');
+  assert.ok(isParseableInstant(acceptedAt as string), `${String(acceptedAt)} is an instant`);
+  // The INJECTED clock's reading, frozen as a literal: a dry run's timestamps
+  // all come from the one synthetic clock (clockMode: 'synthetic-fixture'), so
+  // a stamp taken from the wall clock instead would not land here.
+  assert.equal(acceptedAt, '2026-07-12T16:14:00.000Z');
+
+  const decisions = records.filter((r) => r['recordType'] === 'decision');
+  assert.equal(decisions.length, 3);
+  for (const decision of decisions) {
+    assert.equal(decision['acceptedAt'], acceptedAt, 'no join needed to know when it committed');
+  }
+});
+
+test("a repaired decision's acceptedAt is the REPAIR's accept instant, and the initial attempt has none", async () => {
+  // The discriminating case: on a first-try success every attempt timestamp on
+  // the record is the same instant, so a build reading acceptedAt off the
+  // INITIAL attempt would pass the test above. Here the initial attempt was
+  // never accepted, so only the repair carries an instant at all.
+  const build = makeBuild();
+  const ctx = makeCtx();
+  const request = build.requests[0];
+  assert.ok(request);
+  const env = await envFrom(build, ctx, [
+    () => stubResponse(wrongEcho(makeValidResponse(request))),
+    () => stubResponse(JSON.stringify(makeValidResponse(request))),
+  ]);
+  assert.equal(env.results[0]?.repairUsed, true);
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
+
+  const armResponse = records.find((r) => r['recordType'] === 'arm_game_response');
+  assert.ok(armResponse);
+  const initial = armResponse['attempt'] as Record<string, unknown>;
+  const repair = armResponse['repair'] as Record<string, unknown>;
+  assert.equal(initial['acceptedAt'], null, 'a response that failed validation was not accepted');
+  assert.equal(repair['acceptedAt'], '2026-07-12T16:14:00.000Z');
+  assert.ok(isParseableInstant(repair['acceptedAt'] as string));
+
+  const decisions = records.filter((r) => r['recordType'] === 'decision');
+  assert.equal(decisions.length, 3);
+  for (const decision of decisions) {
+    assert.equal(decision['acceptedAt'], repair['acceptedAt']);
+    assert.notEqual(decision['acceptedAt'], initial['acceptedAt']);
+  }
 });
 
 // ---------------------------------------------------------------------------

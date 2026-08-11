@@ -6,7 +6,11 @@ import {
   SqlBenchmarkServingPort,
   UNNAMED_DRIFT_FIELD,
 } from './servingStore.js';
-import { canonicalConfigurationText, configurationSha256 } from './participantConfiguration.js';
+import {
+  MAX_ENTRANT_IDENTIFIER_BYTES,
+  canonicalConfigurationText,
+  configurationSha256,
+} from './participantConfiguration.js';
 import type {
   ArmAttempt,
   AttemptFacts,
@@ -1304,4 +1308,41 @@ test('every drift source LABELS its padded row, so min() can never drop one', ()
   // assertions above are green against anything.
   const stripped = SERVING_STATEMENTS.attempt.replaceAll("coalesce(t.f, 'drift.unlabelled') as f", 't.f');
   assert.ok((stripped.match(BARE) ?? []).length >= 4, 'the bare matcher recognises what it is looking for');
+});
+
+test('the identifier pair is bounded too, so the entrant-key CHECK is unreachable', async () => {
+  // The database bounds `lab_id + model_id + configuration::text` at 1024
+  // BYTES, where the third term is PostgreSQL's own jsonb rendering - longer
+  // than the canonical text hashed here, because jsonb writes ": " and ", ".
+  //
+  // Measured on PostgreSQL 17.10: the worst expansion is an array of
+  // single-character elements at 1.493x, approaching 1.5 asymptotically. So 512
+  // canonical bytes can never render past 768, and bounding the identifier pair
+  // at 128 puts the whole key under 896. Drop this and the identifiers are
+  // unbounded here, and the CHECK becomes reachable - as a named 23514 rather
+  // than silently, but reachable.
+  const overLong = 'L'.repeat(MAX_ENTRANT_IDENTIFIER_BYTES);
+  assert.deepEqual(
+    await refusal((p) => p.publishAttempt(attempt({
+      participant: { ...MODEL, labId: overLong, modelId: overLong },
+    }))),
+    {
+      outcome: 'invalid_input',
+      reason: 'malformed_configuration',
+      field: `participant.lab and model identifiers are ${overLong.length * 2} bytes together, `
+        + `over the ${MAX_ENTRANT_IDENTIFIER_BYTES}-byte ceiling`,
+    },
+  );
+
+  // NEGATIVE CONTROL: a pair exactly AT the ceiling is accepted, so this is a
+  // bound rather than a blanket refusal of long names.
+  const half = 'L'.repeat(MAX_ENTRANT_IDENTIFIER_BYTES / 2);
+  const accepted = scriptedQuery([OK]);
+  assert.deepEqual(
+    await new SqlBenchmarkServingPort(accepted.deps).publishAttempt(attempt({
+      participant: { ...MODEL, labId: half, modelId: half },
+    })),
+    { outcome: 'published' },
+    'exactly at the ceiling is accepted',
+  );
 });

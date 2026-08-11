@@ -10,8 +10,10 @@ import type { BenchmarkServingPort } from './servingStore.js';
  * `benchmarkServingConfig.ts` turns environment into a decision and opens no
  * socket, and `servingStore.ts` takes an injected `StoreQuery` and imports no
  * driver. This module is the only place that holds both, so it is the only
- * place that imports `pg` — dynamically, so a dry run, a rehearsal or a unit
- * test never loads the driver at all.
+ * only place on the SERVING path that imports `pg` — dynamically, so a dry
+ * run, a rehearsal or a unit test never loads the driver at all. Other entry
+ * points import it for their own pools; what matters here is that neither
+ * half of this seam does.
  *
  * ── DISABLED IS A CONFIGURATION, NOT A DEGRADED MODE ─────────────────────────
  * With no credential the resolver returns `{resolved: false}`, this returns a
@@ -95,7 +97,10 @@ export const STATEMENT_TIMEOUT_MS = 8_000;
  */
 export type ServingStatus =
   | { readonly enabled: true }
-  | { readonly enabled: false; readonly reason: UnresolvedReason | 'schema_not_ready' };
+  | {
+      readonly enabled: false;
+      readonly reason: UnresolvedReason | 'schema_not_ready' | 'driver_unavailable';
+    };
 
 const CLOSE_TIMEOUT_MS = 5_000;
 
@@ -112,14 +117,15 @@ const REQUIRED_PARTICIPANT_COLUMNS = ['model_id', 'configuration', 'configuratio
 /**
  * Refuse to open against a schema that cannot record what an arm IS.
  *
- * A latch, not a lint, and it blocks deliberately. Until it existed the only
- * thing between the current schema and permanent dimensionless participant rows
- * was that nobody had set the credential — and the README and `.env.example`
- * both explain how to set it. "We are relying on no one turning it on" is not a
- * control; a precondition the code enforces is.
+ * It checks for the COLUMNS BY NAME and nothing else — not their nullability,
+ * not the kind-dependent CHECKs, not the entrant index. Against a database
+ * that carries the identity migration it therefore always passes, and it is
+ * NOT what prevents a dimensionless entrant: `configurationPayload` in
+ * servingStore.ts does that, client-side, in both directions.
  *
- * It lifts by itself when the migration lands, so nobody has to remember to
- * remove it.
+ * What it is still worth is a legible refusal rather than a 42703 for a host
+ * pointed at an older database, and it lifts by itself once the migration
+ * lands. Reading it as the control would be reading it as more than it is.
  */
 async function missingParticipantColumns(
   query: (sql: string, params: readonly unknown[]) => Promise<ReadonlyArray<Record<string, unknown>>>,
@@ -146,6 +152,12 @@ export interface BenchmarkServingHandle {
 /** One line for an operator, naming no part of the target. */
 export function describeServingStatus(status: ServingStatus): string {
   if (status.enabled) return 'serving projection: enabled';
+  if (status.reason === 'driver_unavailable') {
+    return (
+      'serving projection: disabled (the PostgreSQL driver is not installed in ' +
+      'this environment)'
+    );
+  }
   if (status.reason === 'schema_not_ready') {
     return (
       'serving projection: HELD — the database cannot yet record which arm a ' +
@@ -195,12 +207,31 @@ export function servingPoolConfig(connection: BenchmarkWriterConnection): PoolCo
 
 const DISABLED: Pick<BenchmarkServingHandle, 'close'> = { close: async () => {} };
 
+/** The three runtime pieces this module needs, loaded together so one failure
+ *  is one branch. */
+async function loadDriver() {
+  const [{ Pool }, { pgStoreQuery }, { pgStoreTransactor }] = await Promise.all([
+    import('pg'),
+    import('./store/atomicStore.js'),
+    import('./store/campaignTickJournal.js'),
+  ]);
+  return { Pool, pgStoreQuery, pgStoreTransactor };
+}
+
+type ServingTransactorFactory = Awaited<ReturnType<typeof loadDriver>>['pgStoreTransactor'];
+
 /**
  * Resolve the environment and open the publisher.
  *
- * Never throws. A pool that cannot be constructed is reported as disabled with
- * the resolver's own vocabulary rather than propagated: this is the projection,
- * and nothing downstream authorizes anything on it.
+ * Never throws, and that is load-bearing rather than tidy: a run calls this on
+ * its way in, and the projection may not be able to end a benchmark night.
+ * Everything that can fail is reported as a disabled status instead.
+ *
+ * ⚠ INCLUDING THE DRIVER IMPORT. `pg` is a devDependency, so a production
+ *   install has no driver at all and `await import('pg')` REJECTS — which,
+ *   unguarded, propagated straight out of a function documented never to
+ *   throw. That is the shape a caller cannot defend against, because the whole
+ *   reason it calls this unconditionally is that it is safe to.
  */
 export async function openBenchmarkServing(
   bounds: ServingBounds = {},
@@ -212,12 +243,21 @@ export async function openBenchmarkServing(
     return { port: new SqlBenchmarkServingPort(null), status: { enabled: false, reason: resolution.reason }, ...DISABLED };
   }
 
-  const { Pool } = await import('pg');
-  const { pgStoreQuery } = await import('./store/atomicStore.js');
-  const { pgStoreTransactor } = await import('./store/campaignTickJournal.js');
-
-  const pool = new Pool(servingPoolConfig(resolution.connection));
-  const query = pgStoreQuery(pool);
+  let pool: InstanceType<Awaited<ReturnType<typeof loadDriver>>['Pool']>;
+  let query: ReturnType<Awaited<ReturnType<typeof loadDriver>>['pgStoreQuery']>;
+  let transactor: ServingTransactorFactory;
+  try {
+    const driver = await loadDriver();
+    pool = new driver.Pool(servingPoolConfig(resolution.connection));
+    query = driver.pgStoreQuery(pool);
+    transactor = driver.pgStoreTransactor;
+  } catch {
+    return {
+      port: new SqlBenchmarkServingPort(null),
+      status: { enabled: false, reason: 'driver_unavailable' },
+      ...DISABLED,
+    };
+  }
 
   // Every client currently checked out — which is exactly the set `pool.end()`
   // will not drain, and therefore the set `closePool` has to destroy. Tracked
@@ -255,7 +295,7 @@ export async function openBenchmarkServing(
   }
 
   return {
-    port: new SqlBenchmarkServingPort({ query, transactor: pgStoreTransactor(pool) }),
+    port: new SqlBenchmarkServingPort({ query, transactor: transactor(pool) }),
     status: { enabled: true },
     close: () => closePool(poolLike, live, closeTimeoutMs),
   };
@@ -325,8 +365,13 @@ function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
  *   all of them                  | 6.2s / 6.2s     | 1.2s / 1.2s
  *
  * So the destroy below is what turns "close returned" into "the process can
- * exit", and it is the only remedy that covers every path — including one the
- * driver's own timeouts do not, because a frozen server cannot enforce its own.
+ * exit", and it covers the paths the driver's own timeouts do not — a frozen
+ * server cannot enforce its own.
+ *
+ * One path it does NOT cover, stated rather than left implied: a client still
+ * inside `connect()` has not emitted `acquire`, so it is not in `live` and the
+ * loop below walks past it. What bounds that one is the pool's own connect
+ * timer at `connectionTimeoutMillis`, which is 10s — twice this close bound.
  *
  * ── WHY DESTROYING IS SAFE HERE, AND WOULD NOT BE ON A MONEY PATH ────────────
  * Every projection write is an idempotent insert that either landed or did not,
@@ -360,17 +405,12 @@ async function closePool(
       // holding the loop open.
     }
   }
-  // A second end() on an ending pool rejects; the point is to let the drain
-  // that was already waiting settle, not to learn anything from it.
-  await Promise.race([
-    pool.end().then(() => undefined, () => undefined),
-    new Promise<void>((resolve) => { setTimeout(resolve, SETTLE_AFTER_DESTROY_MS).unref?.(); }),
-  ]);
+  // One turn of the loop, so the destroyed sockets' close events are handled
+  // before this returns. NOT a second drain: `end()` on an already-ending pool
+  // hands back a promise that is already rejected, so awaiting it would settle
+  // on the next microtask and measure nothing.
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
 }
-
-/** Long enough for a destroyed socket's close to be observed, short enough that
- *  it cannot become a second stall. */
-const SETTLE_AFTER_DESTROY_MS = 500;
 
 /** The two members of `pg`'s Pool this module uses, so `pg` stays dynamic. */
 interface PoolLike {

@@ -75,8 +75,9 @@ export const PROJECT_EXIT = Object.freeze({
 });
 
 /**
- * Everything the command reaches for, injected so every terminal state in the
- * table above is reachable from a unit test.
+ * Everything the command reaches for, injected so every state this function
+ * RETURNS is reachable from a unit test. `crashed` is not one of them: it is
+ * set by the entry point's own catch, and is pinned as a value instead.
  *
  * An exit-code contract that can only be exercised by spawning a process
  * against a real database is an exit-code contract with one case tested and
@@ -98,9 +99,15 @@ export interface ProjectMainDeps {
 export async function runProjectMain(deps: ProjectMainDeps): Promise<number> {
   const files = deps.argv.filter((argument) => !argument.startsWith('-'));
   const { line: printLine, error: printError } = deps.log;
-  if (deps.argv.includes('--help') || deps.argv.includes('-h') || files.length === 0) {
+  // Asking for help and getting it is not a failure, with or without a file
+  // argument beside it. Only an invocation that names no work is a usage error.
+  if (deps.argv.includes('--help') || deps.argv.includes('-h')) {
     printLine(USAGE);
-    return files.length === 0 ? PROJECT_EXIT.usage : PROJECT_EXIT.ok;
+    return PROJECT_EXIT.ok;
+  }
+  if (files.length === 0) {
+    printLine(USAGE);
+    return PROJECT_EXIT.usage;
   }
 
   const missing = files.filter((file) => !deps.exists(file));

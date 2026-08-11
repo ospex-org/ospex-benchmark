@@ -106,6 +106,9 @@ const DISABLED_EXIT: Record<DisabledReason, number> = {
   malformed_port: PROJECT_EXIT.refused,
   plaintext_dsn: PROJECT_EXIT.refused,
   schema_not_ready: PROJECT_EXIT.refused,
+  // The credential was configured and the driver is not installed. Refused, not
+  // unconfigured: the operator asked for publication and did not get it.
+  driver_unavailable: PROJECT_EXIT.refused,
 };
 
 test('every not-enabled reason has a decided, non-zero exit code', async () => {
