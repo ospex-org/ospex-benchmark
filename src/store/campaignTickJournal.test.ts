@@ -273,7 +273,10 @@ test('pgStoreTransactor releases WITH the error, because that is what destroys t
   assert.match(destroyBecause.message, /boom on select 1/);
 });
 
-test('a rollback that never answers cannot stop the client being released', async () => {
+// An EXPLICIT timeout, because the failure this pins is a hang. Without it a
+// build whose rollback bound stopped working would not fail — it would run
+// forever, which a mutation battery scores as unresolved rather than as caught.
+test('a rollback that never answers cannot stop the client being released', { timeout: 5_000 }, async () => {
   // The second place this could hang, and the one that used to. If the
   // transaction failed because a statement never came back, `rollback` is
   // queued BEHIND that statement and waits exactly as long — so the `finally`

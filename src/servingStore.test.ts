@@ -1270,3 +1270,38 @@ test('an integer beyond a PostgreSQL int is refused here, not by the driver', as
   assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).publishAttempt(
     attempt({ facts: { ...FACTS, latencyMs: 2_147_483_647 } })), { outcome: 'published' });
 });
+
+test('every drift source LABELS its padded row, so min() can never drop one', () => {
+  // The other half of the cardinality check above. That one catches a mismatch
+  // at review time; this catches a drift CTE added later WITHOUT the coalesce,
+  // which is the shape that reintroduces "a suppressed write reported as a
+  // duplicate".
+  //
+  // Anchored on executable structure, not on a phrase: the regex requires the
+  // coalesced select to be immediately followed by the `from` line of a real
+  // table. The surrounding comments in servingStore.ts discuss coalescing at
+  // length, and a looser matcher would happily match the prose (rule 3c).
+  // `[^\n]*,` after the source covers the table alias — `from public.foo p, input,`.
+  const LABELLED = /select coalesce\(t\.f, '[a-z.]+'\) as f\s*\n\s*from (?:public\.\w+|cited)[^\n]*,/g;
+  const BARE = /select t\.f\s*\n\s*from (?:public\.\w+|cited)[^\n]*,/g;
+
+  for (const [name, sql] of [
+    ['attempt', SERVING_STATEMENTS.attempt],
+    ['seal', SERVING_STATEMENTS.seal],
+  ] as const) {
+    const bare = sql.match(BARE) ?? [];
+    assert.deepEqual(bare, [], `${name} has an unlabelled drift source: ${bare.join(' | ')}`);
+  }
+  // A floor, so deleting a whole drift source reddens. The attempt statement
+  // labels run, participant, roster and the attempt facts; the seal labels the
+  // first three plus its eligibility reasons.
+  assert.ok((SERVING_STATEMENTS.attempt.match(LABELLED) ?? []).length >= 4,
+    'the attempt statement labels four drift sources');
+  assert.ok((SERVING_STATEMENTS.seal.match(LABELLED) ?? []).length >= 4,
+    'the seal statement labels three drift sources and its eligibility reasons');
+
+  // NEGATIVE CONTROL: the matcher must actually reject the bare form, or the
+  // assertions above are green against anything.
+  const stripped = SERVING_STATEMENTS.attempt.replaceAll("coalesce(t.f, 'drift.unlabelled') as f", 't.f');
+  assert.ok((stripped.match(BARE) ?? []).length >= 4, 'the bare matcher recognises what it is looking for');
+});
