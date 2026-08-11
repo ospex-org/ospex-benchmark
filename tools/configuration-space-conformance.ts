@@ -6,14 +6,14 @@
  *                                              SAME canonical bytes and digest
  *   refused for a STORAGE reason           =>  really is unstorable
  *
- * ADVISORY. Run by hand, never in CI, gates nothing. It needs a throwaway
- * PostgreSQL and a connection string in `CONFIG_SPACE_DB_URL`:
+ * ADVISORY. Run by hand, never in CI, gates nothing.
  *
- *   docker run -d --name jsonbprobe -e POSTGRES_PASSWORD=<pick one> \
- *     -e POSTGRES_DB=p -p 5439:5432 postgres:17-alpine
- *   CONFIG_SPACE_DB_URL=postgresql://postgres:<same>@127.0.0.1:5439/p \
- *     npx tsx tools/configuration-space-conformance.ts
- *   docker rm -f jsonbprobe
+ * It needs a THROWAWAY PostgreSQL — never a real one; it writes — reached
+ * through `CONFIG_SPACE_DB_URL`. Start one with the official image on a port
+ * nothing else uses, point the variable at it as the superuser, run this file
+ * with `npx tsx`, then remove the container. The connection string is not
+ * written down here on purpose: a URL shape in a public repository is a thing
+ * someone later copies and fills in with a real host.
  *
  * WHY IT EXISTS. A participant's configuration is arbitrary JSON by design, so
  * "which values are valid" is a question about the CONSUMERS, not a question

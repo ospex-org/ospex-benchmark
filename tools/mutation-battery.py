@@ -283,6 +283,28 @@ MUTANTS = [
      '    attempt.rawResponse !== null ||',
      '    false ||',
      ['src/scoring.test.ts']),
+# --- the empty-key / path-encoding correction -----------------------------
+    ('M55-empty-key-accepted', 'src/participantConfiguration.ts',
+     "      if (key === '') {",
+     '      if (false) {',
+     ['src/participantConfiguration.test.ts']),
+    # COMPOUND, and it has to be. Mutating the root sentinel alone is an
+    # EQUIVALENT mutant: with the empty-key rule in force no path segment can
+    # ever be the empty string, so `segments.length > 0` and
+    # `segments.join('.') !== ''` cannot disagree, and it would report SURVIVED
+    # forever. Disabling BOTH is what scores the second line of defence --
+    # measured: with only the key rule gone, the sentinel fix still refuses
+    # `{"":{}}` as an empty object.
+    ('M56-both-empty-key-defences-removed', 'src/participantConfiguration.ts',
+     ("      if (key === '') {",
+      "    if (!insideArray && segments.length > 0 && Object.keys(value).length === 0) {"),
+     ('      if (false) {',
+      "    if (!insideArray && segments.join('.') !== '' && Object.keys(value).length === 0) {"),
+     ['src/participantConfiguration.test.ts']),
+    ('M57-resolution-splits-a-joined-path', 'src/participantConfiguration.ts',
+     '    const found = resolvePath(requestParams, leaf.segments);',
+     "    const found = resolvePath(requestParams, leaf.path.split('.'));",
+     ['src/participantConfiguration.test.ts']),
 ]
 
 
@@ -329,16 +351,31 @@ def main():
         path = os.path.join(REPO, relpath)
         original = io.open(path, encoding='utf-8', newline='').read()
         before = sha(path)
-        # The needle is written with \n; the tree may be CRLF. Try both, and
-        # never fall back to a partial match.
-        for candidate in (needle, needle.replace('\n', '\r\n')):
-            if original.count(candidate) == 1:
-                nl = '\r\n' if '\r\n' in candidate else '\n'
-                mutated = original.replace(candidate, replacement.replace('\n', nl))
+        # A mutant may carry SEVERAL edits, so a guard that is shadowed by
+        # another guard can still be scored: disable both and see whether
+        # anything notices. A single-edit mutant on the shadowed one is
+        # equivalent by construction and would only ever report SURVIVED.
+        edits = needle if isinstance(needle, tuple) else (needle,)
+        swaps = replacement if isinstance(replacement, tuple) else (replacement,)
+        if len(edits) != len(swaps):
+            print('%-42s INVALID (edit/replacement arity)' % mid, flush=True)
+            results.append((mid, 'INVALID'))
+            continue
+        mutated = original
+        failed = None
+        for edit, swap in zip(edits, swaps):
+            # The needle is written with \n; the tree may be CRLF. Try both, and
+            # never fall back to a partial match.
+            for candidate in (edit, edit.replace('\n', '\r\n')):
+                if mutated.count(candidate) == 1:
+                    nl = '\r\n' if '\r\n' in candidate else '\n'
+                    mutated = mutated.replace(candidate, swap.replace('\n', nl))
+                    break
+            else:
+                failed = mutated.count(edit) + mutated.count(edit.replace('\n', '\r\n'))
                 break
-        else:
-            hits = original.count(needle) + original.count(needle.replace('\n', '\r\n'))
-            print('%-42s INVALID (needle matched %d times)' % (mid, hits), flush=True)
+        if failed is not None:
+            print('%-42s INVALID (an edit matched %d times)' % (mid, failed), flush=True)
             results.append((mid, 'INVALID'))
             continue
         try:

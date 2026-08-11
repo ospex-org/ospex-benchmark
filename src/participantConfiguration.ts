@@ -118,7 +118,7 @@ export function configurationViolations(
     ];
   }
 
-  walkJson(value, '', violations, false);
+  walkJson(value, [], violations, false);
   if (violations.length > 0) return violations;
 
   const bytes = Buffer.byteLength(canonicalize(value), 'utf8');
@@ -166,8 +166,18 @@ function unstorableString(text: string): string | null {
   return null;
 }
 
-function walkJson(value: unknown, path: string, violations: string[], insideArray: boolean): void {
-  const where = path === '' ? 'configuration' : `configuration.${path}`;
+function walkJson(
+  value: unknown,
+  segments: readonly string[],
+  violations: string[],
+  insideArray: boolean,
+): void {
+  // Depth comes from the SEGMENT COUNT, never from `path === ''`. The empty
+  // string is a legal JSON key, so a joined path used as a root sentinel makes
+  // `{"": …}` indistinguishable from the root — which let an empty top-level
+  // key slip past the empty-object rule below and collapse two structures onto
+  // one leaf path.
+  const where = segments.length === 0 ? 'configuration' : `configuration.${segments.join('.')}`;
   if (value === null || typeof value === 'boolean') return;
   if (typeof value === 'string') {
     const unstorable = unstorableString(value);
@@ -185,7 +195,7 @@ function walkJson(value: unknown, path: string, violations: string[], insideArra
     // array is a LEAF, replaced whole, so any change inside it changes the
     // request.
     value.forEach((item, index) =>
-      walkJson(item, path === '' ? `${index}` : `${path}.${index}`, violations, true),
+      walkJson(item, [...segments, String(index)], violations, true),
     );
     return;
   }
@@ -205,7 +215,7 @@ function walkJson(value: unknown, path: string, violations: string[], insideArra
     // makes "different digest" mean "different request". The top-level `{}` is
     // exempt — it is the real "sets no knobs" value — and so is an empty
     // ARRAY, which is a leaf that does change the body.
-    if (!insideArray && path !== '' && Object.keys(value).length === 0) {
+    if (!insideArray && segments.length > 0 && Object.keys(value).length === 0) {
       violations.push(
         `${where} is an empty object, which changes the digest without changing the request`,
       );
@@ -221,17 +231,32 @@ function walkJson(value: unknown, path: string, violations: string[], insideArra
         violations.push(`${where} has a key that ${unstorableKey}`);
         continue;
       }
+      if (key === '') {
+        // An empty key is legal JSON and it is the one key that can impersonate
+        // the ROOT of a joined evidence path. `{"":{"a":1}}` flattened to the
+        // same leaf as `{"a":1}` — same evidence, different digest — and
+        // `{"":{}}` slipped past the empty-object rule entirely, so deleting
+        // the whole member from the recorded request went undetected.
+        //
+        // Resolution no longer joins or splits (leaves carry their segments),
+        // so this rule is no longer what makes the encoding injective. It is
+        // kept because an empty parameter name is meaningless to every provider
+        // and a configuration containing one is a mistake worth naming, and
+        // because the human-readable path in a violation message is still a
+        // joined string.
+        violations.push(`${where} has an empty key`);
+        continue;
+      }
       if (key.includes('.')) {
-        // `configurationLeaves` joins with `.` and the evidence check splits on
-        // it, so a key containing one is not round-trippable: a flat `{"a.b":1}`
-        // is looked for at nested `a → b`, reported absent, and the run becomes
-        // unscoreable with a message blaming the adapter. The inverse pairing is
-        // worse — a flat declaration is SATISFIED by a nested record, so two
-        // configurations with different digests satisfy the same evidence.
+        // A dot is the separator in the human-readable path a violation
+        // message prints, so a key containing one produces a message that reads
+        // as a nesting it does not have. Resolution is unaffected — it walks
+        // segments — but a diagnostic that misdescribes the value it is
+        // refusing is worse than no diagnostic.
         violations.push(`${where} key "${key}" contains a dot, which is the evidence path separator`);
         continue;
       }
-      walkJson(value[key], path === '' ? key : `${path}.${key}`, violations, insideArray);
+      walkJson(value[key], [...segments, key], violations, insideArray);
     }
     return;
   }
@@ -324,27 +349,39 @@ function cloneJson(value: unknown): unknown {
  * because they merge member-by-member into a request; arrays are not, because
  * they are replaced whole.
  */
+export interface ConfigurationLeaf {
+  /**
+   * The SEGMENTS, which is what resolution walks. Structured rather than
+   * joined because the empty string is a legal JSON key: a joined path cannot
+   * distinguish `{"":{"a":1}}` from `{"a":1}`, and it once did not.
+   */
+  readonly segments: readonly string[];
+  /** The same path joined with dots, for a human-readable message only. */
+  readonly path: string;
+  readonly value: unknown;
+}
+
 export function configurationLeaves(
   configuration: ParticipantConfiguration,
-): Array<{ path: string; value: unknown }> {
-  const leaves: Array<{ path: string; value: unknown }> = [];
-  collectLeaves(configuration, '', leaves);
+): ConfigurationLeaf[] {
+  const leaves: ConfigurationLeaf[] = [];
+  collectLeaves(configuration, [], leaves);
   return leaves;
 }
 
 function collectLeaves(
   value: Record<string, unknown>,
-  prefix: string,
-  leaves: Array<{ path: string; value: unknown }>,
+  prefix: readonly string[],
+  leaves: ConfigurationLeaf[],
 ): void {
   for (const key of Object.keys(value)) {
-    const path = prefix === '' ? key : `${prefix}.${key}`;
+    const segments = [...prefix, key];
     const member = value[key];
     if (isPlainObject(member)) {
-      collectLeaves(member, path, leaves);
+      collectLeaves(member, segments, leaves);
       continue;
     }
-    leaves.push({ path, value: member });
+    leaves.push({ segments, path: segments.join('.'), value: member });
   }
 }
 
@@ -373,7 +410,7 @@ export function configurationEvidenceViolations(
 ): string[] {
   const violations: string[] = [];
   for (const leaf of configurationLeaves(declared)) {
-    const found = resolvePath(requestParams, leaf.path);
+    const found = resolvePath(requestParams, leaf.segments);
     if (!found.present) {
       violations.push(`declared configuration "${leaf.path}" is absent from the recorded request parameters`);
       continue;
@@ -387,9 +424,12 @@ export function configurationEvidenceViolations(
   return violations;
 }
 
-function resolvePath(root: Record<string, unknown>, path: string): { present: boolean; value: unknown } {
+function resolvePath(
+  root: Record<string, unknown>,
+  segments: readonly string[],
+): { present: boolean; value: unknown } {
   let cursor: unknown = root;
-  for (const segment of path.split('.')) {
+  for (const segment of segments) {
     if (!isPlainObject(cursor) || !Object.prototype.hasOwnProperty.call(cursor, segment)) {
       return { present: false, value: undefined };
     }

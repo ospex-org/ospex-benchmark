@@ -273,11 +273,15 @@ test('the merge mutates neither input, and a frozen configuration is safe', () =
 // Declared versus sent
 // ---------------------------------------------------------------------------
 
-test('every leaf of a configuration is a path, and objects are walked', () => {
+test('every leaf carries its SEGMENTS, and objects are walked', () => {
+  // The joined path is for messages only. Resolution walks the segments,
+  // because the empty string is a legal JSON key and a joined path cannot
+  // tell `{"":{"a":1}}` from `{"a":1}` — which is exactly how those two came
+  // to share a leaf set.
   assert.deepEqual(configurationLeaves({ a: 1, b: { c: 'x', d: [1, 2] } }), [
-    { path: 'a', value: 1 },
-    { path: 'b.c', value: 'x' },
-    { path: 'b.d', value: [1, 2] },
+    { segments: ['a'], path: 'a', value: 1 },
+    { segments: ['b', 'c'], path: 'b.c', value: 'x' },
+    { segments: ['b', 'd'], path: 'b.d', value: [1, 2] },
   ]);
 });
 
@@ -334,19 +338,118 @@ test('evidence compares by canonical value, so key order in the record does not 
   );
 });
 
-test('a key containing a dot is refused — it is the evidence path separator', () => {
-  // `configurationLeaves` joins with `.` and `configurationEvidenceViolations`
-  // splits on it, so a dotted key is not round-trippable. Both directions are
-  // wrong and the second is the dangerous one: a flat declaration is SATISFIED
-  // by a nested record, so two configurations with different digests satisfy
-  // the same evidence.
+test('a key containing a dot is refused — it is the message path separator', () => {
+  // Resolution no longer joins or splits, so a dotted key is no longer a
+  // correctness hazard; it is a DIAGNOSTIC one. The path printed in a
+  // violation would read as a nesting the value does not have, and a message
+  // that misdescribes what it refuses is worse than none.
   assert.match(configurationViolations({ 'a.b': 1 })[0] ?? '', /contains a dot/);
   assert.match(configurationViolations({ x: { 'a.b': 1 } })[0] ?? '', /contains a dot/);
   assert.deepEqual(configurationViolations({ a: { b: 1 } }), []);
 
-  // The ambiguity itself, recorded so the refusal is not mistaken for fussiness.
-  assert.deepEqual(configurationEvidenceViolations({ 'a.b': 1 }, { a: { b: 1 } }), []);
-  assert.equal(configurationEvidenceViolations({ 'a.b': 1 }, { 'a.b': 1 }).length, 1);
+  // And resolution now tells the two apart even though the rule refuses one:
+  // belt and braces, so a bug in the rule cannot reopen the collision.
+  assert.equal(configurationEvidenceViolations({ 'a.b': 1 }, { a: { b: 1 } }).length, 1);
+  assert.deepEqual(configurationEvidenceViolations({ 'a.b': 1 }, { 'a.b': 1 }), []);
+});
+
+test('an EMPTY key is refused — it is the one key that can impersonate the root', () => {
+  // `''` was doing double duty as the root sentinel of a joined path and as a
+  // legal JSON key, so `{"":{"a":1}}` flattened to the same leaf as `{"a":1}`
+  // (same evidence, different digest) and `{"":{}}` slipped past the
+  // empty-object rule, making the whole member deletable from the record
+  // undetected.
+  for (const hostile of [{ '': 1 }, { '': { a: 1 } }, { '': {} }, { a: { '': 1 } }]) {
+    assert.match(
+      configurationViolations(hostile)[0] ?? '',
+      /has an empty key/,
+      JSON.stringify(hostile),
+    );
+  }
+  // Negative control: a build refusing every key would satisfy that loop.
+  assert.deepEqual(configurationViolations({ a: 1, b: { c: 2 } }), []);
+});
+
+test('the root sentinel is gone: resolution tells an empty key from the root', () => {
+  // The rule above refuses these before they can be declared. This asserts the
+  // SECOND line of defence — that the encoding itself no longer collides — so
+  // a bug in the rule cannot reopen the hole.
+  assert.deepEqual(configurationLeaves({ '': { a: 1 } } as ParticipantConfiguration), [
+    { segments: ['', 'a'], path: '.a', value: 1 },
+  ]);
+  assert.deepEqual(configurationLeaves({ a: 1 }), [{ segments: ['a'], path: 'a', value: 1 }]);
+  // Resolves against the request it actually describes...
+  assert.deepEqual(
+    configurationEvidenceViolations({ '': { a: 1 } } as ParticipantConfiguration, { '': { a: 1 } }),
+    [],
+  );
+  // ...and refuses the flat one it does not.
+  assert.equal(
+    configurationEvidenceViolations({ '': { a: 1 } } as ParticipantConfiguration, { a: 1 }).length,
+    1,
+  );
+});
+
+test('the accepted KEY GRAMMAR flattens and resolves without collisions', () => {
+  // The standing guard for the whole class, rather than one test per key that
+  // has bitten so far. Every accepted key shape, at four value shapes: no two
+  // distinct configurations may share a leaf set, and every leaf must resolve
+  // against the request that carries it.
+  const keys = [
+    'k', 'K', 'a-b', 'a_b', '0', '00', 'with space', 'with\ttab', 'quote"',
+    'back\\slash', 'é', 'é', '一', '\u{1F600}', '￿', 'constructor',
+    'prototype', 'toString', 'hasOwnProperty', '__proto__x', 'x__proto__',
+    'a.', '.a', 'null', 'true', '-1', '1e3', 'k'.repeat(64),
+  ];
+  const shapes: Array<(k: string) => Record<string, unknown>> = [
+    (k) => ({ [k]: 1 }),
+    (k) => ({ [k]: { inner: 1 } }),
+    (k) => ({ outer: { [k]: 1 } }),
+    (k) => ({ [k]: [1, { deep: 2 }] }),
+  ];
+
+  const byLeafSet = new Map<string, string>();
+  let accepted = 0;
+  for (const key of keys) {
+    for (const shape of shapes) {
+      const configuration = shape(key) as ParticipantConfiguration;
+      if (configurationViolations(configuration).length > 0) continue;
+      accepted += 1;
+
+      // 1. The leaf set is unique to this configuration.
+      //
+      // The set is (segments, VALUE) pairs, sorted. Segments alone is the
+      // wrong invariant and this sweep is what showed it: `{k:1}` and
+      // `{k:[1,{deep:2}]}` share the path set `[["k"]]` and are legitimately
+      // different entrants, because an array is a leaf. What must determine
+      // the configuration is the paths together with what sits at them. Sorted
+      // because key order does not move the digest and must not move this.
+      const leafSet = JSON.stringify(
+        configurationLeaves(configuration)
+          .map((leaf) => [leaf.segments, canonicalize(leaf.value)] as const)
+          .sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1)),
+      );
+      const prior = byLeafSet.get(leafSet);
+      const digest = configurationSha256(configuration);
+      if (prior !== undefined && prior !== digest) {
+        assert.fail(`two configurations share a leaf set ${leafSet}: ${prior} and ${digest}`);
+      }
+      byLeafSet.set(leafSet, digest);
+
+      // 2. Every leaf resolves against the request that carries it, and the
+      //    configuration is NOT satisfied by a request that does not.
+      assert.deepEqual(
+        configurationEvidenceViolations(configuration, { endpoint: 'e', ...configuration }),
+        [],
+        `must resolve: ${JSON.stringify(configuration)}`,
+      );
+      assert.ok(
+        configurationEvidenceViolations(configuration, { endpoint: 'e' }).length > 0,
+        `must not be vacuous: ${JSON.stringify(configuration)}`,
+      );
+    }
+  }
+  assert.ok(accepted >= 80, `the sweep must actually accept a wide grammar, got ${accepted}`);
 });
 
 // --- review blockers: identity must determine the request -------------------
