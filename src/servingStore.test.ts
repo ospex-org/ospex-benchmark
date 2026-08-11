@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ACCEPTED_ATTEMPT_OUTCOMES, SERVING_STATEMENTS, SqlBenchmarkServingPort } from './servingStore.js';
+import {
+  ACCEPTED_ATTEMPT_OUTCOMES,
+  SERVING_STATEMENTS,
+  SqlBenchmarkServingPort,
+  UNNAMED_DRIFT_FIELD,
+} from './servingStore.js';
+import { sha256Hex } from './canonical.js';
+import {
+  MAX_ENTRANT_IDENTIFIER_BYTES,
+  canonicalConfigurationText,
+  configurationSha256,
+} from './participantConfiguration.js';
 import type {
   ArmAttempt,
   AttemptFacts,
@@ -65,8 +76,14 @@ function scriptedQuery(
   };
 }
 
+/**
+ * A scripted result row. `drift_rows` defaults to 0 — no disagreement — and the
+ * contradiction cases below set it explicitly, because it is the COUNT and not
+ * the name that decides the outcome: a drift row the statement could not label
+ * arrives with `contradiction` null and must still be reported.
+ */
 const row = (over: Record<string, unknown> = {}): ReadonlyArray<Record<string, unknown>> =>
-  [{ contradiction: null, ineligible_reason: null, parent_found: 1, inserted: 1, ...over }];
+  [{ contradiction: null, ineligible_reason: null, parent_found: 1, inserted: 1, drift_rows: 0, ...over }];
 const OK = row();
 const DUP = row({ inserted: 0 });
 const ORPHAN = row({ parent_found: 0, inserted: 0 });
@@ -82,6 +99,11 @@ function sentPayload(calls: Call[], index = 0): Record<string, unknown> {
 const SEALED = '2026-08-09T20:06:00.123456Z';
 const DIGEST = 'a'.repeat(64);
 const OTHER_DIGEST = 'b'.repeat(64);
+
+/** Deliberately awkward: a key order that differs under RFC 8785 and under
+ *  PostgreSQL's jsonb ordering, a non-ASCII key, a nested object, and a float
+ *  no rounding leaves alone. A fixture of `{}` cannot catch a normalisation bug. */
+const AWKWARD_CONFIGURATION = { b: 1, aa: { nested: true }, 'é': 0.30000000000000004 };
 
 const RUN: RunFacts = Object.freeze({
   runId: 'smoke-v0-2026-08-09-aa11bb',
@@ -103,11 +125,13 @@ const RUN: RunFacts = Object.freeze({
 
 const MODEL: ParticipantFacts = Object.freeze({
   participantId: 'lab-alpha', kind: 'model', labId: 'alpha', displayName: 'Alpha',
+  modelId: 'alpha-v1', configuration: AWKWARD_CONFIGURATION,
 });
 const BASELINE: ParticipantFacts = Object.freeze({
   participantId: 'baseline-favorite', kind: 'baseline', labId: null, displayName: 'Favourite',
+  modelId: null, configuration: null,
 });
-const ROSTER: RosterFacts = Object.freeze({ armId: 'alpha-v1', walletAddress: `0x${'1'.repeat(40)}` });
+const ROSTER: RosterFacts = Object.freeze({ walletAddress: `0x${'1'.repeat(40)}` });
 
 const FACTS: AttemptFacts = Object.freeze({
   attemptOrdinal: 0,
@@ -330,11 +354,20 @@ test('a seal whose attempt was never published is parent_missing', async () => {
     { outcome: 'parent_missing' });
 });
 
-test('an attempt and a scoring run have no parent, so neither can report parent_missing', async () => {
-  // Both statements select a literal 1. Were that dropped, every such write would
+test('neither an attempt nor a scoring run has a parent row to find', () => {
+  // A scoring run selects a literal 1. Were that dropped, every such write would
   // silently report `parent_missing` and nothing would notice.
-  assert.match(SERVING_STATEMENTS.attempt, /^\s*1\s+as parent_found,?$/m);
   assert.match(SERVING_STATEMENTS.scoringRun, /^\s*1\s+as parent_found,?$/m);
+  // The attempt no longer does, and the reason is worth keeping: it has no
+  // parent either, but a literal cannot report a gate CLOSED by a durable-fact
+  // disagreement. That state arrived as inserted=0 with nothing else set, which
+  // the mapping reads as `duplicate` — a suppressed write reported as a benign
+  // repeat, and therefore as a success. It reports `gate.ok`, as the seal does.
+  for (const sql of [SERVING_STATEMENTS.attempt, SERVING_STATEMENTS.seal]) {
+    assert.match(sql, /\(select gate\.ok::int from gate\)\s+as parent_found/);
+  }
+  assert.ok(!/^\s*1\s+as parent_found,?$/m.test(SERVING_STATEMENTS.attempt),
+    'the attempt reports the gate, not a literal');
 });
 
 test('a contradiction outranks every other branch', async () => {
@@ -343,33 +376,98 @@ test('a contradiction outranks every other branch', async () => {
   // older roster row that disagrees) — so it has to be reported first or it is
   // reported never.
   for (const [name, call] of EVERY_METHOD) {
-    for (const shape of [row({ contradiction: 'forecastDigest' }),
-                         row({ contradiction: 'forecastDigest', inserted: 0 }),
-                         row({ contradiction: 'roster.walletAddress', parent_found: 0, inserted: 0 }),
-                         row({ contradiction: 'participant.kind', ineligible_reason: 'unsent' })]) {
+    for (const shape of [row({ contradiction: 'forecastDigest', drift_rows: 1 }),
+                         row({ contradiction: 'forecastDigest', drift_rows: 1, inserted: 0 }),
+                         row({ contradiction: 'roster.walletAddress', drift_rows: 1, parent_found: 0, inserted: 0 }),
+                         row({ contradiction: 'participant.kind', drift_rows: 1, ineligible_reason: 'unsent' })]) {
       const s = scriptedQuery([shape]);
       const out = await call(new SqlBenchmarkServingPort(s.deps));
       assert.equal(out.outcome, 'contradiction', `${name} on ${JSON.stringify(shape[0])}`);
     }
   }
-  const s = scriptedQuery([row({ contradiction: 'roster.armId' })]);
+  const s = scriptedQuery([row({ contradiction: 'participant.configuration', drift_rows: 1 })]);
   assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).publishAttempt(attempt()),
-    { outcome: 'contradiction', field: 'roster.armId' });
+    { outcome: 'contradiction', field: 'participant.configuration' });
 });
 
-test('the seal statement really does compare the stored digest', async () => {
-  // The mapping above is only meaningful if the SQL can produce a contradiction.
+test('the COUNT decides a contradiction, not the name — an unlabelled drift row is still one', async () => {
+  // The two `unnest` arrays in a drift check are parallel, and a flag with no
+  // name yields a differing row whose label is NULL, which `min()` then drops.
+  // Reported on the name alone this arrived as inserted=0 with no
+  // contradiction, which the mapping reads as `duplicate`: a SUPPRESSED write
+  // reported as a benign repeat, and therefore as a success.
+  const s = scriptedQuery([row({ contradiction: null, drift_rows: 1, inserted: 0 })]);
+  assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).publishAttempt(attempt()),
+    { outcome: 'contradiction', field: UNNAMED_DRIFT_FIELD });
+  // The paired accept, which is what makes the count discriminating rather than
+  // a blanket refusal: no drift rows and no insert really is a duplicate.
+  const dup = scriptedQuery([row({ contradiction: null, drift_rows: 0, inserted: 0 })]);
+  assert.deepEqual(await new SqlBenchmarkServingPort(dup.deps).publishAttempt(attempt()),
+    { outcome: 'duplicate' });
+});
+
+test('EVERY immutable seal fact is compared, not just the forecast digest', async () => {
+  // The outcome mapping is only meaningful if the SQL can produce a
+  // contradiction, and it has to produce one for every fact the seal COMMITS
+  // to. Measured with only the forecast digest compared: a replay carrying a
+  // different rationaleDigest came back `duplicate`, so the caller was told its
+  // write was a benign repeat while the stored row still committed to different
+  // prose.
+  //
+  // Anchored on the comparison EXPRESSION rather than on a column name, because
+  // the comments around this statement discuss every one of these columns and a
+  // name-only matcher would match the prose (rule 3c).
+  const compared = (column: string, against: string): RegExp =>
+    new RegExp(`d\\.${column}\\s+is distinct from input\\.${against}`);
+  for (const [column, against] of [
+    ['forecast_digest', 'forecast_digest'],
+    ['rationale_digest', 'rationale_digest'],
+    ['sealed_at', 'sealed_at'],
+    ['run_id', 'run_id'],
+    ['deployment_round', 'deployment_round'],
+    ['network', 'network'],
+    ['contest_id', 'contest_id'],
+    ['speculation_id', 'speculation_id'],
+    ['bundle_sha256', 'decision_bundle_sha256'],
+    ['response_schema_version', 'decision_response_schema_version'],
+  ] as const) {
+    assert.match(SERVING_STATEMENTS.seal, compared(column, against),
+      `the seal does not compare ${column}, so a replay changing it is absorbed`);
+  }
+  // The cited provider call, compared as the id the insert would resolve.
   assert.match(SERVING_STATEMENTS.seal,
-    /d\.forecast_digest is distinct from input\.forecast_digest/);
+    /d\.attempt_id\s+is distinct from \(select id from cited\)/);
   assert.match(SERVING_STATEMENTS.seal,
     /c\.wallet_address is distinct from input\.wallet_address/);
+
+  // NEGATIVE CONTROL: the matcher must reject a column the statement does not
+  // compare, or every line above is green against anything.
+  assert.doesNotMatch(SERVING_STATEMENTS.seal, compared('source_path', 'source_path'));
+});
+
+test('the withheld prose is bound to the digest its seal committed to', async () => {
+  // Publishing the rationale later is only "provably the original" if something
+  // checks it. Nothing did: the seal stored a digest and the statement inserted
+  // whatever text it was handed, so a replacement landed `published` under a
+  // digest of the prose it replaced.
+  assert.match(SERVING_STATEMENTS.rationale,
+    /where parent\.rationale_digest is distinct from input\.rationale_digest/);
+  // And the insert is GATED on it, not merely reported beside it.
+  assert.match(SERVING_STATEMENTS.rationale,
+    /where not exists \(select 1 from drift\)/);
 });
 
 test('an off-contract result shape resolves to unavailable rather than throwing', async () => {
+  // Every case below carries a well-formed `drift_rows` EXCEPT the two that are
+  // about it, so each row is off-contract on exactly the field it names — a
+  // missing `drift_rows` is itself refused, and without it here these cases
+  // would all pass for that reason instead of the one they were written for.
   for (const rows of [[], [{}],
-    [{ contradiction: null, ineligible_reason: null, parent_found: 'one', inserted: 1 }],
-    [{ contradiction: 7, ineligible_reason: null, parent_found: 1, inserted: 1 }],
-    [{ contradiction: null, ineligible_reason: 9, parent_found: 1, inserted: 1 }],
+    [{ contradiction: null, ineligible_reason: null, parent_found: 'one', inserted: 1, drift_rows: 0 }],
+    [{ contradiction: 7, ineligible_reason: null, parent_found: 1, inserted: 1, drift_rows: 0 }],
+    [{ contradiction: null, ineligible_reason: 9, parent_found: 1, inserted: 1, drift_rows: 0 }],
+    [{ contradiction: null, ineligible_reason: null, parent_found: 1, inserted: 1 }],
+    [{ contradiction: null, ineligible_reason: null, parent_found: 1, inserted: 1, drift_rows: '0' }],
     [OK[0]!, OK[0]!]]) {
     const s = scriptedQuery([rows]);
     const out = await new SqlBenchmarkServingPort(s.deps).sealDecision(seal());
@@ -543,7 +641,7 @@ test('the seal cites an attempt by ordinal and never writes one', async () => {
 test('a baseline seals with no attempt at all', async () => {
   const s = scriptedQuery([OK]);
   await new SqlBenchmarkServingPort(s.deps).sealDecision(seal({
-    participant: BASELINE, roster: { armId: null, walletAddress: null }, attemptOrdinal: null,
+    participant: BASELINE, roster: { walletAddress: null }, attemptOrdinal: null,
   }));
   const payload = sentPayload(s.calls);
   assert.equal(payload['has_attempt'], false);
@@ -561,7 +659,7 @@ test('a MODEL forecast with no attempt is refused — it would read as a baselin
   // ...and the paired accept: a baseline may, which is what makes this discriminating.
   const s = scriptedQuery([OK]);
   assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal({
-    participant: BASELINE, roster: { armId: null, walletAddress: null }, attemptOrdinal: null,
+    participant: BASELINE, roster: { walletAddress: null }, attemptOrdinal: null,
   })), { outcome: 'published' });
 });
 
@@ -758,7 +856,7 @@ test('a slate date must be a real calendar date, not merely the right shape', as
 test('a wallet must be lowercase hex of the right length', async () => {
   for (const bad of [`0x${'A'.repeat(40)}`, `0x${'1'.repeat(39)}`, '1'.repeat(42), '']) {
     assert.deepEqual(
-      await refusal((p) => p.sealDecision(seal({ roster: { armId: 'v1', walletAddress: bad } }))),
+      await refusal((p) => p.sealDecision(seal({ roster: { walletAddress: bad } }))),
       { outcome: 'invalid_input', reason: 'malformed_wallet', field: 'roster.walletAddress' },
       `wallet=${JSON.stringify(bad)}`);
   }
@@ -767,15 +865,19 @@ test('a wallet must be lowercase hex of the right length', async () => {
 test('a non-model may not carry a lab id', async () => {
   assert.deepEqual(
     await refusal((p) => p.sealDecision(seal({
-      participant: { participantId: 'baseline-x', kind: 'baseline', labId: 'alpha', displayName: 'X' },
-      attemptOrdinal: null, roster: { armId: null, walletAddress: null },
+      participant: { participantId: 'baseline-x', kind: 'baseline', labId: 'alpha', displayName: 'X',
+                     modelId: null, configuration: null },
+      attemptOrdinal: null, roster: { walletAddress: null },
     }))),
     { outcome: 'invalid_input', reason: 'lab_id_on_non_model', field: 'participant.labId' },
   );
   // The converse is deliberately allowed: a model with no lab id is legitimate.
+  // `{}` here rather than the awkward fixture, because "sets no knobs" is a real
+  // shipped configuration and has to stay covered somewhere.
   const s = scriptedQuery([OK]);
   assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).sealDecision(seal({
-    participant: { participantId: 'lab-alpha', kind: 'model', labId: null, displayName: 'Alpha' },
+    participant: { participantId: 'lab-alpha', kind: 'model', labId: null, displayName: 'Alpha',
+                   modelId: 'alpha-v1', configuration: {} },
   })), { outcome: 'published' });
 });
 
@@ -921,12 +1023,173 @@ test('every durable parent fact a caller supplies is compared against the stored
   for (const fragment of [
     /'participant\.kind','participant\.labId','participant\.displayName'/,
     /p\.kind\s+is distinct from input\.kind/,
-    /'roster\.armId','roster\.walletAddress'/,
+    // The entrant key the database indexes uniquely, all three parts of it. A
+    // participant re-sealed at a DIFFERENT setting is a different competitor,
+    // and absorbing that silently would score two configurations as one.
+    /p\.model_id\s+is distinct from input\.model_id/,
+    /p\.configuration is distinct from input\.configuration_canonical::jsonb/,
+    /p\.configuration_sha256 is distinct from input\.configuration_sha256/,
+    /array\['roster\.walletAddress'\]/,
     /'run\.slateDate','run\.startedAt'/,
     /r\.slate_date\s+is distinct from input\.slate_date/,
   ]) {
     assert.match(SERVING_STATEMENTS.seal, fragment);
     assert.match(SERVING_STATEMENTS.attempt, fragment);
+  }
+});
+
+/**
+ * Pull the two parallel arrays out of every `unnest(array[…], array[…])` in a
+ * statement. Depth-aware for the same reason `declaredColumns` is: a cast or a
+ * function call inside an element puts commas at a deeper level.
+ *
+ * SQL LINE COMMENTS ARE STRIPPED FIRST, and that is not tidiness. The comment
+ * explaining the jsonb comparison inside the participant drift check contains a
+ * comma, which counted as an extra element and reported 7 names against 8
+ * comparisons on correct SQL. None of these statements has a `--` inside a
+ * string literal, so the strip is safe here and would need revisiting if one
+ * ever did.
+ */
+function unnestPairs(source: string): Array<readonly [names: number, flags: number]> {
+  const sql = source.replace(/--[^\n]*/g, '');
+  const pairs: Array<readonly [number, number]> = [];
+  const marker = 'unnest(';
+  for (let at = sql.indexOf(marker); at !== -1; at = sql.indexOf(marker, at + 1)) {
+    let depth = 0;
+    let end = -1;
+    for (let i = at + marker.length - 1; i < sql.length; i += 1) {
+      if (sql[i] === '(') depth += 1;
+      else if (sql[i] === ')') {
+        depth -= 1;
+        if (depth === 0) { end = i; break; }
+      }
+    }
+    assert.notEqual(end, -1, 'the unnest call is balanced');
+    // The arguments, split at depth 1 relative to `unnest(` — each is an
+    // `array[…]` literal, whose own elements are one level deeper again.
+    const counts: number[] = [];
+    let elements = 1;
+    depth = 0;
+    for (let i = at + marker.length; i < end; i += 1) {
+      const ch = sql[i];
+      if (ch === '(' || ch === '[') depth += 1;
+      else if (ch === ')' || ch === ']') {
+        depth -= 1;
+        if (depth === 0) { counts.push(elements); elements = 1; }
+      } else if (ch === ',' && depth === 1) elements += 1;
+    }
+    assert.equal(counts.length, 2, `unnest takes two arrays, found ${counts.length}`);
+    pairs.push([counts[0]!, counts[1]!]);
+  }
+  return pairs;
+}
+
+test('every drift check names exactly as many fields as it tests', () => {
+  // `unnest` pads the shorter array with NULLs. A name with no flag is silently
+  // never checked; a flag with no name yields a differing row labelled NULL,
+  // which `min()` drops. The second is survivable only because `drift_rows`
+  // reports on the COUNT — the first is not detectable at all at runtime, which
+  // is why it is pinned here on the SQL text.
+  let checked = 0;
+  for (const [name, sql] of Object.entries(SERVING_STATEMENTS)) {
+    for (const [names, flags] of unnestPairs(sql)) {
+      assert.equal(names, flags, `${name}: ${names} field names against ${flags} comparisons`);
+      checked += 1;
+    }
+  }
+  // Negative control on the parser: it has to have found the four drift checks
+  // in each of the two serialized statements, or it is asserting over nothing.
+  // A floor rather than an equality, so adding a drift check does not redden
+  // this while DELETING one still does. Measured at 8.
+  assert.ok(checked >= 8, `expected at least 8 unnest pairs, parsed ${checked}`);
+});
+
+test('the parser counts elements, not commas at any depth or inside a comment', () => {
+  // Its own negative control. Were this depth-blind, a cast or a nested call
+  // would inflate one side and the assertion above would fail on correct SQL —
+  // or, worse, agree by coincidence. The comment case is not hypothetical: it
+  // is what the real participant drift check looks like.
+  assert.deepEqual(unnestPairs("unnest(array['a','b'], array[x is distinct from y, f(p, q)])"), [[2, 2]]);
+  assert.deepEqual(unnestPairs("unnest(array['a'], array[c::jsonb is distinct from d])"), [[1, 1]]);
+  assert.deepEqual(unnestPairs('unnest(\n  array[\'a\',\'b\'],\n  array[p,\n        -- semantic, not textual\n        q]\n)'), [[2, 2]]);
+  // ...and it still catches a genuine mismatch, so stripping comments has not
+  // turned the check into one that always agrees.
+  assert.deepEqual(unnestPairs("unnest(array['a','b'], array[t])"), [[2, 1]]);
+});
+
+// ---------------------------------------------------------------------------
+// The entrant key: a model declares a model and a setting, a control neither
+// ---------------------------------------------------------------------------
+
+test('the kind rule is enforced in BOTH directions', async () => {
+  // Half of the pair is the interesting failure: a model carrying a modelId and
+  // a null configuration satisfies "it has a model" and is a permanently
+  // dimensionless entrant, because the row is insert-once.
+  const cases: ReadonlyArray<readonly [string, Partial<ParticipantFacts>, string, string]> = [
+    ['a model with no configuration', { configuration: null },
+      'model_without_configuration', 'participant.configuration'],
+    ['a model with no model id', { modelId: null },
+      'model_without_configuration', 'participant.configuration'],
+    ['a model with neither', { modelId: null, configuration: null },
+      'model_without_configuration', 'participant.configuration'],
+  ];
+  for (const [label, patch, reason, field] of cases) {
+    assert.deepEqual(
+      await refusal((p) => p.publishAttempt(attempt({ participant: { ...MODEL, ...patch } }))),
+      { outcome: 'invalid_input', reason, field }, label);
+  }
+  // ...and the other direction, on every non-model kind rather than one of them.
+  for (const kind of ['baseline', 'maker', 'human'] as const) {
+    for (const patch of [{ modelId: 'alpha-v1' }, { configuration: AWKWARD_CONFIGURATION }]) {
+      assert.deepEqual(
+        await refusal((p) => p.sealDecision(seal({
+          participant: { ...BASELINE, kind, ...patch }, attemptOrdinal: null,
+          roster: { walletAddress: null },
+        }))),
+        { outcome: 'invalid_input', reason: 'configuration_on_non_model', field: 'participant.modelId' },
+        `${kind} ${JSON.stringify(patch)}`);
+    }
+  }
+});
+
+test('a configuration the digest grammar refuses never reaches the database', async () => {
+  // The same grammar the artifact stamp is held to, checked here because the
+  // database can only answer with a 22P02 or a CHECK name — neither of which
+  // says which key was wrong.
+  const out = await refusal((p) => p.publishAttempt(attempt({
+    participant: { ...MODEL, configuration: { nested: {} } },
+  })));
+  assert.equal(out.outcome, 'invalid_input');
+  assert.equal(out.outcome === 'invalid_input' ? out.reason : '', 'malformed_configuration');
+  assert.ok(out.outcome === 'invalid_input' && out.field.startsWith('participant.configuration'),
+    `the refusal names the offending key, got ${out.outcome === 'invalid_input' ? out.field : ''}`);
+});
+
+test('the digest and its version are DERIVED from the configuration, never supplied', async () => {
+  // A caller that passed both could pass two that disagree, and the row is
+  // insert-once, so the wrong one would be permanent. The configuration crosses
+  // as its CANONICAL TEXT so what PostgreSQL parses is exactly what was hashed.
+  const s = scriptedQuery([OK]);
+  await new SqlBenchmarkServingPort(s.deps).publishAttempt(attempt());
+  const sent = sentPayload(s.calls);
+  assert.equal(sent['model_id'], 'alpha-v1');
+  assert.equal(sent['configuration_canonical'], canonicalConfigurationText(AWKWARD_CONFIGURATION));
+  assert.equal(sent['configuration_sha256'], configurationSha256(AWKWARD_CONFIGURATION));
+  assert.equal(sent['configuration_digest_version'], 1);
+  // The canonical text is not merely `JSON.stringify` of the object — the
+  // fixture's key order and its non-ASCII key are what discriminate the two.
+  assert.notEqual(sent['configuration_canonical'], JSON.stringify(AWKWARD_CONFIGURATION));
+
+  // A control sends all four as null, which is what the database's own CHECK
+  // requires of a non-model.
+  const control = scriptedQuery([OK]);
+  await new SqlBenchmarkServingPort(control.deps).sealDecision(seal({
+    participant: BASELINE, attemptOrdinal: null, roster: { walletAddress: null },
+  }));
+  const blank = sentPayload(control.calls);
+  for (const key of ['model_id', 'configuration_canonical', 'configuration_sha256',
+    'configuration_digest_version']) {
+    assert.equal(blank[key], null, `${key} is null on a control`);
   }
 });
 
@@ -1054,4 +1317,107 @@ test('an integer beyond a PostgreSQL int is refused here, not by the driver', as
   const s = scriptedQuery([OK]);
   assert.deepEqual(await new SqlBenchmarkServingPort(s.deps).publishAttempt(
     attempt({ facts: { ...FACTS, latencyMs: 2_147_483_647 } })), { outcome: 'published' });
+});
+
+test('every drift source LABELS its padded row, so min() can never drop one', () => {
+  // The other half of the cardinality check above. That one catches a mismatch
+  // at review time; this catches a drift CTE added later WITHOUT the coalesce,
+  // which is the shape that reintroduces "a suppressed write reported as a
+  // duplicate".
+  //
+  // Anchored on executable structure, not on a phrase: the regex requires the
+  // coalesced select to be immediately followed by the `from` line of a real
+  // table. The surrounding comments in servingStore.ts discuss coalescing at
+  // length, and a looser matcher would happily match the prose (rule 3c).
+  // `[^\n]*,` after the source covers the table alias — `from public.foo p, input,`.
+  const LABELLED = /select coalesce\(t\.f, '[a-z.]+'\) as f\s*\n\s*from (?:public\.\w+|cited)[^\n]*,/g;
+  const BARE = /select t\.f\s*\n\s*from (?:public\.\w+|cited)[^\n]*,/g;
+
+  for (const [name, sql] of [
+    ['attempt', SERVING_STATEMENTS.attempt],
+    ['seal', SERVING_STATEMENTS.seal],
+  ] as const) {
+    const bare = sql.match(BARE) ?? [];
+    assert.deepEqual(bare, [], `${name} has an unlabelled drift source: ${bare.join(' | ')}`);
+  }
+  // A floor, so deleting a whole drift source reddens. The attempt statement
+  // labels run, participant, roster and the attempt facts; the seal labels the
+  // first three plus its eligibility reasons.
+  assert.ok((SERVING_STATEMENTS.attempt.match(LABELLED) ?? []).length >= 4,
+    'the attempt statement labels four drift sources');
+  assert.ok((SERVING_STATEMENTS.seal.match(LABELLED) ?? []).length >= 4,
+    'the seal statement labels three drift sources and its eligibility reasons');
+
+  // NEGATIVE CONTROL: the matcher must actually reject the bare form, or the
+  // assertions above are green against anything.
+  const stripped = SERVING_STATEMENTS.attempt.replaceAll("coalesce(t.f, 'drift.unlabelled') as f", 't.f');
+  assert.ok((stripped.match(BARE) ?? []).length >= 4, 'the bare matcher recognises what it is looking for');
+});
+
+test('the identifier pair is bounded too, so the entrant-key CHECK is unreachable', async () => {
+  // The database bounds `lab_id + model_id + configuration::text` at 1024
+  // BYTES, where the third term is PostgreSQL's own jsonb rendering - longer
+  // than the canonical text hashed here, because jsonb writes ": " and ", ".
+  //
+  // Measured on PostgreSQL 17.10: the worst expansion is an array of
+  // single-character elements at 1.493x, approaching 1.5 asymptotically. So 512
+  // canonical bytes can never render past 768, and bounding the identifier pair
+  // at 128 puts the whole key under 896. Drop this and the identifiers are
+  // unbounded here, and the CHECK becomes reachable - as a named 23514 rather
+  // than silently, but reachable.
+  const overLong = 'L'.repeat(MAX_ENTRANT_IDENTIFIER_BYTES);
+  assert.deepEqual(
+    await refusal((p) => p.publishAttempt(attempt({
+      participant: { ...MODEL, labId: overLong, modelId: overLong },
+    }))),
+    {
+      outcome: 'invalid_input',
+      reason: 'malformed_configuration',
+      field: `participant.lab and model identifiers are ${overLong.length * 2} bytes together, `
+        + `over the ${MAX_ENTRANT_IDENTIFIER_BYTES}-byte ceiling`,
+    },
+  );
+
+  // NEGATIVE CONTROL: a pair exactly AT the ceiling is accepted, so this is a
+  // bound rather than a blanket refusal of long names.
+  const half = 'L'.repeat(MAX_ENTRANT_IDENTIFIER_BYTES / 2);
+  const accepted = scriptedQuery([OK]);
+  assert.deepEqual(
+    await new SqlBenchmarkServingPort(accepted.deps).publishAttempt(attempt({
+      participant: { ...MODEL, labId: half, modelId: half },
+    })),
+    { outcome: 'published' },
+    'exactly at the ceiling is accepted',
+  );
+});
+
+test('the rationale digest is taken from the REDACTED bytes, not the caller\'s input', async () => {
+  // The store redacts on the way in, so hashing the raw value would commit to a
+  // preimage the table does not hold — and the one thing a reader does with
+  // this digest is recompute it from the stored prose.
+  //
+  // ⚠ THE FIXTURE HAS TO CONTAIN SOMETHING REDACTION ACTUALLY CHANGES. Every
+  //   earlier case used tidy prose, so redacting it was a no-op and hashing
+  //   before or after gave the same answer — a mutant taking the digest from
+  //   the raw input survived the whole suite.
+  const SECRET = 'sk-probe-0123456789';
+  const saved = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = SECRET;
+  try {
+    const raw = `the number looks soft, per ${SECRET}`;
+    const { deps, calls } = scriptedQuery([OK]);
+    await new SqlBenchmarkServingPort(deps).publishRationale({
+      decision: REF, rationale: raw, evidenceRefs: [], source: NO_SOURCE,
+    });
+    const sent = sentPayload(calls);
+    const stored = String(sent['rationale']);
+    assert.notEqual(stored, raw, 'the fixture must be redacted, or it cannot discriminate');
+    assert.equal(sent['rationale_digest'], sha256Hex(stored),
+      'the digest must describe the bytes that are stored');
+    assert.notEqual(sent['rationale_digest'], sha256Hex(raw),
+      'and NOT the bytes the caller handed over');
+  } finally {
+    if (saved === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = saved;
+  }
 });

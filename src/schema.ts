@@ -290,7 +290,7 @@ function isHalfLine(line: number): boolean {
  * `runLine`, so that mapping is applied here. On a full board this is exactly
  * ['moneyline', 'spread', 'total'] — the historical three, in check order.
  */
-function suppliedMarkets(bundleGame: GameBundle): MarketKey[] {
+export function suppliedMarkets(bundleGame: GameBundle): MarketKey[] {
   const markets = bundleGame.markets;
   const supplied: MarketKey[] = [];
   if (markets.moneyline != null) supplied.push('moneyline');
@@ -639,7 +639,88 @@ export function projectionFingerprint(forecast: ForecastOutput): ForecastFingerp
  * retained body and `responseSha256`.
  */
 export function forecastDigest(forecast: ForecastOutput): string {
-  return sha256Hex(canonicalize(projectionFingerprint(forecast)));
+  return decisionDigest(projectionFingerprint(forecast));
+}
+
+/**
+ * The twelve decision-bearing fields AS A REVEAL ROW HOLDS THEM — every numeric
+ * nullable, because a deterministic baseline states a selection, a line and a
+ * price and nothing else.
+ *
+ * Structurally a widening of `ForecastFingerprint`, so a model's fingerprint is
+ * one of these unchanged and the digest below is byte-identical to what it has
+ * always produced. Deliberately a separate type rather than a loosening of that
+ * one: `ForecastFingerprint` binds the repair-preservation check and the fire
+ * artifact, where a nullable numeric would weaken a comparison that must stay
+ * exact.
+ */
+export interface RevealedFingerprint {
+  selection: string;
+  line: number | null;
+  observedDecimal: number | null;
+  win: number | null;
+  push: number | null;
+  loss: number | null;
+  confidence: number | null;
+  wouldAbstain: boolean | null;
+  selectedForExecution: boolean | null;
+  axes: AxesScores | null;
+  primaryAxis: AxisName | null;
+  primaryExpectation: string | null;
+}
+
+/**
+ * The one commitment composition, shared by every kind of participant.
+ *
+ * The point of one function is that a verifier holding a published reveal row
+ * reconstructs the preimage the same way whatever produced it — twelve keys,
+ * canonicalized, hashed. `canonicalize` emits `null` for a null member and
+ * drops only `undefined`, so an absent field is committed to as absent rather
+ * than silently omitted, and a baseline's nulls are part of what it promised.
+ */
+export function decisionDigest(fingerprint: RevealedFingerprint): string {
+  return sha256Hex(canonicalize(fingerprint));
+}
+
+/**
+ * The pregame commitment for a deterministic baseline.
+ *
+ * A baseline runs a fixed rule over the same frozen bundle the models saw: it
+ * names a side, the line it is taking, and the price that side was quoted. It
+ * holds no probabilities, no confidence and no analysis, and this hashes those
+ * nine fields as the explicit nulls a reveal row will carry rather than
+ * inventing values for them — a fabricated `win: 0.5` would be committed to
+ * permanently and then rendered as something the control claimed.
+ *
+ * The two numerics are quantised exactly as a model's are, for the same reason:
+ * the reveal columns hold fixed scale, and a commitment that cannot be
+ * recomputed from the reveal is decorative.
+ *
+ * ⚠ NOT UNIQUE, and nothing may key on it. Two baselines that pick the same
+ *   side of the same market at the same price — `baseline-favorite-ml` and
+ *   `baseline-home-ml` whenever the home team is the favorite — produce the
+ *   same digest, correctly: they made the same commitment. The participant is
+ *   what distinguishes them.
+ */
+export function baselineDigest(pick: {
+  selection: string;
+  line: number | null;
+  observedDecimal: number;
+}): string {
+  return decisionDigest({
+    selection: pick.selection,
+    line: pick.line === null ? null : quantizeForProjection(pick.line, PROJECTION_SCALES.line),
+    observedDecimal: quantizeForProjection(pick.observedDecimal, PROJECTION_SCALES.observedDecimal),
+    win: null,
+    push: null,
+    loss: null,
+    confidence: null,
+    wouldAbstain: null,
+    selectedForExecution: null,
+    axes: null,
+    primaryAxis: null,
+    primaryExpectation: null,
+  });
 }
 
 /** Exact equality of two axis-score sets; both absent is equal, one absent is not. */

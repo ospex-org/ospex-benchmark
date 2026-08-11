@@ -1,6 +1,14 @@
+import { sha256Hex } from './canonical.js';
 import { redactSecrets } from './config.js';
+import {
+  CONFIGURATION_DIGEST_VERSION,
+  canonicalConfigurationText,
+  configurationSha256,
+  configurationViolations,
+} from './participantConfiguration.js';
 import { PROJECTION_SCALES, quantizeForProjection } from './projectionNumeric.js';
 import { isParseableInstant } from './time.js';
+import type { ParticipantConfiguration } from './participantConfiguration.js';
 import type { MarketKey } from './types.js';
 import type { StoreQuery } from './store/atomicStore.js';
 
@@ -20,7 +28,7 @@ import type { StoreQuery } from './store/atomicStore.js';
  *
  * 1. IT CANNOT HALT A RUN. Every method resolves to a typed outcome and none of
  *    them throws — a benchmark night must never be lost because a projection was
- *    unavailable (see .claude/rules/advisory-tooling.md). This INVERTS the house
+ *    unavailable — an advisory layer never gates the work. This INVERTS the house
  *    convention: `SqlCampaignAuthorizationPort` rejects on a driver failure, and
  *    a test pins that it does, because a money-path adapter must fail loud. The
  *    two are different on purpose. Fail-soft is only safe here because nothing
@@ -134,6 +142,9 @@ export type InvalidInputReason =
   | 'network_out_of_domain'
   | 'participant_kind_out_of_domain'
   | 'lab_id_on_non_model'
+  | 'model_without_configuration'
+  | 'configuration_on_non_model'
+  | 'malformed_configuration'
   | 'model_without_attempt'
   | 'attempt_ordinal_out_of_range'
   | 'supplied_markets_malformed'
@@ -202,8 +213,21 @@ export type PublishOutcome =
 // Inputs
 // ---------------------------------------------------------------------------
 
-/** Why a cited provider call cannot carry the forecast being sealed. */
-export type AttemptIneligibleReason = 'unsent' | 'outcome_not_accepted' | 'market_not_supplied';
+/**
+ * Why a cited provider call cannot carry the forecast being sealed.
+ *
+ * `unlabelled` is not one of the three real reasons: it is what the statement
+ * reports when its own reason list is shorter than its predicate list, so the
+ * row that fired has no name. It exists because the alternative is worse —
+ * `unnest` pads the shorter array with NULLs, and an unnamed row that is simply
+ * dropped turns a refused seal into a silent one. See the note above the drift
+ * statements.
+ */
+export type AttemptIneligibleReason =
+  | 'unsent'
+  | 'outcome_not_accepted'
+  | 'market_not_supplied'
+  | 'unlabelled';
 
 /**
  * The attempt outcomes that yield decisions.
@@ -264,17 +288,41 @@ export interface RunFacts {
   readonly executionPolicy: string | null;
 }
 
-/** Durable participant identity, stable across model versions. */
+/**
+ * Durable participant identity — WHICH ENTRANT this is.
+ *
+ * The database indexes models uniquely on `(lab_id, model_id, configuration)`
+ * with NULLS NOT DISTINCT, so these three ARE the competitor: two models from
+ * one lab are two entrants, and one model at two reasoning levels is two
+ * entrants. `participantId` is the durable key those rows are addressed by, and
+ * carries no structure — do not parse a configuration out of it.
+ *
+ * ⚠ THE PAIR IS KIND-DEPENDENT IN BOTH DIRECTIONS, and the database enforces
+ *   both halves. A `kind='model'` row must declare `modelId` AND `configuration`;
+ *   every other kind must declare NEITHER. Supplying one of the two, or
+ *   attaching either to a control, is refused here before it reaches a CHECK.
+ */
 export interface ParticipantFacts {
   readonly participantId: string;
   readonly kind: ParticipantKind;
   readonly labId: string | null;
   readonly displayName: string;
+  /** The exact model string this entrant requests. NULL on every non-model. */
+  readonly modelId: string | null;
+  /**
+   * The settings it competes under, in the lab's own vocabulary and never
+   * normalised. `{}` is a real value — "sets no knobs" — and is hashed and
+   * compared like any other. NULL on every non-model.
+   *
+   * The digest and its version are DERIVED here rather than supplied: they are
+   * a function of this value, and a caller that passes both can pass two that
+   * disagree. See `identityPayload`.
+   */
+  readonly configuration: ParticipantConfiguration | null;
 }
 
 /**
- * The per-cohort binding: which model version an arm ran and which wallet it
- * signed with.
+ * The per-cohort binding: which wallet an entrant signed with.
  *
  * ⚠ FIRST WRITE WINS, and there is no second chance. The roster row is created by
  *   whichever attempt or seal reaches it first and the writer holds no UPDATE, so
@@ -282,9 +330,12 @@ export interface ParticipantFacts {
  *   `contradiction` and the original stands. The wallet is the join key from a
  *   forecast to its on-chain fill, so bind it before the first write for that
  *   participant or the join is dead for the whole cohort.
+ *
+ * It once also carried an `arm_id`, the version-scoped model string. That column
+ * is gone: it was a second copy of an identity the participant row now holds
+ * properly, and a second copy is a thing that can disagree.
  */
 export interface RosterFacts {
-  readonly armId: string | null;
   readonly walletAddress: string | null;
 }
 
@@ -339,7 +390,12 @@ export interface ArmAttempt {
 
 /**
  * A forecast at SEAL time: identity and digests, and nothing of the pick itself.
- * The forecast lands separately, and the absence of that reveal IS the embargo.
+ *
+ * The pick lands in a separate table, so the schema CAN hold a sealed forecast
+ * back. This publisher deliberately does not: it writes both, with the run.
+ * Keeping picks secret was never a requirement here, and the reasoning is
+ * recorded once, beside `ProjectionClock` in servingProjection.ts, rather than
+ * restated at each site that could imply otherwise.
  *
  * `attemptOrdinal` names the already-published provider call this forecast came
  * from, or is null for a deterministic baseline that made none. A participant of
@@ -680,9 +736,22 @@ function suppliedMarkets(values: readonly MarketKey[], field: string): MarketKey
   return [...values];
 }
 
-/** The identity every statement shares: the run, the participant and the roster
- *  binding. Emitted with identical key names by both write paths, so one set of
- *  CTEs serves both. */
+/**
+ * The identity every statement shares: the run, the participant and the roster
+ * binding. Emitted with identical key names by both write paths, so one set of
+ * CTEs serves both.
+ *
+ * ── THE CONFIGURATION CROSSES AS ITS CANONICAL TEXT, NOT AS AN OBJECT ────────
+ * `configuration_canonical` is a JSON STRING holding the RFC 8785 bytes, and
+ * every statement casts it with `::jsonb`. So what PostgreSQL parses is exactly
+ * what was hashed, rather than whatever a second serializer happened to emit —
+ * the digest is the entrant's identity, and a reader recomputing it from the
+ * stored row has to arrive back at the same value.
+ *
+ * The digest and its version are derived here from that same text. Taking them
+ * as inputs would let a caller supply a configuration and a digest that disagree,
+ * and the row is insert-once: the wrong one would be permanent.
+ */
 function identityPayload(
   run: RunFacts,
   participant: ParticipantFacts,
@@ -700,6 +769,7 @@ function identityPayload(
     refuse('malformed_wallet', 'roster.walletAddress');
   }
   return {
+    ...configurationPayload(participant),
     run_id: id(run.runId, 'run.runId'),
     cohort_id: id(run.cohortId, 'run.cohortId'),
     slate_date: calendarDate(run.slateDate, 'run.slateDate'),
@@ -719,8 +789,67 @@ function identityPayload(
     kind: participant.kind,
     lab_id: text(participant.labId, 'participant.labId'),
     display_name: requiredText(participant.displayName, 'participant.displayName'),
-    arm_id: text(roster.armId, 'roster.armId'),
     wallet_address: roster.walletAddress,
+  };
+}
+
+/**
+ * The four identity columns, from the two facts that determine them.
+ *
+ * The kind rule is an equivalence and is checked in BOTH directions, because the
+ * database checks it in both: a model declares a model and a configuration, and
+ * anything else declares neither. Half of the pair is the interesting failure —
+ * a model row carrying a `modelId` and a null configuration satisfies "it has a
+ * model" and is still a permanently dimensionless entrant.
+ */
+function configurationPayload(participant: ParticipantFacts): Record<string, unknown> {
+  const declared = participant.modelId !== null || participant.configuration !== null;
+
+  if (participant.kind !== 'model') {
+    if (declared) refuse('configuration_on_non_model', 'participant.modelId');
+    return {
+      model_id: null,
+      configuration_canonical: null,
+      configuration_sha256: null,
+      configuration_digest_version: null,
+    };
+  }
+
+  if (participant.modelId === null || participant.configuration === null) {
+    refuse('model_without_configuration', 'participant.configuration');
+  }
+  // The same grammar the artifact stamp is held to. Refused here rather than
+  // left to the database because the database can only answer with a 22P02 or a
+  // CHECK name, neither of which says which key was wrong.
+  //
+  // ⚠ THE LAB AND MODEL ARE PASSED IN, and that is what makes the database's
+  //   own bound unreachable rather than merely unlikely. The entrant-key CHECK
+  //   counts `octet_length(lab_id) + octet_length(model_id) +
+  //   octet_length(configuration::text)` against 1024, and the third term is
+  //   PostgreSQL's OWN rendering, which is longer than the canonical text this
+  //   module hashes — jsonb writes ": " and ", " where RFC 8785 writes ":" and
+  //   ",", so it costs one byte per key and one per separator.
+  //
+  //   Measured on PostgreSQL 17.10, densest shapes first: an array of
+  //   single-character elements expands 1.493x (507 canonical -> 757 rendered),
+  //   which is the worst case and approaches 1.5 asymptotically; many tiny
+  //   pairs 1.251x; a long string 1.002x. So 512 canonical bytes can never
+  //   render past 768, and with the identifier pair bounded at 128 the whole
+  //   key is under 896. Without this argument the identifiers are unbounded
+  //   here and the CHECK is reachable — as a named 23514, not silently, but
+  //   reachable.
+  const violations = configurationViolations(participant.configuration, {
+    labId: participant.labId ?? undefined,
+    modelId: participant.modelId ?? undefined,
+  });
+  if (violations.length > 0) refuse('malformed_configuration', `participant.${violations[0]!}`);
+
+  const configuration = participant.configuration as ParticipantConfiguration;
+  return {
+    model_id: requiredText(participant.modelId as string, 'participant.modelId'),
+    configuration_canonical: canonicalConfigurationText(configuration),
+    configuration_sha256: configurationSha256(configuration),
+    configuration_digest_version: CONFIGURATION_DIGEST_VERSION,
   };
 }
 
@@ -837,9 +966,14 @@ function revealPayload(reveal: DecisionReveal): Record<string, unknown> {
 }
 
 function rationalePayload(rationale: DecisionRationale): Record<string, unknown> {
+  // Redacted FIRST, then hashed, so the digest describes the bytes the table
+  // keeps. Hashing the caller's input instead would commit to a preimage the
+  // row does not hold, which is the one thing a reader cannot check.
+  const prose = requiredText(rationale.rationale, 'rationale');
   return {
     ...decisionRef(rationale.decision, 'decision'),
-    rationale: requiredText(rationale.rationale, 'rationale'),
+    rationale: prose,
+    rationale_digest: sha256Hex(prose),
     evidence_refs: rationale.evidenceRefs.map((r, i) => text(r, `evidenceRefs[${i}]`)),
     ...source(rationale.source, 'source'),
   };
@@ -933,7 +1067,7 @@ function scoringRunPayload(run: ScoringRun): Record<string, unknown> {
  * could not un-commit the child it had already written.
  */
 const RUN_DRIFT = `
-  select t.f
+  select coalesce(t.f, 'drift.unlabelled') as f
     from public.benchmark_runs r, input,
          lateral unnest(
            array['run.network','run.deploymentRound','run.slateDate','run.startedAt',
@@ -955,29 +1089,55 @@ const RUN_DRIFT = `
                  r.benchmark_commit         is distinct from input.benchmark_commit,
                  r.execution_policy         is distinct from input.execution_policy]
          ) as t(f, differs)
-   where r.run_id = input.run_id and t.differs`;
+   where r.run_id = input.run_id and coalesce(t.differs, true)`;
 
+/**
+ * ⚠ THE TWO ARRAYS IN EVERY `unnest` BELOW MUST BE THE SAME LENGTH.
+ *
+ * `unnest(array[names], array[flags])` pads the shorter one with NULLs, and
+ * both directions of a mismatch were wrong before this. A flag with no name
+ * gave a differing row whose label was NULL, which `min(f)` dropped: no
+ * contradiction reported while the gate suppressed the write, so a refusal
+ * read as a duplicate. A name with no flag gave `differs = NULL`, which the
+ * WHERE filtered out, so that field was never compared again.
+ *
+ * Three things close it. `coalesce(t.f, ...)` labels the first case so `min()`
+ * keeps it. `coalesce(t.differs, true)` fails the second CLOSED, which is loud
+ * rather than silent — every later write for that parent is reported as a
+ * contradiction until the arrays are fixed. And `drift_rows` decides the
+ * outcome from the COUNT rather than from the label. `servingStore.test.ts`
+ * also parses these statements and requires each pair to match in length.
+ */
 const PARTICIPANT_DRIFT = `
-  select t.f
+  select coalesce(t.f, 'drift.unlabelled') as f
     from public.benchmark_participants p, input,
          lateral unnest(
-           array['participant.kind','participant.labId','participant.displayName'],
+           array['participant.kind','participant.labId','participant.displayName',
+                 'participant.modelId','participant.configuration',
+                 'participant.configurationSha256','participant.configurationDigestVersion'],
            array[p.kind         is distinct from input.kind,
                  p.lab_id       is distinct from input.lab_id,
-                 p.display_name is distinct from input.display_name]
+                 p.display_name is distinct from input.display_name,
+                 p.model_id     is distinct from input.model_id,
+                 -- jsonb equality is semantic, so this compares the CONFIGURATION
+                 -- rather than a rendering of it: key order and whitespace cannot
+                 -- make an entrant look like a different one.
+                 p.configuration is distinct from input.configuration_canonical::jsonb,
+                 p.configuration_sha256 is distinct from input.configuration_sha256,
+                 p.configuration_digest_version
+                   is distinct from input.configuration_digest_version]
          ) as t(f, differs)
-   where p.participant_id = input.participant_id and t.differs`;
+   where p.participant_id = input.participant_id and coalesce(t.differs, true)`;
 
 const ROSTER_DRIFT = `
-  select t.f
+  select coalesce(t.f, 'drift.unlabelled') as f
     from public.benchmark_cohort_participants c, input,
          lateral unnest(
-           array['roster.armId','roster.walletAddress'],
-           array[c.arm_id         is distinct from input.arm_id,
-                 c.wallet_address is distinct from input.wallet_address]
+           array['roster.walletAddress'],
+           array[c.wallet_address is distinct from input.wallet_address]
          ) as t(f, differs)
    where c.cohort_id = input.cohort_id
-     and c.participant_id = input.participant_id and t.differs`;
+     and c.participant_id = input.participant_id and coalesce(t.differs, true)`;
 
 const IDENTITY_DRIFT = `${RUN_DRIFT}\n  union all${PARTICIPANT_DRIFT}\n  union all${ROSTER_DRIFT}`;
 
@@ -1014,8 +1174,13 @@ gate as (
   returning 1
 ), participant_ins as (
   insert into public.benchmark_participants
-    (participant_id, kind, lab_id, display_name, source_path, source_sha256)
-  select participant_id, kind, lab_id, display_name, source_path, source_sha256
+    (participant_id, kind, lab_id, display_name, model_id, configuration,
+     configuration_sha256, configuration_digest_version, source_path, source_sha256)
+  -- The configuration is PARSED FROM THE CANONICAL TEXT that was hashed, so the
+  -- stored jsonb and the digest beside it cannot describe different values.
+  select participant_id, kind, lab_id, display_name, model_id,
+         configuration_canonical::jsonb, configuration_sha256,
+         configuration_digest_version, source_path, source_sha256
     from input, gate
    where gate.ok
      and not exists (select 1 from public.benchmark_participants p
@@ -1024,8 +1189,8 @@ gate as (
   returning 1
 ), roster_ins as (
   insert into public.benchmark_cohort_participants
-    (cohort_id, participant_id, network, arm_id, wallet_address, source_path, source_sha256)
-  select cohort_id, participant_id, network, arm_id, wallet_address, source_path, source_sha256
+    (cohort_id, participant_id, network, wallet_address, source_path, source_sha256)
+  select cohort_id, participant_id, network, wallet_address, source_path, source_sha256
     from input, gate
    where gate.ok
      and not exists (select 1 from public.benchmark_cohort_participants c
@@ -1078,7 +1243,8 @@ with input as (
     baseline_policy_version text, run_price_version text, benchmark_commit text,
     execution_policy text,
     participant_id text, kind text, lab_id text, display_name text,
-    arm_id text, wallet_address text,
+    model_id text, configuration_canonical text, configuration_sha256 text,
+    configuration_digest_version smallint, wallet_address text,
     game_id text, attempt_ordinal smallint, supplied_markets text[], sent boolean,
     attempt_outcome text, requested_model_id text, reported_model_id text,
     provider_response_id text, http_status integer, provider_stop_reason text,
@@ -1093,7 +1259,7 @@ with input as (
   -- The three attempt facts the seal's eligibility test reads. A replay that
   -- flips one of them would otherwise be absorbed while changing what the
   -- already-published decisions are entitled to cite.
-  select t.f
+  select coalesce(t.f, 'drift.unlabelled') as f
     from public.benchmark_arm_attempts a, input,
          lateral unnest(
            array['facts.sent','facts.outcome','facts.suppliedMarkets'],
@@ -1103,7 +1269,7 @@ with input as (
          ) as t(f, differs)
    where a.cohort_id = input.cohort_id and a.participant_id = input.participant_id
      and a.game_id = input.game_id and a.attempt_ordinal = input.attempt_ordinal
-     and t.differs
+     and coalesce(t.differs, true)
 ), child_ready as (
   -- An attempt has no parent to wait for; the CTE exists so the shared identity
   -- gate has the same shape in both statements.
@@ -1130,8 +1296,12 @@ with input as (
   returning 1
 )
 select (select min(f) from drift)             as contradiction,
+       (select count(*) from drift)::int      as drift_rows,
        null::text                             as ineligible_reason,
-       1                                      as parent_found,
+       -- An attempt has no parent row to find, so this reports the GATE: false
+       -- when a durable fact disagrees, which is the state a bare literal 1
+       -- reported as inserted=0-and-nothing-else, i.e. as a benign duplicate.
+       (select gate.ok::int from gate)        as parent_found,
        (select count(*) from attempt_ins)::int as inserted`;
 
 /**
@@ -1168,23 +1338,14 @@ with input as (
     baseline_policy_version text, run_price_version text, benchmark_commit text,
     execution_policy text,
     participant_id text, kind text, lab_id text, display_name text,
-    arm_id text, wallet_address text,
+    model_id text, configuration_canonical text, configuration_sha256 text,
+    configuration_digest_version smallint, wallet_address text,
     game_id text, has_attempt boolean, attempt_ordinal smallint,
     accepted_outcomes text[],
     market text, contest_id text, speculation_id text, sealed_at timestamptz,
     forecast_digest text, rationale_digest text, decision_bundle_sha256 text,
     decision_response_schema_version smallint,
     source_path text, source_sha256 text)
-), drift as (${IDENTITY_DRIFT}
-  union all
-  -- The seal IS the pregame commitment. A second seal for the same key carrying
-  -- a DIFFERENT digest is the one integrity failure this projection exists to
-  -- make visible, and \`on conflict do nothing\` alone reports it as a replay.
-  select 'forecastDigest'
-    from public.benchmark_decisions d, input
-   where d.cohort_id = input.cohort_id and d.participant_id = input.participant_id
-     and d.game_id = input.game_id and d.market = input.market
-     and d.forecast_digest is distinct from input.forecast_digest
 ), cited as (
   select a.id, a.sent, a.outcome, a.supplied_markets
     from public.benchmark_arm_attempts a, input
@@ -1193,8 +1354,44 @@ with input as (
      and a.participant_id = input.participant_id
      and a.game_id = input.game_id
      and a.attempt_ordinal = input.attempt_ordinal
+), drift as (${IDENTITY_DRIFT}
+  union all
+  -- EVERY IMMUTABLE FACT OF THE SEAL, not just the forecast digest.
+  --
+  -- The seal is the commitment, the row is insert-once, and
+  -- an ON CONFLICT DO NOTHING absorbs a second one silently unless something
+  -- compares it. Measured with only the forecast digest compared: a replay
+  -- carrying a different rationaleDigest came back duplicate, so the
+  -- caller was told its write was a benign repeat while the stored row still
+  -- committed to different prose. Every column below is part of what the
+  -- seal promised, so every one of them is a contradiction when it moves.
+  select coalesce(t.f, 'drift.unlabelled') as f
+    from public.benchmark_decisions d, input,
+         lateral unnest(
+           array['seal.forecastDigest','seal.rationaleDigest','seal.sealedAt',
+                 'seal.runId','seal.deploymentRound','seal.network',
+                 'seal.contestId','seal.speculationId','seal.bundleSha256',
+                 'seal.responseSchemaVersion','seal.attemptOrdinal'],
+           array[d.forecast_digest  is distinct from input.forecast_digest,
+                 d.rationale_digest is distinct from input.rationale_digest,
+                 d.sealed_at        is distinct from input.sealed_at,
+                 d.run_id           is distinct from input.run_id,
+                 d.deployment_round is distinct from input.deployment_round,
+                 d.network          is distinct from input.network,
+                 d.contest_id       is distinct from input.contest_id,
+                 d.speculation_id   is distinct from input.speculation_id,
+                 d.bundle_sha256    is distinct from input.decision_bundle_sha256,
+                 d.response_schema_version
+                   is distinct from input.decision_response_schema_version,
+                 -- The provider call it cites, compared as the id the insert
+                 -- would resolve rather than as the ordinal supplied.
+                 d.attempt_id       is distinct from (select id from cited)]
+         ) as t(f, differs)
+   where d.cohort_id = input.cohort_id and d.participant_id = input.participant_id
+     and d.game_id = input.game_id and d.market = input.market
+     and coalesce(t.differs, true)
 ), ineligible as (
-  select t.f
+  select coalesce(t.f, 'unlabelled') as f
     from cited, input,
          lateral unnest(
            array['unsent','outcome_not_accepted','market_not_supplied'],
@@ -1202,7 +1399,7 @@ with input as (
                  not (cited.outcome = any(input.accepted_outcomes)),
                  not (input.market = any(cited.supplied_markets))]
          ) as t(f, differs)
-   where t.differs
+   where coalesce(t.differs, true)
 ), child_ready as (
   select cited.id from cited where not exists (select 1 from ineligible)
   union all
@@ -1223,8 +1420,11 @@ with input as (
   returning 1
 )
 select (select min(f) from drift)                as contradiction,
+       (select count(*) from drift)::int         as drift_rows,
        (select min(f) from ineligible)           as ineligible_reason,
-       (select count(*) from child_ready)::int   as parent_found,
+       -- gate.ok already conjoins "child_ready is non-empty", so this is the
+       -- count it replaces AND the suppression the count could not see.
+       (select gate.ok::int from gate)           as parent_found,
        (select count(*) from decision_ins)::int  as inserted`;
 
 /**
@@ -1269,32 +1469,57 @@ with input as (
   returning 1
 )
 select null::text                          as contradiction,
+       0                                   as drift_rows,
        null::text                          as ineligible_reason,
        (select count(*) from parent)::int  as parent_found,
        (select count(*) from ins)::int     as inserted`;
 
-/** The withheld prose, keyed to its decision the same way the reveal is. */
+/**
+ * The withheld prose, keyed to its decision the same way the reveal is.
+ *
+ * ⚠ IT MUST HASH TO THE DIGEST ITS SEAL COMMITTED TO. The whole claim about
+ *   this table is that publishing the prose later is provably the original,
+ *   and nothing checked it: the seal stored a digest and this statement
+ *   inserted whatever text it was handed. Measured — a replacement rationale
+ *   landed `published` under a digest of the prose it replaced, and the
+ *   commitment was unverifiable from then on with nothing reporting it.
+ *
+ *   The digest compared here is derived by the payload builder from the bytes
+ *   that will actually be STORED, after redaction, so what a reader can
+ *   recompute from the table is what was checked. The seal's own digest comes
+ *   from the artifact, which the writer already redacted, so the two agree —
+ *   and if they ever do not, this reports it rather than storing the pair.
+ */
 const RATIONALE_SQL = `
 with input as (
   select * from jsonb_to_record($1::jsonb) as x(
     cohort_id text, participant_id text, game_id text, market text,
-    rationale text, evidence_refs text[], source_path text, source_sha256 text)
+    rationale text, rationale_digest text, evidence_refs text[],
+    source_path text, source_sha256 text)
 ), parent as (
-  select d.id
+  select d.id, d.rationale_digest
     from public.benchmark_decisions d, input
    where d.cohort_id = input.cohort_id
      and d.participant_id = input.participant_id
      and d.game_id = input.game_id
      and d.market = input.market
+), drift as (
+  -- A NULL stored digest is a seal that committed to having no rationale, so
+  -- is distinct from is the right comparison in both directions.
+  select 'rationale' as f
+    from parent, input
+   where parent.rationale_digest is distinct from input.rationale_digest
 ), ins as (
   insert into public.benchmark_decision_rationales
     (decision_id, rationale, evidence_refs, source_path, source_sha256)
   select parent.id, input.rationale, input.evidence_refs, input.source_path, input.source_sha256
     from parent, input
+   where not exists (select 1 from drift)
   on conflict (decision_id) do nothing
   returning 1
 )
-select null::text                          as contradiction,
+select (select min(f) from drift)          as contradiction,
+       (select count(*) from drift)::int   as drift_rows,
        null::text                          as ineligible_reason,
        (select count(*) from parent)::int  as parent_found,
        (select count(*) from ins)::int     as inserted`;
@@ -1342,6 +1567,7 @@ with input as (
   returning 1
 )
 select null::text                          as contradiction,
+       0                                   as drift_rows,
        null::text                          as ineligible_reason,
        (select count(*) from parent)::int  as parent_found,
        (select count(*) from ins)::int     as inserted`;
@@ -1371,6 +1597,7 @@ with input as (
   returning 1
 )
 select null::text                       as contradiction,
+       0                                as drift_rows,
        null::text                       as ineligible_reason,
        1                                as parent_found,
        (select count(*) from ins)::int  as inserted`;
@@ -1480,8 +1707,10 @@ function classifyRows(rows: ReadonlyArray<Record<string, unknown>>): PublishOutc
   const parentFound = row?.['parent_found'];
   const inserted = row?.['inserted'];
   const contradiction = row?.['contradiction'];
+  const driftRows = row?.['drift_rows'];
   const ineligible = row?.['ineligible_reason'];
   if (typeof parentFound !== 'number' || typeof inserted !== 'number'
+      || typeof driftRows !== 'number'
       || (contradiction !== null && typeof contradiction !== 'string')
       || (ineligible !== null && typeof ineligible !== 'string')) {
     return { outcome: 'unavailable', detail: `off-contract result shape (${rows.length} row(s))` };
@@ -1489,7 +1718,20 @@ function classifyRows(rows: ReadonlyArray<Record<string, unknown>>): PublishOutc
   // Precedence, and it is deliberate: a disagreement about a commitment outranks
   // everything, then an attempt that cannot carry the forecast, then absence.
   // Each of the first three means NOTHING was written.
-  if (typeof contradiction === 'string') return { outcome: 'contradiction', field: contradiction };
+  //
+  // ⚠ THE COUNT DECIDES, NOT THE NAME. Any drift row closes `gate.ok` and
+  //   suppresses the whole statement, but the name comes from a parallel array
+  //   and `min()` drops a NULL — so a drift row the statement could not label
+  //   used to arrive as inserted=0 with no contradiction, which the branch below
+  //   reports as `duplicate`: a suppressed write read as a benign repeat, and
+  //   therefore as a success. Reporting on the count means an unlabelled
+  //   disagreement is still a contradiction.
+  if (driftRows > 0) {
+    return {
+      outcome: 'contradiction',
+      field: typeof contradiction === 'string' ? contradiction : UNNAMED_DRIFT_FIELD,
+    };
+  }
   if (typeof ineligible === 'string') {
     return { outcome: 'attempt_not_eligible', reason: ineligible as AttemptIneligibleReason };
   }
@@ -1497,6 +1739,17 @@ function classifyRows(rows: ReadonlyArray<Record<string, unknown>>): PublishOutc
   if (inserted === 0) return { outcome: 'duplicate' };
   return { outcome: 'published' };
 }
+
+/**
+ * Reported when a drift row exists but the statement could not name the field.
+ *
+ * Unreachable from the statements above as they stand, because every drift
+ * source labels its padded row. It is the second layer, for a drift source
+ * added later WITHOUT that label — a bug in the SQL rather than anything a
+ * caller did. Named rather than blank so it is greppable, and reported as a
+ * contradiction rather than swallowed, because the write really was suppressed.
+ */
+export const UNNAMED_DRIFT_FIELD = 'unnamed (a drift check in this statement is misconfigured)';
 
 // ---------------------------------------------------------------------------
 // Adapter

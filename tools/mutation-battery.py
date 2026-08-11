@@ -305,7 +305,104 @@ MUTANTS = [
      '    const found = resolvePath(requestParams, leaf.segments);',
      "    const found = resolvePath(requestParams, leaf.path.split('.'));",
      ['src/participantConfiguration.test.ts']),
+# --- publication mechanics: the process bound, the entrant, the gate --------
+# Everything below pins a guarantee this PR states in prose. A guarantee with
+# no mutant behind it is a sentence, not a property.
+    ('M58-close-never-destroys-handles', 'src/benchmarkServingClient.ts',
+     '  if (drained) return;',
+     '  return;',
+     ['src/benchmarkServingClient.test.ts']),
+    ('M59-release-without-the-error', 'src/store/campaignTickJournal.ts',
+     '        client.release(failure);',
+     '        client.release();',
+     ['src/store/campaignTickJournal.test.ts']),
+    # Removes the bound rather than lengthening it. A mutant that sets the
+    # deadline to an hour is UNSCOREABLE: the timer is ref'd (deliberately, so a
+    # short one cannot let Node exit mid-await), so an hour-long one holds the
+    # process and the battery reports HUNG instead of a verdict. Deleting the
+    # race leaves nothing ref'd, so the suite fails on its own timeout and the
+    # process still drains.
+    ('M60-rollback-unbounded', 'src/store/campaignTickJournal.ts',
+     "          await Promise.race([\n"
+     "            client.query('rollback', []),\n"
+     "            new Promise((_, reject) => {\n"
+     "              timer = setTimeout(() => reject(new Error('rollback did not answer')), rollbackTimeoutMs);\n"
+     "            }),\n"
+     "          ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });",
+     "          await client.query('rollback', []);",
+     ['src/store/campaignTickJournal.test.ts']),
+    ('M61-no-driver-read-timeout', 'src/benchmarkServingClient.ts',
+     '    query_timeout: QUERY_TIMEOUT_MS,',
+     '    query_timeout: 0,',
+     ['src/benchmarkServingClient.test.ts']),
+    ('M62-server-gives-up-after-the-driver', 'src/benchmarkServingClient.ts',
+     'export const STATEMENT_TIMEOUT_MS = 8_000;',
+     'export const STATEMENT_TIMEOUT_MS = 12_000;',
+     ['src/benchmarkServingClient.test.ts']),
+    ('M63-drift-count-ignored', 'src/servingStore.ts',
+     '  if (driftRows > 0) {',
+     '  if (false) {',
+     ['src/servingStore.test.ts']),
+    ('M64-a-drift-source-loses-its-label', 'src/servingStore.ts',
+     "  select coalesce(t.f, 'drift.unlabelled') as f\n    from public.benchmark_participants p, input,",
+     "  select t.f\n    from public.benchmark_participants p, input,",
+     ['src/servingStore.test.ts']),
+    ('M65-parent-found-back-to-a-literal', 'src/servingStore.ts',
+     '       (select gate.ok::int from gate)        as parent_found,',
+     '       1                                      as parent_found,',
+     ['src/servingStore.test.ts']),
+    ('M66-a-control-may-declare-a-model', 'src/servingStore.ts',
+     "    if (declared) refuse('configuration_on_non_model', 'participant.modelId');",
+     "    if (false) refuse('configuration_on_non_model', 'participant.modelId');",
+     ['src/servingStore.test.ts']),
+    ('M67-a-model-may-declare-half-an-identity', 'src/servingStore.ts',
+     '  if (participant.modelId === null || participant.configuration === null) {',
+     '  if (false) {',
+     ['src/servingStore.test.ts']),
+    ('M68-configuration-sent-uncanonicalised', 'src/servingStore.ts',
+     '    configuration_canonical: canonicalConfigurationText(configuration),',
+     '    configuration_canonical: JSON.stringify(configuration),',
+     ['src/servingStore.test.ts']),
+    ('M69-entrant-identity-not-drift-checked', 'src/servingStore.ts',
+     '                 p.model_id     is distinct from input.model_id,',
+     '                 false,',
+     ['src/servingStore.test.ts']),
+    ('M70-unconfigured-reads-as-success', 'src/projectRunMain.ts',
+     '      ? PROJECT_EXIT.unconfigured',
+     '      ? PROJECT_EXIT.ok',
+     ['src/projectRunMain.test.ts']),
+    ('M71-a-refused-publisher-reads-as-success', 'src/projectRunMain.ts',
+     '      : PROJECT_EXIT.refused;',
+     '      : PROJECT_EXIT.ok;',
+     ['src/projectRunMain.test.ts']),
+# --- the seal's immutable facts, the rationale binding, the capability gate ---
+    ('M72-only-the-forecast-digest-is-drift-checked', 'src/servingStore.ts',
+     "                 d.rationale_digest is distinct from input.rationale_digest,",
+     '                 false,',
+     ['src/servingStore.test.ts']),
+    ('M73-rationale-not-bound-to-its-seal', 'src/servingStore.ts',
+     '   where parent.rationale_digest is distinct from input.rationale_digest',
+     '   where false',
+     ['src/servingStore.test.ts']),
+    ('M74-rationale-digest-taken-before-redaction', 'src/servingStore.ts',
+     '    rationale_digest: sha256Hex(prose),',
+     '    rationale_digest: sha256Hex(rationale.rationale),',
+     ['src/servingStore.test.ts']),
+    ('M75-any-capability-will-do', 'src/benchmarkServingClient.ts',
+     '  if (capability < REQUIRED_SERVING_CAPABILITY) {',
+     '  if (false) {',
+     ['src/benchmarkServingClient.test.ts']),
+    ('M76-unreadable-capability-reads-as-current', 'src/benchmarkServingClient.ts',
+     '    capability = 0;',
+     '    capability = REQUIRED_SERVING_CAPABILITY;',
+     ['src/benchmarkServingClient.test.ts']),
+    ('M77-a-text-version-satisfies-the-gate', 'src/benchmarkServingClient.ts',
+     "  return typeof version === 'number' && Number.isInteger(version) ? version : 0;",
+     '  return Number(version);',
+     ['src/benchmarkServingClient.test.ts']),
 ]
+
+
 
 
 def sha(path):

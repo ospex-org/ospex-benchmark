@@ -37,10 +37,18 @@ import { OPERATOR_RESUMED } from '../campaignSchedule.js';
  * build reaches the halt rule (which fails closed on outcomes it does not recognize)
  * instead of breaking the read.
  */
-/** One checked-out connection, usable for several commands in one transaction. */
+/**
+ * One checked-out connection, usable for several commands in one transaction.
+ *
+ * `release` takes an optional error, and passing one is not cosmetic: `pg-pool`
+ * DESTROYS a client released with a truthy first argument and returns one
+ * released without it to the idle set. A client whose transaction failed —
+ * especially one whose statement never came back — must be destroyed, or the
+ * next caller checks out a connection with a query still in flight.
+ */
 export interface PgTransactionClient {
   query(sql: string, params: readonly unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>;
-  release(): void;
+  release(destroyBecause?: unknown): void;
 }
 
 /** The minimal pool shape the transactor needs — structural, so `pg` stays a
@@ -57,24 +65,78 @@ export interface StoreTransactor {
   transaction<T>(fn: (query: StoreQuery) => Promise<T>): Promise<T>;
 }
 
-export function pgStoreTransactor(pool: PgPoolLike): StoreTransactor {
+/**
+ * How long a rollback on a failing connection may take before it is abandoned.
+ *
+ * An unbounded rollback is not a safety measure, it is a second place to hang:
+ * if the transaction failed because a statement never answered, `rollback` is
+ * queued BEHIND that statement and waits just as long — so the `finally` that
+ * hands the connection back is never reached, and the process cannot exit.
+ * Measured: a pinned client with one hung statement kept Node alive
+ * indefinitely, and only destroying it ended the process.
+ *
+ * Abandoning the rollback is safe because of what happens next: the client is
+ * released WITH the error, which destroys the connection, and the server rolls
+ * back an aborted transaction on its own when the backend goes away.
+ */
+export const TRANSACTOR_ROLLBACK_TIMEOUT_MS = 2_000;
+
+export interface TransactorOptions {
+  /** Injectable so the bound is a property the suite can exercise, not a comment. */
+  readonly rollbackTimeoutMs?: number;
+}
+
+export function pgStoreTransactor(pool: PgPoolLike, options: TransactorOptions = {}): StoreTransactor {
+  const rollbackTimeoutMs = options.rollbackTimeoutMs ?? TRANSACTOR_ROLLBACK_TIMEOUT_MS;
   return {
     async transaction<T>(fn: (query: StoreQuery) => Promise<T>): Promise<T> {
       const client = await pool.connect();
+      let failure: unknown;
       try {
         await client.query('begin isolation level read committed', []);
         const result = await fn(async (sql, params) => (await client.query(sql, params)).rows);
         await client.query('commit', []);
         return result;
       } catch (error) {
+        // TRUTHY, not merely non-nullish. `pg-pool` decides whether to destroy
+        // the client on the truthiness of this value, so `throw 0` or `throw ''`
+        // would satisfy a `??` and still return a poisoned client to the idle
+        // set. Nothing in this repo throws a falsy value today; the guard costs
+        // a line and removes the class.
+        failure = error === undefined || error === null || error === false
+          || error === 0 || error === ''
+          ? new Error(`the transaction failed with a falsy value: ${String(error)}`)
+          : error;
         try {
-          await client.query('rollback', []);
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          // NOT unref'd, deliberately. The rule is: unref a timer you never
+          // clear, ref one you do. This one is cleared in the `finally` below,
+          // so it cannot outlive the call — and unref'ing it meant that when
+          // this rollback was the only pending work, Node drained the loop and
+          // exited before the deadline fired, so the release never ran and the
+          // caller's promise never settled. Measured as a test the runner
+          // reported as "cancelled: promise resolution is still pending but the
+          // event loop has already resolved".
+          await Promise.race([
+            client.query('rollback', []),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error('rollback did not answer')), rollbackTimeoutMs);
+            }),
+          ]).finally(() => { if (timer !== undefined) clearTimeout(timer); });
         } catch {
-          // The primary error stands; the released connection is discarded or reset by the pool.
+          // The primary error stands. Whether the rollback landed changes
+          // nothing about what happens to this connection: it is destroyed
+          // either way, by the release below.
         }
         throw error;
       } finally {
-        client.release();
+        // WITH THE ERROR, ALWAYS, WHEN THE TRANSACTION FAILED. `pg-pool` reads a
+        // truthy first argument as "destroy this client"; a bare `release()`
+        // puts it back in the idle set, and a client whose statement is still
+        // in flight is poisoned — the next checkout queues behind a query that
+        // may never return. Destroying it costs one reconnect on a path that
+        // has already failed, which is the cheaper of the two mistakes.
+        client.release(failure);
       }
     },
   };

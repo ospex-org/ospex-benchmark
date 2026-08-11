@@ -193,8 +193,52 @@ That ordering is part of the contract. A refused or non-final call produces an
 attempt row and no decisions, and that row is the opportunity denominator — a
 failed arm has to be representable or coverage is computed over successes only.
 
-**Nothing calls it yet.** Which producer feeds the projection is a separate
-decision, so today it ships as a library with tests and no run-path effect.
+### Who a row belongs to
+
+A participant is **one competing configuration**: `(lab_id, model_id,
+configuration)`, unique among models. Two models from one lab are two entrants,
+and the same model at two reasoning levels is two entrants — that comparison is
+the point, so the identity has to be able to express it. `configuration` is the
+lab's own vocabulary stored verbatim, never normalised, because a normalisation
+is a permanent claim of equivalence between settings nobody can defend as equal.
+`{}` is a real value meaning "sets no knobs".
+
+The rows are insert-once with no `UPDATE` grant, so an entrant written without
+its settings could never be corrected. Every write compares what the caller
+supplied against what is stored and refuses on any disagreement rather than
+absorbing it.
+
+### Publishing an artifact
+
+The projection is a view **of the artifact**, not a second thing a run emits. A
+run writes its NDJSON, and publication reads that file back:
+
+```bash
+yarn project out/run-2026-08-09.ndjson [more.ndjson ...]
+```
+
+Live publication and recovery are the same call over the same bytes, which is
+what makes republishing safe: every write is idempotent, so a row already
+present reports `duplicate` and nothing changes. The publisher is fail-soft — it
+cannot halt a benchmark night — so a write lost to a network blip is lost
+quietly, and re-running this command is how it comes back.
+
+`yarn project` exits **non-zero whenever it did not publish**, including when it
+was never configured. That is the opposite of the run paths, deliberately: there
+the projection is a side effect and a missing credential must never fail a
+night, while here publishing is the entire job.
+
+| exit | meaning |
+|---|---|
+| 0 | every row is published or already present |
+| 1 | publication was attempted and something did not land |
+| 2 | usage — no files, or a named file does not exist |
+| 3 | no credential is configured, so nothing was attempted |
+| 4 | configured, but the publisher was refused |
+| 5 | the command itself failed |
+
+**No run path calls the publisher yet.** Wiring it into `yarn watch` and
+`yarn smoke` is a separate change.
 
 ```bash
 # unit tests run with the rest of the suite; they open no connection
