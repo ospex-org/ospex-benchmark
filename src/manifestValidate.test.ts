@@ -37,6 +37,7 @@ function codeConsistentRaw(): Record<string, unknown> {
       provider: a.provider,
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: a.approvedReportedModelIds,
+      configuration: a.configuration,
     })),
     toolInferenceConfigSha256: toolInferenceConfigSha256(),
     // A line-open cohort fires markets independently, so any dispatch may be a
@@ -241,7 +242,7 @@ test('scoringPolicyVersion mismatch is flagged', () => {
 test('an unknown roster participant is flagged', () => {
   const raw = codeConsistentRaw();
   const roster = raw.expectedArmRoster as Array<Record<string, unknown>>;
-  roster.push({ participantId: 'ghost', provider: 'openai', requestedModelId: 'x', approvedReportedModelIds: ['x'] });
+  roster.push({ participantId: 'ghost', provider: 'openai', requestedModelId: 'x', approvedReportedModelIds: ['x'], configuration: {} });
   (raw.constants as Record<string, unknown>).maxConcurrentProviderRequests = roster.length; // keep capacity valid
   const v = validateManifestAgainstCode(parse(raw));
   assert.ok(v.some((s) => /"ghost" is not a code-supported participant/.test(s)), v.join('; '));

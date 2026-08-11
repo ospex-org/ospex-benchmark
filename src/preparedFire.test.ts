@@ -69,6 +69,7 @@ function manifestObject(over: { network?: string } = {}): Record<string, unknown
       provider: a.provider,
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
+      configuration: a.configuration,
     })),
     toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',
@@ -239,6 +240,9 @@ function recomputeDigest(snap: PreparedFireSnapshot): string {
         historyRows: m.historyRows,
         historyWatermark: m.historyWatermark,
       })),
+      // Four fields, deliberately: the v1 fire identity carries no
+      // configuration, and `expectedArmIdentity` refuses a roster entry that
+      // declares one rather than dropping it silently.
       expectedArmIdentities: snap.expectedArmIdentities.map((a) => ({
         participantId: a.participantId,
         provider: a.provider,

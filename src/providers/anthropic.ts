@@ -4,6 +4,8 @@ import { ProviderUnfinishedTurnError } from './errors.js';
 import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractAnthropicSearchAudit } from './searchAudit.js';
+import { buildRequestPlan } from './requestPlan.js';
+import type { ProviderRequestPlan } from './requestPlan.js';
 import type {
   ChatTurn,
   ProviderAdapter,
@@ -20,6 +22,46 @@ const DEFAULT_MAX_TOKENS = 16000;
 // beta header), flat block shape, capped by the provider's own `max_uses`.
 const WEB_SEARCH = TOOL_INFERENCE_CONFIG.webSearch.anthropic;
 
+/**
+ * The request this adapter would send, built without sending it.
+ *
+ * Exported so a preflight can check a participant's configuration against the
+ * REAL body: the add-only collision rule then runs on what would actually go
+ * on the wire, rather than on a hand-maintained list of reserved names that
+ * drifts from the adapter the first time the adapter changes.
+ */
+export function anthropicRequestPlan(args: {
+  requestedModelId: string;
+  turns: ChatTurn[];
+  options?: ProviderCallOptions | undefined;
+}): ProviderRequestPlan {
+  const system = args.turns.find((t) => t.role === 'system')?.content ?? '';
+  const messages = args.turns
+    .filter((t) => t.role !== 'system')
+    .map((t) => ({ role: t.role, content: t.content }));
+  const maxTokens = args.options?.maxOutputTokens ?? DEFAULT_MAX_TOKENS;
+  // A repair carries no declared tools (format-only, may not search).
+  const withTools = (args.options?.tools ?? 'declared') === 'declared';
+  const body: Record<string, unknown> = {
+    model: args.requestedModelId,
+    max_tokens: maxTokens,
+    system,
+    messages,
+  };
+  if (withTools) body['tools'] = [{ ...WEB_SEARCH.tool, max_uses: WEB_SEARCH.maxUses }];
+  return buildRequestPlan({
+    endpoint: ANTHROPIC_URL,
+    body,
+    configuration: args.options?.configuration ?? {},
+    // The prompt is bound by its own hash once per run; repeating it on every
+    // attempt would multiply the artifact by the bundle.
+    promptKeys: ['system', 'messages'],
+    // The API version travels in a header, but it selects the request contract
+    // — a change in it changes what was asked for — so it is recorded.
+    recordedNonBody: { anthropic_version: ANTHROPIC_VERSION },
+  });
+}
+
 export function createAnthropicAdapter(requestedModelId: string): ProviderAdapter {
   return {
     provider: 'anthropic',
@@ -35,26 +77,12 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
     ): Promise<ProviderResponse> {
       const apiKey = envValue('ANTHROPIC_API_KEY');
       if (apiKey === undefined) throw new Error('ANTHROPIC_API_KEY is not set');
-      const system = turns.find((t) => t.role === 'system')?.content ?? '';
-      const messages = turns
-        .filter((t) => t.role !== 'system')
-        .map((t) => ({ role: t.role, content: t.content }));
-      const maxTokens = options?.maxOutputTokens ?? DEFAULT_MAX_TOKENS;
-      // A repair carries no declared tools (format-only, may not search).
-      const withTools = (options?.tools ?? 'declared') === 'declared';
-      const tools = [{ ...WEB_SEARCH.tool, max_uses: WEB_SEARCH.maxUses }];
-      const body: Record<string, unknown> = {
-        model: requestedModelId,
-        max_tokens: maxTokens,
-        system,
-        messages,
-      };
-      if (withTools) body['tools'] = tools;
+      const plan = anthropicRequestPlan({ requestedModelId, turns, options });
       const { status, json: raw } = await postJson({
         provider: 'anthropic',
-        url: ANTHROPIC_URL,
+        url: plan.endpoint,
         headers: { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION },
-        body,
+        body: plan.body,
         timeoutMs,
       });
       const json = raw as {
@@ -84,13 +112,7 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
         billableOutputTokens: comparable.billableOutputTokens,
       };
 
-      const requestParams: Record<string, unknown> = {
-        endpoint: ANTHROPIC_URL,
-        model: requestedModelId,
-        max_tokens: maxTokens,
-        anthropic_version: ANTHROPIC_VERSION,
-        ...(withTools ? { tools } : {}),
-      };
+      const requestParams = plan.requestParams;
 
       // Terminal state: on the Messages API only `end_turn` and `stop_sequence`
       // are a finished turn. Everything else — `pause_turn`, `refusal`,

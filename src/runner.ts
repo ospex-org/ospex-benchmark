@@ -345,7 +345,10 @@ interface DispatchTarget {
 }
 
 async function timedChat(
-  adapter: Pick<DispatchTarget, 'chat'>,
+  // The whole target, not just its `chat`: the configuration sent with a call
+  // has to come from the same authenticated arm the result is recorded under,
+  // and taking both from one value is what makes that true by construction.
+  adapter: Pick<DispatchTarget, 'chat' | 'arm'>,
   turns: ChatTurn[],
   timeoutMs: number,
   maxOutputTokens: number,
@@ -366,7 +369,13 @@ async function timedChat(
   const startedAt = startMs;
   const requestAt = new Date(startedAt).toISOString();
   try {
-    const response = await adapter.chat(turns, timeoutMs, { maxOutputTokens, tools });
+    const response = await adapter.chat(turns, timeoutMs, {
+      maxOutputTokens,
+      tools,
+      // The repair leg carries the SAME configuration: it is the same entrant
+      // reformatting its own answer, not a second competitor.
+      configuration: adapter.arm.configuration,
+    });
     const respondedAt = nowMs();
     return {
       rawText: redactSecrets(response.rawText),
@@ -1123,6 +1132,13 @@ export async function runAuthorizedDispatch(
           provider: facade.provider as ArmSpec['provider'],
           requestedModelId: facade.requestedModelId,
           credentialEnvVar: facade.credentialEnvVar,
+          // Empty, and provably so rather than by omission: the authenticated
+          // roster this facade was built from cannot carry a configuration
+          // (`expectedArmIdentity` refuses a roster entry that declares one),
+          // so on this path every arm competes at its provider's defaults.
+          // Reading one off the facade instead would be reading it from
+          // somewhere the authorization gate never checked.
+          configuration: {},
         },
         // The facades' bound methods — captured before the claim, never re-read from a map.
         hasCredential: () => facade.hasCredential(),

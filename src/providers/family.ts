@@ -10,15 +10,34 @@ import type { ProviderName } from '../types.js';
  * - an arm reports any ID outside its approved list (exact requested ID plus
  *   explicitly approved aliases) — same-family substitutions included;
  * - an arm's reported IDs drift across games/attempts;
- * - two arms resolve to the same provider family (PROVIDER_COLLISION);
  * - an arm's reported family contradicts the provider it was requested from;
- * - two arms report the byte-identical model ID.
+ * - two arms are INDISTINGUISHABLE AS ENTRANTS: they report the byte-identical
+ *   model ID under the byte-identical configuration (PROVIDER_COLLISION).
  *
  * A SUCCESSFUL response that reports no model ID is itself a failure —
  * accepted decisions require verified identity. Only arms that never
  * produced a response body (timeouts, HTTP failures, missing credentials)
  * are exempt from the reported-ID requirement; they surface as loud
  * warnings instead.
+ *
+ * The last rule used to be two rules — "two arms report the identical model
+ * ID" and "two arms resolve to the same provider family" — and both are now
+ * wrong as stated, because an arm is one competing CONFIGURATION. Two models
+ * from one lab, and one model at two reasoning levels, are exactly what this
+ * cohort is for. What the old rules were really guarding is intact and is what
+ * the new one says: an operator who believes they are running N distinct
+ * competitors must not be running fewer. Cross-lab substitution — the other
+ * thing the family rule caught — is still caught twice over, by the approved-ID
+ * allowlist and by the family-contradicts-provider check.
+ *
+ * ONE BOUND, stated because it is irreducible rather than because it is small:
+ * the configuration half of an entrant's identity is verified REQUEST-side
+ * only. No provider echoes a reasoning setting back, so a lab that silently
+ * ignores a knob is indistinguishable here from one that honours it. What is
+ * verifiable is that the declared configuration went out on the wire, which
+ * `configurationEvidenceViolations` checks against each attempt's recorded
+ * request. If a provider ever reports enough to close the gap — an effort
+ * echo, a distinct service tier, a reasoning-token floor — this is the hook.
  */
 export function classifyFamily(modelId: string): ProviderName | null {
   const id = modelId.toLowerCase();
@@ -35,6 +54,12 @@ export interface CollisionCheckInput {
   requestedModelId: string;
   /** Exact reported IDs accepted for this arm (requested ID + approved aliases). */
   approvedReportedModelIds: string[];
+  /**
+   * The digest of this arm's declared configuration — the OTHER half of what
+   * makes it a distinct entrant. Supplied by the caller from the authenticated
+   * roster, never derived from a response, because no response carries it.
+   */
+  configurationSha256: string;
   /** Distinct response-reported model IDs observed across the arm's games. */
   reportedModelIds: string[];
   /**
@@ -53,8 +78,13 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
   const failures: string[] = [];
   const warnings: string[] = [];
 
-  const byFamily = new Map<ProviderName, CollisionCheckInput[]>();
-  const byReportedId = new Map<string, CollisionCheckInput>();
+  // Keyed by ENTRANT — reported model ID plus configuration digest — because
+  // two arms sharing a model are a legitimate cohort while two arms sharing a
+  // model AND its configuration are the same competitor entered twice. The key
+  // is a JSON pair rather than a joined string: a model ID may contain any
+  // character, and a separator a model ID can contain is a separator two
+  // different pairs can spell the same way.
+  const byEntrant = new Map<string, CollisionCheckInput>();
 
   for (const arm of arms) {
     if (arm.unidentifiedResponses > 0) {
@@ -98,13 +128,14 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
       } else {
         families.add(family);
       }
-      const prior = byReportedId.get(id.trim().toLowerCase());
+      const entrantKey = JSON.stringify([id.trim().toLowerCase(), arm.configurationSha256]);
+      const prior = byEntrant.get(entrantKey);
       if (prior && prior.participantId !== arm.participantId) {
         failures.push(
-          `PROVIDER_COLLISION: ${prior.participantId} and ${arm.participantId} report the identical model ID "${id}"`,
+          `PROVIDER_COLLISION: ${prior.participantId} and ${arm.participantId} report the identical model ID "${id}" under the identical configuration ${arm.configurationSha256}`,
         );
       } else {
-        byReportedId.set(id.trim().toLowerCase(), arm);
+        byEntrant.set(entrantKey, arm);
       }
     }
     for (const family of families) {
@@ -113,18 +144,6 @@ export function checkProviderCollision(arms: CollisionCheckInput[]): CollisionCh
           `PROVIDER_COLLISION: ${arm.participantId} was requested from ${arm.provider} but responses report the ${family} family (${arm.reportedModelIds.join(', ')})`,
         );
       }
-      const list = byFamily.get(family) ?? [];
-      if (!list.includes(arm)) list.push(arm);
-      byFamily.set(family, list);
-    }
-  }
-
-  for (const [family, members] of byFamily) {
-    if (members.length > 1) {
-      const names = members
-        .map((m) => `${m.participantId} (reported "${m.reportedModelIds.join(', ')}")`)
-        .join(', ');
-      failures.push(`PROVIDER_COLLISION: multiple arms resolve to the ${family} family: ${names}`);
     }
   }
 

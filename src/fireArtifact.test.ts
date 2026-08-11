@@ -80,7 +80,7 @@ function attempt(over: Partial<AttemptRecord> = {}): AttemptRecord {
 
 function armResult(over: Partial<ArmGameResult> = {}): ArmGameResult {
   return {
-    arm: { participantId: 'p1', provider: 'openai', requestedModelId: 'model-1', credentialEnvVar: 'OPENAI_API_KEY' },
+    arm: { participantId: 'p1', provider: 'openai', requestedModelId: 'model-1', credentialEnvVar: 'OPENAI_API_KEY', configuration: {} },
     gameId: 'game-1',
     requestSha256: SHA,
     cutoffAt: '2026-07-16T01:00:00.000Z',
@@ -101,6 +101,7 @@ const ROSTER_ENTRY = {
   provider: 'openai',
   requestedModelId: 'model-1',
   approvedReportedModelIds: ['model-x', 'model-y'],
+  configuration: {},
 };
 
 function digestInput(over: Partial<ArmDigestInputV1> = {}): ArmDigestInputV1 {

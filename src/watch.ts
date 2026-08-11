@@ -5,6 +5,7 @@ import { runBaselines } from './baselines.js';
 import { buildBundle } from './bundle.js';
 import { describeError } from './config.js';
 import { checkProviderCollision } from './providers/family.js';
+import { configurationSha256 } from './participantConfiguration.js';
 import {
   buildRecords,
   failuresByCode,
@@ -695,6 +696,7 @@ export async function fireEligibleGame(
       provider: arm.provider,
       requestedModelId: arm.requestedModelId,
       approvedReportedModelIds: cfg.approvedReportedModelIds(arm.participantId),
+      configurationSha256: configurationSha256(arm.configuration),
       reportedModelIds: reportedByArm.get(arm.participantId) ?? [],
       unidentifiedResponses: unidentifiedByArm.get(arm.participantId) ?? 0,
     })),

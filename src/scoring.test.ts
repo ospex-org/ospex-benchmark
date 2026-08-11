@@ -49,6 +49,7 @@ const FIXTURE_ARMS = [
     provider: 'openai',
     requestedModelId: 'stub-model-1',
     approvedReportedModelIds: ['stub-model-1'],
+    configuration: {},
   },
 ];
 const TIMEOUT_ARM = {
@@ -56,6 +57,7 @@ const TIMEOUT_ARM = {
   provider: 'xai',
   requestedModelId: 'stub-model-2',
   approvedReportedModelIds: ['stub-model-2'],
+  configuration: {},
 };
 const FIXTURE_ARMS_WITH_TIMEOUT = [...FIXTURE_ARMS, TIMEOUT_ARM];
 const SECOND_MODEL_ARM = {
@@ -63,6 +65,7 @@ const SECOND_MODEL_ARM = {
   provider: 'anthropic',
   requestedModelId: 'stub-model-3',
   approvedReportedModelIds: ['stub-model-3'],
+  configuration: {},
 };
 
 /**

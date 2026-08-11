@@ -23,8 +23,8 @@ function validManifest(): Record<string, unknown> {
     marketPolicyDigest: 'aa6f24ddc0758d8366449b0ae4803898079cee1cfdfa36575a67da9751509dcd',
     promptScaffoldSha256: 'a'.repeat(64),
     expectedArmRoster: [
-      { participantId: 'openai-gpt', provider: 'openai', requestedModelId: 'gpt-x', approvedReportedModelIds: ['gpt-x'] },
-      { participantId: 'anthropic-claude', provider: 'anthropic', requestedModelId: 'claude-x', approvedReportedModelIds: ['claude-x'] },
+      { participantId: 'openai-gpt', provider: 'openai', requestedModelId: 'gpt-x', approvedReportedModelIds: ['gpt-x'], configuration: {} },
+      { participantId: 'anthropic-claude', provider: 'anthropic', requestedModelId: 'claude-x', approvedReportedModelIds: ['claude-x'], configuration: {} },
     ],
     toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.2.0',

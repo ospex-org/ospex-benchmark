@@ -48,6 +48,7 @@ import {
 } from './cohortAdapterCapability.js';
 import type { CohortAdapterCapability } from './cohortAdapterCapability.js';
 import { checkProviderCollision } from './providers/family.js';
+import { EMPTY_CONFIGURATION_SHA256 } from './participantConfiguration.js';
 import { ProviderUnfinishedTurnError } from './providers/errors.js';
 import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableDigest } from './modelPriceTable.js';
 import { serializeSpendEscalationSidecar, spendEscalationSidecarSha256 } from './spendEscalationSidecar.js';
@@ -129,6 +130,7 @@ function manifestJson(extra: Record<string, unknown> = {}): string {
       provider: a.provider,
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
+      configuration: a.configuration,
     })),
     toolInferenceConfigSha256: toolInferenceConfigSha256(),
     baselinePolicyVersion: 'baselines-v0.3.0',
@@ -1909,6 +1911,11 @@ test('the fake exercises the mock-blind paths: unapproved model echo FAILS the i
       provider: identity.provider as ProviderName,
       requestedModelId: identity.requestedModelId,
       approvedReportedModelIds: [...identity.approvedReportedModelIds],
+      configuration: {},
+      // The line-open path runs the all-defaults roster: `expectedArmIdentity`
+      // refuses a roster entry that declares a configuration, so every arm
+      // reaching here carries the empty one.
+      configurationSha256: EMPTY_CONFIGURATION_SHA256,
       reportedModelIds: reported,
       unidentifiedResponses: unidentified,
     };
@@ -1919,8 +1926,12 @@ test('the fake exercises the mock-blind paths: unapproved model echo FAILS the i
     'the collided echo is refused fail-closed against the approved list',
   );
   assert.ok(
-    collided.failures.some((f) => /PROVIDER_COLLISION/.test(f)),
-    'two arms resolving to one family is a collision failure',
+    collided.failures.some((f) => /PROVIDER_COLLISION/.test(f) && /identical configuration/.test(f)),
+    'the substituted arm is now indistinguishable from the real one as an entrant',
+  );
+  assert.ok(
+    collided.failures.some((f) => /PROVIDER_COLLISION/.test(f) && /but responses report the/.test(f)),
+    'and its reported family contradicts the provider it was requested from',
   );
 
   // Negative control: the CLEAN fake passes the same fail-closed check outright.
@@ -1933,6 +1944,8 @@ test('the fake exercises the mock-blind paths: unapproved model echo FAILS the i
       provider: identity.provider as ProviderName,
       requestedModelId: identity.requestedModelId,
       approvedReportedModelIds: [...identity.approvedReportedModelIds],
+      configuration: {},
+      configurationSha256: EMPTY_CONFIGURATION_SHA256,
       reportedModelIds: reported,
       unidentifiedResponses: 0,
     };
@@ -2032,6 +2045,7 @@ test('the derived reservation varies exactly with roster and repair cap (per-att
         provider: 'x',
         requestedModelId: 'x',
         approvedReportedModelIds: ['x'],
+        configuration: {},
       }),
       constants: { providerAttemptReservationUsdMicros: perAttempt, maxRepairAttemptsPerArm: maxRepairs },
     }) as unknown as CohortManifestV1;
@@ -2051,6 +2065,7 @@ test('an unknown or amount-mismatched spend policy fails closed before any reque
     provider: 'x',
     requestedModelId: 'x',
     approvedReportedModelIds: ['x'],
+    configuration: {},
   });
   assert.throws(
     () =>

@@ -108,6 +108,11 @@ export function buildRehearsalManifest(now: number, opts: RehearsalManifestOptio
       provider: a.provider,
       requestedModelId: a.requestedModelId,
       approvedReportedModelIds: [...a.approvedReportedModelIds],
+      // The precommitment of what each arm competes under, hashed into
+      // cohortId with everything else here. `manifestValidate` refuses a
+      // manifest whose roster disagrees with the code's, so this cannot
+      // describe a setting the adapters would not send.
+      configuration: a.configuration,
     })),
     // Recomputed from the code's declared tool configuration (tools-v1:
     // provider web search on all four arms), checked by manifestValidate.

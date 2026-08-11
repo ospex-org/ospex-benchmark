@@ -18,6 +18,28 @@ export const TEST_ARM: ArmSpec = {
   provider: 'openai',
   requestedModelId: 'stub-model-1',
   credentialEnvVar: 'STUB_PROVIDER_KEY',
+  configuration: {},
+};
+
+/**
+ * The same stub model entered twice at two settings — the case the whole
+ * per-participant configuration model exists for, and the one that breaks
+ * anything deriving identity from the model rather than from the arm.
+ */
+export const TEST_ARM_LOW: ArmSpec = {
+  participantId: 'stub-openai-low',
+  provider: 'openai',
+  requestedModelId: 'stub-model-1',
+  credentialEnvVar: 'STUB_PROVIDER_KEY',
+  configuration: { reasoning: { effort: 'low' } },
+};
+
+export const TEST_ARM_HIGH: ArmSpec = {
+  participantId: 'stub-openai-high',
+  provider: 'openai',
+  requestedModelId: 'stub-model-1',
+  credentialEnvVar: 'STUB_PROVIDER_KEY',
+  configuration: { reasoning: { effort: 'high' } },
 };
 
 export const TEST_COHORT = 'test-cohort';

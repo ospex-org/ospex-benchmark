@@ -8,6 +8,8 @@
  * all three). Nothing else.
  */
 
+import type { ParticipantConfiguration } from './participantConfiguration.js';
+
 export type MarketKey = 'moneyline' | 'spread' | 'total';
 
 export type ProviderName = 'openai' | 'anthropic' | 'google' | 'xai';
@@ -245,6 +247,18 @@ export interface ArmSpec {
   provider: ProviderName;
   requestedModelId: string;
   credentialEnvVar: string;
+  /**
+   * The provider-native settings this arm competes under, in the lab's own
+   * vocabulary. This is what makes an ARM the unit of competition rather than
+   * a model: one model at two reasoning levels is two arms that differ only
+   * here, and `participantConfiguration.ts` owns the digest that distinguishes
+   * them.
+   *
+   * REQUIRED, and `{}` is a real value meaning "sets no knobs" — not an
+   * absence. An optional field would let two logically identical rosters
+   * canonicalize differently and mint two cohort identities for one cohort.
+   */
+  configuration: ParticipantConfiguration;
 }
 
 /**
@@ -347,6 +361,21 @@ export interface ProviderCallOptions {
    * decision, not a reformatting of the first one.
    */
   tools?: 'declared' | 'none' | undefined;
+  /**
+   * The dispatching arm's declared configuration, merged into the request
+   * body. Passed per CALL rather than held by the adapter deliberately: the
+   * authorized dispatch path binds an arm's identity from the authenticated
+   * roster and never from the adapter it looked up, so the setting an arm
+   * competes under has to arrive by the same route as the identity it is part
+   * of. An adapter holding its own copy would be a second, unchecked source.
+   *
+   * Omitted is treated as `{}`. That default is fail-OPEN — a caller that
+   * forgets sends no knobs and the provider answers anyway — so it is not
+   * relied on: `configurationEvidenceViolations` compares the roster's
+   * declared configuration against what each attempt recorded, and a dropped
+   * configuration makes the run unscoreable rather than quietly cheaper.
+   */
+  configuration?: ParticipantConfiguration | undefined;
 }
 
 export interface ProviderAdapter {

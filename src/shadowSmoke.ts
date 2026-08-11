@@ -13,6 +13,7 @@ import {
 } from './mock.js';
 import { approvedReportedModelIds, ARMS, createRealAdapters } from './providers/index.js';
 import { checkProviderCollision } from './providers/family.js';
+import { configurationSha256 } from './participantConfiguration.js';
 import {
   buildRecords,
   failuresByCode,
@@ -237,6 +238,7 @@ async function main(): Promise<number> {
       provider: arm.provider,
       requestedModelId: arm.requestedModelId,
       approvedReportedModelIds: approvedReportedModelIds(arm.participantId),
+      configurationSha256: configurationSha256(arm.configuration),
       reportedModelIds: reportedByArm.get(arm.participantId) ?? [],
       unidentifiedResponses: unidentifiedByArm.get(arm.participantId) ?? 0,
     })),

@@ -3,6 +3,8 @@ import { postJson } from './http.js';
 import { ProviderUnfinishedTurnError } from './errors.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractResponsesSearchAudit } from './searchAudit.js';
+import { buildRequestPlan } from './requestPlan.js';
+import type { ProviderRequestPlan } from './requestPlan.js';
 import type {
   ChatTurn,
   ProviderAdapter,
@@ -21,11 +23,16 @@ import type {
  * Responses API is also the only surface that reports the EXECUTED search
  * queries (`web_search_call` output items) the audit trail requires.
  *
- * Requests stay minimal beyond the declared tool section: model + input
- * turns + the registry-selected caps — no sampling overrides, so
- * reasoning-model parameter restrictions cannot reject the call.
+ * The cohort's own request stays minimal beyond the declared tool section:
+ * model + input turns + the registry-selected caps, and no sampling
+ * overrides, so reasoning-model parameter restrictions cannot reject a call
+ * the cohort made on its own. An arm's declared configuration is merged on
+ * top of that (`buildRequestPlan`), which is the one way a sampling or
+ * reasoning parameter reaches the wire — deliberately, since it is what makes
+ * the arm a distinct entrant, and add-only, so it can never remove or
+ * override the minimal core above.
  */
-export function createResponsesApiAdapter(config: {
+export interface ResponsesApiConfig {
   provider: ProviderName;
   requestedModelId: string;
   credentialEnvVar: string;
@@ -47,7 +54,45 @@ export function createResponsesApiAdapter(config: {
   toolCapValue: number;
   /** Extra `include` entries (openai: web_search_call.action.sources). */
   include?: readonly string[] | undefined;
-}): ProviderAdapter {
+}
+
+/**
+ * The request this adapter would send, built without sending it. See
+ * `anthropicRequestPlan` for why the builder is exported.
+ */
+export function responsesApiRequestPlan(args: {
+  config: ResponsesApiConfig;
+  turns: ChatTurn[];
+  options?: ProviderCallOptions | undefined;
+}): ProviderRequestPlan {
+  const { config, turns, options } = args;
+  // A repair carries no declared tools, so the tool block, its cap, and the
+  // tool-scoped `include` all drop off the wire together (an `include`
+  // naming a tool that is not declared is not a request this API accepts).
+  const withTools = (options?.tools ?? 'declared') === 'declared';
+  const body: Record<string, unknown> = {
+    model: config.requestedModelId,
+    input: turns.map((t) => ({ role: t.role, content: t.content })),
+  };
+  if (withTools) {
+    body['tools'] = [config.webSearchTool];
+    body[config.toolCapParam] = config.toolCapValue;
+    if (config.include !== undefined && config.include.length > 0) {
+      body['include'] = [...config.include];
+    }
+  }
+  if (options?.maxOutputTokens !== undefined) {
+    body[config.maxTokensParam] = options.maxOutputTokens;
+  }
+  return buildRequestPlan({
+    endpoint: `${config.baseUrl}/responses`,
+    body,
+    configuration: options?.configuration ?? {},
+    promptKeys: ['input'],
+  });
+}
+
+export function createResponsesApiAdapter(config: ResponsesApiConfig): ProviderAdapter {
   return {
     provider: config.provider,
     requestedModelId: config.requestedModelId,
@@ -62,30 +107,13 @@ export function createResponsesApiAdapter(config: {
     ): Promise<ProviderResponse> {
       const apiKey = envValue(config.credentialEnvVar);
       if (apiKey === undefined) throw new Error(`${config.credentialEnvVar} is not set`);
-      const url = `${config.baseUrl}/responses`;
-      // A repair carries no declared tools, so the tool block, its cap, and the
-      // tool-scoped `include` all drop off the wire together (an `include`
-      // naming a tool that is not declared is not a request this API accepts).
-      const withTools = (options?.tools ?? 'declared') === 'declared';
-      const requestBody: Record<string, unknown> = {
-        model: config.requestedModelId,
-        input: turns.map((t) => ({ role: t.role, content: t.content })),
-      };
-      if (withTools) {
-        requestBody['tools'] = [config.webSearchTool];
-        requestBody[config.toolCapParam] = config.toolCapValue;
-        if (config.include !== undefined && config.include.length > 0) {
-          requestBody['include'] = [...config.include];
-        }
-      }
-      if (options?.maxOutputTokens !== undefined) {
-        requestBody[config.maxTokensParam] = options.maxOutputTokens;
-      }
+      const plan = responsesApiRequestPlan({ config, turns, options });
+      const url = plan.endpoint;
       const { status, json: raw } = await postJson({
         provider: config.provider,
         url,
         headers: { authorization: `Bearer ${apiKey}` },
-        body: requestBody,
+        body: plan.body,
         timeoutMs,
       });
       const json = raw as {
@@ -117,22 +145,10 @@ export function createResponsesApiAdapter(config: {
         reasoningTokens: comparable.reasoningTokens,
         billableOutputTokens: comparable.billableOutputTokens,
       };
-      // Recorded params mirror the wire exactly, so the evidence shows whether
-      // this attempt could search at all.
-      const requestParams: Record<string, unknown> = {
-        endpoint: url,
-        model: config.requestedModelId,
-      };
-      if (withTools) {
-        requestParams['tools'] = [config.webSearchTool];
-        requestParams[config.toolCapParam] = config.toolCapValue;
-        if (config.include !== undefined && config.include.length > 0) {
-          requestParams['include'] = [...config.include];
-        }
-      }
-      if (options?.maxOutputTokens !== undefined) {
-        requestParams[config.maxTokensParam] = options.maxOutputTokens;
-      }
+      // Recorded params mirror the wire exactly — they are derived from the
+      // body that was sent — so the evidence shows whether this attempt could
+      // search at all, and under which participant configuration.
+      const requestParams = plan.requestParams;
 
       // Terminal state: the Responses API stamps a root `status`; only
       // `completed` is a finished turn. `incomplete` (e.g. it hit
