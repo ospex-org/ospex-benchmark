@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
 import { test } from 'node:test';
 import { cohortId, parseManifest } from './manifest.js';
+import { MAX_CONFIGURATION_CANONICAL_BYTES } from './participantConfiguration.js';
 
 /**
  * CohortManifestV1 structural-parse tests: a valid fixture round-trips, cohortId
@@ -268,4 +269,84 @@ test('manifest integers must be JS-safe — unsafe magnitudes are rejected (clos
       /invalid cohort manifest/,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// Participant configuration
+// ---------------------------------------------------------------------------
+
+function rosterArm(over: Record<string, unknown>): Record<string, unknown> {
+  const raw = validManifest() as Record<string, unknown>;
+  const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  roster[0] = { ...roster[0]!, ...over };
+  return { ...raw, expectedArmRoster: roster };
+}
+
+test('a roster arm that OMITS its configuration is rejected', () => {
+  // This manifest exists to precommit, and an omission is not a precommitment.
+  // Defaulting the field would read a forgotten line as "this arm sets no
+  // knobs" — a claim nobody made, published to public Git and hashed into the
+  // cohort identity.
+  const omitted = validManifest() as Record<string, unknown>;
+  const roster = [...(omitted['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  const { configuration: _dropped, ...withoutConfiguration } = roster[0]!;
+  roster[0] = withoutConfiguration;
+  assert.throws(
+    () => parseManifest({ ...omitted, expectedArmRoster: roster }),
+    /expectedArmRoster\.0\.configuration/,
+  );
+});
+
+test('an explicit empty configuration is accepted, and IS the value', () => {
+  // The negative control for the test above: `{}` is not an absence.
+  const parsed = parseManifest(rosterArm({ configuration: {} }));
+  assert.deepEqual(parsed.expectedArmRoster[0]?.configuration, {});
+});
+
+test('a configuration changes cohortId — a methodology change mints a new cohort', () => {
+  const base = cohortId(parseManifest(rosterArm({ configuration: {} })));
+  const tuned = cohortId(parseManifest(rosterArm({ configuration: { reasoning: { effort: 'high' } } })));
+  assert.notEqual(base, tuned);
+  // ...and nothing else about the manifest moved.
+  assert.equal(base, cohortId(parseManifest(rosterArm({ configuration: {} }))));
+});
+
+test('the configuration value space is enforced at PARSE, before cohortId can hash it', () => {
+  // `canonicalize` throws on a non-finite number, and `cohortId` re-parses
+  // defensively before hashing — so a value that reached the hash would be a
+  // crash at boot from a stack that does not name the field.
+  assert.throws(() => parseManifest(rosterArm({ configuration: { a: Number.POSITIVE_INFINITY } })));
+  assert.throws(() => parseManifest(rosterArm({ configuration: { a: Number.NaN } })));
+  assert.throws(() => parseManifest(rosterArm({ configuration: 'not-an-object' })));
+  assert.throws(() => parseManifest(rosterArm({ configuration: [] })));
+});
+
+test('an oversized configuration is refused at parse, in bytes', () => {
+  // Refused here rather than at publication: a roster that cannot be written
+  // is a night of provider spend producing an unpublishable artifact, and the
+  // roster is known before the first call.
+  const tooBig = { k: 'x'.repeat(MAX_CONFIGURATION_CANONICAL_BYTES) };
+  assert.throws(() => parseManifest(rosterArm({ configuration: tooBig })), /canonical bytes, over the/);
+});
+
+test('a __proto__ key in a configuration pollutes nothing, and is DROPPED by parsing', () => {
+  // Measured, because the first version of this test guessed wrong and asserted
+  // a refusal. Zod's record parse silently drops an own `__proto__` key rather
+  // than assigning through it: nothing is polluted, the parsed prototype stays
+  // clean, and the key is simply gone. `configurationViolations` never sees it,
+  // which is why its own `__proto__` guard is tested against `applyConfiguration`
+  // instead — that path takes a code-supplied ArmSpec and never goes through zod.
+  //
+  // The consequence worth knowing: for this one key the manifest's declared TEXT
+  // and its parsed VALUE differ, and `cohortId` hashes the parsed value. That
+  // stays self-consistent end to end — publication compares raw bytes AND a
+  // recomputed cohortId, both sides parse it away, and the artifact stamps the
+  // parsed configuration — so it is a curiosity rather than a hazard.
+  const hostile = JSON.parse('{"__proto__": {"polluted": true}}') as Record<string, unknown>;
+  const parsed = parseManifest(rosterArm({ configuration: hostile }));
+  const configuration = parsed.expectedArmRoster[0]?.configuration ?? {};
+  assert.deepEqual(Object.getOwnPropertyNames(configuration), []);
+  assert.equal(Object.getPrototypeOf(configuration), Object.prototype);
+  assert.equal(({} as Record<string, unknown>)['polluted'], undefined);
+  assert.equal((configuration as Record<string, unknown>)['polluted'], undefined);
 });

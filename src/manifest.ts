@@ -71,9 +71,19 @@ const expectedArmSchema = z
     requestedModelId: z.string().min(1),
     approvedReportedModelIds: z.array(z.string().min(1)).min(1),
     /**
-     * REQUIRED, with `{}` the real "this arm sets no knobs" value. Optional
-     * would let an omitted field and an explicit `{}` canonicalize to
-     * different bytes and mint two cohort identities for one cohort.
+     * REQUIRED, with `{}` the real "this arm sets no knobs" value.
+     *
+     * Two reasons, and the first is narrower than it first appears. A bare
+     * `.optional()` does split cohort identity — measured: an omitted field
+     * canonicalizes to `{"a":1}` where an explicit `{}` gives `{"a":1,"c":{}}`,
+     * so one cohort would mint two ids. But `.optional().default({})` does NOT,
+     * because `cohortId` hashes the PARSED output and the default lands in it.
+     *
+     * The reason that covers both forms is the second one: this document exists
+     * to precommit, and an omission is not a precommitment. A manifest that
+     * simply forgot the field would be read as declaring "this arm sets no
+     * knobs" — a claim nobody made, published, and hashed into the cohort
+     * identity. Silence is refused instead.
      */
     configuration: participantConfigurationSchema,
   })

@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { configurationSha256 } from './participantConfiguration.js';
+import type { ParticipantConfiguration } from './participantConfiguration.js';
 import { CLOSE_QUALITY_REASONS } from './clv.js';
 import { buildScorecardMarkdown } from './scorecard.js';
 import type { BaselinePolicyVersion } from './baselines.js';
@@ -3724,5 +3725,75 @@ test('an attempt that never reached the provider is not evidence either way', ()
   assert.ok(
     !violations.some((v) => /declared configuration/.test(v)),
     `a null request record carries no evidence: ${JSON.stringify(violations)}`,
+  );
+});
+
+/**
+ * A run whose SECOND arm reports the FIRST arm's model — one model entered
+ * twice. Which of the two it is, a legitimate pair of entrants or the same
+ * competitor counted twice, is decided entirely by their configurations.
+ *
+ * Built by rewriting the two-arm fixture rather than by adding a fixture
+ * option, because the only thing that has to change is the reported id.
+ */
+function sameModelRun(configurations: [ParticipantConfiguration, ParticipantConfiguration]): {
+  lines: string[];
+  expectedArms: ExpectedArm[];
+} {
+  const records = fixtureRun({ secondModelArm: true }).lines.map(
+    (line) => JSON.parse(line) as JsonRecordish,
+  );
+  for (const record of records) {
+    if (record['recordType'] !== 'arm_game_response') continue;
+    if (record['participantId'] !== 'model-arm-2') continue;
+    record['reportedModelId'] = 'stub-model-1';
+    for (const leg of ['attempt', 'repair']) {
+      const attempt = record[leg] as JsonRecordish | null | undefined;
+      if (attempt === null || attempt === undefined) continue;
+      if (attempt['reportedModelId'] !== null) attempt['reportedModelId'] = 'stub-model-1';
+    }
+  }
+  const [first, second] = configurations;
+  return {
+    lines: records.map((record) => JSON.stringify(record)),
+    expectedArms: [
+      { ...FIXTURE_ARMS[0]!, configuration: first },
+      {
+        ...SECOND_MODEL_ARM,
+        requestedModelId: 'stub-model-1',
+        approvedReportedModelIds: ['stub-model-1'],
+        configuration: second,
+      },
+    ],
+  };
+}
+
+test('two arms of one model at DIFFERENT configurations pass the recomputed identity gate', () => {
+  const { lines, expectedArms } = sameModelRun([
+    { reasoning: { effort: 'low' } },
+    { reasoning: { effort: 'high' } },
+  ]);
+  const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms });
+  assert.deepEqual(
+    violations.filter((v) => /recomputed identity gate/.test(v)),
+    [],
+    `two settings of one model are two entrants: ${JSON.stringify(violations)}`,
+  );
+});
+
+test('two arms of one model at the SAME configuration fail the recomputed identity gate', () => {
+  // The negative control, and the reason the pair exists: without it, a scorer
+  // that passed an empty digest for every arm — collapsing both entrants onto
+  // one key — would satisfy the test above by never distinguishing anything.
+  const shared = { reasoning: { effort: 'low' } };
+  const { lines, expectedArms } = sameModelRun([shared, shared]);
+  const violations = verifyRunIntegrity(parseRunRecords(lines), { expectedArms });
+  assert.ok(
+    violations.some(
+      (v) =>
+        /recomputed identity gate/.test(v) &&
+        /identical model ID "stub-model-1" under the identical configuration/.test(v),
+    ),
+    `one competitor entered twice must be refused: ${JSON.stringify(violations)}`,
   );
 });

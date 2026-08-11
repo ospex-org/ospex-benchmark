@@ -136,17 +136,29 @@ test('__proto__ is refused as a key', () => {
 });
 
 test('the size ceiling is in BYTES, not characters', () => {
-  // The defect this pins: a bound written with `length` passes a multibyte
-  // value that is well over the byte limit. Each of these is 3 bytes in UTF-8
+  // The defect this pins: a bound written with `.length` accepts a multibyte
+  // value well over the byte limit. Each character here is 3 bytes in UTF-8
   // and 1 JavaScript character.
-  const multibyte = '一'.repeat(MAX_CONFIGURATION_CANONICAL_BYTES);
+  //
+  // The COUNT is what makes this discriminating, and the first version of this
+  // test got it wrong: at `repeat(512)` the canonical form is 520 characters
+  // and 1544 bytes, so a character-counting bound refuses it too and the test
+  // passes either way. A mutation battery caught that. 300 characters is
+  // inside the ceiling by every character measure (308) and far outside it by
+  // every byte measure (908), so ONLY a byte-counting bound refuses it.
+  const multibyte = '一'.repeat(300);
+  const canonical = canonicalize({ k: multibyte });
+  assert.ok(
+    canonical.length <= MAX_CONFIGURATION_CANONICAL_BYTES,
+    `the fixture must be ACCEPTED by a character count (${canonical.length}), or it does not discriminate`,
+  );
+  assert.ok(
+    Buffer.byteLength(canonical, 'utf8') > MAX_CONFIGURATION_CANONICAL_BYTES,
+    'and refused by a byte count',
+  );
   const violations = configurationViolations({ k: multibyte });
   assert.equal(violations.length, 1);
   assert.match(violations[0] ?? '', /canonical bytes, over the/);
-  assert.ok(
-    JSON.stringify({ k: multibyte }).length < Buffer.byteLength(JSON.stringify({ k: multibyte })),
-    'the fixture must actually be multibyte, or it does not discriminate',
-  );
 });
 
 test('the size ceiling is exact at the boundary', () => {
