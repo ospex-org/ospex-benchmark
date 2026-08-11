@@ -8,6 +8,7 @@ import { instantMs, isParseableInstant } from './time.js';
 import { checkProviderCollision } from './providers/family.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
+  CONFIGURATION_DIGEST_VERSION,
   configurationEvidenceViolations,
   configurationSha256,
 } from './participantConfiguration.js';
@@ -104,6 +105,25 @@ const watchProvenanceSchema = z
   })
   .passthrough();
 
+/**
+ * One entry of the run's arm-roster stamp: who competed and under what.
+ *
+ * `.strict()`, unlike almost everything else parsed here, because this is the
+ * record that says who a decision belongs to. A key nobody planned for is a
+ * dimension of identity nothing verified, and the whole value of the digest is
+ * that it can be recomputed from the fields beside it.
+ */
+const armRosterEntrySchema = z
+  .object({
+    participantId: z.string().min(1),
+    provider: z.string().min(1),
+    requestedModelId: z.string().min(1),
+    configuration: z.record(z.unknown()),
+    configurationSha256: z.string().regex(/^[0-9a-f]{64}$/),
+    configurationDigestVersion: z.number().int().positive(),
+  })
+  .strict();
+
 const runMetaSchema = z
   .object({
     recordType: z.literal('run_meta'),
@@ -121,6 +141,12 @@ const runMetaSchema = z
     baselinePolicyVersion: z.string().min(1).optional(),
     promptScaffoldVersion: z.string().min(1).optional(),
     watch: watchProvenanceSchema.optional(),
+    // The run's own account of who competed and under what. OPTIONAL because
+    // every artifact written before this stamp existed is still scoreable —
+    // those runs were all-defaults by construction, since no configuration
+    // could be declared. When present it is VERIFIED, never trusted: see
+    // verifyRunIntegrity.
+    armRoster: z.array(armRosterEntrySchema).min(1).optional(),
   })
   .passthrough();
 
@@ -225,6 +251,9 @@ const armResponseSchema = z
     participantId: z.string().min(1),
     provider: z.string().min(1),
     requestedModelId: z.string().min(1),
+    // Binds this row to an entry of the run's arm-roster stamp. Optional on an
+    // archive written before the stamp existed.
+    configurationSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
     reportedModelId: z.string().nullable(),
     gameId: z.string().min(1),
     requestSha256: z.string().min(1),
@@ -386,6 +415,8 @@ export interface ArmResponseRef {
   /** The archived repair transport outcome; `null` when absent (old archives). */
   repairTransport: string | null;
   requestedModelId: string;
+  /** Binds this row to the run's arm-roster stamp; `null` on an old archive. */
+  configurationSha256: string | null;
   reportedModelId: string | null;
   gameId: string;
   requestSha256: string;
@@ -402,6 +433,8 @@ export interface ArmResponseRef {
     rawResponse: string | null;
   };
 }
+
+export type ArmRosterEntry = z.infer<typeof armRosterEntrySchema>;
 
 export interface SourceRun {
   runId: string;
@@ -423,6 +456,12 @@ export interface SourceRun {
   promptScaffoldVersion: string | null;
   /** Watch-mode gate provenance; required (and verified) for watch runs. */
   watch: WatchProvenanceMeta | null;
+  /**
+   * The run's arm-roster stamp: who competed and under what. `null` on an
+   * archive written before the stamp existed — those runs were all-defaults by
+   * construction, because no configuration could be declared.
+   */
+  armRoster: ArmRosterEntry[] | null;
   games: Map<string, SourceGame>;
   picks: SourcePick[];
   armResponses: ArmResponseRef[];
@@ -523,6 +562,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
           provider: response.provider,
           repairTransport: response.repairTransport ?? null,
           requestedModelId: response.requestedModelId,
+          configurationSha256: response.configurationSha256 ?? null,
           reportedModelId: response.reportedModelId,
           gameId: response.gameId,
           requestSha256: response.requestSha256,
@@ -666,6 +706,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
     baselinePolicyVersion: meta.baselinePolicyVersion ?? null,
     promptScaffoldVersion: meta.promptScaffoldVersion ?? null,
     watch: meta.watch ?? null,
+    armRoster: meta.armRoster ?? null,
     games,
     picks,
     armResponses,
@@ -1530,6 +1571,79 @@ export function verifyRunIntegrity(
   );
   for (const failure of recomputedIdentity.failures) {
     violations.push(`recomputed identity gate: ${failure}`);
+  }
+
+  // The run's ARM-ROSTER STAMP, verified rather than read.
+  //
+  // Three separate things, because a stamp is only evidence to the extent that
+  // it can disagree with something:
+  //   1. each entry's digest RECOMPUTES from the configuration beside it, so an
+  //      artifact edited after the fact does not describe itself;
+  //   2. the stamp matches the PRECOMMITTED roster, participant for participant
+  //      and digest for digest — the run's own account of what it ran is not
+  //      evidence about itself;
+  //   3. every arm response's digest names the entry for its own participant,
+  //      so a row cannot be attributed to a setting the arm did not compete at.
+  //
+  // Absent on an archive that predates the stamp, which is not a violation:
+  // those runs were all-defaults by construction. What IS a violation is a
+  // stamp that is present and wrong.
+  if (run.armRoster !== null) {
+    const stamped = new Map<string, ArmRosterEntry>();
+    for (const entry of run.armRoster) {
+      if (stamped.has(entry.participantId)) {
+        violations.push(`arm roster stamps ${entry.participantId} more than once`);
+        continue;
+      }
+      stamped.set(entry.participantId, entry);
+      if (entry.configurationDigestVersion !== CONFIGURATION_DIGEST_VERSION) {
+        violations.push(
+          `arm roster ${entry.participantId}: configuration digest version ${entry.configurationDigestVersion} is not ${CONFIGURATION_DIGEST_VERSION}`,
+        );
+        // A digest under a rule this build does not implement cannot be
+        // recomputed, so do not report a mismatch it could not avoid.
+        continue;
+      }
+      const recomputed = configurationSha256(entry.configuration as ParticipantConfiguration);
+      if (recomputed !== entry.configurationSha256) {
+        violations.push(
+          `arm roster ${entry.participantId}: stamped configuration digest ${entry.configurationSha256} does not recompute (${recomputed})`,
+        );
+      }
+    }
+    for (const arm of expectedArms) {
+      const entry = stamped.get(arm.participantId);
+      if (entry === undefined) {
+        violations.push(`arm roster omits expected arm ${arm.participantId}`);
+        continue;
+      }
+      const expectedDigest = configurationSha256(arm.configuration);
+      if (entry.configurationSha256 !== expectedDigest) {
+        violations.push(
+          `arm roster ${arm.participantId}: ran configuration ${entry.configurationSha256}, precommitted ${expectedDigest}`,
+        );
+      }
+    }
+    for (const participantId of stamped.keys()) {
+      if (!expectedArms.some((arm) => arm.participantId === participantId)) {
+        violations.push(`arm roster stamps ${participantId}, which is not an expected arm`);
+      }
+    }
+    for (const response of run.armResponses) {
+      const entry = stamped.get(response.participantId);
+      if (entry === undefined) continue; // already reported above
+      if (response.configurationSha256 === null) {
+        violations.push(
+          `${response.participantId}:${response.gameId}: the run stamps an arm roster but this response carries no configuration digest`,
+        );
+        continue;
+      }
+      if (response.configurationSha256 !== entry.configurationSha256) {
+        violations.push(
+          `${response.participantId}:${response.gameId}: response configuration ${response.configurationSha256} is not this arm's ${entry.configurationSha256}`,
+        );
+      }
+    }
   }
 
   // DECLARED configuration versus what each attempt recorded sending.

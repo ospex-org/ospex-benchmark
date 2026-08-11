@@ -5,6 +5,12 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
+import {
+  CONFIGURATION_DIGEST_VERSION,
+  configurationSha256,
+  EMPTY_CONFIGURATION_SHA256,
+} from './participantConfiguration.js';
+import type { ParticipantConfiguration } from './participantConfiguration.js';
 import { runSlate } from './runner.js';
 import {
   buildRecords,
@@ -20,11 +26,13 @@ import type { RunContext } from './records.js';
 import type { RunEnvelope } from './runner.js';
 import type {
   ArmGameResult,
+  ArmSpec,
   AttemptRecord,
   BenchmarkResponse,
   ChatTurn,
   GameBundle,
   ProviderAdapter,
+  ProviderCallOptions,
   ProviderResponse,
 } from './types.js';
 
@@ -477,4 +485,130 @@ test('decision records carry the v2 analysis fields and the accepted attempt sea
   const armResponse = records.find((r) => r['recordType'] === 'arm_game_response');
   assert.ok(armResponse);
   assert.deepEqual((armResponse['attempt'] as Record<string, unknown>)['searchAudit'], audit);
+});
+
+// ---------------------------------------------------------------------------
+// The arm-roster stamp
+// ---------------------------------------------------------------------------
+
+const CONFIGURED_ARM: ArmSpec = { ...TEST_ARM, configuration: { reasoning: { effort: 'high' } } };
+
+/**
+ * Dispatches an arm that declares a real configuration, and CAPTURES the call
+ * options the runner passed. Capturing is the point: asserting against a value
+ * the test itself handed in would only prove the code copies.
+ */
+async function envFromConfigured(
+  build: BuildResult,
+  ctx: RunContext,
+  handlers: ChatHandler[],
+): Promise<{ env: RunEnvelope; sent: Array<ProviderCallOptions | undefined> }> {
+  const sent: Array<ProviderCallOptions | undefined> = [];
+  let index = 0;
+  const adapter: ProviderAdapter = {
+    provider: CONFIGURED_ARM.provider,
+    requestedModelId: CONFIGURED_ARM.requestedModelId,
+    credentialEnvVar: CONFIGURED_ARM.credentialEnvVar,
+    hasCredential: () => true,
+    async chat(_turns: ChatTurn[], _timeoutMs: number, options?: ProviderCallOptions) {
+      sent.push(options);
+      const handler = handlers[index];
+      index += 1;
+      if (!handler) throw new Error('stub adapter: no handler for this call');
+      return handler();
+    },
+  };
+  const env = await runSlate(
+    [CONFIGURED_ARM],
+    new Map([[CONFIGURED_ARM.participantId, adapter]]),
+    build.requests,
+    {
+      cohortId: ctx.cohortId,
+      timeoutMs: ctx.timeoutMs,
+      maxOutputTokens: ctx.maxOutputTokens,
+      executionPolicy: ctx.executionPolicy,
+      nowMs: () => CUTOFF_MS - 60_000,
+    },
+  );
+  return { env, sent };
+}
+
+test('run_meta stamps the arm roster, and every arm row carries its digest', async () => {
+  const request = makeRequest();
+  const build = buildFrom(request);
+  const ctx = makeCtx();
+  const env = await envFrom(build, ctx, [
+    () => stubResponse(JSON.stringify(makeValidResponse(request))),
+  ]);
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
+
+  const runMeta = records.find((r) => r['recordType'] === 'run_meta')!;
+  const roster = runMeta['armRoster'] as Array<Record<string, unknown>>;
+  assert.deepEqual(
+    roster.map((entry) => entry['participantId']),
+    [...env.expectedArms],
+    'the stamp is the dispatched roster, in its order',
+  );
+
+  for (const entry of roster) {
+    // The digest must RECOMPUTE from the configuration beside it -- the exact
+    // property the scorer re-checks. Asserting a literal would also pass on a
+    // build that stamped a constant.
+    assert.equal(
+      entry['configurationSha256'],
+      configurationSha256(entry['configuration'] as ParticipantConfiguration),
+    );
+    assert.equal(entry['configurationDigestVersion'], CONFIGURATION_DIGEST_VERSION);
+    assert.deepEqual(Object.keys(entry).sort(), [
+      'configuration',
+      'configurationDigestVersion',
+      'configurationSha256',
+      'participantId',
+      'provider',
+      'requestedModelId',
+    ]);
+  }
+
+  const digestByArm = new Map(roster.map((e) => [e['participantId'], e['configurationSha256']]));
+  const armRows = records.filter((r) => r['recordType'] === 'arm_game_response');
+  assert.ok(armRows.length > 0);
+  for (const row of armRows) {
+    assert.equal(row['configurationSha256'], digestByArm.get(row['participantId']));
+  }
+  const decisions = records.filter((r) => r['recordType'] === 'decision');
+  assert.ok(decisions.length > 0);
+  for (const decision of decisions) {
+    assert.equal(decision['configurationSha256'], digestByArm.get(decision['participantId']));
+  }
+});
+
+test('the stamp carries the configuration the arm ran, and the runner sent it', async () => {
+  // The discriminating case. The default fixture arm declares `{}`, so a build
+  // that stamped a hardcoded empty configuration -- or dropped the field
+  // entirely -- would pass the test above. This one declares a real setting,
+  // so only the true value satisfies it.
+  const request = makeRequest();
+  const build = buildFrom(request);
+  const ctx = makeCtx();
+  const { env, sent } = await envFromConfigured(build, ctx, [
+    () => stubResponse(JSON.stringify(makeValidResponse(request, CONFIGURED_ARM))),
+  ]);
+  const records = buildRecords(env, ctx, build, { failures: [], warnings: [] });
+  const runMeta = records.find((r) => r['recordType'] === 'run_meta')!;
+  const entry = (runMeta['armRoster'] as Array<Record<string, unknown>>)[0]!;
+
+  assert.deepEqual(entry['configuration'], { reasoning: { effort: 'high' } });
+  assert.equal(entry['configurationSha256'], configurationSha256({ reasoning: { effort: 'high' } }));
+  assert.notEqual(entry['configurationSha256'], EMPTY_CONFIGURATION_SHA256);
+
+  // And it reached the adapter. Captured from the call the runner made, not
+  // read back from the value this test supplied.
+  assert.ok(sent.length > 0, 'the arm was dispatched');
+  for (const options of sent) {
+    assert.deepEqual(
+      options?.configuration,
+      { reasoning: { effort: 'high' } },
+      'every leg carries the entrant configuration',
+    );
+  }
 });

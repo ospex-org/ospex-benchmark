@@ -5,9 +5,11 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { BASELINE_POLICY_VERSION, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
+import { configurationSha256 } from './participantConfiguration.js';
 import { CLOSE_QUALITY_REASONS } from './clv.js';
 import { buildScorecardMarkdown } from './scorecard.js';
 import type { BaselinePolicyVersion } from './baselines.js';
+import type { ExpectedArm } from './scoring.js';
 import {
   aggregateByParticipant,
   closeQuoteFromRow,
@@ -3520,4 +3522,207 @@ test('B1 NEGATIVE CONTROL: with an untagged scoreable pick the CLI prints NO not
     else process.env['SUPABASE_ANON_KEY'] = priorKey;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// The arm-roster stamp
+// ---------------------------------------------------------------------------
+
+/**
+ * A NON-EMPTY configuration on purpose. An all-defaults roster cannot
+ * discriminate here: every digest would be the empty one, so a build that
+ * dropped the configuration entirely would produce the same bytes as a build
+ * that carried it, and every assertion below would stay green.
+ */
+const STAMP_CONFIG = { reasoning: { effort: 'high' } };
+const STAMP_DIGEST = configurationSha256(STAMP_CONFIG);
+const STAMP_ARMS: ExpectedArm[] = [{ ...FIXTURE_ARMS[0]!, configuration: STAMP_CONFIG }];
+
+type JsonRecordish = Record<string, unknown>;
+
+/** The default fixture, upgraded to a run that stamps its arm roster. */
+function stampedRun(mutate?: (records: JsonRecordish[]) => void): string[] {
+  const records = fixtureRun().lines.map((line) => JSON.parse(line) as JsonRecordish);
+  for (const record of records) {
+    if (record['recordType'] === 'run_meta') {
+      record['armRoster'] = [
+        {
+          participantId: 'model-arm',
+          provider: 'openai',
+          requestedModelId: 'stub-model-1',
+          configuration: STAMP_CONFIG,
+          configurationSha256: STAMP_DIGEST,
+          configurationDigestVersion: 1,
+        },
+      ];
+    }
+    if (record['recordType'] === 'arm_game_response') {
+      record['configurationSha256'] = STAMP_DIGEST;
+      for (const leg of ['attempt', 'repair']) {
+        const attempt = record[leg] as JsonRecordish | null | undefined;
+        if (attempt === null || attempt === undefined) continue;
+        attempt['requestParams'] = { endpoint: 'e', model: 'stub-model-1', reasoning: { effort: 'high' } };
+      }
+    }
+  }
+  mutate?.(records);
+  return records.map((record) => JSON.stringify(record));
+}
+
+function rosterEntry(records: JsonRecordish[]): JsonRecordish {
+  const meta = records.find((r) => r['recordType'] === 'run_meta')!;
+  return (meta['armRoster'] as JsonRecordish[])[0]!;
+}
+
+function stampViolations(mutate?: (records: JsonRecordish[]) => void): string[] {
+  return verifyRunIntegrity(parseRunRecords(stampedRun(mutate)), { expectedArms: STAMP_ARMS });
+}
+
+test('a correctly stamped run verifies', () => {
+  assert.deepEqual(stampViolations(), []);
+});
+
+test('an unstamped run still verifies - the stamp postdates the archives', () => {
+  // The negative control for every case below: absence is legacy, not a fault.
+  // Without this, a build that refused every stamp would pass them all.
+  assert.deepEqual(
+    verifyRunIntegrity(parseRunRecords(fixtureRun().lines), { expectedArms: FIXTURE_ARMS }),
+    [],
+  );
+});
+
+test('a stamped digest that does not recompute is refused', () => {
+  const violations = stampViolations((records) => {
+    rosterEntry(records)['configuration'] = { reasoning: { effort: 'low' } };
+  });
+  assert.ok(
+    violations.some((v) => /stamped configuration digest .* does not recompute/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a stamp that disagrees with the precommitted roster is refused', () => {
+  // Both halves stay self-consistent, so ONLY the comparison against the
+  // precommitted roster can catch this - a run cannot vouch for its own
+  // distinctness.
+  const other = { reasoning: { effort: 'low' } };
+  const violations = stampViolations((records) => {
+    const entry = rosterEntry(records);
+    entry['configuration'] = other;
+    entry['configurationSha256'] = configurationSha256(other);
+    for (const record of records) {
+      if (record['recordType'] === 'arm_game_response') {
+        record['configurationSha256'] = configurationSha256(other);
+      }
+      if (record['recordType'] !== 'arm_game_response') continue;
+      for (const leg of ['attempt', 'repair']) {
+        const attempt = record[leg] as JsonRecordish | null | undefined;
+        if (attempt === null || attempt === undefined) continue;
+        attempt['requestParams'] = { endpoint: 'e', reasoning: { effort: 'low' } };
+      }
+    }
+  });
+  assert.ok(
+    violations.some((v) => /ran configuration .* precommitted /.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a stamp missing an expected arm is refused', () => {
+  const violations = stampViolations((records) => {
+    const entry = rosterEntry(records);
+    const meta = records.find((r) => r['recordType'] === 'run_meta')!;
+    meta['armRoster'] = [{ ...entry, participantId: 'someone-else' }];
+  });
+  assert.ok(
+    violations.some((v) => /arm roster omits expected arm model-arm/.test(v)),
+    JSON.stringify(violations),
+  );
+  assert.ok(violations.some((v) => /stamps someone-else, which is not an expected arm/.test(v)));
+});
+
+test('a stamp naming one arm twice is refused', () => {
+  const violations = stampViolations((records) => {
+    const entry = rosterEntry(records);
+    const meta = records.find((r) => r['recordType'] === 'run_meta')!;
+    meta['armRoster'] = [entry, { ...entry }];
+  });
+  assert.ok(
+    violations.some((v) => /stamps model-arm more than once/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a digest version this build cannot recompute is refused, and not double-reported', () => {
+  const violations = stampViolations((records) => {
+    rosterEntry(records)['configurationDigestVersion'] = 99;
+  });
+  assert.ok(violations.some((v) => /digest version 99 is not 1/.test(v)), JSON.stringify(violations));
+  assert.ok(
+    !violations.some((v) => /does not recompute/.test(v)),
+    'a digest under an unknown rule must not also be reported as failing to recompute',
+  );
+});
+
+test('a response attributed to a configuration the arm did not run is refused', () => {
+  const violations = stampViolations((records) => {
+    const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+    response['configurationSha256'] = 'f'.repeat(64);
+  });
+  assert.ok(violations.some((v) => /is not this arm/.test(v)), JSON.stringify(violations));
+});
+
+test('a stamped run whose responses carry no digest is refused', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] === 'arm_game_response') delete record['configurationSha256'];
+    }
+  });
+  assert.ok(
+    violations.some((v) =>
+      /stamps an arm roster but this response carries no configuration digest/.test(v),
+    ),
+    JSON.stringify(violations),
+  );
+});
+
+test('an attempt that did not send the declared configuration is refused', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] !== 'arm_game_response') continue;
+      const attempt = record['attempt'] as JsonRecordish;
+      attempt['requestParams'] = { endpoint: 'e', model: 'stub-model-1' };
+    }
+  });
+  assert.ok(
+    violations.some((v) => /"reasoning\.effort" is absent from the recorded request parameters/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('an attempt that sent a DIFFERENT configuration is refused', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] !== 'arm_game_response') continue;
+      const attempt = record['attempt'] as JsonRecordish;
+      attempt['requestParams'] = { endpoint: 'e', reasoning: { effort: 'low' } };
+    }
+  });
+  assert.ok(
+    violations.some((v) => /was recorded as "low", not "high"/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('an attempt that never reached the provider is not evidence either way', () => {
+  const violations = stampViolations((records) => {
+    for (const record of records) {
+      if (record['recordType'] !== 'arm_game_response') continue;
+      (record['attempt'] as JsonRecordish)['requestParams'] = null;
+    }
+  });
+  assert.ok(
+    !violations.some((v) => /declared configuration/.test(v)),
+    `a null request record carries no evidence: ${JSON.stringify(violations)}`,
+  );
 });

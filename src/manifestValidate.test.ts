@@ -334,3 +334,106 @@ test('toolInferenceConfigSha256 mismatch is flagged — the declared tool config
   const v = validateManifestAgainstCode(parse({ ...codeConsistentRaw(), toolInferenceConfigSha256: 'd'.repeat(64) }));
   assert.ok(v.some((s) => /toolInferenceConfigSha256 mismatch/.test(s)), v.join('; '));
 });
+
+// ---------------------------------------------------------------------------
+// Participant configuration
+// ---------------------------------------------------------------------------
+
+/** A manifest whose FIRST roster arm declares `configuration`, everything else intact. */
+function withFirstArmConfiguration(configuration: Record<string, unknown>): ReturnType<typeof parseManifest> {
+  const raw = codeConsistentRaw();
+  const roster = [...(raw['expectedArmRoster'] as Array<Record<string, unknown>>)];
+  roster[0] = { ...roster[0]!, configuration };
+  return parse({ ...raw, expectedArmRoster: roster });
+}
+
+test('a roster configuration that disagrees with the code is flagged, by digest', () => {
+  const violations = validateManifestAgainstCode(
+    withFirstArmConfiguration({ reasoning: { effort: 'high' } }),
+  );
+  assert.ok(
+    violations.some((v) => /configuration [0-9a-f]{64} != code [0-9a-f]{64}/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('the code-consistent roster passes the configuration check', () => {
+  // The negative control: without it, a build that flagged EVERY configuration
+  // would satisfy the test above.
+  assert.ok(!validateManifestAgainstCode(parse(codeConsistentRaw())).some((v) => /configuration/.test(v)));
+});
+
+test('a configuration that could not be merged into the request is flagged', () => {
+  // `max_output_tokens` is the cohort's own output cap on the Responses API,
+  // and the first code arm is an openai arm. A manifest declaring it would
+  // move spend past what a fire reserved, so it is refused at boot rather than
+  // thrown mid-fire with provider calls already committed.
+  const violations = validateManifestAgainstCode(
+    withFirstArmConfiguration({ max_output_tokens: 999_999 }),
+  );
+  assert.ok(
+    violations.some((v) => /configuration cannot be merged into the initial leg/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('a configuration colliding on ONE leg only is still flagged', () => {
+  // The reason the legs are enumerated rather than sampled: a repair carries
+  // no tool block, so this collides on the initial leg and not on the repair.
+  // A check that looked only at the repair would pass it.
+  const violations = validateManifestAgainstCode(withFirstArmConfiguration({ tools: [] }));
+  assert.ok(
+    violations.some((v) => /cannot be merged into the initial leg/.test(v)),
+    JSON.stringify(violations),
+  );
+  assert.ok(!violations.some((v) => /cannot be merged into the repair leg/.test(v)));
+});
+
+test('an additive configuration is NOT flagged as unmergeable', () => {
+  // The positive control for the two tests above. If adding were refused too,
+  // both would still pass and the feature would be unusable.
+  const violations = validateManifestAgainstCode(
+    withFirstArmConfiguration({ reasoning: { effort: 'high' } }),
+  );
+  assert.ok(
+    !violations.some((v) => /cannot be merged/.test(v)),
+    `an added key must merge cleanly: ${JSON.stringify(violations)}`,
+  );
+});
+
+test('a configuration carrying a live credential is refused - the manifest is published', () => {
+  const priorKey = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = 'sk-synthetic-value-generated-for-this-test-only';
+  try {
+    const violations = validateManifestAgainstCode(
+      withFirstArmConfiguration({ note: process.env['OPENAI_API_KEY'] }),
+    );
+    assert.ok(
+      violations.some((v) => /contains a value matching a credential in this environment/.test(v)),
+      JSON.stringify(violations),
+    );
+    // And the refusal must not quote the value it is refusing.
+    for (const violation of violations) {
+      assert.ok(!violation.includes('sk-synthetic'), 'the refusal must not echo the credential');
+    }
+  } finally {
+    if (priorKey === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = priorKey;
+  }
+});
+
+test('an ordinary configuration is not mistaken for a credential', () => {
+  // Negative control for the check above: it must key on the actual secret
+  // VALUE, not on a key name that looks sensitive.
+  const priorKey = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = 'sk-synthetic-value-generated-for-this-test-only';
+  try {
+    const violations = validateManifestAgainstCode(
+      withFirstArmConfiguration({ api_key_style: 'bearer', token_budget: 8192 }),
+    );
+    assert.ok(!violations.some((v) => /matching a credential/.test(v)), JSON.stringify(violations));
+  } finally {
+    if (priorKey === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = priorKey;
+  }
+});

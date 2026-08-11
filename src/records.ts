@@ -8,8 +8,12 @@ import { authenticateRun } from './runner.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
 import type { RunEnvelope } from './runner.js';
+import {
+  CONFIGURATION_DIGEST_VERSION,
+  configurationSha256,
+} from './participantConfiguration.js';
 import type { CollisionCheckResult } from './providers/family.js';
-import type { ArmGameResult, AttemptRecord } from './types.js';
+import type { ArmGameResult, ArmSpec, AttemptRecord } from './types.js';
 
 /**
  * Watch-mode gate provenance, recorded in run_meta so the entry-timing claim
@@ -168,6 +172,13 @@ export function buildRecords(
   // the slate metadata, and the summary.
   const records: JsonRecord[] = [];
 
+  // First result per arm; every dispatched arm has one, because the grid is
+  // complete by construction (A3).
+  const armById = new Map<string, ArmSpec>();
+  for (const result of results) {
+    if (!armById.has(result.arm.participantId)) armById.set(result.arm.participantId, result.arm);
+  }
+
   records.push({
     recordType: 'run_meta',
     label: SMOKE_LABEL,
@@ -192,6 +203,38 @@ export function buildRecords(
       maxQuoteAgeMs: MAX_QUOTE_AGE_MS,
       futureQuoteSkewMs: FUTURE_QUOTE_SKEW_MS,
     },
+    // The ARM ROSTER STAMP: who competed, and under what.
+    //
+    // Stamped once per run rather than repeated on every arm x game row,
+    // because a configuration is a property of the entrant and not of the
+    // response. Each row carries only the digest, which is what binds it back
+    // to this list.
+    //
+    // Stamped INTO the artifact rather than re-derived when the artifact is
+    // read, for the same reason the projection stamp exists: republishing a
+    // run from its file is the recovery path, and a roster re-read from the
+    // code at that moment — a newer commit, an enrolled arm — would describe a
+    // run that never happened. The file is the record of what ran.
+    //
+    // The order is the ENVELOPE's dispatched roster, which `runSlate` already
+    // proved unique and complete before sealing.
+    armRoster: env.expectedArms.map((participantId) => {
+      const arm = armById.get(participantId);
+      if (arm === undefined) {
+        // Unreachable through the envelope (the arm x game grid is complete by
+        // construction), and a throw rather than a skip because a roster
+        // missing an arm would publish a cohort smaller than the one that ran.
+        throw new Error(`dispatched arm "${participantId}" produced no results`);
+      }
+      return {
+        participantId: arm.participantId,
+        provider: arm.provider,
+        requestedModelId: arm.requestedModelId,
+        configuration: arm.configuration,
+        configurationSha256: configurationSha256(arm.configuration),
+        configurationDigestVersion: CONFIGURATION_DIGEST_VERSION,
+      };
+    }),
     eligibleGames: slate.games.length,
     excludedGames: excluded.length,
     armGameResults: results.length,
@@ -258,6 +301,10 @@ export function buildRecords(
       participantId: result.arm.participantId,
       provider: result.arm.provider,
       requestedModelId: result.arm.requestedModelId,
+      // The digest only: the configuration itself is stamped once on the run's
+      // arm roster, and this binds the row to that entry. Two arms of one model
+      // are byte-identical on every other field of this record.
+      configurationSha256: configurationSha256(result.arm.configuration),
       reportedModelId: reportedModelId(result),
       gameId: result.gameId,
       requestSha256: result.requestSha256,
@@ -282,6 +329,11 @@ export function buildRecords(
           runId: ctx.runId,
           cohortId: bound.cohortId,
           participantId: result.arm.participantId,
+          // Which entrant made this decision. `participantId` already says so,
+          // but this is the value the serving layer keys a participant row on,
+          // and carrying it here means a decision can be attributed without
+          // reading the run's roster stamp first.
+          configurationSha256: configurationSha256(result.arm.configuration),
           slateSha256,
           gameSha256: gameShaByGame.get(game.gameId) ?? null,
           bundleSha256: result.requestSha256,
