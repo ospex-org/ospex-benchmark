@@ -405,12 +405,55 @@ test('the COUNT decides a contradiction, not the name — an unlabelled drift ro
     { outcome: 'duplicate' });
 });
 
-test('the seal statement really does compare the stored digest', async () => {
-  // The mapping above is only meaningful if the SQL can produce a contradiction.
+test('EVERY immutable seal fact is compared, not just the forecast digest', async () => {
+  // The outcome mapping is only meaningful if the SQL can produce a
+  // contradiction, and it has to produce one for every fact the seal COMMITS
+  // to. Measured with only the forecast digest compared: a replay carrying a
+  // different rationaleDigest came back `duplicate`, so the caller was told its
+  // write was a benign repeat while the stored row still committed to different
+  // prose.
+  //
+  // Anchored on the comparison EXPRESSION rather than on a column name, because
+  // the comments around this statement discuss every one of these columns and a
+  // name-only matcher would match the prose (rule 3c).
+  const compared = (column: string, against: string): RegExp =>
+    new RegExp(`d\\.${column}\\s+is distinct from input\\.${against}`);
+  for (const [column, against] of [
+    ['forecast_digest', 'forecast_digest'],
+    ['rationale_digest', 'rationale_digest'],
+    ['sealed_at', 'sealed_at'],
+    ['run_id', 'run_id'],
+    ['deployment_round', 'deployment_round'],
+    ['network', 'network'],
+    ['contest_id', 'contest_id'],
+    ['speculation_id', 'speculation_id'],
+    ['bundle_sha256', 'decision_bundle_sha256'],
+    ['response_schema_version', 'decision_response_schema_version'],
+  ] as const) {
+    assert.match(SERVING_STATEMENTS.seal, compared(column, against),
+      `the seal does not compare ${column}, so a replay changing it is absorbed`);
+  }
+  // The cited provider call, compared as the id the insert would resolve.
   assert.match(SERVING_STATEMENTS.seal,
-    /d\.forecast_digest is distinct from input\.forecast_digest/);
+    /d\.attempt_id\s+is distinct from \(select id from cited\)/);
   assert.match(SERVING_STATEMENTS.seal,
     /c\.wallet_address is distinct from input\.wallet_address/);
+
+  // NEGATIVE CONTROL: the matcher must reject a column the statement does not
+  // compare, or every line above is green against anything.
+  assert.doesNotMatch(SERVING_STATEMENTS.seal, compared('source_path', 'source_path'));
+});
+
+test('the withheld prose is bound to the digest its seal committed to', async () => {
+  // Publishing the rationale later is only "provably the original" if something
+  // checks it. Nothing did: the seal stored a digest and the statement inserted
+  // whatever text it was handed, so a replacement landed `published` under a
+  // digest of the prose it replaced.
+  assert.match(SERVING_STATEMENTS.rationale,
+    /where parent\.rationale_digest is distinct from input\.rationale_digest/);
+  // And the insert is GATED on it, not merely reported beside it.
+  assert.match(SERVING_STATEMENTS.rationale,
+    /where not exists \(select 1 from drift\)/);
 });
 
 test('an off-contract result shape resolves to unavailable rather than throwing', async () => {

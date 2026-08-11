@@ -1,3 +1,4 @@
+import { sha256Hex } from './canonical.js';
 import { redactSecrets } from './config.js';
 import {
   CONFIGURATION_DIGEST_VERSION,
@@ -960,9 +961,14 @@ function revealPayload(reveal: DecisionReveal): Record<string, unknown> {
 }
 
 function rationalePayload(rationale: DecisionRationale): Record<string, unknown> {
+  // Redacted FIRST, then hashed, so the digest describes the bytes the table
+  // keeps. Hashing the caller's input instead would commit to a preimage the
+  // row does not hold, which is the one thing a reader cannot check.
+  const prose = requiredText(rationale.rationale, 'rationale');
   return {
     ...decisionRef(rationale.decision, 'decision'),
-    rationale: requiredText(rationale.rationale, 'rationale'),
+    rationale: prose,
+    rationale_digest: sha256Hex(prose),
     evidence_refs: rationale.evidenceRefs.map((r, i) => text(r, `evidenceRefs[${i}]`)),
     ...source(rationale.source, 'source'),
   };
@@ -1335,16 +1341,6 @@ with input as (
     forecast_digest text, rationale_digest text, decision_bundle_sha256 text,
     decision_response_schema_version smallint,
     source_path text, source_sha256 text)
-), drift as (${IDENTITY_DRIFT}
-  union all
-  -- The seal IS the pregame commitment. A second seal for the same key carrying
-  -- a DIFFERENT digest is the one integrity failure this projection exists to
-  -- make visible, and \`on conflict do nothing\` alone reports it as a replay.
-  select 'forecastDigest'
-    from public.benchmark_decisions d, input
-   where d.cohort_id = input.cohort_id and d.participant_id = input.participant_id
-     and d.game_id = input.game_id and d.market = input.market
-     and d.forecast_digest is distinct from input.forecast_digest
 ), cited as (
   select a.id, a.sent, a.outcome, a.supplied_markets
     from public.benchmark_arm_attempts a, input
@@ -1353,6 +1349,42 @@ with input as (
      and a.participant_id = input.participant_id
      and a.game_id = input.game_id
      and a.attempt_ordinal = input.attempt_ordinal
+), drift as (${IDENTITY_DRIFT}
+  union all
+  -- EVERY IMMUTABLE FACT OF THE SEAL, not just the forecast digest.
+  --
+  -- The seal is the commitment, the row is insert-once, and
+  -- an ON CONFLICT DO NOTHING absorbs a second one silently unless something
+  -- compares it. Measured with only the forecast digest compared: a replay
+  -- carrying a different rationaleDigest came back duplicate, so the
+  -- caller was told its write was a benign repeat while the stored row still
+  -- committed to different prose. Every column below is part of what the
+  -- seal promised, so every one of them is a contradiction when it moves.
+  select coalesce(t.f, 'drift.unlabelled') as f
+    from public.benchmark_decisions d, input,
+         lateral unnest(
+           array['seal.forecastDigest','seal.rationaleDigest','seal.sealedAt',
+                 'seal.runId','seal.deploymentRound','seal.network',
+                 'seal.contestId','seal.speculationId','seal.bundleSha256',
+                 'seal.responseSchemaVersion','seal.attemptOrdinal'],
+           array[d.forecast_digest  is distinct from input.forecast_digest,
+                 d.rationale_digest is distinct from input.rationale_digest,
+                 d.sealed_at        is distinct from input.sealed_at,
+                 d.run_id           is distinct from input.run_id,
+                 d.deployment_round is distinct from input.deployment_round,
+                 d.network          is distinct from input.network,
+                 d.contest_id       is distinct from input.contest_id,
+                 d.speculation_id   is distinct from input.speculation_id,
+                 d.bundle_sha256    is distinct from input.decision_bundle_sha256,
+                 d.response_schema_version
+                   is distinct from input.decision_response_schema_version,
+                 -- The provider call it cites, compared as the id the insert
+                 -- would resolve rather than as the ordinal supplied.
+                 d.attempt_id       is distinct from (select id from cited)]
+         ) as t(f, differs)
+   where d.cohort_id = input.cohort_id and d.participant_id = input.participant_id
+     and d.game_id = input.game_id and d.market = input.market
+     and coalesce(t.differs, true)
 ), ineligible as (
   select coalesce(t.f, 'unlabelled') as f
     from cited, input,
@@ -1437,29 +1469,52 @@ select null::text                          as contradiction,
        (select count(*) from parent)::int  as parent_found,
        (select count(*) from ins)::int     as inserted`;
 
-/** The withheld prose, keyed to its decision the same way the reveal is. */
+/**
+ * The withheld prose, keyed to its decision the same way the reveal is.
+ *
+ * ⚠ IT MUST HASH TO THE DIGEST ITS SEAL COMMITTED TO. The whole claim about
+ *   this table is that publishing the prose later is provably the original,
+ *   and nothing checked it: the seal stored a digest and this statement
+ *   inserted whatever text it was handed. Measured — a replacement rationale
+ *   landed `published` under a digest of the prose it replaced, and the
+ *   commitment was unverifiable from then on with nothing reporting it.
+ *
+ *   The digest compared here is derived by the payload builder from the bytes
+ *   that will actually be STORED, after redaction, so what a reader can
+ *   recompute from the table is what was checked. The seal's own digest comes
+ *   from the artifact, which the writer already redacted, so the two agree —
+ *   and if they ever do not, this reports it rather than storing the pair.
+ */
 const RATIONALE_SQL = `
 with input as (
   select * from jsonb_to_record($1::jsonb) as x(
     cohort_id text, participant_id text, game_id text, market text,
-    rationale text, evidence_refs text[], source_path text, source_sha256 text)
+    rationale text, rationale_digest text, evidence_refs text[],
+    source_path text, source_sha256 text)
 ), parent as (
-  select d.id
+  select d.id, d.rationale_digest
     from public.benchmark_decisions d, input
    where d.cohort_id = input.cohort_id
      and d.participant_id = input.participant_id
      and d.game_id = input.game_id
      and d.market = input.market
+), drift as (
+  -- A NULL stored digest is a seal that committed to having no rationale, so
+  -- is distinct from is the right comparison in both directions.
+  select 'rationale' as f
+    from parent, input
+   where parent.rationale_digest is distinct from input.rationale_digest
 ), ins as (
   insert into public.benchmark_decision_rationales
     (decision_id, rationale, evidence_refs, source_path, source_sha256)
   select parent.id, input.rationale, input.evidence_refs, input.source_path, input.source_sha256
     from parent, input
+   where not exists (select 1 from drift)
   on conflict (decision_id) do nothing
   returning 1
 )
-select null::text                          as contradiction,
-       0                                   as drift_rows,
+select (select min(f) from drift)          as contradiction,
+       (select count(*) from drift)::int   as drift_rows,
        null::text                          as ineligible_reason,
        (select count(*) from parent)::int  as parent_found,
        (select count(*) from ins)::int     as inserted`;

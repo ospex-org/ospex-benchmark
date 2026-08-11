@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { test } from 'node:test';
 import {
   describeServingStatus,
+  REQUIRED_SERVING_CAPABILITY,
   openBenchmarkServing,
   servingPoolConfig,
   QUERY_TIMEOUT_MS,
@@ -199,7 +200,7 @@ const PROBE_DEADLINE_MS = 12_000;
  * through the handle a run holds — a different call site, and until this case
  * existed nothing in the suite reached it.
  */
-for (const mode of ['held', 'enabled'] as const) {
+for (const mode of ['held', 'stale', 'enabled'] as const) {
   test(`a process whose database stopped answering still EXITS (${mode})`, { timeout: 60_000 }, async () => {
     // THE guarantee of this module, and the one no promise-level assertion can
     // make: `close()` resolving says nothing about whether Node can drain its
@@ -236,6 +237,13 @@ ${closed.out}`);
     assert.match(closed.out, new RegExp(`${mode}: status=${mode === 'enabled' ? 'enabled' : 'schema_not_ready'}`),
       `the probe took the wrong branch. Output:
 ${closed.out}`);
+    if (mode === 'stale') {
+      // The reviewer's case: a database whose schema has the lookalike
+      // columns and none of the contract. A column-name check opened against
+      // it; a capability VERSION refuses it.
+      assert.ok(REQUIRED_SERVING_CAPABILITY > 1,
+        'the probe reports capability 1, so the requirement must exceed it to discriminate');
+    }
     if (mode === 'enabled') {
       // And the write really was left in flight on a pinned client, rather than
       // refused client-side before it ever opened one.

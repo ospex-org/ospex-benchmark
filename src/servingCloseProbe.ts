@@ -21,10 +21,13 @@ import type { ArmAttempt } from './servingStore.js';
  * at all. A little wire protocol gives the exact condition, in CI, with no
  * dependency.
  *
- * ── THE MODES, AND WHY THERE ARE THREE ───────────────────────────────────────
+ * ── THE MODES, AND WHY THE LAST ONE IS NOT OPTIONAL ───────────────────────────────────────
  *
  *   held      the readiness probe never answers, so the publisher takes its
  *             schema-latch branch and closes there. MUST exit.
+ *   stale     the database reports an OLDER capability than this build needs -
+ *             the lookalike-schema case a column-name check used to accept.
+ *             MUST refuse to open, and MUST exit.
  *   enabled   the readiness probe IS answered, so the publisher opens for real;
  *             then one attempt — the path that pins a client for a lock plus a
  *             statement — never answers, and the handle's own `close()` runs.
@@ -37,6 +40,7 @@ import type { ArmAttempt } from './servingStore.js';
  */
 
 const TEXT_OID = 25;
+const INT4_OID = 23;
 
 const tagged = (type: string, body: Buffer): Buffer => {
   const header = Buffer.alloc(5);
@@ -48,14 +52,14 @@ const tagged = (type: string, body: Buffer): Buffer => {
 const kv = (key: string, value: string): Buffer => Buffer.from(`${key}\0${value}\0`, 'utf8');
 
 /** A one-column result set of text values, then ReadyForQuery. */
-function resultSet(column: string, values: readonly string[]): Buffer {
+function resultSet(column: string, values: readonly string[], oid = TEXT_OID): Buffer {
   const describe = Buffer.alloc(2 + column.length + 1 + 18);
   describe.writeInt16BE(1, 0);
   describe.write(`${column}\0`, 2, 'utf8');
   let at = 2 + column.length + 1;
   describe.writeInt32BE(0, at); at += 4;      // table oid
   describe.writeInt16BE(0, at); at += 2;      // column attribute
-  describe.writeInt32BE(TEXT_OID, at); at += 4;
+  describe.writeInt32BE(oid, at); at += 4;
   describe.writeInt16BE(-1, at); at += 2;     // variable width
   describe.writeInt32BE(-1, at); at += 4;     // no type modifier
   describe.writeInt16BE(0, at);               // text format
@@ -87,7 +91,7 @@ function resultSet(column: string, values: readonly string[]): Buffer {
  * exited promptly for a reason that had nothing to do with the code under test,
  * and a build with the fix removed passed identically.
  */
-function fakePostgres(answerFirstQuery: boolean): Promise<{ port: number; sawQuery: () => boolean }> {
+function fakePostgres(capability: number | null): Promise<{ port: number; sawQuery: () => boolean }> {
   let sawQuery = false;
   const server = createServer((socket) => {
     let sawStartup = false;
@@ -110,11 +114,12 @@ function fakePostgres(answerFirstQuery: boolean): Promise<{ port: number; sawQue
         return;
       }
       sawQuery = true;
-      if (answerFirstQuery && !answered) {
+      if (capability !== null && !answered) {
         answered = true;
-        // The readiness probe asks which identity columns exist. Naming all
-        // three opens the publisher; anything less and it latches instead.
-        socket.write(resultSet('column_name', ['model_id', 'configuration', 'configuration_sha256']));
+        // The readiness probe asks what the schema says it can serve. An
+        // int4 column, because the publisher requires a real integer and a
+        // text lookalike must not satisfy it.
+        socket.write(resultSet('version', [String(capability)], INT4_OID));
         return;
       }
       // Saying nothing is the entire point of this server.
@@ -180,7 +185,8 @@ function probeAttempt(): ArmAttempt {
 
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? 'held';
-  const { port, sawQuery } = await fakePostgres(mode === 'enabled');
+  const capability = mode === 'enabled' ? 2 : mode === 'stale' ? 1 : null;
+  const { port, sawQuery } = await fakePostgres(capability);
   // `sslmode=disable` is LOAD-BEARING, not tidiness. With no CA configured the
   // resolver attaches `ssl: { rejectUnauthorized: false }`, `pg` opens with an
   // SSLRequest, this server refuses it, and the connection dies before a query

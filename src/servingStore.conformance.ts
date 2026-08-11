@@ -47,6 +47,7 @@ import { Client, Pool } from 'pg';
 import { pgStoreQuery } from './store/atomicStore.js';
 import { pgStoreTransactor } from './store/campaignTickJournal.js';
 import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
+import { REQUIRED_SERVING_CAPABILITY } from './benchmarkServingClient.js';
 import { SERVING_STATEMENTS, SqlBenchmarkServingPort } from './servingStore.js';
 import {
   CONFIGURATION_DIGEST_VERSION,
@@ -57,6 +58,7 @@ import type { ParticipantConfiguration } from './participantConfiguration.js';
 import type {
   ArmAttempt, AttemptFacts, DecisionSeal, ParticipantFacts, PublishOutcome, RunFacts,
 } from './servingStore.js';
+import { sha256Hex } from './canonical.js';
 import { forecastDigest } from './schema.js';
 import { makeOverScaleAccepted, makeOverScalePushAccepted } from './testFactories.js';
 import type { ForecastOutput } from './types.js';
@@ -434,7 +436,7 @@ async function main(): Promise<void> {
       'published', 'first seal');
     const out = await port.sealDecision(decisionSeal(cohortId, { forecastDigest: DIGEST(0xbb) }));
     expect(out, 'contradiction', 'second seal with a different digest');
-    assert.equal(out.outcome === 'contradiction' ? out.field : null, 'forecastDigest');
+    assert.equal(out.outcome === 'contradiction' ? out.field : null, 'seal.forecastDigest');
     const stored = await query(
       'select forecast_digest from public.benchmark_decisions where cohort_id = $1', [cohortId]);
     assert.equal(stored[0]!['forecast_digest'], DIGEST(0xaa), 'the original commitment stands');
@@ -863,9 +865,13 @@ async function main(): Promise<void> {
     const cohortId = cohortName('tail');
     const decision = { cohortId, participantId: `${cohortId}-alpha`, gameId: 'game-1', market: 'moneyline' as const };
     await port.publishAttempt(armAttempt(cohortId));
-    await port.sealDecision(decisionSeal(cohortId, { rationaleDigest: DIGEST(0x10) }));
+    // The seal commits to a digest OF THIS PROSE. The fixture used an arbitrary
+    // digest, which was accepted until the binding existed - the shape the
+    // binding was added to refuse.
+    const prose = 'the number looks soft';
+    await port.sealDecision(decisionSeal(cohortId, { rationaleDigest: sha256Hex(prose) }));
     expect(await port.publishRationale({
-      decision, rationale: 'the number looks soft', evidenceRefs: ['ref-1', 'ref-2'], source: NO_SOURCE,
+      decision, rationale: prose, evidenceRefs: ['ref-1', 'ref-2'], source: NO_SOURCE,
     }), 'published', 'rationale');
     const base = {
       decision, marginAdjustedClvPct: null, devigMethod: null, ladderVersion: null,
@@ -917,6 +923,85 @@ async function main(): Promise<void> {
   });
 
   // ── negative controls: the grant is what makes the guarantees real ────────
+
+  await check('EVERY immutable seal fact is compared, not just the forecast digest', async () => {
+    // A seal is a commitment, and `on conflict do nothing` absorbs a second one
+    // silently unless something compares it. Reproduced before the fix: a replay
+    // carrying a DIFFERENT rationaleDigest under the same key was reported
+    // `duplicate` - the caller told the write was a benign repeat while the
+    // stored row still committed to the original prose.
+    const cohortId = cohortName('seal-facts');
+    expect(await port.publishAttempt(armAttempt(cohortId)), 'published', 'the attempt');
+    expect(await port.sealDecision(decisionSeal(cohortId, {
+      rationaleDigest: DIGEST(0xaa),
+    })), 'published', 'the original seal');
+
+    // One case per fact, so a drift entry that is dropped later is named rather
+    // than lost in an aggregate.
+    const cases: ReadonlyArray<readonly [string, Partial<DecisionSeal>]> = [
+      ['seal.rationaleDigest', { rationaleDigest: DIGEST(0xbb) }],
+      ['seal.sealedAt', { sealedAt: '2026-08-09T21:00:00.000000Z' }],
+      ['seal.contestId', { contestId: 'contest-9' }],
+      ['seal.speculationId', { speculationId: 'spec-9' }],
+      ['seal.bundleSha256', { bundleSha256: DIGEST(0xcc) }],
+      ['seal.responseSchemaVersion', { responseSchemaVersion: 1 }],
+    ];
+    for (const [field, patch] of cases) {
+      const out = await port.sealDecision(decisionSeal(cohortId, {
+        rationaleDigest: DIGEST(0xaa), ...patch,
+      }));
+      expect(out, 'contradiction', `a replay changing ${field}`);
+      assert.equal(out.outcome === 'contradiction' ? out.field : null, field);
+    }
+
+    // NEGATIVE CONTROL: a byte-identical replay is still a duplicate, so this is
+    // a comparison rather than a blanket refusal of every second seal.
+    expect(await port.sealDecision(decisionSeal(cohortId, { rationaleDigest: DIGEST(0xaa) })),
+      'duplicate', 'an identical replay');
+  });
+
+  await check('PROSE MUST HASH TO THE DIGEST ITS SEAL COMMITTED TO', async () => {
+    // The projection's whole claim about the withheld rationale is that
+    // publishing it later is provably the original. Nothing checked that: the
+    // seal stored a digest, and `publishRationale` inserted whatever text it was
+    // handed. Reproduced before the fix - a replacement rationale landed
+    // `published` under a digest of the prose it replaced.
+    const cohortId = cohortName('rationale-binding');
+    const prose = 'the original rationale, as sealed';
+    expect(await port.publishAttempt(armAttempt(cohortId)), 'published', 'the attempt');
+    expect(await port.sealDecision(decisionSeal(cohortId, {
+      rationaleDigest: sha256Hex(prose),
+    })), 'published', 'the seal');
+
+    const ref = {
+      cohortId, participantId: `${cohortId}-alpha`, gameId: 'game-1', market: 'moneyline' as const,
+    };
+    const swapped = await port.publishRationale({
+      decision: ref, rationale: 'different prose entirely', evidenceRefs: [], source: NO_SOURCE,
+    });
+    expect(swapped, 'contradiction', 'prose that does not hash to the sealed digest');
+    assert.equal(swapped.outcome === 'contradiction' ? swapped.field : null, 'rationale');
+
+    const rows = await query(
+      `select count(*)::int as n from public.benchmark_decision_rationales r
+         join public.benchmark_decisions d on d.id = r.decision_id
+        where d.cohort_id = $1`, [cohortId]);
+    assert.equal(rows[0]!['n'], 0, 'and nothing was written');
+
+    // NEGATIVE CONTROL: the prose the seal actually committed to still lands.
+    expect(await port.publishRationale({
+      decision: ref, rationale: prose, evidenceRefs: ['ref-1'], source: NO_SOURCE,
+    }), 'published', 'the sealed prose');
+
+    // And the stored text really does reproduce the stored digest, which is the
+    // property a reader checks. Read back rather than assumed: the store
+    // redacts on the way in, so the bytes hashed must be the bytes kept.
+    const stored = await query(
+      `select r.rationale, d.rationale_digest from public.benchmark_decision_rationales r
+         join public.benchmark_decisions d on d.id = r.decision_id
+        where d.cohort_id = $1`, [cohortId]);
+    assert.equal(sha256Hex(String(stored[0]!['rationale'])), stored[0]!['rationale_digest']);
+  });
 
   await check('ONE ENTRANT PER (lab, model, configuration), and the index is what says so', async () => {
     // The rule the whole identity model rests on. Two participant ids carrying
@@ -1059,6 +1144,20 @@ async function main(): Promise<void> {
       'without the coalesce the disagreement is nameless - this is the old defect');
     assert.equal(bare!['drift_rows'], 1,
       'and drift_rows is what still catches it, independently of any label');
+  });
+
+  await check('the LIVE schema reports the capability this build requires', async () => {
+    // The readiness gate reads a version the schema states about itself, so the
+    // constant it compares against has to be held against a real database
+    // rather than against another copy of itself. A build requiring more than
+    // the schema offers refuses to open at all; one requiring less opens
+    // against a schema that cannot hold an entrant.
+    const rows = await query(
+      'select version from public.benchmark_schema_capability where capability = $1',
+      ['serving_projection']);
+    assert.equal(rows.length, 1, 'the capability row exists');
+    assert.ok(Number(rows[0]!['version']) >= REQUIRED_SERVING_CAPABILITY,
+      `schema reports ${String(rows[0]!['version'])}, this build requires ${REQUIRED_SERVING_CAPABILITY}`);
   });
 
   await check('the resolver agrees with what the DRIVER actually does about TLS', async () => {

@@ -105,40 +105,41 @@ export type ServingStatus =
 const CLOSE_TIMEOUT_MS = 5_000;
 
 /**
- * The columns the participant contract requires before anything may be written.
+ * The schema capability this build's writes require.
  *
- * A participant row records WHICH ARM ran, and an arm is a model plus the
- * configuration it ran under — the same model at two reasoning levels is two
- * competitors, and a row that cannot say which is which cannot be corrected.
- * These rows are insert-once with no UPDATE.
+ * Version 2 is the migration that made a participant an ENTRANT: `model_id`,
+ * `configuration`, `configuration_sha256`, the kind-dependent CHECKs that make a
+ * model declare all of them and a control none, and the unique index over
+ * `(lab_id, model_id, configuration)`.
+ *
+ * ⚠ IT IS A VERSION, NOT A COLUMN SNIFF, AND THAT IS THE WHOLE POINT. An earlier
+ *   latch asked `information_schema` whether three column NAMES existed. Three
+ *   nullable lookalike columns satisfy that — demonstrated on a scratch database
+ *   with the names and none of the constraints, which the latch opened against —
+ *   so it certified a schema that could still hold a permanently dimensionless
+ *   entrant. A capability row is a claim the schema makes about itself, and one
+ *   a publisher can only read.
  */
-const REQUIRED_PARTICIPANT_COLUMNS = ['model_id', 'configuration', 'configuration_sha256'];
+export const REQUIRED_SERVING_CAPABILITY = 2;
 
 /**
- * Refuse to open against a schema that cannot record what an arm IS.
+ * What the database says it can serve, or 0.
  *
- * It checks for the COLUMNS BY NAME and nothing else — not their nullability,
- * not the kind-dependent CHECKs, not the entrant index. Against a database
- * that carries the identity migration it therefore always passes, and it is
- * NOT what prevents a dimensionless entrant: `configurationPayload` in
- * servingStore.ts does that, client-side, in both directions.
- *
- * What it is still worth is a legible refusal rather than a 42703 for a host
- * pointed at an older database, and it lifts by itself once the migration
- * lands. Reading it as the control would be reading it as more than it is.
+ * Absence is version 0 rather than an error: the capability table arrived WITH
+ * the contract, so a database that has no row has not adopted it. Every
+ * unreadable answer — a missing relation, a revoked grant, a query that never
+ * comes back — resolves the same way, because the alternative is writing
+ * permanent rows on the strength of a question that did not resolve.
  */
-async function missingParticipantColumns(
+async function servingCapability(
   query: (sql: string, params: readonly unknown[]) => Promise<ReadonlyArray<Record<string, unknown>>>,
-): Promise<string[]> {
+): Promise<number> {
   const rows = await query(
-    `select column_name from information_schema.columns
-      where table_schema = 'public'
-        and table_name = 'benchmark_participants'
-        and column_name = any($1)`,
-    [REQUIRED_PARTICIPANT_COLUMNS],
+    'select version from public.benchmark_schema_capability where capability = $1',
+    ['serving_projection'],
   );
-  const present = new Set(rows.map((row) => String(row['column_name'])));
-  return REQUIRED_PARTICIPANT_COLUMNS.filter((column) => !present.has(column));
+  const version = rows[0]?.['version'];
+  return typeof version === 'number' && Number.isInteger(version) ? version : 0;
 }
 
 export interface BenchmarkServingHandle {
@@ -160,10 +161,10 @@ export function describeServingStatus(status: ServingStatus): string {
   }
   if (status.reason === 'schema_not_ready') {
     return (
-      'serving projection: HELD — the database cannot yet record which arm a ' +
-      `participant is (missing ${REQUIRED_PARTICIPANT_COLUMNS.join(', ')} on ` +
-      'benchmark_participants). Participant rows are insert-once, so nothing is ' +
-      'written until the schema can hold the whole identity.'
+      'serving projection: HELD — the database does not report serving_projection ' +
+      `capability ${REQUIRED_SERVING_CAPABILITY} or higher, so it cannot be relied ` +
+      'on to record which entrant a participant is. Those rows are insert-once, ' +
+      'so nothing is written until the schema says it can hold the whole identity.'
     );
   }
   return `serving projection: disabled (${status.reason})`;
@@ -269,21 +270,19 @@ export async function openBenchmarkServing(
   pool.on('remove', (client: unknown) => { live.delete(client as EndableClient); });
   const poolLike = pool as unknown as PoolLike;
 
-  // Before a single row: can this schema hold the participant contract? A
-  // failure to ANSWER counts as not ready, because the alternative is writing
-  // permanent rows on the strength of a question that did not resolve.
+  // Before a single row: does this schema say it can hold the entrant contract?
   //
   // BOUNDED, because this runs before anything else and an unbounded readiness
   // probe is a startup that never finishes. A probe that does not answer in
-  // time is treated as not ready, which is the same fail-closed reading as a
-  // probe that errors.
-  let missing: string[];
+  // time is treated as not ready — the same fail-closed reading as one that
+  // errors, and for the same reason: these rows cannot be corrected later.
+  let capability: number;
   try {
-    missing = await withDeadline(missingParticipantColumns(query), readinessTimeoutMs);
+    capability = await withDeadline(servingCapability(query), readinessTimeoutMs);
   } catch {
-    missing = REQUIRED_PARTICIPANT_COLUMNS;
+    capability = 0;
   }
-  if (missing.length > 0) {
+  if (capability < REQUIRED_SERVING_CAPABILITY) {
     // Closed the same way as a live handle would be. Nothing was written, but a
     // startup that leaves a socket open still cannot exit.
     await closePool(poolLike, live, closeTimeoutMs);

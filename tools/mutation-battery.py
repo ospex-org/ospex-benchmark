@@ -375,7 +375,33 @@ MUTANTS = [
      '      : PROJECT_EXIT.refused;',
      '      : PROJECT_EXIT.ok;',
      ['src/projectRunMain.test.ts']),
+# --- the seal's immutable facts, the rationale binding, the capability gate ---
+    ('M72-only-the-forecast-digest-is-drift-checked', 'src/servingStore.ts',
+     "                 d.rationale_digest is distinct from input.rationale_digest,",
+     '                 false,',
+     ['src/servingStore.test.ts']),
+    ('M73-rationale-not-bound-to-its-seal', 'src/servingStore.ts',
+     '   where parent.rationale_digest is distinct from input.rationale_digest',
+     '   where false',
+     ['src/servingStore.test.ts']),
+    ('M74-rationale-digest-taken-before-redaction', 'src/servingStore.ts',
+     '    rationale_digest: sha256Hex(prose),',
+     '    rationale_digest: sha256Hex(rationale.rationale),',
+     ['src/servingStore.test.ts']),
+    ('M75-any-capability-will-do', 'src/benchmarkServingClient.ts',
+     '  if (capability < REQUIRED_SERVING_CAPABILITY) {',
+     '  if (false) {',
+     ['src/benchmarkServingClient.test.ts']),
+    ('M76-unreadable-capability-reads-as-current', 'src/benchmarkServingClient.ts',
+     '    capability = 0;',
+     '    capability = REQUIRED_SERVING_CAPABILITY;',
+     ['src/benchmarkServingClient.test.ts']),
+    ('M77-a-text-version-satisfies-the-gate', 'src/benchmarkServingClient.ts',
+     "  return typeof version === 'number' && Number.isInteger(version) ? version : 0;",
+     '  return Number(version);',
+     ['src/benchmarkServingClient.test.ts']),
 ]
+
 
 
 
