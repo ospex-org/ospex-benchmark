@@ -551,7 +551,7 @@ test('run_meta stamps the arm roster, and every arm row carries its digest', asy
   );
 
   for (const entry of roster) {
-    // The digest must RECOMPUTE from the configuration beside it -- the exact
+    // The digest must RECOMPUTE from the configuration beside it — the exact
     // property the scorer re-checks. Asserting a literal would also pass on a
     // build that stamped a constant.
     assert.equal(
@@ -584,8 +584,8 @@ test('run_meta stamps the arm roster, and every arm row carries its digest', asy
 
 test('the stamp carries the configuration the arm ran, and the runner sent it', async () => {
   // The discriminating case. The default fixture arm declares `{}`, so a build
-  // that stamped a hardcoded empty configuration -- or dropped the field
-  // entirely -- would pass the test above. This one declares a real setting,
+  // that stamped a hardcoded empty configuration — or dropped the field
+  // entirely — would pass the test above. This one declares a real setting,
   // so only the true value satisfies it.
   const request = makeRequest();
   const build = buildFrom(request);

@@ -37,7 +37,7 @@ const JCS: Array<[string, unknown, string]> = [
   // THE case that is easy to get wrong, and did get "corrected" into a bug
   // once: JCS sorts by UTF-16 CODE UNITS, not code points. U+1F600 is the
   // surrogate pair D83D DE00, and 0xD83D < 0xFFFF, so the emoji sorts BEFORE
-  // U+FFFF -- the opposite of code-point order. JS string `<` is already
+  // U+FFFF — the opposite of code-point order. JS string `<` is already
   // code-unit order, so deriving the expectation by code point is what turns a
   // correct implementation into a reported defect.
   ['astral key sorts by code UNIT', { '\u{1F600}': 1, '￿': 2 }, '{"\u{1F600}":1,"￿":2}'],

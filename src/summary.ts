@@ -163,7 +163,7 @@ export function buildSummaryMarkdown(
   lines.push(`- Generated: ${ctx.createdAt}`);
   lines.push(`- Slate SHA-256: \`${slateSha256}\``);
   lines.push(
-    `- Dispatch: per game (sequential games, four arms concurrent per game; each game's cutoff is its own first pitch)`,
+    `- Dispatch: per game (sequential games, arms concurrent within a game; each game's cutoff is its own first pitch)`,
   );
   lines.push(`- Execution policy (declared, not executed): \`${bound.executionPolicy}\``);
   lines.push('');

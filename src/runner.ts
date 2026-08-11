@@ -267,7 +267,7 @@ export interface SlateRunOptions {
    * (the dry run a synthetic clock anchored to the fixture).
    */
   nowMs?: (() => number) | undefined;
-  /** Called after each game's four arms have all settled (sealed per game). */
+  /** Called after each game's arms have ALL settled (sealed per game). */
   onGameComplete?: ((line: string) => void) | undefined;
 }
 
@@ -892,10 +892,10 @@ async function dispatchArmCore(
 
 /**
  * Per-game dispatch: games run SEQUENTIALLY in cutoff order (the earliest
- * first pitch is always served first); within each game the four arms run
+ * first pitch is always served first); within each game the arms run
  * CONCURRENTLY against that game's identical frozen request. One game's
  * failure affects only that game. Outputs stay sealed per game — nothing is
- * reported until all four arms for that game have settled, so no arm can be
+ * reported until every arm for that game has settled, so no arm can be
  * conditioned on another's answer.
  *
  * Every request is put through the prepared-request boundary BEFORE any arm is

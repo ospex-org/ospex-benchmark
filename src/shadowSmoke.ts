@@ -33,7 +33,7 @@ import type { ArmOutcome, SlateInputs } from './types.js';
  *
  * Fetches an MLB slate with reference odds from the existing public read
  * path, freezes a content-hashed single-game bundle per game, dispatches the
- * four arms concurrently per game (games sequential, outputs sealed per
+ * the cohort's arms concurrently per game (games sequential, outputs sealed per
  * game), validates every forecast against the strict output schema, records
  * everything with provenance, and stops. No scoring, no wallets, no chain
  * access, no SSE.

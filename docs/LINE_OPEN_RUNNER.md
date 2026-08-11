@@ -22,7 +22,7 @@ twelve participants in the same breath, and the game is never touched again.
 Two mechanisms, two jobs — they are complements, not substitutes:
 
 - **The frozen bundle** is the *fairness* mechanism: all twelve participants
-  (four model arms + eight deterministic baselines) receive identical
+  (the cohort's model arms + eight deterministic baselines) receive identical
   information at the identical instant, entering at the same prices. Without
   it, a leaderboard measures fetch latency and plumbing differences, not
   forecasting.
@@ -78,7 +78,7 @@ For one game, once, at detection:
    what the scorer will).
 3. Claim the game in the ledger — memory first, then disk — BEFORE any
    dispatch, so neither a crash nor a restart can ever double-bill.
-4. Fire: dispatch all four model arms concurrently (existing per-game
+4. Fire: dispatch every model arm concurrently (existing per-game
    runner: injected clock, cutoff enforcement, repair rules, identity
    checks) and run all eight baselines against the same bundle.
 5. Write one self-contained run file for the game (`out/`,
