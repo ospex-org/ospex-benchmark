@@ -444,6 +444,22 @@ export interface ArmResponseRef {
 
 export type ArmRosterEntry = z.infer<typeof armRosterEntrySchema>;
 
+/**
+ * Whether this attempt shows a provider response came back at all.
+ *
+ * Any one of these three is only ever written from a received response, so a
+ * leg carrying one but no `requestParams` is a record that has lost evidence
+ * rather than one that never had any. A timeout or transport failure has all
+ * three null.
+ */
+function reachedProvider(attempt: ArchivedAttempt): boolean {
+  return (
+    attempt.rawResponse !== null ||
+    attempt.reportedModelId !== null ||
+    attempt.providerResponseId !== null
+  );
+}
+
 export interface SourceRun {
   runId: string;
   cohortId: string;
@@ -1713,9 +1729,25 @@ export function verifyRunIntegrity(
       ['repair', response.repair],
     ] as const;
     for (const [leg, attempt] of legs) {
-      // A leg that never reached the provider (timeout, transport failure, no
-      // credential) records no parameters and is evidence of nothing either way.
-      if (attempt === null || attempt.requestParams === null) continue;
+      if (attempt === null) continue;
+      if (attempt.requestParams === null) {
+        // A leg that never reached the provider (timeout, transport failure,
+        // no credential) records no parameters and is evidence of nothing
+        // either way. One that DID reach it and records none has had its
+        // evidence ERASED, and skipping it was an opt-out: deleting one field
+        // from an accepted response removed every configuration guarantee from
+        // the run while it still verified clean.
+        //
+        // Only enforced on a run that stamps a roster. An archive written
+        // before the stamp existed cannot be held to a field nothing wrote,
+        // and its arms were all-defaults by construction anyway.
+        if (run.armRoster !== null && reachedProvider(attempt)) {
+          violations.push(
+            `${response.participantId}:${response.gameId}:${leg}: a response was received but no request parameters were recorded`,
+          );
+        }
+        continue;
+      }
       for (const violation of configurationEvidenceViolations(declared, attempt.requestParams)) {
         violations.push(`${response.participantId}:${response.gameId}:${leg}: ${violation}`);
       }

@@ -3876,3 +3876,73 @@ test('the REPAIR leg is held to the declared configuration too', () => {
     JSON.stringify(violations),
   );
 });
+
+test('a response-bearing attempt with NO recorded request is refused', () => {
+  // Erasing one field from an accepted response removed every configuration
+  // guarantee from the run while it still verified clean — the evidence gate
+  // skipped a null `requestParams` unconditionally, so it was opt-out.
+  const violations = stampViolations((records) => {
+    const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+    (response['attempt'] as JsonRecordish)['requestParams'] = null;
+  });
+  assert.ok(
+    violations.some((v) => /a response was received but no request parameters were recorded/.test(v)),
+    JSON.stringify(violations),
+  );
+});
+
+test('ANY single sign that a response came back is enough to require the request record', () => {
+  // Swept rather than sampled. The obvious fixture carries all three signals
+  // at once, so no one of them is load-bearing and a build that consulted only
+  // two would pass — a mutation battery caught exactly that. Each case below
+  // leaves ONE signal standing, so each disjunct is the only thing that can
+  // produce the refusal.
+  const signals = ['rawResponse', 'reportedModelId', 'providerResponseId'] as const;
+  for (const kept of signals) {
+    const violations = stampViolations((records) => {
+      const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+      const attempt = response['attempt'] as JsonRecordish;
+      attempt['requestParams'] = null;
+      for (const signal of signals) {
+        if (signal !== kept) attempt[signal] = null;
+      }
+    });
+    assert.ok(
+      violations.some((v) => /a response was received but no request parameters were recorded/.test(v)),
+      `${kept} alone must still require a request record: ${JSON.stringify(violations)}`,
+    );
+  }
+});
+
+test('an attempt that genuinely never reached the provider is still not evidence', () => {
+  // The negative control, and the reason the previous version of this test was
+  // wrong: it nulled `requestParams` on an ACCEPTED response and called that
+  // "never reached the provider". A real one has no response id, no reported
+  // model, and no body — there is nothing to have recorded.
+  const violations = stampViolations((records) => {
+    const response = records.find((r) => r['recordType'] === 'arm_game_response')!;
+    const attempt = response['attempt'] as JsonRecordish;
+    attempt['requestParams'] = null;
+    attempt['rawResponse'] = null;
+    attempt['reportedModelId'] = null;
+    attempt['providerResponseId'] = null;
+  });
+  assert.ok(
+    !violations.some((v) => /no request parameters were recorded/.test(v)),
+    `a leg with no response evidence carries no request evidence either: ${JSON.stringify(violations)}`,
+  );
+});
+
+test('an UNSTAMPED archive is not held to the request-evidence rule', () => {
+  // Backward compatibility keyed on the stamp, which only new builds write.
+  const records = fixtureRun().lines.map((line) => JSON.parse(line) as JsonRecordish);
+  for (const record of records) {
+    if (record['recordType'] !== 'arm_game_response') continue;
+    (record['attempt'] as JsonRecordish)['requestParams'] = null;
+  }
+  const violations = verifyRunIntegrity(
+    parseRunRecords(records.map((r) => JSON.stringify(r))),
+    { expectedArms: FIXTURE_ARMS },
+  );
+  assert.deepEqual(violations, []);
+});

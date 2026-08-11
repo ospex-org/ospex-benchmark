@@ -12,6 +12,7 @@ import {
   ConfigurationCollisionError,
   configurationEvidenceViolations,
   configurationSha256,
+  configurationViolations,
 } from './participantConfiguration.js';
 import type { ParticipantConfiguration } from './participantConfiguration.js';
 import type { ArmSpec, ChatTurn, ProviderCallOptions, ProviderName } from './types.js';
@@ -232,12 +233,28 @@ test('a token cap can never be raised by a configuration — spend is not a part
   }
 });
 
-test('an empty object at a reserved path is a no-op, not an override', () => {
-  // Found by a fixture that expected a refusal and did not get one. It is the
-  // correct behaviour and worth pinning: the rule guards LEAVES, and an empty
-  // object contributes none, so the request comes out byte-identical.
+test('a nested empty object leaves the request byte-identical — which is why it is REFUSED', () => {
+  // This started as a test blessing the no-op as correct. A reviewer showed
+  // what it actually buys: `{}` and `{"generationConfig":{}}` are two entrant
+  // IDENTITIES that send byte-identical requests, produce identical evidence,
+  // and pass both the duplicate-entrant gate and the post-run collision check.
+  //
+  // The merge behaviour below is still exactly right at this layer — the rule
+  // guards leaves and an empty object contributes none. What was wrong was
+  // letting such a configuration be DECLARED, so `configurationViolations` now
+  // refuses it and this test pins both halves together.
   const plan = planArmRequest(arm('google', { systemInstruction: {} }), TURNS, DECLARED);
-  assert.deepEqual(plan.body, DECLARED_BODIES.google);
+  assert.deepEqual(plan.body, DECLARED_BODIES.google, 'the request is unchanged...');
+  assert.equal(
+    configurationSha256({ systemInstruction: {} }) === configurationSha256({}),
+    false,
+    '...while the identity is not, which is the hole',
+  );
+  assert.match(
+    configurationViolations({ systemInstruction: {} })[0] ?? '',
+    /empty object, which changes the digest without changing the request/,
+    'so declaring one is refused',
+  );
 });
 
 test('gemini: a nested namespace is ADDITIVE beside the cohort cap, not a collision', () => {

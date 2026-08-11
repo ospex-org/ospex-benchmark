@@ -329,24 +329,33 @@ test('an oversized configuration is refused at parse, in bytes', () => {
   assert.throws(() => parseManifest(rosterArm({ configuration: tooBig })), /canonical bytes, over the/);
 });
 
-test('a __proto__ key in a configuration pollutes nothing, and is DROPPED by parsing', () => {
-  // Measured, because the first version of this test guessed wrong and asserted
-  // a refusal. Zod's record parse silently drops an own `__proto__` key rather
-  // than assigning through it: nothing is polluted, the parsed prototype stays
-  // clean, and the key is simply gone. `configurationViolations` never sees it,
-  // which is why its own `__proto__` guard is tested against `applyConfiguration`
-  // instead — that path takes a code-supplied ArmSpec and never goes through zod.
-  //
-  // The consequence worth knowing: for this one key the manifest's declared TEXT
-  // and its parsed VALUE differ, and `cohortId` hashes the parsed value. That
-  // stays self-consistent end to end — publication compares raw bytes AND a
-  // recomputed cohortId, both sides parse it away, and the artifact stamps the
-  // parsed configuration — so it is a curiosity rather than a hazard.
+test('a __proto__ key anywhere in the RAW manifest is refused', () => {
+  // An earlier version of this test measured that zod SILENTLY DROPS such a
+  // key and called it a curiosity. It is not: this document is a public
+  // precommitment whose raw bytes are compared at publication, and `cohortId`
+  // hashes the PARSED value. Dropping the key lets two different published
+  // byte sequences boot as the SAME cohort while the run stamps a
+  // configuration that is not the one published — and it skips the post-parse
+  // configuration checks, because by then the key is gone.
   const hostile = JSON.parse('{"__proto__": {"polluted": true}}') as Record<string, unknown>;
-  const parsed = parseManifest(rosterArm({ configuration: hostile }));
-  const configuration = parsed.expectedArmRoster[0]?.configuration ?? {};
-  assert.deepEqual(Object.getOwnPropertyNames(configuration), []);
-  assert.equal(Object.getPrototypeOf(configuration), Object.prototype);
+  assert.throws(
+    () => parseManifest(rosterArm({ configuration: hostile })),
+    /uses the reserved key "__proto__"/,
+  );
+  // Anywhere, not just in a configuration — `.strict()` cannot catch it either,
+  // because the key is gone before the unknown-key check runs.
+  const topLevel = JSON.parse('{"__proto__": {"polluted": true}}') as Record<string, unknown>;
+  assert.throws(() => parseManifest({ ...validManifest(), ...topLevel }), /__proto__/);
   assert.equal(({} as Record<string, unknown>)['polluted'], undefined);
-  assert.equal((configuration as Record<string, unknown>)['polluted'], undefined);
+});
+
+test('the refusal names WHERE the key is, and an ordinary manifest still parses', () => {
+  // The negative control: a build that refused every manifest would satisfy
+  // the test above.
+  assert.ok(parseManifest(validManifest()));
+  const hostile = JSON.parse('{"__proto__": 1}') as Record<string, unknown>;
+  assert.throws(
+    () => parseManifest(rosterArm({ configuration: hostile })),
+    /expectedArmRoster\[0\]\.configuration\.__proto__/,
+  );
 });

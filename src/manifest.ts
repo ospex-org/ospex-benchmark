@@ -175,7 +175,47 @@ export type CohortManifestV1 = z.infer<typeof cohortManifestV1Schema>;
  * invariant). A boot-time failure here is intended — an invalid manifest must
  * never run.
  */
+/**
+ * The path of an own `__proto__` key anywhere in the RAW input, or null.
+ *
+ * Run before zod, because zod's object and record parsers DROP such a key
+ * rather than reject it. Nothing is polluted by that — but this manifest is a
+ * public precommitment whose raw bytes are compared at publication, and
+ * `cohortId` hashes the PARSED value. Silently dropping a key therefore lets
+ * two different published byte sequences boot as the same cohort, and lets the
+ * run stamp a configuration that is not the one published. It also skips the
+ * post-parse configuration checks entirely, since by then the key is gone.
+ *
+ * The raw object is walked with `getOwnPropertyNames` and the key is returned
+ * WITHOUT reading its value, because reading `__proto__` is the very thing
+ * that behaves differently from an ordinary member.
+ */
+function rawProtoKeyPath(value: unknown, path: string): string | null {
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const found = rawProtoKeyPath(value[index], `${path}[${index}]`);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  if (typeof value !== 'object' || value === null) return null;
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const here = path === '' ? key : `${path}.${key}`;
+    if (key === '__proto__') return here;
+    const found = rawProtoKeyPath((value as Record<string, unknown>)[key], here);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
 export function parseManifest(raw: unknown): CohortManifestV1 {
+  const protoAt = rawProtoKeyPath(raw, '(root)');
+  if (protoAt !== null) {
+    throw new Error(
+      `invalid cohort manifest: ${protoAt} uses the reserved key "__proto__", which the parser would ` +
+        'silently drop — the published bytes and the hashed cohort identity would then disagree',
+    );
+  }
   const result = cohortManifestV1Schema.safeParse(raw);
   if (!result.success) {
     const issues = result.error.issues

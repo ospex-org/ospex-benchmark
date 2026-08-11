@@ -348,3 +348,84 @@ test('a key containing a dot is refused — it is the evidence path separator', 
   assert.deepEqual(configurationEvidenceViolations({ 'a.b': 1 }, { a: { b: 1 } }), []);
   assert.equal(configurationEvidenceViolations({ 'a.b': 1 }, { 'a.b': 1 }).length, 1);
 });
+
+// --- review blockers: identity must determine the request -------------------
+
+test('a nested empty object is refused; the top-level one and an empty ARRAY are not', () => {
+  assert.match(
+    configurationViolations({ generationConfig: {} })[0] ?? '',
+    /configuration\.generationConfig is an empty object/,
+  );
+  assert.match(configurationViolations({ a: { b: {} } })[0] ?? '', /configuration\.a\.b is an empty object/);
+  assert.match(configurationViolations({ a: {}, b: 1 })[0] ?? '', /configuration\.a is an empty object/);
+  // Exemptions, each for a stated reason:
+  assert.deepEqual(configurationViolations({}), [], 'the top-level {} is the real "sets no knobs" value');
+  assert.deepEqual(configurationViolations({ stop: [] }), [], 'an empty ARRAY is a leaf that changes the body');
+  assert.deepEqual(
+    configurationViolations({ tools: [{}] }),
+    [],
+    'and an empty object INSIDE an array rides along on a leaf that changes the body',
+  );
+});
+
+test('different digest implies different LEAF SET — identity determines the request', () => {
+  // The invariant the empty-object and dotted-key rules exist to create. With
+  // both refused, leaf-set and configuration are a bijection, so two entrants
+  // that hash differently cannot send the same request.
+  const accepted: ParticipantConfiguration[] = [
+    {},
+    { a: 1 },
+    { a: 2 },
+    { a: { b: 1 } },
+    { a: { b: 2 } },
+    { a: { b: 1 }, c: 'x' },
+    { c: 'x' },
+    { stop: [] },
+    { stop: ['x'] },
+    { tools: [{}] },
+    { reasoning: { effort: 'low' } },
+    { reasoning: { effort: 'high' } },
+  ];
+  const seen = new Map<string, string>();
+  for (const configuration of accepted) {
+    assert.deepEqual(configurationViolations(configuration), [], JSON.stringify(configuration));
+    const digest = configurationSha256(configuration);
+    const leaves = JSON.stringify(configurationLeaves(configuration));
+    const prior = seen.get(digest);
+    if (prior !== undefined) assert.equal(prior, leaves, 'one digest, one leaf set');
+    for (const [otherDigest, otherLeaves] of seen) {
+      if (otherDigest === digest) continue;
+      assert.notEqual(otherLeaves, leaves, `distinct digests must have distinct leaf sets: ${leaves}`);
+    }
+    seen.set(digest, leaves);
+  }
+  assert.equal(seen.size, accepted.length, 'every fixture is a distinct entrant');
+});
+
+test('values PostgreSQL jsonb cannot store are refused', () => {
+  // Measured against PostgreSQL 17.10, not reasoned about: a NUL is
+  // `unsupported Unicode escape sequence` in a value AND in a key, and each
+  // half of a split surrogate pair is `invalid input syntax for type json`.
+  // Accepting one means a roster that boots, spends a night, and then cannot
+  // be published.
+  const NUL = String.fromCharCode(0);
+  const HIGH = String.fromCharCode(0xd800);
+  const LOW = String.fromCharCode(0xdc00);
+  assert.match(configurationViolations({ note: `a${NUL}b` })[0] ?? '', /contains a NUL/);
+  assert.match(configurationViolations({ [`k${NUL}`]: 1 })[0] ?? '', /key that contains a NUL/);
+  assert.match(configurationViolations({ note: HIGH })[0] ?? '', /lone surrogate/);
+  assert.match(configurationViolations({ note: LOW })[0] ?? '', /lone surrogate/);
+  assert.match(configurationViolations({ note: `${LOW}${HIGH}` })[0] ?? '', /lone surrogate/);
+  assert.match(configurationViolations({ [`k${HIGH}`]: 1 })[0] ?? '', /key that contains a lone surrogate/);
+  assert.match(configurationViolations({ deep: { list: [HIGH] } })[0] ?? '', /lone surrogate/);
+});
+
+test('the storable characters PostgreSQL DOES accept are not refused', () => {
+  // The negative control, and it is the half that pins the boundary in the
+  // right place: all three of these store fine in jsonb (measured), so a build
+  // that refused "control characters" or "anything with a surrogate in it"
+  // would satisfy the test above and reject legal configurations.
+  assert.deepEqual(configurationViolations({ note: String.fromCharCode(31) }), []);
+  assert.deepEqual(configurationViolations({ note: '\u{1F600}' }), []);
+  assert.deepEqual(configurationViolations({ note: 'e\u0301 \u00e9 \u4e00' }), []);
+});

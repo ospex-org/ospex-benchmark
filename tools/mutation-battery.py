@@ -1,0 +1,365 @@
+"""Mutation battery for the per-participant configuration slice.
+
+ADVISORY. Run by hand, never in CI, and it gates nothing: it reports which
+stated guarantees are enforced by a test and which are only asserted in prose.
+
+    python tools/mutation-battery.py            # all mutants
+    python tools/mutation-battery.py M07 M25    # named mutants only
+
+Every mutation disables ONE stated guarantee. A guarantee whose mutant SURVIVES
+is a claim no test enforces, and the claim -- not the test -- is what gets
+corrected. Verdicts are KILLED / SURVIVED / INVALID / HUNG, and the last two
+matter as much as the first:
+
+  * INVALID means the mutation did not change the file, usually because a
+    refactor moved the code its needle pointed at. Scoring that as SURVIVED
+    would invent a coverage gap; scoring it as KILLED would hide a real one.
+  * HUNG means the suite did not finish. It is a distinct verdict because a
+    battery whose failure mode is "produces no output" needs one.
+
+Windows specifics, all learned the hard way and all load-bearing here:
+
+  * `Popen` + `DEVNULL`, never `subprocess.run(timeout=..., shell=True)`. That
+    call kills `cmd.exe` and leaves the `node` grandchild holding the stdout
+    pipe, so the parent then blocks forever reading a pipe nobody will close --
+    reporting nothing, scoring nothing, and orphaning test runners.
+  * `taskkill /F /T` kills the process TREE, not just its root.
+  * every verdict is flushed, so a wedged battery is distinguishable from a
+    slow one.
+  * the tree is restored in a `finally`, so a hang cannot stack the next mutant
+    on top of the last. Check `git status` afterwards regardless.
+"""
+import hashlib
+import io
+import os
+import subprocess
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TIMEOUT = 240
+
+# (id, file, needle, replacement, [test files whose failure counts as a kill])
+MUTANTS = [
+    # --- participantConfiguration.ts: the add-only merge -------------------
+    ('M01-merge-overwrites', 'src/participantConfiguration.ts',
+     '    throw new ConfigurationCollisionError(path);\n  }\n}',
+     '    target[key] = cloneJson(incoming);\n  }\n}',
+     ['src/requestShape.test.ts', 'src/participantConfiguration.test.ts']),
+    ('M02-merge-is-noop', 'src/participantConfiguration.ts',
+     '  const merged: Record<string, unknown> = { ...body };\n  mergeInto(merged, configuration, \'\');',
+     '  const merged: Record<string, unknown> = { ...body };',
+     ['src/requestShape.test.ts', 'src/participantConfiguration.test.ts']),
+    ('M03-merge-shallow-only', 'src/participantConfiguration.ts',
+     '    if (isPlainObject(existing) && isPlainObject(incoming)) {',
+     '    if (false && isPlainObject(existing) && isPlainObject(incoming)) {',
+     ['src/requestShape.test.ts', 'src/participantConfiguration.test.ts']),
+    ('M04-merge-shares-structure', 'src/participantConfiguration.ts',
+     '      target[key] = cloneJson(incoming);\n      continue;',
+     '      target[key] = incoming;\n      continue;',
+     ['src/participantConfiguration.test.ts']),
+
+    # --- the digest ---------------------------------------------------------
+    ('M05-digest-not-canonical', 'src/participantConfiguration.ts',
+     'return sha256Hex(canonicalize(configuration));',
+     'return sha256Hex(JSON.stringify(configuration));',
+     ['src/participantConfiguration.test.ts']),
+
+    # --- structural validation ---------------------------------------------
+    ('M06-size-bound-removed', 'src/participantConfiguration.ts',
+     '  if (bytes > MAX_CONFIGURATION_CANONICAL_BYTES) {',
+     '  if (false && bytes > MAX_CONFIGURATION_CANONICAL_BYTES) {',
+     ['src/participantConfiguration.test.ts']),
+    ('M07-size-bound-in-characters', 'src/participantConfiguration.ts',
+     "  const bytes = Buffer.byteLength(canonicalize(value), 'utf8');",
+     '  const bytes = canonicalize(value).length;',
+     ['src/participantConfiguration.test.ts']),
+    ('M08-identifier-bound-removed', 'src/participantConfiguration.ts',
+     '  if (identifierBytes > MAX_ENTRANT_IDENTIFIER_BYTES) {',
+     '  if (false && identifierBytes > MAX_ENTRANT_IDENTIFIER_BYTES) {',
+     ['src/participantConfiguration.test.ts']),
+    ('M09-nonfinite-accepted', 'src/participantConfiguration.ts',
+     "    if (!Number.isFinite(value)) violations.push(`${where} is a non-finite number`);",
+     '    if (false) violations.push(`${where}`);',
+     ['src/participantConfiguration.test.ts']),
+    ('M10-proto-key-accepted', 'src/participantConfiguration.ts',
+     '      if (key === FORBIDDEN_KEY) {\n        violations.push(`${where} uses the reserved key "${FORBIDDEN_KEY}"`);\n        continue;\n      }',
+     '      if (false) { continue; }',
+     ['src/participantConfiguration.test.ts']),
+
+    # --- declared versus sent ----------------------------------------------
+    ('M11-evidence-never-fires', 'src/participantConfiguration.ts',
+     '  const violations: string[] = [];\n  for (const leaf of configurationLeaves(declared)) {',
+     '  const violations: string[] = [];\n  for (const leaf of [] as Array<{ path: string; value: unknown }>) {',
+     ['src/participantConfiguration.test.ts', 'src/scoring.test.ts', 'src/requestShape.test.ts']),
+    ('M12-evidence-presence-only', 'src/participantConfiguration.ts',
+     '    if (canonicalizeUnknown(found.value) !== canonicalizeUnknown(leaf.value)) {',
+     '    if (false) {',
+     ['src/participantConfiguration.test.ts', 'src/scoring.test.ts', 'src/requestShape.test.ts']),
+    ('M13-leaves-top-level-only', 'src/participantConfiguration.ts',
+     '    if (isPlainObject(member)) {\n      collectLeaves(member, path, leaves);\n      continue;\n    }',
+     '    if (false) { continue; }',
+     ['src/participantConfiguration.test.ts']),
+
+    # --- requestPlan.ts -----------------------------------------------------
+    ('M14-evidence-empty', 'src/providers/requestPlan.ts',
+     '    if (!prompt.has(key)) requestParams[key] = body[key];',
+     '    if (false) requestParams[key] = body[key];',
+     ['src/requestShape.test.ts']),
+    ('M15-prompt-recorded', 'src/providers/requestPlan.ts',
+     '  const prompt = new Set(spec.promptKeys);',
+     '  const prompt = new Set<string>();',
+     ['src/requestShape.test.ts']),
+    ('M16-configuration-not-merged', 'src/providers/requestPlan.ts',
+     '  const body = applyConfiguration(spec.body, spec.configuration);',
+     '  const body = { ...spec.body };',
+     ['src/requestShape.test.ts', 'src/records.test.ts']),
+
+    # --- family.ts: the entrant collision -----------------------------------
+    ('M17-collision-ignores-configuration', 'src/providers/family.ts',
+     'JSON.stringify([id.trim().toLowerCase(), arm.configurationSha256])',
+     'JSON.stringify([id.trim().toLowerCase()])',
+     ['src/family.test.ts']),
+    ('M18-collision-removed', 'src/providers/family.ts',
+     '      if (prior && prior.participantId !== arm.participantId) {',
+     '      if (false) {',
+     ['src/family.test.ts', 'src/lineOpenSpine.test.ts']),
+
+    # --- scoring.ts: the roster stamp is VERIFIED, not read ------------------
+    ('M19-stamp-never-read', 'src/scoring.ts',
+     '  if (run.armRoster !== null) {',
+     '  if (false && run.armRoster !== null) {',
+     ['src/scoring.test.ts']),
+    ('M20-stamp-digest-not-recomputed', 'src/scoring.ts',
+     '      if (recomputed !== entry.configurationSha256) {',
+     '      if (false) {',
+     ['src/scoring.test.ts']),
+    ('M21-stamp-not-compared-to-precommitment', 'src/scoring.ts',
+     '      if (entry.configurationSha256 !== expectedDigest) {',
+     '      if (false) {',
+     ['src/scoring.test.ts']),
+    ('M22-response-digest-unchecked', 'src/scoring.ts',
+     '      if (response.configurationSha256 !== entry.configurationSha256) {',
+     '      if (false) {',
+     ['src/scoring.test.ts']),
+    ('M23-evidence-gate-skipped', 'src/scoring.ts',
+     '      for (const violation of configurationEvidenceViolations(declared, attempt.requestParams)) {',
+     '      for (const violation of [] as string[]) {',
+     ['src/scoring.test.ts']),
+    ('M24-stamp-parsed-as-absent', 'src/scoring.ts',
+     '    armRoster: meta.armRoster ?? null,',
+     '    armRoster: null,',
+     ['src/scoring.test.ts']),
+    ('M25-collision-input-drops-digest', 'src/scoring.ts',
+     '      configurationSha256: configurationSha256(arm.configuration),\n      reportedModelIds:',
+     "      configurationSha256: '',\n      reportedModelIds:",
+     ['src/scoring.test.ts']),
+
+    # --- records.ts: what gets stamped --------------------------------------
+    ('M26-stamp-constant-configuration', 'src/records.ts',
+     '        configuration: arm.configuration,\n        configurationSha256: configurationSha256(arm.configuration),',
+     '        configuration: {},\n        configurationSha256: configurationSha256({}),',
+     ['src/records.test.ts']),
+    ('M27-arm-row-digest-dropped', 'src/records.ts',
+     '      configurationSha256: configurationSha256(result.arm.configuration),\n      reportedModelId: reportedModelId(result),',
+     '      reportedModelId: reportedModelId(result),',
+     ['src/records.test.ts']),
+    ('M28-roster-stamp-dropped', 'src/records.ts',
+     '    armRoster: env.expectedArms.map((participantId) => {',
+     '    armRosterDisabled: env.expectedArms.map((participantId) => {',
+     ['src/records.test.ts']),
+
+    # --- runner.ts: the configuration reaches the provider -------------------
+    ('M29-runner-drops-configuration', 'src/runner.ts',
+     '      configuration: adapter.arm.configuration,',
+     '      configuration: {},',
+     ['src/records.test.ts']),
+
+    # --- manifestValidate.ts -------------------------------------------------
+    ('M30-manifest-digest-unchecked', 'src/manifestValidate.ts',
+     '    if (declared !== inCode) {',
+     '    if (false) {',
+     ['src/manifestValidate.test.ts']),
+    ('M31-credential-check-removed', 'src/manifestValidate.ts',
+     '  if (redactSecrets(canonicalText) !== canonicalText) {',
+     '  if (false) {',
+     ['src/manifestValidate.test.ts']),
+    ('M32-mergeability-not-checked', 'src/manifestValidate.ts',
+     '  violations.push(...mergeabilityViolations(arm.participantId, arm.configuration));',
+     '  violations.push();',
+     ['src/manifestValidate.test.ts']),
+    ('M33-mergeability-samples-one-leg', 'src/manifestValidate.ts',
+     "    { label: 'the initial leg', options: { tools: 'declared', maxOutputTokens: 16_000 } },",
+     "    { label: 'the repair leg only', options: { tools: 'none', maxOutputTokens: 16_000 } },",
+     ['src/manifestValidate.test.ts']),
+
+    # --- fireArtifact.ts: the v1 identity refuses rather than drops -----------
+    ('M34-identity-drops-configuration', 'src/fireArtifact.ts',
+     '  if (Object.keys(entry.configuration).length > 0) {',
+     '  if (false) {',
+     ['src/fireArtifact.test.ts']),
+
+    # --- manifest.ts: the schema gate ----------------------------------------
+    ('M35-manifest-configuration-optional', 'src/manifest.ts',
+     '    configuration: participantConfigurationSchema,',
+     '    configuration: participantConfigurationSchema.optional().default({}),',
+     ['src/manifest.test.ts', 'src/manifestValidate.test.ts']),
+    ('M36-manifest-skips-configuration-validation', 'src/manifest.ts',
+     '    for (const violation of configurationViolations(arm.configuration, {',
+     '    for (const violation of [] as string[]) { void configurationViolations; }\n    for (const violation of [] as string[]) { void ({',
+     ['src/manifest.test.ts']),
+# --- fixes from the adversarial pass -------------------------------------
+    ('M37-record-only-names-unprotected', 'src/providers/requestPlan.ts',
+     '    if (recordOnly.has(key)) throw new ConfigurationRecordCollisionError(key);',
+     '    if (false) throw new ConfigurationRecordCollisionError(key);',
+     ['src/requestShape.test.ts']),
+    ('M38-dotted-key-accepted', 'src/participantConfiguration.ts',
+     "      if (key.includes('.')) {",
+     "      if (false) {",
+     ['src/participantConfiguration.test.ts']),
+    ('M39-collision-digest-unvalidated', 'src/providers/family.ts',
+     '    if (!/^[0-9a-f]{64}$/.test(arm.configurationSha256)) {',
+     '    if (false) {',
+     ['src/family.test.ts']),
+    ('M40-no-boot-entrant-check', 'src/manifestValidate.ts',
+     '    if (prior !== undefined && prior !== arm.participantId) {',
+     '    if (false) {',
+     ['src/manifestValidate.test.ts']),
+    ('M41-configuration-checks-after-the-guards', 'src/manifestValidate.ts',
+     '    for (const violation of configurationViolationsFor(arm)) {\n      violations.push(`roster arm "${arm.participantId}" ${violation}`);\n    }\n    if (seen.has(arm.participantId)) {',
+     '    if (seen.has(arm.participantId)) {',
+     ['src/manifestValidate.test.ts']),
+    ('M42-stamped-provider-unchecked', 'src/scoring.ts',
+     '      if (entry.provider !== arm.provider) {',
+     '      if (false) {',
+     ['src/scoring.test.ts']),
+    ('M43-stamped-model-unchecked', 'src/scoring.ts',
+     '      if (entry.requestedModelId !== arm.requestedModelId) {',
+     '      if (false) {',
+     ['src/scoring.test.ts']),
+    ('M44-decision-digest-unchecked', 'src/scoring.ts',
+     '      if (pick.configurationSha256 !== entry.configurationSha256) {',
+     '      if (false) {',
+     ['src/scoring.test.ts']),
+    ('M45-decision-missing-digest-allowed', 'src/scoring.ts',
+     '      if (pick.configurationSha256 === null) {',
+     '      if (false) {',
+     ['src/scoring.test.ts']),
+    # Two `['repair', response.repair],` lines exist; anchor on the one paired
+    # with the attempt leg inside the evidence loop.
+    ('M46-repair-leg-not-evidenced', 'src/scoring.ts',
+     "      ['attempt', response.attempt],\n      ['repair', response.repair],",
+     "      ['attempt', response.attempt],",
+     ['src/scoring.test.ts']),
+    ('M47-mock-drops-configuration', 'src/mock.ts',
+     '        requestParams: applyConfiguration(response.requestParams, configuration),',
+     '        requestParams: response.requestParams,',
+     ['src/requestShape.test.ts']),
+    ('M48-fake-drops-configuration', 'src/realShapedFake.ts',
+     '        requestParams: applyConfiguration(response.requestParams, configuration),',
+     '        requestParams: response.requestParams,',
+     ['src/requestShape.test.ts']),
+# --- fixes from the PR #101 review ---------------------------------------
+    ('M49-empty-nested-object-accepted', 'src/participantConfiguration.ts',
+     "    if (!insideArray && path !== '' && Object.keys(value).length === 0) {",
+     '    if (false) {',
+     ['src/participantConfiguration.test.ts', 'src/requestShape.test.ts']),
+    ('M50-nul-accepted', 'src/participantConfiguration.ts',
+     "return 'contains a NUL, which jsonb cannot store';",
+     'return null;',
+     ['src/participantConfiguration.test.ts']),
+    ('M51-lone-surrogate-accepted', 'src/participantConfiguration.ts',
+     "  if (LONE_SURROGATE.test(text)) return 'contains a lone surrogate, which is not valid JSON';",
+     '  if (false) return null;',
+     ['src/participantConfiguration.test.ts']),
+    ('M52-raw-proto-not-prescanned', 'src/manifest.ts',
+     '  if (protoAt !== null) {',
+     '  if (false) {',
+     ['src/manifest.test.ts']),
+    ('M53-erased-request-evidence-allowed', 'src/scoring.ts',
+     '        if (run.armRoster !== null && reachedProvider(attempt)) {',
+     '        if (false) {',
+     ['src/scoring.test.ts']),
+    ('M54-reached-provider-always-false', 'src/scoring.ts',
+     '    attempt.rawResponse !== null ||',
+     '    false ||',
+     ['src/scoring.test.ts']),
+]
+
+
+def sha(path):
+    with io.open(path, 'rb') as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def run(files):
+    """Run a test subset. Returns 'PASS' | 'FAIL' | 'HUNG'."""
+    cmd = 'npx tsx --test ' + ' '.join(files)
+    proc = subprocess.Popen(
+        cmd, cwd=REPO, shell=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        return 'PASS' if proc.wait(timeout=TIMEOUT) == 0 else 'FAIL'
+    except subprocess.TimeoutExpired:
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        return 'HUNG'
+
+
+def main():
+    only = sys.argv[1:] or None
+    results = []
+
+    # M0: the no-mutation control. If the suite is not green to begin with,
+    # every "killed" verdict below is meaningless.
+    control_files = sorted({f for m in MUTANTS for f in m[4]})
+    print('M00-control (no mutation): ', end='', flush=True)
+    control = run(control_files)
+    print(control, flush=True)
+    if control != 'PASS':
+        sys.exit('REFUSING: the unmutated suite is not green; no verdict is trustworthy')
+
+    for mid, relpath, needle, replacement, files in MUTANTS:
+        if only and mid not in only:
+            continue
+        path = os.path.join(REPO, relpath)
+        original = io.open(path, encoding='utf-8', newline='').read()
+        before = sha(path)
+        # The needle is written with \n; the tree may be CRLF. Try both, and
+        # never fall back to a partial match.
+        for candidate in (needle, needle.replace('\n', '\r\n')):
+            if original.count(candidate) == 1:
+                nl = '\r\n' if '\r\n' in candidate else '\n'
+                mutated = original.replace(candidate, replacement.replace('\n', nl))
+                break
+        else:
+            hits = original.count(needle) + original.count(needle.replace('\n', '\r\n'))
+            print('%-42s INVALID (needle matched %d times)' % (mid, hits), flush=True)
+            results.append((mid, 'INVALID'))
+            continue
+        try:
+            io.open(path, 'w', encoding='utf-8', newline='').write(mutated)
+            if sha(path) == before:
+                print('%-42s INVALID (file unchanged)' % mid, flush=True)
+                results.append((mid, 'INVALID'))
+                continue
+            outcome = run(files)
+            verdict = {'FAIL': 'KILLED', 'PASS': 'SURVIVED', 'HUNG': 'HUNG'}[outcome]
+            print('%-42s %s' % (mid, verdict), flush=True)
+            results.append((mid, verdict))
+        finally:
+            io.open(path, 'w', encoding='utf-8', newline='').write(original)
+            assert sha(path) == before, 'restore failed for %s' % relpath
+
+    print('')
+    for verdict in ('KILLED', 'SURVIVED', 'INVALID', 'HUNG'):
+        names = [m for m, v in results if v == verdict]
+        print('%-9s %d%s' % (verdict, len(names), (': ' + ', '.join(names)) if names and verdict != 'KILLED' else ''))
+
+
+if __name__ == '__main__':
+    main()

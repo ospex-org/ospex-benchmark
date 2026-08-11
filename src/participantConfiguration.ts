@@ -118,7 +118,7 @@ export function configurationViolations(
     ];
   }
 
-  walkJson(value, '', violations);
+  walkJson(value, '', violations, false);
   if (violations.length > 0) return violations;
 
   const bytes = Buffer.byteLength(canonicalize(value), 'utf8');
@@ -138,9 +138,42 @@ export function configurationViolations(
   return violations;
 }
 
-function walkJson(value: unknown, path: string, violations: string[]): void {
+/**
+ * A lone surrogate: a high one not followed by a low, or a low one not
+ * preceded by a high. Legal in a JavaScript string and NOT legal JSON — which
+ * makes it exactly the kind of value that passes every check written in
+ * JavaScript and then fails at the database.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/**
+ * Why a string cannot be stored, or null.
+ *
+ * These are the shapes `canonicalize` serializes happily and `jsonb` refuses,
+ * so accepting one means a roster that boots, spends a night of provider
+ * calls, and then cannot be published.
+ *
+ * MEASURED against PostgreSQL 17.10 rather than reasoned about, because the
+ * boundary is not where it looks: a NUL is `unsupported Unicode escape
+ * sequence` in a value AND in a key, and both halves of a split surrogate pair
+ * are `invalid input syntax for type json` — while other control characters
+ * (U+001F) and well-formed surrogate pairs store fine. So the rule is these
+ * two, not "control characters".
+ */
+function unstorableString(text: string): string | null {
+  if (text.includes('\u0000')) return 'contains a NUL, which jsonb cannot store';
+  if (LONE_SURROGATE.test(text)) return 'contains a lone surrogate, which is not valid JSON';
+  return null;
+}
+
+function walkJson(value: unknown, path: string, violations: string[], insideArray: boolean): void {
   const where = path === '' ? 'configuration' : `configuration.${path}`;
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
+  if (value === null || typeof value === 'boolean') return;
+  if (typeof value === 'string') {
+    const unstorable = unstorableString(value);
+    if (unstorable !== null) violations.push(`${where} ${unstorable}`);
+    return;
+  }
   if (typeof value === 'number') {
     // canonicalize() throws on these, which would be a mid-run crash rather
     // than a refused roster; and jsonb has no representation for them either.
@@ -148,7 +181,12 @@ function walkJson(value: unknown, path: string, violations: string[]): void {
     return;
   }
   if (Array.isArray(value)) {
-    value.forEach((item, index) => walkJson(item, path === '' ? `${index}` : `${path}.${index}`, violations));
+    // Everything below an array is exempt from the empty-object rule below: an
+    // array is a LEAF, replaced whole, so any change inside it changes the
+    // request.
+    value.forEach((item, index) =>
+      walkJson(item, path === '' ? `${index}` : `${path}.${index}`, violations, true),
+    );
     return;
   }
   if (isPlainObject(value)) {
@@ -156,9 +194,31 @@ function walkJson(value: unknown, path: string, violations: string[]): void {
       violations.push(`${where} is a class instance, not a plain JSON object`);
       return;
     }
+    // An empty object as the value of a KEY contributes nothing to the request
+    // and nothing to the evidence, while still contributing to the digest — so
+    // `{}` and `{"generationConfig":{}}` are two entrant IDENTITIES that send
+    // byte-identical requests, and neither the duplicate-entrant gate nor the
+    // post-run collision check can tell them apart.
+    //
+    // Refusing it is what makes leaf-set and configuration a BIJECTION (dotted
+    // keys, the other way to break it, are refused below), and therefore what
+    // makes "different digest" mean "different request". The top-level `{}` is
+    // exempt — it is the real "sets no knobs" value — and so is an empty
+    // ARRAY, which is a leaf that does change the body.
+    if (!insideArray && path !== '' && Object.keys(value).length === 0) {
+      violations.push(
+        `${where} is an empty object, which changes the digest without changing the request`,
+      );
+      return;
+    }
     for (const key of Object.keys(value)) {
       if (key === FORBIDDEN_KEY) {
         violations.push(`${where} uses the reserved key "${FORBIDDEN_KEY}"`);
+        continue;
+      }
+      const unstorableKey = unstorableString(key);
+      if (unstorableKey !== null) {
+        violations.push(`${where} has a key that ${unstorableKey}`);
         continue;
       }
       if (key.includes('.')) {
@@ -171,7 +231,7 @@ function walkJson(value: unknown, path: string, violations: string[]): void {
         violations.push(`${where} key "${key}" contains a dot, which is the evidence path separator`);
         continue;
       }
-      walkJson(value[key], path === '' ? key : `${path}.${key}`, violations);
+      walkJson(value[key], path === '' ? key : `${path}.${key}`, violations, insideArray);
     }
     return;
   }
