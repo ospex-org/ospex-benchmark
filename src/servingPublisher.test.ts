@@ -465,20 +465,18 @@ test('a refused artifact is a REFUSAL, distinct from having nothing to publish',
 });
 
 test('a self-consistent artifact claiming the WRONG MODEL for a real arm is refused', async () => {
-  const run = await firedRun({ outDir: tempDir('serving-forge-'), enrolled: true });
-  const text = readFileSync(run.runFile, 'utf8');
-
-  // The forgery: keep a real participant id, change the model it declares. The
-  // file stays internally consistent, so nothing about it is self-evidently
-  // wrong — which is exactly why the check cannot be allowed to derive the
-  // expected identity FROM the file. It did, and this passed, and the projector
-  // published the contradictory identity.
-  const forged = text
-    .split(/\r?\n/)
-    .filter((line) => line.trim() !== '')
-    .map((line) => line.replace(/"requestedModelId":"[^"]+"/g, '"requestedModelId":"not-this-arms-model"'))
-    .join('\n');
-  writeFileSync(run.runFile, `${forged}\n`, 'utf8');
+  // FIRED with the forgery rather than patched into it. Patching the file only
+  // ever produced a file that disagreed with ITSELF, which is refused by the
+  // body check — so the case passed while proving nothing about registry
+  // anchoring, and a mutant that went back to deriving identity from the
+  // artifact survived it. Dispatching the wrong model makes the records and the
+  // archived body agree, so the ONLY thing left to disagree with is the
+  // registry.
+  const run = await firedRun({
+    outDir: tempDir('serving-forge-'),
+    enrolled: true,
+    contradictModel: true,
+  });
 
   const port = new RecordingPort();
   const summary = await publishRunArtifact(port, run.runFile, collector().log);
@@ -549,4 +547,31 @@ test('the deadline binds a decision\'s reveal and rationale, not just its seal',
   // The seal is admitted; the reveal and rationale are past the line.
   assert.ok(summary.published <= 1, `expected at most the seal, got ${summary.published}`);
   assert.ok(summary.skipped.some((reason) => reason.includes('abandoned')));
+});
+
+test('a write is bounded by what is LEFT, not by the per-write timeout', async () => {
+  const { plan } = await planFromFire();
+  const one: ProjectionPlan = { ...plan, attempts: plan.attempts.slice(0, 1), decisions: [] };
+
+  // The per-write timeout is far larger than the budget, so a write that took
+  // its own full allowance would run long past the deadline it started before.
+  // Only the clamp stops that, and nothing else in the suite exercises it.
+  const started = Date.now();
+  const summary = await publishPlan(
+    {
+      publishAttempt: () => new Promise<never>(() => undefined),
+      sealDecision: () => new Promise<never>(() => undefined),
+      revealDecision: () => new Promise<never>(() => undefined),
+      publishRationale: () => new Promise<never>(() => undefined),
+      publishScore: () => new Promise<never>(() => undefined),
+      publishScoringRun: () => new Promise<never>(() => undefined),
+    },
+    one,
+    collector().log,
+    { deadlineMs: 40, perWriteTimeoutMs: 60_000 },
+  );
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 5_000, `the clamp did not bind: took ${elapsed}ms`);
+  assert.ok((summary.rejected['unavailable'] ?? 0) > 0);
 });

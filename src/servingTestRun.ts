@@ -160,6 +160,15 @@ export interface FireOptions {
   readonly enrolled?: boolean;
   readonly mode?: 'live' | 'dry-run';
   readonly behaviour?: StubBehaviour;
+  /**
+   * Dispatch the enrolled participant under a model it does not run.
+   *
+   * Produces a SELF-CONSISTENT artifact — records and archived body agree —
+   * that disagrees only with the registry. Patching the file cannot make
+   * this, because the body echoes the identity and the verifier re-reads it,
+   * and a patched file is refused for the wrong reason.
+   */
+  readonly contradictModel?: boolean;
 }
 
 export async function firedRun(options: FireOptions): Promise<FiredRun> {
@@ -183,7 +192,10 @@ export async function firedRun(options: FireOptions): Promise<FiredRun> {
           ...TEST_ARM,
           participantId: enrolled.participantId,
           provider: enrolled.provider,
-          requestedModelId: enrolled.requestedModelId,
+          requestedModelId:
+            options.contradictModel === true
+              ? 'a-model-this-arm-does-not-run'
+              : enrolled.requestedModelId,
         }
       : TEST_ARM;
 

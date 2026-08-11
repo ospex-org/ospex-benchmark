@@ -1177,6 +1177,75 @@ async function main(): Promise<void> {
     rmSync(artifactDir, { recursive: true, force: true });
   }
 
+  // ── the activation latch, against a real pre-migration schema ─────────────
+  await check('the publisher REFUSES to open while the schema cannot hold an arm', async () => {
+    // The control that makes merging safe, checked against a database that
+    // genuinely lacks the columns rather than against a stub that says it does.
+    // Until this existed the only thing between this schema and permanent
+    // dimensionless participant rows was that nobody had set the credential —
+    // and both the README and .env.example explain how to set it.
+    const saved = {
+      url: process.env['BENCHMARK_DB_URL'],
+      writer: process.env['BENCHMARK_WRITER'],
+    };
+    delete process.env['BENCHMARK_WRITER'];
+    process.env['BENCHMARK_DB_URL'] =
+      `postgresql://benchmark_writer:${encodeURIComponent(PASSWORD)}@${HOST}:${PORT}/${NAME}?sslmode=disable`;
+    try {
+      const { openBenchmarkServing } = await import('./benchmarkServingClient.js');
+      const handle = await openBenchmarkServing();
+      try {
+        assert.deepEqual(
+          handle.status,
+          { enabled: false, reason: 'schema_not_ready' },
+          'the latch must hold against a schema with no model_id/configuration',
+        );
+        // And it is a real hold, not a label: the port writes nothing.
+        expect(await handle.port.publishAttempt(armAttempt('latch-probe')), 'disabled', 'a held publisher');
+      } finally {
+        await handle.close();
+      }
+
+      // NEGATIVE CONTROL. Add the three columns and the same call must open —
+      // otherwise this check would pass against a latch that is simply always
+      // on, which would be indistinguishable from the feature never working.
+      const owner = new Client({ host: HOST, port: PORT, database: NAME, user: 'postgres', password: 't' });
+      await owner.connect();
+      try {
+        await owner.query(
+          `alter table public.benchmark_participants
+             add column if not exists model_id text,
+             add column if not exists configuration jsonb,
+             add column if not exists configuration_sha256 text`,
+        );
+        const opened = await openBenchmarkServing();
+        try {
+          assert.deepEqual(opened.status, { enabled: true }, 'the latch must lift once the schema is ready');
+        } finally {
+          await opened.close();
+        }
+      } finally {
+        // Put the schema back, so every other check still runs against the
+        // shape production actually has.
+        await owner.query(
+          `alter table public.benchmark_participants
+             drop column if exists model_id,
+             drop column if exists configuration,
+             drop column if exists configuration_sha256`,
+        );
+        await owner.end();
+      }
+    } finally {
+      for (const [name, value] of [
+        ['BENCHMARK_DB_URL', saved.url],
+        ['BENCHMARK_WRITER', saved.writer],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   await pool.end();
 
   const failed = results.filter((r) => !r.ok);
