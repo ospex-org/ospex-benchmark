@@ -96,7 +96,7 @@ MUTANTS = [
      '    if (false) {',
      ['src/participantConfiguration.test.ts', 'src/scoring.test.ts', 'src/requestShape.test.ts']),
     ('M13-leaves-top-level-only', 'src/participantConfiguration.ts',
-     '    if (isPlainObject(member)) {\n      collectLeaves(member, path, leaves);\n      continue;\n    }',
+     '    if (isPlainObject(member)) {\n      collectLeaves(member, segments, leaves);\n      continue;\n    }',
      '    if (false) { continue; }',
      ['src/participantConfiguration.test.ts']),
 
@@ -260,7 +260,7 @@ MUTANTS = [
      ['src/requestShape.test.ts']),
 # --- fixes from the PR #101 review ---------------------------------------
     ('M49-empty-nested-object-accepted', 'src/participantConfiguration.ts',
-     "    if (!insideArray && path !== '' && Object.keys(value).length === 0) {",
+     "    if (!insideArray && segments.length > 0 && Object.keys(value).length === 0) {",
      '    if (false) {',
      ['src/participantConfiguration.test.ts', 'src/requestShape.test.ts']),
     ('M50-nul-accepted', 'src/participantConfiguration.ts',
