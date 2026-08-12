@@ -389,3 +389,61 @@ test('row counts that cannot be READ are not reported as unchanged', async () =>
     `the operator must be told the bookend proved nothing; got ${JSON.stringify(it.lines)}`,
   );
 });
+
+test('a table whose policies stop covering this role is a FAILURE, not a pass', async () => {
+  // RLS being enabled is not the same as this role being able to write through
+  // it. Measured against PostgreSQL 17: with the writer policy retargeted at
+  // another role the gate passed, and the real insert came back 42501,
+  // "new row violates row-level security policy".
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('write THROUGH'));
+  assert.ok(check, 'the RLS policy check is gone');
+
+  const healthy = { name: 'benchmark_runs', writable: '1', readable: '1', restrictive: '0', policies: 'p' };
+  assert.equal((await check.run(async () => [healthy])).ok, true, 'the control must pass');
+
+  for (const [what, row] of [
+    ['no INSERT policy', { ...healthy, writable: '0' }],
+    ['no SELECT policy', { ...healthy, readable: '0' }],
+    ['a RESTRICTIVE policy', { ...healthy, restrictive: '1' }],
+  ] as const) {
+    const verdict = await check.run(async () => [row]);
+    assert.equal(verdict.ok, false, `${what} must fail`);
+    assert.match(verdict.detail, /benchmark_runs/);
+  }
+
+  // The capability table needs SELECT but must NOT need INSERT — every
+  // statement reads the stored row to detect drift, and a writer that could
+  // insert the capability row would be authorising its own writes.
+  const capability = { name: 'benchmark_schema_capability', writable: '0', readable: '1', restrictive: '0', policies: 'p' };
+  assert.equal((await check.run(async () => [capability])).ok, true);
+});
+
+test('a SECURITY DEFINER function this role can execute is a FAILURE', async () => {
+  // The grid and the relation sweep both answer "what may this role touch
+  // DIRECTLY". A SECURITY DEFINER function runs as its owner, so EXECUTE on one
+  // is a door around both — measured: with no grant of any kind on a table
+  // outside the projection, the writer inserted into it through such a function.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('SECURITY DEFINER'));
+  assert.ok(check, 'the function-reachability check is gone');
+
+  assert.equal((await check.run(async () => [])).ok, true, 'none executable is the healthy state');
+
+  const verdict = await check.run(async () => [{ fn: 'public.rpc_something' }]);
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.detail, /public\.rpc_something/);
+});
+
+test('the forbidden-reader question covers every verb, not just the reads', async () => {
+  // Asserted on the statement that was SENT: the semantics live in the SQL and
+  // no fake can evaluate them. Measured — a DELETE granted to a browser-facing
+  // key passed the read-only version of this question while that role really
+  // could delete published rows.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('public read keys'));
+  assert.ok(check, 'the read-keys check is gone');
+  const { query, seen } = rowsFor({ pg_roles: [{ rolname: 'anon' }] });
+  await check.run(query);
+  const sql = seen.join('\n');
+  assert.match(sql, /unnest\(\$3::text\[\]\) as v/, 'the verbs must be a parameter, not two hard-coded reads');
+  assert.match(sql, /has_table_privilege\(r, 'public\.' \|\| t, v\)/);
+  assert.match(sql, /has_any_column_privilege\(r, 'public\.' \|\| t, v\)/);
+});

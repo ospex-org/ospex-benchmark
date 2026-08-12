@@ -278,10 +278,20 @@ Ask the configured database whether it can hold these writes, before any are
 sent. It checks the capability version, hands every statement the publisher will
 run to the server's own planner, reads the privilege grid at table *and* column
 level, and confirms the entrant identity index is unique, nulls-not-distinct and
-partial on models — the three properties whose absence is silent. It also checks
-what the *other* roles can reach: the browser-facing keys must not touch the
-projection at all, and the read API's key must hold no privilege of any kind on
-the model-authored rationale.
+partial on models — the three properties whose absence is silent.
+
+It also asks the questions a privilege grid alone cannot answer:
+
+- **what the *other* roles can reach**, by every verb — the browser-facing keys
+  must not touch the projection at all, and the read API's key must hold no
+  privilege of any kind on the model-authored rationale;
+- **whether the writer can write *through* row level security.** RLS being
+  enabled is not the same as a policy admitting this role: a table whose only
+  permissive policy stops naming the writer refuses every insert while every
+  grant in the grid still says yes;
+- **whether a `SECURITY DEFINER` function carries the role past its grants.**
+  Such a function runs as its owner, so `EXECUTE` on one is a door around the
+  whole grid — and `EXECUTE` is granted to `PUBLIC` by default.
 
 It is read-only and proves it: the connection carries
 `default_transaction_read_only=on`, the server is made to refuse a write before

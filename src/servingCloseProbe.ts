@@ -162,6 +162,18 @@ function fakePostgres(
 const say = (message: string): void => { process.stdout.write(`${message}\n`); };
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => { setTimeout(resolve, ms).unref?.(); });
+/**
+ * The same wait, REF'D.
+ *
+ * `delay` is unref'd because it always loses a race and is never cleared — a
+ * ref'd loser would hold the process past the thing being measured. This one
+ * races nothing: it exists so the process is still here AFTER the connection
+ * is dropped, and the line printed on the far side of it is the proof. Unref'd,
+ * Node drains the loop and exits first, and the proof never prints — which
+ * reads exactly like the case passing.
+ */
+const linger = (ms: number): Promise<void> =>
+  new Promise((resolve) => { setTimeout(resolve, ms); });
 
 /**
  * A valid attempt, so the write reaches the DATABASE rather than being turned
@@ -204,7 +216,8 @@ async function main(): Promise<void> {
     : mode === 'stale' ? 1
     : mode === 'bogus' ? 'bogus' as const
     : 'silent' as const;
-  const { port, sawQuery } = await fakePostgres(mode === 'reset' ? 2 : answer, mode === 'reset');
+  const drops = mode === 'reset' || mode === 'sink';
+  const { port, sawQuery } = await fakePostgres(drops ? 2 : answer, drops);
   // `sslmode=disable` is LOAD-BEARING, not tidiness. With no CA configured the
   // resolver attaches `ssl: { rejectUnauthorized: false }`, `pg` opens with an
   // SSLRequest, this server refuses it, and the connection dies before a query
@@ -235,17 +248,24 @@ async function main(): Promise<void> {
   const serving = await openBenchmarkServing({
     readinessTimeoutMs: 300,
     closeTimeoutMs: 300,
-    onError: (line) => say(`${mode}: onError ${line}`),
+    onError: (line) => {
+      say(`${mode}: onError ${line}`);
+      // `sink` is the case where REPORTING is what breaks. `printError` writes
+      // to stderr, and stderr raises EPIPE when the run is piped into something
+      // that has already exited — so the listener that stops one crash must not
+      // introduce another.
+      if (mode === 'sink') throw new Error('EPIPE: the sink is closed');
+    },
   });
   say(`${mode}: status=${serving.status.enabled ? 'enabled' : serving.status.reason}`);
   say(`${mode}: reachedServer=${sawQuery()}`);
 
-  if (mode === 'reset') {
+  if (drops) {
     // Nothing to do but survive. The server drops the connection while the
     // client sits idle in the pool; the only question is whether this process
     // is still here afterwards to exit 0.
-    await delay(600);
-    say('reset: still running after the connection was dropped');
+    await linger(600);
+    say(`${mode}: still running after the connection was dropped`);
     await serving.close();
     return;
   }

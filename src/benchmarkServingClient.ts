@@ -322,7 +322,18 @@ export async function openBenchmarkServing(
   // reported as `unavailable` by the port; what this adds is that the process
   // stays alive to report it.
   pool.on('error', (error: unknown) => {
-    onError(`serving projection: a pooled connection failed (${describeError(error)}) — the pool will reconnect`);
+    try {
+      onError(`serving projection: a pooled connection failed (${describeError(error)}) — the pool will reconnect`);
+    } catch {
+      // ⚠ THE REPORTING PATH IS ITSELF A CRASH PATH. This runs inside an event
+      //   handler, so a throw here is uncaught exactly like the one the listener
+      //   exists to prevent — and the sink is `printError`, which writes to
+      //   stderr, which raises EPIPE when the run is piped into something that
+      //   has already exited. Fixing one crash by adding another is not a fix.
+      //
+      //   Nowhere is left to report it: the place we would report to is the
+      //   thing that broke. The run continues, which is the whole point.
+    }
   });
   const poolLike = pool as unknown as PoolLike;
 

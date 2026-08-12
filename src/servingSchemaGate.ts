@@ -667,14 +667,20 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
 
       const browserKeys = FORBIDDEN_READERS.filter((role) => present.has(role));
       if (browserKeys.length > 0) {
+        // EVERY verb. Asking only about reads was a false negative with teeth:
+        // measured, a DELETE granted to a browser-facing key passed this check
+        // while that role really could delete published rows.
         const reach = await query(
-          `select r as role, t as name
-             from unnest($1::text[]) as r, unnest($2::text[]) as t
-            where has_any_column_privilege(r, 'public.' || t, 'SELECT')
-               or has_any_column_privilege(r, 'public.' || t, 'INSERT')`,
-          [browserKeys, [...SERVING_TABLES]],
+          `select r as role, t as name, v as verb
+             from unnest($1::text[]) as r, unnest($2::text[]) as t, unnest($3::text[]) as v
+            where case when v in ('DELETE', 'TRUNCATE', 'TRIGGER')
+                       then has_table_privilege(r, 'public.' || t, v)
+                       else has_any_column_privilege(r, 'public.' || t, v) end`,
+          [browserKeys, [...SERVING_TABLES], [...ALL_VERBS]],
         );
-        for (const row of reach) faults.push(`${String(row['role'])} reaches ${String(row['name'])}`);
+        for (const row of reach) {
+          faults.push(`${String(row['role'])} holds ${String(row['verb'])} on ${String(row['name'])}`);
+        }
       }
 
       if (present.has(READ_API_ROLE)) {
@@ -716,6 +722,99 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
       return rows.length === 0
         ? { ok: true, detail: `RLS on all ${SERVING_TABLES.length}` }
         : { ok: false, detail: `off on ${rows.map((row) => String(row['name'])).join(', ')}` };
+    },
+  },
+
+  {
+    name: 'the writer can actually write THROUGH row level security',
+    async run(query) {
+      // RLS being ENABLED is not the same as this role being able to write. A
+      // table whose only permissive policy stops naming the writer denies every
+      // insert while every grant in the grid still says yes — measured: the gate
+      // passed, and the real write came back
+      // `new row violates row-level security policy`, 42501.
+      //
+      // This is a policy-SHAPE check and the bound is worth stating: it asks
+      // whether a permissive policy covering the command applies to this role
+      // with an unconditional expression, which is the house shape. Anything
+      // else is reported rather than judged, and the policy names are printed
+      // so a reader can go and look.
+      const rows = await query(
+        `select c.relname as name,
+                count(p.oid) filter (
+                  where p.polpermissive and p.polcmd in ('*', 'a')
+                    and (0 = any(p.polroles) or exists (
+                          select 1 from pg_roles r
+                           where r.oid = any(p.polroles) and r.rolname = current_user))
+                    and coalesce(pg_get_expr(p.polwithcheck, p.polrelid), 'true') = 'true'
+                ) as writable,
+                count(p.oid) filter (
+                  where p.polpermissive and p.polcmd in ('*', 'r')
+                    and (0 = any(p.polroles) or exists (
+                          select 1 from pg_roles r
+                           where r.oid = any(p.polroles) and r.rolname = current_user))
+                    and coalesce(pg_get_expr(p.polqual, p.polrelid), 'true') = 'true'
+                ) as readable,
+                count(p.oid) filter (where not p.polpermissive) as restrictive,
+                coalesce(string_agg(p.polname, ' | '), '(no policies at all)') as policies
+           from pg_class c
+           join pg_namespace n on n.oid = c.relnamespace
+           left join pg_policy p on p.polrelid = c.oid
+          where n.nspname = 'public' and c.relname = any($1::text[]) and c.relrowsecurity
+          group by c.relname order by c.relname`,
+        [[...SERVING_TABLES]],
+      );
+      const faults: string[] = [];
+      for (const row of rows) {
+        const table = String(row['name']);
+        const needsWrite = WRITABLE.has(table);
+        if (needsWrite && Number(row['writable']) === 0) {
+          faults.push(`${table}: no permissive policy lets this role INSERT — ${String(row['policies'])}`);
+        }
+        // Every statement reads the stored row to detect drift, so SELECT is
+        // required on all ten, the capability table included.
+        if (Number(row['readable']) === 0) {
+          faults.push(`${table}: no permissive policy lets this role SELECT — ${String(row['policies'])}`);
+        }
+        if (Number(row['restrictive']) > 0) {
+          faults.push(`${table}: a RESTRICTIVE policy applies, which can deny with nothing in the grid showing why`);
+        }
+      }
+      return faults.length === 0
+        ? { ok: true, detail: `${rows.length} RLS-protected tables admit this role's reads and writes` }
+        : { ok: false, detail: faults.join(' | ') };
+    },
+  },
+
+  {
+    name: 'no SECURITY DEFINER function carries this role past its grants',
+    async run(query) {
+      // The grid and the relation sweep both answer "what may this role touch
+      // DIRECTLY". A SECURITY DEFINER function runs as its OWNER, so EXECUTE on
+      // one is a door around both — measured: with no grant of any kind on a
+      // table outside the projection, the writer inserted into it through such a
+      // function, and the reachability check reported it reached nothing.
+      //
+      // SECURITY INVOKER functions are not listed: they run with this role's own
+      // privileges, so they cannot reach past what the checks above already
+      // cover. That is the whole reason this can be a short list rather than
+      // every function in the database.
+      const rows = await query(
+        `select n.nspname || '.' || p.proname as fn
+           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+          where n.nspname not in ('pg_catalog', 'information_schema')
+            and p.prosecdef
+            and has_function_privilege(p.oid, 'EXECUTE')
+          order by 1 limit 25`,
+      );
+      return rows.length === 0
+        ? { ok: true, detail: 'this role may execute no SECURITY DEFINER function' }
+        : {
+            ok: false,
+            detail:
+              `executable as their owner: ${rows.map((row) => String(row['fn'])).join(', ')}. ` +
+              'Each one is a path out of this role\'s grants; revoke EXECUTE, or decide deliberately that it is safe.',
+          };
     },
   },
 
@@ -944,7 +1043,12 @@ async function openGateConnection(): Promise<GateConnection> {
   // rather than a failed check — the same hazard the publisher's pool carries,
   // and here it would abandon a preflight halfway with no verdict at all.
   pool.on('error', (error: unknown) => {
-    printError(`serving schema gate: the connection failed (${describeError(error)})`);
+    try {
+      printError(`serving schema gate: the connection failed (${describeError(error)})`);
+    } catch {
+      // Same reason as the publisher's listener: this runs in an event handler,
+      // so a sink that throws is an uncaught exception rather than a lost line.
+    }
   });
   return {
     kind: 'ready',

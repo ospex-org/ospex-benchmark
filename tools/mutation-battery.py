@@ -474,6 +474,46 @@ MUTANTS = [
      '  const nowMs = timing.nowMs ?? publicationNowMs;',
      '  const nowMs = timing.nowMs ?? Date.now;',
      ['src/servingPublisher.test.ts']),
+
+    # --- PR4 round 3: the four blockers a second review found ---------------
+    # B2: the listener that stops one uncaught crash must not become another.
+    # The mutation keeps the block structure valid on purpose — replacing `try`
+    # alone leaves a dangling `catch`, which is a syntax error, and a mutant that
+    # cannot parse fails every mode for a reason unrelated to the guarantee.
+    ('M94-error-sink-can-kill-the-process', 'src/benchmarkServingClient.ts',
+     '    try {\n      onError(',
+     '    if (true) {\n      onError(',
+     ['src/benchmarkServingClient.test.ts']),
+    ('M94b-error-sink-catch-removed', 'src/benchmarkServingClient.ts',
+     '    } catch {\n      // ⚠ THE REPORTING PATH IS ITSELF A CRASH PATH.',
+     '    } else if (false) {\n      // ⚠ THE REPORTING PATH IS ITSELF A CRASH PATH.',
+     ['src/benchmarkServingClient.test.ts']),
+
+    # B1.1: the forbidden readers, every verb rather than the two reads.
+    ('M95-forbidden-readers-reads-only', 'src/servingSchemaGate.ts',
+     "            where case when v in ('DELETE', 'TRUNCATE', 'TRIGGER')\n"
+     "                       then has_table_privilege(r, 'public.' || t, v)\n"
+     "                       else has_any_column_privilege(r, 'public.' || t, v) end`,",
+     "            where v = 'SELECT' and has_any_column_privilege(r, 'public.' || t, v)`,",
+     ['src/servingSchemaGate.test.ts']),
+
+    # B1.2: RLS enabled is not the same as this role being able to write.
+    ('M96-rls-policy-shape-unchecked', 'src/servingSchemaGate.ts',
+     "        if (needsWrite && Number(row['writable']) === 0) {",
+     "        if (false && needsWrite && Number(row['writable']) === 0) {",
+     ['src/servingSchemaGate.test.ts']),
+    ('M96b-restrictive-policy-ignored', 'src/servingSchemaGate.ts',
+     "        if (Number(row['restrictive']) > 0) {",
+     "        if (false && Number(row['restrictive']) > 0) {",
+     ['src/servingSchemaGate.test.ts']),
+
+    # B1.3: a SECURITY DEFINER function runs as its owner.
+    ('M97-security-definer-ignored', 'src/servingSchemaGate.ts',
+     '      return rows.length === 0\n'
+     "        ? { ok: true, detail: 'this role may execute no SECURITY DEFINER function' }",
+     '      return true\n'
+     "        ? { ok: true, detail: 'this role may execute no SECURITY DEFINER function' }",
+     ['src/servingSchemaGate.test.ts']),
 ]
 
 

@@ -307,3 +307,19 @@ test('a dropped connection does not take the process with it', async () => {
   // connection look exactly like one that works.
   assert.match(result.out, /reset: onError .*a pooled connection failed/);
 });
+
+test('a dropped connection does not take the process with it, even when the SINK throws', async () => {
+  // The listener added for the case above runs inside an event handler, so a
+  // throw out of IT is uncaught exactly like the one it exists to prevent. The
+  // sink in production is `printError` — stderr — which raises EPIPE when the
+  // run is piped into something that has exited. Fixing one crash by adding
+  // another is not a fix, and nothing pinned the difference.
+  const result = await probeExits('sink', 8_000);
+
+  assert.equal(result.exited, true, `the process did not exit: ${result.out}`);
+  assert.equal(result.code, 0, `the throwing sink killed the process: ${result.out}`);
+  // Reached the hazard: the listener ran (so there was something to throw from)
+  // and the process carried on past it.
+  assert.match(result.out, /sink: onError .*a pooled connection failed/);
+  assert.match(result.out, /sink: still running after the connection was dropped/);
+});
