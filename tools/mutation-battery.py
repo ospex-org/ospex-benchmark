@@ -520,6 +520,14 @@ MUTANTS = [
      "                        where rolname = any($1::text[]) or rolname = current_user) as named",
      "           cross join (select current_user::text as role) as named",
      ['src/servingSchemaGate.test.ts']),
+
+    # The async half of the reporting hazard: EPIPE is delivered as a stream
+    # 'error' event AFTER the write returns, so the call-site try/catch (M94)
+    # cannot see it. Distinct layers, distinct mutants.
+    ('M99-no-stdio-error-guard', 'src/console.ts',
+     "  stream.on('error', () => {",
+     "  stream.on('__no_listener_for_error', () => {",
+     ['src/benchmarkServingClient.test.ts']),
 ]
 
 

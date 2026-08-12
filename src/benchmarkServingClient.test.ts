@@ -169,6 +169,7 @@ test('the bounds are ordered so the layer that can END a statement acts first', 
 function probeExits(
   mode: string,
   deadlineMs: number,
+  closeStderr = false,
 ): Promise<{ exited: boolean; ms: number; out: string; code: number | null }> {
   return new Promise((resolve) => {
     const started = Date.now();
@@ -178,7 +179,14 @@ function probeExits(
     });
     let out = '';
     child.stdout.on('data', (chunk) => { out += String(chunk); });
-    child.stderr.on('data', (chunk) => { out += String(chunk); });
+    if (closeStderr) {
+      // Close the READ end, so the child's next write to stderr has nowhere to
+      // go. Everything the case asserts on therefore has to arrive on stdout.
+      child.stderr.destroy();
+      child.stderr.on('error', () => { /* this end is ours, and we just closed it */ });
+    } else {
+      child.stderr.on('data', (chunk) => { out += String(chunk); });
+    }
     const killer = setTimeout(() => {
       // The tree, not the root: on Windows killing the parent leaves the child
       // holding the socket, and the measurement never completes.
@@ -322,4 +330,29 @@ test('a dropped connection does not take the process with it, even when the SINK
   // and the process carried on past it.
   assert.match(result.out, /sink: onError .*a pooled connection failed/);
   assert.match(result.out, /sink: still running after the connection was dropped/);
+});
+
+test('a dropped connection does not take the process with it when STDERR IS GONE', async () => {
+  // ── THE MECHANISM, AND WHY THE OBVIOUS GUARD MISSES IT ─────────────────────
+  // The two cases above cover a listener that is absent and a sink that throws
+  // where it is called. This is the third and it is the one that happens in
+  // production: `printError` writes to stderr, the consumer is gone, and the
+  // write does NOT throw at the call site. EPIPE arrives afterwards as an
+  // `'error'` event on the stream, so the `try` around the sink catches
+  // nothing — and the error carries the stack of the write's ORIGIN, so the
+  // crash points at the logging line and reads exactly like a synchronous
+  // throw. Measured: exit 7 through an uncaughtException probe, with the top
+  // frames `printError` and the pool's listener.
+  //
+  // Discrimination: remove the stream listeners in console.ts and only THIS
+  // case reddens; remove the try/catch in the pool listener and only `sink`
+  // does. Neither guard can stand in for the other.
+  const result = await probeExits('epipe', 8_000, true);
+
+  assert.equal(result.exited, true, `the process did not exit: ${result.out}`);
+  assert.equal(result.code, 0, `a closed stderr killed the process: ${result.out}`);
+  // Reached the hazard: the pool opened, the connection was dropped, and the
+  // report was attempted down the broken stream — then the run carried on.
+  assert.match(result.out, /epipe: status=enabled/);
+  assert.match(result.out, /epipe: still running after the connection was dropped/);
 });

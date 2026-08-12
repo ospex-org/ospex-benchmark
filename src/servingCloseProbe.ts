@@ -1,5 +1,6 @@
 import { createServer } from 'node:net';
 import { openBenchmarkServing } from './benchmarkServingClient.js';
+import { printError } from './console.js';
 import type { ArmAttempt } from './servingStore.js';
 
 /**
@@ -216,7 +217,7 @@ async function main(): Promise<void> {
     : mode === 'stale' ? 1
     : mode === 'bogus' ? 'bogus' as const
     : 'silent' as const;
-  const drops = mode === 'reset' || mode === 'sink';
+  const drops = mode === 'reset' || mode === 'sink' || mode === 'epipe';
   const { port, sawQuery } = await fakePostgres(drops ? 2 : answer, drops);
   // `sslmode=disable` is LOAD-BEARING, not tidiness. With no CA configured the
   // resolver attaches `ssl: { rejectUnauthorized: false }`, `pg` opens with an
@@ -249,6 +250,10 @@ async function main(): Promise<void> {
     readinessTimeoutMs: 300,
     closeTimeoutMs: 300,
     onError: (line) => {
+      // `epipe` reports through the PRODUCTION sink — stderr — because that is
+      // the path that fails when the consumer is gone, and a probe that
+      // substituted its own writer would be testing the substitute.
+      if (mode === 'epipe') { printError(line); return; }
       say(`${mode}: onError ${line}`);
       // `sink` is the case where REPORTING is what breaks. `printError` writes
       // to stderr, and stderr raises EPIPE when the run is piped into something
