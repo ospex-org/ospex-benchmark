@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { buildBundle } from './bundle.js';
+import { describeServingStatus, dryRunServing, openBenchmarkServing } from './benchmarkServingClient.js';
 import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
@@ -23,6 +24,7 @@ import {
   writeText,
 } from './records.js';
 import { runSlate } from './runner.js';
+import { mirrorRunArtifact } from './servingPublisher.js';
 import { isValidSlateDate, tomorrowEastern } from './slateDate.js';
 import { buildSummaryMarkdown } from './summary.js';
 import type { RunContext } from './records.js';
@@ -252,6 +254,23 @@ async function main(): Promise<number> {
     summaryPath,
     buildSummaryMarkdown(env, ctx, build, collision),
   );
+
+  // Mirror the written artifact onto the serving projection, reading the file
+  // back rather than republishing what is in memory — the same call, over the
+  // same bytes, that recovery would make later. A dry run opens nothing; a live
+  // run that fails its identity check is refused by the publisher's own gate.
+  const serving = options.dryRun ? dryRunServing() : await openBenchmarkServing();
+  try {
+    // Inside the try, so that a handle which exists is a handle that gets
+    // closed — a pool left open by a throw on the way in holds the process
+    // whatever exit code was set.
+    printLine(describeServingStatus(serving.status));
+    await mirrorRunArtifact(serving.port, ndjsonPath, { line: printLine, error: printError });
+  } finally {
+    // Closed before the summary is printed, so the process can exit even when
+    // a write is still checked out against a database that stopped answering.
+    await serving.close();
+  }
 
   printLine('');
   const outcomes: ArmOutcome[] = [

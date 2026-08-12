@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { after, test } from 'node:test';
 import { buildBundle } from './bundle.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
+import { verifyArtifactIntegrity } from './servingProjection.js';
+import { SqlBenchmarkServingPort } from './servingStore.js';
+import { firedRun } from './servingTestRun.js';
+import type { BenchmarkServingPort, PublishOutcome } from './servingStore.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
 import {
   fireEligibleGame,
@@ -404,6 +408,10 @@ test('a fired game produces a run file that passes full scorer integrity verific
     nowMs,
     log: () => undefined,
     logError: () => undefined,
+    // The shipped default: no credential, so every projection write resolves to
+    // `disabled` without a socket. What a fire actually SENDS is pinned below,
+    // against a port that records.
+    serving: new SqlBenchmarkServingPort(null),
   });
 
   assert.equal(outcome.collisionFailed, false);
@@ -923,4 +931,73 @@ test('prolonged deferral escalates exactly once', async () => {
   assert.equal(warns.length, 1);
   await watchTick(deps);
   assert.equal(deps.errors.filter((line) => line.includes('deferred longer')).length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// The serving projection, as the fire reaches it
+// ---------------------------------------------------------------------------
+
+/**
+ * A port that records what it was handed.
+ *
+ * The whole point is to assert on what the fire SENT rather than on what this
+ * file could re-derive: a case that computes the expected participant id and
+ * then checks the projector echoed it proves only that the code copies.
+ */
+class SpyPort implements BenchmarkServingPort {
+  readonly calls: Array<{ kind: string; payload: Record<string, unknown> }> = [];
+  private note(kind: string, payload: unknown): Promise<PublishOutcome> {
+    this.calls.push({ kind, payload: payload as Record<string, unknown> });
+    return Promise.resolve({ outcome: 'published' });
+  }
+  publishAttempt = (a: unknown): Promise<PublishOutcome> => this.note('attempt', a);
+  sealDecision = (a: unknown): Promise<PublishOutcome> => this.note('seal', a);
+  revealDecision = (a: unknown): Promise<PublishOutcome> => this.note('reveal', a);
+  publishRationale = (a: unknown): Promise<PublishOutcome> => this.note('rationale', a);
+  publishScore = (a: unknown): Promise<PublishOutcome> => this.note('score', a);
+  publishScoringRun = (a: unknown): Promise<PublishOutcome> => this.note('scoringRun', a);
+}
+
+test('a fire publishes the artifact it just wrote, from the file', async () => {
+  // What this pins is the WIRING — that fireEligibleGame reaches cfg.serving at
+  // all. Nothing else in the suite could see its absence: with the projection
+  // unwired, every existing watch case still passes, the artifact is still
+  // written, and the only symptom is a projection that stays empty forever.
+  const port = new SpyPort();
+  const run = await firedRun({ outDir: tempDir('watch-serving-'), enrolled: true, serving: port });
+
+  const kinds = new Set(port.calls.map((call) => call.kind));
+  assert.ok(kinds.has('attempt'), `the fire sent no attempt; sent ${[...kinds].join(', ') || 'nothing'}`);
+  assert.ok(kinds.has('seal'), 'the fire sent no sealed decision');
+
+  // Read back out of what was SENT. The source is the artifact's own basename
+  // and the hash of the bytes on disk, so this also pins that publication read
+  // the FILE rather than republishing the records still in memory — the two are
+  // not the same bytes whenever a response carried a credential.
+  const sources = new Set(
+    port.calls.map((call) => String((call.payload['source'] as { sourcePath?: unknown }).sourcePath)),
+  );
+  assert.deepEqual([...sources], [basename(run.runFile)]);
+});
+
+test('a fire is NOT failed by a projection that refuses everything', async () => {
+  // The run must survive the projection being broken. Note which layer this
+  // discriminates: a port that throws is caught by the publisher's per-write
+  // race, so this pins the COMPOSITION rather than the wrapper — the wrapper's
+  // own case lives in servingPublisher.test.ts, where a throw can reach it.
+  class HostilePort extends SpyPort {
+    override publishAttempt = (): Promise<PublishOutcome> => { throw new Error('the database is on fire'); };
+    override sealDecision = (): Promise<PublishOutcome> => Promise.reject(new Error('and still on fire'));
+  }
+  const run = await firedRun({
+    outDir: tempDir('watch-serving-hostile-'),
+    enrolled: true,
+    serving: new HostilePort(),
+  });
+  // Reaching this line at all is most of the assertion: a throw anywhere in the
+  // publish would have unwound out of the fire. The rest says the artifact —
+  // the thing a benchmark night actually produces — is not merely present but
+  // publishable, checked by the same verifier the publisher runs.
+  assert.ok(run.records.length > 0);
+  assert.equal(verifyArtifactIntegrity(readFileSync(run.runFile, 'utf8')), null);
 });

@@ -99,7 +99,7 @@ export type ServingStatus =
   | { readonly enabled: true }
   | {
       readonly enabled: false;
-      readonly reason: UnresolvedReason | 'schema_not_ready' | 'driver_unavailable';
+      readonly reason: UnresolvedReason | 'schema_not_ready' | 'driver_unavailable' | 'dry_run';
     };
 
 const CLOSE_TIMEOUT_MS = 5_000;
@@ -153,6 +153,9 @@ export interface BenchmarkServingHandle {
 /** One line for an operator, naming no part of the target. */
 export function describeServingStatus(status: ServingStatus): string {
   if (status.enabled) return 'serving projection: enabled';
+  if (status.reason === 'dry_run') {
+    return 'serving projection: not opened — a dry run resolves no credential and opens no socket';
+  }
   if (status.reason === 'driver_unavailable') {
     return (
       'serving projection: disabled (the PostgreSQL driver is not installed in ' +
@@ -207,6 +210,33 @@ export function servingPoolConfig(connection: BenchmarkWriterConnection): PoolCo
 }
 
 const DISABLED: Pick<BenchmarkServingHandle, 'close'> = { close: async () => {} };
+
+/**
+ * The handle for a caller that must not even ASK whether publication is set up.
+ *
+ * `openBenchmarkServing` resolves the environment and then dials the database to
+ * read the capability row, so calling it is itself a credential read and a
+ * network connection. `--dry-run` on both entry points is documented as "no
+ * credentials, no network", and that promise covers the projection: a demo on a
+ * host that happens to have a writer password configured must not reach out, and
+ * a broken credential must not be able to delay one.
+ *
+ * Nothing is lost by not asking. The publisher's own gate reads `mode` out of the
+ * artifact and refuses a dry run anyway, so opening would resolve a credential,
+ * dial a database, and publish exactly nothing.
+ *
+ * It lives here rather than at the two call sites because the disabled handle is
+ * this module's shape — a port over a null query and a close that does nothing —
+ * and two hand-written copies are two chances for one of them to construct a live
+ * port by mistake.
+ */
+export function dryRunServing(): BenchmarkServingHandle {
+  return {
+    port: new SqlBenchmarkServingPort(null),
+    status: { enabled: false, reason: 'dry_run' },
+    ...DISABLED,
+  };
+}
 
 /** The three runtime pieces this module needs, loaded together so one failure
  *  is one branch. */

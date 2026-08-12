@@ -1,6 +1,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { describeServingStatus, dryRunServing, openBenchmarkServing } from './benchmarkServingClient.js';
 import { DEFAULT_OSPEX_API_URL, describeErrorWithStack, envValue } from './config.js';
 import { printError, printLine } from './console.js';
 import { loadDotEnv } from './env.js';
@@ -96,70 +97,96 @@ async function main(): Promise<number> {
     nowMs = (): number => Date.now();
   }
 
-  const fireConfig: FireConfig = {
-    arms: ARMS,
-    adapters,
-    approvedReportedModelIds,
-    outDir,
-    timeoutMs: (options.timeoutSeconds ?? (options.dryRun ? 2 : 300)) * 1000,
-    maxOutputTokens: options.maxOutputTokens,
-    mode,
-    clockMode: options.dryRun ? 'synthetic-fixture' : 'wall',
-    nowMs,
-    log: printLine,
-    logError: printError,
-  };
+  // Opened ONCE for the life of the watcher, not per fire: the scoped writer
+  // login carries a small connection limit, and a fresh pool per game would
+  // spend it on setup and teardown. Unconfigured is the shipped default and
+  // costs nothing — the handle is then a port that answers `disabled` without a
+  // socket. A dry run does not open at all; see dryRunServing.
+  const serving = options.dryRun ? dryRunServing() : await openBenchmarkServing();
 
-  const ledgerDir = join(outDir, 'watch-ledger');
-  const ledger = loadLedger(ledgerDir, printError);
-  printLine(`ledger: ${ledger.size} game(s) already handled (${ledgerDir})`);
+  // The handle exists from here on, so everything below it sits inside the
+  // finally — including building the ledger, which reads a directory and can
+  // throw. A pool left open by a throw on the way IN keeps the process alive
+  // just as surely as one left open by the loop, and the exit code it set
+  // would never be delivered.
+  //
+  // Not closed on a signal: nothing here installs a handler, and that is a
+  // decision. Every artifact is on disk by the time a fire returns, so the most
+  // an interrupt can cost is projection rows, and those come back with
+  // `yarn project` over the same file.
+  try {
+    printLine(describeServingStatus(serving.status));
 
-  const deps: WatchDeps = {
-    fetchInputs,
-    fetchFirstBoardAppearance: firstBoardAppearance,
-    fireGame: (build, inputs, slateDate, provenance) =>
-      fireEligibleGame(build, inputs, slateDate, provenance, fireConfig),
-    ledgerDir,
-    ledger,
-    boardFirstSeen: new Map(),
-    deferredSince: new Map(),
-    deferralWarned: new Set(),
-    nowMs,
-    lateMs: options.lateMinutes * 60_000,
-    maxFiresPerTick: options.maxFiresPerTick,
-    maxInputAgeMs: MAX_INPUT_AGE_MS,
-    log: printLine,
-    logError: printError,
-  };
+    const fireConfig: FireConfig = {
+      arms: ARMS,
+      adapters,
+      approvedReportedModelIds,
+      outDir,
+      timeoutMs: (options.timeoutSeconds ?? (options.dryRun ? 2 : 300)) * 1000,
+      maxOutputTokens: options.maxOutputTokens,
+      mode,
+      clockMode: options.dryRun ? 'synthetic-fixture' : 'wall',
+      nowMs,
+      log: printLine,
+      logError: printError,
+      serving: serving.port,
+    };
 
-  for (;;) {
-    // The same injected clock stamps the banner that drives enforcement and
-    // records — never a second clock.
-    const startedAt = new Date(nowMs()).toISOString();
-    let tickFailed = false;
-    try {
-      const summary = await watchTick(deps);
-      printLine(
-        `tick ${startedAt}: ${summary.gamesInWindow} in window · ${summary.watched} watched · ` +
-          `${summary.fired} fired · ${summary.late} late · ${summary.deferred} deferred · ` +
-          `${summary.failed} failed${summary.capHit ? ' · CAP HIT' : ''}`,
-      );
-      // Per-game failures are isolated inside the tick but they are still
-      // failures — and a hit spend cap left work undone. Neither is a
-      // healthy pass.
-      if (summary.failed > 0 || summary.capHit) tickFailed = true;
-    } catch (error) {
-      // A tick failure (fetch outage, transient API error) is logged and the
-      // loop keeps watching — per-game failures are already isolated inside
-      // the tick and can never reach here.
-      tickFailed = true;
-      printError(`tick ${startedAt} failed: ${describeErrorWithStack(error)}`);
+    const ledgerDir = join(outDir, 'watch-ledger');
+    const ledger = loadLedger(ledgerDir, printError);
+    printLine(`ledger: ${ledger.size} game(s) already handled (${ledgerDir})`);
+
+    const deps: WatchDeps = {
+      fetchInputs,
+      fetchFirstBoardAppearance: firstBoardAppearance,
+      fireGame: (build, inputs, slateDate, provenance) =>
+        fireEligibleGame(build, inputs, slateDate, provenance, fireConfig),
+      ledgerDir,
+      ledger,
+      boardFirstSeen: new Map(),
+      deferredSince: new Map(),
+      deferralWarned: new Set(),
+      nowMs,
+      lateMs: options.lateMinutes * 60_000,
+      maxFiresPerTick: options.maxFiresPerTick,
+      maxInputAgeMs: MAX_INPUT_AGE_MS,
+      log: printLine,
+      logError: printError,
+    };
+
+    for (;;) {
+      // The same injected clock stamps the banner that drives enforcement and
+      // records — never a second clock.
+      const startedAt = new Date(nowMs()).toISOString();
+      let tickFailed = false;
+      try {
+        const summary = await watchTick(deps);
+        printLine(
+          `tick ${startedAt}: ${summary.gamesInWindow} in window · ${summary.watched} watched · ` +
+            `${summary.fired} fired · ${summary.late} late · ${summary.deferred} deferred · ` +
+            `${summary.failed} failed${summary.capHit ? ' · CAP HIT' : ''}`,
+        );
+        // Per-game failures are isolated inside the tick but they are still
+        // failures — and a hit spend cap left work undone. Neither is a
+        // healthy pass.
+        if (summary.failed > 0 || summary.capHit) tickFailed = true;
+      } catch (error) {
+        // A tick failure (fetch outage, transient API error) is logged and the
+        // loop keeps watching — per-game failures are already isolated inside
+        // the tick and can never reach here.
+        tickFailed = true;
+        printError(`tick ${startedAt} failed: ${describeErrorWithStack(error)}`);
+      }
+      if (options.once) {
+        // External schedulers need the pass/fail distinction by exit code. A
+        // projection problem is not one of them: it never reaches `tickFailed`,
+        // because the publisher cannot fail a fire.
+        return tickFailed ? 1 : 0;
+      }
+      await sleep(options.pollSeconds * 1000);
     }
-    if (options.once) {
-      // External schedulers need the pass/fail distinction by exit code.
-      return tickFailed ? 1 : 0;
-    }
-    await sleep(options.pollSeconds * 1000);
+  } finally {
+    await serving.close();
   }
 }
 

@@ -1602,6 +1602,31 @@ select null::text                       as contradiction,
        1                                as parent_found,
        (select count(*) from ins)::int  as inserted`;
 
+/**
+ * Every relation the projection is made of, in dependency order.
+ *
+ * One list, here beside the statements that name them, because two copies of it
+ * drift and the drift is invisible: a table added to the schema and to one list
+ * is a table the other list never checks.
+ *
+ * `benchmark_schema_capability` is included and is NOT written by anything here
+ * — it is the schema's own claim about what it can hold, read by the publisher
+ * before it opens. A caller that distinguishes the two should do it by asking
+ * which tables the statements insert into, not by trimming this list.
+ */
+export const SERVING_TABLES: readonly string[] = Object.freeze([
+  'benchmark_runs',
+  'benchmark_participants',
+  'benchmark_cohort_participants',
+  'benchmark_arm_attempts',
+  'benchmark_decisions',
+  'benchmark_decision_reveals',
+  'benchmark_decision_rationales',
+  'benchmark_scores',
+  'benchmark_scoring_runs',
+  'benchmark_schema_capability',
+]);
+
 /** Every statement, exported so a test can hold each record declaration against
  *  the keys its payload builder emits — the drift the jsonb hop cannot detect. */
 export const SERVING_STATEMENTS = Object.freeze({
@@ -1818,16 +1843,20 @@ export class SqlBenchmarkServingPort implements BenchmarkServingPort {
     if (deps === null) return { outcome: 'disabled' };
 
     let parameters: readonly unknown[];
+    let keys: readonly string[] | null;
     try {
       parameters = [JSON.stringify(build())];
+      // Inside the try with the payload it reads. It cannot throw as written —
+      // its input is always `JSON.stringify` over a plain object — but it was
+      // the one unguarded statement left in a method documented never to throw,
+      // and a caller on a run path now depends on that being literally true.
+      keys = serialized ? lockKeys(parameters[0] as string) : null;
     } catch (error) {
       if (error instanceof Refusal) {
         return { outcome: 'invalid_input', reason: error.reason, field: error.field };
       }
       return classify(error);
     }
-
-    const keys = serialized ? lockKeys(parameters[0] as string) : null;
     const run = async (): Promise<PublishOutcome> => {
       try {
         if (keys === null) return classifyRows(await deps.query(sql, parameters));

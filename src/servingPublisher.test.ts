@@ -5,7 +5,12 @@ import { basename, join } from 'node:path';
 import { after, test } from 'node:test';
 import { sha256Hex } from './canonical.js';
 import { writeNdjson } from './records.js';
-import { publishPlan, publishRunArtifact } from './servingPublisher.js';
+import {
+  mirrorRunArtifact,
+  publicationNowMs,
+  publishPlan,
+  publishRunArtifact,
+} from './servingPublisher.js';
 import { parseRunArtifact, projectRun, publishableRun } from './servingProjection.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { ProjectionPlan } from './servingProjection.js';
@@ -574,4 +579,143 @@ test('a write is bounded by what is LEFT, not by the per-write timeout', async (
 
   assert.ok(elapsed < 5_000, `the clamp did not bind: took ${elapsed}ms`);
   assert.ok((summary.rejected['unavailable'] ?? 0) > 0);
+});
+
+// ---------------------------------------------------------------------------
+// Totality: what happens when the publisher itself breaks
+// ---------------------------------------------------------------------------
+//
+// TWO LAYERS, and the cases below are chosen so each one can only be satisfied
+// by the layer it names. Both were added after a reviewer measured that
+// `publishRunArtifact` throws on artifacts a file can actually hold:
+//
+//   publishRunArtifact  refuses a corrupt artifact instead of crashing, so
+//                       `yarn project` reports a bad FILE rather than a broken
+//                       command.
+//   mirrorRunArtifact   catches whatever is left, so a run path cannot lose a
+//                       game to a projection defect.
+//
+// A case that exercised both would pin neither — with the first fix in place a
+// corrupt artifact never reaches the wrapper at all.
+
+/** A real fired artifact, corrupted one specific way. */
+async function corruptedRun(mutate: (line: string) => string): Promise<string> {
+  const dir = tempDir('serving-corrupt-');
+  const run = await firedRun({ outDir: dir, enrolled: true });
+  const lines = readFileSync(run.runFile, 'utf8').trimEnd().split('\n');
+  const index = lines.findIndex((line) => line.includes('"bundle_game"'));
+  assert.ok(index >= 0, 'the fixture has no bundle_game record to corrupt');
+  const mutated = mutate(lines[index]!);
+  assert.notEqual(mutated, lines[index], 'the corruption did not apply — this case proves nothing');
+  lines[index] = mutated;
+  const file = join(dir, 'corrupt.ndjson');
+  writeFileSync(file, `${lines.join('\n')}\n`);
+  return file;
+}
+
+test('a corrupt artifact is REFUSED, by two different throwing mechanisms', async () => {
+  // Both are shapes an NDJSON file can hold and the schema validators accept.
+  // `1e400` parses to Infinity; the bundle is a passthrough object, so deep
+  // nesting survives zod untouched. Each reaches the canonicaliser inside the
+  // integrity check, which throws rather than returning — one an Error, the
+  // other a RangeError, so a catch narrowed to Error would still fail one.
+  const cases = [
+    {
+      what: 'a number that overflows a double',
+      mutate: (line: string) => line.replace(/"awayDecimal":\s*[0-9.]+/, '"awayDecimal": 1e400'),
+      expect: /non-finite/,
+    },
+    {
+      what: 'JSON nested twenty thousand deep',
+      mutate: (line: string) =>
+        line.replace(/"bundle":\{/, `"bundle":{"deep":${'['.repeat(20_000)}1${']'.repeat(20_000)},`),
+      expect: /call stack|RangeError/i,
+    },
+  ];
+
+  for (const { what, mutate, expect } of cases) {
+    const file = await corruptedRun(mutate);
+    const port = new RecordingPort();
+    const log = collector();
+    const summary = await publishRunArtifact(port, file, log.log);
+
+    assert.equal(port.calls.length, 0, `${what}: nothing may be sent from an unverifiable artifact`);
+    assert.notEqual(summary.gateRefusal, null, `${what}: must be refused`);
+    // Naming the mechanism is what distinguishes "the verifier threw and was
+    // caught" from "the verifier returned a mismatch" — the second would also
+    // produce a refusal, and would pass a test that only checked for one.
+    assert.match(summary.gateRefusal ?? '', /could not be verified/, what);
+    assert.match(summary.gateRefusal ?? '', expect, what);
+  }
+});
+
+test('an artifact that is merely INTACT still publishes — the control for the above', async () => {
+  // Without this, deleting the whole read-and-verify phase would satisfy every
+  // assertion in the previous case.
+  const dir = tempDir('serving-intact-');
+  const run = await firedRun({ outDir: dir, enrolled: true });
+  const port = new RecordingPort();
+  const summary = await publishRunArtifact(port, run.runFile, collector().log);
+  assert.equal(summary.gateRefusal, null);
+  assert.ok(port.calls.length > 0, 'the intact artifact sent nothing, so the refusals above prove nothing');
+});
+
+test('mirrorRunArtifact absorbs a throw that publishRunArtifact cannot', async () => {
+  // A log sink that throws is the residue the first fix does not cover, and it
+  // is not hypothetical: printLine writes to stdout, and stdout raises EPIPE
+  // when a run is piped into something that exits first. The throw lands AFTER
+  // the rows are written, which is why the wrapper cannot report counts.
+  const dir = tempDir('serving-epipe-');
+  const run = await firedRun({ outDir: dir, enrolled: true });
+  const errors: string[] = [];
+  const throwingLog = {
+    line: (): void => { throw new Error('EPIPE: stdout closed'); },
+    error: (message: string): void => { errors.push(message); },
+  };
+
+  const port = new RecordingPort();
+  await assert.rejects(
+    publishRunArtifact(port, run.runFile, throwingLog),
+    /EPIPE/,
+    'if this stops throwing, the case below no longer discriminates the wrapper',
+  );
+
+  const wrapped = new RecordingPort();
+  const result = await mirrorRunArtifact(wrapped, run.runFile, throwingLog);
+  assert.equal(result, null, 'a crash cannot claim counts it did not measure');
+  assert.ok(wrapped.calls.length > 0, 'the wrapper returned before reaching the publisher at all');
+  assert.ok(
+    errors.some((message) => message.includes('yarn project')),
+    `the operator must be told how to recover; got ${JSON.stringify(errors)}`,
+  );
+});
+
+test('mirrorRunArtifact is otherwise transparent', async () => {
+  // The negative control for the wrapper: a catch-all that returned null for
+  // everything would pass the case above and silently disable publication.
+  const dir = tempDir('serving-mirror-');
+  const run = await firedRun({ outDir: dir, enrolled: true });
+  const port = new RecordingPort();
+  const summary = await mirrorRunArtifact(port, run.runFile, collector().log);
+  assert.notEqual(summary, null);
+  assert.ok((summary?.published ?? 0) > 0, 'the same call must still publish');
+  assert.equal(summary?.gateRefusal, null);
+});
+
+test('the publication deadline is measured on a clock that cannot step backwards', async () => {
+  // `Date.now` moves backwards on an NTP correction or a host resume, and a
+  // backward step pushes the budget's expiry away — leaving only the per-write
+  // cap, which for a full slate is tens of minutes rather than 45 seconds.
+  assert.notEqual(publicationNowMs as unknown, Date.now as unknown);
+  const realNow = Date.now;
+  try {
+    // A wall clock running backwards. A default of `Date.now` reads it.
+    let fake = 1_000_000;
+    Date.now = (): number => (fake -= 1_000);
+    const first = publicationNowMs();
+    const second = publicationNowMs();
+    assert.ok(second >= first, `the clock went backwards: ${first} then ${second}`);
+  } finally {
+    Date.now = realNow;
+  }
 });

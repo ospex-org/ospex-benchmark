@@ -43,6 +43,9 @@
  *       CREATE TABLE public.commitments (id bigint);
  */
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client, Pool } from 'pg';
 import { pgStoreQuery } from './store/atomicStore.js';
 import { pgStoreTransactor } from './store/campaignTickJournal.js';
@@ -60,6 +63,8 @@ import type {
 } from './servingStore.js';
 import { sha256Hex } from './canonical.js';
 import { forecastDigest } from './schema.js';
+import { PROJECTION_PARTICIPANTS } from './servingIdentity.js';
+import { firedRun } from './servingTestRun.js';
 import { makeOverScaleAccepted, makeOverScalePushAccepted } from './testFactories.js';
 import type { ForecastOutput } from './types.js';
 
@@ -1242,6 +1247,106 @@ async function main(): Promise<void> {
       'benchmark_scores_id_seq']) {
       await assert.rejects(() => query(`select currval('public.${seq}')`, []),
         (e: unknown) => (e as { code?: string }).code === '42501', `currval(${seq}) is unreachable`);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // End to end: a real fire, into this database
+  // -------------------------------------------------------------------------
+  //
+  // Everything above drives the port with payloads this file builds. This drives
+  // it with payloads the RUNNER builds, through the projector, from an artifact
+  // a real fire wrote — which is the only arrangement that can catch a projector
+  // emitting a shape the live schema will not take. A rename in buildRecords, a
+  // column the projector stopped sending, a value the schema quietly rounds:
+  // none of them are visible to a suite whose inputs are typed by hand.
+
+  await check('a real fire publishes its own artifact into this database', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'serving-e2e-'));
+    try {
+      // Its own game, so the decision key is unused. See FireOptions.gameId:
+      // the fixture cohort is fixed, so a second run over one game contradicts
+      // rather than duplicates.
+      const gameId = `e2e-${process.pid}-${(nonce += 1)}`;
+      const fired = await firedRun({ outDir: dir, enrolled: true, gameId, serving: port });
+
+      const decisions = await query(
+        `select participant_id, market from public.benchmark_decisions
+          where cohort_id = $1 and game_id = $2 order by participant_id, market`,
+        [fired.cohortId, gameId],
+      );
+      assert.ok(decisions.length > 0, 'the fire published no decision at all');
+
+      // Every sealed decision has its reveal. The two are separate writes, so a
+      // seal that lands without one is the shape a reader cannot resolve.
+      const orphans = await query(
+        `select d.id from public.benchmark_decisions d
+           left join public.benchmark_decision_reveals r on r.decision_id = d.id
+          where d.cohort_id = $1 and d.game_id = $2 and r.decision_id is null`,
+        [fired.cohortId, gameId],
+      );
+      assert.equal(orphans.length, 0, `${orphans.length} sealed decisions have no reveal`);
+
+      // The model entrant carries a whole identity, and the artifact's own
+      // participant is the one that got it.
+      const participants = [...new Set(decisions.map((row) => String(row['participant_id'])))];
+      const rows = await query(
+        `select participant_id, kind, lab_id, model_id, configuration, configuration_sha256
+           from public.benchmark_participants where participant_id = any($1::text[])`,
+        [participants],
+      );
+      const models = rows.filter((row) => row['kind'] === 'model');
+      assert.ok(models.length > 0, 'the fire published no model participant');
+      for (const row of models) {
+        for (const column of ['lab_id', 'model_id', 'configuration', 'configuration_sha256']) {
+          assert.notEqual(row[column], null, `${String(row['participant_id'])}: ${column} is null on a model`);
+        }
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await check('the eight deterministic controls coexist, which is the partial index', async () => {
+    // Every control declares (null, null, null). The entrant index is unique
+    // with NULLS NOT DISTINCT, so if it were ever NOT partial on kind='model'
+    // the second control would 23505 — and the publisher is fail-soft, so seven
+    // of the eight baselines would go missing with nothing reported anywhere.
+    //
+    // Written through the real fire rather than by hand: the eight are exactly
+    // the ones a night produces, so this fails if the registry grows a control
+    // the schema cannot hold.
+    const dir = mkdtempSync(join(tmpdir(), 'serving-controls-'));
+    try {
+      const gameId = `controls-${process.pid}-${(nonce += 1)}`;
+      const fired = await firedRun({ outDir: dir, enrolled: true, gameId, serving: port });
+      const controls = await query(
+        `select distinct p.participant_id from public.benchmark_decisions d
+           join public.benchmark_participants p on p.participant_id = d.participant_id
+          where d.cohort_id = $1 and d.game_id = $2 and p.kind <> 'model'`,
+        [fired.cohortId, gameId],
+      );
+      // Against the REGISTRY's own count rather than a literal, so enrolling a
+      // ninth control fails here until the schema is shown to hold it — and so
+      // the number cannot quietly drift down to the one a broken index allows.
+      const enrolled = Object.values(PROJECTION_PARTICIPANTS).filter(
+        (entry) => entry.kind !== 'model',
+      ).length;
+      assert.equal(
+        controls.length,
+        enrolled,
+        `${controls.length} of ${enrolled} enrolled controls landed — with a non-partial ` +
+          'entrant index exactly ONE would, which is what this check tells apart',
+      );
+      const identified = await query(
+        `select participant_id from public.benchmark_participants
+          where participant_id = any($1::text[])
+            and num_nonnulls(lab_id, model_id, configuration, configuration_sha256) > 0`,
+        [controls.map((row) => String(row['participant_id']))],
+      );
+      assert.equal(identified.length, 0, 'a control carries part of a model identity');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

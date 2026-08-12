@@ -237,8 +237,60 @@ night, while here publishing is the entire job.
 | 4 | configured, but the publisher was refused |
 | 5 | the command itself failed |
 
-**No run path calls the publisher yet.** Wiring it into `yarn watch` and
-`yarn smoke` is a separate change.
+### When a run publishes
+
+`yarn watch` and `yarn smoke` publish each artifact as soon as they have written
+it — the watcher once per fired game, the smoke once for the slate. Both read the
+file back rather than republishing what is in memory, so a live publication and a
+recovery are the same call over the same bytes.
+
+The projection cannot fail a run. Every write returns a typed outcome instead of
+throwing, the whole publication is bounded, and the publisher is wrapped so that
+even a defect in the publisher itself is logged and stepped over — the artifact is
+already on disk by then, and `yarn project` re-derives whatever did not land. A
+projection problem never reaches a tick's exit code.
+
+Publishing is *unconditional*, not conditional on being configured: with no
+credential the port answers `disabled` for every write without opening a socket,
+which is the shipped default and the reason there is one code path rather than a
+wired one and an unwired one. It also means the artifact is verified and projected
+on every fire whether or not anything is written — so a producer bug, such as a
+reveal that does not reproduce its own seal, is reported on an unconfigured host
+too.
+
+**A dry run publishes nothing and opens nothing.** `--dry-run` on either command
+is documented as "no credentials, no network", and that covers the projection:
+the credential is not resolved and no connection is made. Nothing is lost by it —
+the publisher's own gate reads `mode` out of the artifact and refuses a dry run
+anyway.
+
+Not wired, and worth saying so explicitly: the line-open speculation runner and
+the campaign path (`yarn runner:fire`, `yarn campaign:tick`) emit *fire artifacts*,
+a different shape the projection has no table for. Nothing there publishes.
+
+### Before enabling it against a database
+
+```bash
+yarn gate:serving
+```
+
+Ask the configured database whether it can hold these writes, before any are
+sent. It checks the capability version, hands every statement the publisher will
+run to the server's own planner, reads the privilege grid at table *and* column
+level, and confirms the entrant identity index is unique, nulls-not-distinct and
+partial on models — the three properties whose absence is silent. It also checks
+what the *other* roles can reach: the browser-facing keys must not touch the
+projection at all, and the read API's key must hold no privilege of any kind on
+the model-authored rationale.
+
+It is read-only and proves it: the connection carries
+`default_transaction_read_only=on`, the server is made to refuse a write before
+anything else is asked, and the row counts are compared before and after. That
+matters because the projection's zero lifetime inserts are themselves evidence,
+and PostgreSQL counts an insert even when its transaction aborts.
+
+Nothing calls it automatically. A preflight that can fail for its own reasons has
+no business standing between a slate and a fire.
 
 ```bash
 # unit tests run with the rest of the suite; they open no connection
@@ -246,7 +298,8 @@ yarn test
 
 # the real-PostgreSQL suite, against a scratch database that already carries the
 # projection schema. It refuses a non-local host, mints a fresh cohort per run,
-# and connects as the scoped role with no owner escape hatch.
+# and connects as the scoped role with no owner escape hatch. Its last two checks
+# fire a real run and publish the artifact end to end.
 yarn store:serving
 ```
 

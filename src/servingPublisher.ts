@@ -80,6 +80,21 @@ export const PUBLICATION_DEADLINE_MS = 45_000;
 export const PER_WRITE_TIMEOUT_MS = 10_000;
 
 /**
+ * The clock the deadline is measured on — MONOTONIC, not wall-clock.
+ *
+ * `Date.now` moves backwards: an NTP correction, a host suspend and resume, an
+ * operator setting the clock. A backward step during publication pushes the
+ * budget's expiry away, so `spent()` stops ever returning true and the only
+ * remaining bound is the per-write cap — which for a fifteen-game slate is tens
+ * of minutes rather than the forty-five seconds this module advertises. The
+ * budget only ever computes differences, so nothing here wants a wall time.
+ *
+ * Exported so a test can hold the property rather than the wiring: the default
+ * must not be readable from `Date.now`, whatever `Date.now` is made to say.
+ */
+export const publicationNowMs = (): number => performance.now();
+
+/**
  * The clock and the bounds, injectable so the suite can prove them.
  *
  * A deadline no test exercises is a comment, and this one is load-bearing: it
@@ -253,7 +268,7 @@ export async function publishPlan(
   log: PublishLog,
   timing: PublishTiming = {},
 ): Promise<PublishSummary> {
-  const nowMs = timing.nowMs ?? Date.now;
+  const nowMs = timing.nowMs ?? publicationNowMs;
   const deadlineMs = timing.deadlineMs ?? PUBLICATION_DEADLINE_MS;
   const perWriteTimeoutMs = timing.perWriteTimeoutMs ?? PER_WRITE_TIMEOUT_MS;
   const tally = new Tally();
@@ -371,7 +386,26 @@ export async function publishRunArtifact(
 
   // Integrity BEFORE anything else reads the file, and answered by the scorer's
   // own reader rather than by this module's. See verifyArtifactIntegrity.
-  const broken = verifyArtifactIntegrity(text);
+  //
+  // Guarded, because a corrupt artifact is a file to REFUSE and not a command to
+  // crash. The verifier re-hashes the frozen bundle, and canonicalisation throws
+  // rather than returning on two shapes a file can actually hold — both measured
+  // end to end against a real fired artifact:
+  //
+  //   a number that overflows a double (`1e400` parses to Infinity, and the
+  //   schema's validators accept it)  -> Error, non-finite number
+  //   JSON nested about ten thousand deep under the passthrough bundle
+  //                                    -> RangeError, call stack exceeded
+  //
+  // Either one used to leave this function through the gap between the two
+  // existing catches, which on `yarn project` printed a stack under exit 5 and
+  // in a fire would have been counted as a lost game.
+  let broken: string | null;
+  try {
+    broken = verifyArtifactIntegrity(text);
+  } catch (error) {
+    broken = `the artifact could not be verified (${describeError(error)})`;
+  }
   if (broken !== null) return refuse(broken);
 
   let records: readonly Parameters<typeof publishableRun>[0][number][];
@@ -398,6 +432,53 @@ export async function publishRunArtifact(
   log.line(describeSummary(summary));
   for (const reason of summary.skipped) log.line(`  not published — ${reason}`);
   return summary;
+}
+
+/**
+ * The same publication, from a path where the projection must never be the
+ * reason a benchmark night failed.
+ *
+ * ── WHY publishRunArtifact IS NOT ALREADY SAFE TO CALL FROM A FIRE ───────────
+ * It is fail-soft about the DATABASE — every port method returns a typed outcome
+ * and `settle` converts a rejection or a silence into `unavailable`. It is not
+ * total about ITSELF. Reading, integrity-checking, parsing and PROJECTING the
+ * artifact all happen before any port method is reached, and `projectRun` is not
+ * inside a try. Neither is the summary line at the end, and a log sink can
+ * throw: `printLine` writes to stdout, and stdout raises EPIPE when the run is
+ * piped into something that exits first.
+ *
+ * On `yarn project` a throw is correct and wanted — the command's own catch
+ * reports `crashed`, and the answer is to read the stack. Inside a fire it is
+ * not. The artifact is already written and the benchmark run SUCCEEDED; a throw
+ * here would unwind into the watcher's per-game handler, be recorded in the
+ * ledger as a fire error, count against `summary.failed`, and turn `--once` into
+ * a non-zero exit. A projection defect would present as a lost game.
+ *
+ * ── WHY IT RETURNS null RATHER THAN AN EMPTY SUMMARY ─────────────────────────
+ * A crash can land after rows have been written, so `{published: 0, ...}` would
+ * be a measurement this function did not make. `null` says the counts are
+ * unknown, which is the only true thing available. The reason is logged either
+ * way, and the recovery is the same one line of `yarn project`.
+ */
+export async function mirrorRunArtifact(
+  port: BenchmarkServingPort,
+  runFile: string,
+  log: PublishLog,
+): Promise<PublishSummary | null> {
+  try {
+    return await publishRunArtifact(port, runFile, log);
+  } catch (error) {
+    try {
+      log.error(
+        `serving projection: the publisher itself failed (${describeError(error)}). The run ` +
+          `artifact is written and complete — republish it with \`yarn project ${basename(runFile)}\`.`,
+      );
+    } catch {
+      // The log sink is the thing that broke. There is nowhere left to report
+      // it, and the run still must not fail.
+    }
+    return null;
+  }
 }
 
 export function describeSummary(summary: PublishSummary): string {
