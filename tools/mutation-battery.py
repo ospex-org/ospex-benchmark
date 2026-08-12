@@ -400,6 +400,166 @@ MUTANTS = [
      "  return typeof version === 'number' && Number.isInteger(version) ? version : 0;",
      '  return Number(version);',
      ['src/benchmarkServingClient.test.ts']),
+
+    # --- PR4: the run paths publish, and cannot be failed by publishing ----
+    ('M78-mirror-rethrows', 'src/servingPublisher.ts',
+     '    return null;\n  }\n}',
+     '    throw error;\n  }\n}',
+     ['src/servingPublisher.test.ts', 'src/watch.test.ts']),
+    ('M79-integrity-unguarded', 'src/servingPublisher.ts',
+     '  let broken: string | null;\n  try {\n    broken = verifyArtifactIntegrity(text);\n'
+     '  } catch (error) {\n    broken = `the artifact could not be verified (${describeError(error)})`;\n  }',
+     '  const broken = verifyArtifactIntegrity(text);',
+     ['src/servingPublisher.test.ts']),
+    ('M80-deadline-on-wall-clock', 'src/servingPublisher.ts',
+     'export const publicationNowMs = (): number => performance.now();',
+     'export const publicationNowMs = (): number => Date.now();',
+     ['src/servingPublisher.test.ts']),
+    ('M81-fire-does-not-publish', 'src/watch.ts',
+     '  await mirrorRunArtifact(cfg.serving, runFile, { line: cfg.log, error: cfg.logError });',
+     '  if (runFile === \'\') await mirrorRunArtifact(cfg.serving, runFile, { line: cfg.log, error: cfg.logError });',
+     ['src/watch.test.ts']),
+    ('M82-watch-dry-run-dials', 'src/watchMain.ts',
+     '  const serving = options.dryRun\n    ? dryRunServing()\n    : await openBenchmarkServing({ onError: printError });',
+     '  const serving = await openBenchmarkServing({ onError: printError });',
+     ['src/servingActivation.test.ts']),
+    ('M83-smoke-dry-run-dials', 'src/shadowSmoke.ts',
+     '  const serving = options.dryRun\n    ? dryRunServing()\n    : await openBenchmarkServing({ onError: printError });',
+     '  const serving = await openBenchmarkServing({ onError: printError });',
+     ['src/servingActivation.test.ts']),
+
+    # --- PR4: the schema gate's own safety properties ----------------------
+    ('M84-writable-reads-as-readonly', 'src/servingSchemaGate.ts',
+     "  return {\n    ok: false,\n    detail:\n      'this connection ACCEPTED a write.",
+     "  return {\n    ok: true,\n    detail:\n      'this connection ACCEPTED a write.",
+     ['src/servingSchemaGate.test.ts']),
+    ('M85-local-by-string-prefix', 'src/servingSchemaGate.ts',
+     "  if (connection.kind === 'derived') return isLocalHost(connection.host);",
+     "  if (connection.kind === 'derived') return connection.host.startsWith('127.')"
+     " || connection.host === 'localhost';",
+     ['src/servingSchemaGate.test.ts']),
+    ('M86-informational-becomes-decisive', 'src/servingSchemaGate.ts',
+     '      findings.filter((finding) => !finding.informational && !finding.ok).length +',
+     '      findings.filter((finding) => !finding.ok).length +',
+     ['src/servingSchemaGate.test.ts']),
+    ('M87-no-row-count-bookend', 'src/servingSchemaGate.ts',
+     '      (unmoved ? 0 : 1);',
+     '      0;',
+     ['src/servingSchemaGate.test.ts']),
+    ('M88-runs-checks-on-a-writable-connection', 'src/servingSchemaGate.ts',
+     '    if (!readOnly.ok) return GATE_EXIT.refused;',
+     '',
+     ['src/servingSchemaGate.test.ts']),
+
+    # --- PR4 round 2: a dropped connection must not kill the process --------
+    ('M89-pool-has-no-error-listener', 'src/benchmarkServingClient.ts',
+     "  pool.on('error', (error: unknown) => {",
+     "  pool.on('__no_listener_for_error', (error: unknown) => {",
+     ['src/benchmarkServingClient.test.ts']),
+    ('M90-pinned-client-has-no-error-listener', 'src/store/campaignTickJournal.ts',
+     "      client.on?.('error', absorb);",
+     '      void absorb;',
+     ['src/store/campaignTickJournal.test.ts', 'src/benchmarkServingClient.test.ts']),
+
+    # --- PR4 round 2: the gate's widened questions --------------------------
+    ('M91-reach-check-ignores-column-grants', 'src/servingSchemaGate.ts',
+     "                      has_any_column_privilege(c.oid, 'SELECT')",
+     "                      has_table_privilege(c.oid, 'SELECT')",
+     ['src/servingSchemaGate.test.ts']),
+    ('M92-bookend-treats-unreadable-as-unchanged', 'src/servingSchemaGate.ts',
+     '    const unmoved = before !== null && after !== null && before === after;',
+     '    const unmoved = before === after;',
+     ['src/servingSchemaGate.test.ts']),
+    ('M93-deadline-default-not-wired', 'src/servingPublisher.ts',
+     '  const nowMs = timing.nowMs ?? publicationNowMs;',
+     '  const nowMs = timing.nowMs ?? Date.now;',
+     ['src/servingPublisher.test.ts']),
+
+    # --- PR4 round 3: the four blockers a second review found ---------------
+    # B2: the listener that stops one uncaught crash must not become another.
+    # The mutation keeps the block structure valid on purpose — replacing `try`
+    # alone leaves a dangling `catch`, which is a syntax error, and a mutant that
+    # cannot parse fails every mode for a reason unrelated to the guarantee.
+    ('M94-error-sink-can-kill-the-process', 'src/benchmarkServingClient.ts',
+     '    try {\n      onError(',
+     '    if (true) {\n      onError(',
+     ['src/benchmarkServingClient.test.ts']),
+    ('M94b-error-sink-catch-removed', 'src/benchmarkServingClient.ts',
+     '    } catch {\n      // ⚠ THE REPORTING PATH IS ITSELF A CRASH PATH.',
+     '    } else if (false) {\n      // ⚠ THE REPORTING PATH IS ITSELF A CRASH PATH.',
+     ['src/benchmarkServingClient.test.ts']),
+
+    # B1.1: the forbidden readers, every verb rather than the two reads.
+    ('M95-forbidden-readers-reads-only', 'src/servingSchemaGate.ts',
+     "            where case when v in ('DELETE', 'TRUNCATE', 'TRIGGER')\n"
+     "                       then has_table_privilege(r, 'public.' || t, v)\n"
+     "                       else has_any_column_privilege(r, 'public.' || t, v) end`,",
+     "            where v = 'SELECT' and has_any_column_privilege(r, 'public.' || t, v)`,",
+     ['src/servingSchemaGate.test.ts']),
+
+    # B1.2: RLS enabled is not the same as this role being able to write.
+    ('M96-rls-policy-shape-unchecked', 'src/servingSchemaGate.ts',
+     "        if (needsWrite && Number(row['writable']) === 0) {",
+     "        if (false && needsWrite && Number(row['writable']) === 0) {",
+     ['src/servingSchemaGate.test.ts']),
+    ('M96b-restrictive-policy-ignored', 'src/servingSchemaGate.ts',
+     "        if (Number(row['restrictive']) > 0) {",
+     "        if (false && Number(row['restrictive']) > 0) {",
+     ['src/servingSchemaGate.test.ts']),
+
+    # B1.3: a SECURITY DEFINER function runs as its owner.
+    ('M97-security-definer-ignored', 'src/servingSchemaGate.ts',
+     '      if (rows.length === 0) {',
+     '      if (true) {',
+     ['src/servingSchemaGate.test.ts']),
+
+    # A definer function is a way OUT for the writer and a way IN for a
+    # browser-facing key. Asking only about the connected role closes one half.
+    ('M98-security-definer-connected-role-only', 'src/servingSchemaGate.ts',
+     "           cross join (select rolname::text as role from pg_roles\n"
+     "                        where rolname = any($1::text[]) or rolname = current_user) as named",
+     "           cross join (select current_user::text as role) as named",
+     ['src/servingSchemaGate.test.ts']),
+
+    # The async half of the reporting hazard: EPIPE is delivered as a stream
+    # 'error' event AFTER the write returns, so the call-site try/catch (M94)
+    # cannot see it. Distinct layers, distinct mutants.
+    ('M99-no-stdio-error-guard', 'src/console.ts',
+     "  stream.on('error', (error: unknown) => {",
+     "  stream.on('__no_listener_for_error', (error: unknown) => {",
+     ['src/benchmarkServingClient.test.ts']),
+
+    # The guard must DISCRIMINATE, not blanket-absorb. An empty listener reads as
+    # "tolerate a closed pipe" and behaves as "ignore every output fault".
+    ('M100-guard-absorbs-everything', 'src/console.ts',
+     '    if (isConsumerGone(error)) return;',
+     '    return;',
+     ['src/console.test.ts']),
+    ('M100b-guard-reports-every-time', 'src/console.ts',
+     '    if (reported) return;',
+     '    if (false) return;',
+     ['src/console.test.ts']),
+
+    # The two installs are separate lines, and a case that emits on only one
+    # stream leaves the other pinned by nothing. Measured: with the stderr emit
+    # alone, deleting the stdout install left the suite green while a run piped
+    # into `head` still died.
+    ('M101-stdout-guard-not-installed', 'src/console.ts',
+     "guardStream('stdout', process.stdout, (line) => process.stderr.write(",
+     "void ('stdout', process.stdout, (line) => process.stderr.write(",
+     ['src/benchmarkServingClient.test.ts']),
+    ('M101b-stderr-guard-not-installed', 'src/console.ts',
+     "guardStream('stderr', process.stderr, (line) => process.stdout.write(",
+     "void ('stderr', process.stderr, (line) => process.stdout.write(",
+     ['src/benchmarkServingClient.test.ts']),
+
+    # Which stream the diagnostic lands on. Reporting a stdout fault onto stdout
+    # writes to the stream that just failed, and the once-per-stream latch then
+    # discards the resulting second error — total silence, suite green.
+    ('M102-report-onto-the-broken-stream', 'src/console.ts',
+     "guardStream('stdout', process.stdout, (line) => process.stderr.write(",
+     "guardStream('stdout', process.stdout, (line) => process.stdout.write(",
+     ['src/benchmarkServingClient.test.ts']),
 ]
 
 

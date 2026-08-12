@@ -1,4 +1,5 @@
 import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
+import { describeError } from './config.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { BenchmarkWriterConnection, UnresolvedReason } from './benchmarkServingConfig.js';
 import type { BenchmarkServingPort } from './servingStore.js';
@@ -99,7 +100,7 @@ export type ServingStatus =
   | { readonly enabled: true }
   | {
       readonly enabled: false;
-      readonly reason: UnresolvedReason | 'schema_not_ready' | 'driver_unavailable';
+      readonly reason: UnresolvedReason | 'schema_not_ready' | 'driver_unavailable' | 'dry_run';
     };
 
 const CLOSE_TIMEOUT_MS = 5_000;
@@ -153,6 +154,9 @@ export interface BenchmarkServingHandle {
 /** One line for an operator, naming no part of the target. */
 export function describeServingStatus(status: ServingStatus): string {
   if (status.enabled) return 'serving projection: enabled';
+  if (status.reason === 'dry_run') {
+    return 'serving projection: not opened — a dry run resolves no credential and opens no socket';
+  }
   if (status.reason === 'driver_unavailable') {
     return (
       'serving projection: disabled (the PostgreSQL driver is not installed in ' +
@@ -208,6 +212,33 @@ export function servingPoolConfig(connection: BenchmarkWriterConnection): PoolCo
 
 const DISABLED: Pick<BenchmarkServingHandle, 'close'> = { close: async () => {} };
 
+/**
+ * The handle for a caller that must not even ASK whether publication is set up.
+ *
+ * `openBenchmarkServing` resolves the environment and then dials the database to
+ * read the capability row, so calling it is itself a credential read and a
+ * network connection. `--dry-run` on both entry points is documented as "no
+ * credentials, no network", and that promise covers the projection: a demo on a
+ * host that happens to have a writer password configured must not reach out, and
+ * a broken credential must not be able to delay one.
+ *
+ * Nothing is lost by not asking. The publisher's own gate reads `mode` out of the
+ * artifact and refuses a dry run anyway, so opening would resolve a credential,
+ * dial a database, and publish exactly nothing.
+ *
+ * It lives here rather than at the two call sites because the disabled handle is
+ * this module's shape — a port over a null query and a close that does nothing —
+ * and two hand-written copies are two chances for one of them to construct a live
+ * port by mistake.
+ */
+export function dryRunServing(): BenchmarkServingHandle {
+  return {
+    port: new SqlBenchmarkServingPort(null),
+    status: { enabled: false, reason: 'dry_run' },
+    ...DISABLED,
+  };
+}
+
 /** The three runtime pieces this module needs, loaded together so one failure
  *  is one branch. */
 async function loadDriver() {
@@ -235,10 +266,11 @@ type ServingTransactorFactory = Awaited<ReturnType<typeof loadDriver>>['pgStoreT
  *   reason it calls this unconditionally is that it is safe to.
  */
 export async function openBenchmarkServing(
-  bounds: ServingBounds = {},
+  options: ServingOptions = {},
 ): Promise<BenchmarkServingHandle> {
-  const readinessTimeoutMs = bounds.readinessTimeoutMs ?? READINESS_TIMEOUT_MS;
-  const closeTimeoutMs = bounds.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
+  const readinessTimeoutMs = options.readinessTimeoutMs ?? READINESS_TIMEOUT_MS;
+  const closeTimeoutMs = options.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
+  const onError = options.onError ?? ((): void => {});
   const resolution = resolveBenchmarkWriterConnection();
   if (!resolution.resolved) {
     return { port: new SqlBenchmarkServingPort(null), status: { enabled: false, reason: resolution.reason }, ...DISABLED };
@@ -268,6 +300,41 @@ export async function openBenchmarkServing(
   pool.on('acquire', (client: unknown) => { live.add(client as EndableClient); });
   pool.on('release', (_error: unknown, client: unknown) => { live.delete(client as EndableClient); });
   pool.on('remove', (client: unknown) => { live.delete(client as EndableClient); });
+
+  // ── WITHOUT THIS LINE A DROPPED CONNECTION KILLS THE PROCESS ───────────────
+  // `Pool` is an EventEmitter, and `emit('error', …)` on an emitter with no
+  // 'error' listener THROWS. Every client pg-pool holds idle carries an
+  // internal listener that ends in exactly that emit, so an ordinary reset of
+  // an idle connection — a managed-Postgres restart, a failover, an idle
+  // reaper, a `pg_terminate_backend` — becomes an uncaught exception. Nothing
+  // in this process installs a handler for one.
+  //
+  // It arrives from a socket callback, so it is outside every promise: the
+  // per-write race, the port's own try/catch and `mirrorRunArtifact` all miss
+  // it. In `yarn watch` that is not a lost projection row, it is the WATCHER
+  // dying between games with the rest of the slate unfired and unledgered —
+  // strictly worse than the failure the fail-soft design exists to avoid.
+  //
+  // Measured against PostgreSQL 17 by terminating the backend of a released
+  // client: without this listener the process exits 1; with it, exit 0.
+  //
+  // Absorbing is the whole job. The write that hit a dead connection is already
+  // reported as `unavailable` by the port; what this adds is that the process
+  // stays alive to report it.
+  pool.on('error', (error: unknown) => {
+    try {
+      onError(`serving projection: a pooled connection failed (${describeError(error)}) — the pool will reconnect`);
+    } catch {
+      // ⚠ THE REPORTING PATH IS ITSELF A CRASH PATH. This runs inside an event
+      //   handler, so a throw here is uncaught exactly like the one the listener
+      //   exists to prevent — and the sink is `printError`, which writes to
+      //   stderr, which raises EPIPE when the run is piped into something that
+      //   has already exited. Fixing one crash by adding another is not a fix.
+      //
+      //   Nowhere is left to report it: the place we would report to is the
+      //   thing that broke. The run continues, which is the whole point.
+    }
+  });
   const poolLike = pool as unknown as PoolLike;
 
   // Before a single row: does this schema say it can hold the entrant contract?
@@ -309,16 +376,29 @@ export async function openBenchmarkServing(
 export const READINESS_TIMEOUT_MS = 5_000;
 
 /**
- * The two bounds a caller may shorten.
+ * What a caller may supply.
  *
  * Injectable for one reason only: the guarantee this module exists to make is
  * "the process can still exit", and a child process proving that has to run in
  * about a second rather than about ten. The DEFAULTS are pinned separately, as
  * values, so shortening them in a test cannot quietly become shipping them.
  */
-export interface ServingBounds {
+export interface ServingOptions {
   readonly readinessTimeoutMs?: number;
   readonly closeTimeoutMs?: number;
+  /**
+   * Where an ASYNCHRONOUS pool failure is reported.
+   *
+   * Needed because a pooled connection can fail with no write in flight: an
+   * idle socket reset between two games belongs to nobody's promise, so there
+   * is no outcome to fold it into and no caller to return it to. Absorbing it
+   * silently would make a database that drops every connection look exactly
+   * like one that is working.
+   *
+   * Defaults to doing nothing, so a caller with no console — a probe, a unit
+   * test — is not made to invent one.
+   */
+  readonly onError?: (line: string) => void;
 }
 
 /**

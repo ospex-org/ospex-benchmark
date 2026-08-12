@@ -1,0 +1,1130 @@
+import { pathToFileURL } from 'node:url';
+import {
+  REQUIRED_SERVING_CAPABILITY,
+  SERVING_POOL_MAX,
+  servingPoolConfig,
+} from './benchmarkServingClient.js';
+import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
+import { describeError, describeErrorWithStack } from './config.js';
+import { printError, printLine } from './console.js';
+import { dsnFacts, isLocalHost } from './dsnFacts.js';
+import { loadDotEnv } from './env.js';
+import { SERVING_STATEMENTS, SERVING_TABLES } from './servingStore.js';
+import type { BenchmarkWriterConnection } from './benchmarkServingConfig.js';
+
+/**
+ * Ask a LIVE database whether it can hold this publisher's writes — before one
+ * is sent.
+ *
+ * ── WHY A SEPARATE COMMAND, AND WHY IT GATES NOTHING AUTOMATICALLY ───────────
+ * The publisher already refuses to write against a schema that does not report
+ * the capability it needs, and that refusal is fail-SOFT by design: a benchmark
+ * night must never be lost to a database. Fail-soft means quiet, and quiet is
+ * the wrong mode for the one moment that matters — an operator pointing this at
+ * a real database for the first time. Every row the projection writes is
+ * insert-once with no UPDATE grant, so a schema that is subtly wrong does not
+ * produce a fixable mistake, it produces a permanent one.
+ *
+ * So this is the loud version: run by hand, once, before the credential goes in.
+ * It is deliberately NOT called from `yarn watch`, `yarn smoke` or `yarn
+ * project`, and it must not become so. A preflight that can fail for its own
+ * reasons has no business standing between a slate and a fire.
+ *
+ * ── IT CANNOT WRITE, AND THE SERVER IS WHAT ENFORCES THAT ────────────────────
+ * The connection carries `default_transaction_read_only=on` as a startup
+ * parameter, so PostgreSQL refuses any write with 25006. That is PROVEN rather
+ * than assumed — a pooler is free to drop a startup option, and a gate that
+ * believed its own configuration would be exactly as safe as no gate. Before any
+ * check runs, the connection must demonstrate the refusal, using a statement
+ * that is a no-op even if it executes (measured: on a writable connection the
+ * same statement reports `INSERT 0` and the row count does not move). The check
+ * that a write is refused cannot itself be the write that gets through.
+ *
+ * As a second, independent proof, the row counts are read at the start and again
+ * at the end and must be identical. Nothing the gate did may have moved them.
+ *
+ * ── EVERY QUESTION IS PUT TO THE DATABASE, NOT TO A MODEL OF IT ──────────────
+ * The publisher's statements are handed to the server's own planner; privileges
+ * are read with `has_table_privilege`, the function the executor itself
+ * consults; the entrant index is read out of `pg_index` rather than
+ * reconstructed. A second definition of the schema kept in this repo would be a
+ * second thing to drift, and it would drift in the direction of agreeing with
+ * itself.
+ */
+
+/** The startup parameter that makes this connection incapable of writing. */
+export const READ_ONLY_STARTUP_OPTION = '-c default_transaction_read_only=on';
+
+/**
+ * The statement that proves the refusal is real.
+ *
+ * `where false` is what makes it safe to point at a real database: if the
+ * read-only setting somehow did not take effect, this executes and inserts
+ * nothing. Measured on PostgreSQL 17 both ways — 25006 on the read-only
+ * connection, `INSERT 0` with an unchanged row count on a writable one.
+ */
+const REFUSAL_PROBE =
+  "insert into public.benchmark_runs (cohort_id) select 'serving-schema-gate' where false";
+
+const READ_ONLY_SQLSTATE = '25006';
+
+/**
+ * Below this, several checks would ERROR rather than fail.
+ *
+ * `NULLS NOT DISTINCT` is PostgreSQL 15, and so is the catalog column that
+ * reports it. On 14 the entrant index cannot exist in the form the identity
+ * contract requires, so this is a floor on the schema as much as on the gate.
+ */
+const MINIMUM_SERVER_VERSION_NUM = 150000;
+/** `EXPLAIN (GENERIC_PLAN)` — the strongest form of the statement check. */
+const GENERIC_PLAN_VERSION_NUM = 160000;
+
+export interface GateQuery {
+  (sql: string, params?: readonly unknown[]): Promise<ReadonlyArray<Record<string, unknown>>>;
+}
+
+export interface GateVerdict {
+  readonly ok: boolean;
+  readonly detail: string;
+}
+
+export interface GateCheck {
+  readonly name: string;
+  /**
+   * Reported, never decisive.
+   *
+   * An informational check exists so an operator SEES a number they should look
+   * at, without that number becoming a condition the command refuses on.
+   * Reporting a fact and refusing to proceed are different jobs, and a row count
+   * is a fact about history rather than a fault.
+   */
+  readonly informational?: boolean;
+  run(query: GateQuery): Promise<GateVerdict>;
+}
+
+export interface GateFinding extends GateVerdict {
+  readonly name: string;
+  readonly informational: boolean;
+}
+
+/** The SQLSTATE of a driver error, when it carries one. */
+function sqlstate(error: unknown): string | null {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' ? code : null;
+}
+
+/** Collapse whitespace, so a definition that wraps differently still matches. */
+function normalise(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+// ---------------------------------------------------------------------------
+// The read-only precondition, and the bookend that confirms it held
+// ---------------------------------------------------------------------------
+
+/**
+ * Prove the connection refuses writes, or refuse to use it.
+ *
+ * Measured rather than read back from `show`: `show` reports what the server was
+ * TOLD, and this reports what the server DOES. They agree today. The one that
+ * keeps agreeing after a connection pooler is introduced is the one that tried.
+ */
+export async function proveReadOnly(query: GateQuery): Promise<GateVerdict> {
+  try {
+    await query(REFUSAL_PROBE);
+  } catch (error) {
+    const code = sqlstate(error);
+    if (code === READ_ONLY_SQLSTATE) {
+      return { ok: true, detail: `the server refuses writes on this connection (${READ_ONLY_SQLSTATE})` };
+    }
+    // Any other refusal leaves the question unanswered. A missing table or a
+    // missing grant says nothing about whether a write would be allowed.
+    return {
+      ok: false,
+      detail:
+        'could not prove this connection is read-only: the probe failed with ' +
+        `${code ?? 'no SQLSTATE'} instead of ${READ_ONLY_SQLSTATE} (${describeError(error)})`,
+    };
+  }
+  return {
+    ok: false,
+    detail:
+      'this connection ACCEPTED a write. The read-only startup option did not take effect — ' +
+      'a pooler may have dropped it. Refusing to continue: a preflight that can write is not ' +
+      'a preflight.',
+  };
+}
+
+/**
+ * Confirm the password did not cross a wire in the clear.
+ *
+ * A property of the CONNECTION rather than of the schema, which is why it sits
+ * here beside the read-only proof instead of among the checks.
+ *
+ * ⚠ WHETHER THE TARGET IS LOCAL IS A CLIENT-SIDE QUESTION AND THE SERVER CANNOT
+ *   ANSWER IT. The obvious source, `pg_stat_activity.client_addr`, reports what
+ *   the SERVER sees — and a container with a published port sees the runtime's
+ *   NAT gateway, not loopback. Measured: dialling localhost:5436 against a
+ *   Docker PostgreSQL presents as 172.x, so a gate reading `client_addr`
+ *   declares a connection that never left the machine to be remote and
+ *   unencrypted. `isLocalHost` answers the question that was actually asked —
+ *   which host did this process dial — and it is the reviewed implementation,
+ *   loopback by address rather than by string prefix.
+ */
+export function proveEncrypted(session: {
+  readonly ssl: unknown;
+  readonly version: unknown;
+}, localTarget: boolean): GateVerdict {
+  if (session.ssl === true) return { ok: true, detail: `TLS ${String(session.version)}` };
+  if (localTarget) {
+    return { ok: true, detail: 'not encrypted, and the target is this machine — nothing reaches a wire' };
+  }
+  return {
+    ok: false,
+    detail:
+      'this session is NOT encrypted and the target is not this machine. The connection ' +
+      "string carries this role's password, so it went out in the clear.",
+  };
+}
+
+/** What the server reports about the current session's transport. */
+export async function readSession(query: GateQuery): Promise<{ ssl: unknown; version: unknown }> {
+  const rows = await query('select ssl, version from pg_stat_ssl where pid = pg_backend_pid()');
+  return { ssl: rows[0]?.['ssl'], version: rows[0]?.['version'] };
+}
+
+/** Row counts for every projection table, as `name=n` pairs. */
+export async function readRowCounts(query: GateQuery): Promise<string> {
+  const rows = await query(
+    `select t as name,
+            (xpath('/row/c/text()',
+                   query_to_xml(format('select count(*) as c from public.%I', t),
+                                false, true, '')))[1]::text::bigint as n
+       from unnest($1::text[]) as t`,
+    [[...SERVING_TABLES]],
+  );
+  return rows.map((row) => `${String(row['name'])}=${String(row['n'])}`).join(' ');
+}
+
+// ---------------------------------------------------------------------------
+// What the schema has to be
+// ---------------------------------------------------------------------------
+
+/**
+ * The capability table is the odd one out, deliberately: it is the schema's
+ * claim about what it can hold, and a publisher able to write that claim would
+ * be authorising its own writes. Its absent INSERT is an assertion here, not an
+ * omission.
+ */
+const CAPABILITY_TABLE = 'benchmark_schema_capability';
+const WRITABLE: ReadonlySet<string> = new Set(
+  SERVING_TABLES.filter((table) => table !== CAPABILITY_TABLE),
+);
+
+/** Verbs no projection writer may hold on any of these tables, ever. */
+const FORBIDDEN_VERBS = ['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'] as const;
+
+/**
+ * The entrant index, as the identity contract needs it.
+ *
+ * Three properties, each load-bearing and each failing silently:
+ *   - unique, or two rows hold one competitor's identity;
+ *   - NULLS NOT DISTINCT, or a model with no lab stops colliding with itself and
+ *     the same entrant is admitted twice;
+ *   - PARTIAL on models, or the eight deterministic controls — every one of
+ *     which declares (null, null, null) — collide with each other, and a
+ *     fail-soft publisher turns that into seven missing rows and no error.
+ */
+const ENTRANT_COLUMNS = ['lab_id', 'model_id', 'configuration'] as const;
+const ENTRANT_PREDICATE = "(kind = 'model'::text)";
+
+/**
+ * The constraints that make a participant an entrant, listed by the invariant
+ * each encodes.
+ *
+ * Compared against `pg_get_constraintdef`, PostgreSQL's own canonical rendering
+ * of the expression it stored — the closest a read-only check gets to
+ * evaluating it. That is a text comparison and the bound is worth stating: a
+ * failure here means read the definitions the gate prints beside it, which may
+ * be an equivalent expression rather than a broken one.
+ *
+ * Note the asymmetry, which is the schema's intent rather than an oversight:
+ * `lab_id` is NOT among the four a model must declare — a self-hosted model
+ * legitimately has no lab — only a non-model may not carry one.
+ */
+const ENTRANT_CONSTRAINTS: ReadonlyArray<{ invariant: string; definition: string }> = [
+  {
+    invariant: 'a model declares all four identity columns',
+    definition:
+      "CHECK (((kind <> 'model'::text) OR (num_nonnulls(model_id, configuration, " +
+      'configuration_sha256, configuration_digest_version) = 4)))',
+  },
+  {
+    invariant: 'anything that is not a model declares none of them',
+    definition:
+      "CHECK (((kind = 'model'::text) OR (num_nonnulls(model_id, configuration, " +
+      'configuration_sha256, configuration_digest_version) = 0)))',
+  },
+  {
+    invariant: 'only a model carries a lab',
+    definition: "CHECK (((kind = 'model'::text) OR (lab_id IS NULL)))",
+  },
+];
+
+/**
+ * The scales the reveal's numbers are stored at.
+ *
+ * The seal's forecast digest is taken over values ALREADY quantised to these
+ * scales, so that a reveal can be checked against the commitment it belongs to.
+ * If a scale moves, PostgreSQL rounds on the way in, the recomputed digest stops
+ * matching, and nothing anywhere reports it — every published commitment becomes
+ * unverifiable at once. It is the quietest way this schema can break, which is
+ * why it is checked despite no statement naming a scale.
+ */
+const REVEAL_SCALES: Readonly<Record<string, readonly [precision: number, scale: number]>> = {
+  confidence: [9, 8],
+  line: [10, 4],
+  observed_decimal: [12, 6],
+  prob_loss: [9, 8],
+  prob_push: [9, 8],
+  prob_win: [9, 8],
+};
+
+/** Roles that must not reach the projection at all. Browser-reachable keys
+ *  resolve to the first two; the third additionally holds BYPASSRLS, so for it
+ *  the privilege grid is the only gate there is. */
+const FORBIDDEN_READERS = ['anon', 'authenticated', 'openclaw_readonly'] as const;
+/** The public read API's own role: it may read the projection, and it must not
+ *  be able to reach the model-authored prose. */
+const READ_API_ROLE = 'service_role';
+const WITHHELD_TABLE = 'benchmark_decision_rationales';
+
+
+/** Every table privilege PostgreSQL can grant. Used wherever the claim is "no
+ *  privilege of any kind", so a verb cannot be forgotten out of the question. */
+const ALL_VERBS = [
+  'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER',
+] as const;
+
+/** The row counts, or null when they could not be read. Never throws. */
+async function countsOrNull(query: GateQuery): Promise<string | null> {
+  try {
+    return await readRowCounts(query);
+  } catch {
+    return null;
+  }
+}
+
+export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
+  {
+    name: 'the server is new enough for the identity contract',
+    async run(query) {
+      const rows = await query("select current_setting('server_version_num')::int as v");
+      const version = Number(rows[0]?.['v']);
+      if (!Number.isInteger(version)) return { ok: false, detail: 'the server did not report a version' };
+      return {
+        ok: version >= MINIMUM_SERVER_VERSION_NUM,
+        detail:
+          `server_version_num ${version}` +
+          (version >= MINIMUM_SERVER_VERSION_NUM
+            ? ''
+            : ` — below ${MINIMUM_SERVER_VERSION_NUM}, where NULLS NOT DISTINCT does not exist, ` +
+              'so the entrant index cannot hold the form the identity contract requires'),
+      };
+    },
+  },
+
+  {
+    name: 'the connected role is scoped, not privileged',
+    async run(query) {
+      const rows = await query(
+        `select rolname, rolcanlogin, rolsuper, rolbypassrls, rolreplication, rolcreaterole,
+                rolconnlimit,
+                (rolvaliduntil is not null and rolvaliduntil < now()) as expired
+           from pg_roles where rolname = current_user`,
+      );
+      const row = rows[0];
+      if (row === undefined) return { ok: false, detail: 'the current role is not in pg_roles' };
+      const faults: string[] = [];
+      if (row['rolcanlogin'] !== true) faults.push('cannot log in');
+      // A superuser bypasses every grant, so every privilege check below would
+      // pass by bypass rather than by grant — and the publisher would in fact
+      // hold UPDATE and DELETE on rows the design says can never be altered.
+      if (row['rolsuper'] !== false) faults.push('is a SUPERUSER, which makes every privilege check below vacuous');
+      if (row['rolbypassrls'] !== false) faults.push('holds BYPASSRLS');
+      if (row['rolreplication'] !== false) faults.push('holds REPLICATION, which reads protocol writes over an ordinary connection');
+      if (row['rolcreaterole'] !== false) faults.push('holds CREATEROLE');
+      if (row['expired'] === true) faults.push('the password has expired, which looks identical to a wrong credential');
+      const limit = Number(row['rolconnlimit']);
+      // Past the role's limit PostgreSQL answers 53300 instead of writing, which
+      // the publisher classifies as `unavailable` and, being fail-soft, drops.
+      if (limit !== -1 && limit < SERVING_POOL_MAX) {
+        faults.push(`CONNECTION LIMIT ${limit} is below the publisher's pool maximum of ${SERVING_POOL_MAX}`);
+      }
+      return faults.length === 0
+        ? { ok: true, detail: `${String(row['rolname'])}: login only, no bypass, connection limit ${limit === -1 ? 'unlimited' : limit}` }
+        : { ok: false, detail: `${String(row['rolname'])} ${faults.join('; ')}` };
+    },
+  },
+
+  {
+    name: 'the connected role inherits nothing',
+    async run(query) {
+      // The one hole no privilege probe can see: a NOINHERIT member reports
+      // FALSE for every table privilege above and can still SET ROLE into the
+      // whole protocol schema.
+      const rows = await query(
+        `select r.rolname as held from pg_auth_members m
+           join pg_roles r on r.oid = m.roleid
+          where m.member = (select oid from pg_roles where rolname = current_user)`,
+      );
+      return rows.length === 0
+        ? { ok: true, detail: 'the role is a member of nothing, so no grant boundary can be stepped around' }
+        : {
+            ok: false,
+            detail:
+              `the role is a member of ${rows.map((row) => String(row['held'])).join(', ')} — ` +
+              'membership is an escape from every privilege check here, including a NOINHERIT one',
+          };
+    },
+  },
+
+  {
+    name: `the schema reports serving_projection capability ${REQUIRED_SERVING_CAPABILITY} or higher`,
+    async run(query) {
+      const rows = await query(
+        `select version from public.${CAPABILITY_TABLE} where capability = $1`,
+        ['serving_projection'],
+      );
+      if (rows.length > 1) {
+        return { ok: false, detail: `${rows.length} rows for serving_projection — "the version" is ambiguous` };
+      }
+      const version = rows[0]?.['version'];
+      if (typeof version !== 'number' || !Number.isInteger(version)) {
+        return {
+          ok: false,
+          detail:
+            'no capability row. The publisher reads absence as version 0 and writes nothing, ' +
+            'so this is what an unmigrated database looks like from here.',
+        };
+      }
+      return {
+        ok: version >= REQUIRED_SERVING_CAPABILITY,
+        detail: `serving_projection = ${version} (this build requires ${REQUIRED_SERVING_CAPABILITY})`,
+      };
+    },
+  },
+
+  {
+    name: 'every statement the publisher will run is valid against this schema',
+    async run(query) {
+      // Handed to the server's own planner. This is the one check that covers
+      // the whole write surface at once, because it IS the write surface: a
+      // renamed column, a dropped relation, a drifted type, a missing ON
+      // CONFLICT constraint all fail here rather than at four in the morning,
+      // one row at a time, into a fail-soft log.
+      //
+      // EXPLAIN (GENERIC_PLAN) is preferred over PREPARE because it PLANS as
+      // well as parses, and arbiter inference happens in the planner. Measured:
+      // an `on conflict (col)` with no matching unique index PREPAREs cleanly
+      // and fails GENERIC_PLAN with 42P10. Neither executes, which is what makes
+      // this askable of a live database — verified by the row-count bookend.
+      const versionRows = await query("select current_setting('server_version_num')::int as v");
+      const generic = Number(versionRows[0]?.['v']) >= GENERIC_PLAN_VERSION_NUM;
+      const broken: string[] = [];
+      let index = 0;
+      for (const [name, sql] of Object.entries(SERVING_STATEMENTS)) {
+        index += 1;
+        try {
+          await query(generic ? `explain (generic_plan) ${sql}` : `prepare serving_gate_${index} as ${sql}`);
+        } catch (error) {
+          broken.push(`${name}: ${sqlstate(error) ?? '?'} ${describeError(error)}`);
+        }
+      }
+      const total = Object.keys(SERVING_STATEMENTS).length;
+      // The bound is stated rather than implied: on a pre-16 server the fallback
+      // parses but does not plan, so a missing ON CONFLICT arbiter would not be
+      // caught here.
+      const how = generic
+        ? 'planned (EXPLAIN GENERIC_PLAN, so ON CONFLICT arbiters are covered)'
+        : 'parsed only (PREPARE — this server predates GENERIC_PLAN, so a missing ON CONFLICT arbiter would NOT be caught)';
+      return broken.length === 0
+        ? { ok: true, detail: `${total} statements ${how}` }
+        : { ok: false, detail: `${broken.length} of ${total} failed — ${broken.join(' | ')}` };
+    },
+  },
+
+  {
+    name: 'the role holds exactly the privileges the design gives it',
+    async run(query) {
+      // Column-level as well as table-level. A column-scoped UPDATE is invisible
+      // to has_table_privilege, and one column of UPDATE is all it takes for a
+      // sealed forecast to stop being immutable.
+      const rows = await query(
+        `select t as name,
+                has_table_privilege('public.' || t, 'SELECT')                 as "SELECT",
+                has_table_privilege('public.' || t, 'INSERT')                 as "INSERT",
+                has_any_column_privilege('public.' || t, 'UPDATE')            as "UPDATE",
+                has_table_privilege('public.' || t, 'DELETE')                 as "DELETE",
+                has_table_privilege('public.' || t, 'TRUNCATE')               as "TRUNCATE",
+                has_any_column_privilege('public.' || t, 'REFERENCES')        as "REFERENCES",
+                has_table_privilege('public.' || t, 'TRIGGER')                as "TRIGGER"
+           from unnest($1::text[]) as t`,
+        [[...SERVING_TABLES]],
+      );
+      if (rows.length !== SERVING_TABLES.length) {
+        return { ok: false, detail: `asked about ${SERVING_TABLES.length} tables, the catalog answered for ${rows.length}` };
+      }
+      const wrong: string[] = [];
+      for (const row of rows) {
+        const table = String(row['name']);
+        if (row['SELECT'] !== true) {
+          wrong.push(`${table}: no SELECT, and every statement reads the stored row to detect drift`);
+        }
+        const needsInsert = WRITABLE.has(table);
+        if (row['INSERT'] !== needsInsert) {
+          wrong.push(
+            needsInsert
+              ? `${table}: no INSERT, so every row for it would be refused`
+              : `${table}: holds INSERT, and must not — this role could write the capability row that authorises its own writes`,
+          );
+        }
+        for (const verb of FORBIDDEN_VERBS) {
+          if (row[verb] !== false) wrong.push(`${table}: holds ${verb}, so a published row is not immutable`);
+        }
+      }
+      return wrong.length === 0
+        ? {
+            ok: true,
+            detail: `${rows.length} tables: SELECT on all, INSERT on ${WRITABLE.size}, and no mutating verb anywhere (table or column level)`,
+          }
+        : { ok: false, detail: wrong.join(' | ') };
+    },
+  },
+
+  {
+    name: 'the role reaches nothing outside the projection',
+    async run(query) {
+      // The only justification for a scoped login instead of the widely-held
+      // service key is that it cannot reach protocol state. A single grant
+      // elsewhere removes that, and sequences are the class a table-and-view
+      // sweep misses.
+      const rows = await query(
+        `select c.relname as name, c.relkind as kind
+           from pg_class c join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
+            and c.relkind in ('r', 'p', 'v', 'm', 'f', 'S')
+            and not (n.nspname = 'public' and c.relname = any($1::text[]))
+            -- EVERY verb, and at COLUMN level where the verb is column-grantable.
+            -- Asking only SELECT and INSERT at table level reads a role holding
+            -- UPDATE on a protocol table — or SELECT on one column of it — as
+            -- reaching nothing at all. A sequence answers a different family of
+            -- functions entirely, and is the class a table-and-view sweep misses.
+            and case when c.relkind = 'S' then
+                      has_sequence_privilege(c.oid, 'USAGE')
+                   or has_sequence_privilege(c.oid, 'SELECT')
+                   or has_sequence_privilege(c.oid, 'UPDATE')
+                 else
+                      has_any_column_privilege(c.oid, 'SELECT')
+                   or has_any_column_privilege(c.oid, 'INSERT')
+                   or has_any_column_privilege(c.oid, 'UPDATE')
+                   or has_any_column_privilege(c.oid, 'REFERENCES')
+                   or has_table_privilege(c.oid, 'DELETE')
+                   or has_table_privilege(c.oid, 'TRUNCATE')
+                   or has_table_privilege(c.oid, 'TRIGGER')
+                 end
+          order by c.relname limit 25`,
+        [[...SERVING_TABLES]],
+      );
+      return rows.length === 0
+        ? { ok: true, detail: 'no relation outside the projection is readable or writable by this role' }
+        : {
+            ok: false,
+            detail: `reaches ${rows.length}: ${rows.map((row) => `${String(row['name'])}(${String(row['kind'])})`).join(', ')}`,
+          };
+    },
+  },
+
+  {
+    name: 'an entrant is unique on (lab_id, model_id, configuration), nulls not distinct, models only',
+    async run(query) {
+      const rows = await query(
+        `select i.relname                          as name,
+                x.indisunique                      as uniq,
+                x.indnullsnotdistinct              as nulls_not_distinct,
+                x.indisvalid                       as valid,
+                pg_get_expr(x.indpred, x.indrelid) as predicate,
+                -- Cast to text, because attname has type "name" and the driver
+                -- carries no parser for an array of it: it hands back the raw
+                -- {a,b,c} literal as a string, which compares equal to nothing
+                -- and fails this check closed against a correct index. Measured.
+                (select array_agg(a.attname::text order by k.ord)
+                   from unnest(x.indkey) with ordinality as k(attnum, ord)
+                   join pg_attribute a on a.attrelid = x.indrelid and a.attnum = k.attnum) as cols
+           from pg_index x
+           join pg_class i on i.oid = x.indexrelid
+          where x.indrelid = 'public.benchmark_participants'::regclass`,
+      );
+      // Found by SHAPE, never by name. What protects the identity is the
+      // definition, and a rename is not a defect — whereas an index of the right
+      // NAME over the wrong columns is exactly the defect a name lookup accepts.
+      const wanted = ENTRANT_COLUMNS.join(',');
+      const over = rows.filter((row) => {
+        const cols = row['cols'];
+        return Array.isArray(cols) && cols.join(',') === wanted;
+      });
+      if (over.length === 0) {
+        const seen = rows.map((row) => `${String(row['name'])}(${String(row['cols'])})`).join(', ');
+        return { ok: false, detail: `no index over (${ENTRANT_COLUMNS.join(', ')}). Present: ${seen || 'none'}` };
+      }
+      const faults: string[] = [];
+      const good = over.filter((row) => {
+        const problems: string[] = [];
+        if (row['uniq'] !== true) problems.push('not unique');
+        if (row['valid'] !== true) problems.push('not valid, so it is not enforcing anything');
+        if (row['nulls_not_distinct'] !== true) {
+          problems.push('nulls are DISTINCT, so a model with no lab stops colliding with itself');
+        }
+        const predicate = row['predicate'];
+        if (typeof predicate !== 'string') {
+          problems.push('not partial, so the deterministic controls all collide on (null, null, null)');
+        } else if (normalise(predicate) !== ENTRANT_PREDICATE) {
+          problems.push(`partial on ${normalise(predicate)}, expected ${ENTRANT_PREDICATE}`);
+        }
+        if (problems.length > 0) faults.push(`${String(row['name'])}: ${problems.join('; ')}`);
+        return problems.length === 0;
+      });
+      return good.length > 0
+        ? { ok: true, detail: `${String(good[0]?.['name'])} — unique, nulls not distinct, partial on ${ENTRANT_PREDICATE}` }
+        : { ok: false, detail: faults.join(' | ') };
+    },
+  },
+
+  {
+    name: 'a model declares its identity and a control declares none',
+    async run(query) {
+      const rows = await query(
+        `select pg_get_constraintdef(oid) as def
+           from pg_constraint
+          where conrelid = 'public.benchmark_participants'::regclass and contype = 'c'`,
+      );
+      const present = new Set(rows.map((row) => normalise(String(row['def']))));
+      const missing = ENTRANT_CONSTRAINTS.filter((wanted) => !present.has(normalise(wanted.definition)));
+      return missing.length === 0
+        ? { ok: true, detail: `${ENTRANT_CONSTRAINTS.length} identity constraints present` }
+        : {
+            ok: false,
+            detail:
+              `${missing.length} not found — ${missing.map((entry) => entry.invariant).join('; ')}. ` +
+              `The table's CHECK constraints are: ${[...present].join(' | ') || 'none'}`,
+          };
+    },
+  },
+
+  {
+    name: 'the reveal stores its numbers at the scales the commitment was taken over',
+    async run(query) {
+      const rows = await query(
+        `select column_name as name, numeric_precision as p, numeric_scale as s
+           from information_schema.columns
+          where table_schema = 'public' and table_name = 'benchmark_decision_reveals'
+            and column_name = any($1::text[])`,
+        [Object.keys(REVEAL_SCALES)],
+      );
+      const seen = new Map(rows.map((row) => [String(row['name']), [Number(row['p']), Number(row['s'])] as const]));
+      const wrong: string[] = [];
+      for (const [column, [precision, scale]] of Object.entries(REVEAL_SCALES)) {
+        const actual = seen.get(column);
+        if (actual === undefined) {
+          wrong.push(`${column} is absent or not numeric`);
+        } else if (actual[0] !== precision || actual[1] !== scale) {
+          wrong.push(`${column} is numeric(${actual[0]},${actual[1]}), expected numeric(${precision},${scale})`);
+        }
+      }
+      return wrong.length === 0
+        ? { ok: true, detail: `${Object.keys(REVEAL_SCALES).length} columns at their committed scales` }
+        : {
+            ok: false,
+            detail:
+              `${wrong.join('; ')} — a moved scale rounds on the way in, so the recomputed digest ` +
+              'stops matching its seal and every published commitment becomes unverifiable, silently',
+          };
+    },
+  },
+
+  {
+    name: 'the public read keys reach only what they should',
+    async run(query) {
+      // Two separate properties, checked together because both are grants held
+      // by roles OTHER than the one connected. Any role may ask about another's
+      // privileges, so this is answerable from here — and it has to be asked
+      // from somewhere, because nothing else in the system ever looks.
+      const existing = await query('select rolname from pg_roles where rolname = any($1::text[])', [
+        [...FORBIDDEN_READERS, READ_API_ROLE],
+      ]);
+      const present = new Set(existing.map((row) => String(row['rolname'])));
+      const faults: string[] = [];
+
+      const browserKeys = FORBIDDEN_READERS.filter((role) => present.has(role));
+      if (browserKeys.length > 0) {
+        // EVERY verb. Asking only about reads was a false negative with teeth:
+        // measured, a DELETE granted to a browser-facing key passed this check
+        // while that role really could delete published rows.
+        const reach = await query(
+          `select r as role, t as name, v as verb
+             from unnest($1::text[]) as r, unnest($2::text[]) as t, unnest($3::text[]) as v
+            where case when v in ('DELETE', 'TRUNCATE', 'TRIGGER')
+                       then has_table_privilege(r, 'public.' || t, v)
+                       else has_any_column_privilege(r, 'public.' || t, v) end`,
+          [browserKeys, [...SERVING_TABLES], [...ALL_VERBS]],
+        );
+        for (const row of reach) {
+          faults.push(`${String(row['role'])} holds ${String(row['verb'])} on ${String(row['name'])}`);
+        }
+      }
+
+      if (present.has(READ_API_ROLE)) {
+        // The withheld prose. The publisher writes model-authored rationale on
+        // the stated basis that the read API's key holds no privilege of ANY
+        // kind there, so publishing it later is a deliberate GRANT plus an
+        // endpoint rather than an oversight nobody notices.
+        // The whole grid. "No privilege of ANY kind" is the claim, and a DELETE
+        // grant satisfies a check that only asked about SELECT and UPDATE —
+        // while being strictly worse than a read, because a credential that can
+        // destroy evidence it cannot see leaves nothing downstream able to tell.
+        const prose = await query(
+          `select v as verb from unnest($3::text[]) as v
+            where case when v in ('DELETE', 'TRUNCATE', 'TRIGGER')
+                       then has_table_privilege($1, 'public.' || $2, v)
+                       else has_any_column_privilege($1, 'public.' || $2, v) end`,
+          [READ_API_ROLE, WITHHELD_TABLE, [...ALL_VERBS]],
+        );
+        for (const row of prose) {
+          faults.push(`${READ_API_ROLE} holds ${String(row['verb'])} on ${WITHHELD_TABLE}`);
+        }
+      }
+
+      const checked = [...present].join(', ') || 'none of them exist here';
+      return faults.length === 0
+        ? { ok: true, detail: `${checked}: no browser-reachable key touches the projection, and the read API cannot reach ${WITHHELD_TABLE}` }
+        : { ok: false, detail: faults.join(' | ') };
+    },
+  },
+
+  {
+    name: 'row level security is enabled on every projection table',
+    async run(query) {
+      const rows = await query(
+        `select c.relname as name from pg_class c join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname = 'public' and c.relname = any($1::text[]) and c.relrowsecurity = false`,
+        [[...SERVING_TABLES]],
+      );
+      return rows.length === 0
+        ? { ok: true, detail: `RLS on all ${SERVING_TABLES.length}` }
+        : { ok: false, detail: `off on ${rows.map((row) => String(row['name'])).join(', ')}` };
+    },
+  },
+
+  {
+    name: 'the writer can actually write THROUGH row level security',
+    async run(query) {
+      // RLS being ENABLED is not the same as this role being able to write. A
+      // table whose only permissive policy stops naming the writer denies every
+      // insert while every grant in the grid still says yes — measured: the gate
+      // passed, and the real write came back
+      // `new row violates row-level security policy`, 42501.
+      //
+      // This is a policy-SHAPE check and the bound is worth stating: it asks
+      // whether a permissive policy covering the command applies to this role
+      // with an unconditional expression, which is the house shape. Anything
+      // else is reported rather than judged, and the policy names are printed
+      // so a reader can go and look.
+      const rows = await query(
+        `select c.relname as name,
+                count(p.oid) filter (
+                  where p.polpermissive and p.polcmd in ('*', 'a')
+                    and (0 = any(p.polroles) or exists (
+                          select 1 from pg_roles r
+                           where r.oid = any(p.polroles) and r.rolname = current_user))
+                    and coalesce(pg_get_expr(p.polwithcheck, p.polrelid), 'true') = 'true'
+                ) as writable,
+                count(p.oid) filter (
+                  where p.polpermissive and p.polcmd in ('*', 'r')
+                    and (0 = any(p.polroles) or exists (
+                          select 1 from pg_roles r
+                           where r.oid = any(p.polroles) and r.rolname = current_user))
+                    and coalesce(pg_get_expr(p.polqual, p.polrelid), 'true') = 'true'
+                ) as readable,
+                count(p.oid) filter (where not p.polpermissive) as restrictive,
+                coalesce(string_agg(p.polname, ' | '), '(no policies at all)') as policies
+           from pg_class c
+           join pg_namespace n on n.oid = c.relnamespace
+           left join pg_policy p on p.polrelid = c.oid
+          where n.nspname = 'public' and c.relname = any($1::text[]) and c.relrowsecurity
+          group by c.relname order by c.relname`,
+        [[...SERVING_TABLES]],
+      );
+      const faults: string[] = [];
+      for (const row of rows) {
+        const table = String(row['name']);
+        const needsWrite = WRITABLE.has(table);
+        if (needsWrite && Number(row['writable']) === 0) {
+          faults.push(`${table}: no permissive policy lets this role INSERT — ${String(row['policies'])}`);
+        }
+        // Every statement reads the stored row to detect drift, so SELECT is
+        // required on all ten, the capability table included.
+        if (Number(row['readable']) === 0) {
+          faults.push(`${table}: no permissive policy lets this role SELECT — ${String(row['policies'])}`);
+        }
+        if (Number(row['restrictive']) > 0) {
+          faults.push(`${table}: a RESTRICTIVE policy applies, which can deny with nothing in the grid showing why`);
+        }
+      }
+      return faults.length === 0
+        ? { ok: true, detail: `${rows.length} RLS-protected tables admit this role's reads and writes` }
+        : { ok: false, detail: faults.join(' | ') };
+    },
+  },
+
+  {
+    name: 'no SECURITY DEFINER function carries any checked role past its grants',
+    async run(query) {
+      // The grid and the relation sweep both answer "what may this role touch
+      // DIRECTLY". A SECURITY DEFINER function runs as its OWNER, so EXECUTE on
+      // one is a door around both — measured: with no grant of any kind on a
+      // table outside the projection, the writer inserted into it through such a
+      // function, and the reachability check reported it reached nothing.
+      //
+      // SECURITY INVOKER functions are not listed: they run with this role's own
+      // privileges, so they cannot reach past what the checks above already
+      // cover. That is the whole reason this can be a short list rather than
+      // every function in the database.
+      // Asked for EVERY role the gate has an opinion about, not just the one
+      // connected. For the writer such a function is a way OUT of its grants;
+      // for a browser-facing key it is a way IN to the projection. Same
+      // mechanism, and a check that asked only about the connected role would
+      // close one half of it — which is the exact shape of mistake this commit
+      // is repairing elsewhere.
+      //
+      // Roles that do not exist here are dropped by the join rather than
+      // erroring, so this asks what it can and says which roles it asked about.
+      //
+      // ⚠ SCOPED TO `public`, AND THE BOUND IS WORTH STATING. That is where the
+      //   projection, the protocol objects and anything this project authors
+      //   live, and it is the exact shape that was demonstrated: a definer
+      //   function in `public` granted to the writer. A managed platform ships
+      //   definer functions in its own schemas by the dozen, none of them
+      //   actionable by a reader of this repo, and a preflight that is red on
+      //   every healthy database is a preflight people learn to skip. What this
+      //   therefore does NOT catch: a definer function in a platform schema that
+      //   writes to the projection.
+      const rows = await query(
+        // A subquery rather than a leading CTE, so the statement still begins
+        // with `select`. The suite sweeps every statement these checks issue and
+        // admits only reads by their opening verb; widening that to accept
+        // `with` would also admit `WITH … INSERT`, which is exactly the thing
+        // the sweep exists to refuse.
+        `select named.role,
+                n.nspname || '.' || p.proname as fn,
+                exists (select 1 from pg_depend d
+                         where d.objid = p.oid
+                           and d.classid = 'pg_proc'::regclass
+                           and d.deptype = 'e') as from_extension
+           from pg_proc p
+           join pg_namespace n on n.oid = p.pronamespace
+           cross join (select rolname::text as role from pg_roles
+                        where rolname = any($1::text[]) or rolname = current_user) as named
+          where n.nspname = 'public'
+            and p.prosecdef
+            and has_function_privilege(named.role, p.oid, 'EXECUTE')
+          order by 1, 2 limit 40`,
+        [[...FORBIDDEN_READERS, READ_API_ROLE]],
+      );
+      if (rows.length === 0) {
+        return { ok: true, detail: 'no role this gate checks may execute a SECURITY DEFINER function' };
+      }
+      const named = rows.map((row) => {
+        const platform = row['from_extension'] === true ? ' [extension]' : '';
+        return `${String(row['role'])} -> ${String(row['fn'])}${platform}`;
+      });
+      return {
+        ok: false,
+        detail:
+          `executable as their owner: ${named.join(', ')}. Each one is a path around the ` +
+          'privilege grid above; revoke EXECUTE, or decide deliberately that it is safe. ' +
+          'Entries marked [extension] belong to an installed extension rather than to this schema.',
+      };
+    },
+  },
+
+  {
+    name: 'lifetime row counts',
+    informational: true,
+    async run(query) {
+      // Reported, never decisive. Zero across the board is what a projection
+      // that has never been written looks like, and an operator enabling one for
+      // the first time should see that before they do. A non-zero count is a
+      // fact about history, not a fault, and this command has no business
+      // refusing a database for having been used.
+      return { ok: true, detail: await readRowCounts(query) };
+    },
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Running it
+// ---------------------------------------------------------------------------
+
+export const GATE_EXIT = Object.freeze({
+  ok: 0,
+  failed: 1,
+  usage: 2,
+  unconfigured: 3,
+  refused: 4,
+  crashed: 5,
+});
+
+const USAGE = `usage: yarn gate:serving
+
+Ask the configured serving database whether it can hold this publisher's writes.
+
+Read-only: the connection carries default_transaction_read_only=on, the server is
+made to prove it refuses a write before anything else is asked, and the row counts
+are compared before and after to confirm nothing moved.
+
+Run this by hand before enabling publication against a database for the first
+time. Nothing in yarn watch / yarn smoke / yarn project calls it, deliberately.
+
+Exit codes:
+  0  every check passed
+  1  a check failed — the line beside it says what
+  2  usage
+  3  no serving credential is configured, so there was nothing to ask
+  4  refused — no connection this gate is willing to use
+  5  the command itself failed`;
+
+export type GateConnection =
+  | {
+      readonly kind: 'ready';
+      readonly query: GateQuery;
+      /** Whether the host this process DIALLED is this machine. Client-side
+       *  knowledge; see proveEncrypted for why the server cannot supply it. */
+      readonly localTarget: boolean;
+      close(): Promise<void>;
+    }
+  | { readonly kind: 'unconfigured'; readonly reason: string }
+  | { readonly kind: 'refused'; readonly reason: string };
+
+export interface SchemaGateDeps {
+  readonly argv: readonly string[];
+  readonly open: () => Promise<GateConnection>;
+  readonly checks: readonly GateCheck[];
+  readonly log: { line(message: string): void; error(message: string): void };
+}
+
+export async function runSchemaGate(deps: SchemaGateDeps): Promise<number> {
+  const { line, error } = deps.log;
+  if (deps.argv.includes('--help') || deps.argv.includes('-h')) {
+    line(USAGE);
+    return GATE_EXIT.ok;
+  }
+
+  const connection = await deps.open();
+  if (connection.kind === 'unconfigured') {
+    line(`serving schema gate: nothing to check — ${connection.reason}`);
+    return GATE_EXIT.unconfigured;
+  }
+  if (connection.kind === 'refused') {
+    error(`serving schema gate: ${connection.reason}`);
+    return GATE_EXIT.refused;
+  }
+
+  try {
+    // Before ANY check: prove this connection cannot write. A gate that could
+    // write would be running statements against a database whose rows can never
+    // be deleted, in order to find out whether that was safe.
+    const readOnly = await proveReadOnly(connection.query);
+    line(`${readOnly.ok ? 'ok  ' : 'FAIL'}  the connection is read-only: ${readOnly.detail}`);
+    if (!readOnly.ok) return GATE_EXIT.refused;
+
+    const encrypted = proveEncrypted(await readSession(connection.query), connection.localTarget);
+    line(`${encrypted.ok ? 'ok  ' : 'FAIL'}  the session is encrypted: ${encrypted.detail}`);
+
+    // Read through a catch: an unreadable count is a FINDING, not a crash. The
+    // command exists to report on a database that may be misconfigured, and the
+    // shape it is most likely to be misconfigured in — a missing grant on one
+    // table — is exactly what makes this query throw.
+    const before = await countsOrNull(connection.query);
+    const findings = await runChecks(deps.checks, connection.query);
+    for (const finding of findings) {
+      line(`${finding.informational ? 'note' : finding.ok ? 'ok  ' : 'FAIL'}  ${finding.name}: ${finding.detail}`);
+    }
+
+    // The second, independent proof that this command changed nothing. The
+    // 25006 refusal says writes are impossible; this says none happened.
+    const after = await countsOrNull(connection.query);
+    // Unreadable is NOT unchanged. Two nulls compare equal and would report the
+    // gate as having proven something it never measured.
+    const unmoved = before !== null && after !== null && before === after;
+    line(
+      unmoved
+        ? 'ok    the gate wrote nothing: row counts unchanged'
+        : `FAIL  the gate wrote nothing: ${before === null || after === null
+            ? 'the row counts could not be read, so nothing was proven either way'
+            : `row counts MOVED — ${before} -> ${after}`}`,
+    );
+
+    // Everything decisive, counted in one place: the schema checks, the
+    // transport, and the gate's own proof that it changed nothing. The
+    // read-only precondition is not here because it returns above.
+    const failed =
+      findings.filter((finding) => !finding.informational && !finding.ok).length +
+      (encrypted.ok ? 0 : 1) +
+      (unmoved ? 0 : 1);
+    if (failed > 0) {
+      error(
+        `serving schema gate: ${failed} check(s) FAILED. Do not enable publication against ` +
+          'this database — its rows are insert-once, so what is written wrong stays wrong.',
+      );
+      return GATE_EXIT.failed;
+    }
+    line("serving schema gate: PASS — this database can hold the publisher's writes.");
+    return GATE_EXIT.ok;
+  } finally {
+    await connection.close();
+  }
+}
+
+/**
+ * Run every check, in order, and let none of them stop the others.
+ *
+ * A thrown query error becomes a FAILED finding rather than an escaped
+ * exception: the command's job is to report what it found, and "the question
+ * could not be asked" is one of the things it can find. Sequential rather than
+ * concurrent because the answers are read together by a person, and an
+ * interleaved report is harder to act on than a slow one.
+ */
+export async function runChecks(
+  checks: readonly GateCheck[],
+  query: GateQuery,
+): Promise<readonly GateFinding[]> {
+  const findings: GateFinding[] = [];
+  for (const check of checks) {
+    const informational = check.informational === true;
+    try {
+      findings.push({ name: check.name, informational, ...(await check.run(query)) });
+    } catch (caught) {
+      findings.push({
+        name: check.name,
+        informational,
+        ok: false,
+        detail: `the check could not be run: ${describeError(caught)}`,
+      });
+    }
+  }
+  return findings;
+}
+
+/**
+ * Open the same connection the publisher would, minus the ability to write.
+ *
+ * Deliberately the SAME resolver and the SAME pool configuration, so this also
+ * proves the parts of publication that have nothing to do with the schema: that
+ * the credential resolves, that the TLS decision is one the resolver accepts,
+ * and that the host answers. A gate that connected its own way could pass while
+ * the publisher could not connect at all.
+ */
+/**
+ * Whether the resolved connection dials this machine.
+ *
+ * Answered by the same pair the publisher's own resolver uses, rather than by a
+ * second opinion: `dsnFacts` for which host the driver will actually dial —
+ * which a `?host=` parameter can override — and `isLocalHost` for whether that
+ * host is here, by address and never by string prefix.
+ *
+ * Unknown counts as REMOTE. That direction costs a spurious failure on an
+ * unusual spelling of a local address; the other direction would quietly bless
+ * a cleartext password sent to another machine.
+ */
+export function dialsThisMachine(connection: BenchmarkWriterConnection): boolean {
+  if (connection.kind === 'derived') return isLocalHost(connection.host);
+  try {
+    return isLocalHost(dsnFacts(connection.connectionString).host);
+  } catch {
+    // dsnFacts reads sslcert/sslkey/sslrootcert off the disk and throws when one
+    // is missing. The driver will throw on the same string a moment later; until
+    // then, remote.
+    return false;
+  }
+}
+
+async function openGateConnection(): Promise<GateConnection> {
+  const resolution = resolveBenchmarkWriterConnection();
+  if (!resolution.resolved) {
+    return resolution.reason === 'no_credential'
+      ? { kind: 'unconfigured', reason: 'no serving credential is configured' }
+      : { kind: 'refused', reason: `the connection settings were refused (${resolution.reason})` };
+  }
+  let driver: typeof import('pg');
+  try {
+    driver = await import('pg');
+  } catch {
+    return { kind: 'refused', reason: 'the PostgreSQL driver is not installed in this environment' };
+  }
+  const pool = new driver.Pool({
+    ...servingPoolConfig(resolution.connection),
+    options: READ_ONLY_STARTUP_OPTION,
+    // One connection: the checks are sequential and every one of them must run
+    // against a connection that carried the read-only option.
+    max: 1,
+  });
+  // Without this, a reset while the gate is running is an uncaught exception
+  // rather than a failed check — the same hazard the publisher's pool carries,
+  // and here it would abandon a preflight halfway with no verdict at all.
+  pool.on('error', (error: unknown) => {
+    try {
+      printError(`serving schema gate: the connection failed (${describeError(error)})`);
+    } catch {
+      // Same reason as the publisher's listener: this runs in an event handler,
+      // so a sink that throws is an uncaught exception rather than a lost line.
+    }
+  });
+  return {
+    kind: 'ready',
+    localTarget: dialsThisMachine(resolution.connection),
+    query: async (sql, params) =>
+      (await pool.query(sql, params === undefined ? undefined : [...params])).rows,
+    close: async () => {
+      // This pool holds no long write, so draining is enough — but it still has
+      // to happen, or the command does not exit.
+      await pool.end().catch(() => undefined);
+    },
+  };
+}
+
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  try {
+    return pathToFileURL(entry).href === import.meta.url;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  loadDotEnv();
+  runSchemaGate({
+    argv: process.argv.slice(2),
+    open: openGateConnection,
+    checks: SERVING_SCHEMA_CHECKS,
+    log: { line: printLine, error: printError },
+  })
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((caught: unknown) => {
+      printError(describeErrorWithStack(caught));
+      process.exitCode = GATE_EXIT.crashed;
+    });
+}

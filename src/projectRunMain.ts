@@ -189,7 +189,10 @@ if (isMainModule()) {
   runProjectMain({
     argv: process.argv.slice(2),
     exists: existsSync,
-    open: openBenchmarkServing,
+    // A pooled connection can fail with no write in flight; without a sink
+    // that failure is absorbed silently, which looks exactly like a database
+    // that is working.
+    open: () => openBenchmarkServing({ onError: printError }),
     publish: publishRunArtifact,
     log: { line: printLine, error: printError },
   })

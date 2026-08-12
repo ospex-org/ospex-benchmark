@@ -4,11 +4,13 @@ import { fireEligibleGame } from './watch.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
 import { ARMS } from './providers/index.js';
 import { parseRunArtifact } from './servingProjection.js';
+import { SqlBenchmarkServingPort } from './servingStore.js';
 
 /** The arm this fixture impersonates when `enrolled` is asked for. Named, so
  *  the registry entry and the dispatched arm cannot drift apart silently. */
 const ENROLLED_PARTICIPANT_ID = 'openai-gpt-5.6-sol';
 import type { JsonRecord } from './servingProjection.js';
+import type { BenchmarkServingPort } from './servingStore.js';
 import type { ArmSpec } from './types.js';
 import type { BuildResult } from './bundle.js';
 import type { WatchGateProvenance } from './watch.js';
@@ -40,9 +42,9 @@ const NOW_MS = Date.parse('2026-07-20T12:00:30.000Z');
 export const TEST_SLATE_DATE = '2026-07-20';
 export const TEST_COHORT_ID = `watch-v0-${TEST_SLATE_DATE}`;
 
-function gamesRow(): GamesEndpointRow {
+function gamesRow(gameId: string): GamesEndpointRow {
   return {
-    gameId: GAME_ID,
+    gameId,
     slug: 'mil-pit-2026-07-20',
     sport: 'mlb',
     matchTime: MATCH_TIME,
@@ -53,14 +55,14 @@ function gamesRow(): GamesEndpointRow {
     contestCreated: false,
     contestId: null,
     canCreateContest: false,
-    externalIds: { jsonodds: GAME_ID, sportspage: null, rundown: null },
+    externalIds: { jsonodds: gameId, sportspage: null, rundown: null },
   };
 }
 
-function oddsRow(market: MarketKey, line: number | null): CurrentOddsRow {
+function oddsRow(market: MarketKey, line: number | null, gameId: string): CurrentOddsRow {
   return {
     network: 'polygon',
-    jsonodds_id: GAME_ID,
+    jsonodds_id: gameId,
     market,
     line,
     away_odds_american: market === 'moneyline' ? -135 : 122,
@@ -71,10 +73,14 @@ function oddsRow(market: MarketKey, line: number | null): CurrentOddsRow {
   };
 }
 
-export function fullBoardInputs(): SlateInputs {
+export function fullBoardInputs(gameId: string = GAME_ID): SlateInputs {
   return {
-    gamesRows: [gamesRow()],
-    oddsRows: [oddsRow('moneyline', null), oddsRow('spread', 1.5), oddsRow('total', 8.5)],
+    gamesRows: [gamesRow(gameId)],
+    oddsRows: [
+      oddsRow('moneyline', null, gameId),
+      oddsRow('spread', 1.5, gameId),
+      oddsRow('total', 8.5, gameId),
+    ],
     fetchStartedAt: '2026-07-20T11:59:58.000Z',
     fetchCompletedAt: FETCH_COMPLETED_AT,
   };
@@ -172,10 +178,33 @@ export interface FireOptions {
    * and a patched file is refused for the wrong reason.
    */
   readonly contradictModel?: boolean;
+  /**
+   * Which game the fixture fires.
+   *
+   * Varying it is how a case gets a decision key of its own: a decision is
+   * (cohort, participant, game, market), and the fixture's cohort is derived
+   * from the slate date and so is the same on every run. Two runs over one game
+   * therefore collide — and not benignly, because the run id is fresh each time
+   * and the seal's drift check compares it, so the second run reports a
+   * CONTRADICTION rather than a duplicate.
+   */
+  readonly gameId?: string;
+  /**
+   * Where the fire publishes.
+   *
+   * Defaults to the shipped unconfigured port, so a fixture run writes its
+   * artifact and publishes nothing — which is what makes this usable from the
+   * pure suite. A case that wants to see what the fire SENDS supplies a
+   * recording port, and a case that wants it in a database supplies a real one.
+   */
+  readonly serving?: BenchmarkServingPort;
+  /** The fire's log sink. A case that needs the PUBLISHER's own line to throw
+   *  supplies one; everything else keeps the silent default. */
+  readonly log?: (line: string) => void;
 }
 
 export async function firedRun(options: FireOptions): Promise<FiredRun> {
-  const inputs = fullBoardInputs();
+  const inputs = fullBoardInputs(options.gameId ?? GAME_ID);
   const build = buildBundle(inputs, TEST_SLATE_DATE, { requireFuture: false });
   const provenance: WatchGateProvenance = {
     detectedAt: new Date(NOW_MS).toISOString(),
@@ -219,8 +248,9 @@ export async function firedRun(options: FireOptions): Promise<FiredRun> {
     clockMode: 'wall',
     // Monotonic, so recorded instants are ordered and latency is exact.
     nowMs: () => (clock += 5),
-    log: () => undefined,
+    log: options.log ?? ((): undefined => undefined),
     logError: () => undefined,
+    serving: options.serving ?? new SqlBenchmarkServingPort(null),
   });
 
   return {

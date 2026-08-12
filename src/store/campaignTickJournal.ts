@@ -49,6 +49,17 @@ import { OPERATOR_RESUMED } from '../campaignSchedule.js';
 export interface PgTransactionClient {
   query(sql: string, params: readonly unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>;
   release(destroyBecause?: unknown): void;
+  /**
+   * The emitter half, OPTIONAL so a fake client stays two methods long.
+   *
+   * A checked-out client has no 'error' listener at all: the pool removes its
+   * own while the client is out, and `Client.query` attaches none — unlike
+   * `Pool.query`, which attaches one for the duration. So for the whole length
+   * of a transaction the client is an EventEmitter with nothing listening, and
+   * `emit('error')` on one of those THROWS. See the listener in `transaction`.
+   */
+  on?(event: 'error', listener: (error: unknown) => void): unknown;
+  off?(event: 'error', listener: (error: unknown) => void): unknown;
 }
 
 /** The minimal pool shape the transactor needs — structural, so `pg` stays a
@@ -91,6 +102,21 @@ export function pgStoreTransactor(pool: PgPoolLike, options: TransactorOptions =
   return {
     async transaction<T>(fn: (query: StoreQuery) => Promise<T>): Promise<T> {
       const client = await pool.connect();
+      // ── A CHECKED-OUT CLIENT HAS NO ERROR LISTENER ─────────────────────────
+      // The pool removes its idle listener on checkout and `Client.query`
+      // attaches none, so between `connect()` and `release()` this client is an
+      // EventEmitter with nothing listening for 'error' — and emitting 'error'
+      // on one of those throws, from a socket callback, outside every promise
+      // here. An ordinary connection reset mid-transaction therefore kills the
+      // PROCESS rather than failing the transaction. Measured against
+      // PostgreSQL 17 by terminating the backend of a pinned client: exit 1
+      // without this listener, exit 0 with it.
+      //
+      // Absorbing is all it does. The query in flight rejects on its own and
+      // the catch below owns the outcome; this only stops the process dying
+      // before that can happen.
+      const absorb = (): void => {};
+      client.on?.('error', absorb);
       let failure: unknown;
       try {
         await client.query('begin isolation level read committed', []);
@@ -136,6 +162,13 @@ export function pgStoreTransactor(pool: PgPoolLike, options: TransactorOptions =
         // in flight is poisoned — the next checkout queues behind a query that
         // may never return. Destroying it costs one reconnect on a path that
         // has already failed, which is the cheaper of the two mistakes.
+        //
+        // The listener comes off FIRST, and in the same synchronous block as
+        // the release so no event can be delivered between them. Leaving it
+        // attached would accumulate one per transaction on a client that goes
+        // back to the idle set, and the pool re-attaches its own listener on
+        // the way in — so from here on the pool owns the handling again.
+        client.off?.('error', absorb);
         client.release(failure);
       }
     },

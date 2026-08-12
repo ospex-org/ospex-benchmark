@@ -166,7 +166,23 @@ test('the bounds are ordered so the layer that can END a statement acts first', 
  * drained and a hard kill fires at the deadline: a probe whose failure mode is
  * "produces no output" needs its own liveness proof.
  */
-function probeExits(mode: string, deadlineMs: number): Promise<{ exited: boolean; ms: number; out: string }> {
+function probeExits(
+  mode: string,
+  deadlineMs: number,
+  closeStderr = false,
+): Promise<{
+  exited: boolean;
+  ms: number;
+  out: string;
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  /** Whether the harness actually closed the child's stderr, and what it had
+   *  printed by then — the two facts that make the closed-stderr case an
+   *  measurement rather than a coincidence. */
+  closedStderr: boolean;
+  outAtClose: string;
+}> {
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn(process.execPath, [...process.execArgv, 'src/servingCloseProbe.ts', mode], {
@@ -174,18 +190,47 @@ function probeExits(mode: string, deadlineMs: number): Promise<{ exited: boolean
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
-    child.stdout.on('data', (chunk) => { out += String(chunk); });
-    child.stderr.on('data', (chunk) => { out += String(chunk); });
+    let stdout = '';
+    let stderr = '';
+    let closedStderr = false;
+    let outAtClose = '';
+    child.stdout.on('data', (chunk) => { out += String(chunk); stdout += String(chunk); });
+    if (closeStderr) {
+      // Closed when the child says READY, not at spawn: destroying the read end
+      // before the child is up races its startup, and the resulting pipe state
+      // is what made this measurement environment-dependent.
+      //
+      // Matched against the ACCUMULATED output, not the chunk: a marker split
+      // across two reads would never match, the close would never happen, and
+      // the case would pass having measured the child with a working stderr.
+      child.stderr.on('error', () => { /* this end is ours, and we close it below */ });
+      const closeWhenReady = (): void => {
+        if (closedStderr || !stdout.includes('READY')) return;
+        closedStderr = true;
+        outAtClose = stdout;
+        child.stdout.off('data', closeWhenReady);
+        child.stderr.destroy();
+      };
+      child.stdout.on('data', closeWhenReady);
+    } else {
+      child.stderr.on('data', (chunk) => { out += String(chunk); stderr += String(chunk); });
+    }
     const killer = setTimeout(() => {
       // The tree, not the root: on Windows killing the parent leaves the child
       // holding the socket, and the measurement never completes.
       spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' })
         .on('error', () => child.kill('SIGKILL'));
     }, deadlineMs);
-    child.on('exit', () => {
+    child.on('exit', (code) => {
       clearTimeout(killer);
       const ms = Date.now() - started;
-      resolve({ exited: ms < deadlineMs - 400, ms, out: out.trim() });
+      // The CODE, not just the fact of exiting. An uncaught exception also
+      // exits — with 1 — so "it exited" cannot tell a clean shutdown from a
+      // crash, and the crash is the failure one of these cases exists to catch.
+      resolve({
+        exited: ms < deadlineMs - 400, ms, out: out.trim(),
+        stdout: stdout.trim(), stderr: stderr.trim(), code, closedStderr, outAtClose,
+      });
     });
   });
 }
@@ -270,5 +315,136 @@ ${held.out}`);
     `the negative control exited in ${held.ms}ms, so this suite can no longer tell a bounded ` +
       `process from an unbounded one and the tests above prove nothing. Output:
 ${held.out}`,
+  );
+});
+
+test('a dropped connection does not take the process with it', async () => {
+  // ── THE HAZARD ─────────────────────────────────────────────────────────────
+  // `Pool` is an EventEmitter and every client it holds idle carries a listener
+  // that ends in `pool.emit('error', …)`. Emitting 'error' on an emitter with
+  // no listener THROWS, from a socket callback — outside the per-write race,
+  // outside the port's try/catch, outside mirrorRunArtifact. So an ordinary
+  // reset of an idle connection killed the whole process, which in `yarn watch`
+  // means the watcher dies between games and the rest of the slate is never
+  // fired and never ledgered.
+  //
+  // The probe's fake server answers the readiness query and then drops the
+  // connection while the client sits idle in the pool.
+  const result = await probeExits('reset', 8_000);
+
+  assert.equal(result.exited, true, `the process did not exit: ${result.out}`);
+  // ⚠ THE EXIT CODE IS THE ASSERTION. Without the listener this process also
+  //   "exits" — Node prints the uncaught error and exits 1. Measured both ways
+  //   against this exact probe: 1 with the listener removed, 0 with it.
+  assert.equal(result.code, 0, `crashed instead of absorbing it: ${result.out}`);
+  // And it reached the hazard: a run that never opened, or never had the
+  // connection dropped, would exit 0 for reasons unrelated to the fix.
+  assert.match(result.out, /reset: status=enabled/);
+  assert.match(result.out, /reset: reachedServer=true/);
+  // Absorbed, not swallowed. A failure nobody is waiting on has no outcome to
+  // be folded into, so silence here would make a database that drops every
+  // connection look exactly like one that works.
+  assert.match(result.out, /reset: onError .*a pooled connection failed/);
+});
+
+test('a dropped connection does not take the process with it, even when the SINK throws', async () => {
+  // The listener added for the case above runs inside an event handler, so a
+  // throw out of IT is uncaught exactly like the one it exists to prevent. The
+  // sink in production is `printError` — stderr — which raises EPIPE when the
+  // run is piped into something that has exited. Fixing one crash by adding
+  // another is not a fix, and nothing pinned the difference.
+  const result = await probeExits('sink', 8_000);
+
+  assert.equal(result.exited, true, `the process did not exit: ${result.out}`);
+  assert.equal(result.code, 0, `the throwing sink killed the process: ${result.out}`);
+  // Reached the hazard: the listener ran (so there was something to throw from)
+  // and the process carried on past it.
+  assert.match(result.out, /sink: onError .*a pooled connection failed/);
+  assert.match(result.out, /sink: still running after the connection was dropped/);
+});
+
+test('a dropped connection does not take the process with it when STDERR IS GONE', async () => {
+  // ── THE MECHANISM, AND WHY THE OBVIOUS GUARD MISSES IT ─────────────────────
+  // The two cases above cover a listener that is absent and a sink that throws
+  // where it is called. This is the third and it is the one that happens in
+  // production: `printError` writes to stderr, the consumer is gone, and the
+  // write does NOT throw at the call site. EPIPE arrives afterwards as an
+  // `'error'` event on the stream, so the `try` around the sink catches
+  // nothing — and the error carries the stack of the write's ORIGIN, so the
+  // crash points at the logging line and reads exactly like a synchronous
+  // throw. Measured: exit 7 through an uncaughtException probe, with the top
+  // frames `printError` and the pool's listener.
+  //
+  // Discrimination: remove the stream listeners in console.ts and only THIS
+  // case reddens; remove the try/catch in the pool listener and only `sink`
+  // does. Neither guard can stand in for the other.
+  const result = await probeExits('epipe', 8_000, true);
+
+  assert.equal(result.exited, true, `the process did not exit: ${result.out}`);
+  assert.equal(result.code, 0, `a closed stderr killed the process: ${result.out}`);
+  // Reached the hazard: the pool opened, the connection was dropped, and the
+  // report was attempted down the broken stream — then the run carried on.
+  assert.match(result.out, /epipe: status=enabled/);
+  assert.match(result.out, /epipe: still running after the connection was dropped/);
+  // ── AND THAT THE PREMISE HELD ──────────────────────────────────────────────
+  // Without these two, the case passes identically when the close never
+  // happens — measured — which reduces it to "the process survives while
+  // stderr works", the null hypothesis. The close is a race against the
+  // child's own progress and nothing else observes whether it was won.
+  assert.equal(result.closedStderr, true, 'stderr was never closed, so nothing here was measured');
+  assert.doesNotMatch(
+    result.outAtClose, /reported through the real sink/,
+    'the report happened BEFORE stderr was closed, so it went down a working stream',
+  );
+});
+
+test('an error event on a broken output stream cannot end the process', async () => {
+  // ── THIS IS THE CASE THAT DISCRIMINATES THE GUARD ──────────────────────────
+  // The event is emitted directly rather than by breaking a real pipe, because
+  // EventEmitter semantics are identical on every platform and at every speed:
+  // no listener throws, a listener does not. Node's stdio PIPES are not —
+  // synchronous on Windows, asynchronous on POSIX — so the pipe route below
+  // discriminates 5/5 on one and roughly 1/10 on the other. A reviewer running
+  // Linux saw the mutant survive where it died here, and both measurements were
+  // correct.
+  //
+  // The control is half the case and is asserted FIRST: it strips the listeners
+  // and must crash. If it ever exits 0, the harness has stopped reaching the
+  // hazard and the guarded assertion beside it would prove nothing.
+  const control = await probeExits('stdio-unguarded', 8_000);
+  assert.notEqual(
+    control.code, 0,
+    `the control survived, so this case can no longer tell the guard from its absence: ${control.out}`,
+  );
+
+  // AT THE EMIT, not somewhere earlier: a control asserted only on a non-zero
+  // exit is satisfied by a child that failed to start.
+  assert.match(control.out, /stdio-unguarded: about to emit/);
+  assert.doesNotMatch(control.out, /survived the emit/);
+
+  const guarded = await probeExits('stdio-guard', 8_000);
+  assert.equal(guarded.code, 0, `a stream error ended the process: ${guarded.out}`);
+  assert.match(guarded.out, /stdio-guard: survived the emit/);
+});
+
+test('a fault that is NOT a closed consumer is reported, on the OTHER stream', async () => {
+  // The only case that executes the installed closures. `guardStream` is unit
+  // tested with a fake emitter and a fake reporter, so the two lines that
+  // decide WHICH stream a diagnostic lands on were installed and never run —
+  // measured: swapping them so each stream reports to itself left the suite
+  // green, and in production silenced the diagnostic entirely, because the
+  // report goes to the stream that just failed and the once-per-stream latch
+  // discards the resulting second error.
+  const result = await probeExits('stdio-surprise', 8_000);
+
+  assert.equal(result.code, 0, `an unexpected stream fault ended the process: ${result.out}`);
+  assert.match(result.stdout, /stdio-surprise: survived the emit/);
+  assert.match(
+    result.stderr, /\[stdout\] unexpected output error ENOSPC/,
+    `the stdout fault must be reported on STDERR; stderr was ${JSON.stringify(result.stderr)}`,
+  );
+  assert.doesNotMatch(
+    result.stdout, /unexpected output error/,
+    'reporting a stdout fault onto stdout is writing to the stream that just failed',
   );
 });

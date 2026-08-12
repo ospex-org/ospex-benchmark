@@ -109,6 +109,12 @@ const DISABLED_EXIT: Record<DisabledReason, number> = {
   // The credential was configured and the driver is not installed. Refused, not
   // unconfigured: the operator asked for publication and did not get it.
   driver_unavailable: PROJECT_EXIT.refused,
+  // This command never asks for a dry-run handle — publishing is the whole job,
+  // so it always opens for real. The entry is here because the table is
+  // exhaustive by type rather than by intent, and it is non-zero because every
+  // state in it means nothing was written. If it ever appeared in the wild it
+  // would be a wiring bug, and exiting 4 is the direction that surfaces one.
+  dry_run: PROJECT_EXIT.refused,
 };
 
 test('every not-enabled reason has a decided, non-zero exit code', async () => {

@@ -15,10 +15,12 @@ import {
   writeText,
 } from './records.js';
 import { runSlate } from './runner.js';
+import { mirrorRunArtifact } from './servingPublisher.js';
 import { easternCalendarDay } from './slateDate.js';
 import { buildSummaryMarkdown } from './summary.js';
 import type { BuildResult } from './bundle.js';
 import type { RunContext } from './records.js';
+import type { BenchmarkServingPort } from './servingStore.js';
 import type {
   ArmOutcome,
   ArmSpec,
@@ -642,6 +644,15 @@ export interface FireConfig {
   nowMs: () => number;
   log: (line: string) => void;
   logError: (line: string) => void;
+  /**
+   * Where a fired game's forecasts are mirrored for public reading.
+   *
+   * Not optional, and that is the point: a port is always present, so there is
+   * one code path rather than a wired one and an unwired one. With no credential
+   * — the shipped default, and every dry run — it is a port over a null query
+   * that answers `disabled` for every write without opening a socket.
+   */
+  serving: BenchmarkServingPort;
 }
 
 /**
@@ -709,6 +720,34 @@ export async function fireEligibleGame(
     join(cfg.outDir, `${ctx.runId}-summary.md`),
     buildSummaryMarkdown(env, ctx, build, collision),
   );
+
+  // Mirror the artifact onto the serving projection — from the FILE, not from
+  // the records still in memory. The writer redacts on the way out, so the two
+  // are not the same bytes whenever a credential appears in a response, and it
+  // is the file a reader can check. Publishing from it also means nothing is
+  // written until the canonical record is durable, which turns a crash between
+  // two rows into a command someone re-runs rather than a permanent hole.
+  //
+  // Whether this run may be published at all is decided by reading that file: a
+  // dry run, a synthetic clock, a failed identity check are all refused by the
+  // publisher's own gate rather than by a condition here. The gate has to reach
+  // the same verdict for a backfill months from now, when only the artifact is
+  // left to ask.
+  //
+  // Awaited inside the fire, because the whole point of the projection is to
+  // make a sealed forecast readable in the gap before first pitch — a queue
+  // drained later would publish it after the thing it was supposed to precede.
+  //
+  // What that wait costs, stated at the bound actually measured rather than at
+  // the one the constant names: PUBLICATION_DEADLINE_MS bounds the WRITE phase,
+  // so a database that has stopped answering costs 45s. Reading, verifying,
+  // parsing and projecting the artifact happen before that budget opens and are
+  // bounded instead by the file's size — measured at roughly 20ms per MB, so
+  // tens of milliseconds for a fire's artifact.
+  //
+  // It cannot throw. That is not the same statement as "the publisher is
+  // fail-soft", which is about the database; see mirrorRunArtifact.
+  await mirrorRunArtifact(cfg.serving, runFile, { line: cfg.log, error: cfg.logError });
 
   const armOutcomes: Record<string, ArmOutcome> = {};
   for (const result of armGameResults) {
