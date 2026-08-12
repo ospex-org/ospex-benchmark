@@ -213,6 +213,59 @@ function probeAttempt(): ArmAttempt {
 
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? 'held';
+  // ── THE DETERMINISTIC PAIR ─────────────────────────────────────────────────
+  // Emitting the event directly, rather than breaking a real pipe. An
+  // EventEmitter with no 'error' listener throws and one with a listener does
+  // not — the same on every platform and at every speed. The pipe route is
+  // platform-dependent (Node's stdio pipes are synchronous on Windows and
+  // asynchronous on POSIX), so it discriminates reliably on one and
+  // intermittently on the other; this does not.
+  //
+  // `stdio-unguarded` is the CONTROL: it strips the listeners this module's
+  // import installed, so it MUST crash. If it ever exits 0 the harness has
+  // stopped reaching the hazard, and the guarded case beside it would be
+  // passing on nothing.
+  if (mode === 'stdio-guard' || mode === 'stdio-unguarded' || mode === 'stdio-surprise') {
+    if (mode === 'stdio-unguarded') {
+      process.stdout.removeAllListeners('error');
+      process.stderr.removeAllListeners('error');
+    }
+    // Printed BEFORE the emit so the control can be shown to have crashed AT
+    // the emit rather than somewhere earlier. A control asserted only on a
+    // non-zero exit is satisfied by a child that never got this far.
+    say(`${mode}: about to emit`);
+    // ⚠ EMITTED FROM A FRESH MACROTASK, NOT FROM HERE. A throw inside `main()`
+    //   is caught by the entry point's own rejection handler at the bottom of
+    //   this file, which reports it and exits 0 — measured, and it made the
+    //   control pass for a reason that had nothing to do with the guard. The
+    //   real hazard fires inside a socket callback, where nothing is catching,
+    //   and this is the only way to reproduce that shape.
+    await new Promise<void>((resolve) => {
+      setTimeout(() => {
+        if (mode === 'stdio-surprise') {
+          // NOT a closed consumer. This one must be REPORTED — on the other
+          // stream — rather than absorbed, and it is the only case that
+          // executes the installed closures at all.
+          process.stdout.emit(
+            'error',
+            Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }),
+          );
+        } else {
+          // BOTH streams, because they are installed by two separate lines and
+          // a case that only emits on one leaves the other pinned by nothing.
+          // Measured: with only the stderr emit, deleting the stdout install
+          // left the whole suite green while `yarn score | head` still died.
+          const epipe = (): Error => Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+          process.stdout.emit('error', epipe());
+          process.stderr.emit('error', epipe());
+        }
+        resolve();
+      }, 10);
+    });
+    say(`${mode}: survived the emit`);
+    return;
+  }
+
   const answer = mode === 'enabled' ? 2
     : mode === 'stale' ? 1
     : mode === 'bogus' ? 'bogus' as const
@@ -253,7 +306,13 @@ async function main(): Promise<void> {
       // `epipe` reports through the PRODUCTION sink — stderr — because that is
       // the path that fails when the consumer is gone, and a probe that
       // substituted its own writer would be testing the substitute.
-      if (mode === 'epipe') { printError(line); return; }
+      if (mode === 'epipe') {
+        printError(line);
+        // Printed to STDOUT, which is still open: proof the real sink was
+        // reached, so a pass cannot mean "the pool never reported anything".
+        say('epipe: reported through the real sink');
+        return;
+      }
       say(`${mode}: onError ${line}`);
       // `sink` is the case where REPORTING is what breaks. `printError` writes
       // to stderr, and stderr raises EPIPE when the run is piped into something
@@ -266,6 +325,9 @@ async function main(): Promise<void> {
   say(`${mode}: reachedServer=${sawQuery()}`);
 
   if (drops) {
+    // Announced BEFORE the wait so the harness can close stderr at a known
+    // point rather than racing the child's startup.
+    say(`${mode}: READY`);
     // Nothing to do but survive. The server drops the connection while the
     // client sits idle in the pool; the only question is whether this process
     // is still here afterwards to exit 0.

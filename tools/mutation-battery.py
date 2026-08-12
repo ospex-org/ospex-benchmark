@@ -525,8 +525,40 @@ MUTANTS = [
     # 'error' event AFTER the write returns, so the call-site try/catch (M94)
     # cannot see it. Distinct layers, distinct mutants.
     ('M99-no-stdio-error-guard', 'src/console.ts',
-     "  stream.on('error', () => {",
-     "  stream.on('__no_listener_for_error', () => {",
+     "  stream.on('error', (error: unknown) => {",
+     "  stream.on('__no_listener_for_error', (error: unknown) => {",
+     ['src/benchmarkServingClient.test.ts']),
+
+    # The guard must DISCRIMINATE, not blanket-absorb. An empty listener reads as
+    # "tolerate a closed pipe" and behaves as "ignore every output fault".
+    ('M100-guard-absorbs-everything', 'src/console.ts',
+     '    if (isConsumerGone(error)) return;',
+     '    return;',
+     ['src/console.test.ts']),
+    ('M100b-guard-reports-every-time', 'src/console.ts',
+     '    if (reported) return;',
+     '    if (false) return;',
+     ['src/console.test.ts']),
+
+    # The two installs are separate lines, and a case that emits on only one
+    # stream leaves the other pinned by nothing. Measured: with the stderr emit
+    # alone, deleting the stdout install left the suite green while a run piped
+    # into `head` still died.
+    ('M101-stdout-guard-not-installed', 'src/console.ts',
+     "guardStream('stdout', process.stdout, (line) => process.stderr.write(",
+     "void ('stdout', process.stdout, (line) => process.stderr.write(",
+     ['src/benchmarkServingClient.test.ts']),
+    ('M101b-stderr-guard-not-installed', 'src/console.ts',
+     "guardStream('stderr', process.stderr, (line) => process.stdout.write(",
+     "void ('stderr', process.stderr, (line) => process.stdout.write(",
+     ['src/benchmarkServingClient.test.ts']),
+
+    # Which stream the diagnostic lands on. Reporting a stdout fault onto stdout
+    # writes to the stream that just failed, and the once-per-stream latch then
+    # discards the resulting second error — total silence, suite green.
+    ('M102-report-onto-the-broken-stream', 'src/console.ts',
+     "guardStream('stdout', process.stdout, (line) => process.stderr.write(",
+     "guardStream('stdout', process.stdout, (line) => process.stdout.write(",
      ['src/benchmarkServingClient.test.ts']),
 ]
 

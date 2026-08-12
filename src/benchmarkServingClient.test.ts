@@ -170,7 +170,19 @@ function probeExits(
   mode: string,
   deadlineMs: number,
   closeStderr = false,
-): Promise<{ exited: boolean; ms: number; out: string; code: number | null }> {
+): Promise<{
+  exited: boolean;
+  ms: number;
+  out: string;
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  /** Whether the harness actually closed the child's stderr, and what it had
+   *  printed by then — the two facts that make the closed-stderr case an
+   *  measurement rather than a coincidence. */
+  closedStderr: boolean;
+  outAtClose: string;
+}> {
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn(process.execPath, [...process.execArgv, 'src/servingCloseProbe.ts', mode], {
@@ -178,14 +190,30 @@ function probeExits(
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
-    child.stdout.on('data', (chunk) => { out += String(chunk); });
+    let stdout = '';
+    let stderr = '';
+    let closedStderr = false;
+    let outAtClose = '';
+    child.stdout.on('data', (chunk) => { out += String(chunk); stdout += String(chunk); });
     if (closeStderr) {
-      // Close the READ end, so the child's next write to stderr has nowhere to
-      // go. Everything the case asserts on therefore has to arrive on stdout.
-      child.stderr.destroy();
-      child.stderr.on('error', () => { /* this end is ours, and we just closed it */ });
+      // Closed when the child says READY, not at spawn: destroying the read end
+      // before the child is up races its startup, and the resulting pipe state
+      // is what made this measurement environment-dependent.
+      //
+      // Matched against the ACCUMULATED output, not the chunk: a marker split
+      // across two reads would never match, the close would never happen, and
+      // the case would pass having measured the child with a working stderr.
+      child.stderr.on('error', () => { /* this end is ours, and we close it below */ });
+      const closeWhenReady = (): void => {
+        if (closedStderr || !stdout.includes('READY')) return;
+        closedStderr = true;
+        outAtClose = stdout;
+        child.stdout.off('data', closeWhenReady);
+        child.stderr.destroy();
+      };
+      child.stdout.on('data', closeWhenReady);
     } else {
-      child.stderr.on('data', (chunk) => { out += String(chunk); });
+      child.stderr.on('data', (chunk) => { out += String(chunk); stderr += String(chunk); });
     }
     const killer = setTimeout(() => {
       // The tree, not the root: on Windows killing the parent leaves the child
@@ -199,7 +227,10 @@ function probeExits(
       // The CODE, not just the fact of exiting. An uncaught exception also
       // exits — with 1 — so "it exited" cannot tell a clean shutdown from a
       // crash, and the crash is the failure one of these cases exists to catch.
-      resolve({ exited: ms < deadlineMs - 400, ms, out: out.trim(), code });
+      resolve({
+        exited: ms < deadlineMs - 400, ms, out: out.trim(),
+        stdout: stdout.trim(), stderr: stderr.trim(), code, closedStderr, outAtClose,
+      });
     });
   });
 }
@@ -355,4 +386,65 @@ test('a dropped connection does not take the process with it when STDERR IS GONE
   // report was attempted down the broken stream — then the run carried on.
   assert.match(result.out, /epipe: status=enabled/);
   assert.match(result.out, /epipe: still running after the connection was dropped/);
+  // ── AND THAT THE PREMISE HELD ──────────────────────────────────────────────
+  // Without these two, the case passes identically when the close never
+  // happens — measured — which reduces it to "the process survives while
+  // stderr works", the null hypothesis. The close is a race against the
+  // child's own progress and nothing else observes whether it was won.
+  assert.equal(result.closedStderr, true, 'stderr was never closed, so nothing here was measured');
+  assert.doesNotMatch(
+    result.outAtClose, /reported through the real sink/,
+    'the report happened BEFORE stderr was closed, so it went down a working stream',
+  );
+});
+
+test('an error event on a broken output stream cannot end the process', async () => {
+  // ── THIS IS THE CASE THAT DISCRIMINATES THE GUARD ──────────────────────────
+  // The event is emitted directly rather than by breaking a real pipe, because
+  // EventEmitter semantics are identical on every platform and at every speed:
+  // no listener throws, a listener does not. Node's stdio PIPES are not —
+  // synchronous on Windows, asynchronous on POSIX — so the pipe route below
+  // discriminates 5/5 on one and roughly 1/10 on the other. A reviewer running
+  // Linux saw the mutant survive where it died here, and both measurements were
+  // correct.
+  //
+  // The control is half the case and is asserted FIRST: it strips the listeners
+  // and must crash. If it ever exits 0, the harness has stopped reaching the
+  // hazard and the guarded assertion beside it would prove nothing.
+  const control = await probeExits('stdio-unguarded', 8_000);
+  assert.notEqual(
+    control.code, 0,
+    `the control survived, so this case can no longer tell the guard from its absence: ${control.out}`,
+  );
+
+  // AT THE EMIT, not somewhere earlier: a control asserted only on a non-zero
+  // exit is satisfied by a child that failed to start.
+  assert.match(control.out, /stdio-unguarded: about to emit/);
+  assert.doesNotMatch(control.out, /survived the emit/);
+
+  const guarded = await probeExits('stdio-guard', 8_000);
+  assert.equal(guarded.code, 0, `a stream error ended the process: ${guarded.out}`);
+  assert.match(guarded.out, /stdio-guard: survived the emit/);
+});
+
+test('a fault that is NOT a closed consumer is reported, on the OTHER stream', async () => {
+  // The only case that executes the installed closures. `guardStream` is unit
+  // tested with a fake emitter and a fake reporter, so the two lines that
+  // decide WHICH stream a diagnostic lands on were installed and never run —
+  // measured: swapping them so each stream reports to itself left the suite
+  // green, and in production silenced the diagnostic entirely, because the
+  // report goes to the stream that just failed and the once-per-stream latch
+  // discards the resulting second error.
+  const result = await probeExits('stdio-surprise', 8_000);
+
+  assert.equal(result.code, 0, `an unexpected stream fault ended the process: ${result.out}`);
+  assert.match(result.stdout, /stdio-surprise: survived the emit/);
+  assert.match(
+    result.stderr, /\[stdout\] unexpected output error ENOSPC/,
+    `the stdout fault must be reported on STDERR; stderr was ${JSON.stringify(result.stderr)}`,
+  );
+  assert.doesNotMatch(
+    result.stdout, /unexpected output error/,
+    'reporting a stdout fault onto stdout is writing to the stream that just failed',
+  );
 });
