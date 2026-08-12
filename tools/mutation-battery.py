@@ -420,12 +420,12 @@ MUTANTS = [
      '  if (runFile === \'\') await mirrorRunArtifact(cfg.serving, runFile, { line: cfg.log, error: cfg.logError });',
      ['src/watch.test.ts']),
     ('M82-watch-dry-run-dials', 'src/watchMain.ts',
-     '  const serving = options.dryRun ? dryRunServing() : await openBenchmarkServing();',
-     '  const serving = await openBenchmarkServing();',
+     '  const serving = options.dryRun\n    ? dryRunServing()\n    : await openBenchmarkServing({ onError: printError });',
+     '  const serving = await openBenchmarkServing({ onError: printError });',
      ['src/servingActivation.test.ts']),
     ('M83-smoke-dry-run-dials', 'src/shadowSmoke.ts',
-     '  const serving = options.dryRun ? dryRunServing() : await openBenchmarkServing();',
-     '  const serving = await openBenchmarkServing();',
+     '  const serving = options.dryRun\n    ? dryRunServing()\n    : await openBenchmarkServing({ onError: printError });',
+     '  const serving = await openBenchmarkServing({ onError: printError });',
      ['src/servingActivation.test.ts']),
 
     # --- PR4: the schema gate's own safety properties ----------------------
