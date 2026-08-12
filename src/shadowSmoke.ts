@@ -259,7 +259,9 @@ async function main(): Promise<number> {
   // back rather than republishing what is in memory — the same call, over the
   // same bytes, that recovery would make later. A dry run opens nothing; a live
   // run that fails its identity check is refused by the publisher's own gate.
-  const serving = options.dryRun ? dryRunServing() : await openBenchmarkServing();
+  const serving = options.dryRun
+    ? dryRunServing()
+    : await openBenchmarkServing({ onError: printError });
   try {
     // Inside the try, so that a handle which exists is a handle that gets
     // closed — a pool left open by a throw on the way in holds the process

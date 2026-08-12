@@ -198,6 +198,9 @@ export interface FireOptions {
    * recording port, and a case that wants it in a database supplies a real one.
    */
   readonly serving?: BenchmarkServingPort;
+  /** The fire's log sink. A case that needs the PUBLISHER's own line to throw
+   *  supplies one; everything else keeps the silent default. */
+  readonly log?: (line: string) => void;
 }
 
 export async function firedRun(options: FireOptions): Promise<FiredRun> {
@@ -245,7 +248,7 @@ export async function firedRun(options: FireOptions): Promise<FiredRun> {
     clockMode: 'wall',
     // Monotonic, so recorded instants are ordered and latency is exact.
     nowMs: () => (clock += 5),
-    log: () => undefined,
+    log: options.log ?? ((): undefined => undefined),
     logError: () => undefined,
     serving: options.serving ?? new SqlBenchmarkServingPort(null),
   });

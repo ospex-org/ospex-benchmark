@@ -405,7 +405,7 @@ MUTANTS = [
     ('M78-mirror-rethrows', 'src/servingPublisher.ts',
      '    return null;\n  }\n}',
      '    throw error;\n  }\n}',
-     ['src/servingPublisher.test.ts']),
+     ['src/servingPublisher.test.ts', 'src/watch.test.ts']),
     ('M79-integrity-unguarded', 'src/servingPublisher.ts',
      '  let broken: string | null;\n  try {\n    broken = verifyArtifactIntegrity(text);\n'
      '  } catch (error) {\n    broken = `the artifact could not be verified (${describeError(error)})`;\n  }',
@@ -450,6 +450,30 @@ MUTANTS = [
      '    if (!readOnly.ok) return GATE_EXIT.refused;',
      '',
      ['src/servingSchemaGate.test.ts']),
+
+    # --- PR4 round 2: a dropped connection must not kill the process --------
+    ('M89-pool-has-no-error-listener', 'src/benchmarkServingClient.ts',
+     "  pool.on('error', (error: unknown) => {",
+     "  pool.on('__no_listener_for_error', (error: unknown) => {",
+     ['src/benchmarkServingClient.test.ts']),
+    ('M90-pinned-client-has-no-error-listener', 'src/store/campaignTickJournal.ts',
+     "      client.on?.('error', absorb);",
+     '      void absorb;',
+     ['src/store/campaignTickJournal.test.ts', 'src/benchmarkServingClient.test.ts']),
+
+    # --- PR4 round 2: the gate's widened questions --------------------------
+    ('M91-reach-check-ignores-column-grants', 'src/servingSchemaGate.ts',
+     "                      has_any_column_privilege(c.oid, 'SELECT')",
+     "                      has_table_privilege(c.oid, 'SELECT')",
+     ['src/servingSchemaGate.test.ts']),
+    ('M92-bookend-treats-unreadable-as-unchanged', 'src/servingSchemaGate.ts',
+     '    const unmoved = before !== null && after !== null && before === after;',
+     '    const unmoved = before === after;',
+     ['src/servingSchemaGate.test.ts']),
+    ('M93-deadline-default-not-wired', 'src/servingPublisher.ts',
+     '  const nowMs = timing.nowMs ?? publicationNowMs;',
+     '  const nowMs = timing.nowMs ?? Date.now;',
+     ['src/servingPublisher.test.ts']),
 ]
 
 

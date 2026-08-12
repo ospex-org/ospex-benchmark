@@ -166,7 +166,10 @@ test('the bounds are ordered so the layer that can END a statement acts first', 
  * drained and a hard kill fires at the deadline: a probe whose failure mode is
  * "produces no output" needs its own liveness proof.
  */
-function probeExits(mode: string, deadlineMs: number): Promise<{ exited: boolean; ms: number; out: string }> {
+function probeExits(
+  mode: string,
+  deadlineMs: number,
+): Promise<{ exited: boolean; ms: number; out: string; code: number | null }> {
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn(process.execPath, [...process.execArgv, 'src/servingCloseProbe.ts', mode], {
@@ -182,10 +185,13 @@ function probeExits(mode: string, deadlineMs: number): Promise<{ exited: boolean
       spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' })
         .on('error', () => child.kill('SIGKILL'));
     }, deadlineMs);
-    child.on('exit', () => {
+    child.on('exit', (code) => {
       clearTimeout(killer);
       const ms = Date.now() - started;
-      resolve({ exited: ms < deadlineMs - 400, ms, out: out.trim() });
+      // The CODE, not just the fact of exiting. An uncaught exception also
+      // exits — with 1 — so "it exited" cannot tell a clean shutdown from a
+      // crash, and the crash is the failure one of these cases exists to catch.
+      resolve({ exited: ms < deadlineMs - 400, ms, out: out.trim(), code });
     });
   });
 }
@@ -271,4 +277,33 @@ ${held.out}`);
       `process from an unbounded one and the tests above prove nothing. Output:
 ${held.out}`,
   );
+});
+
+test('a dropped connection does not take the process with it', async () => {
+  // ── THE HAZARD ─────────────────────────────────────────────────────────────
+  // `Pool` is an EventEmitter and every client it holds idle carries a listener
+  // that ends in `pool.emit('error', …)`. Emitting 'error' on an emitter with
+  // no listener THROWS, from a socket callback — outside the per-write race,
+  // outside the port's try/catch, outside mirrorRunArtifact. So an ordinary
+  // reset of an idle connection killed the whole process, which in `yarn watch`
+  // means the watcher dies between games and the rest of the slate is never
+  // fired and never ledgered.
+  //
+  // The probe's fake server answers the readiness query and then drops the
+  // connection while the client sits idle in the pool.
+  const result = await probeExits('reset', 8_000);
+
+  assert.equal(result.exited, true, `the process did not exit: ${result.out}`);
+  // ⚠ THE EXIT CODE IS THE ASSERTION. Without the listener this process also
+  //   "exits" — Node prints the uncaught error and exits 1. Measured both ways
+  //   against this exact probe: 1 with the listener removed, 0 with it.
+  assert.equal(result.code, 0, `crashed instead of absorbing it: ${result.out}`);
+  // And it reached the hazard: a run that never opened, or never had the
+  // connection dropped, would exit 0 for reasons unrelated to the fix.
+  assert.match(result.out, /reset: status=enabled/);
+  assert.match(result.out, /reset: reachedServer=true/);
+  // Absorbed, not swallowed. A failure nobody is waiting on has no outcome to
+  // be folded into, so silence here would make a database that drops every
+  // connection look exactly like one that works.
+  assert.match(result.out, /reset: onError .*a pooled connection failed/);
 });

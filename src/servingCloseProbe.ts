@@ -95,7 +95,10 @@ function resultSet(column: string, values: readonly string[], oid = TEXT_OID): B
  * exited promptly for a reason that had nothing to do with the code under test,
  * and a build with the fix removed passed identically.
  */
-function fakePostgres(answer: number | 'silent' | 'bogus'): Promise<{ port: number; sawQuery: () => boolean }> {
+function fakePostgres(
+  answer: number | 'silent' | 'bogus',
+  resetAfterAnswer = false,
+): Promise<{ port: number; sawQuery: () => boolean }> {
   let sawQuery = false;
   const server = createServer((socket) => {
     let sawStartup = false;
@@ -127,6 +130,11 @@ function fakePostgres(answer: number | 'silent' | 'bogus'): Promise<{ port: numb
         socket.write(answer === 'bogus'
           ? resultSet('capability_version', ['2'])
           : resultSet('version', [String(answer)], INT4_OID));
+        // Answer, then drop the connection out from under the client — a
+        // managed database restarting, failing over, or reaping an idle
+        // session. The client is back in the pool's IDLE set by then, carrying
+        // the pool's own listener, which ends in `pool.emit('error')`.
+        if (resetAfterAnswer) setTimeout(() => socket.destroy(), 150).unref();
         return;
       }
       // Saying nothing is the entire point of this server.
@@ -196,7 +204,7 @@ async function main(): Promise<void> {
     : mode === 'stale' ? 1
     : mode === 'bogus' ? 'bogus' as const
     : 'silent' as const;
-  const { port, sawQuery } = await fakePostgres(answer);
+  const { port, sawQuery } = await fakePostgres(mode === 'reset' ? 2 : answer, mode === 'reset');
   // `sslmode=disable` is LOAD-BEARING, not tidiness. With no CA configured the
   // resolver attaches `ssl: { rejectUnauthorized: false }`, `pg` opens with an
   // SSLRequest, this server refuses it, and the connection dies before a query
@@ -224,9 +232,23 @@ async function main(): Promise<void> {
   // Short bounds so the measurement is about whether the process exits, not
   // about how patient the defaults are. The defaults are pinned separately, as
   // values, by the ordering test.
-  const serving = await openBenchmarkServing({ readinessTimeoutMs: 300, closeTimeoutMs: 300 });
+  const serving = await openBenchmarkServing({
+    readinessTimeoutMs: 300,
+    closeTimeoutMs: 300,
+    onError: (line) => say(`${mode}: onError ${line}`),
+  });
   say(`${mode}: status=${serving.status.enabled ? 'enabled' : serving.status.reason}`);
   say(`${mode}: reachedServer=${sawQuery()}`);
+
+  if (mode === 'reset') {
+    // Nothing to do but survive. The server drops the connection while the
+    // client sits idle in the pool; the only question is whether this process
+    // is still here afterwards to exit 0.
+    await delay(600);
+    say('reset: still running after the connection was dropped');
+    await serving.close();
+    return;
+  }
 
   if (serving.status.enabled) {
     // The transactor path: a lock and a statement on ONE pinned client, which

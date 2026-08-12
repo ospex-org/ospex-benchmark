@@ -719,3 +719,39 @@ test('the publication deadline is measured on a clock that cannot step backwards
     Date.now = realNow;
   }
 });
+
+test('the DEFAULT deadline still binds when the wall clock runs backwards', async () => {
+  // The helper being monotonic is one thing; publishPlan actually USING it is
+  // the behavioural line, and nothing pinned that. `nowMs` is omitted here so
+  // the default is what runs, and Date.now is driven backwards underneath it.
+  const { plan } = await planFromFire();
+  const hanging = {
+    publishAttempt: () => new Promise<never>(() => undefined),
+    sealDecision: () => new Promise<never>(() => undefined),
+    revealDecision: () => new Promise<never>(() => undefined),
+    publishRationale: () => new Promise<never>(() => undefined),
+    publishScore: () => new Promise<never>(() => undefined),
+    publishScoringRun: () => new Promise<never>(() => undefined),
+  };
+  const realNow = Date.now;
+  const started = performance.now();
+  try {
+    let fake = 1_000_000_000_000;
+    Date.now = (): number => (fake -= 60_000);
+    const summary = await publishPlan(hanging, plan, collector().log, {
+      deadlineMs: 150,
+      perWriteTimeoutMs: 80,
+    });
+    const elapsed = performance.now() - started;
+    // BOUNDED AWAY FROM THE RIVAL. The per-write cap alone would also finish
+    // eventually — 80ms for each batch of writes. The deadline is what stops it
+    // after ~150ms, so the assertion has to exclude the slower mechanism rather
+    // than merely observe an ending.
+    const rival = 80 * (Math.ceil(plan.attempts.length / 4) + plan.decisions.length);
+    assert.ok(rival > 600, `the plan is too small to discriminate: rival bound ${rival}ms`);
+    assert.ok(elapsed < rival / 2, `took ${Math.round(elapsed)}ms; the per-write cap alone allows ${rival}ms`);
+    assert.ok(summary.skipped.some((reason) => reason.includes('abandoned')));
+  } finally {
+    Date.now = realNow;
+  }
+});

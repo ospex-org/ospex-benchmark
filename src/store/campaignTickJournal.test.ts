@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import { SqlCampaignTickJournalPort, pgStoreTransactor } from './campaignTickJournal.js';
 import type { PgTransactionClient, StoreTransactor } from './campaignTickJournal.js';
@@ -316,4 +317,38 @@ test('a rollback that never answers cannot stop the client being released', { ti
   );
   assert.deepEqual(seen,
     ['begin isolation level read committed', 'select 1', 'rollback', 'release']);
+});
+
+test('a connection that fails MID-TRANSACTION does not take the process with it', async () => {
+  // A checked-out client has no 'error' listener of its own: the pool removes
+  // its idle one on checkout and `Client.query` attaches none. Emitting 'error'
+  // on an EventEmitter with no listener THROWS — from a socket callback, so
+  // outside every promise here — and that killed the whole process rather than
+  // failing the transaction.
+  //
+  // A real EventEmitter is used deliberately: a hand-written fake would have to
+  // MODEL the throw, and the model is the thing under test.
+  class FakeClient extends EventEmitter {
+    released: unknown;
+    query = async (sql: string): Promise<{ rows: Array<Record<string, unknown>> }> => {
+      if (sql.startsWith('select 1')) {
+        // The socket dies while this transaction holds the client.
+        this.emit('error', new Error('Connection terminated unexpectedly'));
+      }
+      return { rows: [] };
+    };
+    release = (because?: unknown): void => { this.released = because; };
+  }
+  const client = new FakeClient();
+  const transactor = pgStoreTransactor({ connect: async () => client });
+
+  // The emit must not escape: it happens inside the transaction body, and if it
+  // throws it does so synchronously out of `query`.
+  const result = await transactor.transaction(async (query) => {
+    await query('select 1', []);
+    return 'finished';
+  });
+  assert.equal(result, 'finished');
+  assert.equal(client.released, undefined, 'a clean transaction releases without destroying');
+  assert.equal(client.listenerCount('error'), 0, 'the listener must come off again, or it accumulates');
 });

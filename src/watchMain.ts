@@ -102,7 +102,9 @@ async function main(): Promise<number> {
   // spend it on setup and teardown. Unconfigured is the shipped default and
   // costs nothing — the handle is then a port that answers `disabled` without a
   // socket. A dry run does not open at all; see dryRunServing.
-  const serving = options.dryRun ? dryRunServing() : await openBenchmarkServing();
+  const serving = options.dryRun
+    ? dryRunServing()
+    : await openBenchmarkServing({ onError: printError });
 
   // The handle exists from here on, so everything below it sits inside the
   // finally — including building the ledger, which reads a directory and can

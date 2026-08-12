@@ -299,6 +299,22 @@ const FORBIDDEN_READERS = ['anon', 'authenticated', 'openclaw_readonly'] as cons
 const READ_API_ROLE = 'service_role';
 const WITHHELD_TABLE = 'benchmark_decision_rationales';
 
+
+/** Every table privilege PostgreSQL can grant. Used wherever the claim is "no
+ *  privilege of any kind", so a verb cannot be forgotten out of the question. */
+const ALL_VERBS = [
+  'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER',
+] as const;
+
+/** The row counts, or null when they could not be read. Never throws. */
+async function countsOrNull(query: GateQuery): Promise<string | null> {
+  try {
+    return await readRowCounts(query);
+  } catch {
+    return null;
+  }
+}
+
 export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
   {
     name: 'the server is new enough for the identity contract',
@@ -499,7 +515,24 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
           where n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
             and c.relkind in ('r', 'p', 'v', 'm', 'f', 'S')
             and not (n.nspname = 'public' and c.relname = any($1::text[]))
-            and (has_table_privilege(c.oid, 'SELECT') or has_table_privilege(c.oid, 'INSERT'))
+            -- EVERY verb, and at COLUMN level where the verb is column-grantable.
+            -- Asking only SELECT and INSERT at table level reads a role holding
+            -- UPDATE on a protocol table — or SELECT on one column of it — as
+            -- reaching nothing at all. A sequence answers a different family of
+            -- functions entirely, and is the class a table-and-view sweep misses.
+            and case when c.relkind = 'S' then
+                      has_sequence_privilege(c.oid, 'USAGE')
+                   or has_sequence_privilege(c.oid, 'SELECT')
+                   or has_sequence_privilege(c.oid, 'UPDATE')
+                 else
+                      has_any_column_privilege(c.oid, 'SELECT')
+                   or has_any_column_privilege(c.oid, 'INSERT')
+                   or has_any_column_privilege(c.oid, 'UPDATE')
+                   or has_any_column_privilege(c.oid, 'REFERENCES')
+                   or has_table_privilege(c.oid, 'DELETE')
+                   or has_table_privilege(c.oid, 'TRUNCATE')
+                   or has_table_privilege(c.oid, 'TRIGGER')
+                 end
           order by c.relname limit 25`,
         [[...SERVING_TABLES]],
       );
@@ -649,13 +682,20 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
         // the stated basis that the read API's key holds no privilege of ANY
         // kind there, so publishing it later is a deliberate GRANT plus an
         // endpoint rather than an oversight nobody notices.
+        // The whole grid. "No privilege of ANY kind" is the claim, and a DELETE
+        // grant satisfies a check that only asked about SELECT and UPDATE —
+        // while being strictly worse than a read, because a credential that can
+        // destroy evidence it cannot see leaves nothing downstream able to tell.
         const prose = await query(
-          `select has_any_column_privilege($1, 'public.' || $2, 'SELECT') as sel,
-                  has_any_column_privilege($1, 'public.' || $2, 'UPDATE') as upd`,
-          [READ_API_ROLE, WITHHELD_TABLE],
+          `select v as verb from unnest($3::text[]) as v
+            where case when v in ('DELETE', 'TRUNCATE', 'TRIGGER')
+                       then has_table_privilege($1, 'public.' || $2, v)
+                       else has_any_column_privilege($1, 'public.' || $2, v) end`,
+          [READ_API_ROLE, WITHHELD_TABLE, [...ALL_VERBS]],
         );
-        if (prose[0]?.['sel'] !== false) faults.push(`${READ_API_ROLE} can READ ${WITHHELD_TABLE}`);
-        if (prose[0]?.['upd'] !== false) faults.push(`${READ_API_ROLE} can WRITE ${WITHHELD_TABLE}`);
+        for (const row of prose) {
+          faults.push(`${READ_API_ROLE} holds ${String(row['verb'])} on ${WITHHELD_TABLE}`);
+        }
       }
 
       const checked = [...present].join(', ') || 'none of them exist here';
@@ -772,7 +812,11 @@ export async function runSchemaGate(deps: SchemaGateDeps): Promise<number> {
     const encrypted = proveEncrypted(await readSession(connection.query), connection.localTarget);
     line(`${encrypted.ok ? 'ok  ' : 'FAIL'}  the session is encrypted: ${encrypted.detail}`);
 
-    const before = await readRowCounts(connection.query);
+    // Read through a catch: an unreadable count is a FINDING, not a crash. The
+    // command exists to report on a database that may be misconfigured, and the
+    // shape it is most likely to be misconfigured in — a missing grant on one
+    // table — is exactly what makes this query throw.
+    const before = await countsOrNull(connection.query);
     const findings = await runChecks(deps.checks, connection.query);
     for (const finding of findings) {
       line(`${finding.informational ? 'note' : finding.ok ? 'ok  ' : 'FAIL'}  ${finding.name}: ${finding.detail}`);
@@ -780,9 +824,17 @@ export async function runSchemaGate(deps: SchemaGateDeps): Promise<number> {
 
     // The second, independent proof that this command changed nothing. The
     // 25006 refusal says writes are impossible; this says none happened.
-    const after = await readRowCounts(connection.query);
-    const unmoved = before === after;
-    line(`${unmoved ? 'ok  ' : 'FAIL'}  the gate wrote nothing: row counts ${unmoved ? 'unchanged' : `MOVED — ${before} -> ${after}`}`);
+    const after = await countsOrNull(connection.query);
+    // Unreadable is NOT unchanged. Two nulls compare equal and would report the
+    // gate as having proven something it never measured.
+    const unmoved = before !== null && after !== null && before === after;
+    line(
+      unmoved
+        ? 'ok    the gate wrote nothing: row counts unchanged'
+        : `FAIL  the gate wrote nothing: ${before === null || after === null
+            ? 'the row counts could not be read, so nothing was proven either way'
+            : `row counts MOVED — ${before} -> ${after}`}`,
+    );
 
     // Everything decisive, counted in one place: the schema checks, the
     // transport, and the gate's own proof that it changed nothing. The
@@ -887,6 +939,12 @@ async function openGateConnection(): Promise<GateConnection> {
     // One connection: the checks are sequential and every one of them must run
     // against a connection that carried the read-only option.
     max: 1,
+  });
+  // Without this, a reset while the gate is running is an uncaught exception
+  // rather than a failed check — the same hazard the publisher's pool carries,
+  // and here it would abandon a preflight halfway with no verdict at all.
+  pool.on('error', (error: unknown) => {
+    printError(`serving schema gate: the connection failed (${describeError(error)})`);
   });
   return {
     kind: 'ready',

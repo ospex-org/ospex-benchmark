@@ -13,6 +13,7 @@ import {
 } from './servingSchemaGate.js';
 import type { GateCheck, GateConnection, GateQuery, SchemaGateDeps } from './servingSchemaGate.js';
 import type { BenchmarkWriterConnection } from './benchmarkServingConfig.js';
+import { SERVING_TABLES } from './servingStore.js';
 
 /**
  * The preflight's own safety properties, which are the ones worth a suite: that
@@ -125,8 +126,19 @@ test('NOTHING the checks issue can write, on either server-version branch', asyn
   //
   // Both branches, because the statement check picks its verb from the server
   // version and a sweep of one branch would leave the other unexamined.
+  // Non-empty answers for the catalog reads too, so the checks that only issue
+  // their SECOND query when the first returned rows are actually reached. With
+  // an all-empty fake, two of them return early and this sweep never sees the
+  // statements they would have sent.
+  const catalog = {
+    pg_roles: [{ rolname: 'anon' }, { rolname: 'service_role' }],
+    pg_index: [{ name: 'i', cols: ['lab_id', 'model_id', 'configuration'], uniq: true,
+                 nulls_not_distinct: true, valid: true, predicate: "(kind = 'model'::text)" }],
+    pg_constraint: [{ def: 'CHECK (true)' }],
+    'information_schema.columns': [{ name: 'confidence', p: 9, s: 8 }],
+  };
   for (const version of [170010, 150000]) {
-    const { query, seen } = rowsFor({ server_version_num: [{ v: version }] });
+    const { query, seen } = rowsFor({ server_version_num: [{ v: version }], ...catalog });
     await runChecks(SERVING_SCHEMA_CHECKS, query);
     assert.ok(seen.length > 0, 'the checks issued no SQL at all, so this asserts nothing');
     for (const sql of seen) {
@@ -316,8 +328,64 @@ test('the exit codes are distinct, so a wrapper can tell them apart', () => {
 });
 
 test('the row-count reading names every table it was asked about', async () => {
-  const { query } = rowsFor({
-    query_to_xml: [{ name: 'benchmark_runs', n: '0' }, { name: 'benchmark_decisions', n: '7' }],
+  // Built FROM the parameter the code sent, not from a literal this test also
+  // feeds in: a fake that ignores the table list would let the bookend narrow to
+  // a single table and still pass.
+  const sent: unknown[][] = [];
+  const query: GateQuery = async (sql, params) => {
+    sent.push([...(params ?? [])]);
+    if (!sql.includes('query_to_xml')) return [];
+    const tables = (params?.[0] ?? []) as string[];
+    return tables.map((name, index) => ({ name, n: String(index) }));
+  };
+  const counts = await readRowCounts(query);
+  assert.deepEqual(sent[0], [[...SERVING_TABLES]], 'the bookend must ask about every table');
+  assert.equal(counts.split(' ').length, SERVING_TABLES.length);
+  assert.match(counts, /^benchmark_runs=0 /);
+});
+
+test('the reach check asks about COLUMN-level grants, not just table-level', async () => {
+  // Asserted on the statement that was SENT, because the semantics live in the
+  // SQL and no fake can evaluate them. A role holding UPDATE on one column of a
+  // protocol table is reachable; `has_table_privilege` answers false for it, so
+  // a table-level-only question reports "reaches nothing" about a role that
+  // reaches something.
+  const { query, seen } = rowsFor({});
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('reaches nothing'));
+  assert.ok(check, 'the reach check is gone');
+  await check.run(query);
+  const sql = seen.join('\n');
+  for (const verb of ['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']) {
+    assert.match(sql, new RegExp(`has_any_column_privilege\\(c\\.oid, '${verb}'\\)`), `column-level ${verb}`);
+  }
+  for (const verb of ['DELETE', 'TRUNCATE', 'TRIGGER']) {
+    assert.match(sql, new RegExp(`has_table_privilege\\(c\\.oid, '${verb}'\\)`), `table-level ${verb}`);
+  }
+  // Sequences answer a different family of functions entirely, and are the
+  // class a table-and-view sweep misses.
+  assert.match(sql, /has_sequence_privilege/);
+});
+
+test('row counts that cannot be READ are not reported as unchanged', async () => {
+  // Two nulls compare equal. Without the null guard the gate would announce
+  // "the gate wrote nothing" having measured nothing at all — on exactly the
+  // misconfiguration it exists to find, a missing grant on one table.
+  const it = harness({
+    connection: {
+      kind: 'ready',
+      localTarget: true,
+      query: async (sql) => {
+        if (sql.startsWith('insert')) throw Object.assign(new Error('ro'), { code: '25006' });
+        if (sql.includes('pg_stat_ssl')) return [{ ssl: true, version: 'TLSv1.3' }];
+        if (sql.includes('query_to_xml')) throw Object.assign(new Error('denied'), { code: '42501' });
+        return [];
+      },
+      close: async () => {},
+    },
   });
-  assert.equal(await readRowCounts(query), 'benchmark_runs=0 benchmark_decisions=7');
+  assert.equal(await runSchemaGate(it.deps), GATE_EXIT.failed);
+  assert.ok(
+    it.lines.some((line) => line.includes('could not be read')),
+    `the operator must be told the bookend proved nothing; got ${JSON.stringify(it.lines)}`,
+  );
 });

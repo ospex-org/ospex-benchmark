@@ -1,4 +1,5 @@
 import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
+import { describeError } from './config.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { BenchmarkWriterConnection, UnresolvedReason } from './benchmarkServingConfig.js';
 import type { BenchmarkServingPort } from './servingStore.js';
@@ -265,10 +266,11 @@ type ServingTransactorFactory = Awaited<ReturnType<typeof loadDriver>>['pgStoreT
  *   reason it calls this unconditionally is that it is safe to.
  */
 export async function openBenchmarkServing(
-  bounds: ServingBounds = {},
+  options: ServingOptions = {},
 ): Promise<BenchmarkServingHandle> {
-  const readinessTimeoutMs = bounds.readinessTimeoutMs ?? READINESS_TIMEOUT_MS;
-  const closeTimeoutMs = bounds.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
+  const readinessTimeoutMs = options.readinessTimeoutMs ?? READINESS_TIMEOUT_MS;
+  const closeTimeoutMs = options.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
+  const onError = options.onError ?? ((): void => {});
   const resolution = resolveBenchmarkWriterConnection();
   if (!resolution.resolved) {
     return { port: new SqlBenchmarkServingPort(null), status: { enabled: false, reason: resolution.reason }, ...DISABLED };
@@ -298,6 +300,30 @@ export async function openBenchmarkServing(
   pool.on('acquire', (client: unknown) => { live.add(client as EndableClient); });
   pool.on('release', (_error: unknown, client: unknown) => { live.delete(client as EndableClient); });
   pool.on('remove', (client: unknown) => { live.delete(client as EndableClient); });
+
+  // ── WITHOUT THIS LINE A DROPPED CONNECTION KILLS THE PROCESS ───────────────
+  // `Pool` is an EventEmitter, and `emit('error', …)` on an emitter with no
+  // 'error' listener THROWS. Every client pg-pool holds idle carries an
+  // internal listener that ends in exactly that emit, so an ordinary reset of
+  // an idle connection — a managed-Postgres restart, a failover, an idle
+  // reaper, a `pg_terminate_backend` — becomes an uncaught exception. Nothing
+  // in this process installs a handler for one.
+  //
+  // It arrives from a socket callback, so it is outside every promise: the
+  // per-write race, the port's own try/catch and `mirrorRunArtifact` all miss
+  // it. In `yarn watch` that is not a lost projection row, it is the WATCHER
+  // dying between games with the rest of the slate unfired and unledgered —
+  // strictly worse than the failure the fail-soft design exists to avoid.
+  //
+  // Measured against PostgreSQL 17 by terminating the backend of a released
+  // client: without this listener the process exits 1; with it, exit 0.
+  //
+  // Absorbing is the whole job. The write that hit a dead connection is already
+  // reported as `unavailable` by the port; what this adds is that the process
+  // stays alive to report it.
+  pool.on('error', (error: unknown) => {
+    onError(`serving projection: a pooled connection failed (${describeError(error)}) — the pool will reconnect`);
+  });
   const poolLike = pool as unknown as PoolLike;
 
   // Before a single row: does this schema say it can hold the entrant contract?
@@ -339,16 +365,29 @@ export async function openBenchmarkServing(
 export const READINESS_TIMEOUT_MS = 5_000;
 
 /**
- * The two bounds a caller may shorten.
+ * What a caller may supply.
  *
  * Injectable for one reason only: the guarantee this module exists to make is
  * "the process can still exit", and a child process proving that has to run in
  * about a second rather than about ten. The DEFAULTS are pinned separately, as
  * values, so shortening them in a test cannot quietly become shipping them.
  */
-export interface ServingBounds {
+export interface ServingOptions {
   readonly readinessTimeoutMs?: number;
   readonly closeTimeoutMs?: number;
+  /**
+   * Where an ASYNCHRONOUS pool failure is reported.
+   *
+   * Needed because a pooled connection can fail with no write in flight: an
+   * idle socket reset between two games belongs to nobody's promise, so there
+   * is no outcome to fold it into and no caller to return it to. Absorbing it
+   * silently would make a database that drops every connection look exactly
+   * like one that is working.
+   *
+   * Defaults to doing nothing, so a caller with no console — a probe, a unit
+   * test — is not made to invent one.
+   */
+  readonly onError?: (line: string) => void;
 }
 
 /**

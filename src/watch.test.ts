@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { after, test } from 'node:test';
 import { buildBundle } from './bundle.js';
+import { sha256Hex } from './canonical.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
 import { verifyArtifactIntegrity } from './servingProjection.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
@@ -978,6 +979,12 @@ test('a fire publishes the artifact it just wrote, from the file', async () => {
     port.calls.map((call) => String((call.payload['source'] as { sourcePath?: unknown }).sourcePath)),
   );
   assert.deepEqual([...sources], [basename(run.runFile)]);
+  // And the DIGEST, which is what makes "published from the file" a property
+  // rather than a comment: a basename can be derived without opening anything.
+  const digests = new Set(
+    port.calls.map((call) => String((call.payload['source'] as { sourceSha256?: unknown }).sourceSha256)),
+  );
+  assert.deepEqual([...digests], [sha256Hex(readFileSync(run.runFile, 'utf8'))]);
 });
 
 test('a fire is NOT failed by a projection that refuses everything', async () => {
@@ -999,5 +1006,26 @@ test('a fire is NOT failed by a projection that refuses everything', async () =>
   // the thing a benchmark night actually produces — is not merely present but
   // publishable, checked by the same verifier the publisher runs.
   assert.ok(run.records.length > 0);
+  assert.equal(verifyArtifactIntegrity(readFileSync(run.runFile, 'utf8')), null);
+});
+
+test('a fire survives a log sink that throws on the projection line', async () => {
+  // THE LAYER THIS PINS is that the run path calls the TOTAL wrapper. Swap
+  // `mirrorRunArtifact` for `publishRunArtifact` in watch.ts and this reddens,
+  // because that one lets a throwing sink out: its summary line is the last
+  // thing it does and it is not inside a try. The realistic case is stdout
+  // raising EPIPE when a run is piped into something that exits first.
+  //
+  // Only the projection line throws, so the rest of the fire is unaffected and
+  // a failure here cannot be attributed to anything else.
+  const run = await firedRun({
+    outDir: tempDir('watch-serving-epipe-'),
+    enrolled: true,
+    serving: new SpyPort(),
+    log: (line) => {
+      if (line.startsWith('serving projection')) throw new Error('EPIPE: stdout closed');
+    },
+  });
+  assert.ok(run.records.length > 0, 'the fire did not produce an artifact');
   assert.equal(verifyArtifactIntegrity(readFileSync(run.runFile, 'utf8')), null);
 });
