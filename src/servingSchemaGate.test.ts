@@ -428,9 +428,19 @@ test('a SECURITY DEFINER function this role can execute is a FAILURE', async () 
 
   assert.equal((await check.run(async () => [])).ok, true, 'none executable is the healthy state');
 
-  const verdict = await check.run(async () => [{ fn: 'public.rpc_something' }]);
+  const verdict = await check.run(async () => [
+    { role: 'benchmark_writer', fn: 'public.rpc_something', from_extension: false },
+  ]);
   assert.equal(verdict.ok, false);
-  assert.match(verdict.detail, /public\.rpc_something/);
+  assert.match(verdict.detail, /benchmark_writer -> public\.rpc_something/);
+
+  // Asked for the OTHER roles too: for the writer such a function is a way out
+  // of its grants, for a browser-facing key a way in to the projection. A check
+  // that asked only about the connected role would close one half.
+  const { query, seen } = rowsFor({});
+  await check.run(query);
+  assert.match(seen.join('\n'), /has_function_privilege\(named\.role, p\.oid, 'EXECUTE'\)/);
+  assert.match(seen.join('\n'), /rolname = any\(\$1::text\[\]\) or rolname = current_user/);
 });
 
 test('the forbidden-reader question covers every verb, not just the reads', async () => {

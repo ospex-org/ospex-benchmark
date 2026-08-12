@@ -787,7 +787,7 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
   },
 
   {
-    name: 'no SECURITY DEFINER function carries this role past its grants',
+    name: 'no SECURITY DEFINER function carries any checked role past its grants',
     async run(query) {
       // The grid and the relation sweep both answer "what may this role touch
       // DIRECTLY". A SECURITY DEFINER function runs as its OWNER, so EXECUTE on
@@ -799,22 +799,61 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
       // privileges, so they cannot reach past what the checks above already
       // cover. That is the whole reason this can be a short list rather than
       // every function in the database.
+      // Asked for EVERY role the gate has an opinion about, not just the one
+      // connected. For the writer such a function is a way OUT of its grants;
+      // for a browser-facing key it is a way IN to the projection. Same
+      // mechanism, and a check that asked only about the connected role would
+      // close one half of it — which is the exact shape of mistake this commit
+      // is repairing elsewhere.
+      //
+      // Roles that do not exist here are dropped by the join rather than
+      // erroring, so this asks what it can and says which roles it asked about.
+      //
+      // ⚠ SCOPED TO `public`, AND THE BOUND IS WORTH STATING. That is where the
+      //   projection, the protocol objects and anything this project authors
+      //   live, and it is the exact shape that was demonstrated: a definer
+      //   function in `public` granted to the writer. A managed platform ships
+      //   definer functions in its own schemas by the dozen, none of them
+      //   actionable by a reader of this repo, and a preflight that is red on
+      //   every healthy database is a preflight people learn to skip. What this
+      //   therefore does NOT catch: a definer function in a platform schema that
+      //   writes to the projection.
       const rows = await query(
-        `select n.nspname || '.' || p.proname as fn
-           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-          where n.nspname not in ('pg_catalog', 'information_schema')
+        // A subquery rather than a leading CTE, so the statement still begins
+        // with `select`. The suite sweeps every statement these checks issue and
+        // admits only reads by their opening verb; widening that to accept
+        // `with` would also admit `WITH … INSERT`, which is exactly the thing
+        // the sweep exists to refuse.
+        `select named.role,
+                n.nspname || '.' || p.proname as fn,
+                exists (select 1 from pg_depend d
+                         where d.objid = p.oid
+                           and d.classid = 'pg_proc'::regclass
+                           and d.deptype = 'e') as from_extension
+           from pg_proc p
+           join pg_namespace n on n.oid = p.pronamespace
+           cross join (select rolname::text as role from pg_roles
+                        where rolname = any($1::text[]) or rolname = current_user) as named
+          where n.nspname = 'public'
             and p.prosecdef
-            and has_function_privilege(p.oid, 'EXECUTE')
-          order by 1 limit 25`,
+            and has_function_privilege(named.role, p.oid, 'EXECUTE')
+          order by 1, 2 limit 40`,
+        [[...FORBIDDEN_READERS, READ_API_ROLE]],
       );
-      return rows.length === 0
-        ? { ok: true, detail: 'this role may execute no SECURITY DEFINER function' }
-        : {
-            ok: false,
-            detail:
-              `executable as their owner: ${rows.map((row) => String(row['fn'])).join(', ')}. ` +
-              'Each one is a path out of this role\'s grants; revoke EXECUTE, or decide deliberately that it is safe.',
-          };
+      if (rows.length === 0) {
+        return { ok: true, detail: 'no role this gate checks may execute a SECURITY DEFINER function' };
+      }
+      const named = rows.map((row) => {
+        const platform = row['from_extension'] === true ? ' [extension]' : '';
+        return `${String(row['role'])} -> ${String(row['fn'])}${platform}`;
+      });
+      return {
+        ok: false,
+        detail:
+          `executable as their owner: ${named.join(', ')}. Each one is a path around the ` +
+          'privilege grid above; revoke EXECUTE, or decide deliberately that it is safe. ' +
+          'Entries marked [extension] belong to an installed extension rather than to this schema.',
+      };
     },
   },
 

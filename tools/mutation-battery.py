@@ -509,10 +509,16 @@ MUTANTS = [
 
     # B1.3: a SECURITY DEFINER function runs as its owner.
     ('M97-security-definer-ignored', 'src/servingSchemaGate.ts',
-     '      return rows.length === 0\n'
-     "        ? { ok: true, detail: 'this role may execute no SECURITY DEFINER function' }",
-     '      return true\n'
-     "        ? { ok: true, detail: 'this role may execute no SECURITY DEFINER function' }",
+     '      if (rows.length === 0) {',
+     '      if (true) {',
+     ['src/servingSchemaGate.test.ts']),
+
+    # A definer function is a way OUT for the writer and a way IN for a
+    # browser-facing key. Asking only about the connected role closes one half.
+    ('M98-security-definer-connected-role-only', 'src/servingSchemaGate.ts',
+     "           cross join (select rolname::text as role from pg_roles\n"
+     "                        where rolname = any($1::text[]) or rolname = current_user) as named",
+     "           cross join (select current_user::text as role) as named",
      ['src/servingSchemaGate.test.ts']),
 ]
 
