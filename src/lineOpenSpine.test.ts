@@ -1013,7 +1013,7 @@ function repairPair(): Promise<EvidencePair> {
     const atCapFor = (provider: string): unknown => {
       switch (provider) {
         case 'openai':
-          return { prompt_tokens: 8_000_000, completion_tokens: 0, total_tokens: 8_000_000 };
+          return { prompt_tokens: 4_000_000, completion_tokens: 0, total_tokens: 4_000_000 };
         case 'anthropic':
           return { input_tokens: 10_000_000, output_tokens: 0 };
         case 'google':
@@ -1284,18 +1284,18 @@ test('pair verifier: exact per-attempt values on the clean pair (ceiling arithme
   const pair = await cleanPair();
   const verification = verifySpendEvidence({ artifactBytes: pair.artifactBytes, sidecar: pair.sidecar });
   assert.equal(verification.ok, true, JSON.stringify(verification.checks));
-  // Hand-computed at the pinned v2 rates (µUSD): openai (1×12.5 + 1×60 → 72.5 → CEIL 73);
+  // Hand-computed at the pinned v4 rates (µUSD): openai 1×25 + 1×90 = 115;
   // anthropic 1×10 + 1×50 = 60; google 1465×4 + (471+305)×18 = 19_828; xai 1×4 + 1×12 = 16.
   assert.deepEqual(
     verification.attempts.map((a) => [a.participantId, a.derivedActualUsdMicros]),
     [
-      ['openai-gpt-5.6-sol', 73],
+      ['openai-gpt-5.6-sol', 115],
       ['anthropic-claude-fable-5', 60],
       ['google-gemini-3.1-pro-preview', 19_828],
       ['xai-grok-4.5', 16],
     ],
   );
-  assert.equal(verification.aggregateUsdMicros, 73 + 60 + 19_828 + 16);
+  assert.equal(verification.aggregateUsdMicros, 115 + 60 + 19_828 + 16);
 });
 
 test('pair verifier: the full-repair pair passes with 8 at-cap attempts summing EXACTLY to the $800 cap', async () => {

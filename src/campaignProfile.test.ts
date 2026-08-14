@@ -2,15 +2,17 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   CAMPAIGN_BOUNDS,
+  CONSERVATIVE_USD_MICROS_PER_ATTEMPT,
   buildCampaignManifest,
   campaignBoundsViolations,
   projectCampaignCost,
 } from './campaignProfile.js';
+import { SPEND_GUARD_PRICE_TABLE_VERSION, modelPriceTableForVersion } from './modelPriceTable.js';
 import { CanaryAuthorizationError, assertCohortAdapterCapability, gateRealCampaignAdapterCapability } from './cohortAdapterCapability.js';
 import type { CanaryAuthorization } from './cohortAdapterCapability.js';
 import { cohortBoot } from './cohortBoot.js';
 import type { BootedCohort } from './cohortBoot.js';
-import { buildCrossingManifest } from './crossingProfile.js';
+import { CROSSING_PROFILE, buildCrossingManifest } from './crossingProfile.js';
 import { buildRehearsalManifest } from './rehearsalManifest.js';
 import type { CohortManifestV1 } from './manifest.js';
 import { defaultExpectedArms } from './scoring.js';
@@ -94,7 +96,7 @@ test('a built campaign manifest boots, conforms, and derives its reservation cap
   assert.equal(manifest.constants.providerAttemptReservationUsdMicros, 100_000_000);
   assert.equal(manifest.constants.maxOutputTokens, 16_000);
   assert.equal(manifest.constants.providerCallTimeoutMs, 300_000);
-  assert.equal(manifest.modelPriceTableVersion, 'prices-v3');
+  assert.equal(manifest.modelPriceTableVersion, 'prices-v4');
 });
 
 test('cost projection is stated in CALLS, both at the observed rate and the committed conservative bound', () => {
@@ -104,13 +106,52 @@ test('cost projection is stated in CALLS, both at the observed rate and the comm
     {
       maxCalls: 800,
       maxFires: 100,
-      // 800 × the crossing's observed $0.046359/attempt ≈ $37; 800 × $27.36 conservative.
+      // 800 × the crossing's observed $0.046359/attempt ≈ $37; 800 × $31.60 conservative.
       observedUsdMicros: 800 * 46_359,
-      conservativeUsdMicros: 800 * 27_363_330,
+      conservativeUsdMicros: 800 * 31_604_580,
     },
   );
   // The reservation cap is NOT the budget: it is ~2000x the observed expectation.
   assert.ok(campaignManifest().manifest.cohortSpendCapUsdMicros > projection.observedUsdMicros * 1_000);
+});
+
+test('the conservative projection is RE-DERIVED from the pinned guard table, so a rate change cannot leave it stale', () => {
+  // This constant is a hand-carried figure from docs/SPEND-BOUND-PROOF.md, and it drifted
+  // exactly that way once: the guard table moved to prices-v4 while the projection kept
+  // quoting the prices-v3 bound, under-reporting an 800-call campaign by 13%. Recomputing
+  // it from the table the guard actually pins turns the next such change into a red test.
+  //
+  // What this pins is the ARITHMETIC against the live rates, NOT the envelopes: the token
+  // bounds and the per-model worst-case SHAPES below are the proof doc's, so an envelope
+  // that is wrong there is wrong here too. It is the price-table half that moves.
+  const table = modelPriceTableForVersion(SPEND_GUARD_PRICE_TABLE_VERSION);
+  const cost = (tokens: number, ratePerMillion: number) => (tokens * ratePerMillion) / 1_000_000;
+  const openai = table['gpt-5.6-sol']!;
+  const anthropic = table['claude-fable-5']!;
+  const google = table['gemini-3.1-pro-preview']!;
+  const xai = table['grok-4.5']!;
+
+  const worstCaseOneAttemptEachModel =
+    // OpenAI: full context in, max output out.
+    cost(1_050_000, openai.inputUsdMicrosPerMillionTokens) +
+    cost(128_000, openai.outputUsdMicrosPerMillionTokens) +
+    // Anthropic: the whole context treated as cache creation, which is priced at the
+    // OUTPUT rate — so both terms carry the output rate, not the input one.
+    cost(1_000_000, anthropic.outputUsdMicrosPerMillionTokens) +
+    cost(128_000, anthropic.outputUsdMicrosPerMillionTokens) +
+    // Google: thinking tokens are additive and bill at the output rate.
+    cost(1_048_576, google.inputUsdMicrosPerMillionTokens) +
+    cost(1_048_576 + 65_536, google.outputUsdMicrosPerMillionTokens) +
+    // xAI: reasoning is additive within the model's own 500K envelope.
+    cost(500_000, xai.inputUsdMicrosPerMillionTokens) +
+    cost(500_000, xai.outputUsdMicrosPerMillionTokens);
+
+  const perFire = worstCaseOneAttemptEachModel * (CROSSING_PROFILE.maxAttemptsPerFire / defaultExpectedArms().length);
+  assert.equal(perFire, 252_836_640, 'the committed whole-fire bound in SPEND-BOUND-PROOF.md');
+  assert.equal(CONSERVATIVE_USD_MICROS_PER_ATTEMPT, perFire / CROSSING_PROFILE.maxAttemptsPerFire);
+  // And it is strictly dearer than the prices-v3 figure it replaced, so restoring the old
+  // literal fails here rather than passing as "some number the table produces".
+  assert.ok(CONSERVATIVE_USD_MICROS_PER_ATTEMPT > 27_363_330);
 });
 
 test('the priced-attempt terms are pinned EXACTLY — each drift is a named violation', () => {

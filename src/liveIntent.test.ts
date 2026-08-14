@@ -205,8 +205,8 @@ test('the authorization is the EXACT frozen record: booted identity, pinned caps
   assert.deepEqual(resolution.authorization, {
     cohortId: booted.cohortId,
     participantIds: ROSTER,
-    modelPriceTableVersion: 'prices-v3',
-    modelPriceTableDigest: modelPriceTableDigest('prices-v3'),
+    modelPriceTableVersion: 'prices-v4',
+    modelPriceTableDigest: modelPriceTableDigest('prices-v4'),
     liveOptIn: true,
     observedCredentialedParticipantIds: ROSTER,
     cohortSpendCapUsdMicros: 800_000_000,
