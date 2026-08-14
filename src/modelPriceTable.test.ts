@@ -32,10 +32,12 @@ const PINNED_DIGEST = 'bbd49df2721e6cf654fc9dd9760d4cc45f53d4d25cb8c81e5f6e08128
 const PINNED_DIGEST_V2 = '3d6d47a2427d21429e59094fd9cb9235473206a07b19b62b3292cde605e118c5';
 
 /**
- * Canonical digest of prices-v3 — the guard table the code pins today: v2's token rates plus the
- * per-search web-search fee. Its own INDEPENDENT golden, for the same reason as v2's.
+ * Canonical digest of prices-v3 — the retained replay table: v2 token rates plus search fees.
  */
 const PINNED_DIGEST_V3 = '3b6860a5b2c8dfd0df81f4c2ee4b4436dc962402cd1753ed421f6a502a322b35';
+
+/** Canonical digest of prices-v4 — 2026-08-10 conservative Fast long-context reconciliation. */
+const PINNED_DIGEST_V4 = '5a438d718664527135b39780528e21e7046f0420adb361d10ddb5f9dfe37248b';
 
 /** The exact prices-v1 rates, as a literal, to re-derive the digest independently. */
 const EXPECTED_TABLE = {
@@ -45,11 +47,40 @@ const EXPECTED_TABLE = {
   'grok-4.5': { inputUsdMicrosPerMillionTokens: 2_000_000, outputUsdMicrosPerMillionTokens: 6_000_000 },
 } as const;
 
-/** The exact prices-v3 (guard) rates, as a literal, to re-derive the digest independently. */
+/** The exact retained prices-v3 rates, as a literal, to re-derive independently. */
 const EXPECTED_TABLE_V3 = {
   'gpt-5.6-sol': {
     inputUsdMicrosPerMillionTokens: 12_500_000,
     outputUsdMicrosPerMillionTokens: 60_000_000,
+    searchUsdMicrosPerSearch: 10_000,
+  },
+  'claude-fable-5': {
+    inputUsdMicrosPerMillionTokens: 10_000_000,
+    outputUsdMicrosPerMillionTokens: 50_000_000,
+    searchUsdMicrosPerSearch: 10_000,
+  },
+  'gemini-3.1-pro-preview': {
+    inputUsdMicrosPerMillionTokens: 4_000_000,
+    outputUsdMicrosPerMillionTokens: 18_000_000,
+    searchUsdMicrosPerSearch: 14_000,
+  },
+  'grok-4.5': {
+    inputUsdMicrosPerMillionTokens: 4_000_000,
+    outputUsdMicrosPerMillionTokens: 12_000_000,
+    searchUsdMicrosPerSearch: 5_000,
+  },
+} as const;
+
+/**
+ * The exact prices-v4 (guard) rates, as a literal, to re-derive the digest
+ * independently. Spelled out rather than spread from `EXPECTED_TABLE_V3` for the same
+ * reason the production table is: an expectation derived the same way the code derives
+ * it can only prove the derivation ran, not that it produced these numbers.
+ */
+const EXPECTED_TABLE_V4 = {
+  'gpt-5.6-sol': {
+    inputUsdMicrosPerMillionTokens: 25_000_000,
+    outputUsdMicrosPerMillionTokens: 90_000_000,
     searchUsdMicrosPerSearch: 10_000,
   },
   'claude-fable-5': {
@@ -184,7 +215,7 @@ test('runtime immutability: an adversarial cast cannot mutate, replace, or add a
 test('the exported version tuple is frozen — a casted push cannot forge a known version', () => {
   assert.throws(() => (MODEL_PRICE_TABLE_VERSIONS as unknown as string[]).push('prices-v99'));
   assert.equal(isModelPriceTableVersion('prices-v99'), false);
-  assert.deepEqual([...MODEL_PRICE_TABLE_VERSIONS], ['prices-v1', 'prices-v2', 'prices-v3']); // unchanged state
+  assert.deepEqual([...MODEL_PRICE_TABLE_VERSIONS], ['prices-v1', 'prices-v2', 'prices-v3', 'prices-v4']); // unchanged state
 });
 
 test('prices-v2 content: the RETAINED table still equals the exact conservative upper-tier rates', () => {
@@ -242,8 +273,8 @@ test('prices-v2 digest: UNCHANGED by the v3 addition — evidence priced under i
   assert.notEqual(d, modelPriceTableDigest(MODEL_PRICE_TABLE_VERSION)); // v2 digest != v1 digest
 });
 
-test('prices-v3 (the guard table): token rates equal v2, every row carries a positive search fee, digest is its own golden', () => {
-  const guard = modelPriceTableForVersion(SPEND_GUARD_PRICE_TABLE_VERSION);
+test('prices-v3 replay table: token rates equal v2, every row carries a positive search fee, digest is its own golden', () => {
+  const guard = modelPriceTableForVersion('prices-v3');
   const v2 = modelPriceTableForVersion('prices-v2');
   for (const [id, row] of Object.entries(guard)) {
     // The search fee is the ONLY difference from v2 — a token-rate change would
@@ -259,7 +290,7 @@ test('prices-v3 (the guard table): token rates equal v2, every row carries a pos
   // when a nonzero search count is recorded against it.
   for (const row of Object.values(v2)) assert.equal(row.searchUsdMicrosPerSearch, undefined);
 
-  const d = modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION);
+  const d = modelPriceTableDigest('prices-v3');
   assert.match(d, /^[0-9a-f]{64}$/);
   assert.equal(d, PINNED_DIGEST_V3); // INDEPENDENT golden
   assert.equal(d, sha256Hex(canonicalize(EXPECTED_TABLE_V3))); // re-derives from the rate literal
@@ -267,17 +298,54 @@ test('prices-v3 (the guard table): token rates equal v2, every row carries a pos
   assert.notEqual(d, PINNED_DIGEST);
 });
 
-test('SPEND_GUARD_PRICE_TABLE_VERSION is prices-v3, registered, and distinct from the default stamped version', () => {
-  assert.equal(SPEND_GUARD_PRICE_TABLE_VERSION, 'prices-v3');
+test('prices-v4 guard updates only reachable OpenAI Fast long-context rates and pins its own digest', () => {
+  const guard = modelPriceTableForVersion(SPEND_GUARD_PRICE_TABLE_VERSION);
+  const v3 = modelPriceTableForVersion('prices-v3');
+  assert.deepEqual(guard, EXPECTED_TABLE_V4);
+  assert.equal(guard['gpt-5.6-sol']!.inputUsdMicrosPerMillionTokens, 25_000_000);
+  assert.equal(guard['gpt-5.6-sol']!.outputUsdMicrosPerMillionTokens, 90_000_000);
+  for (const id of Object.keys(EXPECTED_TABLE_V4) as Array<keyof typeof EXPECTED_TABLE_V4>) {
+    assert.equal(guard[id]!.searchUsdMicrosPerSearch, v3[id]!.searchUsdMicrosPerSearch, id);
+    if (id !== 'gpt-5.6-sol') assert.deepEqual(guard[id], v3[id], id);
+  }
+  const digest = modelPriceTableDigest(SPEND_GUARD_PRICE_TABLE_VERSION);
+  assert.equal(digest, PINNED_DIGEST_V4);
+  assert.equal(digest, sha256Hex(canonicalize(EXPECTED_TABLE_V4)));
+  assert.notEqual(digest, PINNED_DIGEST_V3);
+});
+
+test('the guard table is nowhere cheaper than the one it replaces, and is strictly dearer where the tiers compose', () => {
+  // The property this version exists for. A guard rate that moves DOWN can only
+  // underbound, so it is asserted over every model and every rate field rather than
+  // over the one row that changed — a later version that lowers a different row is red
+  // here too, without anyone having to remember this reasoning.
+  const guard = modelPriceTableForVersion(SPEND_GUARD_PRICE_TABLE_VERSION);
+  const prior = modelPriceTableForVersion('prices-v3');
+  for (const [id, row] of Object.entries(guard)) {
+    const was = prior[id]!;
+    assert.ok(row.inputUsdMicrosPerMillionTokens >= was.inputUsdMicrosPerMillionTokens, `${id} input`);
+    assert.ok(row.outputUsdMicrosPerMillionTokens >= was.outputUsdMicrosPerMillionTokens, `${id} output`);
+    assert.ok((row.searchUsdMicrosPerSearch ?? 0) >= (was.searchUsdMicrosPerSearch ?? 0), `${id} search`);
+  }
+  // STRICTLY dearer on the composed row, so restoring v3's OpenAI rates — the exact
+  // defect this fixes — fails here rather than passing as "not cheaper than itself".
+  const openai = guard['gpt-5.6-sol']!;
+  const openaiWas = prior['gpt-5.6-sol']!;
+  assert.ok(openai.inputUsdMicrosPerMillionTokens > openaiWas.inputUsdMicrosPerMillionTokens);
+  assert.ok(openai.outputUsdMicrosPerMillionTokens > openaiWas.outputUsdMicrosPerMillionTokens);
+});
+
+test('SPEND_GUARD_PRICE_TABLE_VERSION is prices-v4, registered, and distinct from the default stamped version', () => {
+  assert.equal(SPEND_GUARD_PRICE_TABLE_VERSION, 'prices-v4');
   assert.equal(isModelPriceTableVersion(SPEND_GUARD_PRICE_TABLE_VERSION), true);
   assert.notEqual(SPEND_GUARD_PRICE_TABLE_VERSION, MODEL_PRICE_TABLE_VERSION); // guard table != default (prices-v1)
 });
 
-test('prices-v2 rows are runtime-immutable (deep-frozen registry)', () => {
+test('guard rows are runtime-immutable (deep-frozen registry)', () => {
   const table = modelPriceTableForVersion(SPEND_GUARD_PRICE_TABLE_VERSION);
   const row = table['gpt-5.6-sol']!;
   assert.throws(() => {
     (row as { inputUsdMicrosPerMillionTokens: number }).inputUsdMicrosPerMillionTokens = 1;
   });
-  assert.equal(table['gpt-5.6-sol']!.outputUsdMicrosPerMillionTokens, 60_000_000);
+  assert.equal(table['gpt-5.6-sol']!.outputUsdMicrosPerMillionTokens, 90_000_000);
 });

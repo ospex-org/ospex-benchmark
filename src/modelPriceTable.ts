@@ -27,7 +27,7 @@ import { deepFreeze } from './freeze.js';
  * These are a dated baseline, not a claim of continuous freshness or exact final
  * billing. Price drift is a conscious `prices-vN` edit plus a manifest re-pin.
  */
-export const MODEL_PRICE_TABLE_VERSIONS = Object.freeze(['prices-v1', 'prices-v2', 'prices-v3'] as const);
+export const MODEL_PRICE_TABLE_VERSIONS = Object.freeze(['prices-v1', 'prices-v2', 'prices-v3', 'prices-v4'] as const);
 export type ModelPriceTableVersion = (typeof MODEL_PRICE_TABLE_VERSIONS)[number];
 
 /** The price-table version the harness stamps on NEW runs. */
@@ -35,16 +35,14 @@ export const MODEL_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v1';
 
 /**
  * The CONSERVATIVE table the runtime spend guard prices against, and the version a
- * billable crossing manifest MUST pin. `prices-v3` keeps `prices-v2`'s token rates —
- * each model's HIGHEST conservatively-reachable published tier (the "price at the
- * highest rate reachable" option), so the derived-actual guard can only ever
- * OVER-estimate real token cost — and adds the per-search fees the declared web-search
- * tool bills (`searchUsdMicrosPerSearch`), so search spend is priced instead of
- * assumed away. `prices-v1` (base tier) and `prices-v2` (no search fees) are retained
- * unchanged for historical replay/validation; the default stamped version stays
- * `prices-v1` so existing manifests/cohortIds do not churn.
+ * billable crossing manifest MUST pin. `prices-v4` keeps v3's search fees and its
+ * non-OpenAI token rates, and raises the OpenAI row: v3 priced the Fast tier and the
+ * long-context tier as alternatives, but a single request can be BOTH, and that
+ * composition is reachable here. Earlier tables remain immutable for replay. The
+ * default stamped version stays `prices-v1` so existing historical manifests/cohortIds
+ * do not churn.
  */
-export const SPEND_GUARD_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v3';
+export const SPEND_GUARD_PRICE_TABLE_VERSION: ModelPriceTableVersion = 'prices-v4';
 
 export function isModelPriceTableVersion(value: string): value is ModelPriceTableVersion {
   return (MODEL_PRICE_TABLE_VERSIONS as readonly string[]).includes(value);
@@ -148,6 +146,63 @@ const MODEL_PRICE_TABLE_V3: ModelPriceTable = {
 };
 
 /**
+ * `prices-v4` — v3's search fees and non-OpenAI token rates unchanged; the OpenAI row
+ * raised to the SERVICE TIER COMPOSED WITH THE CONTEXT TIER, which v3 priced as
+ * alternatives. Reconciled against the published pricing page 2026-08-14, which prints
+ * these `gpt-5.6-sol` rows (input / cached input / cache write / output per million):
+ *   - standard, short context ...... $5 / $0.50 / $6.25 / $30
+ *   - standard, long context ....... $10 / $1 / $12.50 / $45   (the >272K tier)
+ *   - Fast .......................... $10 / $1 / $12.50 / $60
+ * The Fast row is EXACTLY 2× the standard short-context row in all four fields, i.e.
+ * Fast is a multiplier on the tier a request already lands in rather than a fifth set
+ * of absolute rates. The page prints no Fast × long-context row, so the composition is
+ * not settled by the documentation, and the two readings differ:
+ *   - Fast composes with long context → 2× the long row = $20 / $2 / $25 / $90;
+ *   - Fast is unavailable above the long-context threshold → the ceiling stays $12.50
+ *     on the input side and $60 on output, which is what v3 priced.
+ * This table takes the FIRST reading, per the documented policy of adopting the higher
+ * treatment wherever the provider does not state the billing detail. Both terms are
+ * reachable: the dispatch sends up to 1,050,000 input tokens, which is past the
+ * long-context threshold, and no adapter sets `service_tier`, so a project defaulted to
+ * Fast selects it for every request. Note the first term is a property of the BOUND, not
+ * a claim about live prompt sizes: the worst case is taken at the model's full
+ * 1,050,000-token context window, which is past the long-context threshold, so the
+ * composed tier is inside the region the bound has to cover whatever real prompts do.
+ * Under the second reading this row over-estimates by 2×/1.5× and the guard is merely
+ * conservative, which is the direction it is allowed to err in.
+ *
+ * The one input-rate field carries $25 — the highest reachable INPUT-side bucket is the
+ * cache write, not ordinary input, so pricing ordinary input at the cache-write rate is
+ * what keeps every input bucket covered by a single field.
+ *
+ * Written out in full rather than spread from v3: each version is then a self-contained
+ * immutable record, and a future edit to an earlier table cannot silently move this one.
+ * The unchanged rows are pinned to v3's by assertion in the test, not by construction.
+ */
+const MODEL_PRICE_TABLE_V4: ModelPriceTable = {
+  'gpt-5.6-sol': {
+    inputUsdMicrosPerMillionTokens: 25_000_000,
+    outputUsdMicrosPerMillionTokens: 90_000_000,
+    searchUsdMicrosPerSearch: 10_000,
+  },
+  'claude-fable-5': {
+    inputUsdMicrosPerMillionTokens: 10_000_000,
+    outputUsdMicrosPerMillionTokens: 50_000_000,
+    searchUsdMicrosPerSearch: 10_000,
+  },
+  'gemini-3.1-pro-preview': {
+    inputUsdMicrosPerMillionTokens: 4_000_000,
+    outputUsdMicrosPerMillionTokens: 18_000_000,
+    searchUsdMicrosPerSearch: 14_000,
+  },
+  'grok-4.5': {
+    inputUsdMicrosPerMillionTokens: 4_000_000,
+    outputUsdMicrosPerMillionTokens: 12_000_000,
+    searchUsdMicrosPerSearch: 5_000,
+  },
+};
+
+/**
  * The version→table registry, **deep-frozen** so neither the registry, the price
  * tables, nor their rate rows can be mutated at runtime. `prices-v1` therefore
  * denotes exactly one immutable table, and its digest can never go stale relative
@@ -157,6 +212,7 @@ const PRICE_TABLES: Readonly<Record<ModelPriceTableVersion, ModelPriceTable>> = 
   'prices-v1': MODEL_PRICE_TABLE_V1,
   'prices-v2': MODEL_PRICE_TABLE_V2,
   'prices-v3': MODEL_PRICE_TABLE_V3,
+  'prices-v4': MODEL_PRICE_TABLE_V4,
 });
 
 /** The price table for a KNOWN version; throws on an unknown version. */

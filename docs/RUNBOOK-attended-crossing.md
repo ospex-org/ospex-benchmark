@@ -84,7 +84,7 @@ The mechanism satisfying this is in the tree:
       arm, 8 max attempts, $100/attempt reservation, $800 spend cap = the
       one-fire reservation = the canary ceiling, call cap 8, concurrency 4, one
       dispatch per tick, `maxOutputTokens` 16000, provider timeout 300s,
-      conservative guard price table (`prices-v3`) + digest.
+      conservative guard price table (`prices-v4`) + digest.
 
 ## 3. Durable destinations (store + artifacts), with read-back
 
@@ -142,15 +142,15 @@ adapters outside the cohort gate and share the same keys.
 
 ## 6. Pricing reconciliation (same day as the crossing)
 
-The runtime guard prices at the conservative table `prices-v3`
-(`src/modelPriceTable.ts`; token rates identical to `prices-v2`, snapshotted
-2026-07-23, plus the per-search fees snapshotted 2026-08-07). Its job is to only ever
+The runtime guard prices at the conservative table `prices-v4`
+(`src/modelPriceTable.ts`; reconciled 2026-08-14, pricing the OpenAI Fast tier
+composed with the long-context tier, plus the per-search fees). Its job is to only ever
 OVER-estimate. Reconcile it against the providers' CURRENT published pricing
 pages immediately before the crossing:
 
-| model | pinned conservative token rates (identical in prices-v2/v3; input/output per 1M tokens) | source page |
+| model | pinned conservative token rates (prices-v4; input/output per 1M tokens) | source page |
 |---|---|---|
-| `gpt-5.6-sol` | $12.50 / $60 | openai.com API pricing |
+| `gpt-5.6-sol` | $25 / $90 | OpenAI API pricing — Fast (2× standard) applied to the long-context tier; input field carries the cache-write ceiling |
 | `claude-fable-5` | $10 / $50 | Anthropic API pricing |
 | `gemini-3.1-pro-preview` | $4 / $18 | Google AI pricing (long-context tier) |
 | `grok-4.5` | $4 / $12 | x.ai API pricing (long-context tier) |
@@ -203,13 +203,13 @@ Expected sequence — read each stage as it happens:
   roughly $0.02–$0.05 per attempt at the pinned rates, ≈ **$0.25–$0.50 for the
   whole fire**.
 - **The committed conservative worst-case bound** is the one in
-  `docs/SPEND-BOUND-PROOF.md`, at the pinned `prices-v3` rates — note that
+  `docs/SPEND-BOUND-PROOF.md`, at the pinned `prices-v4` rates — note that
   Google `thoughtsTokenCount` and xAI reasoning tokens are ADDITIVE and are NOT
   bounded by `maxOutputTokens` (their bound is the model's own output
   envelope), so the visible-output cap alone does not bound the bill. Per
-  attempt: OpenAI $20.805, Anthropic $56.40, Google $24.248320, xAI $8.00 —
+  attempt: OpenAI $37.77, Anthropic $56.40, Google $24.248320, xAI $8.00 —
   each under the $100 per-attempt reservation — giving a conservative
-  full-fire TOKEN bound (two attempts per model) of **$218.906640**, well
+  full-fire TOKEN bound (two attempts per model) of **$252.836640**, well
   under the $800 reservation ceiling. Search fees are priced on top of these
   figures and are provider-capped only on OpenAI and Anthropic (see
   SPEND-BOUND-PROOF.md, "Web-search fees").
