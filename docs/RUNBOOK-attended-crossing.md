@@ -124,7 +124,7 @@ Both destinations must survive the process and be readable afterwards.
 - [ ] Each key belongs to an account the operator controls, with billing enabled
       and a spending limit the operator has reviewed. The expected invoice is
       well under $1, and the committed conservative worst-case TOKEN bound for
-      the whole fire is ≈$219 (§8; search fees sit on top, and on Google/xAI
+      the whole fire is ≈$253 (§8; search fees sit on top, and on Google/xAI
       they have no pre-dispatch cap) — set provider-side limits with that in
       mind; they are an independent backstop, not part of this protocol.
 - [ ] No key material is ever committed, pasted into the execution log, or

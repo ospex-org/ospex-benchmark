@@ -43,9 +43,12 @@ import type { CohortManifestV1 } from './manifest.js';
 export const OBSERVED_USD_MICROS_PER_ATTEMPT = 46_359;
 
 /** The committed conservative TOKEN worst case per attempt, from
- *  `docs/SPEND-BOUND-PROOF.md` ($218.906640 for a full 8-attempt fire). Search fees sit on
- *  top and are not all bounded before dispatch (see the proof doc). Also projection only. */
-export const CONSERVATIVE_USD_MICROS_PER_ATTEMPT = 27_363_330;
+ *  `docs/SPEND-BOUND-PROOF.md` ($252.836640 for a full 8-attempt fire, at the `prices-v4`
+ *  guard rates). Search fees sit on top and are not all bounded before dispatch (see the
+ *  proof doc). Also projection only. Re-derived from the pinned price table by
+ *  `campaignProfile.test.ts`, so a guard-table change that does not reach this line is a
+ *  failing test rather than a quietly stale projection — which is how it last drifted. */
+export const CONSERVATIVE_USD_MICROS_PER_ATTEMPT = 31_604_580;
 
 export const CAMPAIGN_BOUNDS = deepFreeze({
   /** Exactly pinned, from the single definition of the priced attempt shape. */

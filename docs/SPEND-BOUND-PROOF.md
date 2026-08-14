@@ -64,7 +64,10 @@ Notes on the worst cases that are *not* simply base input + output:
   formerly Priority ($10 / $1 / $12.50 / $60). The Fast row is exactly **2× the standard
   short-context row in all four fields**, so Fast reads as a multiplier on whichever tier the
   request already lands in rather than a fifth set of absolute rates. No Fast × long-context row
-  is printed, and the two readings of that gap differ: composing gives 2× the long row
+  is printed — re-checked 2026-08-14 over four reads of the pricing page, one of which enumerated
+  the Batch and Flex tiers as well, and every read returned Fast with short-context rows only. If
+  that row is published later, this stops being an interpretation and the note should collapse to
+  citing it. The two readings of the gap differ: composing gives 2× the long row
   (**$20 / $2 / $25 / $90**), while a Fast tier unavailable above the threshold would cap the
   input side at $12.50 and output at $60 — which is what `prices-v3` priced. The table takes the
   composing reading, per the conservative-treatment rule below. Both terms are inside the region
@@ -189,8 +192,7 @@ against `total_tokens`, pricing the larger reading when no total discriminates.
   that could invalidate the token table is a versioned `prices-vN` edit plus a manifest re-pin,
   not a silent rate change.
 
-Sources (official provider documentation; token and search-fee pages re-observed 2026-08-14,
-except the xAI per-call search fee — see the caveat on it below the list):
+Sources (official provider documentation; token and search-fee pages re-observed 2026-08-14):
 
 - OpenAI — pricing, priority processing, prompt caching, model card:
   <https://developers.openai.com/api/docs/pricing>,
@@ -205,16 +207,11 @@ except the xAI per-call search fee — see the caveat on it below the list):
   <https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview>,
   <https://ai.google.dev/gemini-api/docs/pricing>,
   <https://ai.google.dev/gemini-api/docs/tokens>
-- xAI — model card, usage tracking:
+- xAI — pricing (token tiers and the Tools Pricing table carrying Web Search at $5 / 1k
+  calls), model card, usage tracking:
+  <https://docs.x.ai/docs/pricing>,
   <https://docs.x.ai/developers/models/grok-4.5>,
   <https://docs.x.ai/developers/model-capabilities/text/usage-tracking>
-
-One gap in the 2026-08-14 pass, recorded rather than papered over: xAI's **token** rates were
-re-read from the official model page, but its **per-call search fee** ($0.005) was not — the live
-search guide carries no pricing, and the figure was only corroborated against third-party
-trackers. It is unchanged from the 2026-08-07 observation and it is the smallest fee in the table,
-so it is carried forward as-is; confirm it against x.ai's own billing page in the pre-crossing
-reconciliation.
 
 Rate values live in `modelPriceTable.ts` (`prices-v4`), pinned by digest in the cohort manifest and
 recomputed at boot. Re-reconcile against current official pricing immediately before any paid crossing.

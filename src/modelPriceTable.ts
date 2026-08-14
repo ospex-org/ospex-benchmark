@@ -155,8 +155,9 @@ const MODEL_PRICE_TABLE_V3: ModelPriceTable = {
  *   - Fast .......................... $10 / $1 / $12.50 / $60
  * The Fast row is EXACTLY 2× the standard short-context row in all four fields, i.e.
  * Fast is a multiplier on the tier a request already lands in rather than a fifth set
- * of absolute rates. The page prints no Fast × long-context row, so the composition is
- * not settled by the documentation, and the two readings differ:
+ * of absolute rates. The page prints no Fast × long-context row — re-checked 2026-08-14
+ * over four reads, one of which also enumerated the Batch and Flex tiers — so the
+ * composition is not settled by the documentation, and the two readings differ:
  *   - Fast composes with long context → 2× the long row = $20 / $2 / $25 / $90;
  *   - Fast is unavailable above the long-context threshold → the ceiling stays $12.50
  *     on the input side and $60 on output, which is what v3 priced.
