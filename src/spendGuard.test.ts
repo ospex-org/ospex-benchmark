@@ -15,10 +15,10 @@ const V2 = SPEND_GUARD_PRICE_TABLE_VERSION;
 const CAP = PROVIDER_ATTEMPT_RESERVATION_USD_MICROS; // $100 = 100_000_000 USD-micros
 const SENT = '2026-07-24T00:00:00.000000+00:00';
 
-// gpt-5.6-sol at prices-v2 is $12.50/M input, $60/M output.
-const UNDER_CAP_USAGE = { prompt_tokens: 100, completion_tokens: 20 }; // 100·12.5 + 20·60 = 2,450 micros
-const AT_CAP_USAGE = { prompt_tokens: 8_000_000, completion_tokens: 0 }; // 8M·12.5 = exactly 100,000,000 == CAP
-const OVER_CAP_USAGE = { prompt_tokens: 8_000_000, completion_tokens: 1 }; // 100,000,000 + 60 = 100,000,060 > CAP
+// gpt-5.6-sol at prices-v4 is $25/M conservative input and $90/M output.
+const UNDER_CAP_USAGE = { prompt_tokens: 100, completion_tokens: 20 }; // 100·25 + 20·90 = 4,300 micros
+const AT_CAP_USAGE = { prompt_tokens: 4_000_000, completion_tokens: 0 }; // 4M·25 = exactly 100,000,000 == CAP
+const OVER_CAP_USAGE = { prompt_tokens: 4_000_000, completion_tokens: 1 }; // 100,000,000 + 90 = 100,000,090 > CAP
 
 function billableArm(usageRaw: unknown, requestAt: string | null = SENT, participantId = 'p1'): GuardArmInput {
   return { participantId, billingClass: 'billable', provider: 'openai', requestedModelId: 'gpt-5.6-sol', attempt: { requestAt, usageRaw }, repair: null };
@@ -80,7 +80,7 @@ test('verdict: the boundary is strictly > — exactly $100 passes, over the cap 
   assert.equal(o?.participantId, 'p1');
   assert.equal(o?.role, 'initial');
   assert.equal(o?.status, 'breach');
-  assert.equal(o?.derivedActualUsdMicros, 100_000_060);
+  assert.equal(o?.derivedActualUsdMicros, 100_000_090);
 });
 
 test('verdict: a billable SENT attempt with no usage is UNKNOWN (never read as zero)', () => {

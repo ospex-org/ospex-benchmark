@@ -19,11 +19,9 @@ ADMINISTRATIVE accounting unit, and its backing splits into two regimes:
   accounting enforces and a tripwire the guard prices against — not a proof that no single call
   can invoice more.
 
-The guard prices real cost against `prices-v3` — `prices-v2`'s token rates (each model's
-**highest conservatively-reachable published tier**, so the proof below holds without tracking
-which context tier a given prompt lands in) plus the per-search fees of the declared web-search
-tool. `prices-v1` (the base/short-context tier) and `prices-v2` (no search fees) are retained for
-historical replay only.
+The guard prices real cost against `prices-v4`: the highest conservatively reachable token rate
+for each model plus the declared web-search fees. It updates OpenAI for current Fast long-context
+pricing; `prices-v1` through `prices-v3` remain immutable for historical replay.
 
 ## Bounding model
 
@@ -33,7 +31,7 @@ For one attempt the conservative cost is
 cost = input_tokens × input_rate + billable_output_tokens × output_rate
 ```
 
-priced at the conservative upper tier (token rates identical in `prices-v2` and `prices-v3`). Two
+priced at the conservative upper tier pinned in `prices-v4`. Two
 facts bound each factor:
 
 - **Input tokens** are bounded by the model's **context window**. The dispatch always sends a finite
@@ -49,22 +47,21 @@ facts bound each factor:
     instead bounded by the model's overall token envelope (there is no separate documented
     thinking-budget contract to rely on), and priced at the output rate.
 
-## Per-model TOKEN worst case (rates identical in prices-v2/v3, observed 2026-07-23)
+## Per-model TOKEN worst case (`prices-v4`, reconciled 2026-08-10)
 
 | Model | Ctx / max out | Tier used (in / out per M) | Worst-case attempt | Headroom to $100 |
 |---|---|---|---|---|
-| `gpt-5.6-sol` (OpenAI) | 1,050,000 / 128,000 | $12.50 / $60 | 1,050,000·$12.50 + 128,000·$60 = **$20.805** | $79.195 |
+| `gpt-5.6-sol` (OpenAI) | 1,050,000 / 128,000 | $25 / $90 | 1,050,000·$25 + 128,000·$90 = **$37.77** | $62.23 |
 | `claude-fable-5` (Anthropic) | 1M / 128K | $10 / $50 (single tier) | 1M·$50 + 128K·$50 = **$56.40** | $43.60 |
 | `gemini-3.1-pro-preview` (Google) | 1,048,576 / 65,536 | $4 / $18 (>200K) | 1,048,576·$4 + (1,048,576 + 65,536)·$18 = **$24.248320** | $75.751680 |
 | `grok-4.5` (xAI) | 500K / — | $4 / $12 (≥200K) | 0.5M·$4 + 0.5M·$12 = **$8.00** | $92.00 |
 
 Notes on the worst cases that are *not* simply base input + output:
 
-- **OpenAI** — output uses the **Priority Processing** rate ($60/M): a project can default requests
-  that omit `service_tier` to Priority, and the unchanged adapter omits it, so Priority is reachable.
-  Input uses **$12.50/M**: the pricing page bills automatic prompt-cache writes at 1.25× the *standard*
-  input ($6.25) but does not bound them in the >272K regime, so the conservative row uses 1.25× the $10
-  long-context input — which also over-covers the $10 long-context and $10 Priority input rates.
+- **OpenAI** — Fast mode (formerly Priority) can be the project default when the adapter omits
+  `service_tier`. The current long-context rates are $20/M input, $25/M cache writes, and $90/M
+  output. The one input-rate field uses the reachable $25/M cache-write maximum, deliberately
+  over-covering ordinary input, while output uses $90/M.
 - **Anthropic** — the derived-actual prices `cache_creation_input_tokens` at the **output** rate
   (cache-write bills 1.25–2× input; the output rate dominates it, so it is the conservative choice).
   The binding worst case treats the entire 1M-token context as cache-creation billed at $50/M, giving
@@ -82,7 +79,7 @@ detect after the fact.
 ## Web-search fees (tools-v1)
 
 Every arm runs the cohort-declared web-search tool, which adds a PER-INVOCATION fee on top of
-the token model above. Those fees are now PRICED INTO the derived actual (`prices-v3`), not
+the token model above. Those fees are PRICED INTO the derived actual (`prices-v4`), not
 assumed away: each attempt carries a billable search count, and the guard multiplies it by the
 provider's published rate. Rates and units as observed 2026-08-07 (each provider bills a
 different unit, so each row prices the unit that provider actually bills):
@@ -115,7 +112,7 @@ The declared `maxSearchesPerAttempt` is therefore enforced provider-side on **tw
 For xAI and Google, no request parameter prevents a single call from running more searches than
 the declared ceiling, so the per-attempt reservation is not a pre-dispatch bound on that call's
 search fees. What the harness does instead: the response's billable search count is priced at
-`prices-v3` into the derived actual, an attempt whose derived actual crosses the reservation is a
+`prices-v4` into the derived actual, an attempt whose derived actual crosses the reservation is a
 BREACH that refuses settlement, and the escalation latch stops the campaign from admitting any
 further dispatch. That is detection-and-halt of an overage that has already been billed — it
 limits how many such calls a campaign can make — the already-admitted fire's attempts
@@ -163,9 +160,9 @@ against `total_tokens`, pricing the larger reading when no total discriminates.
 
 ## Caveats
 
-- These rates are a **dated snapshot** (published token tiers observed 2026-07-23, search fees
-  2026-08-07), not a claim of continuous freshness. Re-reconcile the pinned conservative table
-  (`prices-v3`) against current official pricing **immediately before any paid crossing**.
+- These rates are a **dated snapshot** (reconciled 2026-08-10), not a claim of continuous
+  freshness. Re-reconcile the pinned conservative table (`prices-v4`) against current official
+  pricing **immediately before any paid crossing**.
 - Where official documentation does not explicitly state a billing detail (e.g. that a provider's
   reasoning/thinking tokens bill at the output rate), the guard adopts the **conservative** (higher)
   treatment; the derived-actual over-estimates rather than under-estimates in every such case.
@@ -193,5 +190,5 @@ pages 2026-08-07):
   <https://docs.x.ai/developers/models/grok-4.5>,
   <https://docs.x.ai/developers/model-capabilities/text/usage-tracking>
 
-Rate values live in `modelPriceTable.ts` (`prices-v3`), pinned by digest in the cohort manifest and
+Rate values live in `modelPriceTable.ts` (`prices-v4`), pinned by digest in the cohort manifest and
 recomputed at boot. Re-reconcile against current official pricing immediately before any paid crossing.

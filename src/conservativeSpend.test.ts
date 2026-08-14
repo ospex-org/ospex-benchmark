@@ -19,15 +19,15 @@ import type { ProviderName } from './types.js';
  * round UP, and fail closed to a typed UNKNOWN on any ambiguity — never a sentinel 0.
  */
 
-// The conservative guard table the code pins TODAY ('prices-v3'): prices-v2's token
-// rates unchanged, plus the per-search web-search fee.
+// The conservative guard table the code pins TODAY ('prices-v4'): v3 search fees
+// plus the reconciled OpenAI Fast long-context rate ceiling.
 const GUARD = SPEND_GUARD_PRICE_TABLE_VERSION;
 const V1 = MODEL_PRICE_TABLE_VERSION; // 'prices-v1' — the cheaper base table
 
 // ── Exact per-provider correctness at prices-v2 ────────────────────────────────
 
-test('openai: prices prompt·$12.50 + completion·$60; reasoning is a SUBSET, never added again', () => {
-  // 1490·12.5 + 512·60 = 18,625 + 30,720 = 49,345 micros. Adding reasoning (768·60) would give 64,705.
+test('openai: prices prompt·$25 + completion·$90; reasoning is a SUBSET, never added again', () => {
+  // 1490·25 + 512·90 = 37,250 + 46,080 = 83,330 micros. Adding reasoning again would give 106,370.
   const cost = deriveConservativeActualUsdMicros({
     provider: 'openai',
     requestedModelId: 'gpt-5.6-sol',
@@ -39,8 +39,8 @@ test('openai: prices prompt·$12.50 + completion·$60; reasoning is a SUBSET, ne
       completion_tokens_details: { reasoning_tokens: 256 },
     },
   });
-  assert.equal(cost, 49_345);
-  assert.notEqual(cost, 64_705); // double-counting reasoning would land here
+  assert.equal(cost, 83_330);
+  assert.notEqual(cost, 106_370); // double-counting reasoning would land here
 });
 
 test('xai: reasoning is ADDITIVE — prompt·$4 + (completion + reasoning)·$12', () => {
@@ -154,7 +154,7 @@ test('total-consistency: a reported total that disagrees with the reconstructed 
       priceVersion: GUARD,
       usageRaw: { prompt_tokens: 1490, completion_tokens: 512 },
     }),
-    49_345,
+    83_330,
   );
 });
 
@@ -170,12 +170,12 @@ test('ceilDivUsdMicros rounds a non-divisible numerator UP (floor would under-re
 
 // ── Price identity: the passed version actually drives the rate ─────────────────
 
-test('the pinned price VERSION drives the rate — prices-v1 is cheaper than the conservative upper-tier rates (identical in prices-v2/v3)', () => {
+test('the pinned price VERSION drives the rate — prices-v1 is cheaper than the prices-v4 guard', () => {
   const shape = { prompt_tokens: 1490, completion_tokens: 512, total_tokens: 2002 } as const;
   const v1 = deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: V1, usageRaw: { ...shape } });
   const v2 = deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: GUARD, usageRaw: { ...shape } });
   assert.equal(v1, 22_810); // 1490·5 + 512·30
-  assert.equal(v2, 49_345); // 1490·12.5 + 512·60
+  assert.equal(v2, 83_330); // 1490·25 + 512·90
   assert.ok(v2 > v1, 'the guard version must never price below prices-v1');
 });
 
@@ -334,9 +334,9 @@ test('xAI/Google: an absent additive bucket WITHOUT a corroborating total is UNK
   );
 });
 
-test('openai fractional input ($12.50/M) makes the ceiling reachable end-to-end: 1 prompt token → 13 micros (floor would be 12)', () => {
+test('historical prices-v3 fractional input ($12.50/M) still replays with ceiling division', () => {
   assert.equal(
-    deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: GUARD, usageRaw: { prompt_tokens: 1, completion_tokens: 0 } }),
+    deriveConservativeActualUsdMicros({ provider: 'openai', requestedModelId: 'gpt-5.6-sol', priceVersion: 'prices-v3', usageRaw: { prompt_tokens: 1, completion_tokens: 0 } }),
     13, // 1 · 12,500,000 / 1,000,000 = 12.5 → ceil 13
   );
 });
@@ -380,9 +380,9 @@ test('PROVIDER_BY_MODEL matches the authenticated arm roster exactly (no drift)'
 
 // ── Responses-API usage shapes (the live openai/xai adapters since web search) ─
 
-test('openai Responses shape: prices input·$12.50 + output·$60; reasoning stays a subset; legacy chat shape still prices (old evidence)', () => {
+test('openai Responses shape: prices input·$25 + output·$90; reasoning stays a subset; legacy chat shape still prices', () => {
   // Same counts as the chat-shape case above, under the Responses field names:
-  // 1490·12.5 + 512·60 = 49,345 micros — identical, and reasoning never re-added.
+  // 1490·25 + 512·90 = 83,330 micros, and reasoning is never re-added.
   const responsesShape = deriveConservativeActualUsdMicros({
     provider: 'openai',
     requestedModelId: 'gpt-5.6-sol',
@@ -395,7 +395,7 @@ test('openai Responses shape: prices input·$12.50 + output·$60; reasoning stay
       output_tokens_details: { reasoning_tokens: 256 },
     },
   });
-  assert.equal(responsesShape, 49_345);
+  assert.equal(responsesShape, 83_330);
   // An inconsistent Responses total fails closed (accounting must reconcile).
   assert.throws(
     () =>
@@ -535,7 +535,7 @@ test('google with grounding: toolUsePromptTokenCount prices ADDITIVELY at the in
 // ── Web-search fees: priced, fail-closed on an unknown count ──────────────────
 
 test('search fees are PRICED into the derived actual, per provider, at the pinned rate', () => {
-  // openai $0.01/call: token cost 49,345 + 3 × 10,000 = 79,345.
+  // openai $0.01/call: token cost 83,330 + 3 × 10,000 = 113,330.
   assert.equal(
     deriveConservativeActualUsdMicros({
       provider: 'openai',
@@ -544,7 +544,7 @@ test('search fees are PRICED into the derived actual, per provider, at the pinne
       usageRaw: { input_tokens: 1490, output_tokens: 512, total_tokens: 2002 },
       searchCount: 3,
     }),
-    49_345 + 30_000,
+    83_330 + 30_000,
   );
   // google $0.014/query — the unit is the executed QUERY, not the prompt:
   // 1465·4 + (471+305)·18 = 19,828 tokens + 2 × 14,000 = 47,828.
