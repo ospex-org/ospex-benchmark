@@ -147,9 +147,9 @@ export async function runScoreCli(
   const { fetchCloses, printLine, printError } = deps;
   const loaded = loadDotEnv();
   const options = parseArgs(argv, printLine);
-  printLine(
-    `ospex-benchmark scorer — reference-closing CLV — ${SCORING_POLICY_VERSION} — label SMOKE_V0_NOT_A_COHORT`,
-  );
+  // No label in this banner: it prints before the run file is read, and the
+  // label is the RUN's fact — it joins the run line below once it is known.
+  printLine(`ospex-benchmark scorer — reference-closing CLV — ${SCORING_POLICY_VERSION}`);
   if (loaded.length > 0) {
     printLine(`loaded ${loaded.length} env var(s) from .env: ${loaded.join(', ')}`);
   }
@@ -180,7 +180,8 @@ export async function runScoreCli(
     throw error;
   }
   printLine(
-    `run ${run.runId}: ${run.games.size} games, ${run.armResponses.length} arm-game responses, ` +
+    `run ${run.runId} (label ${run.label}): ${run.games.size} games, ` +
+      `${run.armResponses.length} arm-game responses, ` +
       `${run.picks.length} picks (${run.picks.filter((p) => p.kind === 'model').length} model, ` +
       `${run.picks.filter((p) => p.kind === 'baseline').length} baseline)`,
   );

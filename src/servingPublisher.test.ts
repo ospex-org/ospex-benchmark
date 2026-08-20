@@ -12,6 +12,7 @@ import {
   publishRunArtifact,
   publishScoredArtifact,
   publishScores,
+  unpublishedCount,
 } from './servingPublisher.js';
 import {
   parseScoredArtifact,
@@ -778,6 +779,8 @@ function scoredArtifactLines(
     cohortId: 'smoke-v0-2026-08-19', slateDate: '2026-08-19', sourceMode: 'live',
     scoredAt: '2026-08-20T04:00:00.000Z', scoringPolicyVersion: 'scoring-v0.6.0',
     integrityVerified: true,
+    picks: 2 + (over.extraGames?.length ?? 0),
+    participantScorecards: 0,
     ladder: { version: 'TOTALS_V1_PROVISIONAL', parameterVersion: 'retrosheet-2023-25-v1' },
     ...over.meta,
   };
@@ -857,6 +860,24 @@ test('a scored artifact the gate refuses reaches the port not at all', async () 
   assert.equal(port.calls.length, 0, 'nothing may be sent from a refused artifact');
 });
 
+test('a TRUNCATED scored artifact refuses before anything is sent — the CLI turns this into exit 1', async () => {
+  // The review reproduction one tier up: meta declares more picks than the
+  // file carries. Nothing may reach the port, and the summary must be the
+  // gateRefusal shape `unpublishedCount` counts as a failure — which is what
+  // makes `yarn project:scores` and `yarn score --publish` exit nonzero on it.
+  const lines = scoredArtifactLines();
+  const file = writeScoredArtifact([lines[0]!, lines[1]!]); // meta declares 2, carries 1
+  const port = new RecordingPort();
+  const { log } = collector();
+  const summary = await publishScoredArtifact(port, file, log);
+  assert.match(summary.gateRefusal ?? '', /declares picks = 2 but carries 1/);
+  assert.equal(port.calls.length, 0, 'nothing may be sent from a truncated artifact');
+  assert.ok(
+    unpublishedCount(summary, file, collector().log) > 0,
+    'the shared failure taxonomy must count a truncated artifact, so the CLIs exit nonzero',
+  );
+});
+
 test('an unreadable scored artifact is a refusal, not a crash', async () => {
   const port = new RecordingPort();
   const summary = await publishScoredArtifact(port, join(tempDir('serving-scored-'), 'gone.ndjson'), collector().log);
@@ -881,29 +902,47 @@ test('a refused score is counted and logged; a duplicate counts as recovery', as
 });
 
 test('a score port that never settles cannot hold the command open, and says how to finish', async () => {
-  // Six picks: one batch of four that burns the whole deadline against a port
-  // that never answers, and a second batch the spent budget must TURN AWAY —
-  // the abandonment is only observable when there is work left to abandon.
+  // DETERMINISTIC, by construction rather than by margin. The first version
+  // asserted a 4-unavailable / 2-abandoned split with real timers around a
+  // real 100ms expiry, and a review measured it landing 6/0 under full-suite
+  // load twice while passing 20/20 in isolation — whether the last batch
+  // timer fires before or after the expiry read is a sub-millisecond
+  // scheduler race, and an assertion sitting on it flips under load.
+  //
+  // The clock is injected and ADVANCES A FIXED STEP PER READ, so every
+  // admit/abandon decision is a pure function of the nowMs call sequence —
+  // and that sequence is fixed: batch callbacks start synchronously in array
+  // order, each reading spent() then slice() before its first await. With
+  // step 100 and deadline 500: the ctor reads 100 (expiry 600); item one
+  // reads spent@200/slice@300 and item two spent@400/slice@500 — admitted;
+  // items three and four read spent@600 and spent@700 — abandoned MID-BATCH;
+  // batch two reads spent@800/@900 — abandoned. Exactly 2 unavailable and
+  // 4 abandoned on any scheduler, and the mid-batch crossing pins the
+  // original point harder: the budget binds every WRITE, not every batch.
   const file = writeScoredArtifact(scoredArtifactLines({
     extraGames: ['game-3', 'game-4', 'game-5', 'game-6'],
   }));
   const gate = publishableScoredRun(parseScoredArtifact(readFileSync(file, 'utf8')));
   assert.ok(gate.publishable);
   if (!gate.publishable) return;
+  const scores = projectScoredRun(gate.header, gate.decisions, { sourcePath: basename(file), sourceSha256: null });
   const hanging = { publishScore: () => new Promise<never>(() => undefined) } as unknown as BenchmarkServingPort;
   const { log, errors } = collector();
+  let fake = 0;
   const started = performance.now();
-  const summary = await publishScores(
-    hanging,
-    projectScoredRun(gate.header, gate.decisions, { sourcePath: basename(file), sourceSha256: null }),
-    log,
-    { deadlineMs: 100, perWriteTimeoutMs: 400 },
-  );
+  const summary = await publishScores(hanging, scores, log, {
+    nowMs: () => (fake += 100),
+    deadlineMs: 500,
+    perWriteTimeoutMs: 50,
+  });
   const elapsed = performance.now() - started;
-  // Bounded away from the rival: the per-write cap alone would take ~800ms
-  // (two batches at 400ms); the deadline ends it at ~100ms.
-  assert.ok(elapsed < 400, `took ${Math.round(elapsed)}ms; the per-write cap alone allows 800ms`);
-  assert.equal(summary.rejected['unavailable'], 4, JSON.stringify(summary));
+  assert.ok(elapsed < 10_000, `the admitted writes' real 50ms timers still bound this: ${Math.round(elapsed)}ms`);
+  assert.equal(summary.rejected['unavailable'], 2, JSON.stringify(summary));
+  // Every row accounted for — admitted-and-unavailable plus abandoned is the
+  // whole artifact — and the recovery instruction rides with the abandonment.
+  const abandoned = /(\d+) write\(s\) abandoned/.exec(summary.skipped.join('\n'))?.[1];
+  assert.equal(Number(abandoned), 4, `abandonment is reported exactly: ${summary.skipped.join(' | ')}`);
+  assert.equal((summary.rejected['unavailable'] ?? 0) + Number(abandoned), scores.length);
   assert.ok(
     [...summary.skipped, ...errors].some((line) => line.includes('Republish this scored artifact')),
     `the recovery instruction names the scored artifact: ${errors.join(' | ')}`,
@@ -933,14 +972,24 @@ test('the scores DEFAULT deadline still binds when the wall clock runs backwards
       perWriteTimeoutMs: 80,
     });
     const elapsed = performance.now() - started;
-    // The same margin discipline as the run-path sibling: a correct build ends
-    // at ~150ms plus timer jitter, so the exclusion bound must sit far enough
-    // above that a slow scheduler cannot flip the verdict — rival/2 with a
-    // rival of at least 600ms, not a bound a healthy run brushes against.
-    const rival = 80 * Math.ceil(scores.length / 4);
-    assert.ok(rival >= 600, `the artifact is too small to discriminate: rival bound ${rival}ms`);
-    assert.ok(elapsed < rival / 2, `took ${Math.round(elapsed)}ms; the per-write cap alone allows ${rival}ms`);
-    assert.ok(summary.skipped.some((reason) => reason.includes('abandoned')));
+    // LOAD-ROBUST DISCRIMINATION, not a timing margin. Under the DEFAULT
+    // monotonic clock, eight sequential batches of real >=80ms timers cannot
+    // fit inside the 150ms deadline, so SOME write is always abandoned —
+    // however slow the scheduler, later batches only start later, which only
+    // abandons more. Under the mutant (a default readable from Date.now,
+    // which this test drives backwards), the budget never expires: all 32
+    // writes are admitted and none is ever abandoned. The two assertions
+    // below are therefore true on any scheduler for the real build and false
+    // by construction for the mutant, with no elapsed-time margin to flip
+    // under suite load.
+    assert.ok(elapsed < 10_000, `bounded, took ${Math.round(elapsed)}ms`);
+    const abandoned = /(\d+) write\(s\) abandoned/.exec(summary.skipped.join('\n'))?.[1];
+    assert.ok(abandoned !== undefined && Number(abandoned) >= 1,
+      `the deadline abandoned something, with its recovery line: ${summary.skipped.join(' | ')}`);
+    // Every row accounted for, whatever split the scheduler produced.
+    assert.equal((summary.rejected['unavailable'] ?? 0) + Number(abandoned), scores.length);
+    assert.ok((summary.rejected['unavailable'] ?? 0) < scores.length,
+      'a build whose budget never expires marks every write unavailable and abandons none');
   } finally {
     Date.now = realNow;
   }

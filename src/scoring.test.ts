@@ -1420,7 +1420,7 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
 test('the scoring policy version is pinned to its literal value', () => {
   // A bump must be a conscious edit HERE too. 'scoring-v0.1.0' is reserved
   // for pre-stamp output by definition and must never be emitted.
-  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.6.0');
+  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.6.1');
 });
 
 test('every scored record type is stamped with the scoring policy version', () => {
@@ -3513,6 +3513,30 @@ test('the scored artifact the REAL writer emits passes the scores publisher, end
   // The premise the spot-check rides on: both polarities really occurred.
   assert.ok(scoredSeen > 0, 'the fixture produced at least one scored pick');
   assert.ok(refusedSeen > 0, 'and at least one refused pick');
+});
+
+test('scored records carry the SOURCE RUN label, not a constant', () => {
+  // Every run file today carries SMOKE_V0_NOT_A_COHORT, which is exactly why
+  // a hardcoded label survived every other case in this suite — fixture and
+  // hardcode coincide, so no assertion could tell them apart. This run's
+  // parsed label is overridden to a value no constant matches, and every
+  // emitted record type must follow it. (Whether a run FILE's records agree
+  // on one label is verifyRunIntegrity's job; this pins the scorer's binding
+  // of its output to whatever that verified label is.)
+  const { lines } = fixtureRun();
+  const run = { ...parseRunRecords(lines), label: 'CANONICAL-2027-W1' };
+  const scored = scoreRun(run, [driftedClose('moneyline', 0)], TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const records = scoredRecords(run, scored, stats, '2026-07-13T04:00:00.000Z', TEST_LADDER);
+  assert.ok(records.length > 2, 'meta, decisions and scorecards are all present');
+  for (const record of records) {
+    assert.equal(record['label'], 'CANONICAL-2027-W1', String(record['recordType']));
+  }
+  // The scorecard header renders the same run fact — and the smoke-specific
+  // shakedown prose must not follow a label that is not the smoke label.
+  const markdown = buildScorecardMarkdown(run, scored, stats, '2026-07-13T04:00:00.000Z', TEST_LADDER);
+  assert.match(markdown, /\*\*Label: `CANONICAL-2027-W1`\*\*/);
+  assert.doesNotMatch(markdown, /pipeline shakedown/);
 });
 
 test('--publish publishes the file just written, through the injected serving seams', async () => {

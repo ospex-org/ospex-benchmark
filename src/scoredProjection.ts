@@ -51,6 +51,11 @@ const scoredRunMetaSchema = z
     scoredAt: z.string().min(1),
     scoringPolicyVersion: z.string().min(1),
     integrityVerified: z.boolean(),
+    // The artifact's own declared record counts. `.int()` refuses the
+    // Infinity that `1e400` parses to, and the gate holds the file to these
+    // numbers — a truncated artifact is caught disagreeing with itself.
+    picks: z.number().int().nonnegative(),
+    participantScorecards: z.number().int().nonnegative(),
     ladder: z
       .object({
         version: z.string().min(1),
@@ -213,6 +218,26 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
     return no('the artifact does not claim integrityVerified, so the scorer did not write it');
   }
   if (!publishableCohortId(meta.cohortId)) return no('cohortId is outside the published namespace');
+
+  // The file held to its OWN declared counts, on the raw record list — the
+  // same cross-check the run artifact's canonical reader performs, for the
+  // same measured reason: cutting trailing records otherwise turns a partial
+  // pass into one that publishes cleanly, exits zero, and binds every row to
+  // the truncated file's source_sha256 forever. Both counts, because
+  // source_sha256 binds the WHOLE file: scorecards are never projected, but a
+  // file missing them is not the canonical record its rows would cite.
+  for (const [recordType, declared, field] of [
+    ['scored_decision', meta.picks, 'picks'],
+    ['participant_scorecard', meta.participantScorecards, 'participantScorecards'],
+  ] as const) {
+    const carried = records.filter((record) => record['recordType'] === recordType).length;
+    if (carried !== declared) {
+      return no(
+        `the artifact declares ${field} = ${declared} but carries ${carried} ${recordType} ` +
+          'record(s) — truncated, spliced, or not the scorer\'s output',
+      );
+    }
+  }
 
   const decisions: ScoredDecisionRecord[] = [];
   const seen = new Set<string>();

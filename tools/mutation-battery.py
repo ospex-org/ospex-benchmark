@@ -716,6 +716,26 @@ MUTANTS = [
      '                 s.devig_method            is distinct from input.devig_method,',
      '                 s.devig_method            is distinct from input.ladder_version,',
      ['src/servingStore.test.ts']),
+    # --- The second review hold: truncation, and the label binding -----------
+    # A truncated artifact must be caught by the file disagreeing with its own
+    # declared counts; disabling the comparison republishes the review's
+    # reproduction (meta declares 2 picks, file carries 1) as a clean pass.
+    ('M121-truncated-artifact-publishes', 'src/scoredProjection.ts',
+     '    if (carried !== declared) {',
+     '    if (false) {',
+     ['src/scoredProjection.test.ts', 'src/servingPublisher.test.ts']),
+    # The scorer must bind its output to the SOURCE RUN's label. Hardcoding
+    # the constant back reproduces the shipped defect exactly — and survives
+    # every fixture whose run label IS the constant, which is all of them
+    # except the one regression test written to sit where they differ.
+    ('M122-scored-label-minted-not-carried', 'src/scoring.ts',
+     ('    // here survived — a latent misbinding, caught in review.\n    label: run.label,',
+      "      recordType: 'scored_decision',\n      label: run.label,",
+      "      recordType: 'participant_scorecard',\n      label: run.label,"),
+     ("    // here survived — a latent misbinding, caught in review.\n    label: 'SMOKE_V0_NOT_A_COHORT',",
+      "      recordType: 'scored_decision',\n      label: 'SMOKE_V0_NOT_A_COHORT',",
+      "      recordType: 'participant_scorecard',\n      label: 'SMOKE_V0_NOT_A_COHORT',"),
+     ['src/scoring.test.ts']),
 ]
 
 

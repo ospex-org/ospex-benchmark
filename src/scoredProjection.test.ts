@@ -34,9 +34,10 @@ function meta(over: Record<string, unknown> = {}): JsonRecord {
     scoredAt: '2026-08-20T04:00:00.000Z',
     scoringPolicyVersion: 'scoring-v0.6.0',
     integrityVerified: true,
+    picks: 1,
+    participantScorecards: 0,
     metric: 'reference-closing CLV',
     ladder: { version: 'TOTALS_V1_PROVISIONAL', parameterVersion: 'retrosheet-2023-25-v1', k: 8.101 },
-    picks: 2,
     ...over,
   };
 }
@@ -179,7 +180,7 @@ function scorecard(over: Record<string, unknown> = {}): JsonRecord {
 }
 
 test('a coherent scorecard record is tolerated and never projected', () => {
-  const gate = gateOf([meta(), decision(), scorecard()]);
+  const gate = gateOf([meta({ participantScorecards: 1 }), decision(), scorecard()]);
   assert.equal(gate.publishable, true);
   if (gate.publishable) assert.equal(gate.decisions.length, 1);
 });
@@ -192,14 +193,14 @@ test('a scorecard from another pass refuses the file — it is part of what sour
     ['scoredAt', '2026-08-21T04:00:00.000Z'],
   ] as const) {
     assert.match(
-      reasonOf([meta(), decision(), scorecard({ [field]: value })]),
+      reasonOf([meta({ participantScorecards: 1 }), decision(), scorecard({ [field]: value })]),
       new RegExp(`participant_scorecard record 3 disagrees with scored_run_meta on ${field}`),
       field,
     );
   }
   const legacy = scorecard();
   delete (legacy as Record<string, unknown>)['scoredAt'];
-  assert.match(reasonOf([meta(), decision(), legacy]), /participant_scorecard record 3 does not match/);
+  assert.match(reasonOf([meta({ participantScorecards: 1 }), decision(), legacy]), /participant_scorecard record 3 does not match/);
 });
 
 test('a refusal reason beside a live CLV value refuses the file — the pair the scorer never emits', () => {
@@ -215,7 +216,7 @@ test('a refusal reason beside a live CLV value refuses the file — the pair the
   }
   // Both legitimate polarities still gate: refused-with-nulls, and value-with-no-reason.
   headerOf([
-    meta(),
+    meta({ picks: 2 }),
     decision({ primaryClvPct: null, marginAdjustedClvPct: null, unscoredReason: 'close_missing' }),
     decision({ gameId: 'game-2' }),
   ]);
@@ -240,13 +241,15 @@ test('two rows claiming one (participant, game, market) refuse the file as ambig
   // Different values on purpose: whichever row a keep-the-last reader kept
   // would look internally consistent, which is exactly why the file must not
   // be read at all.
+  // picks: 2, so the declared-count check agrees and the duplicate KEY is the
+  // only thing that can refuse — the wrong-reason trap, avoided on purpose.
   assert.match(
-    reasonOf([meta(), decision({ primaryClvPct: 1 }), decision({ primaryClvPct: 2 })]),
+    reasonOf([meta({ picks: 2 }), decision({ primaryClvPct: 1 }), decision({ primaryClvPct: 2 })]),
     /two scored_decision records claim lab-alpha \/ game-1 \/ moneyline/,
   );
   // The same pick identity fields varied one at a time are all distinct picks.
   headerOf([
-    meta(),
+    meta({ picks: 4 }),
     decision(),
     decision({ participantId: 'lab-beta' }),
     decision({ gameId: 'game-2' }),
@@ -255,7 +258,34 @@ test('two rows claiming one (participant, game, market) refuse the file as ambig
 });
 
 test('an artifact with no scored decisions is refused, not silently published as nothing', () => {
-  assert.match(reasonOf([meta()]), /no scored decisions/);
+  assert.match(reasonOf([meta({ picks: 0 })]), /no scored decisions/);
+});
+
+test('a TRUNCATED artifact is refused — the file is held to its own declared counts', () => {
+  // The review reproduction: meta declares two picks, the file carries one.
+  // Without the count check this gated publishable, published a partial pass,
+  // exited zero, and bound the row to the truncated file's sha forever.
+  assert.match(
+    reasonOf([meta({ picks: 2 }), decision()]),
+    /declares picks = 2 but carries 1 scored_decision/,
+  );
+  // The mirror: an extra decision the meta never declared. DISTINCT pick keys
+  // on purpose — with a duplicate key the uniqueness rule would refuse first
+  // and this case would pass for the wrong reason.
+  assert.match(
+    reasonOf([meta({ picks: 1 }), decision(), decision({ gameId: 'game-2' })]),
+    /declares picks = 1 but carries 2 scored_decision/,
+  );
+  // And the scorecard half: never projected, but part of the file every row's
+  // source_sha256 binds — a file missing them is not the canonical record.
+  assert.match(
+    reasonOf([meta({ participantScorecards: 1 }), decision()]),
+    /declares participantScorecards = 1 but carries 0 participant_scorecard/,
+  );
+  assert.match(
+    reasonOf([meta(), decision(), scorecard()]),
+    /declares participantScorecards = 0 but carries 1 participant_scorecard/,
+  );
 });
 
 test('an older scored format is refused with a re-score instruction, not guessed at', () => {
@@ -303,7 +333,7 @@ test('a scored pick maps onto the score row, field by field', () => {
 test('the close columns follow the SIDE — away selects away, home selects home', () => {
   // The asymmetric fixture is what gives this test teeth: 2.05 !== 1.87.
   const [away, home] = projected([
-    meta(),
+    meta({ picks: 2 }),
     decision({ side: 'away' }),
     decision({ gameId: 'game-2', side: 'home', selection: 'Home Team' }),
   ]);
@@ -325,7 +355,7 @@ test('a pick with no captured close projects null close columns, not zeros', () 
 
 test('refusal is the equivalence the schema CHECK states, in both directions', () => {
   const [scored, refused] = projected([
-    meta(),
+    meta({ picks: 2 }),
     decision(),
     decision({
       gameId: 'game-2',
@@ -342,7 +372,7 @@ test('refusal is the equivalence the schema CHECK states, in both directions', (
 
 test('heldOutOfPrimary is the negation of the artifact stratum verdict, in both directions', () => {
   const [inStratum, heldOut] = projected([
-    meta(),
+    meta({ picks: 2 }),
     decision({ inPrimaryStratum: true, scheduleChanged: false }),
     decision({ gameId: 'game-2', inPrimaryStratum: false, scheduleChanged: true }),
   ]);
@@ -371,7 +401,7 @@ test('a NON-DEFAULT label and runId thread through — the default-valued fixtur
 });
 
 test('every row rides the run label and runId — the eligibility handle and the run binding', () => {
-  const rows = projected([meta(), decision(), decision({ gameId: 'game-2' })]);
+  const rows = projected([meta({ picks: 2 }), decision(), decision({ gameId: 'game-2' })]);
   for (const row of rows) {
     assert.equal(row.label, 'SMOKE_V0_NOT_A_COHORT');
     assert.equal(row.runId, 'run-1');
