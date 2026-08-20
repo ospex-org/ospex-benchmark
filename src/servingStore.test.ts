@@ -1480,3 +1480,35 @@ test('every score fact except pass provenance is drift-compared', () => {
     assert.ok(columnCamels.has(name), `drift compares '${name}', which the insert does not carry`);
   }
 });
+
+test('every drift NAME pairs with the comparison of ITS OWN column, positionally', () => {
+  // The set test above proves the right names exist; this proves each name sits
+  // beside a flag comparing the column it names — s.<col> against input.<col>.
+  // Without it, `'score.label'` could label a comparison of two other columns
+  // (or of s.label against input.refusal_reason) and every green would stand:
+  // the arrays stay parallel, the set stays right, and the misattributed arm
+  // reports the wrong field or none. The conformance suite drives every arm
+  // behaviorally; this is the no-database half of the same pin.
+  const sql = SERVING_STATEMENTS.score;
+  const driftStart = sql.indexOf("array['score.");
+  assert.notEqual(driftStart, -1);
+  const namesEnd = sql.indexOf(']', driftStart);
+  const names = [...sql.slice(driftStart, namesEnd).matchAll(/'score\.([^']+)'/g)].map((m) => m[1]!);
+  const flagsStart = sql.indexOf('array[', namesEnd);
+  const flagsEnd = sql.indexOf(']\n         ) as t(f, differs)', flagsStart);
+  assert.notEqual(flagsEnd, -1, 'the flags array terminator parses');
+  const flags = sql
+    .slice(flagsStart + 'array['.length, flagsEnd)
+    .split(',\n')
+    .map((flag) => flag.trim().replace(/,$/, ''));
+  assert.equal(flags.length, names.length, 'one flag per name');
+  const snake = (camel: string): string => camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+  for (const [index, name] of names.entries()) {
+    const column = snake(name);
+    assert.match(
+      flags[index]!,
+      new RegExp(`^s\\.${column}\\s+is distinct from input\\.${column}$`),
+      `'score.${name}' must label the comparison of ${column} on both sides; got: ${flags[index]}`,
+    );
+  }
+});

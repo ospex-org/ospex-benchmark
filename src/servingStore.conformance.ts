@@ -50,7 +50,7 @@ import { Client, Pool } from 'pg';
 import { pgStoreQuery } from './store/atomicStore.js';
 import { pgStoreTransactor } from './store/campaignTickJournal.js';
 import { resolveBenchmarkWriterConnection } from './benchmarkServingConfig.js';
-import { REQUIRED_SERVING_CAPABILITY } from './benchmarkServingClient.js';
+import { SCORES_SERVING_CAPABILITY } from './benchmarkServingClient.js';
 import { SERVING_STATEMENTS, SqlBenchmarkServingPort } from './servingStore.js';
 import {
   CONFIGURATION_DIGEST_VERSION,
@@ -59,7 +59,7 @@ import {
 } from './participantConfiguration.js';
 import type { ParticipantConfiguration } from './participantConfiguration.js';
 import type {
-  ArmAttempt, AttemptFacts, DecisionSeal, ParticipantFacts, PublishOutcome, RunFacts,
+  ArmAttempt, AttemptFacts, DecisionScore, DecisionSeal, ParticipantFacts, PublishOutcome, RunFacts,
 } from './servingStore.js';
 import { sha256Hex } from './canonical.js';
 import { loadLadderParams } from './ladder.js';
@@ -891,16 +891,20 @@ async function main(): Promise<void> {
       closeLine: null, lineMovementFavorable: null, scoredAt: '2026-08-10T04:00:00.000Z',
       source: NO_SOURCE,
     };
-    expect(await port.publishScore({ ...base, scoringPolicyVersion: 'v6', economicClvPct: 1 }),
-      'published', 'v6');
+    expect(await port.publishScore({
+      ...base, scoringPolicyVersion: 'v6', economicClvPct: 1,
+      source: { sourcePath: 'first.ndjson', sourceSha256: sha256Hex('first-pass') },
+    }), 'published', 'v6');
     // A replay of the same pass — same values, and the pass provenance may
     // differ freely: a regenerated scored file carries a fresh timestamp and a
     // fresh sha over identical scores, and republishing it is the recovery
-    // path, not a disagreement.
+    // path, not a disagreement. All THREE provenance fields differ here, each
+    // non-null against non-null, so each one's exclusion from the drift
+    // comparison is individually load-bearing in this expect.
     expect(await port.publishScore({
       ...base, scoringPolicyVersion: 'v6', economicClvPct: 1,
       scoredAt: '2026-08-11T09:00:00.000Z',
-      source: { sourcePath: 'regenerated.ndjson', sourceSha256: null },
+      source: { sourcePath: 'regenerated.ndjson', sourceSha256: sha256Hex('second-pass') },
     }), 'duplicate', 'same version, same values, fresh pass provenance');
     // The SAME policy version claiming a DIFFERENT value is a contradiction,
     // never a benign repeat: the writer holds no UPDATE, so whichever row is
@@ -940,6 +944,57 @@ async function main(): Promise<void> {
     assert.equal(rows[0]!['scores'], 2, 'both scores are retained');
     assert.equal(rows[0]!['first_score'], '1.000000', 'the superseded score was NOT overwritten');
     assert.deepEqual(rows[0]!['reasons'], { no_close: 1 }, 'the jsonb histogram round-tripped');
+  });
+
+  await check('EVERY drift-compared score fact reddens on its own, named exactly', async () => {
+    // The unit tier proves each drift NAME sits beside the comparison of its
+    // own column; this drives every ARM against real PostgreSQL — for each
+    // fact, a base row and a same-version republish differing in ONLY that
+    // fact, which must come back `contradiction` naming exactly that field.
+    // Without it, thirteen of the fifteen arms would be pinned by a string.
+    const cohortId = cohortName('driftarms');
+    const decision = { cohortId, participantId: `${cohortId}-alpha`, gameId: 'game-1', market: 'moneyline' as const };
+    await port.publishAttempt(armAttempt(cohortId));
+    await port.sealDecision(decisionSeal(cohortId));
+    const base = {
+      decision, runId: `${cohortId}-run`, label: 'L1', economicClvPct: 1.25,
+      marginAdjustedClvPct: null, devigMethod: null, ladderVersion: null,
+      ladderParamVersion: null, refused: false, refusalReason: null, scheduleChanged: null,
+      heldOutOfPrimary: null, closeDecimalSelected: null, closeDecimalOpposing: null,
+      closeLine: null, lineMovementFavorable: null, scoredAt: '2026-08-10T04:00:00.000Z',
+      source: NO_SOURCE,
+    };
+    // Every mutation flips exactly one compared fact — except the refusal
+    // pair, which the client-side equivalence forces to move together; the
+    // statement reports the alphabetically first of its drift labels.
+    const arms: Array<[string, Partial<DecisionScore>, string]> = [
+      ['label', { label: 'L2' }, 'score.label'],
+      ['economicClvPct', { economicClvPct: 9.5 }, 'score.economicClvPct'],
+      ['marginAdjustedClvPct', { marginAdjustedClvPct: 0.5 }, 'score.marginAdjustedClvPct'],
+      ['devigMethod', { devigMethod: 'other-v1' }, 'score.devigMethod'],
+      ['ladderVersion', { ladderVersion: 'L_V2' }, 'score.ladderVersion'],
+      ['ladderParamVersion', { ladderParamVersion: 'P_V2' }, 'score.ladderParamVersion'],
+      ['refusal pair', { economicClvPct: null, refused: true, refusalReason: 'close_missing' },
+        'score.economicClvPct'],
+      ['scheduleChanged', { scheduleChanged: true }, 'score.scheduleChanged'],
+      ['heldOutOfPrimary', { heldOutOfPrimary: false }, 'score.heldOutOfPrimary'],
+      ['closeDecimalSelected', { closeDecimalSelected: 1.91 }, 'score.closeDecimalSelected'],
+      ['closeDecimalOpposing', { closeDecimalOpposing: 1.99 }, 'score.closeDecimalOpposing'],
+      ['closeLine', { closeLine: 7.5 }, 'score.closeLine'],
+      ['lineMovementFavorable', { lineMovementFavorable: 0.5 }, 'score.lineMovementFavorable'],
+    ];
+    for (const [name, mutation, expectedField] of arms) {
+      const version = `drift-${name.replace(/[^a-zA-Z]+/g, '-')}`;
+      expect(await port.publishScore({ ...base, scoringPolicyVersion: version }),
+        'published', `${name}: base`);
+      const outcome = await port.publishScore({ ...base, scoringPolicyVersion: version, ...mutation });
+      expect(outcome, 'contradiction', `${name}: mutated republish`);
+      assert.equal(
+        outcome.outcome === 'contradiction' ? outcome.field : null,
+        expectedField,
+        `${name}: the contradiction names its own field`,
+      );
+    }
   });
 
   await check('a child whose decision does not exist is parent_missing, not an error', async () => {
@@ -1189,8 +1244,12 @@ async function main(): Promise<void> {
       'select version from public.benchmark_schema_capability where capability = $1',
       ['serving_projection']);
     assert.equal(rows.length, 1, 'the capability row exists');
-    assert.ok(Number(rows[0]!['version']) >= REQUIRED_SERVING_CAPABILITY,
-      `schema reports ${String(rows[0]!['version'])}, this build requires ${REQUIRED_SERVING_CAPABILITY}`);
+    // The SCORES requirement, not the run paths' 2: this suite executes
+    // SCORE_SQL, whose insert names the label column only capability 3 holds,
+    // so asserting less than the suite itself needs would report a schema fit
+    // that the very next check disproves.
+    assert.ok(Number(rows[0]!['version']) >= SCORES_SERVING_CAPABILITY,
+      `schema reports ${String(rows[0]!['version'])}, this build requires ${SCORES_SERVING_CAPABILITY}`);
   });
 
   await check('the resolver agrees with what the DRIVER actually does about TLS', async () => {
@@ -1444,7 +1503,7 @@ async function main(): Promise<void> {
       const standings = await query(
         `select d.participant_id,
                 count(*) filter (where not s.refused and not coalesce(s.held_out_of_primary, false))::int as n,
-                count(*) filter (where s.economic_clv_pct > 0 and not coalesce(s.held_out_of_primary, false))::int as beats,
+                count(*) filter (where not s.refused and s.economic_clv_pct > 0 and not coalesce(s.held_out_of_primary, false))::int as beats,
                 avg(s.economic_clv_pct) filter (where not s.refused and not coalesce(s.held_out_of_primary, false))::float8 as mean_clv,
                 count(*) filter (where s.label = 'SMOKE_V0_NOT_A_COHORT')::int as labeled
            from public.benchmark_scores s

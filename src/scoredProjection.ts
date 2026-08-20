@@ -97,6 +97,23 @@ const scoredDecisionSchema = z
 
 export type ScoredDecisionRecord = z.infer<typeof scoredDecisionSchema>;
 
+/**
+ * The identity fields a participant_scorecard record shares with the pass. It
+ * is never projected, but it IS part of the artifact `source_sha256` binds to
+ * every published row — so a scorecard spliced in from a different pass would
+ * make the canonical record disagree with the rows citing it, permanently and
+ * silently. The gate holds it to the same one-file-one-pass rule.
+ */
+const scorecardIdentitySchema = z
+  .object({
+    recordType: z.literal('participant_scorecard'),
+    label: z.string().min(1),
+    runId: z.string().min(1),
+    scoredAt: z.string().min(1),
+    scoringPolicyVersion: z.string().min(1),
+  })
+  .passthrough();
+
 /** The record types the current scorer writes. Anything else refuses the file:
  *  a scorer newer than this publisher may carry semantics this gate cannot
  *  judge, and publishing around an unknown record is publishing a partial view
@@ -219,7 +236,24 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
         return no(`scored_decision record ${index + 1} disagrees with scored_run_meta on ${field}`);
       }
     }
-    const key = `${decision.participantId} ${decision.gameId} ${decision.market}`;
+    // The equivalence the projection turns into `refused`, enforced HERE
+    // because nothing downstream can: the mapping derives `refused` from the
+    // reason alone, the payload validator checks only refused<=>reason, and
+    // the schema CHECK matches it — so a record carrying a refusal reason AND
+    // a live CLV value would publish a refused row with numbers in it,
+    // permanently, into standings queries that read NULL-ness as refusal. The
+    // current scorer nulls both whenever it refuses; a file that says
+    // otherwise was not written by it, whatever its other fields claim.
+    if (
+      decision.unscoredReason !== null &&
+      (decision.primaryClvPct !== null || decision.marginAdjustedClvPct !== null)
+    ) {
+      return no(
+        `scored_decision record ${index + 1} carries a refusal reason and a CLV value at once — ` +
+          'the scorer never emits that pair, so the file is not its output',
+      );
+    }
+    const key = `${decision.participantId} ${decision.gameId} ${decision.market}`;
     if (seen.has(key)) {
       return no(
         `two scored_decision records claim ${decision.participantId} / ${decision.gameId} / ` +
@@ -231,6 +265,31 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
   }
 
   if (decisions.length === 0) return no('the artifact contains no scored decisions');
+
+  // Scorecard records are tolerated and never projected, but they are part of
+  // the file `source_sha256` stamps on every published row — the same
+  // one-file-one-pass rule holds them too, or the canonical record the rows
+  // cite carries another pass's aggregates with nothing ever detecting it.
+  for (const [index, record] of records.entries()) {
+    if (record['recordType'] !== 'participant_scorecard') continue;
+    const parsed = scorecardIdentitySchema.safeParse(record);
+    if (!parsed.success) {
+      return no(
+        `participant_scorecard record ${index + 1} does not match the current scorer format ` +
+          `(${describeIssue(parsed.error)}) — re-score the run with the current scorer`,
+      );
+    }
+    for (const [field, expected] of [
+      ['runId', meta.runId],
+      ['label', meta.label],
+      ['scoringPolicyVersion', meta.scoringPolicyVersion],
+      ['scoredAt', meta.scoredAt],
+    ] as const) {
+      if (parsed.data[field] !== expected) {
+        return no(`participant_scorecard record ${index + 1} disagrees with scored_run_meta on ${field}`);
+      }
+    }
+  }
 
   return {
     publishable: true,

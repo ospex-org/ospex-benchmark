@@ -287,18 +287,22 @@ ${closed.out}`);
       // The reviewer's case: a database whose schema has the lookalike
       // columns and none of the contract. A column-name check opened against
       // it; a capability VERSION refuses it.
-      assert.ok(REQUIRED_SERVING_CAPABILITY > 1,
-        'the probe reports capability 1, so the requirement must exceed it to discriminate');
+      const answered = /stale: capabilityAnswer=(\S+)/.exec(closed.out)?.[1];
+      assert.ok(answered !== undefined && REQUIRED_SERVING_CAPABILITY > Number(answered),
+        `the probe answered ${answered}, so the requirement must exceed it to discriminate`);
     }
     if (mode === 'scores-held') {
-      // The premise that makes this mode discriminate: the probe answers a
-      // version every RUN path accepts, and the open asks for the scores
-      // requirement. If the two constants ever collapse, this mode pins
-      // nothing and must be redesigned rather than quietly passing.
-      assert.ok(REQUIRED_SERVING_CAPABILITY <= 2,
-        'the probe answers 2, which must satisfy the run paths');
-      assert.ok(SCORES_SERVING_CAPABILITY > 2,
-        'and must fall short of the scores requirement, or nothing here discriminates');
+      // The premise that makes this mode discriminate, read from what the
+      // probe's server actually ANSWERED rather than restated as prose: the
+      // answer satisfies every run path and falls short of the scores
+      // requirement. If the constants ever collapse onto the answer, this
+      // mode pins nothing and must be redesigned rather than quietly passing.
+      const answered = Number(/scores-held: capabilityAnswer=(\S+)/.exec(closed.out)?.[1]);
+      assert.ok(Number.isInteger(answered), `the probe never reported its answer. Output:\n${closed.out}`);
+      assert.ok(REQUIRED_SERVING_CAPABILITY <= answered,
+        `the answer (${answered}) must satisfy the run paths (${REQUIRED_SERVING_CAPABILITY})`);
+      assert.ok(SCORES_SERVING_CAPABILITY > answered,
+        `and must fall short of the scores requirement (${SCORES_SERVING_CAPABILITY}), or nothing here discriminates`);
     }
     if (mode === 'enabled') {
       // And the write really was left in flight on a pinned client, rather than

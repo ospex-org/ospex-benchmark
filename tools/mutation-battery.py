@@ -697,6 +697,25 @@ MUTANTS = [
      '  if (summary.gateRefusal !== null) {',
      '  if (false) {',
      ['src/projectRunMain.test.ts']),
+    # --- Adversarial-review hardening: the three gate guards it demanded -----
+    ('M118-refused-with-a-value-publishes', 'src/scoredProjection.ts',
+     '    if (\n'
+     '      decision.unscoredReason !== null &&\n'
+     '      (decision.primaryClvPct !== null || decision.marginAdjustedClvPct !== null)\n'
+     '    ) {',
+     '    if (false) {',
+     ['src/scoredProjection.test.ts']),
+    ('M119-spliced-scorecard-tolerated', 'src/scoredProjection.ts',
+     "    if (record['recordType'] !== 'participant_scorecard') continue;",
+     '    if (true) continue;',
+     ['src/scoredProjection.test.ts']),
+    # A drift NAME labeling the comparison of a DIFFERENT column keeps the
+    # arrays parallel and the name set right; only the positional pairing test
+    # (and the per-arm conformance loop, on a database) can tell.
+    ('M120-drift-arm-mislabeled', 'src/servingStore.ts',
+     '                 s.devig_method            is distinct from input.devig_method,',
+     '                 s.devig_method            is distinct from input.ladder_version,',
+     ['src/servingStore.test.ts']),
 ]
 
 

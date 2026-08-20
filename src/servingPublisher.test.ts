@@ -916,7 +916,7 @@ test('the scores DEFAULT deadline still binds when the wall clock runs backwards
   // default of Date.now never expires the budget, and the only remaining
   // bound is the per-write cap — the rival this test excludes by margin.
   const lines = scoredArtifactLines({
-    extraGames: Array.from({ length: 14 }, (_, index) => `game-${index + 3}`),
+    extraGames: Array.from({ length: 30 }, (_, index) => `game-${index + 3}`),
   });
   const gate = publishableScoredRun(parseScoredArtifact(lines.join('\n')));
   assert.ok(gate.publishable);
@@ -933,8 +933,12 @@ test('the scores DEFAULT deadline still binds when the wall clock runs backwards
       perWriteTimeoutMs: 80,
     });
     const elapsed = performance.now() - started;
+    // The same margin discipline as the run-path sibling: a correct build ends
+    // at ~150ms plus timer jitter, so the exclusion bound must sit far enough
+    // above that a slow scheduler cannot flip the verdict — rival/2 with a
+    // rival of at least 600ms, not a bound a healthy run brushes against.
     const rival = 80 * Math.ceil(scores.length / 4);
-    assert.ok(rival >= 320, `the artifact is too small to discriminate: rival bound ${rival}ms`);
+    assert.ok(rival >= 600, `the artifact is too small to discriminate: rival bound ${rival}ms`);
     assert.ok(elapsed < rival / 2, `took ${Math.round(elapsed)}ms; the per-write cap alone allows ${rival}ms`);
     assert.ok(summary.skipped.some((reason) => reason.includes('abandoned')));
   } finally {

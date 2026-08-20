@@ -50,7 +50,8 @@ Exit codes:
   2  usage — no files given, or a named file does not exist
   3  no serving credential is configured, so nothing was attempted
   4  configured, but the publisher was refused (bad connection settings, or a
-     schema that cannot yet record the score label)`;
+     schema that cannot yet record the score label)
+  5  the command itself failed`;
 
 export async function runProjectScoresMain(deps: ProjectMainDeps): Promise<number> {
   return runProjectionCli(deps, { usage: USAGE, missingNoun: 'scored artifact' });

@@ -98,6 +98,7 @@ test('the REAL command still runs — the entry guard did not silence it', () =>
   // publish-run-first ordering, and the re-score recovery.
   assert.match(result.stdout, /^ {2}3 {2}no serving credential is configured/m);
   assert.match(result.stdout, /^ {2}4 {2}configured, but the publisher was refused/m);
+  assert.match(result.stdout, /^ {2}5 {2}the command itself failed/m);
   assert.match(result.stdout, /parent_missing/);
   assert.match(result.stdout, /re-score the run file/);
 });

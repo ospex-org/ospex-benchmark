@@ -165,10 +165,60 @@ test('an unknown record type refuses the whole file', () => {
   );
 });
 
-test('a scorecard record is tolerated and never projected', () => {
-  const gate = gateOf([meta(), decision(), { recordType: 'participant_scorecard', runId: 'run-1' }]);
+function scorecard(over: Record<string, unknown> = {}): JsonRecord {
+  return {
+    recordType: 'participant_scorecard',
+    label: 'SMOKE_V0_NOT_A_COHORT',
+    runId: 'run-1',
+    scoredAt: '2026-08-20T04:00:00.000Z',
+    scoringPolicyVersion: 'scoring-v0.6.0',
+    participantId: 'lab-alpha',
+    eligibleMarkets: 3,
+    ...over,
+  };
+}
+
+test('a coherent scorecard record is tolerated and never projected', () => {
+  const gate = gateOf([meta(), decision(), scorecard()]);
   assert.equal(gate.publishable, true);
   if (gate.publishable) assert.equal(gate.decisions.length, 1);
+});
+
+test('a scorecard from another pass refuses the file — it is part of what source_sha256 binds', () => {
+  for (const [field, value] of [
+    ['runId', 'run-2'],
+    ['label', 'SOME_OTHER_LABEL'],
+    ['scoringPolicyVersion', 'scoring-v0.5.0'],
+    ['scoredAt', '2026-08-21T04:00:00.000Z'],
+  ] as const) {
+    assert.match(
+      reasonOf([meta(), decision(), scorecard({ [field]: value })]),
+      new RegExp(`participant_scorecard record 3 disagrees with scored_run_meta on ${field}`),
+      field,
+    );
+  }
+  const legacy = scorecard();
+  delete (legacy as Record<string, unknown>)['scoredAt'];
+  assert.match(reasonOf([meta(), decision(), legacy]), /participant_scorecard record 3 does not match/);
+});
+
+test('a refusal reason beside a live CLV value refuses the file — the pair the scorer never emits', () => {
+  for (const carrier of [
+    { primaryClvPct: 2.4, marginAdjustedClvPct: null },
+    { primaryClvPct: null, marginAdjustedClvPct: 1.1 },
+  ]) {
+    assert.match(
+      reasonOf([meta(), decision({ ...carrier, unscoredReason: 'push_capable_line' })]),
+      /carries a refusal reason and a CLV value at once/,
+      JSON.stringify(carrier),
+    );
+  }
+  // Both legitimate polarities still gate: refused-with-nulls, and value-with-no-reason.
+  headerOf([
+    meta(),
+    decision({ primaryClvPct: null, marginAdjustedClvPct: null, unscoredReason: 'close_missing' }),
+    decision({ gameId: 'game-2' }),
+  ]);
 });
 
 test('a decision disagreeing with the meta on any identity field refuses the file', () => {

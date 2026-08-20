@@ -334,6 +334,10 @@ async function main(): Promise<void> {
   });
   say(`${mode}: status=${serving.status.enabled ? 'enabled' : serving.status.reason}`);
   say(`${mode}: reachedServer=${sawQuery()}`);
+  // The capability this fake server ANSWERED, from the server's own script —
+  // so a test premise about "what the probe reports" can read the measurement
+  // instead of restating its own literal beside the probe's.
+  say(`${mode}: capabilityAnswer=${String(answer)}`);
 
   if (drops) {
     // Announced BEFORE the wait so the harness can close stderr at a known
