@@ -389,8 +389,17 @@ MUTANTS = [
      '    rationale_digest: sha256Hex(rationale.rationale),',
      ['src/servingStore.test.ts']),
     ('M75-any-capability-will-do', 'src/benchmarkServingClient.ts',
-     '  if (capability < REQUIRED_SERVING_CAPABILITY) {',
+     '  if (capability < requiredCapability) {',
      '  if (false) {',
+     ['src/benchmarkServingClient.test.ts']),
+    # The caller's requirement, not the run paths' constant, is what decides:
+    # a build that quietly compares against REQUIRED_SERVING_CAPABILITY opens
+    # the scores publisher against a schema that cannot hold a label. Killed by
+    # the scores-held probe mode, whose answer satisfies the constant and falls
+    # short of the requirement.
+    ('M75b-requirement-collapses-to-the-constant', 'src/benchmarkServingClient.ts',
+     '  const requiredCapability = options.requiredCapability ?? REQUIRED_SERVING_CAPABILITY;',
+     '  const requiredCapability = REQUIRED_SERVING_CAPABILITY;',
      ['src/benchmarkServingClient.test.ts']),
     ('M76-unreadable-capability-reads-as-current', 'src/benchmarkServingClient.ts',
      '    capability = 0;',
@@ -470,9 +479,32 @@ MUTANTS = [
      '    const unmoved = before !== null && after !== null && before === after;',
      '    const unmoved = before === after;',
      ['src/servingSchemaGate.test.ts']),
+    # The publishScores sibling carries the identical three-line default block,
+    # so both M93 needles anchor on the line that FOLLOWS the defaults — the
+    # only line the two functions do not share.
     ('M93-deadline-default-not-wired', 'src/servingPublisher.ts',
-     '  const nowMs = timing.nowMs ?? publicationNowMs;',
-     '  const nowMs = timing.nowMs ?? Date.now;',
+     '  const nowMs = timing.nowMs ?? publicationNowMs;\n'
+     '  const deadlineMs = timing.deadlineMs ?? PUBLICATION_DEADLINE_MS;\n'
+     '  const perWriteTimeoutMs = timing.perWriteTimeoutMs ?? PER_WRITE_TIMEOUT_MS;\n'
+     '  const tally = new Tally();\n'
+     '  tally.skipped.push(...plan.skipped);',
+     '  const nowMs = timing.nowMs ?? Date.now;\n'
+     '  const deadlineMs = timing.deadlineMs ?? PUBLICATION_DEADLINE_MS;\n'
+     '  const perWriteTimeoutMs = timing.perWriteTimeoutMs ?? PER_WRITE_TIMEOUT_MS;\n'
+     '  const tally = new Tally();\n'
+     '  tally.skipped.push(...plan.skipped);',
+     ['src/servingPublisher.test.ts']),
+    ('M93b-scores-deadline-default-not-wired', 'src/servingPublisher.ts',
+     '  const nowMs = timing.nowMs ?? publicationNowMs;\n'
+     '  const deadlineMs = timing.deadlineMs ?? PUBLICATION_DEADLINE_MS;\n'
+     '  const perWriteTimeoutMs = timing.perWriteTimeoutMs ?? PER_WRITE_TIMEOUT_MS;\n'
+     '  const tally = new Tally();\n'
+     '  const budget = new Budget(nowMs, nowMs() + deadlineMs, perWriteTimeoutMs);',
+     '  const nowMs = timing.nowMs ?? Date.now;\n'
+     '  const deadlineMs = timing.deadlineMs ?? PUBLICATION_DEADLINE_MS;\n'
+     '  const perWriteTimeoutMs = timing.perWriteTimeoutMs ?? PER_WRITE_TIMEOUT_MS;\n'
+     '  const tally = new Tally();\n'
+     '  const budget = new Budget(nowMs, nowMs() + deadlineMs, perWriteTimeoutMs);',
      ['src/servingPublisher.test.ts']),
 
     # --- PR4 round 3: the four blockers a second review found ---------------
@@ -560,6 +592,111 @@ MUTANTS = [
      "guardStream('stdout', process.stdout, (line) => process.stderr.write(",
      "guardStream('stdout', process.stdout, (line) => process.stdout.write(",
      ['src/benchmarkServingClient.test.ts']),
+
+    # --- The scores publisher: gate, mapping, statement, CLIs ----------------
+    # SQL BEHAVIOR (a wrong-run score and a same-version different-value score
+    # both landing as `contradiction`, a fresh-provenance replay landing as
+    # `duplicate`) is pinned by `yarn store:serving` against real PostgreSQL;
+    # the unit tier pins the statement's STRUCTURE and everything client-side.
+    ('M103-dry-run-scores-publish', 'src/scoredProjection.ts',
+     "  if (meta.sourceMode !== 'live') return no('the scored run was not a live run');",
+     "  if (false) return no('the scored run was not a live run');",
+     ['src/scoredProjection.test.ts', 'src/servingPublisher.test.ts']),
+    ('M104-unverified-artifact-publishes', 'src/scoredProjection.ts',
+     '  if (meta.integrityVerified !== true) {',
+     '  if (false) {',
+     ['src/scoredProjection.test.ts']),
+    ('M105-second-meta-shadowed', 'src/scoredProjection.ts',
+     '  if (metas.length > 1) {',
+     '  if (false) {',
+     ['src/scoredProjection.test.ts']),
+    ('M106-cohort-namespace-open', 'src/scoredProjection.ts',
+     "  if (!publishableCohortId(meta.cohortId)) return no('cohortId is outside the published namespace');",
+     "  if (false) return no('cohortId is outside the published namespace');",
+     ['src/scoredProjection.test.ts', 'src/scoring.test.ts']),
+    ('M107-identity-coherence-unchecked', 'src/scoredProjection.ts',
+     '      if (decision[field] !== expected) {',
+     '      if (false) {',
+     ['src/scoredProjection.test.ts']),
+    ('M108-duplicate-pick-kept', 'src/scoredProjection.ts',
+     '    if (seen.has(key)) {',
+     '    if (false) {',
+     ['src/scoredProjection.test.ts']),
+    ('M109-refusal-equivalence-broken', 'src/scoredProjection.ts',
+     '    refused: record.unscoredReason !== null,',
+     '    refused: false,',
+     ['src/scoredProjection.test.ts', 'src/scoring.test.ts']),
+    ('M110-held-out-inverted', 'src/scoredProjection.ts',
+     '    heldOutOfPrimary: !record.inPrimaryStratum,',
+     '    heldOutOfPrimary: record.inPrimaryStratum,',
+     ['src/scoredProjection.test.ts']),
+    # The close columns swapped is the classic positional pair no round-trip of
+    # symmetric fixtures can see; the killing fixture's decimals differ.
+    ('M111-close-side-swapped', 'src/scoredProjection.ts',
+     "        : record.side === 'away'\n          ? record.closing.awayDecimal\n          : record.closing.homeDecimal,",
+     "        : record.side === 'away'\n          ? record.closing.homeDecimal\n          : record.closing.awayDecimal,",
+     ['src/scoredProjection.test.ts', 'src/servingPublisher.test.ts']),
+    # A hardcoded label or run id emits exactly what every default-valued
+    # fixture carries; the killing test sits where fixture and hardcode differ.
+    ('M112-label-minted-not-carried', 'src/scoredProjection.ts',
+     '    label: record.label,',
+     "    label: 'SMOKE_V0_NOT_A_COHORT',",
+     ['src/scoredProjection.test.ts']),
+    ('M112b-run-id-minted-not-carried', 'src/scoredProjection.ts',
+     '    runId: record.runId,',
+     "    runId: 'run-1',",
+     ['src/scoredProjection.test.ts', 'src/servingPublisher.test.ts']),
+    ('M113-score-statement-forgets-the-run', 'src/servingStore.ts',
+     "  select 'score.runId' as f\n    from parent, input\n   where parent.run_id is distinct from input.run_id",
+     "  select 'score.runId' as f\n    from parent, input\n   where false",
+     ['src/servingStore.test.ts']),
+    ('M113b-score-insert-ignores-drift', 'src/servingStore.ts',
+     '    from parent, input\n   where not exists (select 1 from drift)\n  on conflict on constraint uq_benchmark_score_per_policy do nothing',
+     '    from parent, input\n  on conflict on constraint uq_benchmark_score_per_policy do nothing',
+     ['src/servingStore.test.ts']),
+    # A name+flag PAIR deleted together keeps the unnest arrays parallel, so
+    # only the insert-list-vs-drift-names set test can catch it.
+    ('M113c-label-leaves-the-drift-comparison', 'src/servingStore.ts',
+     ("'score.label','score.economicClvPct'",
+      's.label                   is distinct from input.label,\n                 '),
+     ("'score.economicClvPct'",
+      ''),
+     ['src/servingStore.test.ts']),
+    ('M114-score-write-unserialized', 'src/servingStore.ts',
+     '    return this.publish(SCORE_SQL, () => scorePayload(score), true);',
+     '    return this.publish(SCORE_SQL, () => scorePayload(score));',
+     ['src/servingStore.test.ts']),
+    # The two entry wirings that decide which capability the scores paths ask
+    # for. The probe's scores-held mode pins the OPTION working; these pin the
+    # callers PASSING it.
+    ('M115-project-scores-opens-at-run-capability', 'src/projectScoresMain.ts',
+     '        requiredCapability: SCORES_SERVING_CAPABILITY,\n',
+     '',
+     ['src/scoredProjection.test.ts']),
+    ('M115b-score-publish-opens-at-run-capability', 'src/scoreRun.ts',
+     '      requiredCapability: SCORES_SERVING_CAPABILITY,\n',
+     '',
+     ['src/scoredProjection.test.ts']),
+    # --publish is an explicit ask: a held publisher and a partial publication
+    # must both reach the exit code.
+    ('M116-publish-held-reads-as-success', 'src/scoreRun.ts',
+     "      printError(`--publish was asked for, but nothing could be attempted`);\n      return 1;",
+     "      printError(`--publish was asked for, but nothing could be attempted`);\n      return 0;",
+     ['src/scoring.test.ts']),
+    ('M116b-publish-partial-reads-as-success', 'src/scoreRun.ts',
+     "    return unpublishedCount(summary, ndjsonPath, { line: printLine, error: printError }) > 0 ? 1 : 0;",
+     "    return unpublishedCount(summary, ndjsonPath, { line: printLine, error: printError }) > 0 ? 0 : 0;",
+     ['src/scoring.test.ts']),
+    # The shared CLI core must ACCUMULATE failures, and a gate refusal must
+    # surface its reason rather than fall through to the wrong branch.
+    ('M117-cli-failures-not-accumulated', 'src/projectRunMain.ts',
+     '      failed += unpublishedCount(summary, file, deps.log);',
+     '      unpublishedCount(summary, file, deps.log);',
+     ['src/projectRunMain.test.ts', 'src/projectScoresMain.test.ts']),
+    ('M117b-gate-refusal-loses-its-reason', 'src/servingPublisher.ts',
+     '  if (summary.gateRefusal !== null) {',
+     '  if (false) {',
+     ['src/projectRunMain.test.ts']),
 ]
 
 

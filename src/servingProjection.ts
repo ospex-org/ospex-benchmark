@@ -60,9 +60,10 @@ import type {
 
 export type JsonRecord = Record<string, unknown>;
 
-/** Parse the NDJSON a run wrote. Malformed lines are refused, not skipped: a
- *  half-read artifact would publish a partial run that looks complete. */
-export function parseRunArtifact(text: string): readonly JsonRecord[] {
+/** Parse one NDJSON artifact into records. Malformed lines are refused, not
+ *  skipped: a half-read artifact would publish a partial run that looks
+ *  complete. `what` names the artifact kind in the refusal, nothing more. */
+export function parseNdjsonObjects(text: string, what: string): readonly JsonRecord[] {
   const records: JsonRecord[] = [];
   const lines = text.split(/\r?\n/);
   for (const [index, line] of lines.entries()) {
@@ -71,14 +72,19 @@ export function parseRunArtifact(text: string): readonly JsonRecord[] {
     try {
       parsed = JSON.parse(line);
     } catch {
-      throw new Error(`run artifact line ${index + 1} is not valid JSON`);
+      throw new Error(`${what} line ${index + 1} is not valid JSON`);
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      throw new Error(`run artifact line ${index + 1} is not a JSON object`);
+      throw new Error(`${what} line ${index + 1} is not a JSON object`);
     }
     records.push(parsed as JsonRecord);
   }
   return records;
+}
+
+/** Parse the NDJSON a run wrote. */
+export function parseRunArtifact(text: string): readonly JsonRecord[] {
+  return parseNdjsonObjects(text, 'run artifact');
 }
 
 /**
@@ -206,6 +212,12 @@ const typed = (records: readonly JsonRecord[], recordType: string): JsonRecord[]
  * whose runs have an entirely different grain.
  */
 const PUBLISHABLE_COHORT = /^(?:watch|smoke)-v0-\d{4}-\d{2}-\d{2}$/;
+
+/** The one definition of which cohorts may reach the projection, shared with
+ *  the scored-artifact gate so the two paths cannot drift apart. */
+export function publishableCohortId(cohortId: string): boolean {
+  return PUBLISHABLE_COHORT.test(cohortId);
+}
 
 /** Facts the projection freezes, carried by the artifact rather than re-derived. */
 export interface ProjectionStamp {

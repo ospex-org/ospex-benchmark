@@ -2,6 +2,12 @@ import { readFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ZodError } from 'zod';
+import {
+  describeServingStatus,
+  openBenchmarkServing,
+  SCORES_SERVING_CAPABILITY,
+} from './benchmarkServingClient.js';
+import type { BenchmarkServingHandle } from './benchmarkServingClient.js';
 import { describeErrorWithStack, envValue } from './config.js';
 import { printError as printErrorImpl, printLine as printLineImpl } from './console.js';
 import { loadDotEnv } from './env.js';
@@ -9,6 +15,7 @@ import { fetchClosingLines } from './fetchers.js';
 import { LADDER_VERSION, loadLadderParams } from './ladder.js';
 import { writeNdjson, writeText } from './records.js';
 import { buildScorecardMarkdown } from './scorecard.js';
+import { publishScoredArtifact, unpublishedCount } from './servingPublisher.js';
 import {
   aggregateByParticipant,
   emptyPrimaryEstimateNote,
@@ -35,19 +42,27 @@ const USAGE = `Usage: yarn score --run <path-to-run.ndjson> [options]
 Options:
   --run PATH   The harness run file to score (required).
   --out DIR    Output directory. Default: the run file's directory.
+  --publish    After writing the scored artifact, publish it onto the benchmark
+               serving projection (the same call as \`yarn project:scores\` on
+               the file just written). Scoring output is written either way;
+               a publish that does not land in full exits 1, and the recovery
+               is \`yarn project:scores <scored file>\`.
   -h, --help   Show this help.
 
 Requires SUPABASE_URL and SUPABASE_ANON_KEY (public read-only anon key);
-a local gitignored .env is loaded automatically.`;
+a local gitignored .env is loaded automatically. --publish additionally needs
+the serving writer configured (see the README's serving projection section).`;
 
 interface CliOptions {
   runPath: string;
   outDir: string | null;
+  publish: boolean;
 }
 
 function parseArgs(argv: string[], printLine: (line: string) => void): CliOptions {
   let runPath: string | null = null;
   let outDir: string | null = null;
+  let publish = false;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = (): string => {
@@ -63,6 +78,9 @@ function parseArgs(argv: string[], printLine: (line: string) => void): CliOption
       case '--out':
         outDir = next();
         break;
+      case '--publish':
+        publish = true;
+        break;
       case '-h':
       case '--help':
         printLine(USAGE);
@@ -73,12 +91,14 @@ function parseArgs(argv: string[], printLine: (line: string) => void): CliOption
     }
   }
   if (runPath === null) throw new UsageError('--run is required');
-  return { runPath, outDir };
+  return { runPath, outDir, publish };
 }
 
 /**
  * The seams a test needs to drive this CLI without network. Deliberately
- * MINIMAL: only the network read and the two output sinks are injectable.
+ * MINIMAL: only the network touchpoints and the two output sinks are
+ * injectable — the closes read on the way in, and the serving publisher
+ * `--publish` reaches on the way out.
  *
  * Everything else — argument parsing, run-file read, integrity verification,
  * ladder load, scoring, aggregation, artifact writes AND the summary block —
@@ -91,6 +111,13 @@ export interface ScoreCliDeps {
   fetchCloses: typeof fetchClosingLines;
   printLine: (line: string) => void;
   printError: (line: string) => void;
+  /** How `--publish` opens the serving projection. The default asks for the
+   *  scores capability, so a pre-migration schema is one HELD line rather
+   *  than a refusal per row. */
+  openServing: () => Promise<BenchmarkServingHandle>;
+  /** How `--publish` publishes the scored file it just wrote — the same
+   *  function `yarn project:scores` runs, over the same bytes on disk. */
+  publishScored: typeof publishScoredArtifact;
   /**
    * WHICH frozen arm manifest integrity verifies against — never WHETHER it
    * verifies. Undefined (production) means `defaultExpectedArms()`, exactly as
@@ -105,6 +132,12 @@ const DEFAULT_DEPS: ScoreCliDeps = {
   fetchCloses: fetchClosingLines,
   printLine: printLineImpl,
   printError: printErrorImpl,
+  openServing: () =>
+    openBenchmarkServing({
+      onError: printErrorImpl,
+      requiredCapability: SCORES_SERVING_CAPABILITY,
+    }),
+  publishScored: publishScoredArtifact,
 };
 
 export async function runScoreCli(
@@ -223,7 +256,37 @@ export async function runScoreCli(
     printLine('');
     printLine(note);
   }
-  return 0;
+
+  if (!options.publish) return 0;
+
+  // The publish leg runs LAST, from the FILE just written — the same bytes
+  // `yarn project:scores` would read — so a one-step publish and a later
+  // recovery are the same call and cannot disagree. The scored artifact and
+  // scorecard are already on disk whatever happens below: an operator who
+  // asked for publication and was refused keeps the scoring output and retries
+  // with `yarn project:scores`.
+  //
+  // Exit semantics follow the publish-only commands, folded into this CLI's
+  // 0/1/2 contract: `--publish` is an explicit ask, so anything short of the
+  // whole artifact landing (or already being present) exits 1. This is the
+  // OPPOSITE of watch/smoke, where publication is a side effect that must
+  // never fail a night — do not carry this rule across.
+  printLine('');
+  const serving = await deps.openServing();
+  printLine(describeServingStatus(serving.status));
+  try {
+    if (!serving.status.enabled) {
+      printError(`--publish was asked for, but nothing could be attempted`);
+      return 1;
+    }
+    const summary = await deps.publishScored(serving.port, ndjsonPath, {
+      line: printLine,
+      error: printError,
+    });
+    return unpublishedCount(summary, ndjsonPath, { line: printLine, error: printError }) > 0 ? 1 : 0;
+  } finally {
+    await serving.close();
+  }
 }
 
 /**

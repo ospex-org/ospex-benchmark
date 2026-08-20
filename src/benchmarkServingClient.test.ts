@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import {
   describeServingStatus,
   REQUIRED_SERVING_CAPABILITY,
+  SCORES_SERVING_CAPABILITY,
   openBenchmarkServing,
   servingPoolConfig,
   QUERY_TIMEOUT_MS,
@@ -245,7 +246,7 @@ const PROBE_DEADLINE_MS = 12_000;
  * through the handle a run holds — a different call site, and until this case
  * existed nothing in the suite reached it.
  */
-for (const mode of ['held', 'stale', 'bogus', 'enabled'] as const) {
+for (const mode of ['held', 'stale', 'bogus', 'scores-held', 'enabled'] as const) {
   test(`a process whose database stopped answering still EXITS (${mode})`, { timeout: 60_000 }, async () => {
     // THE guarantee of this module, and the one no promise-level assertion can
     // make: `close()` resolving says nothing about whether Node can drain its
@@ -288,6 +289,16 @@ ${closed.out}`);
       // it; a capability VERSION refuses it.
       assert.ok(REQUIRED_SERVING_CAPABILITY > 1,
         'the probe reports capability 1, so the requirement must exceed it to discriminate');
+    }
+    if (mode === 'scores-held') {
+      // The premise that makes this mode discriminate: the probe answers a
+      // version every RUN path accepts, and the open asks for the scores
+      // requirement. If the two constants ever collapse, this mode pins
+      // nothing and must be redesigned rather than quietly passing.
+      assert.ok(REQUIRED_SERVING_CAPABILITY <= 2,
+        'the probe answers 2, which must satisfy the run paths');
+      assert.ok(SCORES_SERVING_CAPABILITY > 2,
+        'and must fall short of the scores requirement, or nothing here discriminates');
     }
     if (mode === 'enabled') {
       // And the write really was left in flight on a pinned client, rather than

@@ -31,10 +31,17 @@ import {
   verifyRunIntegrity,
 } from './scoring.js';
 import { runScoreCli } from './scoreRun.js';
+import {
+  parseScoredArtifact,
+  projectScoredRun,
+  publishableScoredRun,
+} from './scoredProjection.js';
 import { makeGameBundle, makeRequest } from './testFactories.js';
+import type { BenchmarkServingHandle } from './benchmarkServingClient.js';
 import type { GameRequest } from './bundle.js';
 import type { UnscoredReason } from './clv.js';
 import type { MarketStats, ScoredPick } from './scoring.js';
+import type { BenchmarkServingPort } from './servingStore.js';
 import type { ClosingLineRow, GameBundle, SlateBundle } from './types.js';
 
 // Fixture ladder parameter: the real committed k so ladder goldens are
@@ -3431,6 +3438,155 @@ test('B2: a MIXED zero reports each subset separately and never gives run-level 
  * carries a CLV is schedule-tagged, so the strict count is 0 while the loose
  * count is not. That is what makes the revert observable in stdout.
  */
+/**
+ * Serving seams for CLI tests that do not pass `--publish`. Throwing stubs
+ * rather than benign fakes, so they are simultaneously the negative control:
+ * a scoring pass that was not asked to publish must not so much as OPEN the
+ * projection — opening resolves a credential and dials a database.
+ */
+const NO_PUBLISH_DEPS = {
+  openServing: async (): Promise<never> => {
+    throw new Error('a run without --publish must not open the serving projection');
+  },
+  publishScored: async (): Promise<never> => {
+    throw new Error('a run without --publish must not publish');
+  },
+};
+
+test('the scored artifact the REAL writer emits passes the scores publisher, end to end', () => {
+  // The publisher's reader is the strictest scored-file schema in the repo and
+  // nothing else reads these files — so the one drift that matters is between
+  // `scoredRecords` (the writer) and that reader, and only records the REAL
+  // writer emitted can pin it. Hand-built fixtures in scoredProjection.test.ts
+  // cannot: they are the reader's own idea of the shape.
+  const { lines } = fixtureRun();
+  const run = parseRunRecords(lines);
+  // GAME_A carries on-schedule closes; GAME_B has none — so the real output
+  // holds scored AND refused picks, and both shapes must survive the reader.
+  const closes = [driftedClose('moneyline', 0), driftedClose('spread', 0), driftedClose('total', 0)];
+  const scored = scoreRun(run, closes, TEST_LADDER);
+  const stats = aggregateByParticipant(scored, run, TEST_LADDER);
+  const records = scoredRecords(run, scored, stats, '2026-07-13T04:00:00.000Z', TEST_LADDER);
+
+  // Through BYTES, exactly as the publisher reads them off disk.
+  const parsed = parseScoredArtifact(records.map((record) => JSON.stringify(record)).join('\n'));
+
+  // PREMISE: the fixture cohort is the ONLY thing keeping this unpublishable.
+  // If the writer ever emits a shape the reader refuses, this stops matching
+  // the namespace reason and names the real disagreement instead.
+  const unpatched = publishableScoredRun(parsed);
+  assert.equal(unpatched.publishable, false);
+  assert.match(
+    unpatched.publishable ? '' : unpatched.reason,
+    /outside the published namespace/,
+    'the only refusal for real writer output must be the fixture cohort name',
+  );
+
+  // Patch that one fact — the meta record's cohort — and nothing else.
+  const patched = parsed.map((record) =>
+    record['recordType'] === 'scored_run_meta' ? { ...record, cohortId: 'smoke-v0-2026-07-12' } : record,
+  );
+  const gate = publishableScoredRun(patched);
+  assert.equal(gate.publishable, true, gate.publishable ? '' : gate.reason);
+  if (!gate.publishable) return;
+
+  const rows = projectScoredRun(gate.header, gate.decisions, { sourcePath: 'x.ndjson', sourceSha256: null });
+  assert.equal(rows.length, run.picks.length, 'one score row per pick, none dropped');
+
+  // Spot-check the mapping against the records the scorer itself wrote, keyed
+  // rather than positional so a reordering cannot fake agreement.
+  const byKey = new Map(rows.map((row) => [`${row.decision.participantId}:${row.decision.gameId}:${row.decision.market}`, row]));
+  let scoredSeen = 0;
+  let refusedSeen = 0;
+  for (const record of records) {
+    if (record['recordType'] !== 'scored_decision') continue;
+    const key = `${String(record['participantId'])}:${String(record['gameId'])}:${String(record['market'])}`;
+    const row = byKey.get(key);
+    assert.notEqual(row, undefined, `no projected row for ${key}`);
+    assert.equal(row!.economicClvPct, record['primaryClvPct'], `${key}: economic CLV`);
+    assert.equal(row!.marginAdjustedClvPct, record['marginAdjustedClvPct'], `${key}: margin-adjusted CLV`);
+    assert.equal(row!.refused, record['unscoredReason'] !== null, `${key}: refusal`);
+    assert.equal(row!.label, LABEL, `${key}: label`);
+    if (record['unscoredReason'] === null) scoredSeen += 1;
+    else refusedSeen += 1;
+  }
+  // The premise the spot-check rides on: both polarities really occurred.
+  assert.ok(scoredSeen > 0, 'the fixture produced at least one scored pick');
+  assert.ok(refusedSeen > 0, 'and at least one refused pick');
+});
+
+test('--publish publishes the file just written, through the injected serving seams', async () => {
+  const { lines } = fixtureRun();
+  const dir = mkdtempSync(join(tmpdir(), 'ospex-score-publish-'));
+  const runPath = join(dir, 'run.ndjson');
+  writeFileSync(runPath, lines.join('\n'), 'utf8');
+
+  const priorUrl = process.env['SUPABASE_URL'];
+  const priorKey = process.env['SUPABASE_ANON_KEY'];
+  process.env['SUPABASE_URL'] = 'https://scorecli.invalid';
+  process.env['SUPABASE_ANON_KEY'] = 'anon-key-not-used-fetch-is-injected';
+
+  const out: string[] = [];
+  const state = { closes: 0, published: [] as string[] };
+  const okSummary = {
+    published: 5, duplicate: 0, rejected: {}, skipped: [], disabled: false, gateRefusal: null,
+  };
+  const enabledServing = (): Promise<BenchmarkServingHandle> =>
+    Promise.resolve({
+      port: {} as BenchmarkServingPort,
+      status: { enabled: true as const },
+      close: async () => { state.closes += 1; },
+    });
+  const baseDeps = {
+    fetchCloses: async () => [driftedClose('moneyline', 0), driftedClose('spread', 0), driftedClose('total', 0)],
+    printLine: (line: string) => { out.push(line); },
+    printError: (line: string) => { out.push(`ERROR ${line}`); },
+    expectedArms: FIXTURE_ARMS,
+  };
+
+  try {
+    // The whole artifact lands: exit 0, and the file handed to the publisher
+    // is the scored NDJSON this same invocation wrote — the recovery bytes.
+    const ok = await runScoreCli(['--run', runPath, '--out', dir, '--publish'], {
+      ...baseDeps,
+      openServing: enabledServing,
+      publishScored: async (_port, file) => { state.published.push(file); return okSummary; },
+    });
+    assert.equal(ok, 0, `CLI said:\n${out.join('\n')}`);
+    assert.deepEqual(state.published, [join(dir, 'run-scored.ndjson')]);
+    assert.equal(state.closes, 1, 'the serving handle is closed');
+
+    // Anything short of full publication is exit 1 — an explicit ask.
+    const partial = await runScoreCli(['--run', runPath, '--out', dir, '--publish'], {
+      ...baseDeps,
+      openServing: enabledServing,
+      publishScored: async () => ({ ...okSummary, skipped: ['abandoned at the deadline'] }),
+    });
+    assert.equal(partial, 1, 'a partial publication must not exit 0');
+
+    // A publisher that cannot even open: exit 1, scoring output kept, handle closed.
+    const closesBefore = state.closes;
+    const held = await runScoreCli(['--run', runPath, '--out', dir, '--publish'], {
+      ...baseDeps,
+      openServing: async () => ({
+        port: {} as BenchmarkServingPort,
+        status: { enabled: false as const, reason: 'schema_not_ready' as const, requiredCapability: 3 },
+        close: async () => { state.closes += 1; },
+      }),
+      publishScored: async () => { throw new Error('must not be called when the publisher is held'); },
+    });
+    assert.equal(held, 1);
+    assert.equal(state.closes, closesBefore + 1, 'the held handle is still closed');
+    assert.match(out.join('\n'), /--publish was asked for, but nothing could be attempted/);
+  } finally {
+    if (priorUrl === undefined) delete process.env['SUPABASE_URL'];
+    else process.env['SUPABASE_URL'] = priorUrl;
+    if (priorKey === undefined) delete process.env['SUPABASE_ANON_KEY'];
+    else process.env['SUPABASE_ANON_KEY'] = priorKey;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('B1: the CLI summary goes through the shared predicate — a loose count at the call site is caught', async () => {
   // Importing `./scoreRun.js` must NOT run a scoring pass. If the entry guard
   // were wrong, the module would have executed against the test runner's argv,
@@ -3462,6 +3618,7 @@ test('B1: the CLI summary goes through the shared predicate — a loose count at
       printLine: (line) => out.push(line),
       printError: (line) => out.push(line),
       expectedArms: FIXTURE_ARMS,
+      ...NO_PUBLISH_DEPS,
     });
     assert.equal(code, 0, `the run itself must succeed, else this asserts nothing. CLI said:\n${out.join('\n')}`);
 
@@ -3514,6 +3671,7 @@ test('B1 NEGATIVE CONTROL: with an untagged scoreable pick the CLI prints NO not
       printLine: (line) => out.push(line),
       printError: (line) => out.push(line),
       expectedArms: FIXTURE_ARMS,
+      ...NO_PUBLISH_DEPS,
     });
     assert.equal(code, 0, `CLI said:\n${out.join('\n')}`);
     assert.doesNotMatch(out.join('\n'), /nothing was primary-scoreable/);

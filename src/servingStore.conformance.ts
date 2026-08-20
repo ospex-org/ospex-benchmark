@@ -43,7 +43,7 @@
  *       CREATE TABLE public.commitments (id bigint);
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client, Pool } from 'pg';
@@ -62,11 +62,15 @@ import type {
   ArmAttempt, AttemptFacts, DecisionSeal, ParticipantFacts, PublishOutcome, RunFacts,
 } from './servingStore.js';
 import { sha256Hex } from './canonical.js';
+import { loadLadderParams } from './ladder.js';
+import { writeNdjson } from './records.js';
 import { forecastDigest } from './schema.js';
+import { aggregateByParticipant, parseRunRecords, scoredRecords, scoreRun } from './scoring.js';
 import { PROJECTION_PARTICIPANTS } from './servingIdentity.js';
+import { publishScoredArtifact } from './servingPublisher.js';
 import { firedRun } from './servingTestRun.js';
 import { makeOverScaleAccepted, makeOverScalePushAccepted } from './testFactories.js';
-import type { ForecastOutput } from './types.js';
+import type { ClosingLineRow, ForecastOutput } from './types.js';
 
 const HOST = process.env['BENCHMARK_CONFORMANCE_DB_HOST'] ?? 'localhost';
 const PORT = Number(process.env['BENCHMARK_CONFORMANCE_DB_PORT'] ?? '5436');
@@ -785,7 +789,8 @@ async function main(): Promise<void> {
     })) assert.deepEqual(v[column], expected, `benchmark_decision_reveals.${column} holds the wrong value`);
 
     expect(await port.publishScore({
-      decision, scoringPolicyVersion: 'POLICY', economicClvPct: 1.111111,
+      decision, runId: `${cohortId}-run`, label: 'LABEL',
+      scoringPolicyVersion: 'POLICY', economicClvPct: 1.111111,
       marginAdjustedClvPct: 2.222222, devigMethod: 'DEVIG', ladderVersion: 'LADDER',
       ladderParamVersion: 'LADDER-PARAM', refused: true, refusalReason: 'REFUSAL-REASON',
       scheduleChanged: true, heldOutOfPrimary: false, closeDecimalSelected: 3.333333,
@@ -796,7 +801,7 @@ async function main(): Promise<void> {
       `select s.* from public.benchmark_scores s
          join public.benchmark_decisions d on d.id = s.decision_id where d.cohort_id = $1`, [cohortId]))[0]!;
     for (const [column, expected] of Object.entries({
-      scoring_policy_version: 'POLICY', economic_clv_pct: '1.111111',
+      label: 'LABEL', scoring_policy_version: 'POLICY', economic_clv_pct: '1.111111',
       margin_adjusted_clv_pct: '2.222222', devig_method: 'DEVIG', ladder_version: 'LADDER',
       ladder_param_version: 'LADDER-PARAM', refused: true, refusal_reason: 'REFUSAL-REASON',
       schedule_changed: true, held_out_of_primary: false, close_decimal_selected: '3.333333',
@@ -879,7 +884,8 @@ async function main(): Promise<void> {
       decision, rationale: prose, evidenceRefs: ['ref-1', 'ref-2'], source: NO_SOURCE,
     }), 'published', 'rationale');
     const base = {
-      decision, marginAdjustedClvPct: null, devigMethod: null, ladderVersion: null,
+      decision, runId: `${cohortId}-run`, label: 'SMOKE_V0_NOT_A_COHORT',
+      marginAdjustedClvPct: null, devigMethod: null, ladderVersion: null,
       ladderParamVersion: null, refused: false, refusalReason: null, scheduleChanged: null,
       heldOutOfPrimary: null, closeDecimalSelected: null, closeDecimalOpposing: null,
       closeLine: null, lineMovementFavorable: null, scoredAt: '2026-08-10T04:00:00.000Z',
@@ -887,10 +893,32 @@ async function main(): Promise<void> {
     };
     expect(await port.publishScore({ ...base, scoringPolicyVersion: 'v6', economicClvPct: 1 }),
       'published', 'v6');
-    expect(await port.publishScore({ ...base, scoringPolicyVersion: 'v6', economicClvPct: 99 }),
-      'duplicate', 'same version again');
+    // A replay of the same pass — same values, and the pass provenance may
+    // differ freely: a regenerated scored file carries a fresh timestamp and a
+    // fresh sha over identical scores, and republishing it is the recovery
+    // path, not a disagreement.
+    expect(await port.publishScore({
+      ...base, scoringPolicyVersion: 'v6', economicClvPct: 1,
+      scoredAt: '2026-08-11T09:00:00.000Z',
+      source: { sourcePath: 'regenerated.ndjson', sourceSha256: null },
+    }), 'duplicate', 'same version, same values, fresh pass provenance');
+    // The SAME policy version claiming a DIFFERENT value is a contradiction,
+    // never a benign repeat: the writer holds no UPDATE, so whichever row is
+    // right, silence here would leave the wrong one standing unreported.
+    const contradicted = await port.publishScore({ ...base, scoringPolicyVersion: 'v6', economicClvPct: 99 });
+    expect(contradicted, 'contradiction', 'same version, different value');
+    assert.equal(
+      contradicted.outcome === 'contradiction' ? contradicted.field : null,
+      'score.economicClvPct',
+      'the contradiction names the disagreeing field',
+    );
     expect(await port.publishScore({ ...base, scoringPolicyVersion: 'v7', economicClvPct: 2 }),
       'published', 'v7');
+    // The run binding: a score citing a different execution of the slate must
+    // not attach to this run's decision, whatever its values say.
+    expect(await port.publishScore({
+      ...base, runId: 'some-other-run', scoringPolicyVersion: 'v8', economicClvPct: 3,
+    }), 'contradiction', 'a score citing another run');
     expect(await port.publishScoringRun({
       cohortId, scoringPolicyVersion: 'v6', eligible: 2, scored: 1, refused: 1,
       scheduleHeldOut: 0, refusalReasons: { no_close: 1 }, rankingAllowed: false,
@@ -1345,6 +1373,114 @@ async function main(): Promise<void> {
         [controls.map((row) => String(row['participant_id']))],
       );
       assert.equal(identified.length, 0, 'a control carries part of a model identity');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await check('a real fire, scored by the real scorer, publishes its scores — and a plain query reproduces the standings', async () => {
+    // The whole seam end to end: fire -> run artifact -> run publisher (the
+    // decisions land) -> REAL scorer over the same artifact with coherent
+    // fixture closes -> scored artifact on disk -> scores publisher -> rows —
+    // and then the acceptance itself: SQL over benchmark_scores joined to its
+    // decisions reproduces the aggregates the scorer computed, per participant.
+    const dir = mkdtempSync(join(tmpdir(), 'serving-scored-e2e-'));
+    try {
+      const gameId = `scored-${process.pid}-${(nonce += 1)}`;
+      const fired = await firedRun({ outDir: dir, enrolled: true, gameId, serving: port });
+      const run = parseRunRecords(readFileSync(fired.runFile, 'utf8').split(/\r?\n/));
+
+      // One coherent close per (game, market) the run actually picked:
+      // fresh, timed inside every gate, at the pick's own entry line, with
+      // no-vig probabilities the proportional de-vig of the quoted decimals —
+      // the close_inconsistent gate recomputes exactly that.
+      const away = 2.11;
+      const home = 1.82;
+      const qAway = (1 / away) / (1 / away + 1 / home);
+      const closes: ClosingLineRow[] = [];
+      const seen = new Set<string>();
+      for (const pick of run.picks) {
+        const key = `${pick.gameId}:${pick.market}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const game = run.games.get(pick.gameId);
+        const lockMs = Date.parse(game?.startUtc ?? '');
+        closes.push({
+          network: 'polygon', jsonodds_id: pick.gameId, market: pick.market,
+          line: pick.line, away_odds_decimal: away, home_odds_decimal: home,
+          away_p_novig: qAway, home_p_novig: 1 - qAway,
+          value_captured_at: new Date(lockMs - 20_000).toISOString(),
+          last_polled_at: new Date(lockMs - 15_000).toISOString(),
+          lock_time: new Date(lockMs).toISOString(),
+          poll_gap_seconds: 15, confidence: 'fresh', source: 'conformance-fixture',
+        });
+      }
+
+      const ladder = loadLadderParams();
+      const scored = scoreRun(run, closes, ladder);
+      const stats = aggregateByParticipant(scored, run, ladder);
+      const scoredFile = join(dir, `${gameId}-scored.ndjson`);
+      writeNdjson(scoredFile, scoredRecords(run, scored, stats, new Date().toISOString(), ladder));
+
+      const log = { line: () => {}, error: (m: string) => { throw new Error(`scores publisher error: ${m}`); } };
+      const summary = await publishScoredArtifact(port, scoredFile, log);
+      assert.equal(summary.gateRefusal, null, `gate refusal: ${summary.gateRefusal}`);
+      assert.equal(summary.published, run.picks.length,
+        `published ${summary.published} of ${run.picks.length} picks: ${JSON.stringify(summary)}`);
+
+      // Republished, the same file is entirely duplicates — recovery working.
+      const replay = await publishScoredArtifact(port, scoredFile, { line: () => {}, error: () => {} });
+      assert.deepEqual(
+        { published: replay.published, duplicate: replay.duplicate },
+        { published: 0, duplicate: run.picks.length },
+      );
+
+      // THE ACCEPTANCE: standings numbers from a plain query over the
+      // projection, compared against the same numbers computed from the
+      // scorer's own in-memory output. Per participant: n, beat count, mean
+      // economic CLV. float8 comparison inside a hair of the numeric(12,6)
+      // storage scale — an epsilon, not toFixed, because JS tie-rounding and
+      // PostgreSQL numeric rounding disagree on boundary values by design.
+      const standings = await query(
+        `select d.participant_id,
+                count(*) filter (where not s.refused and not coalesce(s.held_out_of_primary, false))::int as n,
+                count(*) filter (where s.economic_clv_pct > 0 and not coalesce(s.held_out_of_primary, false))::int as beats,
+                avg(s.economic_clv_pct) filter (where not s.refused and not coalesce(s.held_out_of_primary, false))::float8 as mean_clv,
+                count(*) filter (where s.label = 'SMOKE_V0_NOT_A_COHORT')::int as labeled
+           from public.benchmark_scores s
+           join public.benchmark_decisions d on d.id = s.decision_id
+          where d.cohort_id = $1 and d.game_id = $2
+          group by d.participant_id`,
+        [fired.cohortId, gameId],
+      );
+      assert.ok(standings.length > 0, 'the standings query returned no participants');
+      let comparedValues = 0;
+      for (const row of standings) {
+        const participantId = String(row['participant_id']);
+        const mine = scored.filter(
+          (p) => p.participantId === participantId
+            && p.result.primaryClvPct !== null && p.scheduleChanged !== true,
+        );
+        const total = scored.filter((p) => p.participantId === participantId).length;
+        assert.equal(row['labeled'], total, `${participantId}: every row carries the run label`);
+        assert.equal(row['n'], mine.length, `${participantId}: scoreable n`);
+        assert.equal(
+          row['beats'],
+          mine.filter((p) => (p.result.primaryClvPct ?? 0) > 0).length,
+          `${participantId}: beat count`,
+        );
+        if (mine.length > 0) {
+          const mean = mine.reduce((sum, p) => sum + (p.result.primaryClvPct ?? 0), 0) / mine.length;
+          assert.ok(
+            Math.abs(Number(row['mean_clv']) - mean) < 1e-5,
+            `${participantId}: mean economic CLV ${String(row['mean_clv'])} vs scorer ${mean}`,
+          );
+          comparedValues += 1;
+        }
+      }
+      // The premise the comparison rides on: at least one participant actually
+      // carried CLV values, or every assertion above compared empty sets.
+      assert.ok(comparedValues > 0, 'no participant had a scoreable pick — the fixture closes never matched');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

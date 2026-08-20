@@ -194,7 +194,8 @@ function rationale(over: Partial<DecisionRationale> = {}): DecisionRationale {
 
 function score(over: Partial<DecisionScore> = {}): DecisionScore {
   return {
-    decision: REF, scoringPolicyVersion: 'scoring-v0.6.0', economicClvPct: 1.85,
+    decision: REF, runId: 'run-1', label: 'SMOKE_V0_NOT_A_COHORT',
+    scoringPolicyVersion: 'scoring-v0.6.0', economicClvPct: 1.85,
     marginAdjustedClvPct: 0.92, devigMethod: 'multiplicative', ladderVersion: 'TOTALS_V1',
     ladderParamVersion: 'TOTALS_V1_PROVISIONAL', refused: false, refusalReason: null,
     scheduleChanged: false, heldOutOfPrimary: false, closeDecimalSelected: 1.87,
@@ -1209,16 +1210,23 @@ test('a contradiction or an unusable attempt writes NOTHING, including the paren
 // The post-write verification
 // ---------------------------------------------------------------------------
 
-test('a seal and an attempt take the lock BEFORE the write; the others do not', async () => {
+test('every drift-comparing write takes the lock BEFORE the write; the others do not', async () => {
   // The drift check inside a single statement reads a snapshot taken before the
   // statement began, so a concurrent writer that has not committed is invisible
   // — the gate passes, the child lands, and nothing checked afterwards can
   // un-commit it. Measured before this: a hundred conflicting-wallet races all
   // reported `contradiction` and 58 had written their child anyway.
+  //
+  // The membership rule is drift, not tier: a score drift-compares the stored
+  // row for its policy version, so an unserialized score race would absorb a
+  // concurrent DIFFERENT score as `duplicate` — the exact silent shape above.
+  // The reveal and the rationale carry no drift source of their own that a
+  // fresh snapshot would change (the rationale compares the parent's own
+  // immutable digest), so they stay lone statements.
   for (const [name, call] of EVERY_METHOD) {
     const s = scriptedQuery([OK]);
     await call(new SqlBenchmarkServingPort(s.deps));
-    const serialized = name === 'sealDecision' || name === 'publishAttempt';
+    const serialized = name === 'sealDecision' || name === 'publishAttempt' || name === 'publishScore';
     assert.equal(s.locks(), serialized ? 1 : 0, `${name} locks`);
     if (serialized) {
       assert.equal(s.calls[0]!.sql, SERVING_STATEMENTS.lock, `${name}: lock comes FIRST`);
@@ -1419,5 +1427,56 @@ test('the rationale digest is taken from the REDACTED bytes, not the caller\'s i
   } finally {
     if (saved === undefined) delete process.env['OPENAI_API_KEY'];
     else process.env['OPENAI_API_KEY'] = saved;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The score statement's own structure
+// ---------------------------------------------------------------------------
+
+test('the score statement binds the run and gates its insert on drift', () => {
+  // String-tier, anchored on executable SQL only (a comment paraphrases, it
+  // does not contain these predicates). The BEHAVIOR — a wrong-run score and a
+  // same-version different-value score both reporting `contradiction` and
+  // writing nothing — is pinned by the conformance suite against real
+  // PostgreSQL, which is where SQL behavior belongs.
+  const sql = SERVING_STATEMENTS.score;
+  assert.match(sql, /parent\.run_id is distinct from input\.run_id/,
+    'the stored decision run_id must arbitrate which execution a score attaches to');
+  assert.match(sql, /from parent, input\n\s*where not exists \(select 1 from drift\)/,
+    'the insert must be suppressed whenever any drift row exists');
+  assert.match(sql, /and s\.scoring_policy_version = input\.scoring_policy_version/,
+    'value drift is judged within one policy version — a rescore under a new version is a new row');
+});
+
+test('every score fact except pass provenance is drift-compared', () => {
+  // The set relation, not a sample: a deleted name+flag PAIR keeps the two
+  // unnest arrays equal in length, so only comparing the drift names against
+  // the insert list itself can catch one column quietly leaving the
+  // comparison. Pass provenance (scored_at, source_*) is excluded by design —
+  // a regenerated identical pass must republish as `duplicate`, or the
+  // recovery path closes.
+  const sql = SERVING_STATEMENTS.score;
+  const insertMatch = /insert into public\.benchmark_scores\n\s*\(([^)]+)\)/.exec(sql);
+  assert.ok(insertMatch, 'the insert column list parses');
+  const columns = insertMatch![1]!.split(',').map((column) => column.trim());
+  const driftMatch = /array\[((?:'score\.[^']+',?\s*)+)\]/.exec(sql);
+  assert.ok(driftMatch, 'the drift name array parses');
+  const driftNames = new Set([...driftMatch![1]!.matchAll(/'score\.([^']+)'/g)].map((m) => m[1]!));
+
+  const passProvenance = new Set(['decision_id', 'scoring_policy_version', 'scored_at', 'source_path', 'source_sha256']);
+  const camel = (snake: string): string => snake.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+  for (const column of columns) {
+    if (passProvenance.has(column)) {
+      assert.ok(!driftNames.has(camel(column)), `${column} is pass provenance and must NOT be drift-compared`);
+      continue;
+    }
+    assert.ok(driftNames.has(camel(column)),
+      `${column} is inserted but not drift-compared — a second pass disagreeing about it would be absorbed as duplicate`);
+  }
+  // And nothing is compared that is not inserted.
+  const columnCamels = new Set(columns.map(camel));
+  for (const name of driftNames) {
+    assert.ok(columnCamels.has(name), `drift compares '${name}', which the insert does not carry`);
   }
 });

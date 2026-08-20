@@ -1,5 +1,5 @@
 import { createServer } from 'node:net';
-import { openBenchmarkServing } from './benchmarkServingClient.js';
+import { openBenchmarkServing, SCORES_SERVING_CAPABILITY } from './benchmarkServingClient.js';
 import { printError } from './console.js';
 import type { ArmAttempt } from './servingStore.js';
 
@@ -33,6 +33,11 @@ import type { ArmAttempt } from './servingStore.js';
  *             open: an unreadable answer is version 0, and a build that turned
  *             it into NaN instead would compare `NaN < 2`, get false, and OPEN.
  *             A mutant did exactly that and survived until this mode existed.
+ *   scores-held  the database answers capability 2 — enough for every run
+ *             path — and the open asks for the SCORES requirement. MUST refuse
+ *             to open, and MUST exit. This is the only mode where the answer
+ *             is valid for one requirement and short of another, so it is what
+ *             pins that the caller's requirement, not the constant, decides.
  *   enabled   the readiness probe IS answered, so the publisher opens for real;
  *             then one attempt — the path that pins a client for a lock plus a
  *             statement — never answers, and the handle's own `close()` runs.
@@ -266,7 +271,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  const answer = mode === 'enabled' ? 2
+  // `scores-held` answers 2 — a REAL current run-path schema — and the open
+  // below asks for the scores requirement instead. That is the discriminating
+  // pair: a database every run path accepts must still refuse the scores
+  // publisher until the label migration lands, and only a mode where the
+  // ANSWER is valid-for-one-requirement can pin that the REQUIREMENT moved.
+  const answer = mode === 'enabled' || mode === 'scores-held' ? 2
     : mode === 'stale' ? 1
     : mode === 'bogus' ? 'bogus' as const
     : 'silent' as const;
@@ -302,6 +312,7 @@ async function main(): Promise<void> {
   const serving = await openBenchmarkServing({
     readinessTimeoutMs: 300,
     closeTimeoutMs: 300,
+    ...(mode === 'scores-held' ? { requiredCapability: SCORES_SERVING_CAPABILITY } : {}),
     onError: (line) => {
       // `epipe` reports through the PRODUCTION sink — stderr — because that is
       // the path that fails when the consumer is gone, and a probe that
