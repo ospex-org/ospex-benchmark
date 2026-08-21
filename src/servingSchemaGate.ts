@@ -56,6 +56,36 @@ import type { BenchmarkWriterConnection } from './benchmarkServingConfig.js';
 export const READ_ONLY_STARTUP_OPTION = '-c default_transaction_read_only=on';
 
 /**
+ * The startup parameter that PINS the schema search path to `public`.
+ *
+ * Why the gate needs it, and why only after the identity-args change: the
+ * definer census renders each function's arguments with
+ * `pg_get_function_identity_arguments`, and PostgreSQL renders a type name
+ * SCHEMA-QUALIFIED (`public.network`) exactly when that schema is not on the
+ * session search path, BARE (`network`) when it is. The declared exemptions
+ * were captured with `public` on the path and use the bare spellings, so a
+ * connection whose role or database default excludes `public` — e.g. an
+ * `ALTER ROLE … SET search_path = ''` hardening — would render the protocol's
+ * twelve custom-typed RPCs as `public.network`, match none of them, and turn
+ * a healthy database RED on its own functions. The old name-only census had
+ * no type names in it and so no such coupling; this pin removes the coupling
+ * the identity-args form introduced. It also makes the emission deterministic
+ * for the conformance suite, which proves the pin holds under a hostile
+ * `search_path`.
+ *
+ * `pg_catalog` is always searched ahead of this whether or not it is named, so
+ * the built-in types (`bigint`, `jsonb`, `timestamp with time zone`, …) render
+ * bare regardless; naming only `public` is what the exemption spellings need.
+ * It is a GUC set at connection time, not a statement, so it is issued under
+ * the read-only option without contradiction.
+ */
+export const SEARCH_PATH_STARTUP_OPTION = '-c search_path=public';
+
+/** Every startup option the gate connection carries, in one place so the
+ *  conformance suite can open a connection with EXACTLY these. */
+export const GATE_STARTUP_OPTIONS = `${READ_ONLY_STARTUP_OPTION} ${SEARCH_PATH_STARTUP_OPTION}`;
+
+/**
  * The statement that proves the refusal is real.
  *
  * `where false` is what makes it safe to point at a real database: if the
@@ -1183,9 +1213,10 @@ async function openGateConnection(): Promise<GateConnection> {
   }
   const pool = new driver.Pool({
     ...servingPoolConfig(resolution.connection),
-    options: READ_ONLY_STARTUP_OPTION,
+    options: GATE_STARTUP_OPTIONS,
     // One connection: the checks are sequential and every one of them must run
-    // against a connection that carried the read-only option.
+    // against a connection that carried the read-only option and the pinned
+    // search path.
     max: 1,
   });
   // Without this, a reset while the gate is running is an uncaught exception

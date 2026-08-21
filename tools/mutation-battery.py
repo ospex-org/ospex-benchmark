@@ -766,6 +766,30 @@ MUTANTS = [
      '      const present = new Set<string>();\n      for (const row of rows) {',
      '      const present = new Set<string>();\n      for (const row of rows.slice(0, 40)) {',
      ['src/servingSchemaGate.test.ts']),
+    # --- Adversarial-pass hardening (workflow wj549fbc1) ---------------------
+    # Dropping the search_path pin re-opens the false-RED the identity-args
+    # census introduced: under a role default that excludes public, the twelve
+    # custom-typed RPCs render as public.network and match no declared entry.
+    # Killed by the GATE_STARTUP_OPTIONS unit test, and by the hostile-path
+    # conformance scenario on a real database.
+    ('M127-search-path-pin-dropped', 'src/servingSchemaGate.ts',
+     'export const GATE_STARTUP_OPTIONS = `${READ_ONLY_STARTUP_OPTION} ${SEARCH_PATH_STARTUP_OPTION}`;',
+     'export const GATE_STARTUP_OPTIONS = `${READ_ONLY_STARTUP_OPTION}`;',
+     ['src/servingSchemaGate.test.ts']),
+    # Negating the security-defining predicate is a TOTAL bypass — no definer
+    # function is ever censused. Invisible to the unit fakes until the census
+    # shape test pins the predicate positively AND against its negation.
+    ('M128-prosecdef-predicate-negated', 'src/servingSchemaGate.ts',
+     '            and p.prosecdef',
+     '            and not p.prosecdef',
+     ['src/servingSchemaGate.test.ts']),
+    # The failure header must count the whole census, not the shown slice.
+    # Undiscriminated by every one-violating-row fixture (the two counts
+    # coincide); killed by the >20-row display-truncation test.
+    ('M129-failure-header-counts-shown-not-all', 'src/servingSchemaGate.ts',
+     '`${violating.length} executable as their owner: ${shown.join(\', \')}`',
+     '`${shown.length} executable as their owner: ${shown.join(\', \')}`',
+     ['src/servingSchemaGate.test.ts']),
 ]
 
 

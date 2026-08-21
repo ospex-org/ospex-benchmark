@@ -40,7 +40,7 @@
  */
 import assert from 'node:assert/strict';
 import { Client } from 'pg';
-import { DECLARED_DEFINER_EXEMPTIONS, SERVING_SCHEMA_CHECKS } from './servingSchemaGate.js';
+import { DECLARED_DEFINER_EXEMPTIONS, GATE_STARTUP_OPTIONS, SERVING_SCHEMA_CHECKS } from './servingSchemaGate.js';
 
 const HOST = process.env['BENCHMARK_GATE_CONFORMANCE_DB_HOST'] ?? 'localhost';
 const PORT = Number(process.env['BENCHMARK_GATE_CONFORMANCE_DB_PORT'] ?? '5439');
@@ -144,6 +144,53 @@ try {
     assert.equal(verdict.ok, true, verdict.detail);
     assert.match(verdict.detail, /^18 definer grant\(s\), every one a declared exemption/);
     assert.ok(!verdict.detail.includes('prune'), 'every entry must be matched — a prune note means one drifted from the emission format');
+  });
+
+  await check('the search_path pin holds the census to bare type names under a hostile role default', async () => {
+    // The catalog here is exactly the 18 declared functions (previous
+    // scenario), twelve of which carry custom types (network, position_type)
+    // whose rendering depends on the session search_path. Force the probe
+    // role's default to exclude public — the `ALTER ROLE … SET search_path =
+    // ''` hardening Supabase's linter encourages — and prove BOTH directions:
+    //   (a) an UNPINNED connection inherits the hostile default, the census
+    //       renders `public.network`, and the gate reds on the protocol's own
+    //       RPCs — the coupling the identity-args form introduced is real;
+    //   (b) a connection carrying the gate's OWN startup options pins
+    //       search_path=public over the role default, the census renders bare
+    //       names, and the gate passes.
+    // Without (a) the scenario could pass by the coupling never existing;
+    // without (b) the pin could be a no-op. Both are required.
+    await owner.query(`alter role ${PROBE_ROLE} set search_path = ''`);
+    try {
+      const unpinned = new Client({ host: HOST, port: PORT, user: PROBE_ROLE, password: PROBE_PASSWORD, database: NAME });
+      await unpinned.connect();
+      try {
+        const q = async (sql: string, params?: readonly unknown[]) =>
+          (await unpinned.query(sql, params ? [...params] : undefined)).rows as ReadonlyArray<Record<string, unknown>>;
+        const verdict = await definerCheck!.run(q);
+        assert.equal(verdict.ok, false, 'unpinned, a hostile role default must red the gate — this is the coupling the pin removes');
+        assert.ok(verdict.detail.includes('public.network'), 'the schema-qualified rendering is exactly what breaks the declared match');
+      } finally {
+        await unpinned.end();
+      }
+
+      const pinned = new Client({
+        host: HOST, port: PORT, user: PROBE_ROLE, password: PROBE_PASSWORD, database: NAME,
+        options: GATE_STARTUP_OPTIONS,
+      });
+      await pinned.connect();
+      try {
+        const q = async (sql: string, params?: readonly unknown[]) =>
+          (await pinned.query(sql, params ? [...params] : undefined)).rows as ReadonlyArray<Record<string, unknown>>;
+        const verdict = await definerCheck!.run(q);
+        assert.equal(verdict.ok, true, `the pin must restore the pass: ${verdict.detail}`);
+        assert.match(verdict.detail, /^18 definer grant\(s\), every one a declared exemption/);
+      } finally {
+        await pinned.end();
+      }
+    } finally {
+      await owner.query(`alter role ${PROBE_ROLE} reset search_path`);
+    }
   });
 
   await check('an overload of a declared name is refused; the declared signature stays exempt', async () => {

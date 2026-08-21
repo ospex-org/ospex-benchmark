@@ -4,6 +4,7 @@ import {
   dialsThisMachine,
   DECLARED_DEFINER_EXEMPTIONS,
   GATE_EXIT,
+  GATE_STARTUP_OPTIONS,
   isExemptDefiner,
   proveEncrypted,
   proveReadOnly,
@@ -11,6 +12,7 @@ import {
   readRowCounts,
   runChecks,
   runSchemaGate,
+  SEARCH_PATH_STARTUP_OPTION,
   SERVING_SCHEMA_CHECKS,
 } from './servingSchemaGate.js';
 import type { GateCheck, GateConnection, GateQuery, SchemaGateDeps } from './servingSchemaGate.js';
@@ -180,6 +182,19 @@ test('the read-only option is the startup parameter, not a SET', () => {
   // A `SET` issued once reaches whichever pooled connection happened to serve
   // it; a startup option is applied by the server to every connection it opens.
   assert.equal(READ_ONLY_STARTUP_OPTION, '-c default_transaction_read_only=on');
+});
+
+test('the gate pins search_path, and carries both startup options together', () => {
+  // The identity-args census renders custom type names relative to the session
+  // search path; unpinned, a role default of `''` would render the protocol's
+  // own RPCs as `public.network` and red a healthy database. Same-mechanism
+  // reasoning as the read-only option: a startup parameter, not a SET, so the
+  // server applies it to every connection it opens. Pinned to `public` because
+  // that is where the exemption spellings were captured; `pg_catalog` is always
+  // searched ahead of it, so built-in types stay bare regardless.
+  assert.equal(SEARCH_PATH_STARTUP_OPTION, '-c search_path=public');
+  assert.ok(GATE_STARTUP_OPTIONS.includes(READ_ONLY_STARTUP_OPTION), 'the read-only proof must survive');
+  assert.ok(GATE_STARTUP_OPTIONS.includes(SEARCH_PATH_STARTUP_OPTION), 'the search_path pin must be present');
 });
 
 // ---------------------------------------------------------------------------
@@ -459,13 +474,23 @@ test('the definer census carries the FULL routine identity and is never capped',
   assert.ok(check, 'the function-reachability check is gone');
   const { query, seen } = rowsFor({});
   await check.run(query);
-  const census = seen.find((sql) => sql.includes('p.prosecdef'));
+  const census = seen.find((sql) => sql.includes('pg_get_function_identity_arguments'));
   assert.ok(census, 'the census statement is gone');
   assert.ok(
     census.includes("n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as fn"),
     'fn must be the whole routine identity — name-only keying exempts every overload of a declared name',
   );
   assert.doesNotMatch(census, /\blimit\b/i, 'a capped census lets an undeclared row hide beyond the cap');
+  // The three predicates that MAKE this the SECURITY DEFINER check. Each is a
+  // total bypass if flipped or dropped, and none is reachable through the fake
+  // query harness — so pin them on the emitted statement, positively AND
+  // against the inverting mutation, or a `not p.prosecdef` edit ships green in
+  // CI (the census-shape locator alone would still match it). Measured: the
+  // adversarial pass reproduced exactly that against the unit suite.
+  assert.match(census, /\band p\.prosecdef\b/, 'must census only SECURITY DEFINER functions');
+  assert.doesNotMatch(census, /not\s+p\.prosecdef/, 'a negated predicate blinds the check to every definer function');
+  assert.match(census, /has_function_privilege\(named\.role, p\.oid, 'EXECUTE'\)/, 'must ask about EXECUTE for the role');
+  assert.match(census, /n\.nspname = 'public'/, 'must be scoped to the public schema, as documented');
 });
 
 test('an undeclared row cannot hide behind 40 declared ones', async () => {
@@ -485,6 +510,30 @@ test('an undeclared row cannot hide behind 40 declared ones', async () => {
   ]);
   assert.equal(verdict.ok, false);
   assert.match(verdict.detail, /service_role -> public\.zz_undeclared\(\)/);
+});
+
+test('the failure header states the WHOLE violating count, not the truncated display count', async () => {
+  // The detail shows at most 20 violating rows and then "… and N more not
+  // displayed"; the leading count must be the full census, never the shown
+  // slice, or a red verdict under-reports how many doors are open. Every OTHER
+  // definer fixture has exactly one violating row, where violating.length and
+  // shown.length coincide and cannot tell a `${shown.length}` mutation apart —
+  // so this fixture deliberately sits ABOVE the display cap. Guarded so a later
+  // edit cannot quietly drop it back under 20 and un-discriminate the test.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('SECURITY DEFINER'));
+  assert.ok(check, 'the function-reachability check is gone');
+  const DISPLAY_CAP = 20;
+  const violatingRows = Array.from({ length: 25 }, (_, i) => ({
+    role: 'service_role',
+    fn: `public.zz_undeclared_${String(i).padStart(2, '0')}()`,
+    from_extension: false,
+  }));
+  assert.ok(violatingRows.length > DISPLAY_CAP, 'the fixture must exceed the display cap to discriminate');
+  const verdict = await check.run(async () => violatingRows);
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.detail, /^25 executable/, 'the header counts every violating row, not the 20 shown');
+  assert.doesNotMatch(verdict.detail, /^20 executable/, 'a truncated-count header would read 20 here');
+  assert.match(verdict.detail, /and 5 more not displayed/, 'the elided remainder is announced with its own count');
 });
 
 test('an overload of a declared name is refused unless its own signature is declared', async () => {
