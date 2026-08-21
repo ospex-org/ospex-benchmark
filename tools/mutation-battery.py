@@ -728,6 +728,13 @@ MUTANTS = [
     # the constant back reproduces the shipped defect exactly — and survives
     # every fixture whose run label IS the constant, which is all of them
     # except the one regression test written to sit where they differ.
+    # A definer-function exemption that matches on the ROLE alone quietly
+    # exempts every function that role will ever be granted — the gate's
+    # tripwire for a NEW definer RPC would never fire again.
+    ('M123-definer-exemption-widens-by-role', 'src/servingSchemaGate.ts',
+     "  return DECLARED_DEFINER_EXEMPTIONS.has(`${role} -> ${fn}`);",
+     "  return role === 'service_role';",
+     ['src/servingSchemaGate.test.ts']),
     ('M122-scored-label-minted-not-carried', 'src/scoring.ts',
      ('    // here survived — a latent misbinding, caught in review.\n    label: run.label,',
       "      recordType: 'scored_decision',\n      label: run.label,",
@@ -736,6 +743,53 @@ MUTANTS = [
       "      recordType: 'scored_decision',\n      label: 'SMOKE_V0_NOT_A_COHORT',",
       "      recordType: 'participant_scorecard',\n      label: 'SMOKE_V0_NOT_A_COHORT',"),
      ['src/scoring.test.ts']),
+    # --- The third review hold: the definer census itself --------------------
+    # Keying the exemption on the bare name re-admits the reproduced defect:
+    # every overload of a declared name — functions nobody has reviewed — reads
+    # as exempt. Killed by the census-shape assertion (the semantics live in
+    # the SQL; no fake can evaluate them) and, on a real catalog, by the
+    # gate-conformance overload scenario.
+    ('M124-definer-overloads-collapse-to-a-name', 'src/servingSchemaGate.ts',
+     "                n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as fn,",
+     "                n.nspname || '.' || p.proname as fn,",
+     ['src/servingSchemaGate.test.ts']),
+    # Reintroducing the row cap on the census re-admits the other half: an
+    # undeclared function hiding behind 40 declared rows that sort ahead of it.
+    ('M125-definer-census-capped-in-sql', 'src/servingSchemaGate.ts',
+     '          order by 1, 2`,',
+     '          order by 1, 2 limit 40`,',
+     ['src/servingSchemaGate.test.ts']),
+    # The same cap one layer up: a classification loop that stops at 40 rows
+    # never sees the 41st. Killed by the 41-fake-row test, which sorts the
+    # undeclared row exactly where the cut falls.
+    ('M126-definer-census-capped-in-code', 'src/servingSchemaGate.ts',
+     '      const present = new Set<string>();\n      for (const row of rows) {',
+     '      const present = new Set<string>();\n      for (const row of rows.slice(0, 40)) {',
+     ['src/servingSchemaGate.test.ts']),
+    # --- Adversarial-pass hardening (workflow wj549fbc1) ---------------------
+    # Dropping the search_path pin re-opens the false-RED the identity-args
+    # census introduced: under a role default that excludes public, the twelve
+    # custom-typed RPCs render as public.network and match no declared entry.
+    # Killed by the GATE_STARTUP_OPTIONS unit test, and by the hostile-path
+    # conformance scenario on a real database.
+    ('M127-search-path-pin-dropped', 'src/servingSchemaGate.ts',
+     'export const GATE_STARTUP_OPTIONS = `${READ_ONLY_STARTUP_OPTION} ${SEARCH_PATH_STARTUP_OPTION}`;',
+     'export const GATE_STARTUP_OPTIONS = `${READ_ONLY_STARTUP_OPTION}`;',
+     ['src/servingSchemaGate.test.ts']),
+    # Negating the security-defining predicate is a TOTAL bypass — no definer
+    # function is ever censused. Invisible to the unit fakes until the census
+    # shape test pins the predicate positively AND against its negation.
+    ('M128-prosecdef-predicate-negated', 'src/servingSchemaGate.ts',
+     '            and p.prosecdef',
+     '            and not p.prosecdef',
+     ['src/servingSchemaGate.test.ts']),
+    # The failure header must count the whole census, not the shown slice.
+    # Undiscriminated by every one-violating-row fixture (the two counts
+    # coincide); killed by the >20-row display-truncation test.
+    ('M129-failure-header-counts-shown-not-all', 'src/servingSchemaGate.ts',
+     '`${violating.length} executable as their owner: ${shown.join(\', \')}`',
+     '`${shown.length} executable as their owner: ${shown.join(\', \')}`',
+     ['src/servingSchemaGate.test.ts']),
 ]
 
 

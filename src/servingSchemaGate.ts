@@ -56,6 +56,36 @@ import type { BenchmarkWriterConnection } from './benchmarkServingConfig.js';
 export const READ_ONLY_STARTUP_OPTION = '-c default_transaction_read_only=on';
 
 /**
+ * The startup parameter that PINS the schema search path to `public`.
+ *
+ * Why the gate needs it, and why only after the identity-args change: the
+ * definer census renders each function's arguments with
+ * `pg_get_function_identity_arguments`, and PostgreSQL renders a type name
+ * SCHEMA-QUALIFIED (`public.network`) exactly when that schema is not on the
+ * session search path, BARE (`network`) when it is. The declared exemptions
+ * were captured with `public` on the path and use the bare spellings, so a
+ * connection whose role or database default excludes `public` — e.g. an
+ * `ALTER ROLE … SET search_path = ''` hardening — would render the protocol's
+ * twelve custom-typed RPCs as `public.network`, match none of them, and turn
+ * a healthy database RED on its own functions. The old name-only census had
+ * no type names in it and so no such coupling; this pin removes the coupling
+ * the identity-args form introduced. It also makes the emission deterministic
+ * for the conformance suite, which proves the pin holds under a hostile
+ * `search_path`.
+ *
+ * `pg_catalog` is always searched ahead of this whether or not it is named, so
+ * the built-in types (`bigint`, `jsonb`, `timestamp with time zone`, …) render
+ * bare regardless; naming only `public` is what the exemption spellings need.
+ * It is a GUC set at connection time, not a statement, so it is issued under
+ * the read-only option without contradiction.
+ */
+export const SEARCH_PATH_STARTUP_OPTION = '-c search_path=public';
+
+/** Every startup option the gate connection carries, in one place so the
+ *  conformance suite can open a connection with EXACTLY these. */
+export const GATE_STARTUP_OPTIONS = `${READ_ONLY_STARTUP_OPTION} ${SEARCH_PATH_STARTUP_OPTION}`;
+
+/**
  * The statement that proves the refusal is real.
  *
  * `where false` is what makes it safe to point at a real database: if the
@@ -313,6 +343,72 @@ async function countsOrNull(query: GateQuery): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * SECURITY DEFINER grants decided SAFE, deliberately, once — the branch the
+ * definer check's own failure text offers, taken here in reviewed code
+ * instead of re-argued in chat on every preflight.
+ *
+ * Every entry is `role -> schema.function(identity arguments)`, EXACT, where
+ * the argument list is `pg_get_function_identity_arguments` verbatim: no
+ * wildcard admits a function nobody has looked at, and a protocol refactor
+ * that renames one makes the stale entry a visible pruning note rather than a
+ * silent widening. The arguments are part of the identity because PostgreSQL
+ * overloads are SEPARATE functions — a name-only entry would silently exempt
+ * every overload anyone ever creates under that name (measured: an undeclared
+ * `rpc_active_recovery_run(hostile text)` passed a name-keyed build of this
+ * check). The same property makes an ALTERed signature fail closed: the old
+ * entry turns into a pruning note and the new signature arrives as a
+ * violation until someone re-reviews and re-declares it.
+ *
+ * Why these are safe, and the shape any future entry must argue in its own
+ * comment: they are the indexer/read-API's OWN write path — the RPCs that
+ * mirror public on-chain events into the protocol tables, plus two trigger
+ * functions on `games` — owned by the schema owner and granted to
+ * `service_role`, the backend's key. None of them reads or writes any
+ * `benchmark_*` relation, so none is a path around the projection grid in
+ * either direction; and `service_role` is never handed to a browser. The
+ * roles this check exists to keep OUT of definer functions — the writer, and
+ * every browser-facing or readonly key — have no exemptions and may never
+ * gain one: `servingSchemaGate.test.ts` refuses any entry for them by
+ * construction.
+ *
+ * First measured against the live project 2026-08-21, immediately after the
+ * scores-capability migration: these eighteen were the whole list, none of
+ * their names carried a second overload, the writer and browser keys held
+ * EXECUTE on none, and run-path publication had already been operating under
+ * exactly this posture since 2026-08-15. The signatures below are the live
+ * catalog's own `pg_get_function_identity_arguments` output, read that day.
+ */
+export const DECLARED_DEFINER_EXEMPTIONS: ReadonlySet<string> = new Set([
+  'service_role -> public.rpc_active_recovery_run(p_network network)',
+  'service_role -> public.rpc_backfill_range(p_network text, p_from_block bigint, p_to_block bigint, p_fresh_events jsonb)',
+  'service_role -> public.rpc_commitment_matched(p_network network, p_speculation_id bigint, p_contest_id bigint, p_commitment_hash text, p_maker_address text, p_taker_address text, p_maker_position_type position_type, p_taker_position_type position_type, p_maker_risk_amount numeric, p_taker_risk_amount numeric, p_odds_tick smallint, p_block_time timestamp with time zone, p_tx_hash text, p_log_index integer, p_source_block bigint, p_commitment_risk_amount numeric, p_nonce numeric, p_expiry timestamp with time zone, p_speculation_key text)',
+  'service_role -> public.rpc_leaderboard_funded(p_network network, p_leaderboard_id bigint, p_amount numeric, p_funder text, p_tx_hash text, p_log_index integer, p_block_number bigint, p_block_time timestamp with time zone, p_source_block bigint)',
+  'service_role -> public.rpc_leaderboard_new_highest_roi(p_network network, p_leaderboard_id bigint, p_new_highest_roi numeric, p_winner_address text, p_block_time timestamp with time zone, p_source_block bigint)',
+  'service_role -> public.rpc_leaderboard_position_added(p_network network, p_leaderboard_id bigint, p_speculation_id bigint, p_user_address text, p_position_type position_type, p_contest_id bigint, p_risk_amount numeric, p_profit_amount numeric, p_block_time timestamp with time zone, p_source_block bigint)',
+  'service_role -> public.rpc_leaderboard_prize_claimed(p_network network, p_leaderboard_id bigint, p_user_address text, p_share numeric, p_block_time timestamp with time zone, p_tx_hash text, p_log_index integer)',
+  'service_role -> public.rpc_position_fill_upsert(p_network network, p_speculation_id bigint, p_contest_id bigint, p_commitment_hash text, p_maker_address text, p_taker_address text, p_maker_position_type position_type, p_taker_position_type position_type, p_maker_risk_amount numeric, p_taker_risk_amount numeric, p_odds_tick smallint, p_block_time timestamp with time zone, p_tx_hash text, p_log_index integer, p_source_block bigint)',
+  'service_role -> public.rpc_position_matched_pair(p_network network, p_speculation_id bigint, p_maker_address text, p_taker_address text, p_maker_pt position_type, p_taker_pt position_type, p_maker_risk numeric, p_taker_risk numeric, p_block_time timestamp with time zone, p_source_block bigint, p_tx_hash text, p_log_index integer)',
+  'service_role -> public.rpc_position_sold(p_network network, p_speculation_id bigint, p_seller text, p_position_type position_type, p_risk_amount numeric, p_profit_amount numeric, p_purchase_price numeric, p_block_time timestamp with time zone, p_tx_hash text, p_log_index integer)',
+  'service_role -> public.rpc_position_transferred(p_network network, p_speculation_id bigint, p_from_address text, p_to_address text, p_position_type position_type, p_risk_amount numeric, p_profit_amount numeric, p_block_time timestamp with time zone, p_source_block bigint, p_tx_hash text, p_log_index integer)',
+  'service_role -> public.rpc_recovery_run_complete(p_id bigint)',
+  'service_role -> public.rpc_recovery_run_fail(p_id bigint, p_phase text, p_error text)',
+  'service_role -> public.rpc_recovery_run_phase(p_id bigint, p_phase text)',
+  'service_role -> public.rpc_recovery_run_start(p_network network, p_kind text, p_from_block bigint, p_to_block bigint, p_fork_point bigint, p_plan jsonb)',
+  'service_role -> public.rpc_user_registered(p_network network, p_leaderboard_id bigint, p_user_address text, p_declared_bankroll numeric, p_block_time timestamp with time zone, p_source_block bigint)',
+  'service_role -> public.tg_games_maintain_earliest_match_time()',
+  'service_role -> public.tg_games_touch_contest_on_match_time()',
+]);
+
+/** The one place membership is decided, on the FULL `role -> function` pair
+ *  where `fn` carries the routine's whole identity, `schema.name(identity
+ *  arguments)` — extracted so a test can hold it to exactly that and nothing
+ *  looser (a role-only, name-only or prefix match would exempt functions
+ *  nobody has looked at, name-only via any overload of a declared name). */
+export function isExemptDefiner(role: string, fn: string): boolean {
+  return DECLARED_DEFINER_EXEMPTIONS.has(`${role} -> ${fn}`);
 }
 
 export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
@@ -794,6 +890,10 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
 
   {
     name: 'no SECURITY DEFINER function carries any checked role past its grants',
+    // Exemptions are DECLARED, per role-and-function pair, in
+    // DECLARED_DEFINER_EXEMPTIONS below — the "decide deliberately that it is
+    // safe" branch of this check's own failure text, decided once and
+    // reviewed, instead of re-decided in chat every time the gate runs.
     async run(query) {
       // The grid and the relation sweep both answer "what may this role touch
       // DIRECTLY". A SECURITY DEFINER function runs as its OWNER, so EXECUTE on
@@ -830,8 +930,16 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
         // admits only reads by their opening verb; widening that to accept
         // `with` would also admit `WITH … INSERT`, which is exactly the thing
         // the sweep exists to refuse.
+        // The fn is the routine's FULL identity — name AND identity arguments —
+        // because overloads are separate functions and each must stand or fall
+        // on its own declaration. And there is deliberately NO row limit: this
+        // statement is the census the verdict is computed from, and a capped
+        // census lets an undeclared row hide behind enough declared ones to
+        // fill the cap (measured: 40 overloads of a declared name sorted ahead
+        // of an undeclared function and a limited build passed). Only the
+        // failure DETAIL truncates, below, and it says when it does.
         `select named.role,
-                n.nspname || '.' || p.proname as fn,
+                n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as fn,
                 exists (select 1 from pg_depend d
                          where d.objid = p.oid
                            and d.classid = 'pg_proc'::regclass
@@ -843,22 +951,48 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
           where n.nspname = 'public'
             and p.prosecdef
             and has_function_privilege(named.role, p.oid, 'EXECUTE')
-          order by 1, 2 limit 40`,
+          order by 1, 2`,
         [[...FORBIDDEN_READERS, READ_API_ROLE]],
       );
       if (rows.length === 0) {
         return { ok: true, detail: 'no role this gate checks may execute a SECURITY DEFINER function' };
       }
-      const named = rows.map((row) => {
+      const exempt: string[] = [];
+      const violating: string[] = [];
+      const present = new Set<string>();
+      for (const row of rows) {
+        const entry = `${String(row['role'])} -> ${String(row['fn'])}`;
+        present.add(entry);
         const platform = row['from_extension'] === true ? ' [extension]' : '';
-        return `${String(row['role'])} -> ${String(row['fn'])}${platform}`;
-      });
+        (isExemptDefiner(String(row['role']), String(row['fn'])) ? exempt : violating)
+          .push(`${entry}${platform}`);
+      }
+      if (violating.length > 0) {
+        // The verdict was computed over EVERY row; only the display truncates,
+        // and it says so with the count, so nothing red can look green.
+        const shown = violating.slice(0, 20);
+        const elided = violating.length - shown.length;
+        return {
+          ok: false,
+          detail:
+            `${violating.length} executable as their owner: ${shown.join(', ')}` +
+            (elided > 0 ? ` … and ${elided} more not displayed` : '') +
+            '. Each one is a path around the ' +
+            'privilege grid above; revoke EXECUTE, or decide deliberately that it is safe by ' +
+            'adding the exact pair to DECLARED_DEFINER_EXEMPTIONS with its reasoning. ' +
+            'Entries marked [extension] belong to an installed extension rather than to this schema.',
+        };
+      }
+      // Pruning hint, not a failure: an exemption whose function is gone should
+      // be removed, but a gate that reddens on a healthy database because the
+      // protocol refactored an RPC is a gate people learn to skip.
+      const unused = [...DECLARED_DEFINER_EXEMPTIONS].filter((entry) => !present.has(entry));
       return {
-        ok: false,
+        ok: true,
         detail:
-          `executable as their owner: ${named.join(', ')}. Each one is a path around the ` +
-          'privilege grid above; revoke EXECUTE, or decide deliberately that it is safe. ' +
-          'Entries marked [extension] belong to an installed extension rather than to this schema.',
+          `${exempt.length} definer grant(s), every one a declared exemption ` +
+          `(service_role's own protocol write path)` +
+          (unused.length > 0 ? `; declared but no longer present, prune: ${unused.join(', ')}` : ''),
       };
     },
   },
@@ -1079,9 +1213,10 @@ async function openGateConnection(): Promise<GateConnection> {
   }
   const pool = new driver.Pool({
     ...servingPoolConfig(resolution.connection),
-    options: READ_ONLY_STARTUP_OPTION,
+    options: GATE_STARTUP_OPTIONS,
     // One connection: the checks are sequential and every one of them must run
-    // against a connection that carried the read-only option.
+    // against a connection that carried the read-only option and the pinned
+    // search path.
     max: 1,
   });
   // Without this, a reset while the gate is running is an uncaught exception

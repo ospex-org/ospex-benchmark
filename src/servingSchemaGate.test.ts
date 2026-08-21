@@ -2,13 +2,17 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   dialsThisMachine,
+  DECLARED_DEFINER_EXEMPTIONS,
   GATE_EXIT,
+  GATE_STARTUP_OPTIONS,
+  isExemptDefiner,
   proveEncrypted,
   proveReadOnly,
   READ_ONLY_STARTUP_OPTION,
   readRowCounts,
   runChecks,
   runSchemaGate,
+  SEARCH_PATH_STARTUP_OPTION,
   SERVING_SCHEMA_CHECKS,
 } from './servingSchemaGate.js';
 import type { GateCheck, GateConnection, GateQuery, SchemaGateDeps } from './servingSchemaGate.js';
@@ -178,6 +182,19 @@ test('the read-only option is the startup parameter, not a SET', () => {
   // A `SET` issued once reaches whichever pooled connection happened to serve
   // it; a startup option is applied by the server to every connection it opens.
   assert.equal(READ_ONLY_STARTUP_OPTION, '-c default_transaction_read_only=on');
+});
+
+test('the gate pins search_path, and carries both startup options together', () => {
+  // The identity-args census renders custom type names relative to the session
+  // search path; unpinned, a role default of `''` would render the protocol's
+  // own RPCs as `public.network` and red a healthy database. Same-mechanism
+  // reasoning as the read-only option: a startup parameter, not a SET, so the
+  // server applies it to every connection it opens. Pinned to `public` because
+  // that is where the exemption spellings were captured; `pg_catalog` is always
+  // searched ahead of it, so built-in types stay bare regardless.
+  assert.equal(SEARCH_PATH_STARTUP_OPTION, '-c search_path=public');
+  assert.ok(GATE_STARTUP_OPTIONS.includes(READ_ONLY_STARTUP_OPTION), 'the read-only proof must survive');
+  assert.ok(GATE_STARTUP_OPTIONS.includes(SEARCH_PATH_STARTUP_OPTION), 'the search_path pin must be present');
 });
 
 // ---------------------------------------------------------------------------
@@ -429,18 +446,116 @@ test('a SECURITY DEFINER function this role can execute is a FAILURE', async () 
   assert.equal((await check.run(async () => [])).ok, true, 'none executable is the healthy state');
 
   const verdict = await check.run(async () => [
-    { role: 'benchmark_writer', fn: 'public.rpc_something', from_extension: false },
+    { role: 'benchmark_writer', fn: 'public.rpc_something(p_id bigint)', from_extension: false },
   ]);
   assert.equal(verdict.ok, false);
-  assert.match(verdict.detail, /benchmark_writer -> public\.rpc_something/);
+  assert.match(verdict.detail, /benchmark_writer -> public\.rpc_something\(p_id bigint\)/);
 
   // Asked for the OTHER roles too: for the writer such a function is a way out
   // of its grants, for a browser-facing key a way in to the projection. A check
   // that asked only about the connected role would close one half.
   const { query, seen } = rowsFor({});
   await check.run(query);
-  assert.match(seen.join('\n'), /has_function_privilege\(named\.role, p\.oid, 'EXECUTE'\)/);
-  assert.match(seen.join('\n'), /rolname = any\(\$1::text\[\]\) or rolname = current_user/);
+  const sql = seen.join('\n');
+  assert.match(sql, /has_function_privilege\(named\.role, p\.oid, 'EXECUTE'\)/);
+  assert.match(sql, /rolname = any\(\$1::text\[\]\) or rolname = current_user/);
+});
+
+test('the definer census carries the FULL routine identity and is never capped', async () => {
+  // Review reproduction (2026-08-21, disposable PG 17): with the fn keyed on
+  // name alone, an undeclared overload `rpc_active_recovery_run(hostile text)`
+  // classified as exempt; and with `limit 40` on the census, 40 overloads of a
+  // declared name sorted ahead of an undeclared `zz_undeclared()` and the gate
+  // passed over a 41-row catalog. Both properties live in the STATEMENT, so
+  // they are asserted on the statement that was sent (no fake can evaluate
+  // SQL) — the behavioural halves are pinned by the tests below and by the
+  // hostile-catalog conformance suite against real PostgreSQL.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('SECURITY DEFINER'));
+  assert.ok(check, 'the function-reachability check is gone');
+  const { query, seen } = rowsFor({});
+  await check.run(query);
+  const census = seen.find((sql) => sql.includes('pg_get_function_identity_arguments'));
+  assert.ok(census, 'the census statement is gone');
+  assert.ok(
+    census.includes("n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as fn"),
+    'fn must be the whole routine identity — name-only keying exempts every overload of a declared name',
+  );
+  assert.doesNotMatch(census, /\blimit\b/i, 'a capped census lets an undeclared row hide beyond the cap');
+  // The three predicates that MAKE this the SECURITY DEFINER check. Each is a
+  // total bypass if flipped or dropped, and none is reachable through the fake
+  // query harness — so pin them on the emitted statement, positively AND
+  // against the inverting mutation, or a `not p.prosecdef` edit ships green in
+  // CI (the census-shape locator alone would still match it). Measured: the
+  // adversarial pass reproduced exactly that against the unit suite.
+  assert.match(census, /\band p\.prosecdef\b/, 'must census only SECURITY DEFINER functions');
+  assert.doesNotMatch(census, /not\s+p\.prosecdef/, 'a negated predicate blinds the check to every definer function');
+  assert.match(census, /has_function_privilege\(named\.role, p\.oid, 'EXECUTE'\)/, 'must ask about EXECUTE for the role');
+  assert.match(census, /n\.nspname = 'public'/, 'must be scoped to the public schema, as documented');
+});
+
+test('an undeclared row cannot hide behind 40 declared ones', async () => {
+  // The classification layer's half of the truncation guarantee: 41 rows, the
+  // undeclared one SORTED LAST — exactly where a leading cap would cut. Only a
+  // build that classifies every row can name it.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('SECURITY DEFINER'));
+  assert.ok(check, 'the function-reachability check is gone');
+  const declared = [...DECLARED_DEFINER_EXEMPTIONS].map((entry) => {
+    const [role, fn] = entry.split(' -> ');
+    return { role, fn, from_extension: false };
+  });
+  const forty = Array.from({ length: 40 }, (_, i) => declared[i % declared.length]!);
+  const verdict = await check.run(async () => [
+    ...forty,
+    { role: 'service_role', fn: 'public.zz_undeclared()', from_extension: false },
+  ]);
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.detail, /service_role -> public\.zz_undeclared\(\)/);
+});
+
+test('the failure header states the WHOLE violating count, not the truncated display count', async () => {
+  // The detail shows at most 20 violating rows and then "… and N more not
+  // displayed"; the leading count must be the full census, never the shown
+  // slice, or a red verdict under-reports how many doors are open. Every OTHER
+  // definer fixture has exactly one violating row, where violating.length and
+  // shown.length coincide and cannot tell a `${shown.length}` mutation apart —
+  // so this fixture deliberately sits ABOVE the display cap. Guarded so a later
+  // edit cannot quietly drop it back under 20 and un-discriminate the test.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('SECURITY DEFINER'));
+  assert.ok(check, 'the function-reachability check is gone');
+  const DISPLAY_CAP = 20;
+  const violatingRows = Array.from({ length: 25 }, (_, i) => ({
+    role: 'service_role',
+    fn: `public.zz_undeclared_${String(i).padStart(2, '0')}()`,
+    from_extension: false,
+  }));
+  assert.ok(violatingRows.length > DISPLAY_CAP, 'the fixture must exceed the display cap to discriminate');
+  const verdict = await check.run(async () => violatingRows);
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.detail, /^25 executable/, 'the header counts every violating row, not the 20 shown');
+  assert.doesNotMatch(verdict.detail, /^20 executable/, 'a truncated-count header would read 20 here');
+  assert.match(verdict.detail, /and 5 more not displayed/, 'the elided remainder is announced with its own count');
+});
+
+test('an overload of a declared name is refused unless its own signature is declared', async () => {
+  // Overloads are separate functions. The declared signature stays exempt; the
+  // same name under ANY other argument list is a function nobody has reviewed.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('SECURITY DEFINER'));
+  assert.ok(check, 'the function-reachability check is gone');
+  const [first] = DECLARED_DEFINER_EXEMPTIONS;
+  const declaredFn = first!.split(' -> ')[1]!;
+  const overloadFn = declaredFn.replace(/\(.*\)$/, '(hostile text)');
+  assert.notEqual(overloadFn, declaredFn, 'the fixture must differ in arguments only');
+  const verdict = await check.run(async () => [
+    { role: 'service_role', fn: declaredFn, from_extension: false },
+    { role: 'service_role', fn: overloadFn, from_extension: false },
+  ]);
+  assert.equal(verdict.ok, false, 'the undeclared overload must redden the gate');
+  assert.ok(verdict.detail.includes(`service_role -> ${overloadFn}`), 'and be named exactly');
+  assert.ok(
+    !verdict.detail.startsWith('2 executable'),
+    'the declared signature is still exempt — exactly one row violates',
+  );
+  assert.ok(verdict.detail.startsWith('1 executable'), 'the count states the whole census');
 });
 
 test('the forbidden-reader question covers every verb, not just the reads', async () => {
@@ -456,4 +571,46 @@ test('the forbidden-reader question covers every verb, not just the reads', asyn
   assert.match(sql, /unnest\(\$3::text\[\]\) as v/, 'the verbs must be a parameter, not two hard-coded reads');
   assert.match(sql, /has_table_privilege\(r, 'public\.' \|\| t, v\)/);
   assert.match(sql, /has_any_column_privilege\(r, 'public\.' \|\| t, v\)/);
+});
+
+test('definer exemptions may only ever name the read API, exactly, one pair at a time', () => {
+  // The roles this check exists to keep OUT of definer functions can never be
+  // exempted: an entry for the writer would be a declared way out of its own
+  // grants, and one for a browser key a declared way in. Refused by SHAPE, so
+  // the review that would catch it does not have to be the last line.
+  assert.ok(DECLARED_DEFINER_EXEMPTIONS.size > 0);
+  for (const entry of DECLARED_DEFINER_EXEMPTIONS) {
+    // The parenthesised identity-argument list is REQUIRED: an entry without
+    // one can never match what the census emits, and a name-only entry is the
+    // shape that exempted an unreviewed overload. The argument character class
+    // is deliberately narrow — the 18 shipped signatures need nothing more,
+    // and a future entry needing more (array types, quoted identifiers) should
+    // widen it here, consciously, in review.
+    assert.match(
+      entry,
+      /^service_role -> public\.[a-z0-9_]+\([a-z0-9_, ]*\)$/,
+      `${entry}: an exemption is service_role, one exact public function WITH its identity arguments, nothing else`,
+    );
+  }
+});
+
+test('exemption membership is the FULL role-and-function pair, nothing looser', () => {
+  const [first] = DECLARED_DEFINER_EXEMPTIONS;
+  const fn = first!.split(' -> ')[1]!;
+  assert.equal(isExemptDefiner('service_role', fn), true);
+  // The half a role-only or prefix match would get wrong, one case each:
+  // the SAME function under a role that may never hold an exemption...
+  assert.equal(isExemptDefiner('benchmark_writer', fn), false);
+  assert.equal(isExemptDefiner('anon', fn), false);
+  // ...an UNLISTED function under the exempted role — a new definer RPC
+  // must arrive as a gate failure until someone looks at it and declares it...
+  assert.equal(isExemptDefiner('service_role', 'public.rpc_added_next_week(p_id bigint)'), false);
+  // ...and the SAME NAME with different identity arguments: an overload is a
+  // separate function, and membership on the name alone would exempt every
+  // overload anyone ever creates under it.
+  const overload = fn.replace(/\(.*\)$/, '(hostile text)');
+  assert.notEqual(overload, fn);
+  assert.equal(isExemptDefiner('service_role', overload), false);
+  // The bare name — the pre-fix key shape — may never match an entry again.
+  assert.equal(isExemptDefiner('service_role', fn.replace(/\(.*\)$/, '')), false);
 });
