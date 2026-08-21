@@ -101,7 +101,7 @@ The envelope is what makes an audit re-derivable. A per-attempt web-search audit
 yarn replay:search-audit out/<runId>.ndjson
 ```
 
-re-extracts every attempt's audit from its retained envelope and reports where the result now differs. It reads the named files only: no provider is called and nothing is billed.
+re-extracts every attempt's audit from its retained envelope and reports where the result now differs. It reads the named files only: no provider is called and nothing is billed. On a **dry run** it reports every leg as changed, and that is correct: a mock's recorded audit is a hand-built fixture rather than something extracted from its (also synthetic) body, so the two are not meant to agree. On a live run a changed leg means the parser now reads that response differently than it did at the time.
 
 The body is stored **as received** — not canonicalized, not re-serialized — because key order, whitespace and number formatting are part of what identifies an unrecognized shape. Credential values are substituted out before the digest is taken, so the digest covers exactly what is stored; credentials travel only in request headers, and no header is ever recorded. Retention covers the 2xx-with-parseable-JSON path; a non-2xx body and a 200 that is not JSON keep their existing truncated error detail, since a provider error body is the likeliest place request content is echoed back.
 

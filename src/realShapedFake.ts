@@ -48,6 +48,13 @@ export interface RealShapedFakeOptions {
  * between a dry run and a live one — the scorer's envelope check then runs on
  * every dry-run artifact rather than only on runs nobody can produce locally —
  * and its `synthetic` marker says plainly that no provider ever sent it.
+ *
+ * One consequence worth knowing before it surprises someone: a fake's recorded
+ * `searchAudit` is a hand-built fixture, not something extracted from this
+ * body, so `yarn replay:search-audit` reports every dry-run leg as CHANGED.
+ * That is the replay working — it says this run's audits are not derivable
+ * from its retained bodies, which is true of a fake and would be a red flag on
+ * a live run.
  */
 function syntheticEnvelope(fields: {
   source: string;
