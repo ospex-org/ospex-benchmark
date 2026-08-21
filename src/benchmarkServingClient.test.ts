@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import {
   describeServingStatus,
   REQUIRED_SERVING_CAPABILITY,
+  SCORES_SERVING_CAPABILITY,
   openBenchmarkServing,
   servingPoolConfig,
   QUERY_TIMEOUT_MS,
@@ -245,7 +246,7 @@ const PROBE_DEADLINE_MS = 12_000;
  * through the handle a run holds — a different call site, and until this case
  * existed nothing in the suite reached it.
  */
-for (const mode of ['held', 'stale', 'bogus', 'enabled'] as const) {
+for (const mode of ['held', 'stale', 'bogus', 'scores-held', 'enabled'] as const) {
   test(`a process whose database stopped answering still EXITS (${mode})`, { timeout: 60_000 }, async () => {
     // THE guarantee of this module, and the one no promise-level assertion can
     // make: `close()` resolving says nothing about whether Node can drain its
@@ -286,8 +287,22 @@ ${closed.out}`);
       // The reviewer's case: a database whose schema has the lookalike
       // columns and none of the contract. A column-name check opened against
       // it; a capability VERSION refuses it.
-      assert.ok(REQUIRED_SERVING_CAPABILITY > 1,
-        'the probe reports capability 1, so the requirement must exceed it to discriminate');
+      const answered = /stale: capabilityAnswer=(\S+)/.exec(closed.out)?.[1];
+      assert.ok(answered !== undefined && REQUIRED_SERVING_CAPABILITY > Number(answered),
+        `the probe answered ${answered}, so the requirement must exceed it to discriminate`);
+    }
+    if (mode === 'scores-held') {
+      // The premise that makes this mode discriminate, read from what the
+      // probe's server actually ANSWERED rather than restated as prose: the
+      // answer satisfies every run path and falls short of the scores
+      // requirement. If the constants ever collapse onto the answer, this
+      // mode pins nothing and must be redesigned rather than quietly passing.
+      const answered = Number(/scores-held: capabilityAnswer=(\S+)/.exec(closed.out)?.[1]);
+      assert.ok(Number.isInteger(answered), `the probe never reported its answer. Output:\n${closed.out}`);
+      assert.ok(REQUIRED_SERVING_CAPABILITY <= answered,
+        `the answer (${answered}) must satisfy the run paths (${REQUIRED_SERVING_CAPABILITY})`);
+      assert.ok(SCORES_SERVING_CAPABILITY > answered,
+        `and must fall short of the scores requirement (${SCORES_SERVING_CAPABILITY}), or nothing here discriminates`);
     }
     if (mode === 'enabled') {
       // And the write really was left in flight on a pinned client, rather than

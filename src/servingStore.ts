@@ -488,6 +488,22 @@ export interface DecisionRationale {
  *  carried side by side because a read path must never show one alone. */
 export interface DecisionScore {
   readonly decision: DecisionRef;
+  /**
+   * The run the scored artifact says it scored. The decision is resolved by its
+   * natural key alone, so without this the score would attach to whatever
+   * decision that key resolves to — including one from a DIFFERENT execution of
+   * the same slate, whose entry prices the CLV was never computed against. The
+   * statement compares it against the stored decision's `run_id` and reports a
+   * disagreement as a contradiction rather than landing the row.
+   */
+  readonly runId: string;
+  /**
+   * The run label, stamped on every scored record by the scorer and carried
+   * onto every published row, so a read path can decide leaderboard
+   * eligibility later without republishing — the rows are insert-once, so a
+   * label that does not land with the row can never land at all.
+   */
+  readonly label: string;
   readonly scoringPolicyVersion: string;
   readonly economicClvPct: number | null;
   readonly marginAdjustedClvPct: number | null;
@@ -987,6 +1003,8 @@ function scorePayload(score: DecisionScore): Record<string, unknown> {
   }
   return {
     ...decisionRef(score.decision, 'decision'),
+    run_id: id(score.runId, 'runId'),
+    label: requiredText(score.label, 'label'),
     scoring_policy_version: requiredText(score.scoringPolicyVersion, 'scoringPolicyVersion'),
     economic_clv_pct: num(score.economicClvPct, 'economicClvPct'),
     margin_adjusted_clv_pct: num(score.marginAdjustedClvPct, 'marginAdjustedClvPct'),
@@ -1530,11 +1548,36 @@ select (select min(f) from drift)          as contradiction,
  * rescore under a NEW version adds a row beside the old one and never overwrites
  * it. `yarn score` rewrites its NDJSON in place under a gitignored `out/`, so
  * this is where a superseded score keeps a home.
+ *
+ * Two drift sources, and what each one binds:
+ *
+ *   run binding    the decision is resolved by its natural key, which says
+ *                  nothing about WHICH execution of the slate it came from. A
+ *                  scored artifact from a re-run of the same cohort carries CLV
+ *                  computed against entry prices the stored decision never
+ *                  committed to, and landing it would misattribute every value
+ *                  on the row. The stored decision's run_id is the arbiter.
+ *
+ *   value drift    the conflict target is DO NOTHING, so without this a second
+ *                  pass under the SAME policy version whose values disagree —
+ *                  a close that arrived after an early scoring pass is the
+ *                  realistic shape — would be absorbed as `duplicate`: a benign
+ *                  repeat, when the stored row and the artifact in hand say
+ *                  different things. An immutable fact that is not
+ *                  drift-compared is absorbed silently.
+ *
+ * `scored_at`, `source_path` and `source_sha256` are deliberately OUTSIDE the
+ * drift comparison. They describe the scoring PASS, not the score: re-running
+ * `yarn score` over the same run file under the same policy produces identical
+ * values with a fresh timestamp in a fresh file, and comparing pass provenance
+ * would turn that legitimate recovery into a permanent contradiction — the one
+ * republish path a fail-soft publisher cannot afford to close.
  */
 const SCORE_SQL = `
 with input as (
   select * from jsonb_to_record($1::jsonb) as x(
     cohort_id text, participant_id text, game_id text, market text,
+    run_id text, label text,
     scoring_policy_version text, economic_clv_pct numeric(12,6),
     margin_adjusted_clv_pct numeric(12,6), devig_method text, ladder_version text,
     ladder_param_version text, refused boolean, refusal_reason text,
@@ -1543,31 +1586,68 @@ with input as (
     close_line numeric(10,4), line_movement_favorable numeric(10,4),
     scored_at timestamptz, source_path text, source_sha256 text)
 ), parent as (
-  select d.id
+  select d.id, d.run_id
     from public.benchmark_decisions d, input
    where d.cohort_id = input.cohort_id
      and d.participant_id = input.participant_id
      and d.game_id = input.game_id
      and d.market = input.market
+), drift as (
+  select 'score.runId' as f
+    from parent, input
+   where parent.run_id is distinct from input.run_id
+  union all
+  -- Scoped to the SAME policy version: a rescore under a new version is a new
+  -- row beside the old one by design, and must not be judged against it. The
+  -- numeric comparisons happen at the column scales because the record
+  -- declaration above already applied them to the input.
+  select coalesce(t.f, 'drift.unlabelled') as f
+    from public.benchmark_scores s, parent, input,
+         lateral unnest(
+           array['score.label','score.economicClvPct','score.marginAdjustedClvPct',
+                 'score.devigMethod','score.ladderVersion','score.ladderParamVersion',
+                 'score.refused','score.refusalReason','score.scheduleChanged',
+                 'score.heldOutOfPrimary','score.closeDecimalSelected',
+                 'score.closeDecimalOpposing','score.closeLine',
+                 'score.lineMovementFavorable'],
+           array[s.label                   is distinct from input.label,
+                 s.economic_clv_pct        is distinct from input.economic_clv_pct,
+                 s.margin_adjusted_clv_pct is distinct from input.margin_adjusted_clv_pct,
+                 s.devig_method            is distinct from input.devig_method,
+                 s.ladder_version          is distinct from input.ladder_version,
+                 s.ladder_param_version    is distinct from input.ladder_param_version,
+                 s.refused                 is distinct from input.refused,
+                 s.refusal_reason          is distinct from input.refusal_reason,
+                 s.schedule_changed        is distinct from input.schedule_changed,
+                 s.held_out_of_primary     is distinct from input.held_out_of_primary,
+                 s.close_decimal_selected  is distinct from input.close_decimal_selected,
+                 s.close_decimal_opposing  is distinct from input.close_decimal_opposing,
+                 s.close_line              is distinct from input.close_line,
+                 s.line_movement_favorable is distinct from input.line_movement_favorable]
+         ) as t(f, differs)
+   where s.decision_id = parent.id
+     and s.scoring_policy_version = input.scoring_policy_version
+     and coalesce(t.differs, true)
 ), ins as (
   insert into public.benchmark_scores
-    (decision_id, scoring_policy_version, economic_clv_pct, margin_adjusted_clv_pct,
+    (decision_id, label, scoring_policy_version, economic_clv_pct, margin_adjusted_clv_pct,
      devig_method, ladder_version, ladder_param_version, refused, refusal_reason,
      schedule_changed, held_out_of_primary, close_decimal_selected,
      close_decimal_opposing, close_line, line_movement_favorable, scored_at,
      source_path, source_sha256)
-  select parent.id, input.scoring_policy_version, input.economic_clv_pct,
+  select parent.id, input.label, input.scoring_policy_version, input.economic_clv_pct,
          input.margin_adjusted_clv_pct, input.devig_method, input.ladder_version,
          input.ladder_param_version, input.refused, input.refusal_reason,
          input.schedule_changed, input.held_out_of_primary, input.close_decimal_selected,
          input.close_decimal_opposing, input.close_line, input.line_movement_favorable,
          input.scored_at, input.source_path, input.source_sha256
     from parent, input
+   where not exists (select 1 from drift)
   on conflict on constraint uq_benchmark_score_per_policy do nothing
   returning 1
 )
-select null::text                          as contradiction,
-       0                                   as drift_rows,
+select (select min(f) from drift)          as contradiction,
+       (select count(*) from drift)::int   as drift_rows,
        null::text                          as ineligible_reason,
        (select count(*) from parent)::int  as parent_found,
        (select count(*) from ins)::int     as inserted`;
@@ -1808,7 +1888,12 @@ export class SqlBenchmarkServingPort implements BenchmarkServingPort {
   }
 
   publishScore(score: DecisionScore): Promise<PublishOutcome> {
-    return this.publish(SCORE_SQL, () => scorePayload(score));
+    // Serialized for the same reason a seal is: the statement drift-compares
+    // the stored row, and inside a lone statement that read uses a snapshot
+    // taken before the statement began — a concurrent writer's different score
+    // would be invisible and absorbed as `duplicate`. The lock keys are the
+    // participant and cohort already present in the payload.
+    return this.publish(SCORE_SQL, () => scorePayload(score), true);
   }
 
   publishScoringRun(run: ScoringRun): Promise<PublishOutcome> {

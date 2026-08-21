@@ -3,6 +3,11 @@ import { basename } from 'node:path';
 import { sha256Hex } from './canonical.js';
 import { describeError } from './config.js';
 import {
+  parseScoredArtifact,
+  projectScoredRun,
+  publishableScoredRun,
+} from './scoredProjection.js';
+import {
   parseRunArtifact,
   projectRun,
   publishableRun,
@@ -10,7 +15,7 @@ import {
   verifyArtifactIntegrity,
 } from './servingProjection.js';
 import type { ProjectedDecision, ProjectionPlan } from './servingProjection.js';
-import type { BenchmarkServingPort, PublishOutcome, SourceRef } from './servingStore.js';
+import type { BenchmarkServingPort, DecisionScore, PublishOutcome, SourceRef } from './servingStore.js';
 
 /**
  * Writes a run artifact onto the serving projection, and says what happened.
@@ -479,6 +484,149 @@ export async function mirrorRunArtifact(
     }
     return null;
   }
+}
+
+/**
+ * Publish the scores of one scored artifact.
+ *
+ * The scored sibling of `publishPlan`, under the same budget discipline: one
+ * budget for the whole publication, consulted before EVERY write. Score rows
+ * are independent of each other — each resolves its own decision — so there is
+ * no phase ordering here, just batches at the pool's own width.
+ */
+export async function publishScores(
+  port: BenchmarkServingPort,
+  scores: readonly DecisionScore[],
+  log: PublishLog,
+  timing: PublishTiming = {},
+): Promise<PublishSummary> {
+  const nowMs = timing.nowMs ?? publicationNowMs;
+  const deadlineMs = timing.deadlineMs ?? PUBLICATION_DEADLINE_MS;
+  const perWriteTimeoutMs = timing.perWriteTimeoutMs ?? PER_WRITE_TIMEOUT_MS;
+  const tally = new Tally();
+  const budget = new Budget(nowMs, nowMs() + deadlineMs, perWriteTimeoutMs);
+
+  await inBatches(scores, async (score) => {
+    if (budget.spent()) return;
+    const what = `score ${score.decision.participantId} / ${score.decision.gameId} / ${score.decision.market}`;
+    tally.record(await settle(() => port.publishScore(score), budget.slice()), what, log);
+  });
+
+  if (budget.abandoned > 0) {
+    const reason =
+      `${budget.abandoned} write(s) abandoned — the projection did not finish within ` +
+      `${deadlineMs}ms. Republish this scored artifact to complete it.`;
+    tally.skipped.push(reason);
+    log.error(`serving projection: ${reason}`);
+  }
+
+  return tally.summary();
+}
+
+/**
+ * Read a written scored artifact and mirror it onto the projection.
+ *
+ * The scored sibling of `publishRunArtifact`, and the same shape on purpose:
+ * the artifact is the canonical record, the projection is a view of it, and a
+ * recovery republish is this same call on the same bytes. The file is read
+ * back rather than trusting anything in memory, so nothing is published until
+ * the artifact is durable and `source_sha256` names bytes a reader can check.
+ *
+ * There is no `verifyArtifactIntegrity` analog here, and that is a property of
+ * the artifact rather than a gap: a scored file carries no frozen bundle to
+ * re-hash and no seal/reveal pair to reconcile. Its reader IS the gate's
+ * schema — the strictest one in the repo for these records, because it is the
+ * only one — and everything else it claims is bound to the run artifact the
+ * scorer verified before writing it.
+ */
+export async function publishScoredArtifact(
+  port: BenchmarkServingPort,
+  scoredFile: string,
+  log: PublishLog,
+): Promise<PublishSummary> {
+  const refuse = (reason: string): PublishSummary => {
+    log.line(`serving projection: skipped this scored artifact (${reason})`);
+    return {
+      published: 0,
+      duplicate: 0,
+      rejected: {},
+      skipped: [reason],
+      disabled: false,
+      gateRefusal: reason,
+    };
+  };
+
+  let text: string;
+  try {
+    text = readFileSync(scoredFile, 'utf8');
+  } catch (error) {
+    return refuse(`the artifact could not be read (${describeError(error)})`);
+  }
+
+  let records: ReturnType<typeof parseScoredArtifact>;
+  try {
+    records = parseScoredArtifact(text);
+  } catch (error) {
+    return refuse(describeError(error));
+  }
+
+  const gate = publishableScoredRun(records);
+  if (!gate.publishable) return refuse(gate.reason);
+
+  const source: SourceRef = {
+    // The basename, never the full path — same reasoning as the run path: an
+    // absolute path here is an operator's home directory destined for a public
+    // page, and redaction knows nothing about usernames.
+    sourcePath: basename(scoredFile),
+    sourceSha256: sha256Hex(text),
+  };
+
+  const summary = await publishScores(port, projectScoredRun(gate.header, gate.decisions, source), log);
+  log.line(describeSummary(summary));
+  for (const reason of summary.skipped) log.line(`  not published — ${reason}`);
+  return summary;
+}
+
+/**
+ * How many of one file's rows a publish-only command must answer for.
+ *
+ * FOUR ways such a command fails, and every one of them has to reach the exit
+ * code. Its whole contract is that it exists only to publish, so anything
+ * short of publishing the artifact is a failure — and a partial success is the
+ * most dangerous of them, because it looks like a success to a script and
+ * leaves a gap nobody goes looking for.
+ *
+ *   rejected      the projection would not take a row.
+ *   gateRefusal   the file was turned away before anything was sent.
+ *   skipped       rows this side declined — work abandoned at the deadline,
+ *                 or (on the run path) a reveal that did not reproduce its
+ *                 seal. Measured: a run published 16 rows, silently omitted an
+ *                 entire model, and exited 0.
+ *   nothing       an enabled publisher that wrote no row and found none
+ *                 already present did not do the one thing it is for.
+ *
+ * Shared by `yarn project`, `yarn project:scores` and `yarn score --publish`,
+ * because three hand-written copies of a failure taxonomy are three chances
+ * for one of them to lose a case. ⚠ The run paths (`watch`, `smoke`) must
+ * never consult this — there the projection is a side effect and a missing
+ * row must not fail a night.
+ */
+export function unpublishedCount(summary: PublishSummary, file: string, log: PublishLog): number {
+  let failed = Object.values(summary.rejected).reduce((total, count) => total + count, 0);
+  failed += summary.skipped.length;
+  if (summary.gateRefusal !== null) {
+    log.error(`${file}: nothing was published — ${summary.gateRefusal}`);
+    failed += 1;
+  } else if (summary.published === 0 && summary.duplicate === 0) {
+    log.error(`${file}: the publisher is enabled but wrote nothing and found nothing`);
+    failed += 1;
+  } else if (summary.skipped.length > 0) {
+    log.error(
+      `${file}: PARTIAL — ${summary.published} written, ${summary.skipped.length} not sent. ` +
+        'The projection does not hold this artifact in full.',
+    );
+  }
+  return failed;
 }
 
 export function describeSummary(summary: PublishSummary): string {

@@ -1,6 +1,6 @@
 import { pathToFileURL } from 'node:url';
 import {
-  REQUIRED_SERVING_CAPABILITY,
+  SCORES_SERVING_CAPABILITY,
   SERVING_POOL_MAX,
   servingPoolConfig,
 } from './benchmarkServingClient.js';
@@ -390,7 +390,13 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
   },
 
   {
-    name: `the schema reports serving_projection capability ${REQUIRED_SERVING_CAPABILITY} or higher`,
+    // The gate preflights the WHOLE write surface — the scores statement
+    // included — so it asks for the highest capability any of this build's
+    // publishers needs. The run paths themselves still open at the lower
+    // REQUIRED_SERVING_CAPABILITY: a schema this check fails can be fine for a
+    // watch night, and the statement-planning check below says which half is
+    // affected.
+    name: `the schema reports serving_projection capability ${SCORES_SERVING_CAPABILITY} or higher`,
     async run(query) {
       const rows = await query(
         `select version from public.${CAPABILITY_TABLE} where capability = $1`,
@@ -409,8 +415,8 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
         };
       }
       return {
-        ok: version >= REQUIRED_SERVING_CAPABILITY,
-        detail: `serving_projection = ${version} (this build requires ${REQUIRED_SERVING_CAPABILITY})`,
+        ok: version >= SCORES_SERVING_CAPABILITY,
+        detail: `serving_projection = ${version} (this build requires ${SCORES_SERVING_CAPABILITY})`,
       };
     },
   },

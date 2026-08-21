@@ -22,7 +22,7 @@ import {
   fingerprintFromParsed,
   validateResponseText,
 } from './schema.js';
-import { AXIS_NAMES, SMOKE_LABEL } from './types.js';
+import { AXIS_NAMES } from './types.js';
 import type { ResponseSchemaVersion } from './schema.js';
 import type { BaselinePolicyVersion } from './baselines.js';
 import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
@@ -69,8 +69,15 @@ import type { ArmSpec, AxisName, ClosingLineRow, MarketKey, ProviderName, SlateB
  * is discarded). Reason vocabulary, aggregation membership, and the
  * scored-record/scorecard shape all change, so this must not share a
  * methodology identity with v0.5.0.
+ * v0.6.1 makes the scored artifact SELF-DESCRIBING about completeness:
+ * `scored_run_meta` now declares `participantScorecards` beside `picks`, so a
+ * reader can hold the file to its own declared record counts — a truncated
+ * artifact is caught disagreeing with itself instead of publishing a partial
+ * pass that looks complete. No scoring math, membership, or per-record shape
+ * changes; the bump exists because the meta record's shape is part of the
+ * artifact contract and readers key strictness off this identity.
  */
-export const SCORING_POLICY_VERSION = 'scoring-v0.6.0';
+export const SCORING_POLICY_VERSION = 'scoring-v0.6.1';
 
 /**
  * Schedule-change tolerance for the `yarn score` path, in milliseconds.
@@ -2718,7 +2725,13 @@ export function scoredRecords(
   const records: Array<Record<string, unknown>> = [];
   records.push({
     recordType: 'scored_run_meta',
-    label: SMOKE_LABEL,
+    // The RUN's own label, never the constant: the label is the read-path
+    // eligibility handle the serving projection carries on every row, so a
+    // scored record claiming a label its source run does not have would
+    // misfile the whole pass the day the operator mints a non-smoke label.
+    // Today every run file carries SMOKE_LABEL, which is why hardcoding it
+    // here survived — a latent misbinding, caught in review.
+    label: run.label,
     runId: run.runId,
     cohortId: run.cohortId,
     slateDate: run.slateDate,
@@ -2772,6 +2785,12 @@ export function scoredRecords(
         'The recorded lock is the scheduled start as known at capture — a PREDICTION of first pitch, never ground truth. These gates do NOT detect a start that moved EARLIER without the upstream capture noticing: in that case the lock, the schedule row it was copied from, and the frozen bundle start are the SAME wrong instant, and no comparison available to this scorer can separate them. Detecting that needs an independent start-time source (the on-chain contest start served by the public API, or a league schedule feed)',
     },
     picks: scored.length,
+    // Beside `picks`, the OTHER record count this file carries. Together they
+    // are what lets a reader hold the artifact to its own declared contents:
+    // every published score row binds this file whole via source_sha256, so a
+    // trailing truncation has to be detectable from the file alone — the same
+    // count-vs-records cross-check the run artifact's canonical reader does.
+    participantScorecards: stats.length,
     // Stratum-aware, to agree with the per-participant aggregates: a
     // rescheduled pick is not a member of the primary estimate even though
     // its CLV is present on its own record.
@@ -2795,7 +2814,7 @@ export function scoredRecords(
     const game = run.games.get(pick.gameId);
     records.push({
       recordType: 'scored_decision',
-      label: SMOKE_LABEL,
+      label: run.label,
       runId: run.runId,
       scoredAt,
       scoringPolicyVersion: SCORING_POLICY_VERSION,
@@ -2856,7 +2875,7 @@ export function scoredRecords(
   for (const stat of stats) {
     records.push({
       recordType: 'participant_scorecard',
-      label: SMOKE_LABEL,
+      label: run.label,
       runId: run.runId,
       scoredAt,
       scoringPolicyVersion: SCORING_POLICY_VERSION,

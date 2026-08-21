@@ -4,7 +4,7 @@ import { describeServingStatus, openBenchmarkServing } from './benchmarkServingC
 import { describeErrorWithStack } from './config.js';
 import { loadDotEnv } from './env.js';
 import { printError, printLine } from './console.js';
-import { publishRunArtifact } from './servingPublisher.js';
+import { publishRunArtifact, unpublishedCount } from './servingPublisher.js';
 import type { BenchmarkServingHandle } from './benchmarkServingClient.js';
 import type { PublishLog, PublishSummary } from './servingPublisher.js';
 import type { BenchmarkServingPort } from './servingStore.js';
@@ -96,23 +96,35 @@ export interface ProjectMainDeps {
   readonly log: PublishLog;
 }
 
-export async function runProjectMain(deps: ProjectMainDeps): Promise<number> {
+/** The words that differ between the two publish-only commands. Nothing else
+ *  may: they share one exit-code contract, and a shared implementation is what
+ *  keeps a case from being lost in one of two hand-written copies. */
+export interface ProjectCliWording {
+  readonly usage: string;
+  /** Names what a missing argument was supposed to be, e.g. `run file`. */
+  readonly missingNoun: string;
+}
+
+export async function runProjectionCli(
+  deps: ProjectMainDeps,
+  wording: ProjectCliWording,
+): Promise<number> {
   const files = deps.argv.filter((argument) => !argument.startsWith('-'));
   const { line: printLine, error: printError } = deps.log;
   // Asking for help and getting it is not a failure, with or without a file
   // argument beside it. Only an invocation that names no work is a usage error.
   if (deps.argv.includes('--help') || deps.argv.includes('-h')) {
-    printLine(USAGE);
+    printLine(wording.usage);
     return PROJECT_EXIT.ok;
   }
   if (files.length === 0) {
-    printLine(USAGE);
+    printLine(wording.usage);
     return PROJECT_EXIT.usage;
   }
 
   const missing = files.filter((file) => !deps.exists(file));
   if (missing.length > 0) {
-    printError(`no such run file: ${missing.join(', ')}`);
+    printError(`no such ${wording.missingNoun}: ${missing.join(', ')}`);
     return PROJECT_EXIT.usage;
   }
 
@@ -133,34 +145,9 @@ export async function runProjectMain(deps: ProjectMainDeps): Promise<number> {
     for (const file of files) {
       printLine(`— ${file}`);
       const summary = await deps.publish(serving.port, file, deps.log);
-      // FOUR ways this command fails, and every one of them has to reach the
-      // exit code. Its whole contract is that it exists only to publish, so
-      // anything short of publishing the artifact is a failure — and a partial
-      // success is the most dangerous of them, because it looks like a success
-      // to a script and leaves a gap nobody goes looking for.
-      //
-      //   rejected      the projection would not take a row.
-      //   gateRefusal   the file was turned away before anything was sent.
-      //   skipped       rows this side declined — an unenrolled participant, a
-      //                 reveal that did not reproduce its seal, work abandoned
-      //                 at the deadline. Measured: a run published 16 rows,
-      //                 silently omitted an entire model, and exited 0.
-      //   nothing       an enabled publisher that wrote no row and found none
-      //                 already present did not do the one thing it is for.
-      const rejected = Object.values(summary.rejected).reduce((total, count) => total + count, 0);
-      failed += rejected + summary.skipped.length;
-      if (summary.gateRefusal !== null) {
-        printError(`${file}: nothing was published — ${summary.gateRefusal}`);
-        failed += 1;
-      } else if (summary.published === 0 && summary.duplicate === 0) {
-        printError(`${file}: the publisher is enabled but wrote nothing and found nothing`);
-        failed += 1;
-      } else if (summary.skipped.length > 0) {
-        printError(
-          `${file}: PARTIAL — ${summary.published} written, ${summary.skipped.length} not sent. ` +
-            'The projection does not hold this run in full.',
-        );
-      }
+      // The failure taxonomy lives beside the summary type it reads — see
+      // `unpublishedCount`. Everything short of full publication counts.
+      failed += unpublishedCount(summary, file, deps.log);
     }
   } finally {
     await serving.close();
@@ -170,6 +157,10 @@ export async function runProjectMain(deps: ProjectMainDeps): Promise<number> {
   // publish IS its failure. Nothing else in the repo treats a projection
   // problem this way, and nothing else should.
   return failed > 0 ? PROJECT_EXIT.publishFailed : PROJECT_EXIT.ok;
+}
+
+export async function runProjectMain(deps: ProjectMainDeps): Promise<number> {
+  return runProjectionCli(deps, { usage: USAGE, missingNoun: 'run file' });
 }
 
 /** The same guard the other entry points use: importing this module for its

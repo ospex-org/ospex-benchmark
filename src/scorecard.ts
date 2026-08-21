@@ -3,6 +3,7 @@ import { LADDER_VERSION, MAX_LADDER_LINE } from './ladder.js';
 import { MARKETS, SCHEDULE_CHANGE_TOLERANCE_MS, SCORING_POLICY_VERSION } from './scoring.js';
 import type { LadderParams } from './ladder.js';
 import type { MarketStats, ParticipantStats, ScoredPick, SourceRun } from './scoring.js';
+import { SMOKE_LABEL } from './types.js';
 import type { MarketKey } from './types.js';
 
 /**
@@ -135,7 +136,14 @@ export function buildScorecardMarkdown(
 
   lines.push(`# Reference-closing CLV scorecard — ${run.slateDate}`);
   lines.push('');
-  lines.push('**Label: `SMOKE_V0_NOT_A_COHORT`** — pipeline shakedown, not a scored cohort.');
+  // The RUN's label, not a constant — the scored records derive theirs the
+  // same way. The shakedown warning belongs to the smoke label specifically;
+  // a run under any other label must not inherit smoke prose.
+  lines.push(
+    run.label === SMOKE_LABEL
+      ? `**Label: \`${run.label}\`** — pipeline shakedown, not a scored cohort.`
+      : `**Label: \`${run.label}\`**`,
+  );
   lines.push(
     run.watch !== null && run.runId.startsWith('watch-v0-')
       ? `Entry prices are the first-eligible board, fired at detection under the late-detection gate ` +

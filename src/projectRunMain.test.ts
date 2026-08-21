@@ -145,6 +145,16 @@ test('a gate refusal, an empty publication and a PARTIAL one all fail', async ()
       PROJECT_EXIT.publishFailed,
       `${label} must reach the exit code`,
     );
+    if (label === 'gate refusal') {
+      // The MESSAGE, not just the code. A gate refusal that lost its own
+      // branch would fall into "wrote nothing and found nothing" and exit 1
+      // for the wrong reason with the reason discarded — the exit code alone
+      // cannot tell the two apart, and the reason is what the operator acts on.
+      assert.ok(
+        harness.lines.some((line) => line.includes('nothing was published — not a live run')),
+        `the refusal reason reaches the operator: ${harness.lines.join(' | ')}`,
+      );
+    }
   }
 });
 

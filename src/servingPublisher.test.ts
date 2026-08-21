@@ -10,7 +10,15 @@ import {
   publicationNowMs,
   publishPlan,
   publishRunArtifact,
+  publishScoredArtifact,
+  publishScores,
+  unpublishedCount,
 } from './servingPublisher.js';
+import {
+  parseScoredArtifact,
+  projectScoredRun,
+  publishableScoredRun,
+} from './scoredProjection.js';
 import { parseRunArtifact, projectRun, publishableRun } from './servingProjection.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import type { ProjectionPlan } from './servingProjection.js';
@@ -751,6 +759,237 @@ test('the DEFAULT deadline still binds when the wall clock runs backwards', asyn
     assert.ok(rival > 600, `the plan is too small to discriminate: rival bound ${rival}ms`);
     assert.ok(elapsed < rival / 2, `took ${Math.round(elapsed)}ms; the per-write cap alone allows ${rival}ms`);
     assert.ok(summary.skipped.some((reason) => reason.includes('abandoned')));
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The scored-artifact path
+// ---------------------------------------------------------------------------
+
+/** A minimal scored artifact whose every value is distinct, so what the port
+ *  RECEIVES can be checked against what the file SAYS rather than against a
+ *  reconstruction. */
+function scoredArtifactLines(
+  over: { meta?: Record<string, unknown>; extraGames?: readonly string[] } = {},
+): string[] {
+  const meta = {
+    recordType: 'scored_run_meta', label: 'SMOKE_V0_NOT_A_COHORT', runId: 'run-77',
+    cohortId: 'smoke-v0-2026-08-19', slateDate: '2026-08-19', sourceMode: 'live',
+    scoredAt: '2026-08-20T04:00:00.000Z', scoringPolicyVersion: 'scoring-v0.6.0',
+    integrityVerified: true,
+    picks: 2 + (over.extraGames?.length ?? 0),
+    participantScorecards: 0,
+    ladder: { version: 'TOTALS_V1_PROVISIONAL', parameterVersion: 'retrosheet-2023-25-v1' },
+    ...over.meta,
+  };
+  const shared = {
+    recordType: 'scored_decision', label: 'SMOKE_V0_NOT_A_COHORT', runId: 'run-77',
+    scoredAt: '2026-08-20T04:00:00.000Z', scoringPolicyVersion: 'scoring-v0.6.0',
+    kind: 'model', participantId: 'lab-alpha', market: 'moneyline', side: 'away',
+    devigMethod: 'proportional-v1', scheduleChanged: false, inPrimaryStratum: true,
+    unscoredReason: null, lineMovementFavorable: null,
+  };
+  return [
+    JSON.stringify(meta),
+    JSON.stringify({
+      ...shared, gameId: 'game-1', selection: 'Away Team',
+      closing: { line: null, awayDecimal: 2.05, homeDecimal: 1.87 },
+      primaryClvPct: 3.21, marginAdjustedClvPct: 1.25,
+    }),
+    JSON.stringify({
+      ...shared, gameId: 'game-2', selection: 'Road Team', closing: null,
+      primaryClvPct: null, marginAdjustedClvPct: null, unscoredReason: 'close_missing',
+    }),
+    ...(over.extraGames ?? []).map((gameId) =>
+      JSON.stringify({
+        ...shared, gameId, selection: 'Away Team', closing: null,
+        primaryClvPct: null, marginAdjustedClvPct: null, unscoredReason: 'close_missing',
+      }),
+    ),
+  ];
+}
+
+function writeScoredArtifact(lines: string[]): string {
+  const file = join(tempDir('serving-scored-'), 'run-77-scored.ndjson');
+  writeFileSync(file, lines.join('\n'), 'utf8');
+  return file;
+}
+
+test('a scored artifact publishes one score per pick, from the bytes on disk', async () => {
+  const lines = scoredArtifactLines();
+  const file = writeScoredArtifact(lines);
+  const port = new RecordingPort();
+  const { log, lines: printed } = collector();
+
+  const summary = await publishScoredArtifact(port, file, log);
+  assert.deepEqual(
+    { published: summary.published, duplicate: summary.duplicate, gateRefusal: summary.gateRefusal },
+    { published: 2, duplicate: 0, gateRefusal: null },
+  );
+
+  // What was SENT, not what this test would have sent: the assertion sits
+  // downstream of the code that decides the values.
+  assert.deepEqual(port.calls.map((call) => call.kind), ['score', 'score']);
+  const payloads = port.calls.map((call) => call.payload as unknown as DecisionScore);
+  const scored = payloads.find((p) => p.decision.gameId === 'game-1');
+  const refused = payloads.find((p) => p.decision.gameId === 'game-2');
+  assert.equal(scored?.economicClvPct, 3.21);
+  assert.equal(scored?.closeDecimalSelected, 2.05);
+  assert.equal(scored?.closeDecimalOpposing, 1.87);
+  assert.equal(scored?.runId, 'run-77');
+  assert.equal(scored?.label, 'SMOKE_V0_NOT_A_COHORT');
+  assert.equal(refused?.refused, true);
+  assert.equal(refused?.refusalReason, 'close_missing');
+
+  // The provenance is the FILE: its basename, and the hash of its bytes.
+  const bytes = readFileSync(file, 'utf8');
+  for (const payload of payloads) {
+    assert.deepEqual(payload.source, { sourcePath: basename(file), sourceSha256: sha256Hex(bytes) });
+  }
+  assert.ok(printed.some((line) => line.includes('2 written')), `summary printed: ${printed.join(' | ')}`);
+});
+
+test('a scored artifact the gate refuses reaches the port not at all', async () => {
+  const file = writeScoredArtifact(scoredArtifactLines({ meta: { sourceMode: 'dry-run' } }));
+  const port = new RecordingPort();
+  const { log } = collector();
+  const summary = await publishScoredArtifact(port, file, log);
+  assert.match(summary.gateRefusal ?? '', /not a live run/);
+  assert.equal(port.calls.length, 0, 'nothing may be sent from a refused artifact');
+});
+
+test('a TRUNCATED scored artifact refuses before anything is sent — the CLI turns this into exit 1', async () => {
+  // The review reproduction one tier up: meta declares more picks than the
+  // file carries. Nothing may reach the port, and the summary must be the
+  // gateRefusal shape `unpublishedCount` counts as a failure — which is what
+  // makes `yarn project:scores` and `yarn score --publish` exit nonzero on it.
+  const lines = scoredArtifactLines();
+  const file = writeScoredArtifact([lines[0]!, lines[1]!]); // meta declares 2, carries 1
+  const port = new RecordingPort();
+  const { log } = collector();
+  const summary = await publishScoredArtifact(port, file, log);
+  assert.match(summary.gateRefusal ?? '', /declares picks = 2 but carries 1/);
+  assert.equal(port.calls.length, 0, 'nothing may be sent from a truncated artifact');
+  assert.ok(
+    unpublishedCount(summary, file, collector().log) > 0,
+    'the shared failure taxonomy must count a truncated artifact, so the CLIs exit nonzero',
+  );
+});
+
+test('an unreadable scored artifact is a refusal, not a crash', async () => {
+  const port = new RecordingPort();
+  const summary = await publishScoredArtifact(port, join(tempDir('serving-scored-'), 'gone.ndjson'), collector().log);
+  assert.match(summary.gateRefusal ?? '', /could not be read/);
+  assert.equal(port.calls.length, 0);
+});
+
+test('a refused score is counted and logged; a duplicate counts as recovery', async () => {
+  const file = writeScoredArtifact(scoredArtifactLines());
+  const port = new RecordingPort({ score: { outcome: 'contradiction', field: 'score.economicClvPct' } });
+  const { log, errors } = collector();
+  const summary = await publishScoredArtifact(port, file, log);
+  assert.deepEqual(summary.rejected, { contradiction: 2 });
+  assert.ok(errors.some((line) => line.includes('score.economicClvPct')), errors.join(' | '));
+
+  const replay = new RecordingPort({ score: { outcome: 'duplicate' } });
+  const replayed = await publishScoredArtifact(replay, file, collector().log);
+  assert.deepEqual(
+    { published: replayed.published, duplicate: replayed.duplicate },
+    { published: 0, duplicate: 2 },
+  );
+});
+
+test('a score port that never settles cannot hold the command open, and says how to finish', async () => {
+  // DETERMINISTIC, by construction rather than by margin. The first version
+  // asserted a 4-unavailable / 2-abandoned split with real timers around a
+  // real 100ms expiry, and a review measured it landing 6/0 under full-suite
+  // load twice while passing 20/20 in isolation — whether the last batch
+  // timer fires before or after the expiry read is a sub-millisecond
+  // scheduler race, and an assertion sitting on it flips under load.
+  //
+  // The clock is injected and ADVANCES A FIXED STEP PER READ, so every
+  // admit/abandon decision is a pure function of the nowMs call sequence —
+  // and that sequence is fixed: batch callbacks start synchronously in array
+  // order, each reading spent() then slice() before its first await. With
+  // step 100 and deadline 500: the ctor reads 100 (expiry 600); item one
+  // reads spent@200/slice@300 and item two spent@400/slice@500 — admitted;
+  // items three and four read spent@600 and spent@700 — abandoned MID-BATCH;
+  // batch two reads spent@800/@900 — abandoned. Exactly 2 unavailable and
+  // 4 abandoned on any scheduler, and the mid-batch crossing pins the
+  // original point harder: the budget binds every WRITE, not every batch.
+  const file = writeScoredArtifact(scoredArtifactLines({
+    extraGames: ['game-3', 'game-4', 'game-5', 'game-6'],
+  }));
+  const gate = publishableScoredRun(parseScoredArtifact(readFileSync(file, 'utf8')));
+  assert.ok(gate.publishable);
+  if (!gate.publishable) return;
+  const scores = projectScoredRun(gate.header, gate.decisions, { sourcePath: basename(file), sourceSha256: null });
+  const hanging = { publishScore: () => new Promise<never>(() => undefined) } as unknown as BenchmarkServingPort;
+  const { log, errors } = collector();
+  let fake = 0;
+  const started = performance.now();
+  const summary = await publishScores(hanging, scores, log, {
+    nowMs: () => (fake += 100),
+    deadlineMs: 500,
+    perWriteTimeoutMs: 50,
+  });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 10_000, `the admitted writes' real 50ms timers still bound this: ${Math.round(elapsed)}ms`);
+  assert.equal(summary.rejected['unavailable'], 2, JSON.stringify(summary));
+  // Every row accounted for — admitted-and-unavailable plus abandoned is the
+  // whole artifact — and the recovery instruction rides with the abandonment.
+  const abandoned = /(\d+) write\(s\) abandoned/.exec(summary.skipped.join('\n'))?.[1];
+  assert.equal(Number(abandoned), 4, `abandonment is reported exactly: ${summary.skipped.join(' | ')}`);
+  assert.equal((summary.rejected['unavailable'] ?? 0) + Number(abandoned), scores.length);
+  assert.ok(
+    [...summary.skipped, ...errors].some((line) => line.includes('Republish this scored artifact')),
+    `the recovery instruction names the scored artifact: ${errors.join(' | ')}`,
+  );
+});
+
+test('the scores DEFAULT deadline still binds when the wall clock runs backwards', async () => {
+  // The publishScores sibling of the case above: `nowMs` omitted so the
+  // default is what runs, with Date.now driven backwards underneath it. A
+  // default of Date.now never expires the budget, and the only remaining
+  // bound is the per-write cap — the rival this test excludes by margin.
+  const lines = scoredArtifactLines({
+    extraGames: Array.from({ length: 30 }, (_, index) => `game-${index + 3}`),
+  });
+  const gate = publishableScoredRun(parseScoredArtifact(lines.join('\n')));
+  assert.ok(gate.publishable);
+  if (!gate.publishable) return;
+  const scores = projectScoredRun(gate.header, gate.decisions, { sourcePath: 'x.ndjson', sourceSha256: null });
+  const hanging = { publishScore: () => new Promise<never>(() => undefined) } as unknown as BenchmarkServingPort;
+  const realNow = Date.now;
+  const started = performance.now();
+  try {
+    let fake = 1_000_000_000_000;
+    Date.now = (): number => (fake -= 60_000);
+    const summary = await publishScores(hanging, scores, collector().log, {
+      deadlineMs: 150,
+      perWriteTimeoutMs: 80,
+    });
+    const elapsed = performance.now() - started;
+    // LOAD-ROBUST DISCRIMINATION, not a timing margin. Under the DEFAULT
+    // monotonic clock, eight sequential batches of real >=80ms timers cannot
+    // fit inside the 150ms deadline, so SOME write is always abandoned —
+    // however slow the scheduler, later batches only start later, which only
+    // abandons more. Under the mutant (a default readable from Date.now,
+    // which this test drives backwards), the budget never expires: all 32
+    // writes are admitted and none is ever abandoned. The two assertions
+    // below are therefore true on any scheduler for the real build and false
+    // by construction for the mutant, with no elapsed-time margin to flip
+    // under suite load.
+    assert.ok(elapsed < 10_000, `bounded, took ${Math.round(elapsed)}ms`);
+    const abandoned = /(\d+) write\(s\) abandoned/.exec(summary.skipped.join('\n'))?.[1];
+    assert.ok(abandoned !== undefined && Number(abandoned) >= 1,
+      `the deadline abandoned something, with its recovery line: ${summary.skipped.join(' | ')}`);
+    // Every row accounted for, whatever split the scheduler produced.
+    assert.equal((summary.rejected['unavailable'] ?? 0) + Number(abandoned), scores.length);
+    assert.ok((summary.rejected['unavailable'] ?? 0) < scores.length,
+      'a build whose budget never expires marks every write unavailable and abandons none');
   } finally {
     Date.now = realNow;
   }

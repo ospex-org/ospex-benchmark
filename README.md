@@ -167,6 +167,14 @@ Output: `<runId>-scored.ndjson` (per-pick `scored_decision` records with full pr
 
 Requires only `SUPABASE_URL` + `SUPABASE_ANON_KEY` (the same public read-only anon key).
 
+With `--publish`, the scorer additionally publishes the scored artifact it just
+wrote onto the serving projection — the same call `yarn project:scores` makes
+over the same bytes on disk, so a one-step publish and a later recovery cannot
+disagree. Scoring output is written either way; a publish that does not land in
+full exits 1, and the recovery is `yarn project:scores <scored file>`. This leg
+needs the serving writer configured (below) against a schema at the scores
+capability.
+
 ## Serving projection (optional, not wired to a run)
 
 Benchmark output reaches the public today only after settlement, through a
@@ -236,6 +244,40 @@ night, while here publishing is the entire job.
 | 3 | no credential is configured, so nothing was attempted |
 | 4 | configured, but the publisher was refused |
 | 5 | the command itself failed |
+
+### Publishing scored results
+
+The scorer's output gets the same treatment. `yarn score` writes
+`<runId>-scored.ndjson` beside the run file, and:
+
+```bash
+yarn project:scores out/run-2026-08-09-scored.ndjson [more-scored.ndjson ...]
+```
+
+publishes one `benchmark_scores` row per scored pick — both CLV metrics side by
+side, the refusal reason when a pick was unscored, the close values it was
+judged against, and the run **label** on every row. The label is the read-path
+eligibility handle: rows are insert-once, so which runs count toward a
+leaderboard is decided by filtering on the stored label, never by republishing.
+Scores land against the decisions `yarn project` already sealed — publish the
+run artifact first, or every row reports `parent_missing`. The exit-code
+contract is `yarn project`'s, through the same implementation.
+
+Idempotency is per `(decision, scoring policy version)` and judged on values:
+republishing the same pass — even regenerated, with a fresh timestamp in a
+fresh file — reports `duplicate`, while a pass claiming **different** values
+under the same policy version reports `contradiction` naming the field, and a
+scored artifact from a different execution of the slate than the one whose
+decisions are published reports `contradiction` on the run id. A rescore under
+a **new** policy version adds rows beside the old ones; nothing is ever
+overwritten. Scored files from dry runs, from cohorts outside the published
+namespace, or in a format older than the current scorer are refused with a
+reason — a scored artifact is derived, so re-running `yarn score` over the
+canonical run file regenerates it in the current format.
+
+The scores path requires serving-schema capability **3** (the label column);
+the run paths above require 2 and are deliberately unaffected — a watch night
+must not be held hostage to a scores migration.
 
 ### When a run publishes
 

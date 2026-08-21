@@ -101,6 +101,10 @@ export type ServingStatus =
   | {
       readonly enabled: false;
       readonly reason: UnresolvedReason | 'schema_not_ready' | 'driver_unavailable' | 'dry_run';
+      /** On `schema_not_ready` only: the capability version the caller asked
+       *  for, so the one line an operator sees names the version that was
+       *  actually required rather than the run paths' default. */
+      readonly requiredCapability?: number;
     };
 
 const CLOSE_TIMEOUT_MS = 5_000;
@@ -122,6 +126,19 @@ const CLOSE_TIMEOUT_MS = 5_000;
  *   a publisher can only read.
  */
 export const REQUIRED_SERVING_CAPABILITY = 2;
+
+/**
+ * The capability the SCORES publisher requires, above the run paths' 2.
+ *
+ * Version 3 is the migration that gave `benchmark_scores` its `label` column.
+ * The label is the row's leaderboard-eligibility handle and the rows are
+ * insert-once, so a score published into a version-2 schema would be a
+ * permanent row that can never carry one. The run paths deliberately stay at
+ * 2: a watch night's attempt/seal/reveal writes touch nothing version 3 adds,
+ * and holding them hostage to an unapplied scores migration would fail a night
+ * for a column it never writes.
+ */
+export const SCORES_SERVING_CAPABILITY = 3;
 
 /**
  * What the database says it can serve, or 0.
@@ -166,9 +183,9 @@ export function describeServingStatus(status: ServingStatus): string {
   if (status.reason === 'schema_not_ready') {
     return (
       'serving projection: HELD — the database does not report serving_projection ' +
-      `capability ${REQUIRED_SERVING_CAPABILITY} or higher, so it cannot be relied ` +
-      'on to record which entrant a participant is. Those rows are insert-once, ' +
-      'so nothing is written until the schema says it can hold the whole identity.'
+      `capability ${status.requiredCapability ?? REQUIRED_SERVING_CAPABILITY} or higher, ` +
+      'so it cannot be relied on to record what this publisher writes. Those rows are ' +
+      'insert-once, so nothing is written until the schema says it can hold them.'
     );
   }
   return `serving projection: disabled (${status.reason})`;
@@ -271,6 +288,7 @@ export async function openBenchmarkServing(
   const readinessTimeoutMs = options.readinessTimeoutMs ?? READINESS_TIMEOUT_MS;
   const closeTimeoutMs = options.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
   const onError = options.onError ?? ((): void => {});
+  const requiredCapability = options.requiredCapability ?? REQUIRED_SERVING_CAPABILITY;
   const resolution = resolveBenchmarkWriterConnection();
   if (!resolution.resolved) {
     return { port: new SqlBenchmarkServingPort(null), status: { enabled: false, reason: resolution.reason }, ...DISABLED };
@@ -349,13 +367,13 @@ export async function openBenchmarkServing(
   } catch {
     capability = 0;
   }
-  if (capability < REQUIRED_SERVING_CAPABILITY) {
+  if (capability < requiredCapability) {
     // Closed the same way as a live handle would be. Nothing was written, but a
     // startup that leaves a socket open still cannot exit.
     await closePool(poolLike, live, closeTimeoutMs);
     return {
       port: new SqlBenchmarkServingPort(null),
-      status: { enabled: false, reason: 'schema_not_ready' },
+      status: { enabled: false, reason: 'schema_not_ready', requiredCapability },
       close: async () => {},
     };
   }
@@ -386,6 +404,15 @@ export const READINESS_TIMEOUT_MS = 5_000;
 export interface ServingOptions {
   readonly readinessTimeoutMs?: number;
   readonly closeTimeoutMs?: number;
+  /**
+   * The `serving_projection` capability version this caller's writes need.
+   * Defaults to `REQUIRED_SERVING_CAPABILITY` — the run paths' requirement.
+   * The scores publisher passes `SCORES_SERVING_CAPABILITY`, because its
+   * statement names a column version 2 does not have; opening below the
+   * requirement reports `schema_not_ready` rather than letting every write
+   * arrive as an opaque refusal.
+   */
+  readonly requiredCapability?: number;
   /**
    * Where an ASYNCHRONOUS pool failure is reported.
    *
