@@ -728,6 +728,13 @@ MUTANTS = [
     # the constant back reproduces the shipped defect exactly — and survives
     # every fixture whose run label IS the constant, which is all of them
     # except the one regression test written to sit where they differ.
+    # A definer-function exemption that matches on the ROLE alone quietly
+    # exempts every function that role will ever be granted — the gate's
+    # tripwire for a NEW definer RPC would never fire again.
+    ('M123-definer-exemption-widens-by-role', 'src/servingSchemaGate.ts',
+     "  return DECLARED_DEFINER_EXEMPTIONS.has(`${role} -> ${fn}`);",
+     "  return role === 'service_role';",
+     ['src/servingSchemaGate.test.ts']),
     ('M122-scored-label-minted-not-carried', 'src/scoring.ts',
      ('    // here survived — a latent misbinding, caught in review.\n    label: run.label,',
       "      recordType: 'scored_decision',\n      label: run.label,",

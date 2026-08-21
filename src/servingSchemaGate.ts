@@ -315,6 +315,60 @@ async function countsOrNull(query: GateQuery): Promise<string | null> {
   }
 }
 
+/**
+ * SECURITY DEFINER grants decided SAFE, deliberately, once — the branch the
+ * definer check's own failure text offers, taken here in reviewed code
+ * instead of re-argued in chat on every preflight.
+ *
+ * Every entry is `role -> schema.function`, EXACT: no wildcard admits a
+ * function nobody has looked at, and a protocol refactor that renames one
+ * makes the stale entry a visible pruning note rather than a silent widening.
+ *
+ * Why these are safe, and the shape any future entry must argue in its own
+ * comment: they are the indexer/read-API's OWN write path — the RPCs that
+ * mirror public on-chain events into the protocol tables, plus two trigger
+ * functions on `games` — owned by the schema owner and granted to
+ * `service_role`, the backend's key. None of them reads or writes any
+ * `benchmark_*` relation, so none is a path around the projection grid in
+ * either direction; and `service_role` is never handed to a browser. The
+ * roles this check exists to keep OUT of definer functions — the writer, and
+ * every browser-facing or readonly key — have no exemptions and may never
+ * gain one: `servingSchemaGate.test.ts` refuses any entry for them by
+ * construction.
+ *
+ * First measured against the live project 2026-08-21, immediately after the
+ * scores-capability migration: these eighteen were the whole list, the
+ * writer and browser keys held EXECUTE on none, and run-path publication had
+ * already been operating under exactly this posture since 2026-08-15.
+ */
+export const DECLARED_DEFINER_EXEMPTIONS: ReadonlySet<string> = new Set([
+  'service_role -> public.rpc_active_recovery_run',
+  'service_role -> public.rpc_backfill_range',
+  'service_role -> public.rpc_commitment_matched',
+  'service_role -> public.rpc_leaderboard_funded',
+  'service_role -> public.rpc_leaderboard_new_highest_roi',
+  'service_role -> public.rpc_leaderboard_position_added',
+  'service_role -> public.rpc_leaderboard_prize_claimed',
+  'service_role -> public.rpc_position_fill_upsert',
+  'service_role -> public.rpc_position_matched_pair',
+  'service_role -> public.rpc_position_sold',
+  'service_role -> public.rpc_position_transferred',
+  'service_role -> public.rpc_recovery_run_complete',
+  'service_role -> public.rpc_recovery_run_fail',
+  'service_role -> public.rpc_recovery_run_phase',
+  'service_role -> public.rpc_recovery_run_start',
+  'service_role -> public.rpc_user_registered',
+  'service_role -> public.tg_games_maintain_earliest_match_time',
+  'service_role -> public.tg_games_touch_contest_on_match_time',
+]);
+
+/** The one place membership is decided, on the FULL `role -> function` pair —
+ *  extracted so a test can hold it to exactly that and nothing looser (a
+ *  role-only or prefix match would exempt functions nobody has looked at). */
+export function isExemptDefiner(role: string, fn: string): boolean {
+  return DECLARED_DEFINER_EXEMPTIONS.has(`${role} -> ${fn}`);
+}
+
 export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
   {
     name: 'the server is new enough for the identity contract',
@@ -794,6 +848,10 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
 
   {
     name: 'no SECURITY DEFINER function carries any checked role past its grants',
+    // Exemptions are DECLARED, per role-and-function pair, in
+    // DECLARED_DEFINER_EXEMPTIONS below — the "decide deliberately that it is
+    // safe" branch of this check's own failure text, decided once and
+    // reviewed, instead of re-decided in chat every time the gate runs.
     async run(query) {
       // The grid and the relation sweep both answer "what may this role touch
       // DIRECTLY". A SECURITY DEFINER function runs as its OWNER, so EXECUTE on
@@ -849,16 +907,36 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
       if (rows.length === 0) {
         return { ok: true, detail: 'no role this gate checks may execute a SECURITY DEFINER function' };
       }
-      const named = rows.map((row) => {
+      const exempt: string[] = [];
+      const violating: string[] = [];
+      const present = new Set<string>();
+      for (const row of rows) {
+        const entry = `${String(row['role'])} -> ${String(row['fn'])}`;
+        present.add(entry);
         const platform = row['from_extension'] === true ? ' [extension]' : '';
-        return `${String(row['role'])} -> ${String(row['fn'])}${platform}`;
-      });
+        (isExemptDefiner(String(row['role']), String(row['fn'])) ? exempt : violating)
+          .push(`${entry}${platform}`);
+      }
+      if (violating.length > 0) {
+        return {
+          ok: false,
+          detail:
+            `executable as their owner: ${violating.join(', ')}. Each one is a path around the ` +
+            'privilege grid above; revoke EXECUTE, or decide deliberately that it is safe by ' +
+            'adding the exact pair to DECLARED_DEFINER_EXEMPTIONS with its reasoning. ' +
+            'Entries marked [extension] belong to an installed extension rather than to this schema.',
+        };
+      }
+      // Pruning hint, not a failure: an exemption whose function is gone should
+      // be removed, but a gate that reddens on a healthy database because the
+      // protocol refactored an RPC is a gate people learn to skip.
+      const unused = [...DECLARED_DEFINER_EXEMPTIONS].filter((entry) => !present.has(entry));
       return {
-        ok: false,
+        ok: true,
         detail:
-          `executable as their owner: ${named.join(', ')}. Each one is a path around the ` +
-          'privilege grid above; revoke EXECUTE, or decide deliberately that it is safe. ' +
-          'Entries marked [extension] belong to an installed extension rather than to this schema.',
+          `${exempt.length} definer grant(s), every one a declared exemption ` +
+          `(service_role's own protocol write path)` +
+          (unused.length > 0 ? `; declared but no longer present, prune: ${unused.join(', ')}` : ''),
       };
     },
   },

@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   dialsThisMachine,
+  DECLARED_DEFINER_EXEMPTIONS,
   GATE_EXIT,
+  isExemptDefiner,
   proveEncrypted,
   proveReadOnly,
   READ_ONLY_STARTUP_OPTION,
@@ -456,4 +458,32 @@ test('the forbidden-reader question covers every verb, not just the reads', asyn
   assert.match(sql, /unnest\(\$3::text\[\]\) as v/, 'the verbs must be a parameter, not two hard-coded reads');
   assert.match(sql, /has_table_privilege\(r, 'public\.' \|\| t, v\)/);
   assert.match(sql, /has_any_column_privilege\(r, 'public\.' \|\| t, v\)/);
+});
+
+test('definer exemptions may only ever name the read API, exactly, one pair at a time', () => {
+  // The roles this check exists to keep OUT of definer functions can never be
+  // exempted: an entry for the writer would be a declared way out of its own
+  // grants, and one for a browser key a declared way in. Refused by SHAPE, so
+  // the review that would catch it does not have to be the last line.
+  assert.ok(DECLARED_DEFINER_EXEMPTIONS.size > 0);
+  for (const entry of DECLARED_DEFINER_EXEMPTIONS) {
+    assert.match(
+      entry,
+      /^service_role -> public\.[a-z0-9_]+$/,
+      `${entry}: an exemption is service_role, one exact public function, nothing else`,
+    );
+  }
+});
+
+test('exemption membership is the FULL role-and-function pair, nothing looser', () => {
+  const [first] = DECLARED_DEFINER_EXEMPTIONS;
+  const fn = first!.split(' -> ')[1]!;
+  assert.equal(isExemptDefiner('service_role', fn), true);
+  // The half a role-only or prefix match would get wrong, one case each:
+  // the SAME function under a role that may never hold an exemption...
+  assert.equal(isExemptDefiner('benchmark_writer', fn), false);
+  assert.equal(isExemptDefiner('anon', fn), false);
+  // ...and an UNLISTED function under the exempted role — a new definer RPC
+  // must arrive as a gate failure until someone looks at it and declares it.
+  assert.equal(isExemptDefiner('service_role', 'public.rpc_added_next_week'), false);
 });
