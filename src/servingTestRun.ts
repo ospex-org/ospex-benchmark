@@ -3,6 +3,7 @@ import { buildBundle } from './bundle.js';
 import { fireEligibleGame } from './watch.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
 import { ARMS } from './providers/index.js';
+import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { parseRunArtifact } from './servingProjection.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 
@@ -137,6 +138,17 @@ function stubAdapter(
           : valid();
       return Promise.resolve({
         rawText,
+        // No wire body exists here; one is composed from the values this stub
+        // reports and sealed by the same function a live adapter uses, so the
+        // artifact carries the same evidence shape a real run would.
+        responseEnvelope: sealResponseEnvelope(
+          JSON.stringify({
+            synthetic: 'serving-test-stub',
+            model: arm.requestedModelId,
+            id: 'stub-response',
+            output: [{ type: 'message', content: [{ type: 'output_text', text: rawText }] }],
+          }),
+        ),
         // The body must report the id the arm is APPROVED for, or the
         // artifact contradicts itself and the identity gate refuses it.
         reportedModelId: arm.requestedModelId,

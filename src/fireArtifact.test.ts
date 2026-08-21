@@ -13,6 +13,7 @@ import {
 import type { ArmDigestInputV1 } from './fireArtifact.js';
 import { forecastFingerprint } from './schema.js';
 import type { ArmGameResult, AttemptRecord, BenchmarkResponse, ForecastOutput, MarketKey } from './types.js';
+import { fixtureEnvelope } from './testFactories.js';
 
 /**
  * The fire artifact's arm integrity core (SPEC §5). These fixtures are the
@@ -60,6 +61,7 @@ function response(forecasts: ForecastOutput[], gameId = 'game-1'): BenchmarkResp
 function attempt(over: Partial<AttemptRecord> = {}): AttemptRecord {
   return {
     rawText: '{"ok":true}',
+    responseEnvelope: fixtureEnvelope('{"ok":true}'),
     reportedModelId: 'model-x',
     providerResponseId: 'resp-1',
     httpStatus: 200,

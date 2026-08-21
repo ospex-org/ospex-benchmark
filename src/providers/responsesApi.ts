@@ -3,6 +3,7 @@ import { postJson } from './http.js';
 import { ProviderUnfinishedTurnError } from './errors.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractResponsesSearchAudit } from './searchAudit.js';
+import { sealResponseEnvelope } from './responseEnvelope.js';
 import { buildRequestPlan } from './requestPlan.js';
 import type { ProviderRequestPlan } from './requestPlan.js';
 import type {
@@ -109,13 +110,16 @@ export function createResponsesApiAdapter(config: ResponsesApiConfig): ProviderA
       if (apiKey === undefined) throw new Error(`${config.credentialEnvVar} is not set`);
       const plan = responsesApiRequestPlan({ config, turns, options });
       const url = plan.endpoint;
-      const { status, json: raw } = await postJson({
+      const { status, json: raw, bodyText } = await postJson({
         provider: config.provider,
         url,
         headers: { authorization: `Bearer ${apiKey}` },
         body: plan.body,
         timeoutMs,
       });
+      // The complete body, retained as received: every later re-extraction of
+      // this call's search audit reads THIS, not the normalized result below.
+      const responseEnvelope = sealResponseEnvelope(bodyText);
       const json = raw as {
         id?: unknown;
         model?: unknown;
@@ -176,6 +180,7 @@ export function createResponsesApiAdapter(config: ResponsesApiConfig): ProviderA
           providerResponseId: typeof json.id === 'string' ? json.id : null,
           reportedModelId: typeof json.model === 'string' ? json.model : null,
           rawText,
+          responseEnvelope,
           usage,
           usageRaw: json.usage ?? null,
           searchAudit: extractResponsesSearchAudit(raw),
@@ -185,6 +190,7 @@ export function createResponsesApiAdapter(config: ResponsesApiConfig): ProviderA
 
       return {
         rawText,
+        responseEnvelope,
         reportedModelId: typeof json.model === 'string' ? json.model : null,
         providerResponseId: typeof json.id === 'string' ? json.id : null,
         httpStatus: status,

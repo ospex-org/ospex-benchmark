@@ -318,8 +318,36 @@ export interface SearchAudit {
   incomplete: string[];
 }
 
+/**
+ * The provider's complete HTTP response BODY for one attempt, retained so a
+ * search/tool audit can be re-extracted later — after a parser fix, or after
+ * the provider ships a shape the extractor of the day did not recognize.
+ *
+ * `body` is the received body text with credential values substituted out; it
+ * is NOT canonicalized and NOT re-serialized. Key order, indentation and
+ * number formatting are exactly what arrived, because those are part of the
+ * evidence: an unrecognized shape is recognizable later only if the bytes that
+ * carried it survive. `sha256` is taken over `body` as stored, so a later edit
+ * to the retained text is detectable; `bytes` is that same string's UTF-8
+ * length (characters and bytes disagree on any non-ASCII body).
+ *
+ * Retained for the 2xx-with-parseable-JSON path only — the path this evidence
+ * gap was found on. Non-2xx bodies and 200s that are not JSON keep their
+ * existing truncated error detail; see `postJson`.
+ *
+ * PRIVATE evidence. It stays in the run NDJSON under `out/` (gitignored) and
+ * is never written to a serving column.
+ */
+export interface ProviderResponseEnvelope {
+  body: string;
+  sha256: string;
+  bytes: number;
+}
+
 export interface ProviderResponse {
   rawText: string;
+  /** The complete response body this answer text was extracted from. */
+  responseEnvelope: ProviderResponseEnvelope;
   reportedModelId: string | null;
   providerResponseId: string | null;
   httpStatus: number;
@@ -396,6 +424,13 @@ export interface ProviderAdapter {
 
 export interface AttemptRecord {
   rawText: string | null;
+  /**
+   * The complete provider response body for this attempt, or `null` when no
+   * body was received (unsent, timeout, transport failure, non-2xx). Serialized
+   * as `responseEnvelope`, beside `answerText` — which holds the extracted
+   * answer only.
+   */
+  responseEnvelope: ProviderResponseEnvelope | null;
   reportedModelId: string | null;
   providerResponseId: string | null;
   httpStatus: number | null;

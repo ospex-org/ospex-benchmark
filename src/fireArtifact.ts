@@ -274,7 +274,15 @@ export interface PersistedAttemptV1 {
   acceptedAt: string | null;
   reportedModelId: string | null;
   httpStatus: number | null;
-  /** Redacted retained body, or `null` when no body was received. */
+  /**
+   * The redacted ANSWER TEXT the adapter extracted, or `null` when no body was
+   * received. The name predates the distinction and overstates what the field
+   * holds: it is not the provider's HTTP response body. That body is retained
+   * on the run NDJSON's attempt records as `responseEnvelope` (#92); this
+   * artifact's schema is `.strict()` and its field feeds `armDigest`, so
+   * renaming or extending it would invalidate every fire artifact already
+   * written, and neither is in the scope of that change.
+   */
   persistedResponseBody: string | null;
   /** `sha256Hex(persistedResponseBody)`, or `null` with no body. */
   responseSha256: string | null;

@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { ProviderHttpError, ProviderTimeoutError, ProviderUnfinishedTurnError } from './providers/errors.js';
 import { prepareGameRequest } from './preparedRequest.js';
 import { runOneArmGame, runSlate } from './runner.js';
-import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
+import { fixtureEnvelope, makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
 import { CODE_MAX_REPAIRS_PER_ARM } from './repairPolicy.js';
 import type { ArmSpec,
   BenchmarkResponse,
@@ -42,6 +42,7 @@ function stubAdapter(handlers: ChatHandler[]): ProviderAdapter & { calls: number
 function stubResponse(rawText: string, reportedModelId = 'stub-model-1'): ProviderResponse {
   return {
     rawText,
+    responseEnvelope: fixtureEnvelope(rawText),
     reportedModelId,
     providerResponseId: 'stub-response',
     httpStatus: 200,
@@ -333,6 +334,7 @@ test('an unfinished turn records the FULL received-response evidence: httpStatus
         providerResponseId: 'msg_paused_runner_1',
         reportedModelId: 'stub-model-1',
         rawText: '',
+        responseEnvelope: fixtureEnvelope(''),
         usage,
         usageRaw,
         searchAudit,

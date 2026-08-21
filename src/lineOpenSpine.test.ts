@@ -57,6 +57,7 @@ import type { SpendEscalationSidecarV1 } from './spendEscalationSidecar.js';
 import type { BillingClass } from './spendGuard.js';
 import type { CandidateInput } from './detection.js';
 import type { TwoSidedHistoryRow } from './oddsHistory.js';
+import { fixtureEnvelope } from './testFactories.js';
 import type {
   AcquireRepairLeaseRequest,
   AdmitDispatchRequest,
@@ -360,7 +361,7 @@ function scriptedAdapter(
     async chat(_t: ChatTurn[], _ms: number): Promise<ProviderResponse> {
       state.calls += 1;
       const body = await bodies(state.calls);
-      return { rawText: body, reportedModelId: identity.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: opts.usageRawFor ? opts.usageRawFor(state.calls) : {}, requestParams: {}, searchAudit: null };
+      return { rawText: body, responseEnvelope: fixtureEnvelope(body), reportedModelId: identity.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: opts.usageRawFor ? opts.usageRawFor(state.calls) : {}, requestParams: {}, searchAudit: null };
     },
   };
   return { adapter, get calls() { return state.calls; } } as Scripted;
@@ -857,6 +858,7 @@ test('END-TO-END: an anthropic pause_turn carrying usage yields a coherent artif
         providerResponseId: 'msg_paused_e2e_1',
         reportedModelId: anthropicId.requestedModelId,
         rawText: '',
+        responseEnvelope: fixtureEnvelope(''),
         usage: pausedUsage,
         usageRaw: pausedUsageRaw,
         searchAudit: pausedAudit,

@@ -4,6 +4,7 @@ import { ProviderUnfinishedTurnError } from './errors.js';
 import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractGoogleSearchAudit } from './searchAudit.js';
+import { sealResponseEnvelope } from './responseEnvelope.js';
 import { buildRequestPlan } from './requestPlan.js';
 import type { ProviderRequestPlan } from './requestPlan.js';
 import type {
@@ -85,13 +86,16 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
       if (apiKey === undefined) throw new Error('GEMINI_API_KEY / GOOGLE_API_KEY is not set');
       const plan = googleRequestPlan({ requestedModelId, turns, options });
       const url = plan.endpoint;
-      const { status, json: raw } = await postJson({
+      const { status, json: raw, bodyText } = await postJson({
         provider: 'google',
         url,
         headers: { 'x-goog-api-key': apiKey },
         body: plan.body,
         timeoutMs,
       });
+      // The complete body, retained as received: every later re-extraction of
+      // this call's search audit reads THIS, not the normalized result below.
+      const responseEnvelope = sealResponseEnvelope(bodyText);
       const json = raw as {
         responseId?: unknown;
         modelVersion?: unknown;
@@ -166,6 +170,7 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
           providerResponseId: typeof json.responseId === 'string' ? json.responseId : null,
           reportedModelId: typeof json.modelVersion === 'string' ? json.modelVersion : null,
           rawText: text,
+          responseEnvelope,
           usage,
           usageRaw: json.usageMetadata ?? null,
           searchAudit: extractGoogleSearchAudit(raw),
@@ -175,6 +180,7 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
 
       return {
         rawText: text,
+        responseEnvelope,
         reportedModelId: typeof json.modelVersion === 'string' ? json.modelVersion : null,
         providerResponseId: typeof json.responseId === 'string' ? json.responseId : null,
         httpStatus: status,

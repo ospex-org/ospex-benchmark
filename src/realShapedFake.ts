@@ -8,6 +8,7 @@ import {
 } from './mock.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { deriveComparableUsage } from './providers/comparableUsage.js';
+import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import type { ProviderAdapter, ProviderResponse, ProviderUsage, SearchAudit } from './types.js';
 import { applyConfiguration } from './participantConfiguration.js';
 
@@ -40,6 +41,32 @@ export interface RealShapedFakeOptions {
   readonly rateLimitedGameId?: string;
 }
 
+/**
+ * The envelope a NON-NETWORK adapter retains. There is no wire body here, so
+ * one is composed from the same values the fake reports and sealed by the same
+ * function a live adapter uses. It keeps the shape of the evidence identical
+ * between a dry run and a live one — the scorer's envelope check then runs on
+ * every dry-run artifact rather than only on runs nobody can produce locally —
+ * and its `synthetic` marker says plainly that no provider ever sent it.
+ */
+function syntheticEnvelope(fields: {
+  source: string;
+  model: string;
+  id: string;
+  text: string;
+  usageRaw: unknown;
+}) {
+  return sealResponseEnvelope(
+    JSON.stringify({
+      synthetic: fields.source,
+      model: fields.model,
+      id: fields.id,
+      output: [{ type: 'message', content: [{ type: 'output_text', text: fields.text }] }],
+      usage: fields.usageRaw,
+    }),
+  );
+}
+
 function response(options: {
   rawText: string;
   reportedModelId: string;
@@ -52,6 +79,13 @@ function response(options: {
 }): ProviderResponse {
   return {
     rawText: options.rawText,
+    responseEnvelope: syntheticEnvelope({
+      source: 'real-shaped-fake',
+      model: options.reportedModelId,
+      id: options.responseId,
+      text: options.rawText,
+      usageRaw: options.usageRaw,
+    }),
     reportedModelId: options.reportedModelId,
     providerResponseId: options.responseId,
     httpStatus: 200,

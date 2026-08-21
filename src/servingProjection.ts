@@ -553,9 +553,16 @@ function attemptFacts(
 ): AttemptFacts {
   const requestAt = str(leg, 'requestAt');
   const httpStatus = num(leg, 'httpStatus');
-  const rawResponse = str(leg, 'rawResponse');
+  // Either name: `answerText` on files written since #92, `rawResponse` on
+  // everything archived before it. Same value under both.
+  const answerText = str(leg, 'answerText') ?? str(leg, 'rawResponse');
   const tokens = nested(leg, 'tokens');
   const searchAudit = nested(leg, 'searchAudit');
+  // Presence only. The envelope BODY is private evidence and no serving column
+  // carries it; what the projection needs from it is whether this attempt's
+  // audit can still be re-derived, which is what decides how far the recorded
+  // status can be trusted.
+  const envelopeRetained = nested(leg, 'responseEnvelope') !== null;
 
   return {
     attemptOrdinal,
@@ -576,7 +583,7 @@ function attemptFacts(
     // responseAt is stamped on timeouts and transport failures too, so it is
     // not a receipt on its own. Published only when something actually came
     // back; otherwise every timeout would claim a response it never received.
-    responseAt: rawResponse !== null || httpStatus !== null ? str(leg, 'responseAt') : null,
+    responseAt: answerText !== null || httpStatus !== null ? str(leg, 'responseAt') : null,
     latencyMs: num(leg, 'latencyMs'),
     inputTokens: tokens === null ? null : num(tokens, 'inputTokens'),
     outputTokens: tokens === null ? null : num(tokens, 'outputTokens'),
@@ -586,7 +593,7 @@ function attemptFacts(
     reasoningTokens: tokens === null ? null : num(tokens, 'reasoningTokens'),
     billableOutputTokens: tokens === null ? null : num(tokens, 'billableOutputTokens'),
     billableSearchCount: searchAudit === null ? null : num(searchAudit, 'searchCount'),
-    searchEvidenceStatus: searchEvidenceStatus(searchAudit),
+    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeRetained),
     costUsd: null,
     priceVersion: null,
   };
@@ -600,9 +607,21 @@ function attemptFacts(
  * lists a reason for every gap otherwise. So "nothing ran" and "we could not
  * see what ran" never collapse into one value, and neither is ever reported as
  * a search count of zero.
+ *
+ * The absent audit needed one more distinction, which is the reporting half of
+ * #92. An empty audit is a claim made by the extractor that read the response,
+ * and that claim is only checkable while the response survives. With the
+ * envelope retained, `no_search_evidence` can be re-derived — and disproved —
+ * from the stored body. Without it (every file archived before retention) the
+ * same absence is unfalsifiable, so it is reported as `unknown_unproven`:
+ * ENVELOPE-UNAVAILABLE, not "nothing ran".
+ *
+ * Both values already exist in this column, which is plain `text` with no
+ * check constraint (ospex-indexer migration 073), so nothing about the schema
+ * moves.
  */
-function searchEvidenceStatus(searchAudit: JsonRecord | null): string {
-  if (searchAudit === null) return 'no_search_evidence';
+function searchEvidenceStatus(searchAudit: JsonRecord | null, envelopeRetained: boolean): string {
+  if (searchAudit === null) return envelopeRetained ? 'no_search_evidence' : 'unknown_unproven';
   const incomplete = strings(searchAudit, 'incomplete');
   if (incomplete === null) return 'unknown_unproven';
   return incomplete.length === 0 ? 'complete' : 'unknown_unproven';

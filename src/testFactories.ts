@@ -1,9 +1,17 @@
 import { canonicalize, sha256Hex } from './canonical.js';
+import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { RESPONSE_SCHEMA_VERSIONS, validateResponseText } from './schema.js';
 import { SMOKE_LABEL } from './types.js';
 import type { GameRequest } from './bundle.js';
 import type { ResponseSchemaVersion } from './schema.js';
-import type { ArmSpec, BenchmarkResponse, ForecastOutput, GameBundle, SlateBundle } from './types.js';
+import type {
+  ArmSpec,
+  BenchmarkResponse,
+  ForecastOutput,
+  GameBundle,
+  ProviderResponseEnvelope,
+  SlateBundle,
+} from './types.js';
 
 /**
  * Shared deterministic factories for unit tests: one synthetic game request
@@ -12,6 +20,24 @@ import type { ArmSpec, BenchmarkResponse, ForecastOutput, GameBundle, SlateBundl
  * conformance suites, which are run by their own scripts and not by
  * `yarn test`.
  */
+
+/**
+ * The retained response envelope for a fixture provider response.
+ *
+ * DELIBERATELY not the answer text: a real envelope is the whole provider body
+ * and the answer is one field inside it, so a fixture where the two are equal
+ * cannot tell `answerText` and `responseEnvelope.body` apart if a serializer
+ * swaps them. Sealed by the production function so fixtures carry a digest
+ * that verifies for the same reason a live one does.
+ */
+export function fixtureEnvelope(answerText: string): ProviderResponseEnvelope {
+  return sealResponseEnvelope(
+    JSON.stringify({
+      fixture: 'test-factory',
+      output: [{ type: 'message', content: [{ type: 'output_text', text: answerText }] }],
+    }),
+  );
+}
 
 export const TEST_ARM: ArmSpec = {
   participantId: 'stub-openai',

@@ -10,7 +10,7 @@ import { verifyArtifactIntegrity } from './servingProjection.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 import { firedRun } from './servingTestRun.js';
 import type { BenchmarkServingPort, PublishOutcome } from './servingStore.js';
-import { makeValidResponse, TEST_ARM } from './testFactories.js';
+import { fixtureEnvelope, makeValidResponse, TEST_ARM } from './testFactories.js';
 import {
   fireEligibleGame,
   loadLedger,
@@ -358,6 +358,7 @@ function stubAdapter(rawText: () => string): ProviderAdapter {
     chat(): Promise<ProviderResponse> {
       return Promise.resolve({
         rawText: rawText(),
+        responseEnvelope: fixtureEnvelope('watch-stub'),
         reportedModelId: 'stub-model-1',
         providerResponseId: 'stub-response',
         httpStatus: 200,

@@ -23,7 +23,7 @@ import {
   writeText,
 } from './records.js';
 import { buildSummaryMarkdown } from './summary.js';
-import { makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
+import { fixtureEnvelope, makeRequest, makeValidResponse, TEST_ARM, TEST_COHORT } from './testFactories.js';
 import type { BuildResult, GameRequest } from './bundle.js';
 import type { RunContext } from './records.js';
 import type { RunEnvelope } from './runner.js';
@@ -72,6 +72,7 @@ function makeCtx(): RunContext {
 function attempt(overrides: Partial<AttemptRecord>): AttemptRecord {
   return {
     rawText: '{}',
+    responseEnvelope: fixtureEnvelope('{}'),
     reportedModelId: null,
     providerResponseId: null,
     httpStatus: 200,
@@ -120,6 +121,7 @@ function stubResponse(
 ): ProviderResponse {
   return {
     rawText,
+    responseEnvelope: fixtureEnvelope(rawText),
     reportedModelId: ids.reportedModelId ?? 'stub-model-1',
     providerResponseId: ids.providerResponseId ?? 'stub-response',
     httpStatus: 200,

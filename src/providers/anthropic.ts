@@ -4,6 +4,7 @@ import { ProviderUnfinishedTurnError } from './errors.js';
 import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractAnthropicSearchAudit } from './searchAudit.js';
+import { sealResponseEnvelope } from './responseEnvelope.js';
 import { buildRequestPlan } from './requestPlan.js';
 import type { ProviderRequestPlan } from './requestPlan.js';
 import type {
@@ -78,13 +79,16 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
       const apiKey = envValue('ANTHROPIC_API_KEY');
       if (apiKey === undefined) throw new Error('ANTHROPIC_API_KEY is not set');
       const plan = anthropicRequestPlan({ requestedModelId, turns, options });
-      const { status, json: raw } = await postJson({
+      const { status, json: raw, bodyText } = await postJson({
         provider: 'anthropic',
         url: plan.endpoint,
         headers: { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION },
         body: plan.body,
         timeoutMs,
       });
+      // The complete body, retained as received: every later re-extraction of
+      // this call's search audit reads THIS, not the normalized result below.
+      const responseEnvelope = sealResponseEnvelope(bodyText);
       const json = raw as {
         id?: unknown;
         model?: unknown;
@@ -139,6 +143,7 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
           providerResponseId: typeof json.id === 'string' ? json.id : null,
           reportedModelId: typeof json.model === 'string' ? json.model : null,
           rawText: text,
+          responseEnvelope,
           usage,
           usageRaw: json.usage ?? null,
           searchAudit: extractAnthropicSearchAudit(raw),
@@ -148,6 +153,7 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
 
       return {
         rawText: text,
+        responseEnvelope,
         reportedModelId: typeof json.model === 'string' ? json.model : null,
         providerResponseId: typeof json.id === 'string' ? json.id : null,
         httpStatus: status,

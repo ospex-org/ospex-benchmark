@@ -4,7 +4,7 @@ A sports-market decision benchmark running through [Ospex](https://ospex.org), t
 
 **The question:** given the same frozen pregame information bundle, the same decision deadline, and the same strict output contract, how do different frontier models perform at making sports-market decisions?
 
-Each participating model receives an identical, content-hashed bundle (game identity, scheduled start, and timestamped reference odds for moneyline, run line, and total), returns forced forecasts for all three markets per game under a strict JSON schema, and is recorded with full provenance — requested and response-reported model IDs, timestamps, latency, token usage, and the raw response. Forecasts are scored later against no-vig reference closing lines (closing-line value), which evaluates the price obtained rather than the noisy game result.
+Each participating model receives an identical, content-hashed bundle (game identity, scheduled start, and timestamped reference odds for moneyline, run line, and total), returns forced forecasts for all three markets per game under a strict JSON schema, and is recorded with full provenance — requested and response-reported model IDs, timestamps, latency, token usage, the extracted answer text, and the complete provider response body it came out of. Forecasts are scored later against no-vig reference closing lines (closing-line value), which evaluates the price obtained rather than the noisy game result.
 
 ## ⚠️ v0 is a shakedown, not a scored cohort
 
@@ -89,7 +89,23 @@ Every decision is keyed by `gameId` — the upstream odds-feed event identifier 
 
 Token accounting: each response's provider usage object is stored **verbatim** (`usageRaw`, including reasoning/thinking-token fields and any provider-reported cost figure) alongside normalized counts. Every live call carries an explicit output-token bound (default 16000, `--max-output-tokens`), recorded in the request params. Dollar cost is never fabricated — a price table can be applied retroactively; token counts cannot be recovered after the fact.
 
-Artifact safety: every byte serialized to NDJSON or the summary passes through credential redaction at the write chokepoint — parsed rationales, validation errors, reported IDs, and raw usage objects included, not just raw response text — and every dynamic console line prints through the same redactor.
+Artifact safety: every byte serialized to NDJSON or the summary passes through credential redaction at the write chokepoint — parsed rationales, validation errors, reported IDs, and raw usage objects included, not just the model's answer text — and every dynamic console line prints through the same redactor.
+
+### Retained response envelopes
+
+Each attempt records two provider-derived values, deliberately separate: `answerText`, the answer the adapter extracted, and `responseEnvelope`, the **complete HTTP response body** it was extracted from, with a `sha256` over exactly the stored bytes and their UTF-8 length. (Files written before this existed carry the extracted text alone, under its former name `rawResponse`; both names are read.)
+
+The envelope is what makes an audit re-derivable. A per-attempt web-search audit is whatever the extractor of the day made of the response, so when a provider ships a shape that extractor does not recognize, the audit comes back empty and — with the body discarded — is indistinguishable from a model that did not search. Retaining the body separates the two:
+
+```bash
+yarn replay:search-audit out/<runId>.ndjson
+```
+
+re-extracts every attempt's audit from its retained envelope and reports where the result now differs. It reads the named files only: no provider is called and nothing is billed.
+
+The body is stored **as received** — not canonicalized, not re-serialized — because key order, whitespace and number formatting are part of what identifies an unrecognized shape. Credential values are substituted out before the digest is taken, so the digest covers exactly what is stored; credentials travel only in request headers, and no header is ever recorded. Retention covers the 2xx-with-parseable-JSON path; a non-2xx body and a 200 that is not JSON keep their existing truncated error detail, since a provider error body is the likeliest place request content is echoed back.
+
+Envelopes are **private evidence**. They live in the run file under `out/` (gitignored), and the serving projection publishes no column carrying one — what it takes from an envelope is whether one exists, which is what separates a provable `no_search_evidence` from an `unknown_unproven` nobody can check.
 
 ### Slate-date rule
 
@@ -157,6 +173,7 @@ Second, a close whose lock differs from the frozen bundle's scheduled start by a
 - every decision re-derived from the accepted response — content and provenance — and backed by exactly one `valid` arm response per game;
 - the deterministic baselines re-derived via `runBaselines` under the run's RECORDED policy version (v0.1.0 six policies, v0.2.0 adds the mirrored run-line pair) and compared exactly — archived runs keep verifying as newer baseline versions ship, and the per-decision version stamps are cross-checked against run_meta's `baselinePolicyVersion` (absent on pre-stamp archives); like every non-hashed manifest field, the stamps defend against incoherent edits, not a forger rewriting the whole file consistently — see the trust boundary below;
 - the **identity/collision gate recomputed** from the archived reported model IDs and the approved-ID registry — the recomputed failure set must be empty regardless of whether `run_failure` records survive, and any surviving `run_failure` must correspond to a recomputed failure;
+- every **retained response envelope** re-hashed from the body stored beside it, so an artifact edited after the fact does not describe itself; and, on a run stamped with the evidence era (`run_meta.evidenceEra`), an envelope **required** on every attempt that received a response — a leg with a body and no envelope is lost evidence, not a shrug. A file with no era stamp predates retention and is reported as envelope-unavailable rather than failed for a field that did not exist when it was written;
 - the frozen arm manifest, manifest counts, uniqueness, cross-products, and per-record run/label/cohort identity all enforced.
 
 What this cannot detect, by design: a forger who consistently rewrites the archived raw responses themselves (and the frozen bundles, and their hashes) is fabricating the primary evidence — no self-contained file format can distinguish that without provider-signed responses. The archived artifacts are the stated trust boundary.

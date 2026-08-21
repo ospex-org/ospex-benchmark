@@ -1,4 +1,4 @@
-import type { ProviderUsage, SearchAudit } from '../types.js';
+import type { ProviderResponseEnvelope, ProviderUsage, SearchAudit } from '../types.js';
 
 export class ProviderTimeoutError extends Error {
   constructor(provider: string, timeoutMs: number) {
@@ -42,10 +42,11 @@ export class ProviderHttpError extends Error {
  *
  * The call's evidence IS carried here — the HTTP status, provider response
  * id, reported model id, the extracted (possibly empty) answer text, the
- * response's own usage (normalized and verbatim), the search audit, and the
- * recorded request params — so the persisted attempt records what actually
- * happened and the money guard prices what the call actually cost instead of
- * escalating on absent evidence. The runner redacts the carried text/audit
+ * COMPLETE response body it was extracted from, the response's own usage
+ * (normalized and verbatim), the search audit, and the recorded request params
+ * — so the persisted attempt records what actually happened and the money
+ * guard prices what the call actually cost instead of escalating on absent
+ * evidence. The runner redacts the carried text/audit
  * when it records the attempt, exactly as it does for a returned response.
  */
 export class ProviderUnfinishedTurnError extends Error {
@@ -54,6 +55,13 @@ export class ProviderUnfinishedTurnError extends Error {
   readonly providerResponseId: string | null;
   readonly reportedModelId: string | null;
   readonly rawText: string;
+  /**
+   * The complete response body. An unfinished turn is a PAID, received
+   * response, so it retains an envelope on the same terms a returned response
+   * does — and it is the case most likely to carry a shape the extractor of
+   * the day does not recognize, which is exactly what the envelope exists for.
+   */
+  readonly responseEnvelope: ProviderResponseEnvelope;
   readonly usage: ProviderUsage;
   readonly usageRaw: unknown;
   readonly searchAudit: SearchAudit | null;
@@ -67,6 +75,7 @@ export class ProviderUnfinishedTurnError extends Error {
     providerResponseId: string | null;
     reportedModelId: string | null;
     rawText: string;
+    responseEnvelope: ProviderResponseEnvelope;
     usage: ProviderUsage;
     usageRaw: unknown;
     searchAudit: SearchAudit | null;
@@ -79,6 +88,7 @@ export class ProviderUnfinishedTurnError extends Error {
     this.providerResponseId = input.providerResponseId;
     this.reportedModelId = input.reportedModelId;
     this.rawText = input.rawText;
+    this.responseEnvelope = input.responseEnvelope;
     this.usage = input.usage;
     this.usageRaw = input.usageRaw;
     this.searchAudit = input.searchAudit;

@@ -10,7 +10,7 @@ import { runOneArmGame, runSlate, sealDispatch } from './runner.js';
 import type { RunEnvelope, SlateRunOptions } from './runner.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
 import { buildSummaryMarkdown } from './summary.js';
-import { makeRequest, makeValidResponse } from './testFactories.js';
+import { fixtureEnvelope, makeRequest, makeValidResponse } from './testFactories.js';
 import type { BuildResult, GameRequest } from './bundle.js';
 import type { PreparedGameRequest } from './preparedRequest.js';
 import type { ArmSpec, ProviderAdapter, ProviderResponse } from './types.js';
@@ -51,6 +51,7 @@ const ARMS: ArmSpec[] = [ARM_A, ARM_B];
 function stubResponse(rawText: string, reportedModelId: string): ProviderResponse {
   return {
     rawText,
+    responseEnvelope: fixtureEnvelope(rawText),
     reportedModelId,
     providerResponseId: 'counting-response',
     httpStatus: 200,

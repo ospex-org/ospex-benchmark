@@ -51,6 +51,7 @@ import type {
   ProviderName,
   ProviderResponse,
 } from './types.js';
+import { fixtureEnvelope } from './testFactories.js';
 
 /**
  * The permit-bound attempt lifecycle and the canonical authorized dispatch path. Every test
@@ -290,7 +291,7 @@ function scriptedAdapter(
     async chat(_t: ChatTurn[], _ms: number): Promise<ProviderResponse> {
       state.calls += 1;
       const body = await bodies(state.calls);
-      return { rawText: body, reportedModelId: identity.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {}, searchAudit: null };
+      return { rawText: body, responseEnvelope: fixtureEnvelope(body), reportedModelId: identity.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {}, searchAudit: null };
     },
   };
   return { adapter, get calls() { return state.calls; } } as Scripted;

@@ -6,6 +6,18 @@ import { ProviderHttpError, ProviderTimeoutError } from './errors.js';
  * reach a record or the console; response bodies in errors are truncated.
  * HTTP 429 is surfaced via ProviderHttpError.status so the runner can
  * classify it as rate_limited rather than a model failure.
+ *
+ * On success the RECEIVED BODY TEXT is returned beside the parse. Before this,
+ * the text was a local that died with the call, so no adapter could retain a
+ * response envelope even if it wanted to — the extractor's normalized output
+ * was the only thing that survived a run, and an unrecognized shape could
+ * never be re-read (#92). `bodyText` is the bytes as received: un-redacted and
+ * un-canonicalized, for `sealResponseEnvelope` to bind.
+ *
+ * Only the 2xx-with-parseable-JSON path returns it. A non-2xx body and a 200
+ * that is not JSON keep their existing truncated error detail deliberately: a
+ * provider error body is the likeliest place request content is echoed back,
+ * and widening it would put an unbounded copy of it into evidence.
  */
 export async function postJson(options: {
   provider: string;
@@ -13,7 +25,7 @@ export async function postJson(options: {
   headers: Record<string, string>;
   body: unknown;
   timeoutMs: number;
-}): Promise<{ status: number; json: unknown }> {
+}): Promise<{ status: number; json: unknown; bodyText: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs);
   try {
@@ -57,7 +69,7 @@ export async function postJson(options: {
       );
     }
     try {
-      return { status: response.status, json: JSON.parse(text) as unknown };
+      return { status: response.status, json: JSON.parse(text) as unknown, bodyText: text };
     } catch {
       throw new ProviderHttpError(
         options.provider,

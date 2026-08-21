@@ -305,6 +305,7 @@ export class ClockRequiredError extends Error {
 function emptyAttempt(): AttemptRecord {
   return {
     rawText: null,
+    responseEnvelope: null,
     reportedModelId: null,
     providerResponseId: null,
     httpStatus: null,
@@ -379,6 +380,10 @@ async function timedChat(
     const respondedAt = nowMs();
     return {
       rawText: redactSecrets(response.rawText),
+      // Carried through, not re-sealed: `sealResponseEnvelope` already redacted
+      // the body and hashed exactly what it stored, so re-hashing here would
+      // only move the one binding away from the code that produced it.
+      responseEnvelope: response.responseEnvelope,
       reportedModelId: response.reportedModelId,
       providerResponseId: response.providerResponseId,
       httpStatus: response.httpStatus,
@@ -422,6 +427,10 @@ async function timedChat(
       error instanceof ProviderUnfinishedTurnError
         ? {
             rawText: redactSecrets(error.rawText),
+            // A paid, received response retains its envelope on the same terms
+            // as a returned one — and this is the path where an unrecognized
+            // provider shape is most likely to show up.
+            responseEnvelope: error.responseEnvelope,
             reportedModelId: error.reportedModelId,
             providerResponseId: error.providerResponseId,
             httpStatus: error.httpStatus,
