@@ -320,9 +320,17 @@ async function countsOrNull(query: GateQuery): Promise<string | null> {
  * definer check's own failure text offers, taken here in reviewed code
  * instead of re-argued in chat on every preflight.
  *
- * Every entry is `role -> schema.function`, EXACT: no wildcard admits a
- * function nobody has looked at, and a protocol refactor that renames one
- * makes the stale entry a visible pruning note rather than a silent widening.
+ * Every entry is `role -> schema.function(identity arguments)`, EXACT, where
+ * the argument list is `pg_get_function_identity_arguments` verbatim: no
+ * wildcard admits a function nobody has looked at, and a protocol refactor
+ * that renames one makes the stale entry a visible pruning note rather than a
+ * silent widening. The arguments are part of the identity because PostgreSQL
+ * overloads are SEPARATE functions — a name-only entry would silently exempt
+ * every overload anyone ever creates under that name (measured: an undeclared
+ * `rpc_active_recovery_run(hostile text)` passed a name-keyed build of this
+ * check). The same property makes an ALTERed signature fail closed: the old
+ * entry turns into a pruning note and the new signature arrives as a
+ * violation until someone re-reviews and re-declares it.
  *
  * Why these are safe, and the shape any future entry must argue in its own
  * comment: they are the indexer/read-API's OWN write path — the RPCs that
@@ -337,34 +345,38 @@ async function countsOrNull(query: GateQuery): Promise<string | null> {
  * construction.
  *
  * First measured against the live project 2026-08-21, immediately after the
- * scores-capability migration: these eighteen were the whole list, the
- * writer and browser keys held EXECUTE on none, and run-path publication had
- * already been operating under exactly this posture since 2026-08-15.
+ * scores-capability migration: these eighteen were the whole list, none of
+ * their names carried a second overload, the writer and browser keys held
+ * EXECUTE on none, and run-path publication had already been operating under
+ * exactly this posture since 2026-08-15. The signatures below are the live
+ * catalog's own `pg_get_function_identity_arguments` output, read that day.
  */
 export const DECLARED_DEFINER_EXEMPTIONS: ReadonlySet<string> = new Set([
-  'service_role -> public.rpc_active_recovery_run',
-  'service_role -> public.rpc_backfill_range',
-  'service_role -> public.rpc_commitment_matched',
-  'service_role -> public.rpc_leaderboard_funded',
-  'service_role -> public.rpc_leaderboard_new_highest_roi',
-  'service_role -> public.rpc_leaderboard_position_added',
-  'service_role -> public.rpc_leaderboard_prize_claimed',
-  'service_role -> public.rpc_position_fill_upsert',
-  'service_role -> public.rpc_position_matched_pair',
-  'service_role -> public.rpc_position_sold',
-  'service_role -> public.rpc_position_transferred',
-  'service_role -> public.rpc_recovery_run_complete',
-  'service_role -> public.rpc_recovery_run_fail',
-  'service_role -> public.rpc_recovery_run_phase',
-  'service_role -> public.rpc_recovery_run_start',
-  'service_role -> public.rpc_user_registered',
-  'service_role -> public.tg_games_maintain_earliest_match_time',
-  'service_role -> public.tg_games_touch_contest_on_match_time',
+  'service_role -> public.rpc_active_recovery_run(p_network network)',
+  'service_role -> public.rpc_backfill_range(p_network text, p_from_block bigint, p_to_block bigint, p_fresh_events jsonb)',
+  'service_role -> public.rpc_commitment_matched(p_network network, p_speculation_id bigint, p_contest_id bigint, p_commitment_hash text, p_maker_address text, p_taker_address text, p_maker_position_type position_type, p_taker_position_type position_type, p_maker_risk_amount numeric, p_taker_risk_amount numeric, p_odds_tick smallint, p_block_time timestamp with time zone, p_tx_hash text, p_log_index integer, p_source_block bigint, p_commitment_risk_amount numeric, p_nonce numeric, p_expiry timestamp with time zone, p_speculation_key text)',
+  'service_role -> public.rpc_leaderboard_funded(p_network network, p_leaderboard_id bigint, p_amount numeric, p_funder text, p_tx_hash text, p_log_index integer, p_block_number bigint, p_block_time timestamp with time zone, p_source_block bigint)',
+  'service_role -> public.rpc_leaderboard_new_highest_roi(p_network network, p_leaderboard_id bigint, p_new_highest_roi numeric, p_winner_address text, p_block_time timestamp with time zone, p_source_block bigint)',
+  'service_role -> public.rpc_leaderboard_position_added(p_network network, p_leaderboard_id bigint, p_speculation_id bigint, p_user_address text, p_position_type position_type, p_contest_id bigint, p_risk_amount numeric, p_profit_amount numeric, p_block_time timestamp with time zone, p_source_block bigint)',
+  'service_role -> public.rpc_leaderboard_prize_claimed(p_network network, p_leaderboard_id bigint, p_user_address text, p_share numeric, p_block_time timestamp with time zone, p_tx_hash text, p_log_index integer)',
+  'service_role -> public.rpc_position_fill_upsert(p_network network, p_speculation_id bigint, p_contest_id bigint, p_commitment_hash text, p_maker_address text, p_taker_address text, p_maker_position_type position_type, p_taker_position_type position_type, p_maker_risk_amount numeric, p_taker_risk_amount numeric, p_odds_tick smallint, p_block_time timestamp with time zone, p_tx_hash text, p_log_index integer, p_source_block bigint)',
+  'service_role -> public.rpc_position_matched_pair(p_network network, p_speculation_id bigint, p_maker_address text, p_taker_address text, p_maker_pt position_type, p_taker_pt position_type, p_maker_risk numeric, p_taker_risk numeric, p_block_time timestamp with time zone, p_source_block bigint, p_tx_hash text, p_log_index integer)',
+  'service_role -> public.rpc_position_sold(p_network network, p_speculation_id bigint, p_seller text, p_position_type position_type, p_risk_amount numeric, p_profit_amount numeric, p_purchase_price numeric, p_block_time timestamp with time zone, p_tx_hash text, p_log_index integer)',
+  'service_role -> public.rpc_position_transferred(p_network network, p_speculation_id bigint, p_from_address text, p_to_address text, p_position_type position_type, p_risk_amount numeric, p_profit_amount numeric, p_block_time timestamp with time zone, p_source_block bigint, p_tx_hash text, p_log_index integer)',
+  'service_role -> public.rpc_recovery_run_complete(p_id bigint)',
+  'service_role -> public.rpc_recovery_run_fail(p_id bigint, p_phase text, p_error text)',
+  'service_role -> public.rpc_recovery_run_phase(p_id bigint, p_phase text)',
+  'service_role -> public.rpc_recovery_run_start(p_network network, p_kind text, p_from_block bigint, p_to_block bigint, p_fork_point bigint, p_plan jsonb)',
+  'service_role -> public.rpc_user_registered(p_network network, p_leaderboard_id bigint, p_user_address text, p_declared_bankroll numeric, p_block_time timestamp with time zone, p_source_block bigint)',
+  'service_role -> public.tg_games_maintain_earliest_match_time()',
+  'service_role -> public.tg_games_touch_contest_on_match_time()',
 ]);
 
-/** The one place membership is decided, on the FULL `role -> function` pair —
- *  extracted so a test can hold it to exactly that and nothing looser (a
- *  role-only or prefix match would exempt functions nobody has looked at). */
+/** The one place membership is decided, on the FULL `role -> function` pair
+ *  where `fn` carries the routine's whole identity, `schema.name(identity
+ *  arguments)` — extracted so a test can hold it to exactly that and nothing
+ *  looser (a role-only, name-only or prefix match would exempt functions
+ *  nobody has looked at, name-only via any overload of a declared name). */
 export function isExemptDefiner(role: string, fn: string): boolean {
   return DECLARED_DEFINER_EXEMPTIONS.has(`${role} -> ${fn}`);
 }
@@ -888,8 +900,16 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
         // admits only reads by their opening verb; widening that to accept
         // `with` would also admit `WITH … INSERT`, which is exactly the thing
         // the sweep exists to refuse.
+        // The fn is the routine's FULL identity — name AND identity arguments —
+        // because overloads are separate functions and each must stand or fall
+        // on its own declaration. And there is deliberately NO row limit: this
+        // statement is the census the verdict is computed from, and a capped
+        // census lets an undeclared row hide behind enough declared ones to
+        // fill the cap (measured: 40 overloads of a declared name sorted ahead
+        // of an undeclared function and a limited build passed). Only the
+        // failure DETAIL truncates, below, and it says when it does.
         `select named.role,
-                n.nspname || '.' || p.proname as fn,
+                n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as fn,
                 exists (select 1 from pg_depend d
                          where d.objid = p.oid
                            and d.classid = 'pg_proc'::regclass
@@ -901,7 +921,7 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
           where n.nspname = 'public'
             and p.prosecdef
             and has_function_privilege(named.role, p.oid, 'EXECUTE')
-          order by 1, 2 limit 40`,
+          order by 1, 2`,
         [[...FORBIDDEN_READERS, READ_API_ROLE]],
       );
       if (rows.length === 0) {
@@ -918,10 +938,16 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
           .push(`${entry}${platform}`);
       }
       if (violating.length > 0) {
+        // The verdict was computed over EVERY row; only the display truncates,
+        // and it says so with the count, so nothing red can look green.
+        const shown = violating.slice(0, 20);
+        const elided = violating.length - shown.length;
         return {
           ok: false,
           detail:
-            `executable as their owner: ${violating.join(', ')}. Each one is a path around the ` +
+            `${violating.length} executable as their owner: ${shown.join(', ')}` +
+            (elided > 0 ? ` … and ${elided} more not displayed` : '') +
+            '. Each one is a path around the ' +
             'privilege grid above; revoke EXECUTE, or decide deliberately that it is safe by ' +
             'adding the exact pair to DECLARED_DEFINER_EXEMPTIONS with its reasoning. ' +
             'Entries marked [extension] belong to an installed extension rather than to this schema.',

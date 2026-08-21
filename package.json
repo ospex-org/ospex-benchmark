@@ -16,6 +16,7 @@
     "project": "tsx src/projectRunMain.ts",
     "project:scores": "tsx src/projectScoresMain.ts",
     "gate:serving": "tsx src/servingSchemaGate.ts",
+    "gate:serving:conformance": "tsx src/servingSchemaGate.conformance.ts",
     "watch": "tsx src/watchMain.ts",
     "runner:dry": "tsx src/cohortRunnerMain.ts",
     "runner:fire": "tsx src/cohortRunnerMain.ts --store=postgres --fixture",

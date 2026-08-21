@@ -743,6 +743,29 @@ MUTANTS = [
       "      recordType: 'scored_decision',\n      label: 'SMOKE_V0_NOT_A_COHORT',",
       "      recordType: 'participant_scorecard',\n      label: 'SMOKE_V0_NOT_A_COHORT',"),
      ['src/scoring.test.ts']),
+    # --- The third review hold: the definer census itself --------------------
+    # Keying the exemption on the bare name re-admits the reproduced defect:
+    # every overload of a declared name — functions nobody has reviewed — reads
+    # as exempt. Killed by the census-shape assertion (the semantics live in
+    # the SQL; no fake can evaluate them) and, on a real catalog, by the
+    # gate-conformance overload scenario.
+    ('M124-definer-overloads-collapse-to-a-name', 'src/servingSchemaGate.ts',
+     "                n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' as fn,",
+     "                n.nspname || '.' || p.proname as fn,",
+     ['src/servingSchemaGate.test.ts']),
+    # Reintroducing the row cap on the census re-admits the other half: an
+    # undeclared function hiding behind 40 declared rows that sort ahead of it.
+    ('M125-definer-census-capped-in-sql', 'src/servingSchemaGate.ts',
+     '          order by 1, 2`,',
+     '          order by 1, 2 limit 40`,',
+     ['src/servingSchemaGate.test.ts']),
+    # The same cap one layer up: a classification loop that stops at 40 rows
+    # never sees the 41st. Killed by the 41-fake-row test, which sorts the
+    # undeclared row exactly where the cut falls.
+    ('M126-definer-census-capped-in-code', 'src/servingSchemaGate.ts',
+     '      const present = new Set<string>();\n      for (const row of rows) {',
+     '      const present = new Set<string>();\n      for (const row of rows.slice(0, 40)) {',
+     ['src/servingSchemaGate.test.ts']),
 ]
 
 
