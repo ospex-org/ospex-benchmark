@@ -14,38 +14,38 @@
  * 41-fake-row test proves the classification layer (what the verdict does with
  * rows) — a cap reintroduced in either place goes red somewhere.
  *
- * WHAT THE ROUND-TRIP SCENARIO DOES AND DOES NOT PROVE. Creating every declared
- * signature from its own exemption string and reading it back through the
- * census is a round trip through the server's normalizer: if an entry drifts
- * from the catalog's emission format (`int` for `integer`, a missing argument
- * name), the recreated function comes back under a different string and the
- * scenario reds. It does NOT prove the entries match the LIVE project's
- * functions — that is measured against production by `yarn gate:serving` itself.
- *
  * ── THIS HARNESS IS DESTRUCTIVE, AND OWNS ITS TARGET BEFORE IT TOUCHES IT ─────
  * Unlike the store conformance, this connects as the OWNER — it has to, to
  * build hostile catalogs of SECURITY DEFINER functions and to grant EXECUTE on
- * them. That makes it capable of harm, so two guards stand between it and any
- * database that is not a throwaway:
+ * them. That makes it capable of harm, so it refuses to touch anything it does
+ * not own:
  *
- *   1. HOST is pinned to loopback with no override. There is no legitimate
- *      remote target.
- *   2. Before any DDL or grant, it proves the target's `public` schema is an
- *      EMPTY scratch — no relations, no routines, no user types. A database
- *      that holds anything of its own (a real function, a real table) is
- *      REFUSED with exit 2, its contents untouched. This is what stops a green
- *      run from silently rewriting grants on someone's local development
- *      database; the routine-canary scenario below proves the refusal fires
- *      and changes nothing.
+ *   1. HOST is pinned to loopback with no override.
+ *   2. Before any DDL or grant it proves the target is an EMPTY OWNED SCRATCH:
+ *        - NO user object in ANY non-system schema (not only `public`) — a
+ *          `business.real_data` table is as disqualifying as a `public` one;
+ *        - NO user schema other than `public`;
+ *        - NEITHER reserved role (`gate_conformance_probe`, `service_role`)
+ *          already exists — it creates and owns both, and a pre-existing one
+ *          means this is not a clean scratch (and would be a role it must not
+ *          reuse or drop).
+ *      Anything else is REFUSED with exit 2, its catalog untouched.
+ *   3. It NEVER grants a database-level privilege. A fresh database already
+ *      lets PUBLIC (hence the probe role) CONNECT, so no `GRANT … ON DATABASE`
+ *      is issued and `pg_database.datacl` is left NULL — nothing to restore.
+ *   4. Grants are per-function on the exact function created, never `ON ALL
+ *      FUNCTIONS`, so no object it did not make can be altered.
+ *   5. It tracks and drops only what it created — functions, then the two enum
+ *      types and both reserved roles a bare server lacked. Full cleanup returns
+ *      the database and cluster to their prior state, which is what lets a
+ *      re-run pass the ownership guard exactly as the first run did.
  *
- * Everything it then creates — functions, and the two enum types and probe
- * role a bare server lacks — is tracked and dropped on the way out, and only
- * what it actually created (a role that already existed is left alone). Grants
- * are issued per-function on the exact function created, never `ON ALL
- * FUNCTIONS`, so no object it did not make can be altered. Full cleanup is also
- * what makes a re-run work: the second run finds the database empty again and
- * passes the ownership guard exactly as the first did (or use a fresh
- * container).
+ * The refusal is one function, `refuseUnlessOwnedScratch`, that the command's
+ * own startup and the process-level regression both drive; and a process-level
+ * scenario spawns the ACTUAL entry point against hostile targets (a
+ * pre-existing role, a business schema) and requires exit 2 with the target
+ * unchanged — so a mutation that deletes the top-level guard is caught here, not
+ * only in the helper.
  *
  * The CHECK itself still runs as a dedicated non-superuser login: a superuser
  * sees EXECUTE on everything, so running the check as one would redden every
@@ -61,6 +61,8 @@
  *   yarn gate:serving:conformance
  */
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { Client } from 'pg';
 import { DECLARED_DEFINER_EXEMPTIONS, GATE_STARTUP_OPTIONS, SERVING_SCHEMA_CHECKS } from './servingSchemaGate.js';
 
@@ -69,6 +71,12 @@ const PORT = Number(process.env['BENCHMARK_GATE_CONFORMANCE_DB_PORT'] ?? '5439')
 const NAME = process.env['BENCHMARK_GATE_CONFORMANCE_DB_NAME'] ?? 'gate';
 const OWNER_PASSWORD = process.env['BENCHMARK_GATE_CONFORMANCE_DB_PASSWORD'] ?? 't';
 const LOCAL = new Set(['localhost', '127.0.0.1', '::1']);
+
+// A child invocation runs only the in-process scenarios against its own target,
+// never the process-level ones — that is what stops the spawn from recursing.
+const IS_CHILD = process.env['BENCHMARK_GATE_CONFORMANCE_CHILD'] === '1';
+const SELF = fileURLToPath(import.meta.url);
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 if (!LOCAL.has(HOST)) {
   // No override exists on purpose: this suite CREATES SECURITY DEFINER
@@ -79,6 +87,7 @@ if (!LOCAL.has(HOST)) {
 
 const PROBE_ROLE = 'gate_conformance_probe';
 const PROBE_PASSWORD = 'gate_conformance_probe_pw';
+const RESERVED_ROLES = [PROBE_ROLE, 'service_role'];
 
 /** `schema.name(identity arguments)` for every declared exemption. */
 const DECLARED_FNS = [...DECLARED_DEFINER_EXEMPTIONS].map((entry) => entry.split(' -> ')[1]!);
@@ -98,45 +107,54 @@ async function check(name: string, fn: () => Promise<void>): Promise<void> {
 }
 
 /**
- * Every object in `public` that makes a database something other than an empty
- * scratch: a relation (table/view/sequence/matview/foreign table), a routine
- * of any kind, or a user type. Reads only — this is the guard that decides
- * whether the destructive part may run, so it must never itself write. The
- * routine union is what refuses a target holding someone else's function.
+ * Everything that makes a target something other than an empty owned scratch: a
+ * user object in ANY non-system schema, a user schema other than `public`, or a
+ * reserved role that already exists. Reads only — this is the guard that decides
+ * whether the destructive part may run, so it must never itself write.
  */
-async function scratchOffenders(query: RowQuery): Promise<string[]> {
-  const rows = await query(
-    `select kind || ' ' || name as offender from (
-        select 'relation' as kind, c.relname as name
+async function ownershipOffenders(query: RowQuery): Promise<string[]> {
+  const objects = await query(
+    `select offender from (
+        select 'relation ' || n.nspname || '.' || c.relname as offender
           from pg_class c join pg_namespace n on n.oid = c.relnamespace
-         where n.nspname = 'public' and c.relkind in ('r', 'p', 'v', 'm', 'S', 'f')
+         where n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
+           and c.relkind in ('r', 'p', 'v', 'm', 'S', 'f')
         union all
-        select 'routine', p.proname
+        select 'routine ' || n.nspname || '.' || p.proname
           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-         where n.nspname = 'public'
+         where n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
         union all
-        select 'type', t.typname
+        select 'type ' || n.nspname || '.' || t.typname
           from pg_type t join pg_namespace n on n.oid = t.typnamespace
-         where n.nspname = 'public' and t.typtype in ('e', 'c', 'd', 'r') and t.typcategory <> 'A'
-      ) offenders order by 1`,
+         where n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
+           and t.typtype in ('e', 'c', 'd', 'r') and t.typcategory <> 'A'
+        union all
+        select 'schema ' || nspname
+          from pg_namespace
+         where nspname !~ '^pg_' and nspname not in ('information_schema', 'public')
+      ) o order by offender`,
   );
-  return rows.map((r) => String(r['offender']));
+  const roles = await query(
+    'select \'reserved role \' || rolname as offender from pg_roles where rolname = any($1::text[]) order by 1',
+    [RESERVED_ROLES],
+  );
+  return [...objects, ...roles].map((r) => String(r['offender']));
 }
 
 /**
  * The ownership guard the command runs before any DDL or grant. THROWS if the
- * target is not an empty scratch; returns silently if it is. Reads only, so a
- * refused target is left byte-for-byte as it was found. Extracted so the
- * no-mutation regression can drive the exact predicate the command refuses on,
- * not merely its ingredients.
+ * target is not an empty owned scratch; returns silently if it is. Reads only,
+ * so a refused target is left byte-for-byte as it was found. Extracted so the
+ * no-mutation regression can drive the exact predicate the command refuses on.
  */
-async function refuseUnlessEmptyScratch(query: RowQuery, dbLabel: string): Promise<void> {
-  const offenders = await scratchOffenders(query);
+async function refuseUnlessOwnedScratch(query: RowQuery, dbLabel: string): Promise<void> {
+  const offenders = await ownershipOffenders(query);
   if (offenders.length > 0) {
     throw new Error(
-      `refusing ${dbLabel}: its public schema is not an empty scratch — found ${offenders.join(', ')}. ` +
-        'This suite creates functions and rewrites EXECUTE grants, so it must own an empty target. ' +
-        'Point it at a fresh disposable database (docker run … -e POSTGRES_DB=gate … postgres:17-alpine).',
+      `refusing ${dbLabel}: not an empty owned scratch — found ${offenders.join(', ')}. ` +
+        'This suite creates functions, rewrites EXECUTE grants, and owns both reserved roles, ' +
+        'so it must be pointed at a fresh disposable database with neither reserved role present ' +
+        '(docker run … -e POSTGRES_DB=gate … postgres:17-alpine).',
     );
   }
 }
@@ -147,20 +165,20 @@ const ownerQuery: RowQuery = async (sql, params) =>
   (await owner.query(sql, params ? [...params] : undefined)).rows as ReadonlyArray<Record<string, unknown>>;
 
 // ── OWNERSHIP GUARD ─ before any DDL, grant, or scenario ─────────────────────
-// If the target is not an empty scratch, refuse without touching it. This is
-// the line that keeps a green run from silently rewriting grants on a real
-// local database; the routine-canary scenario below drives this exact function
-// and proves it throws and mutates nothing.
+// If the target is not an empty owned scratch, refuse without touching it. This
+// is the line that keeps a green run from mutating a real local database; the
+// no-mutation scenario drives this exact function, and the process-level
+// scenario proves the wired entry point exits 2 here.
 try {
-  await refuseUnlessEmptyScratch(ownerQuery, NAME);
+  await refuseUnlessOwnedScratch(ownerQuery, NAME);
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   await owner.end();
   process.exit(2);
 }
 
-/** Only what THIS run creates, so cleanup drops exactly that and a role or type
- *  that already existed is left untouched. */
+/** Only what THIS run creates, so cleanup drops exactly that. Past the guard,
+ *  neither reserved role and no user object exists, so these are unconditional. */
 const created: string[] = [];
 const createdTypes: string[] = [];
 const createdRoles: string[] = [];
@@ -169,32 +187,21 @@ let probe: Client | undefined;
 async function bootstrap(): Promise<void> {
   // The declared signatures reference the protocol's own enum types, which a
   // scratch server does not have; their VALUES are irrelevant to routine
-  // identity, only the type names matter. Create each only if absent, and
-  // remember which we made, so cleanup never drops a pre-existing object.
+  // identity, only the type names matter. The guard has already proven neither
+  // type nor reserved role exists, so these create-and-own unconditionally —
+  // and NO `grant connect on database`, because a fresh database already lets
+  // PUBLIC connect, so issuing one would be the DB-ACL change the guard forbids.
   for (const [type, ddl] of [
     ['network', "create type public.network as enum ('polygon', 'amoy')"],
     ['position_type', "create type public.position_type as enum ('upper', 'lower')"],
   ] as const) {
-    const exists = await ownerQuery(
-      `select 1 from pg_type t join pg_namespace n on n.oid = t.typnamespace where n.nspname = 'public' and t.typname = $1`,
-      [type],
-    );
-    if (exists.length === 0) {
-      await owner.query(ddl);
-      createdTypes.push(`public.${type}`);
-    }
+    await owner.query(ddl);
+    createdTypes.push(`public.${type}`);
   }
-  for (const [role, ddl] of [
-    ['service_role', 'create role service_role nologin'],
-    [PROBE_ROLE, `create role ${PROBE_ROLE} login password '${PROBE_PASSWORD}'`],
-  ] as const) {
-    const exists = await ownerQuery('select 1 from pg_roles where rolname = $1', [role]);
-    if (exists.length === 0) {
-      await owner.query(ddl);
-      createdRoles.push(role);
-    }
-  }
-  await owner.query(`grant connect on database ${NAME} to ${PROBE_ROLE}`);
+  await owner.query('create role service_role nologin');
+  createdRoles.push('service_role');
+  await owner.query(`create role ${PROBE_ROLE} login password '${PROBE_PASSWORD}'`);
+  createdRoles.push(PROBE_ROLE);
 }
 
 async function createDefiner(identity: string): Promise<void> {
@@ -203,16 +210,12 @@ async function createDefiner(identity: string): Promise<void> {
   );
   created.push(identity);
   // Scope the grant surface to EXACTLY this function — never `ON ALL FUNCTIONS`,
-  // which would rewrite EXECUTE on every other function in the schema (the B2
-  // hazard this harness was refused for). Creation grants EXECUTE to PUBLIC by
-  // default; the scenarios need it to be service_role-only.
+  // which would rewrite EXECUTE on every other function in the schema. Creation
+  // grants EXECUTE to PUBLIC by default; the scenarios need it service_role-only.
   await owner.query(`revoke execute on function ${identity} from public`);
   await owner.query(`grant execute on function ${identity} to service_role`);
 }
 
-/** The catalog's own answer, from the server, so a scenario proves the rows it
- *  claims to test really exist (a setup failure and a pass look identical
- *  otherwise). */
 async function censusCount(): Promise<number> {
   const rows = await ownerQuery(
     `select count(*)::int as n
@@ -223,12 +226,132 @@ async function censusCount(): Promise<number> {
   return rows[0]!['n'] as number;
 }
 
+/** Invoke the ACTUAL command as a child process against `dbName`, so a scenario
+ *  proves the WIRED entry point behaves, not just an extracted helper. Fast: a
+ *  refused target exits in the guard, a clean one runs the ~2s in-process set. */
+function runEntryPoint(dbName: string): { status: number | null; output: string } {
+  const result = spawnSync(`npx tsx "${SELF}"`, {
+    cwd: REPO_ROOT,
+    shell: true,
+    encoding: 'utf8',
+    timeout: 120000,
+    env: { ...process.env, BENCHMARK_GATE_CONFORMANCE_CHILD: '1', BENCHMARK_GATE_CONFORMANCE_DB_NAME: dbName },
+  });
+  return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+}
+
+/** A deterministic fingerprint of a database's user catalog plus its datacl, so
+ *  "identical post-run state" is a byte comparison rather than a vibe. */
+async function catalogFingerprint(dbName: string): Promise<string> {
+  const client = new Client({ host: HOST, port: PORT, user: 'postgres', password: OWNER_PASSWORD, database: dbName });
+  await client.connect();
+  try {
+    const rows = await client.query(
+      `select coalesce(string_agg(x, '|' order by x), '<empty>') as fp from (
+          select 'schema:' || nspname as x from pg_namespace where nspname !~ '^pg_' and nspname <> 'information_schema'
+          union all select 'rel:' || n.nspname || '.' || c.relname
+            from pg_class c join pg_namespace n on n.oid = c.relnamespace
+           where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' and c.relkind in ('r','p','v','m','S','f')
+          union all select 'proc:' || n.nspname || '.' || p.proname
+            from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+           where n.nspname !~ '^pg_' and n.nspname <> 'information_schema'
+          union all select 'type:' || n.nspname || '.' || t.typname
+            from pg_type t join pg_namespace n on n.oid = t.typnamespace
+           where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' and t.typtype in ('e','c','d','r') and t.typcategory <> 'A'
+          union all select 'datacl:' || coalesce((select datacl::text from pg_database where datname = $1), '<null>')
+        ) f`,
+      [dbName],
+    );
+    return String(rows.rows[0]!['fp']);
+  } finally {
+    await client.end();
+  }
+}
+
+/** Cluster-wide reserved-role state, so a child's create/drop of them is proven
+ *  to leave no residue. */
+async function reservedRoleState(): Promise<string> {
+  const rows = await ownerQuery(
+    'select coalesce(string_agg(rolname, \',\' order by rolname), \'<none>\') as s from pg_roles where rolname = any($1::text[])',
+    [RESERVED_ROLES],
+  );
+  return String(rows[0]!['s']);
+}
+
 const definerCheck = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('SECURITY DEFINER'));
 
 try {
-  // Runs FIRST, while public is still pristine, so the only offender the guard
-  // can find is the canary — isolating the routine detection from the enum
-  // types bootstrap will add next.
+  if (!IS_CHILD) {
+    // ── Process-level regressions: the WIRED entry point against hostile
+    //    targets. These run first, while the cluster has neither reserved role
+    //    and this database is pristine, and each fully undoes its own fixture.
+    await check('the wired command refuses a target where a reserved role already exists, role and DB ACL untouched', async () => {
+      const childDb = `${NAME}_pl_role`;
+      await owner.query(`drop database if exists ${childDb} with (force)`);
+      await owner.query(`create database ${childDb}`);
+      // A pre-existing reserved role is the ONLY thing wrong with the target, so
+      // a refusal can only be about the role (not an object or schema).
+      await owner.query(`create role ${PROBE_ROLE} login password '${PROBE_PASSWORD}'`);
+      try {
+        const roleConfigBefore = await reservedRoleState();
+        const aclBefore = await catalogFingerprint(childDb);
+        const child = runEntryPoint(childDb);
+        assert.equal(child.status, 2, `a pre-existing reserved role must exit 2; got ${child.status}\n${child.output}`);
+        assert.ok(child.output.includes(`reserved role ${PROBE_ROLE}`), `the refusal must name the role: ${child.output}`);
+        assert.equal(await reservedRoleState(), roleConfigBefore, 'the pre-existing role must be untouched');
+        assert.equal(await catalogFingerprint(childDb), aclBefore, 'the target database ACL/catalog must be untouched');
+      } finally {
+        await owner.query(`drop owned by ${PROBE_ROLE}`).catch(() => undefined);
+        await owner.query(`drop role if exists ${PROBE_ROLE}`).catch(() => undefined);
+        await owner.query(`drop database if exists ${childDb} with (force)`);
+      }
+    });
+
+    await check('the wired command refuses a target holding a non-public business schema, data untouched', async () => {
+      const childDb = `${NAME}_pl_schema`;
+      await owner.query(`drop database if exists ${childDb} with (force)`);
+      await owner.query(`create database ${childDb}`);
+      try {
+        const bootstrapClient = new Client({ host: HOST, port: PORT, user: 'postgres', password: OWNER_PASSWORD, database: childDb });
+        await bootstrapClient.connect();
+        try {
+          await bootstrapClient.query('create schema business');
+          await bootstrapClient.query('create table business.real_data(id int primary key)');
+          await bootstrapClient.query('insert into business.real_data values (1)');
+        } finally {
+          await bootstrapClient.end();
+        }
+        const before = await catalogFingerprint(childDb);
+        const child = runEntryPoint(childDb);
+        assert.equal(child.status, 2, `a non-public business schema must exit 2; got ${child.status}\n${child.output}`);
+        assert.ok(child.output.includes('business'), `the refusal must name the business schema: ${child.output}`);
+        assert.equal(await catalogFingerprint(childDb), before, 'the business schema and its row must be untouched');
+      } finally {
+        await owner.query(`drop database if exists ${childDb} with (force)`);
+      }
+    });
+
+    await check('the wired command runs and RE-runs on an empty target with byte-identical catalog state', async () => {
+      const childDb = `${NAME}_pl_empty`;
+      await owner.query(`drop database if exists ${childDb} with (force)`);
+      await owner.query(`create database ${childDb}`);
+      try {
+        const before = `${await catalogFingerprint(childDb)}||roles:${await reservedRoleState()}`;
+        const run1 = runEntryPoint(childDb);
+        assert.equal(run1.status, 0, `the first run on an empty target must pass; got ${run1.status}\n${run1.output}`);
+        assert.ok(run1.output.includes('7/7 scenarios passed'), `the child runs its in-process scenarios: ${run1.output}`);
+        const run2 = runEntryPoint(childDb);
+        assert.equal(run2.status, 0, `the rerun must pass; got ${run2.status}\n${run2.output}`);
+        assert.ok(run2.output.includes('7/7 scenarios passed'), `the rerun runs its in-process scenarios: ${run2.output}`);
+        const after = `${await catalogFingerprint(childDb)}||roles:${await reservedRoleState()}`;
+        assert.equal(after, before, 'two full runs must leave the catalog and cluster roles exactly as found');
+      } finally {
+        await owner.query(`drop database if exists ${childDb} with (force)`);
+      }
+    });
+  }
+
+  // ── In-process scenarios (both the parent and every child run these) ────────
   await check('a routine canary makes the target non-scratch, is named as the offender, and is left untouched', async () => {
     const canary = 'public.ospex_gate_canary(x integer)';
     const canaryRef = "'public.ospex_gate_canary(integer)'::regprocedure";
@@ -251,12 +374,12 @@ try {
       };
       const before = await snapshot();
 
-      // Drive the EXACT function the command refuses on, and require it to
-      // throw naming the canary — proving a routine-bearing target is refused
-      // before any mutation, since this call is the command's first act.
+      // Drive the EXACT function the command refuses on, and require it to throw
+      // naming the canary — proving a routine-bearing target is refused before
+      // any mutation, since this call is the command's first act.
       await assert.rejects(
-        refuseUnlessEmptyScratch(ownerQuery, NAME),
-        (error: Error) => error.message.includes('ospex_gate_canary') && /not an empty scratch/.test(error.message),
+        refuseUnlessOwnedScratch(ownerQuery, NAME),
+        (error: Error) => error.message.includes('ospex_gate_canary') && /not an empty owned scratch/.test(error.message),
         'the guard must refuse a target holding a routine canary and name it',
       );
 
@@ -298,19 +421,17 @@ try {
   });
 
   await check('the search_path pin holds the census to bare type names under a hostile role default', async () => {
-    // The catalog here is exactly the 18 declared functions (previous
-    // scenario), twelve of which carry custom types (network, position_type)
-    // whose rendering depends on the session search_path. Force the probe
-    // role's default to exclude public — the `ALTER ROLE … SET search_path =
-    // ''` hardening Supabase's linter encourages — and prove BOTH directions:
+    // The catalog here is exactly the 18 declared functions (previous scenario),
+    // twelve of which carry custom types (network, position_type) whose
+    // rendering depends on the session search_path. Force the probe role's
+    // default to exclude public — the `ALTER ROLE … SET search_path = ''`
+    // hardening Supabase's linter encourages — and prove BOTH directions:
     //   (a) an UNPINNED connection inherits the hostile default, the census
-    //       renders `public.network`, and the gate reds on the protocol's own
-    //       RPCs — the coupling the identity-args form introduced is real;
+    //       renders `public.network`, and the gate reds — the coupling is real;
     //   (b) a connection carrying the gate's OWN startup options pins
-    //       search_path=public over the role default, the census renders bare
-    //       names, and the gate passes.
-    // Without (a) the scenario could pass by the coupling never existing;
-    // without (b) the pin could be a no-op. Both are required.
+    //       search_path=public over the role default and the gate passes.
+    // The role is one THIS run created and drops, so this alters nothing
+    // pre-existing (the ownership guard has already refused a pre-existing one).
     await owner.query(`alter role ${PROBE_ROLE} set search_path = ''`);
     try {
       const unpinned = new Client({ host: HOST, port: PORT, user: PROBE_ROLE, password: PROBE_PASSWORD, database: NAME });
@@ -371,8 +492,9 @@ try {
   });
 } finally {
   // Drop exactly what this run created, in dependency order: functions first
-  // (they reference the types and are granted to the role), then the types and
-  // roles this run made — never one it found already there.
+  // (they reference the types and are granted to the role), then the types, then
+  // the reserved roles — `DROP OWNED BY` clears any grant the role still holds so
+  // the DROP ROLE succeeds and leaves no residue.
   for (const identity of created.reverse()) {
     try {
       await owner.query(`drop function if exists ${identity}`);
@@ -396,17 +518,11 @@ try {
   }
   for (const role of createdRoles.reverse()) {
     try {
-      // A role holding a grant (the probe role is granted CONNECT on the
-      // database) cannot be dropped while that dependency stands. `DROP OWNED
-      // BY` revokes every privilege granted TO this role in this database and
-      // drops anything it owns — safe because these are roles THIS run created,
-      // which own nothing of anyone else's — so the DROP ROLE then succeeds and
-      // leaves no residue. A fresh container is still the guaranteed reset, and
-      // the ownership guard refuses a dirty rerun.
       await owner.query(`drop owned by ${role}`);
       await owner.query(`drop role if exists ${role}`);
     } catch {
-      // best-effort on a disposable database
+      // best-effort; the ownership guard refuses a dirty rerun, and a fresh
+      // container is the guaranteed reset.
     }
   }
   await owner.end();
