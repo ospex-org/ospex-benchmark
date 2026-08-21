@@ -324,6 +324,7 @@ test('an unfinished turn records the FULL received-response evidence: httpStatus
     searchCount: 2,
     incomplete: ['query text unavailable for one or more executed searches'],
   };
+  const unfinishedEnvelope = fixtureEnvelope('the partial body behind an unfinished turn');
   const adapter = stubAdapter([
     async () => {
       throw new ProviderUnfinishedTurnError({
@@ -334,7 +335,9 @@ test('an unfinished turn records the FULL received-response evidence: httpStatus
         providerResponseId: 'msg_paused_runner_1',
         reportedModelId: 'stub-model-1',
         rawText: '',
-        responseEnvelope: fixtureEnvelope(''),
+        // A DISTINCT value from rawText, so a runner that carried the wrong one
+        // through cannot pass by the two happening to agree.
+        responseEnvelope: unfinishedEnvelope,
         usage,
         usageRaw,
         searchAudit,
@@ -359,6 +362,11 @@ test('an unfinished turn records the FULL received-response evidence: httpStatus
   assert.deepEqual(result.attempt.usage, usage);
   assert.deepEqual(result.attempt.usageRaw, usageRaw);
   assert.deepEqual(result.attempt.searchAudit, searchAudit);
+  // An unfinished turn is a PAID response, so the complete body it returned is
+  // retained on the same terms as a returned response's — it is the case most
+  // likely to carry a shape no extractor understands yet (#92).
+  assert.deepEqual(result.attempt.responseEnvelope, unfinishedEnvelope);
+  assert.notEqual(result.attempt.responseEnvelope?.body, result.attempt.rawText);
   assert.deepEqual(result.attempt.requestParams, {
     endpoint: 'https://stub.example/v1/messages',
     model: 'stub-model-1',
@@ -390,6 +398,10 @@ test('an unfinished turn records the FULL received-response evidence: httpStatus
   // No response was received, so no completion state exists to record.
   assert.equal(failed.attempt.providerStopReason, null);
   assert.equal(failed.attempt.turnCompleted, null);
+  // …and no envelope, because nothing was received to retain. This is the
+  // negative control for the assertion above: without it, a build that
+  // retained an envelope unconditionally would still pass.
+  assert.equal(failed.attempt.responseEnvelope, null);
 });
 
 test('repair that changes a decision is rejected even when schema-valid', async () => {

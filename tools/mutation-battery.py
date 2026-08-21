@@ -280,7 +280,7 @@ MUTANTS = [
      '        if (false) {',
      ['src/scoring.test.ts']),
     ('M54-reached-provider-always-false', 'src/scoring.ts',
-     '    attempt.rawResponse !== null ||',
+     '    attempt.answerText !== null ||',
      '    false ||',
      ['src/scoring.test.ts']),
 # --- the empty-key / path-encoding correction -----------------------------
@@ -790,6 +790,88 @@ MUTANTS = [
      '`${violating.length} executable as their owner: ${shown.join(\', \')}`',
      '`${shown.length} executable as their owner: ${shown.join(\', \')}`',
      ['src/servingSchemaGate.test.ts']),
+# --- #92: retained provider response envelopes ----------------------------
+# Every mutant below disables ONE stated guarantee of the retention change.
+    # The enabling defect itself: with the received text unreachable, nothing
+    # downstream can retain anything.
+    ('M130-http-discards-the-received-body', 'src/providers/http.ts',
+     "      return { status: response.status, json: JSON.parse(text) as unknown, bodyText: text };",
+     "      return { status: response.status, json: JSON.parse(text) as unknown, bodyText: '' };",
+     ['src/providers/responseEnvelope.test.ts']),
+    # Byte fidelity. Killed only by a fixture whose received bytes differ from
+    # its own JSON round trip -- NON_CANONICAL_BODY exists for exactly this.
+    ('M131-envelope-stored-canonicalized', 'src/providers/responseEnvelope.ts',
+     '  const body = redactSecrets(receivedBodyText);',
+     '  const body = redactSecrets(JSON.stringify(JSON.parse(receivedBodyText)));',
+     ['src/providers/responseEnvelope.test.ts']),
+    # The digest must cover what is STORED. With no credential present,
+    # redaction is the identity and this mutant is equivalent -- the credential
+    # case is the only thing in the suite that discriminates it.
+    ('M132-digest-taken-before-redaction', 'src/providers/responseEnvelope.ts',
+     '    sha256: sha256Hex(body),',
+     '    sha256: sha256Hex(receivedBodyText),',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M133-bytes-counts-characters', 'src/providers/responseEnvelope.ts',
+     "    bytes: Buffer.byteLength(body, 'utf8'),",
+     '    bytes: body.length,',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M134-digest-never-verified', 'src/providers/responseEnvelope.ts',
+     "  if (sha256Hex(envelope.body) !== envelope.sha256) failures.push(ENVELOPE_VIOLATION.DIGEST);",
+     '  if (false) failures.push(ENVELOPE_VIOLATION.DIGEST);',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    ('M135-byte-length-never-verified', 'src/providers/responseEnvelope.ts',
+     "  if (Buffer.byteLength(envelope.body, 'utf8') !== envelope.bytes) {",
+     '  if (false) {',
+     ['src/providers/responseEnvelope.test.ts']),
+    # An unfinished turn is a paid response and must retain its body too.
+    ('M136-unfinished-turn-loses-its-envelope', 'src/runner.ts',
+     '            responseEnvelope: error.responseEnvelope,',
+     '            responseEnvelope: null,',
+     ['src/runner.test.ts']),
+    # The repair leg ONLY. A build that kept the initial envelope and dropped
+    # the repair's would leave the ACCEPTED attempt unverifiable.
+    ('M137-repair-envelope-dropped', 'src/records.ts',
+     '      repair: result.repair === null ? null : attemptFields(result.repair),',
+     '      repair: result.repair === null ? null : { ...attemptFields(result.repair), responseEnvelope: null },',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Rule 3d, the same-typed positional swap: each field carries the other's
+    # value, with a correctly recomputed digest so nothing fails for a
+    # bookkeeping reason. Compound, because the swap needs the seal imported.
+    ('M138-answer-and-envelope-swapped', 'src/records.ts',
+     ("import { EVIDENCE_ERA } from './providers/responseEnvelope.js';",
+      '    answerText: attempt?.rawText ?? null,',
+      '    responseEnvelope: attempt?.responseEnvelope ?? null,'),
+     ("import { EVIDENCE_ERA, sealResponseEnvelope } from './providers/responseEnvelope.js';",
+      '    answerText: attempt?.responseEnvelope?.body ?? null,',
+      '    responseEnvelope: attempt?.rawText == null ? null : sealResponseEnvelope(attempt.rawText),'),
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    ('M139-era-stamp-omitted', 'src/records.ts',
+     '    evidenceEra: EVIDENCE_ERA,',
+     '    evidenceEra: undefined,',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Rule 3k: the skip is an opt-out unless the skipped case is unreachable.
+    ('M140-missing-envelope-always-skipped', 'src/scoring.ts',
+     '        if (run.evidenceEra !== null && reachedProvider(attempt)) {',
+     '        if (false) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The legacy field name must still be read, or every archived run stops
+    # being scoreable the moment the rename lands.
+    ('M141-archived-answer-name-ignored', 'src/scoring.ts',
+     '            answerText: response.attempt.answerText ?? response.attempt.rawResponse ?? null,',
+     '            answerText: response.attempt.answerText ?? null,',
+     ['src/responseEnvelopeIntegrity.test.ts', 'src/scoring.test.ts']),
+    # The reporting half: absence of an envelope must not be read as proof that
+    # no search ran.
+    ('M142-unavailable-backfilled-as-no-search', 'src/servingProjection.ts',
+     "  if (searchAudit === null) return envelopeRetained ? 'no_search_evidence' : 'unknown_unproven';",
+     "  if (searchAudit === null) return 'no_search_evidence';",
+     ['src/responseEnvelopeIntegrity.test.ts', 'src/servingProjection.test.ts']),
+    # A tampered body is not evidence about the call it names, so the replay
+    # must refuse it rather than extract from it.
+    ('M143-replay-reads-a-tampered-body', 'src/searchAuditReplay.ts',
+     '  if (envelopeVerificationFailures(envelope).length > 0) {',
+     '  if (false) {',
+     ['src/searchAuditReplay.test.ts']),
 ]
 
 
