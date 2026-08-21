@@ -49,6 +49,15 @@ export type ReplayEnvelopeState =
   | 'retained'
   /** No envelope on the record: it predates retention, or nothing came back. */
   | 'unavailable'
+  /**
+   * An envelope is PRESENT but is not one: a missing or wrong-typed `body`,
+   * `sha256` or `bytes`. Reported apart from `unavailable`, because "we could
+   * not read this" and "there was nothing to read" are the two readings #92
+   * exists to keep apart, and collapsing them here would reintroduce the
+   * conflation one layer down. The scorer refuses the same bytes outright
+   * (`responseEnvelopeSchema` is `.strict()`), so the two readers agree.
+   */
+  | 'malformed'
   /** An envelope is present but its stored body does not reproduce its digest. */
   | 'digest-mismatch'
   /** The retained body is not parseable JSON. */
@@ -98,14 +107,27 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function readEnvelope(value: unknown): ProviderResponseEnvelope | null {
+/**
+ * Reading an envelope has THREE outcomes, not two. A record that carries no
+ * envelope key at all is a file that predates retention or a leg that received
+ * nothing; a record carrying something under that key which is not an envelope
+ * is damaged evidence. Returning one null for both is what made the tool report
+ * a hand-edited artifact as "nothing to see here" at exit 0.
+ */
+type EnvelopeRead =
+  | { kind: 'absent' }
+  | { kind: 'malformed' }
+  | { kind: 'envelope'; envelope: ProviderResponseEnvelope };
+
+function readEnvelope(value: unknown): EnvelopeRead {
+  if (value === undefined || value === null) return { kind: 'absent' };
   const record = asRecord(value);
-  if (record === null) return null;
+  if (record === null) return { kind: 'malformed' };
   const { body, sha256, bytes } = record;
   if (typeof body !== 'string' || typeof sha256 !== 'string' || typeof bytes !== 'number') {
-    return null;
+    return { kind: 'malformed' };
   }
-  return { body, sha256, bytes };
+  return { kind: 'envelope', envelope: { body, sha256, bytes } };
 }
 
 function readAudit(value: unknown): SearchAudit | null {
@@ -124,8 +146,11 @@ function replayLeg(
 ): ReplayLeg {
   const archivedAudit = readAudit(attempt.searchAudit);
   const base = { participantId, gameId, leg, provider, archivedAudit, replayedAudit: null, changed: false };
-  const envelope = readEnvelope(attempt.responseEnvelope);
-  if (envelope === null) return { ...base, envelope: 'unavailable' };
+  const read = readEnvelope(attempt.responseEnvelope);
+  if (read.kind !== 'envelope') {
+    return { ...base, envelope: read.kind === 'absent' ? 'unavailable' : 'malformed' };
+  }
+  const envelope = read.envelope;
   // Before the body, its binding. An altered body is not evidence about the
   // call it names, so it is reported rather than extracted from.
   if (envelopeVerificationFailures(envelope).length > 0) {
@@ -194,7 +219,11 @@ export function replaySearchAudits(
       retained: legs.filter((l) => l.envelope === 'retained').length,
       unavailable: legs.filter((l) => l.envelope === 'unavailable').length,
       unreadable: legs.filter(
-        (l) => l.envelope === 'digest-mismatch' || l.envelope === 'unparseable' || l.envelope === 'no-extractor',
+        (l) =>
+          l.envelope === 'malformed' ||
+          l.envelope === 'digest-mismatch' ||
+          l.envelope === 'unparseable' ||
+          l.envelope === 'no-extractor',
       ).length,
       changed: legs.filter((l) => l.changed).length,
     },
@@ -213,8 +242,9 @@ envelope-unavailable; that is the honest answer for them, not a failure.
 
 Exit codes:
   0  every retained envelope was read
-  1  at least one envelope is present but unreadable (digest mismatch,
-     unparseable body, or no extractor for its provider)
+  1  at least one envelope is present but unreadable (not a well-formed
+     envelope, digest mismatch, unparseable body, or no extractor for its
+     provider)
   2  usage -- no files given, or a named file does not exist`;
 
 export const REPLAY_EXIT = Object.freeze({ ok: 0, unreadable: 1, usage: 2 });

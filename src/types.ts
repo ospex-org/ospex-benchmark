@@ -335,8 +335,10 @@ export interface SearchAudit {
  * gap was found on. Non-2xx bodies and 200s that are not JSON keep their
  * existing truncated error detail; see `postJson`.
  *
- * PRIVATE evidence. It stays in the run NDJSON under `out/` (gitignored) and
- * is never written to a serving column.
+ * PRIVATE evidence. It stays in the run NDJSON under `out/` (gitignored), and
+ * no row the serving projection builds carries the body — attempts, decisions
+ * and run facts alike, pinned by a marker scan over the whole projection plan.
+ * What the projection takes from an envelope is whether one exists.
  */
 export interface ProviderResponseEnvelope {
   body: string;

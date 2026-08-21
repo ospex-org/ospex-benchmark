@@ -881,6 +881,56 @@ MUTANTS = [
      '  if (envelopeVerificationFailures(envelope).length > 0) {',
      '  if (false) {',
      ['src/searchAuditReplay.test.ts']),
+
+    # --- found by the adversarial pass, and SURVIVING before it -------------
+    # Integrity is claimed for EVERY retained envelope, and on a repaired
+    # decision the repair is the leg whose body backs the published forecast.
+    # Every digest case tampered the initial leg, so verification could be
+    # disabled for the repair alone and the whole suite stayed green.
+    ('M144-repair-envelope-integrity-unchecked', 'src/scoring.ts',
+     '      for (const failure of envelopeVerificationFailures(attempt.responseEnvelope)) {',
+     "      for (const failure of leg === 'repair' ? [] : envelopeVerificationFailures(attempt.responseEnvelope)) {",
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Rule 3k, the second half: sweep the predicate. `reachedProvider` is three
+    # OR'd signals, and every fixture reaching the presence rule carried a
+    # non-null answer text, so the other two disjuncts were dead and a build
+    # consulting one signal exempted a leg whose answer had also been stripped.
+    ('M145-presence-gate-reads-one-disjunct', 'src/scoring.ts',
+     '        if (run.evidenceEra !== null && reachedProvider(attempt)) {',
+     '        if (run.evidenceEra !== null && attempt.answerText !== null) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Idempotence on its own output. Rule 4b: the suite always runs
+    # credential-free (only the entry points call `loadDotEnv`), so redaction
+    # was the identity and the test asserted seal(x) == seal(x). The state the
+    # claim is about -- a credential present, as under `yarn smoke` -- was the
+    # one never exercised.
+    ('M146-seal-not-idempotent-on-own-output', 'src/providers/responseEnvelope.ts',
+     '  const body = redactSecrets(receivedBodyText);',
+     "  const body = receivedBodyText.includes('[REDACTED]')\n    ? `${redactSecrets(receivedBodyText)} `\n    : redactSecrets(receivedBodyText);",
+     ['src/providers/responseEnvelope.test.ts']),
+    # Neither name present must be REFUSED, not read as a null answer. Both
+    # field names are optional so a file carries one or the other; a record
+    # carrying neither parsed as `answerText: null` and every rule that reads
+    # the answer went quiet.
+    ('M147-neither-answer-name-required', 'src/scoring.ts',
+     '    if (value.answerText === undefined && value.rawResponse === undefined) {',
+     '    if (false) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The replay's two nulls. An envelope that is PRESENT but not well formed
+    # was reported as `unavailable` at exit 0 -- the same conflation of "we
+    # could not see" with "there was nothing to see" that #92 exists to remove.
+    # The privacy claim: the envelope BODY reaches no published row. Scored by
+    # publishing it, which is the only way to find out whether the marker scan
+    # covers the surfaces it says it does (it scans the whole plan, not just the
+    # attempt rows the envelope is nearest to).
+    ('M149-envelope-body-published', 'src/servingProjection.ts',
+     '    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeRetained),',
+     "    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeRetained),\n    responseEnvelopeBody: (nested(leg, 'responseEnvelope') as { body?: string } | null)?.body ?? null,",
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    ('M148-malformed-envelope-read-as-absent', 'src/searchAuditReplay.ts',
+     "    return { ...base, envelope: read.kind === 'absent' ? 'unavailable' : 'malformed' };",
+     "    return { ...base, envelope: 'unavailable' };",
+     ['src/searchAuditReplay.test.ts']),
 ]
 
 

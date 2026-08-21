@@ -31,9 +31,16 @@ export const EVIDENCE_ERA = 'response-envelope-v1';
  *    unrecognized response shape be identified after the fact — so the thing
  *    retained to preserve an unknown shape would arrive already reshaped.
  *
- * Idempotent on its own output: sealing an already-sealed body reproduces the
- * same body, digest and length, so passing evidence through a second redaction
- * pass (`writeNdjson` redacts every line it writes) cannot break the binding.
+ * Both properties are load-bearing on the way to disk, and the second is the
+ * one that actually fires: `writeNdjson` redacts EVERY line it writes, so the
+ * stored body meets `redactSecrets` a second time after its digest was taken.
+ * Because the seal redacted first, that pass finds nothing left to substitute
+ * and the body still reproduces the digest beside it — and sealing an
+ * already-sealed body likewise reproduces the same body, digest and length.
+ * Both are pinned with a credential present, which is the state the suite would
+ * otherwise never reach: only the entry points load `.env`, so redaction is the
+ * identity under `yarn test` and a test written credential-free asserts nothing
+ * about either.
  */
 export function sealResponseEnvelope(receivedBodyText: string): ProviderResponseEnvelope {
   const body = redactSecrets(receivedBodyText);

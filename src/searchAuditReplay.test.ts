@@ -38,6 +38,11 @@ interface LegFixture {
   answerText: string | null;
   /** Corrupt the sealed body after digesting it, to model a tampered file. */
   tamper?: boolean;
+  /**
+   * Remove `sha256` from the sealed envelope: something IS under the envelope
+   * key, and it is not an envelope. A hand-edited file, not an archived one.
+   */
+  malform?: boolean;
 }
 
 function attemptRecord(fixture: LegFixture): Record<string, unknown> {
@@ -51,9 +56,11 @@ function attemptRecord(fixture: LegFixture): Record<string, unknown> {
     responseEnvelope:
       sealed === null
         ? null
-        : fixture.tamper === true
-          ? { ...sealed, body: `${sealed.body} ` }
-          : sealed,
+        : fixture.malform === true
+          ? { body: sealed.body, bytes: sealed.bytes }
+          : fixture.tamper === true
+            ? { ...sealed, body: `${sealed.body} ` }
+            : sealed,
   };
 }
 
@@ -265,6 +272,60 @@ test('a tampered envelope is refused before its body is read', () => {
   assert.equal(report.legs[0]!.envelope, 'digest-mismatch');
   assert.equal(report.legs[0]!.replayedAudit, null, 'an altered body is not extracted from');
   assert.equal(report.counts.unreadable, 1);
+});
+
+test('an envelope that is PRESENT but not an envelope is unreadable, never "unavailable"', () => {
+  // The conflation #92 exists to remove, one layer down. Absent and malformed
+  // both used to read as a single null, so a hand-edited file reported "there
+  // was nothing to see" where the truth is "we could not read what is here".
+  //
+  // The negative control is the case above ('no envelope ... envelope-
+  // unavailable'), which keeps the same shape MINUS the envelope key and must
+  // still report `unavailable`. The two cases differ in exactly one thing.
+  const fixture = {
+    participantId: 'google-arm' as const,
+    provider: 'google' as const,
+    body: GROUNDED_BODY,
+    archivedAudit: null,
+    answerText: 'grounded answer',
+  };
+  const lines = runLines([{ ...fixture, malform: true }]);
+  const report = replaySearchAudits(lines);
+  assert.equal(report.legs[0]!.envelope, 'malformed');
+  assert.equal(report.legs[0]!.replayedAudit, null, 'nothing is extracted from it');
+  assert.equal(report.counts.unreadable, 1, 'it counts as unreadable, so the command exits non-zero');
+  assert.equal(report.counts.unavailable, 0, 'and NOT as "there was nothing to read"');
+
+  // The scorer refuses the same damage outright — that half is pinned on a real
+  // fired artifact in `responseEnvelopeIntegrity.test.ts`, where the record is
+  // complete enough that the refusal can only be about the envelope. These
+  // minimal fixtures carry no cohort id or label, so a `parseRunRecords` here
+  // would throw for a reason that has nothing to do with the envelope.
+
+  // The well-formed version of the identical fixture replays, so the refusal
+  // above is about the damage rather than about the fixture.
+  assert.equal(replaySearchAudits(runLines([fixture])).legs[0]!.envelope, 'retained');
+});
+
+test('the command exits 1 on a malformed envelope and names it', () => {
+  const text = `${runLines([
+    {
+      participantId: 'google-arm',
+      provider: 'google',
+      body: GROUNDED_BODY,
+      archivedAudit: null,
+      answerText: 'grounded answer',
+      malform: true,
+    },
+  ]).join('\n')}\n`;
+  const { code, out } = cli({ 'run.ndjson': text }, ['run.ndjson']);
+  assert.equal(code, REPLAY_EXIT.unreadable);
+  assert.ok(out.some((line) => line.includes('malformed')), out.join('\n'));
+  assert.ok(out.some((line) => line.includes('1 unreadable')), out.join('\n'));
+  assert.ok(
+    !out.some((line) => line.includes('1 envelope-unavailable')),
+    `it must not be reported as absent: ${out.join('\n')}`,
+  );
 });
 
 test('a provider with no registered extractor is reported, not silently skipped', () => {

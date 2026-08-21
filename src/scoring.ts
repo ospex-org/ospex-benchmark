@@ -290,7 +290,21 @@ const attemptFieldsSchema = z
     // predates the reader should not become unscoreable for it.
     requestParams: z.record(z.unknown()).nullable().optional(),
   })
-  .passthrough();
+  .passthrough()
+  // Optional on its own, required as a pair. Before the rename the answer field
+  // was one REQUIRED key, so a record missing it was refused at the parse; two
+  // independent optionals would have accepted a record carrying NEITHER name
+  // and read it as a null answer — a fail-closed rule turned fail-open by a
+  // rename. This keeps the parse refusing that record while letting a file
+  // carry whichever of the two names its era wrote.
+  .superRefine((value, ctx) => {
+    if (value.answerText === undefined && value.rawResponse === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'an attempt records its answer under "answerText" (or the archived name "rawResponse"); neither is present',
+      });
+    }
+  });
 
 const armResponseSchema = z
   .object({

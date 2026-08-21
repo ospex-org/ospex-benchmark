@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { sha256Hex, canonicalize } from '../canonical.js';
+import { writeNdjson } from '../records.js';
 import { ProviderUnfinishedTurnError } from './errors.js';
 import { createRealAdapters } from './index.js';
 import {
@@ -98,10 +102,54 @@ test('the digest and byte count cover exactly the stored body', () => {
   assert.deepEqual(envelopeVerificationFailures(sealed), []);
 });
 
-test('sealing an already-sealed body changes nothing', () => {
-  const once = sealResponseEnvelope(NON_CANONICAL_BODY);
-  const twice = sealResponseEnvelope(once.body);
-  assert.deepEqual(twice, once);
+test('sealing an already-sealed body changes nothing — WITH a credential set', () => {
+  // Rule 4b: the environment is part of the space. With no credential present
+  // `redactSecrets` is the identity, so a credential-free version of this case
+  // asserts seal(x) === seal(x) and a seal that mangles its own output passes
+  // it. And credential-free is the state `yarn test` is ALWAYS in — only the
+  // entry points load `.env` — while the runs this claim is about (`yarn smoke`)
+  // are always the other one. So the credential goes in here explicitly.
+  const prior = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = SYNTHETIC_KEY;
+  try {
+    const received = `{"note":"upstream echoed ${SYNTHETIC_KEY} back","ok":true}`;
+    const once = sealResponseEnvelope(received);
+    assert.ok(once.body.includes('[REDACTED]'), 'the first seal really did substitute something');
+    const twice = sealResponseEnvelope(once.body);
+    assert.deepEqual(twice, once);
+  } finally {
+    if (prior === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = prior;
+  }
+});
+
+test('the write chokepoint redacts a second time and the binding still holds', () => {
+  // The property that actually fires on the way to disk, and the reason the
+  // one above is stated at all: `writeNdjson` runs `redactSecrets` over EVERY
+  // serialized line, so the stored body meets the redactor again AFTER its
+  // digest was taken. Because the seal redacted first there is nothing left to
+  // substitute, and the body read back off disk still reproduces its digest.
+  //
+  // Driven through the real writer and a real file rather than through
+  // `redactSecrets` directly — the claim is about the artifact, not the helper.
+  const prior = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = SYNTHETIC_KEY;
+  const dir = mkdtempSync(join(tmpdir(), 'envelope-write-'));
+  try {
+    const received = `{"note":"upstream echoed ${SYNTHETIC_KEY} back","ok":true}`;
+    const sealed = sealResponseEnvelope(received);
+    const path = join(dir, 'run.ndjson');
+    writeNdjson(path, [{ recordType: 'probe', responseEnvelope: sealed } as never]);
+    const onDisk = readFileSync(path, 'utf8');
+    assert.ok(!onDisk.includes(SYNTHETIC_KEY), 'the credential is not on disk');
+    const readBack = (JSON.parse(onDisk.trim()) as { responseEnvelope: typeof sealed }).responseEnvelope;
+    assert.deepEqual(readBack, sealed, 'the write pass left the envelope byte-identical');
+    assert.deepEqual(envelopeVerificationFailures(readBack), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (prior === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = prior;
+  }
 });
 
 /**
