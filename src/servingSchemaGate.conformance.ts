@@ -62,6 +62,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Client } from 'pg';
 import { DECLARED_DEFINER_EXEMPTIONS, GATE_STARTUP_OPTIONS, SERVING_SCHEMA_CHECKS } from './servingSchemaGate.js';
@@ -240,6 +241,12 @@ function runEntryPoint(dbName: string): { status: number | null; output: string 
   return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
 }
 
+/** A collision-resistant SQL-safe name. Ownership is established only when this
+ *  run's CREATE DATABASE succeeds; cleanup never drops a pre-existing name. */
+function ownedChildDatabase(label: string): string {
+  return `ospex_gate_${label}_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+}
+
 /** A deterministic fingerprint of a database's user catalog plus its datacl, so
  *  "identical post-run state" is a byte comparison rather than a vibe. */
 async function catalogFingerprint(dbName: string): Promise<string> {
@@ -268,14 +275,37 @@ async function catalogFingerprint(dbName: string): Promise<string> {
   }
 }
 
-/** Cluster-wide reserved-role state, so a child's create/drop of them is proven
- *  to leave no residue. */
+/** Cluster-wide reserved-role state: attributes/config, memberships, and
+ *  database-role settings, so a child's refusal is proved byte-identical. */
 async function reservedRoleState(): Promise<string> {
-  const rows = await ownerQuery(
-    'select coalesce(string_agg(rolname, \',\' order by rolname), \'<none>\') as s from pg_roles where rolname = any($1::text[])',
+  const roles = await ownerQuery(
+    `select rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
+            rolcanlogin, rolreplication, rolconnlimit,
+            rolvaliduntil::text as rolvaliduntil, rolbypassrls, rolconfig
+       from pg_roles where rolname = any($1::text[]) order by rolname`,
     [RESERVED_ROLES],
   );
-  return String(rows[0]!['s']);
+  const memberships = await ownerQuery(
+    `select pg_get_userbyid(roleid) as role_name,
+            pg_get_userbyid(member) as member_name,
+            pg_get_userbyid(grantor) as grantor_name,
+            admin_option, inherit_option, set_option
+       from pg_auth_members
+      where pg_get_userbyid(roleid) = any($1::text[])
+         or pg_get_userbyid(member) = any($1::text[])
+      order by role_name, member_name, grantor_name`,
+    [RESERVED_ROLES],
+  );
+  const settings = await ownerQuery(
+    `select r.rolname, coalesce(d.datname, '<all>') as database_name, s.setconfig
+       from pg_db_role_setting s
+       join pg_roles r on r.oid = s.setrole
+       left join pg_database d on d.oid = s.setdatabase
+      where r.rolname = any($1::text[])
+      order by r.rolname, database_name`,
+    [RESERVED_ROLES],
+  );
+  return JSON.stringify({ roles, memberships, settings });
 }
 
 const definerCheck = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('SECURITY DEFINER'));
@@ -286,13 +316,19 @@ try {
     //    targets. These run first, while the cluster has neither reserved role
     //    and this database is pristine, and each fully undoes its own fixture.
     await check('the wired command refuses a target where a reserved role already exists, role and DB ACL untouched', async () => {
-      const childDb = `${NAME}_pl_role`;
-      await owner.query(`drop database if exists ${childDb} with (force)`);
-      await owner.query(`create database ${childDb}`);
-      // A pre-existing reserved role is the ONLY thing wrong with the target, so
-      // a refusal can only be about the role (not an object or schema).
-      await owner.query(`create role ${PROBE_ROLE} login password '${PROBE_PASSWORD}'`);
+      // This child DB is collision-resistant and run-owned: CREATE (never a
+      // pre-drop) establishes ownership, and cleanup only drops it after that
+      // CREATE succeeded. Revoking PUBLIC CONNECT recreates the reported hostile
+      // fixture without changing NAME's ACL representation.
+      const childDb = ownedChildDatabase('role');
+      let createdFixtureDb = false;
+      let createdFixtureRole = false;
       try {
+        await owner.query(`create database ${childDb}`);
+        createdFixtureDb = true;
+        await owner.query(`revoke connect on database ${childDb} from public`);
+        await owner.query(`create role ${PROBE_ROLE} login password '${PROBE_PASSWORD}'`);
+        createdFixtureRole = true;
         const roleConfigBefore = await reservedRoleState();
         const aclBefore = await catalogFingerprint(childDb);
         const child = runEntryPoint(childDb);
@@ -301,53 +337,62 @@ try {
         assert.equal(await reservedRoleState(), roleConfigBefore, 'the pre-existing role must be untouched');
         assert.equal(await catalogFingerprint(childDb), aclBefore, 'the target database ACL/catalog must be untouched');
       } finally {
-        await owner.query(`drop owned by ${PROBE_ROLE}`).catch(() => undefined);
-        await owner.query(`drop role if exists ${PROBE_ROLE}`).catch(() => undefined);
-        await owner.query(`drop database if exists ${childDb} with (force)`);
+        if (createdFixtureRole) {
+          await owner.query(`drop owned by ${PROBE_ROLE}`).catch(() => undefined);
+          await owner.query(`drop role if exists ${PROBE_ROLE}`).catch(() => undefined);
+        }
+        if (createdFixtureDb) await owner.query(`drop database ${childDb} with (force)`).catch(() => undefined);
       }
     });
 
     await check('the wired command refuses a target holding a non-public business schema, data untouched', async () => {
-      const childDb = `${NAME}_pl_schema`;
-      await owner.query(`drop database if exists ${childDb} with (force)`);
-      await owner.query(`create database ${childDb}`);
+      let createdFixtureSchema = false;
       try {
-        const bootstrapClient = new Client({ host: HOST, port: PORT, user: 'postgres', password: OWNER_PASSWORD, database: childDb });
-        await bootstrapClient.connect();
-        try {
-          await bootstrapClient.query('create schema business');
-          await bootstrapClient.query('create table business.real_data(id int primary key)');
-          await bootstrapClient.query('insert into business.real_data values (1)');
-        } finally {
-          await bootstrapClient.end();
-        }
-        const before = await catalogFingerprint(childDb);
-        const child = runEntryPoint(childDb);
+        await owner.query('create schema business');
+        createdFixtureSchema = true;
+        await owner.query('create table business.real_data(id int primary key)');
+        await owner.query("comment on table business.real_data is 'must survive exact'");
+        await owner.query('insert into business.real_data values (1)');
+        const before = await catalogFingerprint(NAME);
+        const rowsBefore = await ownerQuery('select id from business.real_data order by id');
+        const relationBefore = await ownerQuery(
+          `select pg_get_userbyid(c.relowner) as owner,
+                  coalesce(c.relacl::text, '<null>') as acl,
+                  obj_description(c.oid, 'pg_class') as comment
+             from pg_class c join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = 'business' and c.relname = 'real_data'`,
+        );
+        const child = runEntryPoint(NAME);
         assert.equal(child.status, 2, `a non-public business schema must exit 2; got ${child.status}\n${child.output}`);
         assert.ok(child.output.includes('business'), `the refusal must name the business schema: ${child.output}`);
-        assert.equal(await catalogFingerprint(childDb), before, 'the business schema and its row must be untouched');
+        assert.equal(await catalogFingerprint(NAME), before, 'the business schema catalog must be untouched');
+        assert.deepEqual(await ownerQuery('select id from business.real_data order by id'), rowsBefore, 'the business data must be untouched');
+        assert.deepEqual(
+          await ownerQuery(
+            `select pg_get_userbyid(c.relowner) as owner,
+                    coalesce(c.relacl::text, '<null>') as acl,
+                    obj_description(c.oid, 'pg_class') as comment
+               from pg_class c join pg_namespace n on n.oid = c.relnamespace
+              where n.nspname = 'business' and c.relname = 'real_data'`,
+          ),
+          relationBefore,
+          'the business relation owner, ACL, and comment must be untouched',
+        );
       } finally {
-        await owner.query(`drop database if exists ${childDb} with (force)`);
+        if (createdFixtureSchema) await owner.query('drop schema business cascade').catch(() => undefined);
       }
     });
 
     await check('the wired command runs and RE-runs on an empty target with byte-identical catalog state', async () => {
-      const childDb = `${NAME}_pl_empty`;
-      await owner.query(`drop database if exists ${childDb} with (force)`);
-      await owner.query(`create database ${childDb}`);
-      try {
-        const before = `${await catalogFingerprint(childDb)}||roles:${await reservedRoleState()}`;
-        const run1 = runEntryPoint(childDb);
-        assert.equal(run1.status, 0, `the first run on an empty target must pass; got ${run1.status}\n${run1.output}`);
-        assert.ok(run1.output.includes('7/7 scenarios passed'), `the child runs its in-process scenarios: ${run1.output}`);
-        const run2 = runEntryPoint(childDb);
-        assert.equal(run2.status, 0, `the rerun must pass; got ${run2.status}\n${run2.output}`);
-        assert.ok(run2.output.includes('7/7 scenarios passed'), `the rerun runs its in-process scenarios: ${run2.output}`);
-        const after = `${await catalogFingerprint(childDb)}||roles:${await reservedRoleState()}`;
-        assert.equal(after, before, 'two full runs must leave the catalog and cluster roles exactly as found');
-      } finally {
-        await owner.query(`drop database if exists ${childDb} with (force)`);
-      }
+      const before = `${await catalogFingerprint(NAME)}||roles:${await reservedRoleState()}`;
+      const run1 = runEntryPoint(NAME);
+      assert.equal(run1.status, 0, `the first run on an empty target must pass; got ${run1.status}\n${run1.output}`);
+      assert.ok(run1.output.includes('7/7 scenarios passed'), `the child runs its in-process scenarios: ${run1.output}`);
+      const run2 = runEntryPoint(NAME);
+      assert.equal(run2.status, 0, `the rerun must pass; got ${run2.status}\n${run2.output}`);
+      assert.ok(run2.output.includes('7/7 scenarios passed'), `the rerun runs its in-process scenarios: ${run2.output}`);
+      const after = `${await catalogFingerprint(NAME)}||roles:${await reservedRoleState()}`;
+      assert.equal(after, before, 'two full runs must leave the catalog and cluster roles exactly as found');
     });
   }
 
@@ -368,9 +413,11 @@ try {
         const rows = await ownerQuery(
           `select pg_get_functiondef(${canaryRef}) as def,
                   obj_description(${canaryRef}, 'pg_proc') as comment,
-                  coalesce((select proacl::text from pg_proc where oid = ${canaryRef}), '<null>') as acl`,
+                  pg_get_userbyid(p.proowner) as owner,
+                  coalesce(p.proacl::text, '<null>') as acl
+             from pg_proc p where p.oid = ${canaryRef}`,
         );
-        return rows[0] as { def: string; comment: string; acl: string };
+        return rows[0] as { def: string; comment: string; owner: string; acl: string };
       };
       const before = await snapshot();
 
@@ -386,6 +433,7 @@ try {
       const after = await snapshot();
       assert.equal(after.def, before.def, 'the guard must not alter the canary definition');
       assert.equal(after.comment, before.comment, 'the guard must not alter the canary comment');
+      assert.equal(after.owner, before.owner, 'the guard must not alter the canary owner');
       assert.equal(after.acl, before.acl, 'the guard must not alter the canary ACL');
     } finally {
       await owner.query(`drop function if exists ${canary}`);
