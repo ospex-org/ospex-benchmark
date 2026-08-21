@@ -856,10 +856,19 @@ MUTANTS = [
      ['src/responseEnvelopeIntegrity.test.ts']),
     # The legacy field name must still be read, or every archived run stops
     # being scoreable the moment the rename lands.
+    #
+    # Scored on the integrity suite ALONE, deliberately. scoring.test.ts also
+    # reddens under this mutant -- its whole fixture corpus uses the legacy
+    # name -- but it takes over 240s to do it: with every archived body reading
+    # as absent, the run integrity check re-derives and re-reports across the
+    # entire corpus, and the battery reported HUNG rather than a verdict.
+    # Measured 2026-08-21: 4m40s and still running, against ~20s clean. The
+    # discriminating case is the archived-parity one in the integrity suite,
+    # which fails mutated in 15s and passes clean.
     ('M141-archived-answer-name-ignored', 'src/scoring.ts',
      '            answerText: response.attempt.answerText ?? response.attempt.rawResponse ?? null,',
      '            answerText: response.attempt.answerText ?? null,',
-     ['src/responseEnvelopeIntegrity.test.ts', 'src/scoring.test.ts']),
+     ['src/responseEnvelopeIntegrity.test.ts']),
     # The reporting half: absence of an envelope must not be read as proof that
     # no search ran.
     ('M142-unavailable-backfilled-as-no-search', 'src/servingProjection.ts',
