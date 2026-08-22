@@ -1264,11 +1264,16 @@ type ArtifactVerdict =
  * pre-retention era unconditionally, which was true of the three files archived on one
  * machine and false of every artifact the current build writes.
  *
- *  1. TRUE OF EVERY ERA: it parses, it replays clean, the envelope rule FOR ITS OWN ERA
- *     is satisfied, and every `armDigest` recomputes byte-identically. The digest
- *     recomputation is restated here rather than left to `recomputeFireArtifactDigests`
- *     because the property being pinned is that a domain which gained an optional field
- *     still digests to the SAME bytes for a file that predates it.
+ *  1. TRUE OF EVERY ERA: it parses, it replays clean, and the envelope rule FOR ITS OWN
+ *     ERA is satisfied. The arm-digest property — a domain that gained an optional field
+ *     still digests to the SAME bytes for a file that predates it — rides in
+ *     `violations`, because `verifyFireArtifactReplay` runs `recomputeFireArtifactDigests`
+ *     over that same parsed value and that same ten-field domain. An earlier draft
+ *     restated the recomputation here; measured, deleting the restatement reddened
+ *     nothing with the archive present OR with the directory empty, so it was a copy of
+ *     a check already in the array rather than a second one. What proves the digest rule
+ *     load-bearing is deletion-table row 2, which deletes an envelope and leaves the
+ *     digest alone, and requires BOTH findings.
  *  2. TRUE OF THE ERA IT IS ACTUALLY FROM: a pre-retention artifact carries the envelope
  *     KEY on no attempt (key-absent, which is the exemption's whole basis — an explicit
  *     `null` is a retaining build's write); a retaining-era artifact carries a retained
@@ -1290,25 +1295,7 @@ function inspectFireArtifactBytes(bytes: string): ArtifactVerdict {
   }
   const era: FireArtifactEra = isCoherentPreRetentionFireArtifact(parsed) ? 'pre-retention' : 'retaining';
   const envelopeViolations = verifyFireArtifactEnvelopes(parsed);
-  const violations: string[] = [...verifyFireArtifactReplay(parsed)];
-
-  for (const arm of parsed.arms) {
-    const recomputed = armDigest({
-      cohortId: parsed.cohortId,
-      fireId: parsed.fireId,
-      runId: parsed.runId,
-      participantId: arm.expectedArmIdentity.participantId,
-      requestSha256: parsed.requestSha256,
-      expectedArmIdentity: arm.expectedArmIdentity,
-      orderedAttempts: arm.orderedAttempts,
-      terminalOutcome: arm.terminalOutcome,
-      acceptedResponseDigestOrNull: arm.acceptedResponseDigest,
-      acceptedDecisionFingerprintOrNull: arm.acceptedDecisionFingerprint,
-    });
-    if (recomputed !== arm.armDigest) {
-      violations.push(`arm ${arm.expectedArmIdentity.participantId} armDigest does not recompute byte-identically`);
-    }
-  }
+  const violations: readonly string[] = verifyFireArtifactReplay(parsed);
 
   // Read the attempts back as raw JSON, because the era distinction is key-ABSENT vs
   // key-present-and-null and a typed read cannot see the difference.
