@@ -338,10 +338,12 @@ export interface SearchAudit {
  * of the day recognizing what came back. Non-2xx bodies retain nothing and keep
  * their existing truncated error detail; see `postJsonAndRead`.
  *
- * PRIVATE evidence. It stays in the run NDJSON under `out/` (gitignored), and
- * no row the serving projection builds carries the body — attempts, decisions
- * and run facts alike, pinned by a marker scan over the whole projection plan.
- * What the projection takes from an envelope is whether one exists.
+ * PRIVATE evidence. It stays in the two durable local records that carry it —
+ * the run NDJSON under `out/` and the fire artifact under the campaign's
+ * artifact root, both gitignored — and no row the serving projection builds
+ * carries the body: attempts, decisions and run facts alike, pinned by a marker
+ * scan over the whole projection plan. What the projection takes from an
+ * envelope is whether one exists.
  */
 export interface ProviderResponseEnvelope {
   body: string;
@@ -438,7 +440,8 @@ export interface AttemptRecord {
    * its body turned out to be: bytes that are not JSON, and JSON in a shape
    * this build's extractor cannot walk, both keep it. Serialized as
    * `responseEnvelope`, beside `answerText` — which holds the extracted answer
-   * only.
+   * only — and mapped under the same name onto the fire artifact's persisted
+   * attempts, which on the campaign path is the only durable record there is.
    */
   responseEnvelope: ProviderResponseEnvelope | null;
   reportedModelId: string | null;

@@ -132,6 +132,18 @@ Everything below states the contract that holds it.
    dispatch budget). Any other failure journals `loud_failure` best-effort and
    propagates (exit 1).
 
+**What the fire artifact has to carry, because nothing else will.** This path writes no
+run NDJSON. The fire artifact and its spend sidecar are the only durable records a tick
+produces, so anything not in the artifact does not survive process exit — and a cohort is
+armed at most once, ever, so evidence a campaign did not retain cannot be recovered
+afterwards by any later build. Each sent attempt therefore retains the **complete provider
+response body** it answered with, beside the extracted answer, sealed with its own digest
+and byte length (`responseEnvelope`). The sink refuses to install an artifact where an
+attempt records having received a response and retains no body; the rule, its one
+exemption for pre-retention artifacts, and the bounds on both are specified in
+[`SPEC-line-open-evidence-model.md`](./SPEC-line-open-evidence-model.md) §"Per-attempt
+provenance and the arm digest".
+
 ## The durable escalation latch
 
 A spend-guard escalation means the spend model is not holding; it must not be able to

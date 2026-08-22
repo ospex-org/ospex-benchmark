@@ -87,8 +87,13 @@ export function recordsHttpStatus(rawLeg: unknown): boolean {
 }
 
 /**
- * Whether a run file is a COHERENT PRE-RETENTION ARCHIVE — the one shape exempt
- * from the envelope-presence requirement.
+ * Whether a RUN FILE is a COHERENT PRE-RETENTION ARCHIVE — the one shape exempt
+ * from that surface's envelope-presence requirement.
+ *
+ * Run files only. The fire artifact has its own presence rule and its own
+ * exemption predicate (`isCoherentPreRetentionFireArtifact`), because it carries
+ * neither an era stamp nor a `rawResponse` name to read — and because its
+ * attempts are inside a digest, which a run leg is not.
  *
  * Retention is the DEFAULT and exemption has to be asserted by the whole file,
  * because the rule this replaces read a single optional field: deleting

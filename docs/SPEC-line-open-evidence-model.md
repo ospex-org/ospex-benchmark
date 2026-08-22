@@ -655,18 +655,54 @@ to substantiate it. Each attempt records:
   `acceptedAt`, in **full causal order** —
   `requestStartedAt ≤ requestReceivedAt ≤ acceptedAt` (the `acceptedAt` bound when present) —
   and across attempts `repair.requestStartedAt ≥ initial.requestReceivedAt`;
-- `requestSha256`, the exact persisted response body, `responseSha256`;
+- `requestSha256`, the exact persisted **answer text** the adapter extracted, `responseSha256`;
+- the **complete provider response body** that answer came out of, retained as
+  `responseEnvelope` on every attempt that received one — digest-bound when present,
+  absent on attempts persisted before the field existed;
 - transport status, usage/token metadata (including the derived reasoningTokens / billableOutputTokens comparable fields on new records), the per-attempt web-search audit (executed queries + result references; digest-bound when present, absent on pre-search records), and repair linkage.
 
-**Persisted response bytes (one exact rule).**
+**Persisted response bytes (two exact rules, over two different strings).**
 
 ```
-persistedResponseBytes = UTF8(the exact post-redaction retained response body)
-responseSha256         = sha256Hex(persistedResponseBytes)
+persistedResponseBytes  = UTF8(the exact post-redaction ANSWER TEXT the adapter extracted)
+responseSha256          = sha256Hex(persistedResponseBytes)
+
+responseEnvelope.body   = the exact post-redaction COMPLETE provider response body
+responseEnvelope.sha256 = sha256Hex(UTF8(responseEnvelope.body))
+responseEnvelope.bytes  = UTF8 length of responseEnvelope.body
 ```
 
-The scorer recomputes `responseSha256` from those **exact persisted bytes**. Any
-unpersisted raw-provider digest kept for diagnostics is **not** an integrity proof.
+Both are redact-then-digest, so each digest covers exactly the string stored beside it.
+The two strings are different — the answer is one field inside the body — and
+`acceptedResponseDigest` stays the **answer's** digest; the envelope carries its own.
+
+The scorer recomputes `responseSha256` from those **exact persisted bytes**, and re-hashes
+every retained envelope from the body stored beside it. Any unpersisted raw-provider digest
+kept for diagnostics is **not** an integrity proof.
+
+**Retained response bodies are REQUIRED, and that requirement fails closed.** The
+per-attempt web-search audit is one parser's reading of a response; without the body, a
+provider shape that parser did not recognize is indistinguishable from a model that never
+searched, and no later build can tell the two apart. So an attempt whose record says a
+response came back — an answer, a reported model ID, a 2xx status, or an `ok` transport,
+any one of them — must retain the body it came from. An attempt that received nothing (a
+timeout, a transport failure, a body that dropped mid-read, or a non-2xx, whose body is
+deliberately not kept) retains an explicit `null`, which is not a violation.
+
+Retention is the DEFAULT. The one exemption is an artifact that reads as a coherent
+**pre-retention** artifact as a whole: **every** attempt in it carries none of the optional
+attempt fields (`searchAudit`, `providerStopReason`, `turnCompleted`, `responseEnvelope`).
+An artifact carrying any one of them anywhere is a retaining-era artifact and is enforced.
+This is deliberately not a single stamp a single deletion can remove.
+
+Two bounds, stated rather than left to be found. An artifact from an intermediate build —
+one that wrote `searchAudit` but not `responseEnvelope` — is enforced and therefore refused;
+that is fail-closed on an artifact this rule cannot place. And a COHERENT whole-artifact
+rewrite still verifies: strip all four keys from every attempt and recompute every
+`armDigest`, or re-seal an invented body and recompute the digests, and the file describes
+itself consistently. What the rule buys is that no SINGLE deletion downgrades enforcement,
+and that every edit which tries has to move a digest. It is integrity, not tamper
+resistance.
 
 **Arm digest (domain-bound to its enclosing identity).**
 
@@ -680,6 +716,12 @@ armDigest = sha256Hex(canonicalize({
   acceptedDecisionFingerprintOrNull
 }))
 ```
+
+`orderedAttempts` carries each attempt's retained `responseEnvelope`, so this digest binds
+the complete response bodies as well as the answers: removing, nulling or editing one
+changes a digest the scorer already recomputes. On this surface a deleted body is
+DETECTABLE, not merely refused — which is why the exemption above can be a property of the
+attempts themselves, with no era stamp to delete.
 
 The scorer **recomputes** `armDigest`. Mutating the persisted response bytes, the enclosing
 fire/run identity, an attempt's order, or an attempt timestamp must **fail** integrity. The
