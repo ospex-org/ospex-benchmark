@@ -14,11 +14,14 @@ import {
   isCoherentPreRetentionArchive,
   reachedProviderByContent,
   receivedProviderResponse,
+  recordsHttpStatus,
   responseEnvelopeSchema,
   sealResponseEnvelope,
+  statusFromErrorDetail,
 } from './responseEnvelope.js';
 import { damageEnvelope, ENVELOPE_DAMAGE } from '../testFactories.js';
 import type { EnvelopeDamage } from '../testFactories.js';
+import type { ReceiptSignals } from './responseEnvelope.js';
 import type { ChatTurn, ProviderAdapter, ProviderResponse } from '../types.js';
 
 /**
@@ -491,6 +494,16 @@ test('archiveEraSignals reads KEY PRESENCE, not value', () => {
   });
 });
 
+test('recordsHttpStatus reads the KEY, so an explicit null is still recorded', () => {
+  // The same presence-not-value distinction as the era signals, one field over,
+  // and it is what stops `httpStatus: null` on an edited leg from reading as
+  // "this build never wrote a status".
+  assert.equal(recordsHttpStatus({ httpStatus: 200 }), true);
+  assert.equal(recordsHttpStatus({ httpStatus: null }), true, 'a null status is one the build wrote');
+  assert.equal(recordsHttpStatus({ reportedModelId: 'm' }), false, 'a deleted key is not');
+  assert.equal(recordsHttpStatus(null), false, 'and a leg that is not an object has no keys');
+});
+
 test('exemption needs all three clauses; each one alone withdraws it', () => {
   // Rule 3k, swept: the predicate is a conjunction, so one case per clause,
   // each leaving exactly one clause broken. An input that broke several at
@@ -546,13 +559,24 @@ test('exemption needs all three clauses; each one alone withdraws it', () => {
 // the receipt: what counts as "a response came back"
 // ---------------------------------------------------------------------------
 
+/** Every content signal null, the status key recorded, no error text: the state
+ *  in which the status alone decides. */
+const BARE: Omit<ReceiptSignals, 'httpStatus'> = {
+  answerText: null,
+  reportedModelId: null,
+  providerResponseId: null,
+  httpStatusRecorded: true,
+  errorDetail: null,
+};
+
 test('a bare 2xx is a receipt; the content signals and the status are independent', () => {
   // Rule 4b, as a table with LITERAL expectations rather than derived ones.
-  // Every row has all three content signals null, so the status is the only
-  // thing that can decide it — a row carrying an answer would be accepted by
-  // the three-signal predicate too and would say nothing about the fourth
-  // disjunct.
-  const bare = { answerText: null, reportedModelId: null, providerResponseId: null };
+  // Every row has all three content signals null, the status key recorded and
+  // no error text, so the numeric status is the only thing that can decide it —
+  // a row carrying an answer would be accepted by the three-signal predicate
+  // too and would say nothing about the status disjunct, and a row carrying an
+  // error detail would be decided by the prose carrier instead (rule 3b: each
+  // carrier is swept alone below).
   const statuses: Array<[number | null, boolean]> = [
     [null, false],
     [0, false],
@@ -567,14 +591,14 @@ test('a bare 2xx is a receipt; the content signals and the status are independen
   ];
   for (const [httpStatus, expected] of statuses) {
     assert.equal(
-      receivedProviderResponse({ ...bare, httpStatus }),
+      receivedProviderResponse({ ...BARE, httpStatus }),
       expected,
       `status ${String(httpStatus)}`,
     );
     // And the narrow predicate ignores the status entirely — the property that
     // keeps the request-parameter rule exactly where it was.
     assert.equal(
-      reachedProviderByContent({ ...bare, httpStatus }),
+      reachedProviderByContent({ ...BARE, httpStatus }),
       false,
       `status ${String(httpStatus)} must not move the content-only predicate`,
     );
@@ -582,16 +606,101 @@ test('a bare 2xx is a receipt; the content signals and the status are independen
 });
 
 test('each content signal alone is a receipt, and a 500 alone is not', () => {
-  const none = {
-    answerText: null,
-    reportedModelId: null,
-    providerResponseId: null,
-    httpStatus: 500,
-  };
+  const none = { ...BARE, httpStatus: 500 };
   assert.equal(receivedProviderResponse(none), false, 'the negative control');
   for (const signal of ['answerText', 'reportedModelId', 'providerResponseId'] as const) {
     assert.equal(receivedProviderResponse({ ...none, [signal]: 'present' }), true, signal);
     assert.equal(reachedProviderByContent({ ...none, [signal]: 'present' }), true, signal);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// the receipt has THREE carriers, because one was one edit
+// ---------------------------------------------------------------------------
+
+test('the status a leg states in prose is read from the START of its error text', () => {
+  // Literal expectations. The anchor is the property under test: the leading
+  // clause is this call's own status, and a "returned HTTP 200" appearing later
+  // is text a provider echoed back about some other exchange.
+  const table: Array<[string | null, number | null]> = [
+    [null, null],
+    ['openai returned HTTP 200: non-JSON response body: <!doctype html>', 200],
+    ['openai returned HTTP 0: response body read failed: ECONNRESET', 0],
+    ['anthropic returned HTTP 429: rate limited', 429],
+    // Anchored: the leading status wins, and the echoed one is not consulted.
+    ['openai returned HTTP 500: upstream said openai returned HTTP 200: ok', 500],
+    // Not this shape at all.
+    ['openai call exceeded 60000ms', null],
+    // THE ROW THAT DISCRIMINATES THE ANCHOR, and the reason it is written this
+    // way: an unfinished turn claims no status of its own, and a body it quotes
+    // back can contain anything. A reader that searched the whole string finds
+    // the echoed 200 here and calls a turn that never completed a receipt; the
+    // row above, where the leading status is a 500, cannot tell the two rules
+    // apart, because the first match is the same either way.
+    [
+      'openai returned an unfinished turn (stop_reason: max_tokens): the body said openai returned HTTP 200: ok',
+      null,
+    ],
+    // No provider token in front, so it is not the message this reads.
+    ['returned HTTP 200: something', null],
+  ];
+  for (const [detail, expected] of table) {
+    assert.equal(statusFromErrorDetail(detail), expected, JSON.stringify(detail));
+  }
+});
+
+test('EACH receipt carrier alone makes a contentless leg a receipt', () => {
+  // Rule 3b, one row per carrier: every other carrier is left in its
+  // non-receipt state, so exactly one thing in each row can produce `true`. A
+  // build consulting only the numeric status passes row 1 and fails rows 2 and
+  // 3; one consulting only the prose passes row 2 and fails 1 and 3.
+  const table: Array<{ name: string; signals: Partial<typeof BARE> & { httpStatus: number | null }; expected: boolean }> = [
+    {
+      // The negative control AND the stated bound, which here are one input:
+      // a leg whose status is null, whose status key is present and whose
+      // error text says nothing is exempt — so erasing an errored leg still
+      // works, at a cost of three mutually consistent edits instead of one.
+      // That residual is written into `receivedProviderResponse`, the README
+      // and the PR body; this row is what keeps those honest.
+      name: 'THE BOUND, and the negative control: all three carriers silent',
+      signals: { httpStatus: null },
+      expected: false,
+    },
+    {
+      name: 'carrier 1: the numeric status, with no error text',
+      signals: { httpStatus: 200 },
+      expected: true,
+    },
+    {
+      name: 'carrier 2: the prose status, with the numeric field nulled',
+      signals: { httpStatus: null, errorDetail: 'openai returned HTTP 200: non-JSON response body' },
+      expected: true,
+    },
+    {
+      name: 'carrier 3: the status key deleted, with nothing else standing',
+      signals: { httpStatus: null, httpStatusRecorded: false },
+      expected: true,
+    },
+    {
+      name: 'and the prose carrier keeps the same 2xx bound: a 429 is not a receipt',
+      signals: { httpStatus: null, errorDetail: 'openai returned HTTP 429: rate limited' },
+      expected: false,
+    },
+    {
+      name: 'nor is a transport failure that never got a status',
+      signals: { httpStatus: null, errorDetail: 'openai returned HTTP 0: response body read failed' },
+      expected: false,
+    },
+  ];
+  for (const row of table) {
+    assert.equal(receivedProviderResponse({ ...BARE, ...row.signals }), row.expected, row.name);
+    // None of the three moves the CONTENT-only predicate, which is what keeps
+    // the sibling request-parameter rule where it was.
+    assert.equal(
+      reachedProviderByContent({ ...BARE, ...row.signals }),
+      false,
+      `${row.name}: must not move the content-only predicate`,
+    );
   }
 });
 
@@ -677,6 +786,60 @@ test('a NON-2xx still retains nothing, and 300 is the boundary', async () => {
   const boundary = await chatError(300, 'not json either');
   assert.ok(boundary instanceof ProviderHttpError);
   assert.equal(boundary.responseEnvelope, null, '300 is outside 2xx');
+});
+
+test('a 2xx whose body drops MID-READ is a transport failure, not a receipt', async () => {
+  // An UNTAMPERED artifact from an ordinary network event. `fetch` resolves at
+  // the headers, so a connection can drop after the status line and before the
+  // body; reporting that status would make the leg a 2xx owing an envelope no
+  // code could produce, and a single such leg refuses the whole run file for
+  // scoring and for publication.
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"partial":'));
+          controller.error(new Error('ECONNRESET'));
+        },
+      }),
+      { status: 200 },
+    )) as typeof fetch;
+  let error: unknown;
+  try {
+    error = await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, async () => {
+      try {
+        await registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, {
+          maxOutputTokens: 16_000,
+        });
+        return null;
+      } catch (thrown: unknown) {
+        return thrown;
+      }
+    });
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.ok(error instanceof ProviderHttpError, `got ${String(error)}`);
+  assert.ok(error.message.includes('response body read failed'), error.message);
+  assert.equal(error.status, 0, 'status 0 — the code for "no HTTP exchange completed"');
+  assert.equal(error.responseEnvelope, null, 'and nothing retained, because nothing was read');
+  // The CONSEQUENCE beside the mechanism: this leg owes no envelope. Every
+  // content signal is null in the record it produces, so the status is the only
+  // thing that could make it a receipt — which is what makes 0 load-bearing
+  // rather than cosmetic.
+  assert.equal(
+    receivedProviderResponse({
+      answerText: null,
+      reportedModelId: null,
+      providerResponseId: null,
+      httpStatus: error.status,
+      httpStatusRecorded: true,
+      errorDetail: error.message,
+    }),
+    false,
+    'a dropped body must not read as a 2xx receipt',
+  );
 });
 
 test('a 2xx whose JSON is NOT an object goes down the parseable path and retains too', async () => {

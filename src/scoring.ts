@@ -11,6 +11,7 @@ import {
   envelopeVerificationFailures,
   isCoherentPreRetentionArchive,
   receivedProviderResponse,
+  recordsHttpStatus,
   responseEnvelopeSchema,
 } from './providers/responseEnvelope.js';
 import type { ArchiveEraSignals } from './providers/responseEnvelope.js';
@@ -272,8 +273,15 @@ const attemptFieldsSchema = z
     // The HTTP status this leg settled on. Read as a RECEIPT: a 2xx says a body
     // arrived even when nothing identifying survived it, which is the one thing
     // that separates a discarded 200 from a call that never landed. Optional
-    // because the field has always been written but has never before been read.
+    // because the field has always been written but has never before been read
+    // — and its ABSENCE is read fail-closed rather than as "no status", because
+    // every build that has written a leg wrote this key.
     httpStatus: z.number().nullable().optional(),
+    // The leg's own error text. Read only as a SECOND carrier of the status
+    // above: `ProviderHttpError` states it in prose ("<provider> returned HTTP
+    // 200: …"), so nulling the numeric field alone no longer erases the fact
+    // that a body arrived.
+    errorDetail: z.string().nullable().optional(),
     requestAt: z.string().nullable(),
     responseAt: z.string().nullable(),
     latencyMs: z.number().nullable(),
@@ -485,6 +493,12 @@ export interface ArchivedAttempt {
   /** The HTTP status this leg settled on; `null` when the call never got one.
    *  A 2xx is a receipt that a body arrived, whatever survived of it. */
   httpStatus: number | null;
+  /** Whether the record carried an `httpStatus` KEY at all — presence, not
+   *  value. Absence is an edit rather than an era, and is read fail-closed. */
+  httpStatusRecorded: boolean;
+  /** The leg's own error text; `null` when the call did not fail or the archive
+   *  predates the field. A second carrier of the HTTP status, in prose. */
+  errorDetail: string | null;
   /** Which era-marking KEYS this leg's record carried — presence, not value.
    *  Read only by the whole-file archive predicate. */
   archiveEra: ArchiveEraSignals;
@@ -708,6 +722,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
             answerText: response.attempt.answerText ?? response.attempt.rawResponse ?? null,
             responseEnvelope: response.attempt.responseEnvelope ?? null,
             httpStatus: response.attempt.httpStatus ?? null,
+            httpStatusRecorded: recordsHttpStatus(rawLegs.attempt),
+            errorDetail: response.attempt.errorDetail ?? null,
             archiveEra: archiveEraSignals(rawLegs.attempt),
             requestAt: response.attempt.requestAt,
             responseAt: response.attempt.responseAt,
@@ -725,6 +741,8 @@ export function parseRunRecords(lines: string[]): SourceRun {
                   answerText: response.repair.answerText ?? response.repair.rawResponse ?? null,
                   responseEnvelope: response.repair.responseEnvelope ?? null,
                   httpStatus: response.repair.httpStatus ?? null,
+                  httpStatusRecorded: recordsHttpStatus(rawLegs.repair),
+                  errorDetail: response.repair.errorDetail ?? null,
                   archiveEra: archiveEraSignals(rawLegs.repair),
                   requestAt: response.repair.requestAt,
                   responseAt: response.repair.responseAt,
@@ -1859,11 +1877,14 @@ export function verifyRunIntegrity(
       const where = `${response.participantId}:${response.gameId}:${leg}`;
       if (attempt.responseEnvelope === null) {
         // The two cases this skip is FOR, and no others: a file that predates
-        // retention entirely, and a leg where nothing came back — unsent,
-        // timeout, transport failure, or a non-2xx status, none of which
-        // leaves a body to retain. A 2xx counts as a receipt even with every
-        // content field null, so a 200 whose body was discarded no longer
-        // exempts itself by looking like silence.
+        // retention entirely, and a leg where nothing came back — unsent, a
+        // timeout, a transport failure, a body that dropped mid-read (status
+        // 0), or a non-2xx status, none of which leaves a body to retain. A
+        // 2xx counts as a receipt even with every content field null, so a 200
+        // whose body was discarded no longer exempts itself by looking like
+        // silence — and the 2xx is read from the status, from the prose in
+        // `errorDetail`, and from the absence of the status key, so no one
+        // field switches it off.
         if (!preRetentionArchive && receivedProviderResponse(attempt)) {
           violations.push(
             `${where}: a response was received but no response envelope was retained (${

@@ -244,6 +244,17 @@ export interface FireOptions {
   /** The fire's log sink. A case that needs the PUBLISHER's own line to throw
    *  supplies one; everything else keeps the silent default. */
   readonly log?: (line: string) => void;
+  /**
+   * Dispatch through this adapter instead of the stub.
+   *
+   * Exists so a case can drive the PRODUCTION adapter — the real request
+   * builder, the real `postJson`, the real error types — against a controlled
+   * `globalThis.fetch`, and then read what the runner wrote. Without it the
+   * http layer and the artifact are pinned by two tests that meet in the
+   * middle, and a change to what the http layer hands the runner is invisible
+   * to both. The adapter must answer to the dispatched arm's participant id.
+   */
+  readonly adapter?: ProviderAdapter;
 }
 
 export async function firedRun(options: FireOptions): Promise<FiredRun> {
@@ -281,7 +292,10 @@ export async function firedRun(options: FireOptions): Promise<FiredRun> {
   const outcome = await fireEligibleGame(build, inputs, TEST_SLATE_DATE, provenance, {
     arms: [arm],
     adapters: new Map([
-      [arm.participantId, stubAdapter(build, TEST_COHORT_ID, options.behaviour ?? 'ok', arm)],
+      [
+        arm.participantId,
+        options.adapter ?? stubAdapter(build, TEST_COHORT_ID, options.behaviour ?? 'ok', arm),
+      ],
     ]),
     approvedReportedModelIds: () => [arm.requestedModelId],
     outDir: options.outDir,

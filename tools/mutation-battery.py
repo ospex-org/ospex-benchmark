@@ -1074,6 +1074,61 @@ MUTANTS = [
      '    if (value.answerText !== undefined && value.rawResponse !== undefined) {',
      '    if (value.answerText !== undefined && value.rawResponse !== undefined && value.answerText !== value.rawResponse) {',
      ['src/responseEnvelopeIntegrity.test.ts']),
+
+    # --- the review round after B1/B2 ---------------------------------------
+    # A body that dropped mid-read is a TRANSPORT failure. Reporting the header
+    # status made an ordinary network event a 2xx receipt owing an envelope
+    # that cannot exist, which refuses the whole run file.
+    ('M174-http-reports-the-header-status-on-a-dropped-body', 'src/providers/http.ts',
+     '        0,\n        `response body read failed:',
+     '        response.status,\n        `response body read failed:',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    # THREE receipt carriers, because one was one edit: nulling `httpStatus` on
+    # a contentless leg switched the envelope requirement back off.
+    ('M175-receipt-ignores-the-prose-status', 'src/providers/responseEnvelope.ts',
+     '    isSuccessStatus(statusFromErrorDetail(signals.errorDetail)) ||',
+     '    false ||',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts',
+      'src/searchAuditReplay.test.ts']),
+    ('M176-prose-status-not-bounded-to-2xx', 'src/providers/responseEnvelope.ts',
+     '    isSuccessStatus(statusFromErrorDetail(signals.errorDetail)) ||',
+     '    statusFromErrorDetail(signals.errorDetail) !== null ||',
+     ['src/providers/responseEnvelope.test.ts', 'src/searchAuditReplay.test.ts']),
+    # Anchored: the leading clause is this call's own status, and a later
+    # "returned HTTP 200" is a body the provider quoted back.
+    ('M177-prose-status-read-unanchored', 'src/providers/responseEnvelope.ts',
+     "  const match = /^\\S+ returned HTTP (\\d{1,3}):/.exec(errorDetail);",
+     "  const match = /\\S+ returned HTTP (\\d{1,3}):/.exec(errorDetail);",
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M178-receipt-ignores-a-deleted-status-key', 'src/providers/responseEnvelope.ts',
+     '    !signals.httpStatusRecorded',
+     '    false',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts',
+      'src/searchAuditReplay.test.ts']),
+    ('M179-scorer-assumes-the-status-key-is-there', 'src/scoring.ts',
+     '            httpStatusRecorded: recordsHttpStatus(rawLegs.attempt),',
+     '            httpStatusRecorded: true,',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The scorer's OTHER install site for the era stamp. Every deletion-table
+    # row but one deletes the stamp, so a build reading the legs alone answered
+    # all of them correctly and this survived the whole suite.
+    ('M180-scorer-ignores-the-era-stamp', 'src/scoring.ts',
+     '    evidenceEraStamped: run.evidenceEra !== null,',
+     '    evidenceEraStamped: false,',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The replay must read the pre-#92 answer name as a receipt, or every
+    # archived leg in a file the archive predicate refuses is exempted.
+    ('M181-replay-ignores-the-archived-answer-name', 'src/searchAuditReplay.ts',
+     "    answerText: text(attempt['answerText']) ?? text(attempt['rawResponse']),",
+     "    answerText: text(attempt['answerText']),",
+     ['src/searchAuditReplay.test.ts']),
+    # Presence is not replayability: a retained HTML error page verifies against
+    # its own digest and supports no re-derivation, so publishing the provable
+    # negative `no_search_evidence` for it is a claim nothing can check.
+    ('M182-projection-reads-envelope-presence-only', 'src/servingProjection.ts',
+     "  const envelopeReplayable = envelope !== null && parsesAsJson(str(envelope, 'body'));",
+     '  const envelopeReplayable = envelope !== null;',
+     ['src/responseEnvelopeIntegrity.test.ts', 'src/servingProjection.test.ts']),
 ]
 
 

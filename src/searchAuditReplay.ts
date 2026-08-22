@@ -13,6 +13,7 @@ import {
   envelopeVerificationFailures,
   isCoherentPreRetentionArchive,
   receivedProviderResponse,
+  recordsHttpStatus,
   responseEnvelopeSchema,
 } from './providers/responseEnvelope.js';
 import type { ReceiptSignals } from './providers/responseEnvelope.js';
@@ -184,7 +185,8 @@ function readAudit(value: unknown): SearchAudit | null {
 }
 
 /** The receipt fields, read off the raw leg. Both answer names are consulted,
- *  because an archive carries the pre-#92 one. */
+ *  because an archive carries the pre-#92 one — and the status key's PRESENCE
+ *  is read as well as its value, because deleting it is an edit, not an era. */
 function receiptSignals(attempt: Record<string, unknown>): ReceiptSignals {
   const text = (value: unknown): string | null => (typeof value === 'string' ? value : null);
   return {
@@ -192,6 +194,8 @@ function receiptSignals(attempt: Record<string, unknown>): ReceiptSignals {
     reportedModelId: text(attempt['reportedModelId']),
     providerResponseId: text(attempt['providerResponseId']),
     httpStatus: typeof attempt['httpStatus'] === 'number' ? attempt['httpStatus'] : null,
+    httpStatusRecorded: recordsHttpStatus(attempt),
+    errorDetail: text(attempt['errorDetail']),
   };
 }
 

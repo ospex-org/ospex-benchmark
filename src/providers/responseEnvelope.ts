@@ -60,15 +60,30 @@ export interface ArchiveEraSignals {
  * name the file actually used, and that is the whole question here.
  */
 export function archiveEraSignals(rawLeg: unknown): ArchiveEraSignals {
-  const record =
-    typeof rawLeg === 'object' && rawLeg !== null && !Array.isArray(rawLeg)
-      ? (rawLeg as Record<string, unknown>)
-      : {};
+  const record = asLeg(rawLeg);
   return {
     answerText: Object.hasOwn(record, 'answerText'),
     rawResponse: Object.hasOwn(record, 'rawResponse'),
     responseEnvelope: Object.hasOwn(record, 'responseEnvelope'),
   };
+}
+
+/** A raw archived leg as a plain record; `{}` for anything that is not one, so
+ *  every key reads as absent rather than throwing. */
+function asLeg(rawLeg: unknown): Record<string, unknown> {
+  return typeof rawLeg === 'object' && rawLeg !== null && !Array.isArray(rawLeg)
+    ? (rawLeg as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Whether a raw archived leg carried an `httpStatus` KEY at all — presence,
+ * never value, and read off the raw record for the same reason the era signals
+ * are: an optional field's absence and its explicit `null` are one value in a
+ * schema's output, and here they mean opposite things.
+ */
+export function recordsHttpStatus(rawLeg: unknown): boolean {
+  return Object.hasOwn(asLeg(rawLeg), 'httpStatus');
 }
 
 /**
@@ -93,12 +108,17 @@ export function archiveEraSignals(rawLeg: unknown): ArchiveEraSignals {
  * Measured over the 47 run files in this repo's `out/` on 2026-08-22: 44
  * separate as coherent archives, 3 as era-stamped, none mixed.
  *
- * WHAT THIS IS NOT. A coherent whole-file rewrite still passes, and so would it
- * under any alternative available here: the envelope is bound to nothing
- * outside the file, so re-sealing an invented body (new text, recomputed
- * `sha256` and `bytes`) verifies clean today. This raises the cost of the
- * one-field edit a reviewer demonstrated; it is not tamper resistance, and
- * nothing here should be read as claiming it.
+ * WHAT THIS IS NOT. A coherent whole-file rewrite still passes. The envelope is
+ * bound to nothing outside the file, so re-sealing an invented body (new text,
+ * recomputed `sha256` and `bytes`) verifies clean — and the cheapest known
+ * rewrite needs no digest work at all: renaming every `answerText` to
+ * `rawResponse`, dropping every envelope key and dropping the stamp is one
+ * `sed`, and this predicate then reads the result as a genuine archive.
+ * Cross-checking the other modern stamps a rewritten file still carries
+ * (`promptScaffoldVersion`, `armRoster`, `watch`, `projection`) would raise
+ * that cost further and is NOT done here. What this predicate buys is that no
+ * SINGLE field decides the exemption; it is not tamper resistance, and nothing
+ * here should be read as claiming it.
  *
  * A file with no legs satisfies clause 2 and 3 vacuously, which changes
  * nothing: with no leg to enforce on, both branches produce the same empty
@@ -121,7 +141,42 @@ export interface ReceiptSignals {
   answerText: string | null;
   reportedModelId: string | null;
   providerResponseId: string | null;
+  /** The status this leg settled on; `null` when it never got one. */
   httpStatus: number | null;
+  /**
+   * Whether the record carried an `httpStatus` KEY at all — presence, never
+   * value. Every build that has ever written a leg wrote this key, so its
+   * absence is an edit rather than an era, and it is read fail-closed below.
+   */
+  httpStatusRecorded: boolean;
+  /**
+   * The leg's own error text, which on a failed call restates the status in
+   * prose. A SECOND carrier of the same fact, in the same record, so no single
+   * field decides whether a leg with no content was a receipt.
+   */
+  errorDetail: string | null;
+}
+
+/**
+ * The status a leg's own `errorDetail` says it settled on, or `null` when the
+ * text does not name one.
+ *
+ * `ProviderHttpError`'s message is `<provider> returned HTTP <status>: <detail>`
+ * and the runner stores it verbatim (redacted), so the status survives in prose
+ * beside the numeric field. ANCHORED at the start deliberately: the leading
+ * clause is this call's own status, while a later "returned HTTP 200" can only
+ * be text a provider echoed back inside a detail, which describes some other
+ * exchange.
+ */
+export function statusFromErrorDetail(errorDetail: string | null): number | null {
+  if (errorDetail === null) return null;
+  const match = /^\S+ returned HTTP (\d{1,3}):/.exec(errorDetail);
+  return match === null ? null : Number(match[1]);
+}
+
+/** Whether a status is a 2xx — the window in which a body arrived. */
+function isSuccessStatus(status: number | null): boolean {
+  return status !== null && status >= 200 && status < 300;
 }
 
 /**
@@ -139,14 +194,31 @@ export function reachedProviderByContent(signals: ReceiptSignals): boolean {
 }
 
 /**
- * A response came back AT ALL — the three content signals, plus a bare 2xx
- * status with nothing else to show for it.
+ * A response came back AT ALL — the three content signals, plus every way the
+ * record says a 2xx arrived with nothing else to show for it.
  *
- * The fourth disjunct is the receipt half of #92's second hole. A 200 whose
+ * The status disjuncts are the receipt half of #92's second hole. A 200 whose
  * body did not parse used to be recorded with every content field null, so it
  * was indistinguishable from "nothing came back" and the envelope rule read the
- * second: a discarded 200 exempted itself. The status is the one field that
- * still says a body arrived.
+ * second: a discarded 200 exempted itself.
+ *
+ * THREE CARRIERS, because one was one edit. A reviewer showed that nulling the
+ * single `httpStatus` field on such a leg — the exact leg class this rule was
+ * added to protect — switched the requirement back off without touching the
+ * era stamp. So the same fact is read from every place the record states it:
+ *
+ *   1. the numeric `httpStatus`, when it is a 2xx;
+ *   2. the status `errorDetail` names in prose, when that is a 2xx;
+ *   3. the ABSENCE of the `httpStatus` key, read fail-closed — every build
+ *      that has written a leg wrote that key (630 of 630 legs across the 47
+ *      run files in this repo's `out/`, measured 2026-08-22), so a leg without
+ *      it is an edited record and is treated as owing evidence.
+ *
+ * THE BOUND, since a reviewer will and should look for it: erasing an errored
+ * leg still works if all three are rewritten into one consistent story —
+ * envelope gone, `httpStatus` null, `errorDetail` silent. That is three fields
+ * on one leg rather than one, and it is the same residual as the whole-file
+ * rewrite `isCoherentPreRetentionArchive` names. It is not tamper resistance.
  *
  * Deliberately WIDER than `reachedProviderByContent`, and used only by the
  * envelope-presence rule. The sibling rule about recorded request parameters
@@ -156,7 +228,9 @@ export function reachedProviderByContent(signals: ReceiptSignals): boolean {
 export function receivedProviderResponse(signals: ReceiptSignals): boolean {
   return (
     reachedProviderByContent(signals) ||
-    (signals.httpStatus !== null && signals.httpStatus >= 200 && signals.httpStatus < 300)
+    isSuccessStatus(signals.httpStatus) ||
+    isSuccessStatus(statusFromErrorDetail(signals.errorDetail)) ||
+    !signals.httpStatusRecorded
   );
 }
 

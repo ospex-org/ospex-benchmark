@@ -59,6 +59,12 @@ interface LegFixture {
   providerResponseId?: string | null;
   /** The settled HTTP status. Defaults to 200 when a body was received. */
   httpStatus?: number | null;
+  /** Write no `httpStatus` KEY at all — a hand-edited leg, since every build
+   *  that has written one wrote that key. */
+  omitHttpStatus?: boolean;
+  /** The leg's own error text, which restates the status in prose. Omitted
+   *  entirely unless a case is about that second carrier. */
+  errorDetail?: string;
 }
 
 function attemptRecord(fixture: LegFixture): Record<string, unknown> {
@@ -67,10 +73,13 @@ function attemptRecord(fixture: LegFixture): Record<string, unknown> {
     reportedModelId: fixture.reportedModelId === undefined ? 'fixture-model' : fixture.reportedModelId,
     providerResponseId:
       fixture.providerResponseId === undefined ? 'fixture-response' : fixture.providerResponseId,
-    httpStatus:
-      fixture.httpStatus === undefined ? (fixture.body === null ? null : 200) : fixture.httpStatus,
     searchAudit: fixture.archivedAudit,
   };
+  if (fixture.omitHttpStatus !== true) {
+    record['httpStatus'] =
+      fixture.httpStatus === undefined ? (fixture.body === null ? null : 200) : fixture.httpStatus;
+  }
+  if (fixture.errorDetail !== undefined) record['errorDetail'] = fixture.errorDetail;
   if (fixture.archived === true) {
     // A pre-#92 leg carries neither key a retaining build adds. Assigned by
     // NOT assigning: the point of the archive rule is key presence, so a
@@ -351,6 +360,85 @@ test('a bare 2xx with no content left is still a receipt, so its missing envelop
   assert.equal(stateFor(200), 'unretained', 'a 200 is a receipt');
   assert.equal(stateFor(500), 'unavailable', 'a 500 is not — its body is not retained by design');
   assert.equal(stateFor(null), 'unavailable', 'and nothing settled at all is not');
+});
+
+test('the replay reads the SAME three receipt carriers the scorer does', () => {
+  // The one-field exemption a reviewer found after the era redesign, on the
+  // replay side. Nulling `httpStatus` on a contentless leg used to make it
+  // `unavailable` at exit 0 while the same bytes were a scorer violation — the
+  // divergence this state exists to remove.
+  //
+  // Rule 3b: every content signal is null in every row, so only a status
+  // carrier can decide, and each row leaves exactly one carrier standing.
+  const bare = {
+    participantId: 'google-arm' as const,
+    provider: 'google' as const,
+    body: null,
+    archivedAudit: null,
+    answerText: null,
+    reportedModelId: null,
+    providerResponseId: null,
+  };
+  const stateFor = (fixture: Partial<LegFixture>): string =>
+    replaySearchAudits(runLines([{ ...bare, ...fixture }])).legs[0]!.envelope;
+
+  assert.equal(stateFor({ httpStatus: 200 }), 'unretained', 'carrier 1: the numeric status');
+  assert.equal(
+    stateFor({ httpStatus: null, errorDetail: 'google returned HTTP 200: non-JSON response body' }),
+    'unretained',
+    'carrier 2: the status stated in prose, with the numeric field nulled',
+  );
+  assert.equal(
+    stateFor({ httpStatus: null, omitHttpStatus: true }),
+    'unretained',
+    'carrier 3: the status key deleted, read fail-closed',
+  );
+  assert.equal(
+    stateFor({ httpStatus: null, errorDetail: 'google returned HTTP 429: rate limited' }),
+    'unavailable',
+    'and the prose carrier keeps the 2xx bound',
+  );
+  // THE BOUND, and the negative control: all three silent, and the leg is a
+  // leg that genuinely received nothing. Erasing an errored leg costs three
+  // consistent edits, which is the residual the README and the PR body state.
+  assert.equal(stateFor({ httpStatus: null }), 'unavailable');
+});
+
+test('the ARCHIVED answer name alone is a receipt, in a file that is not an archive', () => {
+  // `receiptSignals` reads `answerText ?? rawResponse`, and the fallback had no
+  // test: a reader consulting only the modern name would exempt every
+  // pre-rename leg that ends up in a file the archive predicate refuses.
+  //
+  // Reaching it needs two legs. One archived-shape leg alone makes the file a
+  // coherent archive, which exempts it for a different reason — so the modern
+  // leg is here to withdraw that exemption, and the archived leg then has its
+  // old answer name as its ONLY receipt: no model id, no response id, no
+  // status, no error text.
+  const report = replaySearchAudits(
+    runLines([
+      {
+        participantId: 'google-modern',
+        provider: 'google',
+        body: '{"candidates":[]}',
+        archivedAudit: null,
+        answerText: 'a modern answer',
+      },
+      {
+        participantId: 'google-archived',
+        provider: 'google',
+        body: null,
+        archivedAudit: null,
+        answerText: 'an answer under the pre-#92 name',
+        archived: true,
+        reportedModelId: null,
+        providerResponseId: null,
+        httpStatus: null,
+      },
+    ]),
+  );
+  assert.equal(report.preRetentionArchive, false, 'the modern leg withdraws the exemption');
+  assert.equal(report.legs[0]!.envelope, 'retained', 'the modern leg is fine');
+  assert.equal(report.legs[1]!.envelope, 'unretained', 'and the archived name is read as a receipt');
 });
 
 test('deleting the era stamp does NOT turn the report back into "unavailable"', () => {

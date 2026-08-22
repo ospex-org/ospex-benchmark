@@ -30,6 +30,12 @@ import { sealResponseEnvelope } from './responseEnvelope.js';
  * is the likeliest place request content is echoed back, and widening
  * retention to it would put an unbounded copy of that into evidence. It keeps
  * the truncated `detail` it always had.
+ *
+ * A BODY THAT WAS NEVER READ reports status 0, not the status on the headers.
+ * `fetch` resolves at the headers, so a connection can drop mid-body; that is
+ * a transport failure that happens to have seen a status line, and calling it
+ * a 2xx would make it a receipt owing an envelope no code could produce —
+ * refusing an untampered run file over an ordinary network event.
  */
 export async function postJson(options: {
   provider: string;
@@ -69,7 +75,14 @@ export async function postJson(options: {
       }
       throw new ProviderHttpError(
         options.provider,
-        response.status,
+        // STATUS 0 — the same "no HTTP exchange completed" code the
+        // fetch-failure branch above reports, and not the status on the
+        // headers. A body that was never read is not a receipt: reporting
+        // `response.status` here would make an ordinary dropped connection a
+        // 2xx that owes an envelope which cannot exist, and one such leg
+        // refuses the whole run file for scoring and for publication. Nothing
+        // is retained on this path because there is nothing to retain.
+        0,
         `response body read failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
       );
     }

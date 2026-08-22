@@ -428,15 +428,23 @@ export interface AttemptRecord {
   rawText: string | null;
   /**
    * The complete provider response body for this attempt, or `null` when no
-   * body was retained: unsent, timeout, transport failure, or a non-2xx status
-   * (whose body is deliberately not kept — see `postJson`). A 2xx retains one
-   * whatever its body turned out to be, including a body that did not parse.
-   * Serialized as `responseEnvelope`, beside `answerText` — which holds the
-   * extracted answer only.
+   * body was retained: unsent, timeout, transport failure, a body that dropped
+   * MID-READ after the headers arrived (recorded as status 0, because a body
+   * that was never read is not a receipt), or a non-2xx status (whose body is
+   * deliberately not kept — see `postJson`). A 2xx retains one whatever its
+   * body turned out to be, including a body that did not parse. Serialized as
+   * `responseEnvelope`, beside `answerText` — which holds the extracted answer
+   * only.
    */
   responseEnvelope: ProviderResponseEnvelope | null;
   reportedModelId: string | null;
   providerResponseId: string | null;
+  /**
+   * The status this attempt settled on; `null` when the call never got one and
+   * `0` when no HTTP exchange completed (a transport failure, or a body that
+   * dropped mid-read). The scorer reads a 2xx here as a RECEIPT that a body
+   * arrived, so the two must stay distinct.
+   */
   httpStatus: number | null;
   usage: ProviderUsage | null;
   usageRaw: unknown;

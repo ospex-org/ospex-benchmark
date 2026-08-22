@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { sha256Hex } from './canonical.js';
+import { createRealAdapters } from './providers/index.js';
 import { EVIDENCE_ERA } from './providers/responseEnvelope.js';
 import { defaultExpectedArms, parseRunRecords, verifyRunIntegrity } from './scoring.js';
 import { replaySearchAudits } from './searchAuditReplay.js';
@@ -57,6 +58,43 @@ async function firedRecords(
     );
     return records;
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Bytes a proxy in front of a provider really sends, written non-canonically
+ *  so "the exact bytes survived the chain" is a checkable claim. */
+const PROXY_HTML = '<!doctype html>\n  <html><body>upstream timeout</body></html>';
+
+/**
+ * Fire the enrolled arm through the PRODUCTION adapter — the real request
+ * builder, the real `postJson`, the real error types — against `respond`, and
+ * return the records the runner wrote.
+ *
+ * No socket is opened: `globalThis.fetch` is replaced for the duration and
+ * restored in a `finally`. The credential is synthetic and is never in the
+ * response, so nothing about redaction changes.
+ */
+async function firedThroughRealAdapter(respond: () => Response): Promise<JsonRecord[]> {
+  const adapter = createRealAdapters().get(FIRED_PARTICIPANT);
+  assert.ok(adapter !== undefined, `the production registry has no adapter for ${FIRED_PARTICIPANT}`);
+  const originalFetch = globalThis.fetch;
+  const priorKey = process.env[adapter.credentialEnvVar];
+  process.env[adapter.credentialEnvVar] = 'synthetic-test-credential';
+  globalThis.fetch = (async () => respond()) as typeof fetch;
+  const dir = mkdtempSync(join(tmpdir(), 'envelope-real-adapter-'));
+  try {
+    const run = await firedRun({ outDir: dir, enrolled: true, adapter, gameId: nextGameId() });
+    const records = run.records.map((record) => JSON.parse(JSON.stringify(record)) as JsonRecord);
+    assert.ok(
+      records.some((record) => record['recordType'] === 'arm_game_response'),
+      'the fire produced an arm response, so the case is not vacuous',
+    );
+    return records;
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (priorKey === undefined) delete process.env[adapter.credentialEnvVar];
+    else process.env[adapter.credentialEnvVar] = priorKey;
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -399,6 +437,26 @@ test('THE DELETION TABLE: every era carrier can only RAISE enforcement', async (
       expected: 'parse-refused',
     },
     {
+      // THE STAMP'S OWN ROW, and it is the one the scorer was missing. Every
+      // other row here deletes the stamp, so a build that ignored it entirely
+      // — reading the legs alone — answered all of them correctly. This is the
+      // row above with the stamp LEFT IN: the legs are rewritten into the
+      // archive shape, so the leg clauses are satisfied and the stamp is the
+      // only thing that can withdraw the exemption. A mutant hardcoding the
+      // scorer's `evidenceEraStamped` to false survived the whole suite until
+      // this row existed.
+      name: 'KEEP evidenceEra and rewrite every leg into the archive shape',
+      edit: (records) => {
+        assert.equal(runMeta(records)['evidenceEra'], EVIDENCE_ERA, 'the stamp stays');
+        everyLeg(records, (value) => {
+          value['rawResponse'] = value['answerText'];
+          delete value['answerText'];
+          delete value['responseEnvelope'];
+        });
+      },
+      expected: 2,
+    },
+    {
       name: 'a genuine pre-#92 archive',
       edit: () => {},
       expected: 0,
@@ -487,6 +545,162 @@ test('a leg with NO status and no content is still exempt — the receipt has a 
   assert.equal(attempt['httpStatus'], null, 'the fixture really never settled on a status');
   assert.equal(attempt['responseEnvelope'], null);
   assert.equal(violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING)).length, 0);
+});
+
+test('THE RECEIPT TABLE: erasing an errored leg takes three consistent edits, not one', async () => {
+  // The hole a reviewer found after the era redesign, at the artifact layer.
+  // The era stamp stopped being a one-field exemption; `httpStatus` had become
+  // one instead, on exactly the leg class the 2xx receipt was added to
+  // protect — a 200 whose body no parser understood, where the status is the
+  // only content-free sign a body arrived.
+  //
+  // The fixture is the unparseable 2xx, so `answerText`, `reportedModelId` and
+  // `providerResponseId` are all null: nothing but a status carrier can produce
+  // a refusal here, which is what makes each row discriminate (rule 3b).
+  const carriers: Array<{ name: string; edit: (leg: JsonRecord) => void; expected: number }> = [
+    { name: 'nothing edited: the file the harness wrote', edit: () => {}, expected: 0 },
+    {
+      name: 'delete the envelope only',
+      edit: (value) => {
+        delete value['responseEnvelope'];
+      },
+      expected: 1,
+    },
+    {
+      name: 'delete the envelope and NULL httpStatus — the reviewer\'s one-field edit',
+      edit: (value) => {
+        delete value['responseEnvelope'];
+        value['httpStatus'] = null;
+      },
+      expected: 1,
+    },
+    {
+      name: 'delete the envelope and DELETE the httpStatus key',
+      edit: (value) => {
+        delete value['responseEnvelope'];
+        delete value['httpStatus'];
+      },
+      expected: 1,
+    },
+    {
+      name: 'delete the envelope and put httpStatus just under the 2xx window',
+      edit: (value) => {
+        delete value['responseEnvelope'];
+        value['httpStatus'] = 199;
+      },
+      expected: 1,
+    },
+    {
+      name: 'delete the envelope and NULL errorDetail, leaving the status',
+      edit: (value) => {
+        delete value['responseEnvelope'];
+        value['errorDetail'] = null;
+      },
+      expected: 1,
+    },
+    {
+      name: 'delete the envelope, delete the httpStatus key AND null errorDetail',
+      edit: (value) => {
+        delete value['responseEnvelope'];
+        delete value['httpStatus'];
+        value['errorDetail'] = null;
+      },
+      expected: 1,
+    },
+    {
+      // THE BOUND, pinned so the prose cannot drift from it. This is not a
+      // behaviour being blessed as fine: it is the residual named in
+      // `receivedProviderResponse`, in the README and in the PR body, and the
+      // point of the row is that reaching it costs three mutually consistent
+      // edits to one leg rather than one. A leg with no content, no status and
+      // no error text is genuinely indistinguishable from a call that never
+      // landed, in a file that is bound to nothing outside itself.
+      name: 'THE BOUND: envelope gone, httpStatus null, errorDetail silent',
+      edit: (value) => {
+        delete value['responseEnvelope'];
+        value['httpStatus'] = null;
+        value['errorDetail'] = null;
+      },
+      expected: 0,
+    },
+  ];
+
+  for (const row of carriers) {
+    const records = await firedRecords('unparseable-2xx');
+    const attempt = leg(records, 'attempt');
+    assert.deepEqual(
+      ['answerText', 'reportedModelId', 'providerResponseId'].map((field) => attempt[field]),
+      [null, null, null],
+      'no content signal is left standing, so only a status carrier can decide',
+    );
+    assert.match(
+      String(attempt['errorDetail']),
+      /^\S+ returned HTTP 200:/,
+      'and the leg really does state its status in prose too',
+    );
+    row.edit(attempt);
+    const missing = violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING));
+    assert.equal(missing.length, row.expected, `${row.name}: ${JSON.stringify(missing)}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// the PRODUCTION http layer, the runner and the file, in one chain
+// ---------------------------------------------------------------------------
+
+test('a 200 an adapter could not parse is retained END TO END, and stripping it fails closed', async () => {
+  // The two halves joined. Everything below the assertion is production: the
+  // real registry adapter builds the request, the real `postJson` reads the
+  // canned response, the real runner persists it and the file is read back off
+  // disk. The stub-driven cases above and the adapter cases in
+  // `providers/responseEnvelope.test.ts` each cover one side of that seam.
+  const records = await firedThroughRealAdapter(() => new Response(PROXY_HTML, { status: 200 }));
+  const attempt = leg(records, 'attempt');
+  assert.equal(attempt['httpStatus'], 200);
+  const envelope = attempt['responseEnvelope'] as { body: string; sha256: string; bytes: number };
+  assert.ok(envelope !== null && typeof envelope === 'object', 'the received bytes survived the chain');
+  assert.equal(envelope.body, PROXY_HTML, 'byte-identical to what fetch returned');
+  assert.equal(envelope.sha256, sha256Hex(PROXY_HTML));
+  assert.equal(violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING)).length, 0);
+
+  // And the same file with the envelope taken out is refused — so the chain is
+  // load-bearing rather than incidental.
+  delete attempt['responseEnvelope'];
+  assert.equal(violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING)).length, 1);
+});
+
+test('a connection that DROPS mid-body leaves an untampered file that still scores', async () => {
+  // The regression this pairs with: reporting the header status here made an
+  // ordinary dropped connection a 2xx receipt owing an envelope that cannot
+  // exist, and `scoreRun` and `servingProjection` both refuse a run with any
+  // integrity violation — so one dropped connection on one leg made the whole
+  // file unscoreable and unpublishable, with no operator remedy.
+  const records = await firedThroughRealAdapter(
+    () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"partial":'));
+            controller.error(new Error('ECONNRESET'));
+          },
+        }),
+        { status: 200 },
+      ),
+  );
+  const attempt = leg(records, 'attempt');
+  assert.equal(attempt['httpStatus'], 0, 'no HTTP exchange completed, so no status is claimed');
+  assert.equal(attempt['responseEnvelope'], null, 'and nothing was retained, because nothing was read');
+  assert.match(String(attempt['errorDetail']), /response body read failed/);
+  assert.deepEqual(
+    ['answerText', 'reportedModelId', 'providerResponseId'].map((field) => attempt[field]),
+    [null, null, null],
+    'every content signal is null, so the status is the only thing that could refuse this file',
+  );
+  assert.deepEqual(
+    violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING)),
+    [],
+    'an untampered artifact from a dropped connection is still scoreable',
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -662,6 +876,31 @@ test('an envelope-unavailable attempt is reported unknown, never as "no search r
     archived.map(() => 'unknown_unproven'),
   );
   assert.equal(archived.length, withEnvelope.length, 'the same attempts, differing only in retention');
+});
+
+test('a retained body that no parser accepts publishes unknown, not a provable negative', async () => {
+  // The half that came apart when retention widened to every 2xx. A 200 whose
+  // body is an HTML error page now HAS an envelope, so a rule reading presence
+  // alone would publish `no_search_evidence` — a provable negative — about
+  // bytes nothing can re-derive an audit from, while `replay:search-audit`
+  // calls the same leg `unparseable` and exits 1. The control is the case
+  // above, which is the same absent audit with a parseable body beside it.
+  const records = await firedRecords('unparseable-2xx');
+  const attempt = leg(records, 'attempt');
+  assert.equal(attempt['searchAudit'], null, 'the archived audit is absent in both cases');
+  const envelope = attempt['responseEnvelope'] as { body: string };
+  assert.ok(envelope !== null && typeof envelope === 'object', 'and an envelope IS retained');
+  assert.throws(() => JSON.parse(envelope.body), 'which is exactly what cannot be re-parsed');
+
+  const facts = attemptFacts(records);
+  assert.ok(facts.length > 0, 'the run projects at least one attempt row');
+  assert.deepEqual(
+    facts.map((f) => f['searchEvidenceStatus']),
+    facts.map(() => 'unknown_unproven'),
+  );
+  // And the replay agrees on the same bytes, which is the point of the pair.
+  const report = replaySearchAudits(lines(records));
+  assert.equal(report.legs[0]!.envelope, 'unparseable');
 });
 
 test('the envelope body reaches no published field', async () => {
