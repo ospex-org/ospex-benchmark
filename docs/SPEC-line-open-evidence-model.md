@@ -690,19 +690,38 @@ timeout, a transport failure, a body that dropped mid-read, or a non-2xx, whose 
 deliberately not kept) retains an explicit `null`, which is not a violation.
 
 Retention is the DEFAULT. The one exemption is an artifact that reads as a coherent
-**pre-retention** artifact as a whole: **every** attempt in it carries none of the optional
-attempt fields (`searchAudit`, `providerStopReason`, `turnCompleted`, `responseEnvelope`).
-An artifact carrying any one of them anywhere is a retaining-era artifact and is enforced.
-This is deliberately not a single stamp a single deletion can remove.
+**pre-retention** artifact as a whole: **no** attempt in it carries a `responseEnvelope`
+KEY. A retaining build writes that key on every sent attempt — explicit `null` when
+nothing came back — so one key anywhere makes the file a retaining-era artifact and every
+received leg in it owes a body. This is deliberately not a single stamp a single deletion
+can remove: buying the exemption means deleting the key from every attempt and forging
+one `armDigest` per arm.
 
-Two bounds, stated rather than left to be found. An artifact from an intermediate build —
-one that wrote `searchAudit` but not `responseEnvelope` — is enforced and therefore refused;
-that is fail-closed on an artifact this rule cannot place. And a COHERENT whole-artifact
-rewrite still verifies: strip all four keys from every attempt and recompute every
-`armDigest`, or re-seal an invented body and recompute the digests, and the file describes
-itself consistently. What the rule buys is that no SINGLE deletion downgrades enforcement,
-and that every edit which tries has to move a digest. It is integrity, not tamper
-resistance.
+**The exemption reads the envelope key alone, and that is a deliberate narrowing.** An
+earlier draft required every attempt to carry none of the four optional attempt fields
+(`searchAudit`, `providerStopReason`, `turnCompleted`, `responseEnvelope`). The first
+three landed together on 2026-08-07 and envelope retention only afterwards, so the build
+in between produced artifacts carrying three of the four — which the wider clause would
+have enforced and therefore refused. On the campaign path that refusal is not a write
+refusal: an already-installed artifact is replayed by every later tick's evidence scan,
+so one such file under a cohort's evidence root latches the campaign, and a latch's
+recovery ends a cohort that is armed at most once. What the narrowing gives up is stated
+with it: a FUTURE build that stops writing the key produces artifacts this rule reads as
+pre-retention rather than refusing them. That regression is caught by the test suite, not
+by this rule.
+
+**Two further bounds, stated rather than left to be found.** A COHERENT whole-artifact
+rewrite still verifies: delete the key from every attempt and recompute every `armDigest`,
+or re-seal an invented body and recompute the digests, and the file describes itself
+consistently. And the receipt carriers run out on one leg class: a 2xx whose body the
+extractor could not read persists with answer text, reported model ID and `ok` transport
+all absent, so its numeric status is the only carrier left — deleting that leg's envelope
+and nulling its status is two field edits plus a forged digest, where the run file needs
+three because it also names the status in prose in `errorDetail`, which a fire attempt
+does not persist. That is the one place this surface is weaker than the run file. What
+the rule buys is that no SINGLE deletion downgrades enforcement on an artifact carrying
+more than one attempt, and that every edit which tries has to move a digest. It is
+integrity, not tamper resistance.
 
 **Arm digest (domain-bound to its enclosing identity).**
 

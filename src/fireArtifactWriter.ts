@@ -405,17 +405,11 @@ function allAttempts(artifact: FireArtifactV1): PersistedAttemptRead[] {
 }
 
 /**
- * The four OPTIONAL attempt fields, in the order they were added. Every one of them
- * is written EXPLICITLY (as `null` when there is nothing to say) by the build that
- * introduced it and by every build after it, so a persisted attempt carrying none of
- * them predates the first — and therefore predates envelope retention, which is the
- * last.
- *
- * Read as KEYS, never values. A `responseEnvelope` explicitly set to `null` is still
- * a key a retaining build wrote, and reading that as "absent" is exactly the
- * downgrade this exists to refuse.
+ * The one optional attempt field this rule reads, and it is read as a KEY, never as a
+ * value. A `responseEnvelope` explicitly set to `null` is still a key a retaining build
+ * wrote, and reading that as "absent" is exactly the downgrade this exists to refuse.
  */
-const OPTIONAL_ATTEMPT_FIELDS = ['searchAudit', 'providerStopReason', 'turnCompleted', 'responseEnvelope'] as const;
+const RESPONSE_ENVELOPE_KEY = 'responseEnvelope';
 
 /**
  * Whether the artifact is a COHERENT PRE-RETENTION FIRE ARTIFACT — the one shape
@@ -429,31 +423,45 @@ const OPTIONAL_ATTEMPT_FIELDS = ['searchAudit', 'providerStopReason', 'turnCompl
  * this polarity a stamp could only ever make the rule stricter, so it would carry
  * nothing — and it would be the one field in the artifact outside every `armDigest`.
  *
- * Exemption is earned only when EVERY persisted attempt in the artifact carries NONE
- * of the four optional fields. For an artifact with N attempts that is 4N keys, not
- * one, and each of those keys is inside `armDigest`'s domain, so buying the exemption
- * also means forging one digest per arm.
+ * Exemption is earned only when NO persisted attempt in the artifact carries the
+ * `responseEnvelope` KEY. A retaining build writes that key on every sent attempt —
+ * explicit `null` when nothing came back — so an artifact it produced is never exempt,
+ * and buying the exemption means deleting the key from EVERY attempt and forging one
+ * `armDigest` per arm: N deletions for N attempts, not one.
  *
- * THE BOUND, stated rather than left for a reviewer to find:
+ * WHY THE ENVELOPE KEY ALONE, AND WHAT THAT COSTS. The first draft of this predicate
+ * required every attempt to carry none of the FOUR optional fields (`searchAudit`,
+ * `providerStopReason`, `turnCompleted`, `responseEnvelope`) — 4N keys rather than N.
+ * It was narrowed for an operational reason that outweighs the extra 3N: the build in
+ * between (`searchAudit` and its two siblings landed 2026-08-07 in 68dfc6e, envelope
+ * retention only now) wrote the first three and not the fourth, so EVERY artifact that
+ * build produced would have been enforced and refused. On the live campaign path that
+ * refusal is not a write refusal — `verifySpendEvidence` replays every installed
+ * artifact whose spend sidecar claims a clean pass, so one already-installed artifact
+ * from that build turns every subsequent tick's evidence scan into an
+ * `unverified_evidence` latch cause, and the documented recovery for a tripped latch is
+ * `campaign:stop`, which ends a cohort that can never be re-armed. Measured
+ * 2026-08-22: an artifact in exactly that shape produced 4 presence violations under
+ * the four-field clause and 0 under this one.
  *
- *  - An artifact from an INTERMEDIATE build — one that wrote `searchAudit` but not
- *    `responseEnvelope` — is enforced, not exempt, and so is refused. That is
- *    deliberately fail-closed on an artifact this predicate cannot place. Measured
- *    2026-08-22: the three fire artifacts under `.fire-artifacts/` in this repo carry
- *    11 keys per attempt and none of the four, so none is in that class.
- *  - A COHERENT whole-artifact rewrite still passes, as it does on the run path: strip
- *    all four keys from every attempt and recompute every `armDigest` and this
- *    predicate reads the result as a genuine pre-retention artifact. What the rule
- *    buys is that no SINGLE deletion downgrades enforcement, and that every edit that
- *    tries has to move a digest. It is not tamper resistance.
+ * What the narrower clause gives up, stated so it reads as a choice rather than an
+ * oversight: a FUTURE build that stops writing the key produces artifacts this
+ * predicate reads as pre-retention instead of refusing them. That regression is caught
+ * by the suite — a mapper that stops binding the envelope reddens cases in
+ * `fireArtifact.test.ts` and in this module's tests — not by this function.
+ *
+ * THE OTHER BOUND, the same one the run path names: a COHERENT whole-artifact rewrite
+ * still passes. Delete the key from every attempt, recompute every `armDigest`, and
+ * this predicate reads the result as a genuine pre-retention artifact. What the rule
+ * buys is that no SINGLE deletion downgrades enforcement on an artifact carrying more
+ * than one persisted attempt, and that every edit which tries has to move a digest. It
+ * is not tamper resistance.
  *
  * An artifact with no attempts at all satisfies the clause vacuously, which changes
  * nothing: with no attempt to enforce on, both branches produce the same empty result.
  */
 export function isCoherentPreRetentionFireArtifact(artifact: FireArtifactV1): boolean {
-  return allAttempts(artifact).every(
-    (attempt) => !OPTIONAL_ATTEMPT_FIELDS.some((key) => Object.hasOwn(attempt, key)),
-  );
+  return allAttempts(artifact).every((attempt) => !Object.hasOwn(attempt, RESPONSE_ENVELOPE_KEY));
 }
 
 /**
@@ -468,8 +476,23 @@ export function isCoherentPreRetentionFireArtifact(artifact: FireArtifactV1): bo
  * instead of needing the run path's fail-closed read of an absent key.
  *
  * `transport` is the carrier this surface adds. It is set to `ok` from exactly the same
- * fact that fills `persistedResponseBody` — a second field stating one thing, so nulling
- * either one alone does not make a received response look like silence.
+ * fact that fills `persistedResponseBody`, so on an ordinary received leg four fields
+ * state one thing and nulling any one of them does not make a received response look
+ * like silence.
+ *
+ * UP TO four, and the bound matters because it runs out on the leg class #92 exists to
+ * preserve. A 2xx whose body the extractor could NOT read
+ * (`ProviderUnreadableResponseError`, and the non-JSON 2xx `ProviderHttpError` beside
+ * it) persists with `persistedResponseBody`, `reportedModelId` and an `ok` `transport`
+ * all absent, so the numeric `httpStatus` is the ONLY carrier standing there: deleting
+ * that leg's envelope and nulling its status is two field edits plus a forged digest,
+ * against three on the run path — which persists an `errorDetail` naming the status in
+ * prose and reads it with `statusFromErrorDetail`. A fire attempt persists no
+ * `errorDetail` at all, so this surface is one carrier short exactly there, and that is
+ * the one place it is weaker than the run file rather than stronger. Both halves are
+ * pinned by the deletion table's two `unreadable` rows and by the bound case beside
+ * them. Persisting a second status carrier on the attempt would close it and is a change
+ * to the persisted shape, not part of this rule.
  */
 function attemptReceivedResponse(attempt: PersistedAttemptRead): boolean {
   return (

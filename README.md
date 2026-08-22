@@ -342,14 +342,21 @@ campaign did not retain cannot be recovered later. Each sent attempt there keeps
 `sha256` and UTF-8 length, and every one of those bodies is inside the `armDigest`
 domain. The write, the sink install and every re-parse re-hash each retained body and
 **require** one on any attempt whose record says a response came back — an answer, a
-reported model ID, a 2xx status, or an `ok` transport, read as four separate carriers
-so nulling one does not make a received response look like silence. The one waiver is
-an artifact carrying none of the optional attempt fields anywhere in it, which is what
-a pre-retention artifact looks like; unlike the run file's rule this one has no era
+reported model ID, a 2xx status, or an `ok` transport, read as separate carriers so
+nulling one does not make a received response look like silence. The one waiver is an
+artifact where no attempt carries a `responseEnvelope` key at all, which is what every
+artifact written before this looks like; unlike the run file's rule this one has no era
 stamp to delete, because deleting a body moves a digest that is already recomputed.
-The bound is the same as the run file's and worth repeating: a *coherent* whole-file
-rewrite — every key stripped and every arm digest forged, or a body re-sealed — still
-verifies. This is integrity, not tamper resistance. `docs/SPEC-line-open-evidence-model.md`
+
+Two bounds, both worth repeating rather than discovering. A *coherent* whole-file
+rewrite — the key deleted from every attempt and every arm digest forged, or a body
+re-sealed — still verifies: this is integrity, not tamper resistance. And the carriers
+run out on exactly one leg class: a 2xx whose body the extractor could not read persists
+with answer text, reported model ID and `ok` transport all absent, so its numeric status
+is the only carrier standing, and erasing that leg's body takes two field edits plus a
+forged digest instead of three. The run file keeps a second carrier there (`errorDetail`
+names the status in prose); a fire artifact does not persist one, and that is the one
+place this surface is weaker rather than stronger. `docs/SPEC-line-open-evidence-model.md`
 specifies both rules.
 
 ### Before enabling it against a database

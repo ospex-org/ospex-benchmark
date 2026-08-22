@@ -22,7 +22,7 @@ import {
   verifyFireArtifactRelations,
   writeFireArtifactV1,
 } from './fireArtifactWriter.js';
-import { ProviderTimeoutError } from './providers/errors.js';
+import { ProviderTimeoutError, ProviderUnreadableResponseError } from './providers/errors.js';
 import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { checkPublication } from './manifestPublication.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
@@ -74,6 +74,9 @@ const NOW_MS = Date.parse('2026-07-18T12:00:40.000Z');
 const W = 120_000;
 const SKEW = 5_000;
 const AWAY_TEAM = 'Milwaukee Brewers';
+/** A string that appears ONLY inside an unreadable-2xx leg's retained body, so a case
+ *  can tell "the body reached the file" from "the file merely verified". */
+const UNREADABLE_BODY_MARKER = 'unreadable-2xx-body-4f10c3';
 
 const CODE_ARMS = defaultExpectedArms();
 const ARMS: ArmSpec[] = CODE_ARMS.map((a) => ({
@@ -302,9 +305,12 @@ interface FireOpts {
   /**
    * What each arm's provider does. `repair` echoes a wrong cohort id first (schema-
    * invalid, fingerprint-preserving) so `runSlate` sends a real second leg; `timeout`
-   * throws the typed timeout so the arm settles with nothing received.
+   * throws the typed timeout so the arm settles with nothing received. `unreadable`
+   * throws the typed unreadable-2xx error — a response that DID come back, carrying a
+   * sealed body, whose content fields all persist as `null`: the one leg class where
+   * `httpStatus` is the only receipt carrier left standing.
    */
-  behaviourFor?: (arm: ArmSpec) => 'valid' | 'repair' | 'timeout';
+  behaviourFor?: (arm: ArmSpec) => 'valid' | 'repair' | 'timeout' | 'unreadable';
   /** Override the retained response envelope, given the answer text and the leg. */
   envelopeFor?: (rawText: string, leg: 'initial' | 'repair') => ProviderResponseEnvelope;
 }
@@ -331,6 +337,14 @@ async function fireParts(opts: FireOpts = {}): Promise<{ env: RunEnvelope; ctx: 
       stubAdapter(arm, () => {
         calls += 1;
         if (behaviour === 'timeout') throw new ProviderTimeoutError(arm.provider, 600_000);
+        if (behaviour === 'unreadable') {
+          throw new ProviderUnreadableResponseError({
+            provider: arm.provider,
+            httpStatus: 200,
+            detail: 'response body did not parse',
+            responseEnvelope: sealResponseEnvelope(JSON.stringify({ unreadable: UNREADABLE_BODY_MARKER })),
+          });
+        }
         // The leg this call IS, not the behaviour that produced it: a repair is only
         // ever the second call, so the label matches the persisted attempt's `kind`.
         const leg: 'initial' | 'repair' = calls === 1 ? 'initial' : 'repair';
@@ -677,6 +691,21 @@ async function mixedFire(opts: Omit<FireOpts, 'behaviourFor'> = {}): Promise<Fir
   });
 }
 
+/**
+ * A produced fire whose first arm returned a 2xx the extractor could NOT read
+ * (`ProviderUnreadableResponseError`). Kept separate from {@link mixedFire} because
+ * that fixture's cases assert `transport !== 'ok' ⇒ nothing retained`, and this leg
+ * class is exactly the exception: a response DID come back and its body IS retained,
+ * while the answer text, the reported model id and the `ok` transport are all absent.
+ * That leaves the numeric `httpStatus` as the only receipt carrier standing, which is
+ * the bound the two `unreadable` rows in the deletion table measure.
+ */
+async function unreadableFire(): Promise<FireArtifactV1> {
+  return producedFire({
+    behaviourFor: (arm) => (arm.participantId === ARMS[0]!.participantId ? 'unreadable' : 'valid'),
+  });
+}
+
 /** A raw persisted artifact as plain JSON — the shape a hand-edit actually reaches. */
 type RawFire = Record<string, any>;
 
@@ -720,7 +749,20 @@ function repairArm(raw: RawFire): RawFire {
   return arm;
 }
 
+/** The unreadable-2xx leg: a received 2xx whose content fields are all null. */
+function unreadableLeg(raw: RawFire): RawFire {
+  const legs = everyAttempt(raw).filter(
+    (a) => a['httpStatus'] === 200 && a['persistedResponseBody'] === null && a['reportedModelId'] === null,
+  );
+  assert.equal(legs.length, 1, 'the unreadable fixture must contain exactly one unreadable-2xx leg');
+  return legs[0]!;
+}
+
 const OPTIONAL_KEYS = ['searchAudit', 'providerStopReason', 'turnCompleted', 'responseEnvelope'] as const;
+/** The three optional attempt fields that the build BEFORE envelope retention wrote —
+ *  `searchAudit` and its two siblings landed together in 68dfc6e (2026-08-07). An
+ *  artifact carrying these and no `responseEnvelope` is what that build produced. */
+const PRE_ENVELOPE_OPTIONAL_KEYS = ['searchAudit', 'providerStopReason', 'turnCompleted'] as const;
 
 test('a produced fire retains a complete response envelope on every leg that received one', async () => {
   const artifact = await mixedFire();
@@ -894,6 +936,10 @@ interface DeletionRow {
   readonly edit: (raw: RawFire) => void;
   /** `CLEAN`, `PARSE_THROWS`, or the needles that must ALL appear in the violations. */
   readonly expect: 'CLEAN' | 'PARSE_THROWS' | readonly string[];
+  /** Which produced fire the row edits. `mixed` (the default) has an initial leg, a
+   *  repair leg and a no-receipt leg; `unreadable` adds the received-2xx-with-no-content
+   *  leg, which the mixed fixture cannot carry (see {@link unreadableFire}). */
+  readonly fixture?: 'mixed' | 'unreadable';
 }
 
 const NO_ENVELOPE = 'no response envelope was retained';
@@ -937,14 +983,6 @@ const DELETION_TABLE: readonly DeletionRow[] = [
     },
     // #92 covers every initial AND repair attempt, so the message must name the repair.
     expect: ['attempt 2 (repair)', NO_ENVELOPE],
-  },
-  {
-    name: 'delete the envelope from EVERY leg and forge every digest — the sibling keys still place the file',
-    edit: (raw) => {
-      for (const attempt of everyAttempt(raw)) delete attempt['responseEnvelope'];
-      recomputeAllArmDigests(raw);
-    },
-    expect: [NO_ENVELOPE],
   },
   {
     name: 'strip all four optional keys from ONE leg only and forge every digest',
@@ -1047,7 +1085,38 @@ const DELETION_TABLE: readonly DeletionRow[] = [
     },
     expect: ['does not match its recorded byte length'],
   },
-  // --- the two rows that say what this does NOT buy --------------------------
+  // --- the leg class where the carriers run out ------------------------------
+  // A received 2xx the extractor could not read persists with answer text, reported
+  // model id and `ok` transport ALL absent, so `httpStatus` is the only carrier left.
+  // The rows above cannot reach this class: every one of them edits a leg that
+  // transported `ok`, so a predicate consulting only some carriers still passes them.
+  {
+    fixture: 'unreadable',
+    name: 'delete the envelope from an UNREADABLE-2xx leg and forge every digest',
+    edit: (raw) => {
+      delete unreadableLeg(raw)['responseEnvelope'];
+      recomputeAllArmDigests(raw);
+    },
+    expect: [NO_ENVELOPE],
+  },
+  {
+    fixture: 'unreadable',
+    name: 'BOUND: on an unreadable-2xx leg the status is the ONLY carrier, so TWO edits erase the body',
+    edit: (raw) => {
+      const leg = unreadableLeg(raw);
+      delete leg['responseEnvelope'];
+      leg['httpStatus'] = null;
+      recomputeAllArmDigests(raw);
+    },
+    // Two field edits plus the forged digests. The run path needs three on the same leg
+    // class, because it also persists an `errorDetail` naming the status in prose and
+    // `statusFromErrorDetail` reads it; a fire artifact persists no `errorDetail` at all,
+    // so this surface is one carrier short exactly here. Stated in
+    // `attemptReceivedResponse`, in the README and in the spec rather than left to be
+    // found, and measured by the row above, which shows the status carrier IS load-bearing.
+    expect: 'CLEAN',
+  },
+  // --- the rows that say what this does NOT buy ------------------------------
   {
     name: 'BOUND: re-seal an invented body coherently and forge every digest',
     edit: (raw) => {
@@ -1062,27 +1131,54 @@ const DELETION_TABLE: readonly DeletionRow[] = [
     expect: 'CLEAN',
   },
   {
+    name: 'BOUND: delete the envelope KEY from EVERY leg and forge every digest',
+    edit: (raw) => {
+      for (const attempt of everyAttempt(raw)) delete attempt['responseEnvelope'];
+      recomputeAllArmDigests(raw);
+    },
+    // The exemption, earned the only way it can be: the key gone from EVERY attempt plus
+    // one forged digest per arm. That is what the rule buys — no SINGLE deletion reaches
+    // it on an artifact with more than one attempt. The other three optional keys are
+    // deliberately NOT part of the clause; `isCoherentPreRetentionFireArtifact` says why,
+    // and the intermediate-build case below is the reason.
+    expect: 'CLEAN',
+  },
+  {
     name: 'BOUND: strip all four optional keys from EVERY leg and forge every digest',
     edit: (raw) => {
       for (const attempt of everyAttempt(raw)) for (const key of OPTIONAL_KEYS) delete attempt[key];
       recomputeAllArmDigests(raw);
     },
-    // The exemption, earned the only way it can be: 4 keys on every attempt plus one
-    // forged digest per arm. That is the whole point — no SINGLE deletion reaches it.
     expect: 'CLEAN',
   },
 ];
 
 test('deletion table: no single field deletion or nulling downgrades envelope enforcement', async () => {
-  const base = rawOf(await mixedFire());
-  // The fixture must be one the rule actually applies to, or every row passes vacuously.
-  assert.equal(isCoherentPreRetentionFireArtifact(reparse(base)), false);
-  assert.ok(
-    everyAttempt(base).filter((a) => a['responseEnvelope'] !== null).length >= 4,
-    'the fixture retains bodies on at least four legs, or the rows below discriminate nothing',
-  );
+  const bases: Record<'mixed' | 'unreadable', RawFire> = {
+    mixed: rawOf(await mixedFire()),
+    unreadable: rawOf(await unreadableFire()),
+  };
+  // Each fixture must be one the rule actually applies to, or its rows pass vacuously.
+  for (const [which, base] of Object.entries(bases)) {
+    assert.equal(isCoherentPreRetentionFireArtifact(reparse(base)), false, `${which}: not exempt`);
+    assert.ok(
+      everyAttempt(base).filter((a) => a['responseEnvelope'] !== null).length >= 4,
+      `${which}: retains bodies on at least four legs, or the rows below discriminate nothing`,
+    );
+    assert.deepEqual(verifyFireArtifactReplay(reparse(base)), [], `${which}: starts clean`);
+  }
+  // And the unreadable fixture must really carry the leg its rows are about: a received
+  // 2xx with EVERY other carrier absent. Without this the two rows below would be
+  // measuring an ordinary `ok` leg and could not distinguish the bound they state.
+  const unreadable = unreadableLeg(bases.unreadable);
+  assert.equal(unreadable['transport'], 'provider_error');
+  assert.equal(unreadable['httpStatus'], 200);
+  assert.equal(unreadable['persistedResponseBody'], null);
+  assert.equal(unreadable['reportedModelId'], null);
+  assert.ok(unreadable['responseEnvelope'].body.includes(UNREADABLE_BODY_MARKER), 'and it retained its body');
 
   for (const row of DELETION_TABLE) {
+    const base = bases[row.fixture ?? 'mixed'];
     const raw = JSON.parse(JSON.stringify(base)) as RawFire;
     row.edit(raw);
     if (row.expect === 'PARSE_THROWS') {
@@ -1164,22 +1260,97 @@ test('every fire artifact already written to .fire-artifacts/ still replays clea
   }
 });
 
-test('a pre-retention artifact stops being exempt the moment any optional key appears on it', async () => {
+test('a pre-retention artifact stops being exempt the moment a responseEnvelope KEY appears — and only then', async () => {
   // The exemption is not "old file, never mind": it is a claim the whole artifact has to
-  // support. One modern key anywhere makes the file a retaining-era artifact, and then
-  // every received leg owes a body. Each of the four keys is checked on its own, so no
-  // single one carries the classification.
+  // support, and ONE envelope key anywhere makes the file a retaining-era artifact, after
+  // which every received leg owes a body. An explicit `null` counts — that is a key a
+  // retaining build wrote, and reading it as "absent" is the downgrade the rule refuses.
+  //
+  // The other three optional keys deliberately do NOT flip it, and that half is not a
+  // gap: it is what stops an artifact from the build BEFORE this one — which wrote those
+  // three and no envelope — from being refused. See the intermediate-build case below
+  // for what that refusal would have cost.
   const raw = rawOf(await mixedFire());
   for (const attempt of everyAttempt(raw)) for (const key of OPTIONAL_KEYS) delete attempt[key];
   recomputeAllArmDigests(raw);
   assert.equal(isCoherentPreRetentionFireArtifact(reparse(raw)), true, 'the starting point is exempt');
-  for (const key of OPTIONAL_KEYS) {
+
+  const withKey = (key: string): FireArtifactV1 => {
     const edited = JSON.parse(JSON.stringify(raw)) as RawFire;
-    const attempt = (edited['arms'] as RawFire[])[0]!['orderedAttempts'][0]!;
-    attempt[key] = null;
+    (edited['arms'] as RawFire[])[0]!['orderedAttempts'][0]![key] = null;
     recomputeAllArmDigests(edited);
-    const parsed = reparse(edited);
-    assert.equal(isCoherentPreRetentionFireArtifact(parsed), false, `${key} places the file in the retaining era`);
-    assert.ok(has(verifyFireArtifactReplay(parsed), NO_ENVELOPE), `${key}: the file is now enforced`);
+    return reparse(edited);
+  };
+
+  const flipped = withKey('responseEnvelope');
+  assert.equal(isCoherentPreRetentionFireArtifact(flipped), false, 'one envelope key places the file in the retaining era');
+  assert.ok(has(verifyFireArtifactReplay(flipped), NO_ENVELOPE), 'and the file is now enforced');
+
+  for (const key of PRE_ENVELOPE_OPTIONAL_KEYS) {
+    const parsed = withKey(key);
+    assert.equal(isCoherentPreRetentionFireArtifact(parsed), true, `${key} alone does not place the file in the retaining era`);
+    assert.deepEqual(verifyFireArtifactReplay(parsed), [], `${key}: still replays clean`);
   }
+});
+
+test('an INTERMEDIATE-BUILD artifact — the three older optional keys, no envelope — parses, is exempt, and replays clean', async () => {
+  // THE OPERATIONAL CASE, and the reason the exemption clause reads one key rather than
+  // four. The build between 68dfc6e (2026-08-07) and envelope retention wrote
+  // `searchAudit`, `providerStopReason` and `turnCompleted` on every attempt and no
+  // `responseEnvelope`. Under a four-field clause every artifact it produced would be
+  // enforced and therefore refused — and on the live campaign path that is not a write
+  // refusal: `verifySpendEvidence` replays every installed artifact whose spend sidecar
+  // claims a clean pass, so ONE such artifact already under a cohort's evidence root
+  // turns every later tick's evidence scan into an `unverified_evidence` latch cause,
+  // whose documented recovery is `campaign:stop` — and a cohort is armed at most once,
+  // ever. Deploying a retaining build mid-campaign would have ended that campaign.
+  const raw = rawOf(await mixedFire());
+  for (const attempt of everyAttempt(raw)) delete attempt['responseEnvelope'];
+  recomputeAllArmDigests(raw);
+  const parsed = reparse(raw);
+
+  // Fixture reach (rule 3b-reach): this really is the intermediate shape — the three
+  // older keys present on every attempt, the envelope key absent — and not a
+  // pre-retention artifact wearing its name, which would pass for a different reason.
+  for (const attempt of everyAttempt(JSON.parse(JSON.stringify(parsed)) as RawFire)) {
+    for (const key of PRE_ENVELOPE_OPTIONAL_KEYS) {
+      assert.ok(Object.hasOwn(attempt, key), `the intermediate shape carries ${key}`);
+    }
+    assert.equal(Object.hasOwn(attempt, 'responseEnvelope'), false, 'and no envelope key');
+  }
+  assert.ok(everyAttempt(raw).some((a) => a['transport'] === 'ok'), 'and at least one leg received a response');
+
+  assert.equal(isCoherentPreRetentionFireArtifact(parsed), true);
+  assert.deepEqual(verifyFireArtifactEnvelopes(parsed), []);
+  assert.deepEqual(verifyFireArtifactReplay(parsed), []);
+});
+
+test('BOUND: on an unreadable-2xx leg the retained body is erasable with two field edits', async () => {
+  // What the calibrated claim in `attemptReceivedResponse` costs, measured rather than
+  // asserted. Four carriers exist, but not on every leg: a 2xx whose body the extractor
+  // could not read persists with answer text, reported model id and `ok` transport all
+  // absent, so the numeric status stands alone — and that leg class is precisely the one
+  // #92 exists to preserve.
+  const raw = rawOf(await unreadableFire());
+  assert.ok(JSON.stringify(raw).includes(UNREADABLE_BODY_MARKER), 'the produced fire retained the body');
+
+  const envelopeOnly = JSON.parse(JSON.stringify(raw)) as RawFire;
+  delete unreadableLeg(envelopeOnly)['responseEnvelope'];
+  recomputeAllArmDigests(envelopeOnly);
+  assert.ok(
+    has(verifyFireArtifactReplay(reparse(envelopeOnly)), NO_ENVELOPE),
+    'deleting the body alone is caught — the status carrier is load-bearing',
+  );
+
+  const bothEdits = JSON.parse(JSON.stringify(raw)) as RawFire;
+  const leg = unreadableLeg(bothEdits);
+  delete leg['responseEnvelope'];
+  leg['httpStatus'] = null;
+  recomputeAllArmDigests(bothEdits);
+  const parsed = reparse(bothEdits);
+  assert.deepEqual(verifyFireArtifactReplay(parsed), [], 'nulling the one remaining carrier as well verifies clean');
+  assert.ok(
+    !JSON.stringify(parsed).includes(UNREADABLE_BODY_MARKER),
+    'and the retained body really is gone from the artifact — this is the loss the bound names',
+  );
 });
