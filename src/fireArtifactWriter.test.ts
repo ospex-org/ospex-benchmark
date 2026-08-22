@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { canonicalize, sha256Hex } from './canonical.js';
@@ -448,18 +448,25 @@ async function withEnvAsync<T>(name: string, value: string | undefined, fn: () =
   }
 }
 
+/** Every `fire-*.json` under a fire-artifact output root, laid out the way the runner
+ *  lays one out: one directory per fire, the artifact inside it. Taken as a parameter
+ *  so the hermetic corpus below walks a temp root through THIS function rather than a
+ *  parallel copy of it — one discovery path, two callers. */
+function fireArtifactsUnder(root: string): string[] {
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .flatMap((entry) =>
+      readdirSync(join(root, entry.name))
+        .filter((name) => name.startsWith('fire-') && name.endsWith('.json'))
+        .map((name) => join(root, entry.name, name)),
+    );
+}
+
 /** The fire artifacts this machine has actually written. `.fire-artifacts/` is
  *  gitignored, so this is local evidence and may legitimately be empty elsewhere. */
 function archivedFireArtifacts(): string[] {
-  const base = fileURLToPath(new URL('../.fire-artifacts', import.meta.url));
-  if (!existsSync(base)) return [];
-  return readdirSync(base, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .flatMap((entry) =>
-      readdirSync(join(base, entry.name))
-        .filter((name) => name.startsWith('fire-') && name.endsWith('.json'))
-        .map((name) => join(base, entry.name, name)),
-    );
+  return fireArtifactsUnder(fileURLToPath(new URL('../.fire-artifacts', import.meta.url)));
 }
 
 // --- happy path -------------------------------------------------------------
@@ -1219,44 +1226,283 @@ test('a PRE-RETENTION artifact — no optional attempt key anywhere — parses, 
   }
 });
 
-test('every fire artifact already written to .fire-artifacts/ still replays clean', (t) => {
-  // The local half: the real files this machine produced before any of the optional
-  // attempt fields existed. The directory is gitignored, so an empty one is "nothing to
-  // check here" rather than a failure — the property itself is pinned by the
-  // reconstructed case above, which runs everywhere.
+/**
+ * The era a persisted artifact is FROM, decided from the artifact rather than assumed.
+ * `pre-retention` is the shape written before envelope retention existed; `retaining`
+ * is what a build carrying #92 writes. Both are legitimate on disk at the same time,
+ * which is the whole point of classifying instead of asserting one.
+ */
+type FireArtifactEra = 'pre-retention' | 'retaining';
+
+type ArtifactVerdict =
+  | { readonly kind: 'unparseable'; readonly detail: string }
+  | {
+      readonly kind: 'checked';
+      readonly era: FireArtifactEra;
+      /** Everything the PRODUCTION verifiers say about this file, listed once:
+       *  `verifyFireArtifactReplay` already contains `verifyFireArtifactEnvelopes`, so
+       *  concatenating the two would report every envelope finding twice. */
+      readonly violations: readonly string[];
+      /** The era-aware envelope rule on its own. A subset of `violations` by
+       *  construction, kept as its own field so the property has an assertion that names
+       *  it rather than being carried implicitly by the full replay. */
+      readonly envelopeViolations: readonly string[];
+      /** What the era-specific structural clause BELOW says. Kept in its own array, and
+       *  worded so it shares no phrase with the production messages, because a corpus row
+       *  asserting "the verifier catches this" must not be satisfiable by this file's own
+       *  restatement of the same property (rule 3c). Measured: with both in one array and
+       *  the wording shared, deleting the presence rule from `verifyFireArtifactEnvelopes`
+       *  left the tampered row green. */
+      readonly eraFindings: readonly string[];
+    };
+
+/**
+ * Inspect one persisted artifact's BYTES the way a reader of `.fire-artifacts/` has to:
+ * with no advance knowledge of which build wrote it.
+ *
+ * Two tiers, and the split is the fix for what this used to do — it asserted the
+ * pre-retention era unconditionally, which was true of the three files archived on one
+ * machine and false of every artifact the current build writes.
+ *
+ *  1. TRUE OF EVERY ERA: it parses, it replays clean, the envelope rule FOR ITS OWN ERA
+ *     is satisfied, and every `armDigest` recomputes byte-identically. The digest
+ *     recomputation is restated here rather than left to `recomputeFireArtifactDigests`
+ *     because the property being pinned is that a domain which gained an optional field
+ *     still digests to the SAME bytes for a file that predates it.
+ *  2. TRUE OF THE ERA IT IS ACTUALLY FROM: a pre-retention artifact carries the envelope
+ *     KEY on no attempt (key-absent, which is the exemption's whole basis — an explicit
+ *     `null` is a retaining build's write); a retaining-era artifact carries a retained
+ *     envelope on every leg that transported `ok`.
+ *
+ * The bound on that last clause, stated rather than implied: `transport === 'ok'` is a
+ * SUFFICIENT reading of "this leg received a response", not the complete one — a 2xx the
+ * extractor could not read also received one and does not transport `ok`. The complete
+ * predicate lives in `verifyFireArtifactEnvelopes`, which tier 1 already requires to be
+ * empty; this clause exists so the retaining branch fails on its own if that verifier is
+ * ever waived for the wrong file.
+ */
+function inspectFireArtifactBytes(bytes: string): ArtifactVerdict {
+  let parsed: FireArtifactV1;
+  try {
+    parsed = parseFireArtifactV1(bytes);
+  } catch (error) {
+    return { kind: 'unparseable', detail: error instanceof Error ? error.message : String(error) };
+  }
+  const era: FireArtifactEra = isCoherentPreRetentionFireArtifact(parsed) ? 'pre-retention' : 'retaining';
+  const envelopeViolations = verifyFireArtifactEnvelopes(parsed);
+  const violations: string[] = [...verifyFireArtifactReplay(parsed)];
+
+  for (const arm of parsed.arms) {
+    const recomputed = armDigest({
+      cohortId: parsed.cohortId,
+      fireId: parsed.fireId,
+      runId: parsed.runId,
+      participantId: arm.expectedArmIdentity.participantId,
+      requestSha256: parsed.requestSha256,
+      expectedArmIdentity: arm.expectedArmIdentity,
+      orderedAttempts: arm.orderedAttempts,
+      terminalOutcome: arm.terminalOutcome,
+      acceptedResponseDigestOrNull: arm.acceptedResponseDigest,
+      acceptedDecisionFingerprintOrNull: arm.acceptedDecisionFingerprint,
+    });
+    if (recomputed !== arm.armDigest) {
+      violations.push(`arm ${arm.expectedArmIdentity.participantId} armDigest does not recompute byte-identically`);
+    }
+  }
+
+  // Read the attempts back as raw JSON, because the era distinction is key-ABSENT vs
+  // key-present-and-null and a typed read cannot see the difference.
+  const eraFindings: string[] = [];
+  for (const arm of JSON.parse(bytes)['arms'] as RawFire[]) {
+    const who = arm['expectedArmIdentity'].participantId;
+    for (const attempt of arm['orderedAttempts'] as RawFire[]) {
+      const where = `arm ${who} attempt ${attempt['attemptNumber']}`;
+      if (era === 'pre-retention') {
+        if (Object.hasOwn(attempt, 'responseEnvelope')) {
+          eraFindings.push(`${where}: read as pre-retention, and the envelope key is present`);
+        }
+      } else if (attempt['transport'] === 'ok' && attempt['responseEnvelope'] == null) {
+        eraFindings.push(`${where}: an ok-transport leg of a retaining-era file holds no envelope object`);
+      }
+    }
+  }
+
+  return { kind: 'checked', era, violations, envelopeViolations, eraFindings };
+}
+
+test('every fire artifact already written to .fire-artifacts/ still replays clean, whatever era wrote it', (t) => {
+  // The local half: the real files this machine has produced. It spans TWO eras now —
+  // artifacts written before any of the optional attempt fields existed, and artifacts
+  // the current build writes with a retained envelope on every received leg — so the
+  // per-file check classifies rather than assuming. The directory is gitignored, so an
+  // empty one is "nothing to check here" rather than a failure, and CI's is always
+  // empty: the mixed-era corpus below is what carries this property everywhere.
   const files = archivedFireArtifacts();
   if (files.length === 0) {
-    t.diagnostic('no archived fire artifacts on this machine — the reconstructed pre-retention case covers the property');
+    t.diagnostic('no archived fire artifacts on this machine — the hermetic mixed-era corpus covers the property');
     return;
   }
   for (const file of files) {
-    const parsed = parseFireArtifactV1(readFileSync(file, 'utf8'));
-    assert.ok(
-      isCoherentPreRetentionFireArtifact(parsed),
-      `${file}: carries none of the optional attempt fields, so it predates retention`,
-    );
-    assert.deepEqual(verifyFireArtifactEnvelopes(parsed), [], `${file}: exempt, not enforced`);
-    assert.deepEqual(verifyFireArtifactReplay(parsed), [], `${file}: replays clean`);
-    // And the digests recompute BYTE-IDENTICALLY over a domain that now has one more
-    // optional field: an absent key contributes nothing to `canonicalize`.
-    for (const arm of parsed.arms) {
-      assert.equal(
-        armDigest({
-          cohortId: parsed.cohortId,
-          fireId: parsed.fireId,
-          runId: parsed.runId,
-          participantId: arm.expectedArmIdentity.participantId,
-          requestSha256: parsed.requestSha256,
-          expectedArmIdentity: arm.expectedArmIdentity,
-          orderedAttempts: arm.orderedAttempts,
-          terminalOutcome: arm.terminalOutcome,
-          acceptedResponseDigestOrNull: arm.acceptedResponseDigest,
-          acceptedDecisionFingerprintOrNull: arm.acceptedDecisionFingerprint,
-        }),
-        arm.armDigest,
-        `${file}: ${arm.expectedArmIdentity.participantId} armDigest is unchanged by the new field`,
-      );
+    const verdict = inspectFireArtifactBytes(readFileSync(file, 'utf8'));
+    assert.equal(verdict.kind, 'checked', `${file}: must parse — ${verdict.kind === 'unparseable' ? verdict.detail : ''}`);
+    assert.ok(verdict.kind === 'checked');
+    // The corpus this run actually covered, so a reader of the output can see which eras
+    // were present rather than inferring them from a count of green assertions.
+    t.diagnostic(`${basename(dirname(file))}/${basename(file)}: ${verdict.era}`);
+    assert.deepEqual(verdict.violations, [], `${file}: replays clean, and its arm digests recompute`);
+    assert.deepEqual(verdict.envelopeViolations, [], `${file}: satisfies the envelope rule for the ${verdict.era} era`);
+    assert.deepEqual(verdict.eraFindings, [], `${file}: consistent with the ${verdict.era} era it was read as`);
+  }
+});
+
+/** What a reader of the corpus directory must conclude about one file in it. */
+type CorpusExpectation =
+  | { readonly outcome: 'clean'; readonly era: FireArtifactEra }
+  | { readonly outcome: 'violations'; readonly needles: readonly string[] }
+  | { readonly outcome: 'unparseable' };
+
+interface CorpusFile {
+  /** Directory name AND file stem, so a failure message names the row it came from. */
+  readonly slug: string;
+  readonly bytes: string;
+  readonly expect: CorpusExpectation;
+}
+
+/** The deletion-table row with this name, so the corpus's tampered shapes ARE the
+ *  branch's tampered shapes: change a row's edit and the corpus changes with it, and
+ *  delete a row and this fails loudly rather than silently covering less. */
+function deletionRow(name: string): DeletionRow {
+  const row = DELETION_TABLE.find((r) => r.name === name);
+  assert.ok(row !== undefined, `the deletion table must still carry the row "${name}"`);
+  return row;
+}
+
+/** Apply one deletion-table row to a copy of `base`, and take the outcome the corpus
+ *  requires FROM THE ROW rather than restating it — two copies of a needle drift. */
+function corpusFromDeletionRow(slug: string, base: RawFire, name: string): CorpusFile {
+  const row = deletionRow(name);
+  assert.ok(row.expect !== 'CLEAN', `${name}: a row the table declares CLEAN cannot serve as a tampered corpus file`);
+  const raw = JSON.parse(JSON.stringify(base)) as RawFire;
+  row.edit(raw);
+  return {
+    slug,
+    bytes: JSON.stringify(raw),
+    expect: row.expect === 'PARSE_THROWS' ? { outcome: 'unparseable' } : { outcome: 'violations', needles: row.expect },
+  };
+}
+
+test('a HERMETIC mixed-era corpus verifies both eras and still refuses malformed or tampered files', async () => {
+  // THE PART THAT RUNS EVERYWHERE. `.fire-artifacts/` is gitignored, so CI's is empty and
+  // the scan above has never executed a single assertion there. This builds its own
+  // two-era directory in a temp root, walks it with the SAME `fireArtifactsUnder`, and
+  // requires each file to reach the verdict it was built to reach — including the ones
+  // that must FAIL, because a corpus check that accepts everything is worse than none.
+  const artifact = await mixedFire();
+  const mixedBase = rawOf(artifact);
+
+  // --- the pre-retention era, reconstructed from a real produced artifact ------
+  const preRetention = JSON.parse(JSON.stringify(mixedBase)) as RawFire;
+  for (const attempt of everyAttempt(preRetention)) for (const key of OPTIONAL_KEYS) delete attempt[key];
+  recomputeAllArmDigests(preRetention);
+  // Fixture discipline, asserted INLINE so a later edit cannot quietly un-discriminate
+  // this row: the envelope key must be ABSENT, not null. An explicit null is what a
+  // retaining build writes, and reading it as "absent" is the downgrade the rule refuses.
+  for (const attempt of everyAttempt(preRetention)) {
+    assert.equal(Object.hasOwn(attempt, 'responseEnvelope'), false, 'the pre-retention row carries no envelope KEY');
+  }
+  assert.ok(
+    everyAttempt(preRetention).some((a) => a['transport'] === 'ok'),
+    'and it has a leg that received a response, or its exemption is vacuous',
+  );
+
+  // --- the retaining era, as the PRODUCTION WRITER emits it -------------------
+  // Written through `writeFireArtifactV1` rather than hand-serialized, so this row is
+  // bytes the shipped write path actually produces (rule 2).
+  const retaining = everyAttempt(mixedBase);
+  const received = retaining.filter((a) => a['transport'] === 'ok');
+  const silent = retaining.filter((a) => a['transport'] !== 'ok');
+  assert.ok(received.length >= 2, 'the retaining row has legs that received a response');
+  for (const leg of received) assert.ok(leg['responseEnvelope'] != null, 'each of which retained an envelope');
+  assert.ok(silent.length >= 1, 'and at least one leg where nothing came back');
+  for (const leg of silent) assert.equal(leg['responseEnvelope'], null, 'which retained none');
+
+  const corpus: readonly CorpusFile[] = [
+    { slug: 'era-pre-retention', bytes: JSON.stringify(preRetention), expect: { outcome: 'clean', era: 'pre-retention' } },
+    { slug: 'era-retaining', bytes: serializeFireArtifactV1(artifact), expect: { outcome: 'clean', era: 'retaining' } },
+    // Tampered: the envelope removed from a leg that DID receive a response, with every
+    // arm digest forged — without the forgery it would fail on the digest instead and
+    // prove nothing about the presence rule (rule 3b).
+    corpusFromDeletionRow('tampered-envelope-deleted', mixedBase, 'delete the envelope from one received leg AND forge that arm digest'),
+    // Tampered: a rewritten body re-sealed with a fresh sha256 and forged digests.
+    corpusFromDeletionRow('tampered-body-resealed', mixedBase, 'edit the retained body and forge its sha256 but not its byte length'),
+    // Structurally invalid: a required field gone, so it never reaches any rule.
+    corpusFromDeletionRow(
+      'malformed-schema',
+      mixedBase,
+      'delete the httpStatus KEY — required by the strict schema, so it never reaches the rule',
+    ),
+    // Malformed bytes: truncated mid-object, which no schema is even consulted for.
+    { slug: 'malformed-bytes', bytes: serializeFireArtifactV1(artifact).slice(0, 4_096), expect: { outcome: 'unparseable' } },
+  ];
+
+  // And the truncation really truncates: a slice longer than the artifact would leave a
+  // VALID file behind a row that expects an unparseable one.
+  const truncated = corpus.find((f) => f.slug === 'malformed-bytes')!;
+  assert.ok(truncated.bytes.length < serializeFireArtifactV1(artifact).length, 'the malformed row is genuinely cut short');
+
+  const root = mkdtempSync(join(tmpdir(), 'ospex-fire-corpus-'));
+  try {
+    const expectedPaths: string[] = [];
+    for (const file of corpus) {
+      const target = join(root, file.slug, `fire-${file.slug}.json`);
+      expectedPaths.push(target);
+      if (file.slug === 'era-retaining') {
+        writeFireArtifactV1(target, artifact); // the real write path, refusal and all
+        assert.equal(readFileSync(target, 'utf8'), file.bytes, 'the writer emitted the bytes this row claims');
+      } else {
+        mkdirSync(dirname(target), { recursive: true });
+        writeFileSync(target, file.bytes, 'utf8');
+      }
     }
+
+    const discovered = fireArtifactsUnder(root);
+    assert.deepEqual([...discovered].sort(), [...expectedPaths].sort(), 'the walker discovers exactly the corpus');
+
+    const eras: FireArtifactEra[] = [];
+    for (const file of corpus) {
+      const target = join(root, file.slug, `fire-${file.slug}.json`);
+      const verdict = inspectFireArtifactBytes(readFileSync(target, 'utf8'));
+      if (file.expect.outcome === 'unparseable') {
+        assert.equal(verdict.kind, 'unparseable', `${file.slug}: must fail to parse at all`);
+        continue;
+      }
+      assert.equal(verdict.kind, 'checked', `${file.slug}: must parse`);
+      assert.ok(verdict.kind === 'checked');
+      if (file.expect.outcome === 'clean') {
+        assert.deepEqual(verdict.violations, [], `${file.slug}: must verify clean`);
+        assert.deepEqual(verdict.envelopeViolations, [], `${file.slug}: and satisfy the envelope rule for its own era`);
+        assert.deepEqual(verdict.eraFindings, [], `${file.slug}: and be consistent with the era it is read as`);
+        assert.equal(verdict.era, file.expect.era, `${file.slug}: must be read as a ${file.expect.era} artifact`);
+        eras.push(verdict.era);
+        continue;
+      }
+      // Matched against the PRODUCTION violations alone. `eraFindings` also fires on the
+      // deleted-envelope row, and letting it count here would mean this row stayed green
+      // with the presence rule removed from the verifier — measured, not hypothetical.
+      assert.ok(verdict.violations.length > 0, `${file.slug}: the production verifiers must refuse it, and they returned nothing`);
+      for (const needle of file.expect.needles) {
+        assert.ok(
+          has([...verdict.violations], needle),
+          `${file.slug}: expected a violation containing "${needle}", got ${JSON.stringify(verdict.violations)}`,
+        );
+      }
+    }
+    // The corpus really is MIXED: one file of each era passed, so neither branch of the
+    // era split went unexercised (which is how the unconditional assertion this replaces
+    // stayed green for as long as one machine's archive held only one era).
+    assert.deepEqual([...eras].sort(), ['pre-retention', 'retaining']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
