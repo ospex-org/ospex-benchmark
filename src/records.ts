@@ -219,12 +219,16 @@ export function buildRecords(
     slateCutoffAt: slate.cutoffAt,
     promptScaffoldVersion: PROMPT_SCAFFOLD_VERSION,
     promptScaffoldSha256: promptScaffoldSha256(),
-    // The EVIDENCE ERA this run was produced under. It says one thing: this
-    // build retains a complete provider response envelope on every attempt
-    // that reached a provider, so the scorer may REQUIRE one and fail closed
-    // when it is missing. A file without the stamp predates retention; its
-    // attempts are envelope-unavailable, and the scorer says so rather than
-    // reading absent evidence as "no search ran".
+    // The EVIDENCE ERA this run was produced under. It DECLARES that this build
+    // retains a complete provider response envelope on every attempt that
+    // received a response, and it names that era in a violation message.
+    //
+    // It is not a switch. The scorer requires an envelope by default and
+    // exempts only a file that reads as a coherent pre-retention archive as a
+    // whole (`isCoherentPreRetentionArchive`), so deleting this line from a
+    // written artifact does not make its missing envelopes acceptable — it is
+    // one of 2N+1 era markers and every one of them can only raise
+    // enforcement.
     evidenceEra: EVIDENCE_ERA,
     // Facts the SERVING PROJECTION freezes on its run row and then compares
     // against on every later write for that run. They are stamped here, into

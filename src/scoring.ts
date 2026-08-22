@@ -163,11 +163,11 @@ const runMetaSchema = z
     baselineDecisionCount: z.number().int().nonnegative(),
     baselinePolicyVersion: z.string().min(1).optional(),
     promptScaffoldVersion: z.string().min(1).optional(),
-    // The EVIDENCE ERA this run was produced under. Present means the writing
-    // build retained a complete response envelope on every attempt that
-    // reached a provider, so a missing one here is lost evidence and fails
-    // closed. Absent means the file predates retention: its attempts are
-    // ENVELOPE-UNAVAILABLE, reported as such rather than read as "nothing ran".
+    // The EVIDENCE ERA this run was produced under. It NAMES the era in a
+    // violation message and nothing more: its absence does not exempt a file
+    // from the envelope-presence rule, because it is one optional field and
+    // deleting it used to switch that rule off. Exemption is decided over the
+    // whole file by `isCoherentPreRetentionArchive`.
     //
     // Any non-empty value is treated as in force. A later era can only add to
     // what is retained, so a build that does not recognize the name still
@@ -265,8 +265,9 @@ const attemptFieldsSchema = z
     rawResponse: z.string().nullable().optional(),
     // The COMPLETE provider response body this answer was extracted from, with
     // the digest it was stored under. Absent on any file written before
-    // retention existed; verified whenever present, and REQUIRED on a run that
-    // stamps the evidence era (see verifyRunIntegrity).
+    // retention existed; verified whenever present, and REQUIRED on every leg
+    // that received a response unless the whole file reads as a pre-retention
+    // archive (see verifyRunIntegrity).
     responseEnvelope: responseEnvelopeSchema.nullable().optional(),
     // The HTTP status this leg settled on. Read as a RECEIPT: a 2xx says a body
     // arrived even when nothing identifying survived it, which is the one thing
@@ -575,9 +576,11 @@ export interface SourceRun {
    *  Selects the response-schema era the integrity checks re-validate under. */
   promptScaffoldVersion: string | null;
   /**
-   * The run's evidence-era stamp; `null` on a file written before provider
-   * response envelopes were retained. Non-null makes the envelope presence
-   * check binding for every attempt that reached a provider.
+   * The run's evidence-era stamp; `null` when run_meta carries none. It names
+   * the era in a violation message. It does NOT decide whether the
+   * envelope-presence check runs — see `isCoherentPreRetentionArchive`, which
+   * reads the whole file and can only be satisfied when this is null AND every
+   * leg is in the pre-#92 shape.
    */
   evidenceEra: string | null;
   /** Watch-mode gate provenance; required (and verified) for watch runs. */

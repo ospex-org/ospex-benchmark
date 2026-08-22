@@ -23,9 +23,11 @@ import type { JsonRecord } from './servingProjection.js';
  * agrees with the serializer by construction.
  *
  * The two rules under test are deliberately separate:
- *   - PRESENCE is gated on the run's evidence-era stamp, so an archived file is
- *     reported as envelope-unavailable rather than failed for a field that did
- *     not exist when it was written;
+ *   - PRESENCE is required by DEFAULT, and waived only for a file that reads as
+ *     a coherent pre-retention archive as a whole, so an archive is reported as
+ *     envelope-unavailable rather than failed for a field that did not exist
+ *     when it was written — and no single edit to a modern artifact buys that
+ *     waiver;
  *   - INTEGRITY is unconditional, so an envelope that is present and wrong is a
  *     violation in any era.
  */
@@ -145,7 +147,7 @@ test('the serializer keeps the answer and the envelope in their own fields', asy
 });
 
 // ---------------------------------------------------------------------------
-// the era-gated presence rule
+// the presence rule, and the one file shape that is exempt from it
 // ---------------------------------------------------------------------------
 
 test('an era-stamped run whose INITIAL envelope was dropped fails closed', async () => {
@@ -258,9 +260,10 @@ test('integrity is checked even with no era stamp — a present envelope is alwa
   // present envelope that does not reproduce its digest is a violation
   // whatever the run's era. Kept, because the measurement is worth having.
   //
-  // What it used to assert BESIDE that was the hole. It pinned "presence stays
-  // era-gated" as correct — factually right about the code and wrong about
-  // what the code bought, which is rule 3j exactly. The adversarial question:
+  // What it used to assert BESIDE that was the hole. It pinned, as correct,
+  // that deleting the run's era stamp also switched the presence requirement
+  // off — factually right about the code and wrong about what the code bought,
+  // which is rule 3j exactly. The adversarial question:
   // deleting one optional field from a modern artifact stripped every
   // retention guarantee from the run while it still verified clean. So the
   // consequence is asserted here now, next to the mechanism, and the probe
