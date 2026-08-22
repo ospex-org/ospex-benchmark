@@ -6,7 +6,12 @@ import {
   fingerprintFromParsed,
   validateResponseText,
 } from './schema.js';
-import { ProviderHttpError, ProviderTimeoutError, ProviderUnfinishedTurnError } from './providers/errors.js';
+import {
+  ProviderHttpError,
+  ProviderTimeoutError,
+  ProviderUnfinishedTurnError,
+  ProviderUnreadableResponseError,
+} from './providers/errors.js';
 import { redactSearchAudit } from './providers/searchAudit.js';
 import { assertPrepared, prepareGameRequest } from './preparedRequest.js';
 import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines.js';
@@ -410,7 +415,8 @@ async function timedChat(
     const detail =
       error instanceof ProviderHttpError ||
       error instanceof ProviderTimeoutError ||
-      error instanceof ProviderUnfinishedTurnError
+      error instanceof ProviderUnfinishedTurnError ||
+      error instanceof ProviderUnreadableResponseError
         ? error.message
         : describeError(error);
     const respondedAt = nowMs();
@@ -446,17 +452,29 @@ async function timedChat(
             providerStopReason: error.stopReason,
             turnCompleted: false,
           }
-        : {
-            httpStatus: error instanceof ProviderHttpError ? error.status : null,
-            // A 2xx whose body did not parse IS a received response, and
-            // `postJson` seals those bytes onto the error. Carrying them here
-            // is what makes the persisted leg evidence instead of a record
-            // indistinguishable from a call that never landed. Null on every
-            // other error path, where nothing was received or nothing is
-            // retained (see ProviderHttpError.responseEnvelope).
-            responseEnvelope:
-              error instanceof ProviderHttpError ? error.responseEnvelope : null,
-          };
+        : error instanceof ProviderUnreadableResponseError
+          ? {
+              // A 2xx whose JSON this build could not read is a received
+              // response like any other: the body arrived, `postJsonAndRead`
+              // sealed it before the read that threw, and both the status and
+              // the bytes are on the typed error. Without this branch the
+              // throw was untyped, so BOTH were dropped and the leg read as a
+              // call that never landed — with the sealed evidence already in
+              // hand.
+              httpStatus: error.httpStatus,
+              responseEnvelope: error.responseEnvelope,
+            }
+          : {
+              httpStatus: error instanceof ProviderHttpError ? error.status : null,
+              // A 2xx whose body is not JSON at all IS a received response,
+              // and the http layer seals those bytes onto the error. Carrying
+              // them here is what makes the persisted leg evidence instead of
+              // a record indistinguishable from a call that never landed. Null
+              // on every other error path, where nothing was received or
+              // nothing is retained (see ProviderHttpError.responseEnvelope).
+              responseEnvelope:
+                error instanceof ProviderHttpError ? error.responseEnvelope : null,
+            };
     return {
       ...emptyAttempt(),
       ...carried,

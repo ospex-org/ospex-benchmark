@@ -5,7 +5,11 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { sha256Hex, canonicalize } from '../canonical.js';
 import { writeNdjson } from '../records.js';
-import { ProviderHttpError, ProviderUnfinishedTurnError } from './errors.js';
+import {
+  ProviderHttpError,
+  ProviderUnfinishedTurnError,
+  ProviderUnreadableResponseError,
+} from './errors.js';
 import { createRealAdapters } from './index.js';
 import {
   archiveEraSignals,
@@ -842,16 +846,270 @@ test('a 2xx whose body drops MID-READ is a transport failure, not a receipt', as
   );
 });
 
-test('a 2xx whose JSON is NOT an object goes down the parseable path and retains too', async () => {
-  // The adjacent shape, and the reason the rule is stated as "every 2xx"
-  // rather than "every 2xx that fails to parse": a bare `42` parses, so it was
-  // ALREADY retained, by accident of what `JSON.parse` accepts. Uniform now,
-  // and pinned so the two halves cannot drift into different rules.
+test('a bare number retains too — and is NOT the case that discriminates this rule', async () => {
+  // The MECHANISM this case has always measured, and it is still worth having:
+  // a body that parses to a non-object goes down the parseable path and keeps
+  // its bytes, so "a 2xx retains its body" is not secretly "a 2xx that fails to
+  // parse retains its body".
+  //
+  // What it does NOT do is reach the defect that rule was claimed against, and
+  // saying so here is what stops the fixture being weakened back. JavaScript
+  // BOXES a primitive on property access, so `(42).stop_reason` is `undefined`
+  // rather than a throw; Anthropic's extractor then finds no terminal state and
+  // settles into `ProviderUnfinishedTurnError`, which carries its envelope by
+  // construction. A build with no guard at all around the extraction passes
+  // this case exactly as a guarded one does.
+  //
+  // `null` is the discriminating input, and the sweep below is where it lives:
+  // it is the ONE JSON value that throws on any property access, and `undefined`
+  // — the other value that would — cannot be written in JSON at all.
   const body = '  42  ';
   const error = await chatError(200, body);
-  // Anthropic's parser finds no `stop_reason` in a number, so this settles as
-  // an unfinished turn — a typed failure that carries its envelope.
   assert.ok(error instanceof ProviderUnfinishedTurnError, `got ${String(error)}`);
   assert.equal(error.responseEnvelope.body, body, 'the received bytes, spaces and all');
   assert.equal(error.responseEnvelope.sha256, sha256Hex(body));
+  // Stated rather than assumed: this fixture does not throw on the access the
+  // extractors make, so it cannot tell a guarded build from an unguarded one.
+  assert.equal((42 as unknown as { stop_reason?: unknown }).stop_reason, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// B2: a 2xx whose PARSE cannot be walked keeps its bytes and its status
+// ---------------------------------------------------------------------------
+
+/**
+ * The production registry's membership, as a LITERAL.
+ *
+ * The sweeps below take their adapter list from `createRealAdapters()`, so a
+ * fifth adapter is covered the moment it is added rather than when someone
+ * remembers to add a case. That direction is only half of it: a registry that
+ * SHRANK would make every sweep pass by having less to sweep, which is the
+ * enumeration trap one level up. So the expected side is written out here and
+ * is never derived from the registry.
+ */
+const REGISTRY_PARTICIPANTS = [
+  'anthropic-claude-fable-5',
+  'google-gemini-3.1-pro-preview',
+  'openai-gpt-5.6-sol',
+  'xai-grok-4.5',
+] as const;
+
+test('the production registry is exactly the arms the sweeps below expect', () => {
+  assert.deepEqual([...createRealAdapters().keys()].sort(), [...REGISTRY_PARTICIPANTS].sort());
+});
+
+/** Call one registry adapter against a canned 2xx, and report what came back
+ *  ALONGSIDE proof the call was actually made (rule 3b-reach: a setup failure
+ *  and a fast success are the same observation from the caller's side). */
+async function chatAgainst(
+  participantId: string,
+  status: number,
+  bodyText: string,
+): Promise<{ error: unknown; calls: number }> {
+  const adapter = registryAdapter(participantId);
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response(bodyText, { status });
+  }) as typeof fetch;
+  try {
+    const error = await withEnv(adapter.credentialEnvVar, SYNTHETIC_KEY, async () => {
+      try {
+        await adapter.chat(TURNS, 5_000, { maxOutputTokens: 16_000 });
+        return null;
+      } catch (thrown: unknown) {
+        return thrown;
+      }
+    });
+    return { error, calls };
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+/** The status and envelope a typed provider failure carries — the same three
+ *  cases the runner branches on, read here so a sweep can assert retention
+ *  without caring which typed class a shape happens to land in. */
+function receipt(error: unknown): {
+  status: number | null;
+  envelope: { body: string; sha256: string; bytes: number } | null;
+} {
+  if (error instanceof ProviderUnreadableResponseError) {
+    return { status: error.httpStatus, envelope: error.responseEnvelope };
+  }
+  if (error instanceof ProviderUnfinishedTurnError) {
+    return { status: error.httpStatus, envelope: error.responseEnvelope };
+  }
+  if (error instanceof ProviderHttpError) {
+    return { status: error.status, envelope: error.responseEnvelope };
+  }
+  return { status: null, envelope: null };
+}
+
+/**
+ * A 2xx body of literal `null`, over EVERY adapter the registry returns.
+ *
+ * `JSON.parse('null')` succeeds, so this body reaches an extractor as a
+ * successful parse and then throws on the first property access — the one
+ * shape where "the bytes were retained" and "the bytes survived to the runner"
+ * came apart. Measured before the fix, through the real registry adapters: a
+ * bare `TypeError` out of all four, and end to end a persisted leg with
+ * `httpStatus: null` and `responseEnvelope: null` that both readers called
+ * "nothing came back".
+ */
+for (const participantId of [...createRealAdapters().keys()]) {
+  test(`${participantId}: a 2xx body of literal null keeps its bytes and its status`, async () => {
+    const { error, calls } = await chatAgainst(participantId, 200, 'null');
+    assert.equal(calls, 1, 'the adapter really sent a request, so the case is not vacuous');
+    assert.ok(
+      error instanceof ProviderUnreadableResponseError,
+      `expected the typed unreadable-response failure, got ${String(error)}`,
+    );
+    assert.equal(error.httpStatus, 200, 'the status the body arrived with');
+    assert.equal(error.responseEnvelope.body, 'null', 'the received bytes, unaltered');
+    assert.equal(error.responseEnvelope.sha256, sha256Hex('null'));
+    assert.equal(error.responseEnvelope.bytes, Buffer.byteLength('null', 'utf8'));
+    assert.deepEqual(envelopeVerificationFailures(error.responseEnvelope), []);
+    // The three provider failure types are DISJOINT, and that is not a
+    // tautology pin. `classifyFailure` and the runner both branch on
+    // `instanceof ProviderHttpError`; a subclass would silently enrol every
+    // rule written for a failed HTTP exchange over legs whose exchange
+    // succeeded, and would take its nullable envelope with it.
+    assert.ok(
+      !(error instanceof ProviderHttpError),
+      'a 2xx whose shape could not be read is not a failed HTTP exchange',
+    );
+    assert.ok(
+      !(error instanceof ProviderUnfinishedTurnError),
+      'nor a turn whose provider declared it unfinished — nothing here read a terminal state',
+    );
+    // The status survives in prose as well as in the field, so a leg with no
+    // content still carries the receipt twice (see statusFromErrorDetail).
+    assert.equal(statusFromErrorDetail(error.message), 200, error.message);
+  });
+}
+
+/**
+ * Provider-specific NESTED shapes: a body that parses to an object whose
+ * expected member is null or the wrong type.
+ *
+ * These reach deeper than the top-level `null` — a `.filter()` callback, a
+ * `parts` element — which is exactly where a per-adapter fix would rot, since
+ * each provider walks its own path to its own field. The expected class per row
+ * is a LITERAL: some of these shapes settle as an unfinished turn today
+ * (`Array.isArray` refuses them before anything is dereferenced) and some throw,
+ * and writing down which is which is what makes a later adapter change that
+ * moves a row visible instead of silent.
+ *
+ * Every row asserts the same invariant whichever class it lands in: the leg
+ * keeps the received bytes and the 2xx it arrived with.
+ */
+const NESTED_SHAPES: Array<{
+  participantId: string;
+  body: string;
+  expected: 'unreadable' | 'unfinished';
+}> = [
+  // Responses API (openai + xai share this extractor, and both are swept).
+  { participantId: 'openai-gpt-5.6-sol', body: '{"output":null}', expected: 'unfinished' },
+  { participantId: 'openai-gpt-5.6-sol', body: '{"output":"not-an-array"}', expected: 'unfinished' },
+  { participantId: 'openai-gpt-5.6-sol', body: '{"output":[null]}', expected: 'unreadable' },
+  {
+    participantId: 'openai-gpt-5.6-sol',
+    body: '{"output":[{"type":"message","content":[null]}]}',
+    expected: 'unreadable',
+  },
+  {
+    // A body the provider says COMPLETED, so the extractor runs to the end and
+    // the terminal-state branch cannot catch it first (rule 3b).
+    participantId: 'openai-gpt-5.6-sol',
+    body: '{"status":"completed","output":[null]}',
+    expected: 'unreadable',
+  },
+  { participantId: 'xai-grok-4.5', body: '{"output":[null]}', expected: 'unreadable' },
+  {
+    participantId: 'xai-grok-4.5',
+    body: '{"status":"completed","output":[null]}',
+    expected: 'unreadable',
+  },
+  // Anthropic Messages.
+  { participantId: 'anthropic-claude-fable-5', body: '{"content":null}', expected: 'unfinished' },
+  {
+    participantId: 'anthropic-claude-fable-5',
+    body: '{"content":"not-an-array"}',
+    expected: 'unfinished',
+  },
+  { participantId: 'anthropic-claude-fable-5', body: '{"content":[null]}', expected: 'unreadable' },
+  {
+    participantId: 'anthropic-claude-fable-5',
+    body: '{"stop_reason":"end_turn","content":[null]}',
+    expected: 'unreadable',
+  },
+  // Google generateContent — one level deeper again, because the extractor
+  // reaches candidates[0].content.parts before it touches an element.
+  { participantId: 'google-gemini-3.1-pro-preview', body: '{"candidates":null}', expected: 'unfinished' },
+  {
+    participantId: 'google-gemini-3.1-pro-preview',
+    body: '{"candidates":"not-an-array"}',
+    expected: 'unfinished',
+  },
+  { participantId: 'google-gemini-3.1-pro-preview', body: '{"candidates":[null]}', expected: 'unfinished' },
+  {
+    participantId: 'google-gemini-3.1-pro-preview',
+    body: '{"candidates":[{"content":{"parts":[null]}}]}',
+    expected: 'unreadable',
+  },
+  {
+    participantId: 'google-gemini-3.1-pro-preview',
+    body: '{"candidates":[{"finishReason":"STOP","content":{"parts":[null]}}]}',
+    expected: 'unreadable',
+  },
+];
+
+test('the nested-shape table covers every registry adapter', () => {
+  // The table is written per provider, so it cannot be derived from the
+  // registry — which means it can fall behind it. This is the pairing check:
+  // every arm the registry returns has at least one nested row.
+  const covered = new Set(NESTED_SHAPES.map((row) => row.participantId));
+  assert.deepEqual([...covered].sort(), [...createRealAdapters().keys()].sort());
+});
+
+for (const row of NESTED_SHAPES) {
+  test(`${row.participantId}: a nested malformed shape keeps its bytes — ${row.body}`, async () => {
+    const { error, calls } = await chatAgainst(row.participantId, 200, row.body);
+    assert.equal(calls, 1, 'the adapter really sent a request');
+    if (row.expected === 'unreadable') {
+      assert.ok(
+        error instanceof ProviderUnreadableResponseError,
+        `expected the typed unreadable-response failure, got ${String(error)}`,
+      );
+    } else {
+      assert.ok(
+        error instanceof ProviderUnfinishedTurnError,
+        `expected the typed unfinished turn, got ${String(error)}`,
+      );
+    }
+    const kept = receipt(error);
+    assert.equal(kept.status, 200, 'the status the body arrived with');
+    assert.ok(kept.envelope !== null, 'and the bytes were kept');
+    assert.equal(kept.envelope.body, row.body, 'exactly as received');
+    assert.equal(kept.envelope.sha256, sha256Hex(row.body));
+    assert.deepEqual(envelopeVerificationFailures(kept.envelope), []);
+  });
+}
+
+test('a well-formed finished turn still RETURNS — the negative control for the guard', async () => {
+  // Rule 5. Every case above asserts a refusal, and a guard that converted
+  // every read into a typed failure would pass all of them. This is the same
+  // adapter, the same canned fetch, on a body its extractor can walk: it must
+  // come back as a response and not as an error at all.
+  const fixture = FINISHED_BODY['anthropic']!;
+  const { result } = await withEnv(fixture.env, SYNTHETIC_KEY, () =>
+    withCannedBody(fixture.body, () =>
+      registryAdapter(fixture.participantId).chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+    ),
+  );
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.responseEnvelope.body, fixture.body);
+  assert.equal(result.rawText, 'answer-anthropic');
 });

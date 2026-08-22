@@ -255,6 +255,16 @@ export interface FireOptions {
    * to both. The adapter must answer to the dispatched arm's participant id.
    */
   readonly adapter?: ProviderAdapter;
+  /**
+   * The per-call deadline handed to the adapter. Defaults to the 60s a real
+   * fire uses.
+   *
+   * A case that wants a GENUINE `ProviderTimeoutError` — raised by the real
+   * `postJsonAndRead` against a `fetch` that never settles, rather than by a
+   * stub rejecting with the type — sets this small. Faking the rejection would
+   * test the fixture; waiting out 60s would not be run.
+   */
+  readonly timeoutMs?: number;
 }
 
 export async function firedRun(options: FireOptions): Promise<FiredRun> {
@@ -299,7 +309,7 @@ export async function firedRun(options: FireOptions): Promise<FiredRun> {
     ]),
     approvedReportedModelIds: () => [arm.requestedModelId],
     outDir: options.outDir,
-    timeoutMs: 60_000,
+    timeoutMs: options.timeoutMs ?? 60_000,
     maxOutputTokens: 16000,
     mode: options.mode ?? 'live',
     clockMode: 'wall',

@@ -11,11 +11,13 @@ export class ProviderHttpError extends Error {
   readonly status: number;
 
   /**
-   * The complete received body, sealed — on the one path that has one: a 2xx
-   * whose body did not parse as JSON. Those bytes are the most likely place an
+   * The complete received body, sealed — on the one path this type has one: a
+   * 2xx whose bytes are not JSON at all. Those bytes are a likely place an
    * unrecognized provider shape shows up, and discarding them left a leg that
    * recorded nothing at all, indistinguishable downstream from a call that
-   * never landed.
+   * never landed. The sibling case — bytes that ARE JSON in a shape the
+   * extractor cannot walk — is `ProviderUnreadableResponseError`, whose
+   * envelope is non-nullable.
    *
    * `null` everywhere else, and deliberately so on a NON-2xx: a provider error
    * body is the likeliest place request content is echoed back, so that path
@@ -34,6 +36,61 @@ export class ProviderHttpError extends Error {
     this.name = 'ProviderHttpError';
     this.status = status;
     this.responseEnvelope = responseEnvelope;
+  }
+}
+
+/**
+ * A 2xx whose body ARRIVED and was sealed, and which this build's extractor
+ * could not walk: reading a field off the parse threw.
+ *
+ * The three provider failure types are disjoint, and the difference is what
+ * each one says about the response:
+ *
+ *  - `ProviderHttpError` — the HTTP exchange itself is the finding: a non-2xx
+ *    status, a transport failure (status 0), or a 2xx whose bytes are not JSON
+ *    at all. Its envelope is nullable, because most of those paths retain
+ *    nothing.
+ *  - `ProviderUnfinishedTurnError` — the body was read fine, and the
+ *    provider's OWN terminal-state field says the turn did not finish.
+ *  - this — the body is JSON, and the shape is not one the extractor of the
+ *    day knows how to read. `JSON.parse` accepts values that are not objects,
+ *    and `null` is the one of them that throws on any property access; a
+ *    non-object element inside an expected array does the same one level down.
+ *
+ * The distinction is not cosmetic. Before this type existed such a body raised
+ * a bare `TypeError`, which no branch in the runner recognized, so the SEALED
+ * envelope and the 2xx status were both discarded — and the persisted leg then
+ * read, to the scorer and to the offline replay alike, as a call that never
+ * landed. Retention is the whole point of #92 and that was the one 2xx shape
+ * where it silently did not happen.
+ *
+ * Both fields are REQUIRED and non-null here, unlike `ProviderHttpError`'s: on
+ * this path a body demonstrably arrived, so there is always a status to state
+ * and always bytes to keep. Deliberately NOT a subclass of `ProviderHttpError`
+ * — `classifyFailure` and the runner both branch on `instanceof
+ * ProviderHttpError`, and a subclass would enrol every rule written for a
+ * failed HTTP exchange over legs whose exchange succeeded.
+ *
+ * The message keeps the `<provider> returned HTTP <status>: <detail>` form
+ * that `statusFromErrorDetail` reads, so the leg states its status in prose as
+ * well as in its numeric field — the second receipt carrier, on a leg whose
+ * content fields are all null.
+ */
+export class ProviderUnreadableResponseError extends Error {
+  readonly httpStatus: number;
+  readonly responseEnvelope: ProviderResponseEnvelope;
+
+  /** `detail` must already be redacted/truncated by the caller. */
+  constructor(input: {
+    provider: string;
+    httpStatus: number;
+    detail: string;
+    responseEnvelope: ProviderResponseEnvelope;
+  }) {
+    super(`${input.provider} returned HTTP ${input.httpStatus}: ${input.detail}`);
+    this.name = 'ProviderUnreadableResponseError';
+    this.httpStatus = input.httpStatus;
+    this.responseEnvelope = input.responseEnvelope;
   }
 }
 

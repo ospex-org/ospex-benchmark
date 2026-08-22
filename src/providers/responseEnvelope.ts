@@ -161,9 +161,12 @@ export interface ReceiptSignals {
  * The status a leg's own `errorDetail` says it settled on, or `null` when the
  * text does not name one.
  *
- * `ProviderHttpError`'s message is `<provider> returned HTTP <status>: <detail>`
- * and the runner stores it verbatim (redacted), so the status survives in prose
- * beside the numeric field. ANCHORED at the start deliberately: the leading
+ * `ProviderHttpError` and `ProviderUnreadableResponseError` both build their
+ * message as `<provider> returned HTTP <status>: <detail>` and the runner
+ * stores it verbatim (redacted), so the status survives in prose beside the
+ * numeric field on every leg that got one — including the 2xx legs whose
+ * content fields are all null, which is where a second carrier is worth
+ * having. ANCHORED at the start deliberately: the leading
  * clause is this call's own status, while a later "returned HTTP 200" can only
  * be text a provider echoed back inside a detail, which describes some other
  * exchange.

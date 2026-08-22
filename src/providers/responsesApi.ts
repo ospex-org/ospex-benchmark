@@ -1,9 +1,8 @@
 import { envValue, redactAndTruncate } from '../config.js';
-import { postJson } from './http.js';
+import { postJsonAndRead } from './http.js';
 import { ProviderUnfinishedTurnError } from './errors.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractResponsesSearchAudit } from './searchAudit.js';
-import { sealResponseEnvelope } from './responseEnvelope.js';
 import { buildRequestPlan } from './requestPlan.js';
 import type { ProviderRequestPlan } from './requestPlan.js';
 import type {
@@ -110,95 +109,101 @@ export function createResponsesApiAdapter(config: ResponsesApiConfig): ProviderA
       if (apiKey === undefined) throw new Error(`${config.credentialEnvVar} is not set`);
       const plan = responsesApiRequestPlan({ config, turns, options });
       const url = plan.endpoint;
-      const { status, json: raw, bodyText } = await postJson({
-        provider: config.provider,
-        url,
-        headers: { authorization: `Bearer ${apiKey}` },
-        body: plan.body,
-        timeoutMs,
-      });
-      // The complete body, retained as received: every later re-extraction of
-      // this call's search audit reads THIS, not the normalized result below.
-      const responseEnvelope = sealResponseEnvelope(bodyText);
-      const json = raw as {
-        id?: unknown;
-        model?: unknown;
-        status?: unknown;
-        incomplete_details?: { reason?: unknown };
-        error?: { code?: unknown; message?: unknown };
-        output?: Array<{ type?: unknown; content?: Array<{ type?: unknown; text?: unknown }> }>;
-        usage?: { input_tokens?: unknown; output_tokens?: unknown; total_tokens?: unknown };
-      };
-
-      // The answer text: every `output_text` block of every `message` output
-      // item, in order (search-call items and annotations carry no answer text).
-      const rawText = Array.isArray(json.output)
-        ? json.output
-            .filter((item) => item.type === 'message' && Array.isArray(item.content))
-            .flatMap((item) => item.content ?? [])
-            .filter((block) => block.type === 'output_text' && typeof block.text === 'string')
-            .map((block) => block.text as string)
-            .join('')
-        : '';
-      const comparable = deriveComparableUsage(config.provider, json.usage ?? null);
-      const usage: ProviderUsage = {
-        inputTokens: typeof json.usage?.input_tokens === 'number' ? json.usage.input_tokens : null,
-        outputTokens:
-          typeof json.usage?.output_tokens === 'number' ? json.usage.output_tokens : null,
-        totalTokens: typeof json.usage?.total_tokens === 'number' ? json.usage.total_tokens : null,
-        reasoningTokens: comparable.reasoningTokens,
-        billableOutputTokens: comparable.billableOutputTokens,
-      };
-      // Recorded params mirror the wire exactly — they are derived from the
-      // body that was sent — so the evidence shows whether this attempt could
-      // search at all, and under which participant configuration.
-      const requestParams = plan.requestParams;
-
-      // Terminal state: the Responses API stamps a root `status`; only
-      // `completed` is a finished turn. `incomplete` (e.g. it hit
-      // max_output_tokens), `failed`, anything else, or a missing field is
-      // typed as an unfinished turn carrying the call's full evidence (status,
-      // ids, partial text, usage, audit), so a truncated or failed response is
-      // never scored as the model's invalid JSON — nor accepted as its answer.
-      const rootStatus = typeof json.status === 'string' ? json.status : 'missing';
-      if (rootStatus !== 'completed') {
-        const incompleteReason =
-          typeof json.incomplete_details?.reason === 'string' ? json.incomplete_details.reason : null;
-        const errorMessage =
-          typeof json.error?.message === 'string' ? redactAndTruncate(json.error.message, 300) : null;
-        const detail =
-          rootStatus === 'incomplete'
-            ? `the provider reported an incomplete response${incompleteReason === null ? '' : ` (${incompleteReason})`}`
-            : rootStatus === 'failed'
-              ? `the provider reported a failed response${errorMessage === null ? '' : `: ${errorMessage}`}`
-              : `the provider reported response status "${rootStatus}", not "completed"`;
-        throw new ProviderUnfinishedTurnError({
+      // Everything that READS the response runs inside `postJsonAndRead`, which
+      // owns the seal and the one try/catch that converts a shape this build
+      // cannot walk into a typed failure carrying the sealed bytes and the
+      // status. Dereferencing a cast parse outside it would put those bytes
+      // back at the mercy of an untyped throw.
+      return await postJsonAndRead(
+        {
           provider: config.provider,
-          stopReason: rootStatus,
-          detail,
-          httpStatus: status,
-          providerResponseId: typeof json.id === 'string' ? json.id : null,
-          reportedModelId: typeof json.model === 'string' ? json.model : null,
-          rawText,
-          responseEnvelope,
-          usage,
-          usageRaw: json.usage ?? null,
-          searchAudit: extractResponsesSearchAudit(raw),
-          requestParams,
-        });
-      }
+          url,
+          headers: { authorization: `Bearer ${apiKey}` },
+          body: plan.body,
+          timeoutMs,
+        },
+        ({ json: raw, status, responseEnvelope }): ProviderResponse => {
+          const json = raw as {
+            id?: unknown;
+            model?: unknown;
+            status?: unknown;
+            incomplete_details?: { reason?: unknown };
+            error?: { code?: unknown; message?: unknown };
+            output?: Array<{ type?: unknown; content?: Array<{ type?: unknown; text?: unknown }> }>;
+            usage?: { input_tokens?: unknown; output_tokens?: unknown; total_tokens?: unknown };
+          };
 
-      return {
-        rawText,
-        responseEnvelope,
-        reportedModelId: typeof json.model === 'string' ? json.model : null,
-        providerResponseId: typeof json.id === 'string' ? json.id : null,
-        httpStatus: status,
-        usage,
-        usageRaw: json.usage ?? null,
-        requestParams,
-        searchAudit: extractResponsesSearchAudit(raw),
-      };
+          // The answer text: every `output_text` block of every `message` output
+          // item, in order (search-call items and annotations carry no answer text).
+          const rawText = Array.isArray(json.output)
+            ? json.output
+                .filter((item) => item.type === 'message' && Array.isArray(item.content))
+                .flatMap((item) => item.content ?? [])
+                .filter((block) => block.type === 'output_text' && typeof block.text === 'string')
+                .map((block) => block.text as string)
+                .join('')
+            : '';
+          const comparable = deriveComparableUsage(config.provider, json.usage ?? null);
+          const usage: ProviderUsage = {
+            inputTokens: typeof json.usage?.input_tokens === 'number' ? json.usage.input_tokens : null,
+            outputTokens:
+              typeof json.usage?.output_tokens === 'number' ? json.usage.output_tokens : null,
+            totalTokens: typeof json.usage?.total_tokens === 'number' ? json.usage.total_tokens : null,
+            reasoningTokens: comparable.reasoningTokens,
+            billableOutputTokens: comparable.billableOutputTokens,
+          };
+          // Recorded params mirror the wire exactly — they are derived from the
+          // body that was sent — so the evidence shows whether this attempt could
+          // search at all, and under which participant configuration.
+          const requestParams = plan.requestParams;
+
+          // Terminal state: the Responses API stamps a root `status`; only
+          // `completed` is a finished turn. `incomplete` (e.g. it hit
+          // max_output_tokens), `failed`, anything else, or a missing field is
+          // typed as an unfinished turn carrying the call's full evidence (status,
+          // ids, partial text, usage, audit), so a truncated or failed response is
+          // never scored as the model's invalid JSON — nor accepted as its answer.
+          const rootStatus = typeof json.status === 'string' ? json.status : 'missing';
+          if (rootStatus !== 'completed') {
+            const incompleteReason =
+              typeof json.incomplete_details?.reason === 'string' ? json.incomplete_details.reason : null;
+            const errorMessage =
+              typeof json.error?.message === 'string' ? redactAndTruncate(json.error.message, 300) : null;
+            const detail =
+              rootStatus === 'incomplete'
+                ? `the provider reported an incomplete response${incompleteReason === null ? '' : ` (${incompleteReason})`}`
+                : rootStatus === 'failed'
+                  ? `the provider reported a failed response${errorMessage === null ? '' : `: ${errorMessage}`}`
+                  : `the provider reported response status "${rootStatus}", not "completed"`;
+            throw new ProviderUnfinishedTurnError({
+              provider: config.provider,
+              stopReason: rootStatus,
+              detail,
+              httpStatus: status,
+              providerResponseId: typeof json.id === 'string' ? json.id : null,
+              reportedModelId: typeof json.model === 'string' ? json.model : null,
+              rawText,
+              responseEnvelope,
+              usage,
+              usageRaw: json.usage ?? null,
+              searchAudit: extractResponsesSearchAudit(raw),
+              requestParams,
+            });
+          }
+
+          return {
+            rawText,
+            responseEnvelope,
+            reportedModelId: typeof json.model === 'string' ? json.model : null,
+            providerResponseId: typeof json.id === 'string' ? json.id : null,
+            httpStatus: status,
+            usage,
+            usageRaw: json.usage ?? null,
+            requestParams,
+            searchAudit: extractResponsesSearchAudit(raw),
+          };
+        },
+      );
     },
   };
 }

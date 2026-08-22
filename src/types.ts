@@ -331,9 +331,12 @@ export interface SearchAudit {
  * to the retained text is detectable; `bytes` is that same string's UTF-8
  * length (characters and bytes disagree on any non-ASCII body).
  *
- * Retained on EVERY 2xx, whether or not the body parses as JSON and whether or
- * not the parse is an object. Non-2xx bodies retain nothing and keep their
- * existing truncated error detail; see `postJson`.
+ * Retained on a 2xx WHATEVER THE BODY TURNED OUT TO BE. The bytes are sealed
+ * before any adapter reads the parse, and that read runs inside the one guard
+ * that converts a shape it cannot walk into a typed failure carrying this
+ * envelope and the status — so the retention does not depend on the extractor
+ * of the day recognizing what came back. Non-2xx bodies retain nothing and keep
+ * their existing truncated error detail; see `postJsonAndRead`.
  *
  * PRIVATE evidence. It stays in the run NDJSON under `out/` (gitignored), and
  * no row the serving projection builds carries the body — attempts, decisions
@@ -431,8 +434,9 @@ export interface AttemptRecord {
    * body was retained: unsent, timeout, transport failure, a body that dropped
    * MID-READ after the headers arrived (recorded as status 0, because a body
    * that was never read is not a receipt), or a non-2xx status (whose body is
-   * deliberately not kept — see `postJson`). A 2xx retains one whatever its
-   * body turned out to be, including a body that did not parse. Serialized as
+   * deliberately not kept — see `postJsonAndRead`). A 2xx retains one whatever
+   * its body turned out to be: bytes that are not JSON, and JSON in a shape
+   * this build's extractor cannot walk, both keep it. Serialized as
    * `responseEnvelope`, beside `answerText` — which holds the extracted answer
    * only.
    */

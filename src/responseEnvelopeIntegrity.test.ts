@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -7,7 +7,7 @@ import { sha256Hex } from './canonical.js';
 import { createRealAdapters } from './providers/index.js';
 import { EVIDENCE_ERA } from './providers/responseEnvelope.js';
 import { defaultExpectedArms, parseRunRecords, verifyRunIntegrity } from './scoring.js';
-import { replaySearchAudits } from './searchAuditReplay.js';
+import { replaySearchAudits, REPLAY_EXIT, runReplayMain } from './searchAuditReplay.js';
 import { projectRun, publishableRun } from './servingProjection.js';
 import { firedRun, UNPARSEABLE_2XX_BODY } from './servingTestRun.js';
 import { damageEnvelope, ENVELOPE_DAMAGE } from './testFactories.js';
@@ -76,27 +76,74 @@ const PROXY_HTML = '<!doctype html>\n  <html><body>upstream timeout</body></html
  * response, so nothing about redaction changes.
  */
 async function firedThroughRealAdapter(respond: () => Response): Promise<JsonRecord[]> {
+  return (await firedFileThroughRealAdapter({ fetch: async () => respond() })).records;
+}
+
+/**
+ * The same chain as `firedThroughRealAdapter`, returning the RUN FILE's own
+ * bytes beside the parsed records.
+ *
+ * The replay is a command with an exit code, and pointing it at the text the
+ * harness actually wrote is what makes "the tool does not call this leg
+ * unavailable" a statement about the tool rather than about a record built in
+ * memory. `fetch` is supplied whole rather than as a response factory, because
+ * a timeout case has to see the abort signal.
+ */
+async function firedFileThroughRealAdapter(options: {
+  fetch: typeof globalThis.fetch;
+  timeoutMs?: number;
+}): Promise<{ records: JsonRecord[]; runFileText: string }> {
   const adapter = createRealAdapters().get(FIRED_PARTICIPANT);
   assert.ok(adapter !== undefined, `the production registry has no adapter for ${FIRED_PARTICIPANT}`);
   const originalFetch = globalThis.fetch;
   const priorKey = process.env[adapter.credentialEnvVar];
   process.env[adapter.credentialEnvVar] = 'synthetic-test-credential';
-  globalThis.fetch = (async () => respond()) as typeof fetch;
+  globalThis.fetch = options.fetch;
   const dir = mkdtempSync(join(tmpdir(), 'envelope-real-adapter-'));
   try {
-    const run = await firedRun({ outDir: dir, enrolled: true, adapter, gameId: nextGameId() });
+    const run = await firedRun({
+      outDir: dir,
+      enrolled: true,
+      adapter,
+      gameId: nextGameId(),
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    });
     const records = run.records.map((record) => JSON.parse(JSON.stringify(record)) as JsonRecord);
     assert.ok(
       records.some((record) => record['recordType'] === 'arm_game_response'),
       'the fire produced an arm response, so the case is not vacuous',
     );
-    return records;
+    return { records, runFileText: readFileSync(run.runFile, 'utf8') };
   } finally {
     globalThis.fetch = originalFetch;
     if (priorKey === undefined) delete process.env[adapter.credentialEnvVar];
     else process.env[adapter.credentialEnvVar] = priorKey;
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** Run the replay COMMAND over one run file's text, and report its exit code
+ *  and the lines it printed. `exists`/`read` are injected, so no path outside
+ *  the fixture is consulted and nothing is left on disk. */
+function replayCommand(runFileText: string): { exit: number; output: string } {
+  const printed: string[] = [];
+  const exit = runReplayMain({
+    argv: ['run.ndjson'],
+    exists: (path) => path === 'run.ndjson',
+    read: (path) => {
+      assert.equal(path, 'run.ndjson', 'the command reads the file it was given');
+      return runFileText;
+    },
+    log: { line: (text) => printed.push(text), error: (text) => printed.push(text) },
+  });
+  return { exit, output: printed.join('\n') };
+}
+
+/** The two counts the replay's summary line states, read back out of it. */
+function replayedCounts(output: string): { replayed: number; unavailable: number } {
+  const match = /(\d+) replayed, (\d+) envelope-unavailable/.exec(output);
+  assert.ok(match !== null, `the replay printed no summary line: ${output}`);
+  return { replayed: Number(match[1]), unavailable: Number(match[2]) };
 }
 
 function lines(records: readonly JsonRecord[]): string[] {
@@ -701,6 +748,140 @@ test('a connection that DROPS mid-body leaves an untampered file that still scor
     [],
     'an untampered artifact from a dropped connection is still scoreable',
   );
+});
+
+// ---------------------------------------------------------------------------
+// a 2xx whose PARSE cannot be walked, end to end
+// ---------------------------------------------------------------------------
+
+/** `JSON.parse('null')` SUCCEEDS, so these bytes reach the extractor as a
+ *  parsed body and throw on the first property access. `undefined` is the only
+ *  other value that would, and JSON cannot express it — which is what makes
+ *  this the discriminating body rather than one of many. */
+const NULL_BODY = 'null';
+
+test('a 200 whose JSON no extractor can walk is retained END TO END, status and all', async () => {
+  // The whole chain is production: the real registry adapter builds the
+  // request, the real http layer seals the bytes and converts the throw, the
+  // real runner persists it, and the assertions read the NDJSON back off disk.
+  //
+  // Measured on this exact chain BEFORE the fix: outcome provider_error,
+  // httpStatus null, responseEnvelope null, 0 integrity violations, and the
+  // replay reporting the leg envelope-unavailable — a run that received a
+  // response keeping nothing, with both readers calling it "nothing came back".
+  const { records, runFileText } = await firedFileThroughRealAdapter({
+    fetch: async () => new Response(NULL_BODY, { status: 200 }),
+  });
+  const attempt = leg(records, 'attempt');
+  assert.equal(attempt['httpStatus'], 200, 'the status the body arrived with');
+  const envelope = attempt['responseEnvelope'] as { body: string; sha256: string; bytes: number };
+  assert.ok(envelope !== null && typeof envelope === 'object', 'the received bytes survived the chain');
+  assert.equal(envelope.body, NULL_BODY, 'byte-identical to what fetch returned');
+  assert.equal(envelope.sha256, sha256Hex(NULL_BODY));
+  assert.equal(envelope.bytes, Buffer.byteLength(NULL_BODY, 'utf8'));
+  // Nothing was extracted, so the status and the error prose are the only
+  // things saying a body arrived — which is what makes the retention
+  // load-bearing rather than decorative here.
+  assert.deepEqual(
+    ['answerText', 'reportedModelId', 'providerResponseId'].map((field) => attempt[field]),
+    [null, null, null],
+    'no content signal is left standing',
+  );
+  assert.match(String(attempt['errorDetail']), /^\S+ returned HTTP 200:/, 'the status is in prose too');
+
+  // The scorer reads the file as complete.
+  assert.deepEqual(violationsFor(records), [], 'the artifact scores clean');
+
+  // And the replay COMMAND does not call it unavailable — the word is reserved
+  // for a leg where nothing came back, and this leg is the opposite of that.
+  const report = replaySearchAudits(lines(records));
+  assert.equal(report.legs.length, 1);
+  assert.equal(report.legs[0]!.envelope, 'retained');
+  assert.equal(report.counts.unavailable, 0, 'a received response is never envelope-unavailable');
+  const command = replayCommand(runFileText);
+  assert.equal(command.exit, REPLAY_EXIT.ok, command.output);
+  // The COUNTS the operator reads, parsed out of the report rather than
+  // grepped for: the word "envelope-unavailable" is in the summary line
+  // whatever the number beside it, so a substring test would match the label
+  // that explains the count instead of the count.
+  assert.deepEqual(replayedCounts(command.output), { replayed: 1, unavailable: 0 }, command.output);
+});
+
+test('the retained 200 is load-bearing: strip it and the same file fails closed', async () => {
+  // The other half of the pair (rule 5 in the other direction): the case above
+  // asserts an ACCEPTANCE, and an integrity check that accepted everything
+  // would pass it. Each row here removes one carrier from the same leg and the
+  // refusal has to survive, because the leg's content fields are all null and
+  // only a status carrier can produce it.
+  const rows: Array<{ name: string; edit: (value: JsonRecord) => void; expected: number }> = [
+    { name: 'nothing edited: the file the harness wrote', edit: () => {}, expected: 0 },
+    {
+      name: 'delete the envelope only',
+      edit: (value) => {
+        delete value['responseEnvelope'];
+      },
+      expected: 1,
+    },
+    {
+      name: 'delete the envelope and NULL the numeric status — the prose still states it',
+      edit: (value) => {
+        delete value['responseEnvelope'];
+        value['httpStatus'] = null;
+      },
+      expected: 1,
+    },
+  ];
+  for (const row of rows) {
+    const { records } = await firedFileThroughRealAdapter({
+      fetch: async () => new Response(NULL_BODY, { status: 200 }),
+    });
+    const attempt = leg(records, 'attempt');
+    assert.deepEqual(
+      ['answerText', 'reportedModelId', 'providerResponseId'].map((field) => attempt[field]),
+      [null, null, null],
+      'no content signal is left standing, so only a status carrier can decide',
+    );
+    row.edit(attempt);
+    const missing = violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING));
+    assert.equal(missing.length, row.expected, `${row.name}: ${JSON.stringify(missing)}`);
+  }
+});
+
+test('a GENUINE timeout is still unavailable, and still exits 0 — the negative control', async () => {
+  // The word `unavailable` has to keep meaning "nothing came back", or the
+  // case above proves nothing: a build that called every leg `retained` would
+  // pass it. This is a real `ProviderTimeoutError` — the deadline in the real
+  // `postJsonAndRead` firing against a `fetch` that only ever settles on the
+  // abort signal — not a stub rejecting with the type.
+  const TIMEOUT_MS = 50;
+  const { records, runFileText } = await firedFileThroughRealAdapter({
+    timeoutMs: TIMEOUT_MS,
+    fetch: ((_input: unknown, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        });
+      })) as typeof globalThis.fetch,
+  });
+  const attempt = leg(records, 'attempt');
+  // The timeout really fired, sourced from the record rather than from the
+  // fixture's own expectation: this is what proves the case is the timeout
+  // path and not some earlier refusal wearing the same empty shape.
+  assert.match(String(attempt['errorDetail']), new RegExp(`call exceeded ${TIMEOUT_MS}ms`));
+  assert.equal(attempt['httpStatus'], null, 'no status was ever settled on');
+  assert.equal(attempt['responseEnvelope'], null, 'and nothing was retained, because nothing arrived');
+  assert.deepEqual(
+    violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING)),
+    [],
+    'a leg that received nothing owes no envelope',
+  );
+
+  const report = replaySearchAudits(lines(records));
+  assert.equal(report.legs.length, 1);
+  assert.equal(report.legs[0]!.envelope, 'unavailable', 'the honest word for a leg with nothing to read');
+  const command = replayCommand(runFileText);
+  assert.equal(command.exit, REPLAY_EXIT.ok, `a timeout must not move the exit code: ${command.output}`);
+  assert.deepEqual(replayedCounts(command.output), { replayed: 0, unavailable: 1 }, command.output);
 });
 
 // ---------------------------------------------------------------------------

@@ -1,10 +1,9 @@
 import { envValue } from '../config.js';
-import { postJson } from './http.js';
+import { postJsonAndRead } from './http.js';
 import { ProviderUnfinishedTurnError } from './errors.js';
 import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractAnthropicSearchAudit } from './searchAudit.js';
-import { sealResponseEnvelope } from './responseEnvelope.js';
 import { buildRequestPlan } from './requestPlan.js';
 import type { ProviderRequestPlan } from './requestPlan.js';
 import type {
@@ -79,89 +78,95 @@ export function createAnthropicAdapter(requestedModelId: string): ProviderAdapte
       const apiKey = envValue('ANTHROPIC_API_KEY');
       if (apiKey === undefined) throw new Error('ANTHROPIC_API_KEY is not set');
       const plan = anthropicRequestPlan({ requestedModelId, turns, options });
-      const { status, json: raw, bodyText } = await postJson({
-        provider: 'anthropic',
-        url: plan.endpoint,
-        headers: { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION },
-        body: plan.body,
-        timeoutMs,
-      });
-      // The complete body, retained as received: every later re-extraction of
-      // this call's search audit reads THIS, not the normalized result below.
-      const responseEnvelope = sealResponseEnvelope(bodyText);
-      const json = raw as {
-        id?: unknown;
-        model?: unknown;
-        stop_reason?: unknown;
-        content?: Array<{ type?: unknown; text?: unknown }>;
-        usage?: { input_tokens?: unknown; output_tokens?: unknown };
-      };
-
-      const text = Array.isArray(json.content)
-        ? json.content
-            .filter((block) => block.type === 'text' && typeof block.text === 'string')
-            .map((block) => block.text as string)
-            .join('')
-        : '';
-      const inputTokens =
-        typeof json.usage?.input_tokens === 'number' ? json.usage.input_tokens : null;
-      const outputTokens =
-        typeof json.usage?.output_tokens === 'number' ? json.usage.output_tokens : null;
-      const comparable = deriveComparableUsage('anthropic', json.usage ?? null);
-      const usage: ProviderUsage = {
-        inputTokens,
-        outputTokens,
-        totalTokens: inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null,
-        reasoningTokens: comparable.reasoningTokens,
-        billableOutputTokens: comparable.billableOutputTokens,
-      };
-
-      const requestParams = plan.requestParams;
-
-      // Terminal state: on the Messages API only `end_turn` and `stop_sequence`
-      // are a finished turn. Everything else — `pause_turn`, `refusal`,
-      // `max_tokens`, an unknown value, or a missing field — is HTTP 200 with
-      // empty or partial content. Surfacing those as a typed failure carrying
-      // the call's full evidence (status, ids, partial text, usage, audit)
-      // keeps a truncated or paused turn from reading downstream as a model
-      // that emitted invalid JSON.
-      const stopReason = typeof json.stop_reason === 'string' ? json.stop_reason : 'missing';
-      if (stopReason !== 'end_turn' && stopReason !== 'stop_sequence') {
-        const detail =
-          stopReason === 'pause_turn'
-            ? 'the server-side tool loop hit its iteration limit; continuation is not enabled (maxServerToolContinuations)'
-            : stopReason === 'refusal'
-              ? 'the request was declined by the provider safety classifiers'
-              : stopReason === 'max_tokens'
-                ? 'the response hit its max_tokens output cap before the turn finished'
-                : `the provider reported a non-final stop_reason "${stopReason}"`;
-        throw new ProviderUnfinishedTurnError({
+      // Everything that READS the response runs inside `postJsonAndRead`, which
+      // owns the seal and the one try/catch that converts a shape this build
+      // cannot walk into a typed failure carrying the sealed bytes and the
+      // status. Dereferencing a cast parse outside it would put those bytes
+      // back at the mercy of an untyped throw.
+      return await postJsonAndRead(
+        {
           provider: 'anthropic',
-          stopReason,
-          detail,
-          httpStatus: status,
-          providerResponseId: typeof json.id === 'string' ? json.id : null,
-          reportedModelId: typeof json.model === 'string' ? json.model : null,
-          rawText: text,
-          responseEnvelope,
-          usage,
-          usageRaw: json.usage ?? null,
-          searchAudit: extractAnthropicSearchAudit(raw),
-          requestParams,
-        });
-      }
+          url: plan.endpoint,
+          headers: { 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION },
+          body: plan.body,
+          timeoutMs,
+        },
+        ({ json: raw, status, responseEnvelope }): ProviderResponse => {
+          const json = raw as {
+            id?: unknown;
+            model?: unknown;
+            stop_reason?: unknown;
+            content?: Array<{ type?: unknown; text?: unknown }>;
+            usage?: { input_tokens?: unknown; output_tokens?: unknown };
+          };
 
-      return {
-        rawText: text,
-        responseEnvelope,
-        reportedModelId: typeof json.model === 'string' ? json.model : null,
-        providerResponseId: typeof json.id === 'string' ? json.id : null,
-        httpStatus: status,
-        usage,
-        usageRaw: json.usage ?? null,
-        requestParams,
-        searchAudit: extractAnthropicSearchAudit(raw),
-      };
+          const text = Array.isArray(json.content)
+            ? json.content
+                .filter((block) => block.type === 'text' && typeof block.text === 'string')
+                .map((block) => block.text as string)
+                .join('')
+            : '';
+          const inputTokens =
+            typeof json.usage?.input_tokens === 'number' ? json.usage.input_tokens : null;
+          const outputTokens =
+            typeof json.usage?.output_tokens === 'number' ? json.usage.output_tokens : null;
+          const comparable = deriveComparableUsage('anthropic', json.usage ?? null);
+          const usage: ProviderUsage = {
+            inputTokens,
+            outputTokens,
+            totalTokens: inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null,
+            reasoningTokens: comparable.reasoningTokens,
+            billableOutputTokens: comparable.billableOutputTokens,
+          };
+
+          const requestParams = plan.requestParams;
+
+          // Terminal state: on the Messages API only `end_turn` and `stop_sequence`
+          // are a finished turn. Everything else — `pause_turn`, `refusal`,
+          // `max_tokens`, an unknown value, or a missing field — is HTTP 200 with
+          // empty or partial content. Surfacing those as a typed failure carrying
+          // the call's full evidence (status, ids, partial text, usage, audit)
+          // keeps a truncated or paused turn from reading downstream as a model
+          // that emitted invalid JSON.
+          const stopReason = typeof json.stop_reason === 'string' ? json.stop_reason : 'missing';
+          if (stopReason !== 'end_turn' && stopReason !== 'stop_sequence') {
+            const detail =
+              stopReason === 'pause_turn'
+                ? 'the server-side tool loop hit its iteration limit; continuation is not enabled (maxServerToolContinuations)'
+                : stopReason === 'refusal'
+                  ? 'the request was declined by the provider safety classifiers'
+                  : stopReason === 'max_tokens'
+                    ? 'the response hit its max_tokens output cap before the turn finished'
+                    : `the provider reported a non-final stop_reason "${stopReason}"`;
+            throw new ProviderUnfinishedTurnError({
+              provider: 'anthropic',
+              stopReason,
+              detail,
+              httpStatus: status,
+              providerResponseId: typeof json.id === 'string' ? json.id : null,
+              reportedModelId: typeof json.model === 'string' ? json.model : null,
+              rawText: text,
+              responseEnvelope,
+              usage,
+              usageRaw: json.usage ?? null,
+              searchAudit: extractAnthropicSearchAudit(raw),
+              requestParams,
+            });
+          }
+
+          return {
+            rawText: text,
+            responseEnvelope,
+            reportedModelId: typeof json.model === 'string' ? json.model : null,
+            providerResponseId: typeof json.id === 'string' ? json.id : null,
+            httpStatus: status,
+            usage,
+            usageRaw: json.usage ?? null,
+            requestParams,
+            searchAudit: extractAnthropicSearchAudit(raw),
+          };
+        },
+      );
     },
   };
 }

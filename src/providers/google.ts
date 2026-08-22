@@ -1,10 +1,9 @@
 import { googleApiKey } from '../config.js';
-import { postJson } from './http.js';
+import { postJsonAndRead } from './http.js';
 import { ProviderUnfinishedTurnError } from './errors.js';
 import { TOOL_INFERENCE_CONFIG } from '../toolInferenceConfig.js';
 import { deriveComparableUsage } from './comparableUsage.js';
 import { extractGoogleSearchAudit } from './searchAudit.js';
-import { sealResponseEnvelope } from './responseEnvelope.js';
 import { buildRequestPlan } from './requestPlan.js';
 import type { ProviderRequestPlan } from './requestPlan.js';
 import type {
@@ -86,109 +85,115 @@ export function createGoogleAdapter(requestedModelId: string): ProviderAdapter {
       if (apiKey === undefined) throw new Error('GEMINI_API_KEY / GOOGLE_API_KEY is not set');
       const plan = googleRequestPlan({ requestedModelId, turns, options });
       const url = plan.endpoint;
-      const { status, json: raw, bodyText } = await postJson({
-        provider: 'google',
-        url,
-        headers: { 'x-goog-api-key': apiKey },
-        body: plan.body,
-        timeoutMs,
-      });
-      // The complete body, retained as received: every later re-extraction of
-      // this call's search audit reads THIS, not the normalized result below.
-      const responseEnvelope = sealResponseEnvelope(bodyText);
-      const json = raw as {
-        responseId?: unknown;
-        modelVersion?: unknown;
-        candidates?: Array<{
-          content?: { parts?: Array<{ text?: unknown; thought?: unknown }> };
-          finishReason?: unknown;
-        }>;
-        promptFeedback?: { blockReason?: unknown };
-        usageMetadata?: {
-          promptTokenCount?: unknown;
-          candidatesTokenCount?: unknown;
-          totalTokenCount?: unknown;
-        };
-      };
-
-      const parts = json.candidates?.[0]?.content?.parts;
-      const text = Array.isArray(parts)
-        ? parts
-            // Thinking models may emit thought parts; only answer text counts.
-            .filter((p) => typeof p.text === 'string' && p.thought !== true)
-            .map((p) => p.text as string)
-            .join('')
-        : '';
-      const comparable = deriveComparableUsage('google', json.usageMetadata ?? null);
-      const usage: ProviderUsage = {
-        inputTokens:
-          typeof json.usageMetadata?.promptTokenCount === 'number'
-            ? json.usageMetadata.promptTokenCount
-            : null,
-        outputTokens:
-          typeof json.usageMetadata?.candidatesTokenCount === 'number'
-            ? json.usageMetadata.candidatesTokenCount
-            : null,
-        totalTokens:
-          typeof json.usageMetadata?.totalTokenCount === 'number'
-            ? json.usageMetadata.totalTokenCount
-            : null,
-        reasoningTokens: comparable.reasoningTokens,
-        billableOutputTokens: comparable.billableOutputTokens,
-      };
-      const requestParams = plan.requestParams;
-
-      // Terminal state: only `finishReason: "STOP"` on the first candidate is a
-      // finished turn. `MAX_TOKENS`, `TOO_MANY_TOOL_CALLS`, safety/recitation
-      // stops, any other value, a missing field, or a blocked prompt with no
-      // candidate at all is HTTP 200 with empty or truncated content — typed as
-      // an unfinished turn carrying the call's full evidence (status, ids,
-      // partial text, usage, audit), so it is never scored as the model's
-      // invalid JSON, nor accepted as its answer.
-      const blockReason =
-        typeof json.promptFeedback?.blockReason === 'string' ? json.promptFeedback.blockReason : null;
-      const finishReason =
-        typeof json.candidates?.[0]?.finishReason === 'string'
-          ? json.candidates[0].finishReason
-          : blockReason !== null
-            ? `blocked:${blockReason}`
-            : 'missing';
-      if (finishReason !== 'STOP') {
-        const detail =
-          finishReason === 'MAX_TOKENS'
-            ? 'the response hit its maxOutputTokens cap before finishing'
-            : finishReason === 'TOO_MANY_TOOL_CALLS'
-              ? 'the provider terminated the server-side tool loop before the turn finished'
-              : blockReason !== null && json.candidates?.[0] === undefined
-                ? 'the prompt was blocked by the provider before any candidate was produced'
-                : `the provider reported finishReason "${finishReason}", not "STOP"`;
-        throw new ProviderUnfinishedTurnError({
+      // Everything that READS the response runs inside `postJsonAndRead`, which
+      // owns the seal and the one try/catch that converts a shape this build
+      // cannot walk into a typed failure carrying the sealed bytes and the
+      // status. Dereferencing a cast parse outside it would put those bytes
+      // back at the mercy of an untyped throw.
+      return await postJsonAndRead(
+        {
           provider: 'google',
-          stopReason: finishReason,
-          detail,
-          httpStatus: status,
-          providerResponseId: typeof json.responseId === 'string' ? json.responseId : null,
-          reportedModelId: typeof json.modelVersion === 'string' ? json.modelVersion : null,
-          rawText: text,
-          responseEnvelope,
-          usage,
-          usageRaw: json.usageMetadata ?? null,
-          searchAudit: extractGoogleSearchAudit(raw),
-          requestParams,
-        });
-      }
+          url,
+          headers: { 'x-goog-api-key': apiKey },
+          body: plan.body,
+          timeoutMs,
+        },
+        ({ json: raw, status, responseEnvelope }): ProviderResponse => {
+          const json = raw as {
+            responseId?: unknown;
+            modelVersion?: unknown;
+            candidates?: Array<{
+              content?: { parts?: Array<{ text?: unknown; thought?: unknown }> };
+              finishReason?: unknown;
+            }>;
+            promptFeedback?: { blockReason?: unknown };
+            usageMetadata?: {
+              promptTokenCount?: unknown;
+              candidatesTokenCount?: unknown;
+              totalTokenCount?: unknown;
+            };
+          };
 
-      return {
-        rawText: text,
-        responseEnvelope,
-        reportedModelId: typeof json.modelVersion === 'string' ? json.modelVersion : null,
-        providerResponseId: typeof json.responseId === 'string' ? json.responseId : null,
-        httpStatus: status,
-        usage,
-        usageRaw: json.usageMetadata ?? null,
-        requestParams,
-        searchAudit: extractGoogleSearchAudit(raw),
-      };
+          const parts = json.candidates?.[0]?.content?.parts;
+          const text = Array.isArray(parts)
+            ? parts
+                // Thinking models may emit thought parts; only answer text counts.
+                .filter((p) => typeof p.text === 'string' && p.thought !== true)
+                .map((p) => p.text as string)
+                .join('')
+            : '';
+          const comparable = deriveComparableUsage('google', json.usageMetadata ?? null);
+          const usage: ProviderUsage = {
+            inputTokens:
+              typeof json.usageMetadata?.promptTokenCount === 'number'
+                ? json.usageMetadata.promptTokenCount
+                : null,
+            outputTokens:
+              typeof json.usageMetadata?.candidatesTokenCount === 'number'
+                ? json.usageMetadata.candidatesTokenCount
+                : null,
+            totalTokens:
+              typeof json.usageMetadata?.totalTokenCount === 'number'
+                ? json.usageMetadata.totalTokenCount
+                : null,
+            reasoningTokens: comparable.reasoningTokens,
+            billableOutputTokens: comparable.billableOutputTokens,
+          };
+          const requestParams = plan.requestParams;
+
+          // Terminal state: only `finishReason: "STOP"` on the first candidate is a
+          // finished turn. `MAX_TOKENS`, `TOO_MANY_TOOL_CALLS`, safety/recitation
+          // stops, any other value, a missing field, or a blocked prompt with no
+          // candidate at all is HTTP 200 with empty or truncated content — typed as
+          // an unfinished turn carrying the call's full evidence (status, ids,
+          // partial text, usage, audit), so it is never scored as the model's
+          // invalid JSON, nor accepted as its answer.
+          const blockReason =
+            typeof json.promptFeedback?.blockReason === 'string' ? json.promptFeedback.blockReason : null;
+          const finishReason =
+            typeof json.candidates?.[0]?.finishReason === 'string'
+              ? json.candidates[0].finishReason
+              : blockReason !== null
+                ? `blocked:${blockReason}`
+                : 'missing';
+          if (finishReason !== 'STOP') {
+            const detail =
+              finishReason === 'MAX_TOKENS'
+                ? 'the response hit its maxOutputTokens cap before finishing'
+                : finishReason === 'TOO_MANY_TOOL_CALLS'
+                  ? 'the provider terminated the server-side tool loop before the turn finished'
+                  : blockReason !== null && json.candidates?.[0] === undefined
+                    ? 'the prompt was blocked by the provider before any candidate was produced'
+                    : `the provider reported finishReason "${finishReason}", not "STOP"`;
+            throw new ProviderUnfinishedTurnError({
+              provider: 'google',
+              stopReason: finishReason,
+              detail,
+              httpStatus: status,
+              providerResponseId: typeof json.responseId === 'string' ? json.responseId : null,
+              reportedModelId: typeof json.modelVersion === 'string' ? json.modelVersion : null,
+              rawText: text,
+              responseEnvelope,
+              usage,
+              usageRaw: json.usageMetadata ?? null,
+              searchAudit: extractGoogleSearchAudit(raw),
+              requestParams,
+            });
+          }
+
+          return {
+            rawText: text,
+            responseEnvelope,
+            reportedModelId: typeof json.modelVersion === 'string' ? json.modelVersion : null,
+            providerResponseId: typeof json.responseId === 'string' ? json.responseId : null,
+            httpStatus: status,
+            usage,
+            usageRaw: json.usageMetadata ?? null,
+            requestParams,
+            searchAudit: extractGoogleSearchAudit(raw),
+          };
+        },
+      );
     },
   };
 }
