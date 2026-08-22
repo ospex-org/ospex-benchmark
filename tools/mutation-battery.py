@@ -872,7 +872,7 @@ MUTANTS = [
     # The reporting half: absence of an envelope must not be read as proof that
     # no search ran.
     ('M142-unavailable-backfilled-as-no-search', 'src/servingProjection.ts',
-     "  if (searchAudit === null) return envelopeRetained ? 'no_search_evidence' : 'unknown_unproven';",
+     "  if (searchAudit === null) return envelopeReplayable ? 'no_search_evidence' : 'unknown_unproven';",
      "  if (searchAudit === null) return 'no_search_evidence';",
      ['src/responseEnvelopeIntegrity.test.ts', 'src/servingProjection.test.ts']),
     # A tampered body is not evidence about the call it names, so the replay
@@ -924,8 +924,8 @@ MUTANTS = [
     # covers the surfaces it says it does (it scans the whole plan, not just the
     # attempt rows the envelope is nearest to).
     ('M149-envelope-body-published', 'src/servingProjection.ts',
-     '    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeRetained),',
-     "    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeRetained),\n    responseEnvelopeBody: (nested(leg, 'responseEnvelope') as { body?: string } | null)?.body ?? null,",
+     '    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeReplayable),',
+     "    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeReplayable),\n    responseEnvelopeBody: (nested(leg, 'responseEnvelope') as { body?: string } | null)?.body ?? null,",
      ['src/responseEnvelopeIntegrity.test.ts']),
     ('M148-malformed-envelope-read-as-absent', 'src/searchAuditReplay.ts',
      "  if (read.kind === 'malformed') return { ...base, envelope: 'malformed' };",
@@ -1032,13 +1032,13 @@ MUTANTS = [
 
     # B2: a 2xx is a receipt, and its body is retained.
     ('M166-2xx-receipt-not-counted', 'src/providers/responseEnvelope.ts',
-     '    (signals.httpStatus !== null && signals.httpStatus >= 200 && signals.httpStatus < 300)',
-     '    false',
+     '    isSuccessStatus(signals.httpStatus) ||',
+     '    false ||',
      ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts',
       'src/searchAuditReplay.test.ts']),
     ('M167-2xx-receipt-bound-widened-to-4xx', 'src/providers/responseEnvelope.ts',
-     '    (signals.httpStatus !== null && signals.httpStatus >= 200 && signals.httpStatus < 300)',
-     '    signals.httpStatus !== null',
+     '    isSuccessStatus(signals.httpStatus) ||',
+     '    signals.httpStatus !== null ||',
      ['src/providers/responseEnvelope.test.ts']),
     ('M168-content-predicate-widened-to-the-status', 'src/providers/responseEnvelope.ts',
      ('export function reachedProviderByContent(signals: ReceiptSignals): boolean {\n'
