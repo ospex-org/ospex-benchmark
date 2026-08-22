@@ -446,7 +446,17 @@ async function timedChat(
             providerStopReason: error.stopReason,
             turnCompleted: false,
           }
-        : { httpStatus: error instanceof ProviderHttpError ? error.status : null };
+        : {
+            httpStatus: error instanceof ProviderHttpError ? error.status : null,
+            // A 2xx whose body did not parse IS a received response, and
+            // `postJson` seals those bytes onto the error. Carrying them here
+            // is what makes the persisted leg evidence instead of a record
+            // indistinguishable from a call that never landed. Null on every
+            // other error path, where nothing was received or nothing is
+            // retained (see ProviderHttpError.responseEnvelope).
+            responseEnvelope:
+              error instanceof ProviderHttpError ? error.responseEnvelope : null,
+          };
     return {
       ...emptyAttempt(),
       ...carried,

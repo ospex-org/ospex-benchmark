@@ -3,6 +3,7 @@ import { buildBundle } from './bundle.js';
 import { fireEligibleGame } from './watch.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
 import { ARMS } from './providers/index.js';
+import { ProviderHttpError } from './providers/errors.js';
 import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { parseRunArtifact } from './servingProjection.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
@@ -96,7 +97,20 @@ export function fullBoardInputs(gameId: string = GAME_ID): SlateInputs {
  * instant is only provably withheld when nothing came back, and ordinal 1 only
  * appears when a repair ran.
  */
-export type StubBehaviour = 'ok' | 'unsent' | 'transport-failure' | 'repaired';
+export type StubBehaviour =
+  | 'ok'
+  | 'unsent'
+  | 'transport-failure'
+  | 'repaired'
+  | 'unparseable-2xx';
+
+/**
+ * A 2xx body no JSON parser accepts — bytes a proxy in front of a provider
+ * really sends. Written non-canonically so "the exact bytes survived" is a
+ * checkable claim rather than something a re-serialization could reproduce.
+ */
+export const UNPARSEABLE_2XX_BODY =
+  '<!doctype html>\n  <html><head><title>504</title></head>\n  <body>upstream timeout</body></html>';
 
 function stubAdapter(
   build: BuildResult,
@@ -122,6 +136,23 @@ function stubAdapter(
       // response field null already and cannot tell the two apart.
       if (behaviour === 'transport-failure') {
         return Promise.reject(new Error('synthetic transport failure'));
+      }
+      // A 200 whose body is not JSON. The adapter extracts nothing, so the
+      // persisted leg has every content field null and only the status says a
+      // body arrived — the shape that used to read downstream as "nothing came
+      // back". Raised as the typed error `postJson` raises, carrying the same
+      // sealed bytes, because what is under test here is what the RUNNER
+      // persists; the http layer's own half is pinned in
+      // `providers/responseEnvelope.test.ts` against a canned fetch.
+      if (behaviour === 'unparseable-2xx') {
+        return Promise.reject(
+          new ProviderHttpError(
+            arm.provider,
+            200,
+            'non-JSON response body: <!doctype html>',
+            sealResponseEnvelope(UNPARSEABLE_2XX_BODY),
+          ),
+        );
       }
       // The repair is offered only when the initial body yields a complete
       // decision fingerprint, so that the repair can be proved to preserve it —

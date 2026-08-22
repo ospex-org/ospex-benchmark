@@ -5,13 +5,20 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { sha256Hex, canonicalize } from '../canonical.js';
 import { writeNdjson } from '../records.js';
-import { ProviderUnfinishedTurnError } from './errors.js';
+import { ProviderHttpError, ProviderUnfinishedTurnError } from './errors.js';
 import { createRealAdapters } from './index.js';
 import {
+  archiveEraSignals,
   ENVELOPE_VIOLATION,
   envelopeVerificationFailures,
+  isCoherentPreRetentionArchive,
+  reachedProviderByContent,
+  receivedProviderResponse,
+  responseEnvelopeSchema,
   sealResponseEnvelope,
 } from './responseEnvelope.js';
+import { damageEnvelope, ENVELOPE_DAMAGE } from '../testFactories.js';
+import type { EnvelopeDamage } from '../testFactories.js';
 import type { ChatTurn, ProviderAdapter, ProviderResponse } from '../types.js';
 
 /**
@@ -364,14 +371,324 @@ test('a non-2xx body is NOT retained — that path keeps its truncated error det
         return error;
       }
     });
-    assert.ok(thrown instanceof Error);
+    assert.ok(thrown instanceof ProviderHttpError);
     assert.ok(!(thrown instanceof ProviderUnfinishedTurnError));
-    assert.ok(
-      !Object.prototype.hasOwnProperty.call(thrown, 'responseEnvelope'),
-      'a non-2xx failure carries no envelope',
-    );
+    // The field EXISTS on this type now — a 2xx that does not parse fills it —
+    // so the assertion is on its value. `hasOwnProperty` would report the
+    // widening as a pass, which is the shape of assertion this PR is removing.
+    assert.equal(thrown.responseEnvelope, null, 'a non-2xx failure retains no envelope');
     assert.ok(thrown.message.includes('quota exceeded'), 'it keeps the truncated detail it always had');
   } finally {
     globalThis.fetch = original;
   }
+});
+
+// ---------------------------------------------------------------------------
+// the ONE schema both readers apply
+// ---------------------------------------------------------------------------
+
+test('the damage table stays the four boundary cases, and each is a boundary', () => {
+  // The enumeration guard. Two test files sweep this table; dropping an entry
+  // would silently stop checking that rule in BOTH, so the key list is pinned
+  // against a literal here.
+  assert.deepEqual(Object.keys(ENVELOPE_DAMAGE).sort(), [
+    'extra-key',
+    'fractional-bytes',
+    'missing-sha256',
+    'upper-case-sha256',
+  ]);
+
+  // And each case really is a boundary rather than an extreme (rule 3g-both):
+  // three of the four leave `body`, the digest and the byte count intact, so a
+  // reader that checked only those three would ACCEPT them — which is the
+  // reader this schema replaced. Only `missing-sha256` is coarse, and it is
+  // labelled as the control.
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  const survivesThreeTypeofChecks = (damage: EnvelopeDamage): boolean => {
+    const record = damageEnvelope(sealed, damage);
+    return (
+      typeof record['body'] === 'string' &&
+      typeof record['sha256'] === 'string' &&
+      typeof record['bytes'] === 'number'
+    );
+  };
+  assert.equal(survivesThreeTypeofChecks('extra-key'), true);
+  assert.equal(survivesThreeTypeofChecks('upper-case-sha256'), true);
+  assert.equal(survivesThreeTypeofChecks('fractional-bytes'), true);
+  assert.equal(survivesThreeTypeofChecks('missing-sha256'), false, 'the coarse control');
+
+  // `extra-key` is the sharpest of them: it is identical to a good envelope in
+  // every field the digest is about, so nothing but `.strict()` can refuse it.
+  // Stated here so an edit that adds a second defect to it fails rather than
+  // quietly making the parity case vacuous.
+  const extra = damageEnvelope(sealed, 'extra-key');
+  assert.equal(extra['body'], sealed.body);
+  assert.equal(extra['sha256'], sealed.sha256);
+  assert.equal(extra['bytes'], sealed.bytes);
+});
+
+test('the schema refuses every damaged shape and accepts the sealed one', () => {
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  // Negative control FIRST: an undamaged envelope parses, so every refusal
+  // below is about the damage rather than about the fixture.
+  assert.equal(responseEnvelopeSchema.safeParse(sealed).success, true);
+  for (const damage of Object.keys(ENVELOPE_DAMAGE) as EnvelopeDamage[]) {
+    assert.equal(
+      responseEnvelopeSchema.safeParse(damageEnvelope(sealed, damage)).success,
+      false,
+      `${damage} must be refused`,
+    );
+  }
+});
+
+test('a well-formed envelope whose BODY was altered still parses; the digest is what catches it', () => {
+  // The negative control for the schema, and the reason `digest-mismatch` and
+  // `malformed` are different states downstream. Shape and binding are two
+  // questions, and a reader that answered them with one rule would report the
+  // wrong one about half the damaged files it sees.
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  const tampered = { ...sealed, body: `${sealed.body} ` };
+  assert.equal(responseEnvelopeSchema.safeParse(tampered).success, true, 'the SHAPE is fine');
+  assert.notDeepEqual(envelopeVerificationFailures(tampered), [], 'the BINDING is not');
+});
+
+// ---------------------------------------------------------------------------
+// the whole-file archive predicate
+// ---------------------------------------------------------------------------
+
+/** A leg the way a pre-#92 build wrote it: the old answer name, and neither of
+ *  the two keys a retaining build adds. */
+const ARCHIVED_LEG = { rawResponse: 'an archived answer', reportedModelId: 'm', httpStatus: 200 };
+/** A leg the way this build writes it. */
+const MODERN_LEG = {
+  answerText: 'an answer',
+  responseEnvelope: sealResponseEnvelope('{"ok":true}'),
+  reportedModelId: 'm',
+  httpStatus: 200,
+};
+
+test('archiveEraSignals reads KEY PRESENCE, not value', () => {
+  // The distinction the whole rule rests on: `responseEnvelope: null` is a key
+  // a retaining build wrote. A reader that treated it as absent would hand the
+  // archive exemption to any modern file whose envelopes were nulled — which
+  // was a measured bypass, not a hypothetical.
+  assert.deepEqual(archiveEraSignals({ ...MODERN_LEG, responseEnvelope: null }), {
+    answerText: true,
+    rawResponse: false,
+    responseEnvelope: true,
+  });
+  assert.deepEqual(archiveEraSignals(ARCHIVED_LEG), {
+    answerText: false,
+    rawResponse: true,
+    responseEnvelope: false,
+  });
+  // A leg that is not an object at all reports every key absent rather than
+  // throwing; the caller has already decided such a record has no legs.
+  assert.deepEqual(archiveEraSignals(null), {
+    answerText: false,
+    rawResponse: false,
+    responseEnvelope: false,
+  });
+});
+
+test('exemption needs all three clauses; each one alone withdraws it', () => {
+  // Rule 3k, swept: the predicate is a conjunction, so one case per clause,
+  // each leaving exactly one clause broken. An input that broke several at
+  // once would be refused by a build consulting any of them and would prove
+  // nothing about which one shipped.
+  const archived = archiveEraSignals(ARCHIVED_LEG);
+  const table: Array<{ name: string; stamped: boolean; legs: unknown[]; expected: boolean }> = [
+    { name: 'a genuine archive', stamped: false, legs: [ARCHIVED_LEG, ARCHIVED_LEG], expected: true },
+    { name: 'clause 1: an era stamp is present', stamped: true, legs: [ARCHIVED_LEG], expected: false },
+    {
+      name: 'clause 2: one leg carries answerText',
+      stamped: false,
+      legs: [ARCHIVED_LEG, { ...ARCHIVED_LEG, answerText: 'a modern answer' }],
+      expected: false,
+    },
+    {
+      name: 'clause 2, other half: one leg carries neither answer name',
+      stamped: false,
+      legs: [ARCHIVED_LEG, { reportedModelId: 'm' }],
+      expected: false,
+    },
+    {
+      name: 'clause 3: one leg carries a responseEnvelope key, explicitly null',
+      stamped: false,
+      legs: [ARCHIVED_LEG, { ...ARCHIVED_LEG, responseEnvelope: null }],
+      expected: false,
+    },
+    { name: 'a modern run with no stamp', stamped: false, legs: [MODERN_LEG], expected: false },
+    { name: 'a modern run with its stamp', stamped: true, legs: [MODERN_LEG], expected: false },
+  ];
+  for (const row of table) {
+    assert.equal(
+      isCoherentPreRetentionArchive({
+        evidenceEraStamped: row.stamped,
+        legs: row.legs.map(archiveEraSignals),
+      }),
+      row.expected,
+      row.name,
+    );
+  }
+  // The exemption is whole-FILE: one modern leg among archived ones withdraws
+  // it for every leg, which is what makes a per-leg edit useless.
+  assert.equal(
+    isCoherentPreRetentionArchive({
+      evidenceEraStamped: false,
+      legs: [archived, archived, archiveEraSignals(MODERN_LEG)],
+    }),
+    false,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// the receipt: what counts as "a response came back"
+// ---------------------------------------------------------------------------
+
+test('a bare 2xx is a receipt; the content signals and the status are independent', () => {
+  // Rule 4b, as a table with LITERAL expectations rather than derived ones.
+  // Every row has all three content signals null, so the status is the only
+  // thing that can decide it — a row carrying an answer would be accepted by
+  // the three-signal predicate too and would say nothing about the fourth
+  // disjunct.
+  const bare = { answerText: null, reportedModelId: null, providerResponseId: null };
+  const statuses: Array<[number | null, boolean]> = [
+    [null, false],
+    [0, false],
+    [199, false],
+    [200, true],
+    [204, true],
+    [299, true],
+    [300, false],
+    [404, false],
+    [429, false],
+    [500, false],
+  ];
+  for (const [httpStatus, expected] of statuses) {
+    assert.equal(
+      receivedProviderResponse({ ...bare, httpStatus }),
+      expected,
+      `status ${String(httpStatus)}`,
+    );
+    // And the narrow predicate ignores the status entirely — the property that
+    // keeps the request-parameter rule exactly where it was.
+    assert.equal(
+      reachedProviderByContent({ ...bare, httpStatus }),
+      false,
+      `status ${String(httpStatus)} must not move the content-only predicate`,
+    );
+  }
+});
+
+test('each content signal alone is a receipt, and a 500 alone is not', () => {
+  const none = {
+    answerText: null,
+    reportedModelId: null,
+    providerResponseId: null,
+    httpStatus: 500,
+  };
+  assert.equal(receivedProviderResponse(none), false, 'the negative control');
+  for (const signal of ['answerText', 'reportedModelId', 'providerResponseId'] as const) {
+    assert.equal(receivedProviderResponse({ ...none, [signal]: 'present' }), true, signal);
+    assert.equal(reachedProviderByContent({ ...none, [signal]: 'present' }), true, signal);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// B2: every 2xx retains its body
+// ---------------------------------------------------------------------------
+
+/** Serve an arbitrary status and body; always restore `globalThis.fetch`. */
+async function withCannedResponse<T>(
+  status: number,
+  bodyText: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(bodyText, { status })) as typeof fetch;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+async function chatError(status: number, bodyText: string): Promise<unknown> {
+  return withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedResponse(status, bodyText, async () => {
+      try {
+        await registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, {
+          maxOutputTokens: 16_000,
+        });
+        return null;
+      } catch (error: unknown) {
+        return error;
+      }
+    }),
+  );
+}
+
+/**
+ * The 2xx bodies that never reach the parseable path, and what each one is.
+ *
+ * The bytes are chosen so a re-serialization could not have produced them:
+ * indented HTML, a bare token, the empty string. Every one is something a
+ * provider or a proxy in front of one really sends, and every one used to be
+ * dropped on the floor.
+ */
+const UNPARSEABLE_2XX: Array<{ name: string; status: number; body: string }> = [
+  {
+    name: 'an HTML error page from a proxy',
+    status: 200,
+    body: '<!doctype html>\n  <html><body>upstream timeout</body></html>',
+  },
+  { name: 'a bare token', status: 200, body: 'OK' },
+  { name: 'an EMPTY body', status: 200, body: '' },
+  { name: 'a 202 with an unparseable body', status: 202, body: 'accepted, come back later' },
+];
+
+for (const shape of UNPARSEABLE_2XX) {
+  test(`a ${shape.status} that does not parse retains its exact bytes: ${shape.name}`, async () => {
+    const error = await chatError(shape.status, shape.body);
+    assert.ok(error instanceof ProviderHttpError, `it is still the typed HTTP failure: ${String(error)}`);
+    assert.equal(error.status, shape.status);
+    assert.ok(error.responseEnvelope !== null, 'and it carries an envelope');
+    assert.equal(error.responseEnvelope.body, shape.body, 'the received bytes, unaltered');
+    assert.equal(error.responseEnvelope.sha256, sha256Hex(shape.body));
+    assert.equal(error.responseEnvelope.bytes, Buffer.byteLength(shape.body, 'utf8'));
+    assert.deepEqual(envelopeVerificationFailures(error.responseEnvelope), []);
+    // The truncated detail a human reads is unchanged and still there; the
+    // envelope is added evidence, not a replacement for it.
+    assert.ok(error.message.includes('non-JSON response body'), error.message);
+  });
+}
+
+test('a NON-2xx still retains nothing, and 300 is the boundary', async () => {
+  // The negative control the widening needs, and the line stated as a
+  // boundary rather than as a mood: 299 retains (above), 300 does not. A
+  // provider error body is the likeliest place request content is echoed
+  // back, so the line is deliberate.
+  const refused = await chatError(500, 'not json either');
+  assert.ok(refused instanceof ProviderHttpError);
+  assert.equal(refused.responseEnvelope, null, 'a 500 retains nothing');
+  assert.ok(refused.message.includes('not json either'), 'it keeps the truncated detail');
+
+  const boundary = await chatError(300, 'not json either');
+  assert.ok(boundary instanceof ProviderHttpError);
+  assert.equal(boundary.responseEnvelope, null, '300 is outside 2xx');
+});
+
+test('a 2xx whose JSON is NOT an object goes down the parseable path and retains too', async () => {
+  // The adjacent shape, and the reason the rule is stated as "every 2xx"
+  // rather than "every 2xx that fails to parse": a bare `42` parses, so it was
+  // ALREADY retained, by accident of what `JSON.parse` accepts. Uniform now,
+  // and pinned so the two halves cannot drift into different rules.
+  const body = '  42  ';
+  const error = await chatError(200, body);
+  // Anthropic's parser finds no `stop_reason` in a number, so this settles as
+  // an unfinished turn — a typed failure that carries its envelope.
+  assert.ok(error instanceof ProviderUnfinishedTurnError, `got ${String(error)}`);
+  assert.equal(error.responseEnvelope.body, body, 'the received bytes, spaces and all');
+  assert.equal(error.responseEnvelope.sha256, sha256Hex(body));
 });

@@ -6,8 +6,11 @@ import { test } from 'node:test';
 import { sha256Hex } from './canonical.js';
 import { EVIDENCE_ERA } from './providers/responseEnvelope.js';
 import { defaultExpectedArms, parseRunRecords, verifyRunIntegrity } from './scoring.js';
+import { replaySearchAudits } from './searchAuditReplay.js';
 import { projectRun, publishableRun } from './servingProjection.js';
-import { firedRun } from './servingTestRun.js';
+import { firedRun, UNPARSEABLE_2XX_BODY } from './servingTestRun.js';
+import { damageEnvelope, ENVELOPE_DAMAGE } from './testFactories.js';
+import type { EnvelopeDamage } from './testFactories.js';
 import type { JsonRecord } from './servingProjection.js';
 
 /**
@@ -39,7 +42,9 @@ function nextGameId(): string {
   return `00000000-0000-4000-8000-0000000env${String(gameCounter).padStart(2, '0')}`;
 }
 
-async function firedRecords(behaviour: 'ok' | 'repaired' | 'transport-failure'): Promise<JsonRecord[]> {
+async function firedRecords(
+  behaviour: 'ok' | 'repaired' | 'transport-failure' | 'unparseable-2xx',
+): Promise<JsonRecord[]> {
   const dir = mkdtempSync(join(tmpdir(), 'envelope-integrity-'));
   try {
     const run = await firedRun({ outDir: dir, enrolled: true, behaviour, gameId: nextGameId() });
@@ -149,6 +154,12 @@ test('an era-stamped run whose INITIAL envelope was dropped fails closed', async
   const violations = violationsFor(records);
   assert.equal(violations.filter((v) => v.includes(ENVELOPE_MISSING)).length, 1);
   assert.ok(violations.some((v) => v.includes(':attempt:') && v.includes(ENVELOPE_MISSING)));
+  // The stamp keeps its declarative job: it NAMES the era in the message. It
+  // no longer decides whether the rule runs, which is the whole of B1.
+  assert.ok(
+    violations.some((v) => v.includes(`evidence era ${EVIDENCE_ERA}`)),
+    JSON.stringify(violations),
+  );
 });
 
 test('an era-stamped run whose REPAIR envelope was dropped fails closed', async () => {
@@ -243,6 +254,17 @@ test('a retained REPAIR envelope that does not reproduce its digest fails closed
 });
 
 test('integrity is checked even with no era stamp — a present envelope is always verified', async () => {
+  // The MECHANISM this test has always measured, and it is still true: a
+  // present envelope that does not reproduce its digest is a violation
+  // whatever the run's era. Kept, because the measurement is worth having.
+  //
+  // What it used to assert BESIDE that was the hole. It pinned "presence stays
+  // era-gated" as correct — factually right about the code and wrong about
+  // what the code bought, which is rule 3j exactly. The adversarial question:
+  // deleting one optional field from a modern artifact stripped every
+  // retention guarantee from the run while it still verified clean. So the
+  // consequence is asserted here now, next to the mechanism, and the probe
+  // that demonstrates it is the test immediately below.
   const records = await firedRecords('ok');
   const meta = records.find((record) => record['recordType'] === 'run_meta');
   delete meta?.['evidenceEra'];
@@ -250,7 +272,252 @@ test('integrity is checked even with no era stamp — a present envelope is alwa
   envelope.body = `${envelope.body} tampered`;
   const violations = violationsFor(records);
   assert.equal(violations.filter((v) => v.includes(ENVELOPE_DIGEST)).length, 1);
-  assert.equal(violations.filter((v) => v.includes(ENVELOPE_MISSING)).length, 0, 'presence stays era-gated');
+  assert.equal(
+    violations.filter((v) => v.includes(ENVELOPE_MISSING)).length,
+    0,
+    'and no presence violation, because this envelope is PRESENT — it is only damaged',
+  );
+});
+
+test("THE REVIEWER'S PROBE: deleting the era stamp no longer switches presence off", async () => {
+  // One field deleted from run_meta, one envelope nulled. Under the rule this
+  // replaces, that verified clean. The file still says `answerText` and still
+  // carries `responseEnvelope` keys, so it is not an archive and the
+  // requirement stands.
+  const records = await firedRecords('ok');
+  const meta = records.find((record) => record['recordType'] === 'run_meta');
+  assert.equal(meta?.['evidenceEra'], EVIDENCE_ERA, 'the stamp is there to begin with');
+  delete meta?.['evidenceEra'];
+  leg(records, 'attempt')['responseEnvelope'] = null;
+
+  const violations = violationsFor(records);
+  assert.equal(violations.filter((v) => v.includes(ENVELOPE_MISSING)).length, 1);
+  assert.ok(
+    violations.some((v) => v.includes(':attempt:') && v.includes(ENVELOPE_MISSING)),
+    JSON.stringify(violations),
+  );
+  // The message says WHY the file was not exempt, so an operator reading it
+  // does not conclude the stamp is missing by accident.
+  assert.ok(
+    violations.some((v) => v.includes('not a coherent pre-retention archive')),
+    JSON.stringify(violations),
+  );
+});
+
+test('a GENUINE archive with no envelopes anywhere is still exempt — the rival control', async () => {
+  // The other half of the pair, and it is a RIVAL rather than a duplicate: a
+  // build that reverted to the era gate reddens the probe above and leaves
+  // this green, and a build that enforced unconditionally does the opposite.
+  // Neither mutation can satisfy both.
+  const archived = asArchived(await firedRecords('repaired'));
+  for (const name of ['attempt', 'repair'] as const) {
+    const archivedLeg = armResponse(archived)[name] as JsonRecord;
+    assert.equal(archivedLeg['responseEnvelope'], undefined, 'no envelope key at all');
+    assert.equal(archivedLeg['answerText'], undefined, 'and the old answer name');
+    assert.equal(typeof archivedLeg['rawResponse'], 'string', 'which really carries an answer');
+  }
+  assert.equal(violationsFor(archived).filter((v) => v.includes(ENVELOPE_MISSING)).length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// THE DELETION TABLE — each row is what one edit to a modern artifact buys
+// ---------------------------------------------------------------------------
+
+/** Run_meta, for the rows that edit it. */
+function runMeta(records: JsonRecord[]): JsonRecord {
+  const found = records.find((record) => record['recordType'] === 'run_meta');
+  assert.ok(found !== undefined, 'the fired run wrote a run_meta');
+  return found;
+}
+
+/** Apply `edit` to every leg of every arm response. */
+function everyLeg(records: JsonRecord[], edit: (leg: JsonRecord) => void): void {
+  for (const record of records) {
+    if (record['recordType'] !== 'arm_game_response') continue;
+    for (const name of ['attempt', 'repair'] as const) {
+      const value = record[name];
+      if (value !== null && typeof value === 'object') edit(value as JsonRecord);
+    }
+  }
+}
+
+test('THE DELETION TABLE: every era carrier can only RAISE enforcement', async () => {
+  // The specification, as a table with LITERAL expectations. The fixture is
+  // the repaired run, so it has TWO legs and both received a response —
+  // which is what makes "one violation per reached leg" distinguishable from
+  // "one violation".
+  const table: Array<{
+    name: string;
+    edit: (records: JsonRecord[]) => void;
+    expected: number | 'parse-refused';
+  }> = [
+    {
+      name: 'nothing edited: the file the harness wrote',
+      edit: () => {},
+      expected: 0,
+    },
+    {
+      name: 'delete evidenceEra only, and null ONE envelope',
+      edit: (records) => {
+        delete runMeta(records)['evidenceEra'];
+        leg(records, 'attempt')['responseEnvelope'] = null;
+      },
+      expected: 1,
+    },
+    {
+      name: 'delete evidenceEra and DELETE every envelope key',
+      edit: (records) => {
+        delete runMeta(records)['evidenceEra'];
+        everyLeg(records, (value) => {
+          delete value['responseEnvelope'];
+        });
+      },
+      expected: 2,
+    },
+    {
+      name: 'delete evidenceEra and NULL every envelope (a key is still a key)',
+      edit: (records) => {
+        delete runMeta(records)['evidenceEra'];
+        everyLeg(records, (value) => {
+          value['responseEnvelope'] = null;
+        });
+      },
+      expected: 2,
+    },
+    {
+      name: 'delete evidenceEra, every envelope AND every answerText',
+      edit: (records) => {
+        delete runMeta(records)['evidenceEra'];
+        everyLeg(records, (value) => {
+          delete value['responseEnvelope'];
+          delete value['answerText'];
+        });
+      },
+      expected: 'parse-refused',
+    },
+    {
+      name: 'a genuine pre-#92 archive',
+      edit: () => {},
+      expected: 0,
+    },
+  ];
+
+  for (const row of table) {
+    const records = row.name.includes('genuine pre-#92')
+      ? asArchived(await firedRecords('repaired'))
+      : await firedRecords('repaired');
+    row.edit(records);
+    if (row.expected === 'parse-refused') {
+      assert.throws(() => parseRunRecords(lines(records)), /answerText/, row.name);
+      continue;
+    }
+    const missing = violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING));
+    assert.equal(missing.length, row.expected, `${row.name}: ${JSON.stringify(missing)}`);
+  }
+});
+
+test('the archive exemption is whole-FILE: one modern leg withdraws it from every leg', async () => {
+  // A hand-edit that downgrades MOST of a file does not buy the exemption. The
+  // control is the row above ('a genuine pre-#92 archive'), which is the same
+  // transformation applied to every leg and scores clean.
+  const records = asArchived(await firedRecords('repaired'));
+  const repair = armResponse(records)['repair'] as JsonRecord;
+  // One leg put back into the modern shape, with no envelope beside it.
+  repair['answerText'] = repair['rawResponse'];
+  delete repair['rawResponse'];
+
+  const missing = violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING));
+  assert.equal(missing.length, 2, `both legs are enforced, not just the giveaway: ${JSON.stringify(missing)}`);
+});
+
+// ---------------------------------------------------------------------------
+// a 2xx is a receipt, even when nothing survived it
+// ---------------------------------------------------------------------------
+
+test('a 200 whose body did not parse retains that body in the artifact', async () => {
+  // B2, at the layer that matters: the file. The adapter extracted nothing, so
+  // every content field is null — and the bytes are still there.
+  const records = await firedRecords('unparseable-2xx');
+  const attempt = leg(records, 'attempt');
+  assert.equal(attempt['httpStatus'], 200);
+  assert.equal(attempt['answerText'], null);
+  assert.equal(attempt['reportedModelId'], null);
+  assert.equal(attempt['providerResponseId'], null);
+  const envelope = attempt['responseEnvelope'] as { body: string; sha256: string; bytes: number };
+  assert.ok(envelope !== null && typeof envelope === 'object', 'the received bytes were retained');
+  assert.equal(envelope.body, UNPARSEABLE_2XX_BODY, 'exactly as received');
+  assert.equal(envelope.sha256, sha256Hex(UNPARSEABLE_2XX_BODY));
+  assert.equal(envelope.bytes, Buffer.byteLength(UNPARSEABLE_2XX_BODY, 'utf8'));
+  assert.equal(violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING)).length, 0);
+});
+
+test('a 2xx status ALONE requires an envelope — with every other signal null', async () => {
+  // Rule 3b, and the reason this fixture exists rather than a reuse of the
+  // 'ok' one: `answerText`, `reportedModelId` and `providerResponseId` are all
+  // null here, so the three older disjuncts cannot produce this refusal and
+  // the status is the only thing that can. On the 'ok' fixture all four are
+  // present and a build consulting any one of them passes.
+  const records = await firedRecords('unparseable-2xx');
+  const attempt = leg(records, 'attempt');
+  assert.deepEqual(
+    ['answerText', 'reportedModelId', 'providerResponseId'].map((field) => attempt[field]),
+    [null, null, null],
+    'no content signal is left standing',
+  );
+  assert.equal(attempt['rawResponse'], undefined, 'and no archived alias revives one');
+  attempt['responseEnvelope'] = null;
+
+  const violations = violationsFor(records);
+  assert.equal(
+    violations.filter((v) => v.includes(ENVELOPE_MISSING)).length,
+    1,
+    `the status alone must require an envelope: ${JSON.stringify(violations)}`,
+  );
+});
+
+test('a leg with NO status and no content is still exempt — the receipt has a negative side', async () => {
+  // The negative control for the widening. A transport failure never got a
+  // status, so nothing says a body arrived and requiring one would make every
+  // dropped connection unscoreable. Measured on the same rule, one field over.
+  const records = await firedRecords('transport-failure');
+  const attempt = leg(records, 'attempt');
+  assert.equal(attempt['httpStatus'], null, 'the fixture really never settled on a status');
+  assert.equal(attempt['responseEnvelope'], null);
+  assert.equal(violationsFor(records).filter((v) => v.includes(ENVELOPE_MISSING)).length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// exactly one answer name
+// ---------------------------------------------------------------------------
+
+test('an attempt carrying BOTH answer names is refused at the parse', async () => {
+  // Two fixtures, because two DIFFERENT rules both refuse the obvious one
+  // (rule 3g-both). A rule written "refuse when the two names DISAGREE" and a
+  // rule written "refuse when both are PRESENT" agree about the differing
+  // case and disagree about the byte-equal one — so only the second fixture
+  // says which rule shipped, and the first is here to show the pair is not
+  // vacuous.
+  const differing = await firedRecords('ok');
+  const differingLeg = leg(differing, 'attempt');
+  const answer = differingLeg['answerText'];
+  assert.equal(typeof answer, 'string', 'the leg starts with exactly one name');
+  differingLeg['rawResponse'] = 'a different answer entirely';
+  assert.notEqual(differingLeg['rawResponse'], answer, 'the two names DISAGREE here');
+  assert.throws(() => parseRunRecords(lines(differing)), /exactly one name/);
+
+  // The discriminating case: byte-identical values. Nothing is contradicted,
+  // and it is still refused — the rule is about the file stating its answer
+  // twice, not about the two statements differing.
+  const identical = await firedRecords('ok');
+  const identicalLeg = leg(identical, 'attempt');
+  identicalLeg['rawResponse'] = identicalLeg['answerText'];
+  assert.equal(identicalLeg['rawResponse'], identicalLeg['answerText'], 'byte-equal, so only "both present" can refuse it');
+  assert.throws(() => parseRunRecords(lines(identical)), /exactly one name/);
+
+  // And the negative control: one name alone still parses, under either name.
+  const modern = await firedRecords('ok');
+  assert.doesNotThrow(() => parseRunRecords(lines(modern)));
+  assert.doesNotThrow(() => parseRunRecords(lines(asArchived(modern))));
 });
 
 // ---------------------------------------------------------------------------
@@ -319,15 +586,40 @@ test('an attempt carrying NEITHER answer name is refused at the parse', async ()
   assert.doesNotThrow(() => parseRunRecords(lines(records)));
 });
 
-test('a retained envelope missing a binding field is refused at the parse', async () => {
-  // The scorer's half of the replay's `malformed` state: something is under the
-  // envelope key and it is not an envelope. The two readers of these bytes must
-  // agree, and this is the assertion that says so on the scorer's side.
-  const records = await firedRecords('ok');
-  const envelope = leg(records, 'attempt')['responseEnvelope'] as JsonRecord;
-  assert.equal(typeof envelope['sha256'], 'string', 'the fixture starts well formed');
-  delete envelope['sha256'];
-  assert.throws(() => parseRunRecords(lines(records)), /sha256/);
+test('BOTH readers refuse the same damaged envelope shapes, on the same bytes', async () => {
+  // B1-b. The two readers had separate definitions of an envelope and they
+  // disagreed: an envelope carrying an extra key made the scorer refuse the
+  // whole file, while the replay read the same bytes, reported the leg as
+  // fully replayed and exited 0. They now import ONE schema, and this is the
+  // measurement of that over a real fired artifact.
+  //
+  // The table is swept rather than sampled because the four damages used to
+  // produce three DIFFERENT replay answers between them, so any single one
+  // would have measured only its own corner.
+  const clean = await firedRecords('ok');
+  // Negative control FIRST, on the untouched file, so every refusal below is
+  // about the damage rather than about the fixture.
+  assert.doesNotThrow(() => parseRunRecords(lines(clean)));
+  assert.equal(replaySearchAudits(lines(clean)).legs[0]!.envelope, 'retained');
+
+  for (const damage of Object.keys(ENVELOPE_DAMAGE) as EnvelopeDamage[]) {
+    const records = await firedRecords('ok');
+    const attempt = leg(records, 'attempt');
+    const sealed = attempt['responseEnvelope'] as { body: string; sha256: string; bytes: number };
+    assert.equal(typeof sealed.sha256, 'string', 'the fixture starts well formed');
+    attempt['responseEnvelope'] = damageEnvelope(sealed, damage);
+
+    assert.throws(
+      () => parseRunRecords(lines(records)),
+      /responseEnvelope/,
+      `the scorer refuses ${damage}`,
+    );
+    assert.equal(
+      replaySearchAudits(lines(records)).legs[0]!.envelope,
+      'malformed',
+      `the replay refuses ${damage}`,
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------

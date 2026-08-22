@@ -10,11 +10,30 @@ export class ProviderTimeoutError extends Error {
 export class ProviderHttpError extends Error {
   readonly status: number;
 
+  /**
+   * The complete received body, sealed — on the one path that has one: a 2xx
+   * whose body did not parse as JSON. Those bytes are the most likely place an
+   * unrecognized provider shape shows up, and discarding them left a leg that
+   * recorded nothing at all, indistinguishable downstream from a call that
+   * never landed.
+   *
+   * `null` everywhere else, and deliberately so on a NON-2xx: a provider error
+   * body is the likeliest place request content is echoed back, so that path
+   * keeps its truncated `detail` and retains nothing.
+   */
+  readonly responseEnvelope: ProviderResponseEnvelope | null;
+
   /** `detail` must already be redacted/truncated by the caller. */
-  constructor(provider: string, status: number, detail: string) {
+  constructor(
+    provider: string,
+    status: number,
+    detail: string,
+    responseEnvelope: ProviderResponseEnvelope | null = null,
+  ) {
     super(`${provider} returned HTTP ${status}: ${detail}`);
     this.name = 'ProviderHttpError';
     this.status = status;
+    this.responseEnvelope = responseEnvelope;
   }
 }
 

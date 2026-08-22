@@ -1,5 +1,6 @@
 import { redactAndTruncate, redactSecrets } from '../config.js';
 import { ProviderHttpError, ProviderTimeoutError } from './errors.js';
+import { sealResponseEnvelope } from './responseEnvelope.js';
 
 /**
  * POST JSON with a hard timeout. Every error path is redacted before it can
@@ -14,10 +15,21 @@ import { ProviderHttpError, ProviderTimeoutError } from './errors.js';
  * never be re-read (#92). `bodyText` is the bytes as received: un-redacted and
  * un-canonicalized, for `sealResponseEnvelope` to bind.
  *
- * Only the 2xx-with-parseable-JSON path returns it. A non-2xx body and a 200
- * that is not JSON keep their existing truncated error detail deliberately: a
- * provider error body is the likeliest place request content is echoed back,
- * and widening it would put an unbounded copy of it into evidence.
+ * EVERY 2xx RETAINS ITS BODY. The parseable ones return it as `bodyText`; a
+ * 2xx whose body does not parse as JSON carries the same sealed bytes on the
+ * `ProviderHttpError` it throws, so the two are one rule rather than a
+ * distinction the JSON parser happened to draw. That distinction was an
+ * accident with teeth: a 200 was recorded with every content field null and
+ * read downstream as "nothing came back", so the exact shape #92 exists to
+ * preserve — a body no parser of the day understood — was the shape most
+ * likely to be discarded. An empty 200 body follows the same rule and retains
+ * an empty envelope; so does a 2xx whose JSON is not an object (a bare `42`),
+ * which already returned through the parseable path.
+ *
+ * A NON-2XX retains nothing, deliberately and unchanged: a provider error body
+ * is the likeliest place request content is echoed back, and widening
+ * retention to it would put an unbounded copy of that into evidence. It keeps
+ * the truncated `detail` it always had.
  */
 export async function postJson(options: {
   provider: string;
@@ -75,6 +87,11 @@ export async function postJson(options: {
         options.provider,
         response.status,
         `non-JSON response body: ${redactAndTruncate(text, 500)}`,
+        // The received bytes, sealed on the same terms as a parseable body.
+        // The truncated detail above stays for the human reading a log; this is
+        // the evidence, and it is what makes the leg a receipt rather than a
+        // record that looks like silence.
+        sealResponseEnvelope(text),
       );
     }
   } finally {

@@ -851,7 +851,7 @@ MUTANTS = [
      ['src/responseEnvelopeIntegrity.test.ts']),
     # Rule 3k: the skip is an opt-out unless the skipped case is unreachable.
     ('M140-missing-envelope-always-skipped', 'src/scoring.ts',
-     '        if (run.evidenceEra !== null && reachedProvider(attempt)) {',
+     '        if (!preRetentionArchive && receivedProviderResponse(attempt)) {',
      '        if (false) {',
      ['src/responseEnvelopeIntegrity.test.ts']),
     # The legacy field name must still be read, or every archived run stops
@@ -896,8 +896,8 @@ MUTANTS = [
     # non-null answer text, so the other two disjuncts were dead and a build
     # consulting one signal exempted a leg whose answer had also been stripped.
     ('M145-presence-gate-reads-one-disjunct', 'src/scoring.ts',
-     '        if (run.evidenceEra !== null && reachedProvider(attempt)) {',
-     '        if (run.evidenceEra !== null && attempt.answerText !== null) {',
+     '        if (!preRetentionArchive && receivedProviderResponse(attempt)) {',
+     '        if (!preRetentionArchive && attempt.answerText !== null) {',
      ['src/responseEnvelopeIntegrity.test.ts']),
     # Idempotence on its own output. Rule 4b: the suite always runs
     # credential-free (only the entry points call `loadDotEnv`), so redaction
@@ -928,9 +928,152 @@ MUTANTS = [
      "    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeRetained),\n    responseEnvelopeBody: (nested(leg, 'responseEnvelope') as { body?: string } | null)?.body ?? null,",
      ['src/responseEnvelopeIntegrity.test.ts']),
     ('M148-malformed-envelope-read-as-absent', 'src/searchAuditReplay.ts',
-     "    return { ...base, envelope: read.kind === 'absent' ? 'unavailable' : 'malformed' };",
+     "  if (read.kind === 'malformed') return { ...base, envelope: 'malformed' };",
+     "  if (read.kind === 'malformed') return { ...base, envelope: 'unavailable' };",
+     ['src/searchAuditReplay.test.ts']),
+
+    # --- PR #109 round 2: the era redesign, the shared schema, the 2xx receipt
+    # One schema, two readers (B1-b). The replay's own three `typeof` checks are
+    # what the shared schema replaced: they accept an envelope carrying extra
+    # keys, which the scorer refuses outright.
+    ('M150-replay-keeps-its-own-loose-envelope-reader', 'src/searchAuditReplay.ts',
+     ("  const parsed = responseEnvelopeSchema.safeParse(value);\n"
+      "  if (!parsed.success) return { kind: 'malformed' };\n"
+      "  return { kind: 'envelope', envelope: parsed.data };"),
+     ("  const record = asRecord(value);\n"
+      "  if (record === null) return { kind: 'malformed' };\n"
+      "  const { body, sha256, bytes } = record;\n"
+      "  if (typeof body !== 'string' || typeof sha256 !== 'string' || typeof bytes !== 'number') {\n"
+      "    return { kind: 'malformed' };\n"
+      "  }\n"
+      "  return { kind: 'envelope', envelope: { body, sha256, bytes } };"),
+     ['src/searchAuditReplay.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    # The three schema rules, one mutant each. Each is killed only by the damage
+    # case that isolates it -- an extra key, an upper-case digest, a fractional
+    # byte count -- which is why the damage table has one boundary entry per rule
+    # rather than one blunt "not an envelope" fixture.
+    ('M151-envelope-schema-not-strict', 'src/providers/responseEnvelope.ts',
+     "    bytes: z.number().int().nonnegative(),\n  })\n  .strict();",
+     '    bytes: z.number().int().nonnegative(),\n  })\n  .passthrough();',
+     ['src/providers/responseEnvelope.test.ts', 'src/searchAuditReplay.test.ts',
+      'src/responseEnvelopeIntegrity.test.ts']),
+    ('M152-digest-field-shape-unchecked', 'src/providers/responseEnvelope.ts',
+     '    sha256: z.string().regex(/^[0-9a-f]{64}$/),',
+     '    sha256: z.string(),',
+     ['src/providers/responseEnvelope.test.ts', 'src/searchAuditReplay.test.ts',
+      'src/responseEnvelopeIntegrity.test.ts']),
+    ('M153-byte-count-shape-unchecked', 'src/providers/responseEnvelope.ts',
+     '    bytes: z.number().int().nonnegative(),',
+     '    bytes: z.number(),',
+     ['src/providers/responseEnvelope.test.ts', 'src/searchAuditReplay.test.ts',
+      'src/responseEnvelopeIntegrity.test.ts']),
+
+    # B1 proper: the era redesign. The rule this replaces is the mutant --
+    # deleting one optional field from a modern artifact turned presence off.
+    ('M154-presence-gated-on-the-era-stamp-again', 'src/scoring.ts',
+     '        if (!preRetentionArchive && receivedProviderResponse(attempt)) {',
+     '        if (run.evidenceEra !== null && receivedProviderResponse(attempt)) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The conjunction, one clause per mutant. A build missing any one of the
+    # three hands the exemption to an edit that leaves the other two intact.
+    ('M155-archive-ignores-the-envelope-key', 'src/providers/responseEnvelope.ts',
+     '  return run.legs.every((leg) => leg.rawResponse && !leg.answerText && !leg.responseEnvelope);',
+     '  return run.legs.every((leg) => leg.rawResponse && !leg.answerText);',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts',
+      'src/searchAuditReplay.test.ts']),
+    ('M156-archive-ignores-the-modern-answer-name', 'src/providers/responseEnvelope.ts',
+     '  return run.legs.every((leg) => leg.rawResponse && !leg.answerText && !leg.responseEnvelope);',
+     '  return run.legs.every((leg) => !leg.responseEnvelope);',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    ('M157-archive-ignores-the-era-stamp', 'src/providers/responseEnvelope.ts',
+     '  if (run.evidenceEraStamped) return false;',
+     '  if (false) return false;',
+     ['src/providers/responseEnvelope.test.ts']),
+    # Presence, not value. `responseEnvelope: null` is a key a retaining build
+    # wrote; reading it as absent was a measured bypass.
+    ('M158-era-signals-read-value-not-presence', 'src/providers/responseEnvelope.ts',
+     "    responseEnvelope: Object.hasOwn(record, 'responseEnvelope'),",
+     "    responseEnvelope: record['responseEnvelope'] != null,",
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    # The predicate is a property of the FILE. Reading one leg lets a hand-edit
+    # downgrade every other leg and keep the exemption.
+    ('M159-archive-decided-from-one-leg', 'src/scoring.ts',
+     '    legs: archivedLegs(run).map((attempt) => attempt.archiveEra),',
+     '    legs: archivedLegs(run).slice(0, 1).map((attempt) => attempt.archiveEra),',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    ('M160-replay-archive-decided-from-one-leg', 'src/searchAuditReplay.ts',
+     '    legs: raw.map((entry) => archiveEraSignals(entry.attempt)),',
+     '    legs: raw.slice(0, 1).map((entry) => archiveEraSignals(entry.attempt)),',
+     ['src/searchAuditReplay.test.ts']),
+    ('M161-replay-era-stamp-read-by-type', 'src/searchAuditReplay.ts',
+     "      if (Object.hasOwn(record, 'evidenceEra')) evidenceEraStamped = true;",
+     "      if (typeof record['evidenceEra'] === 'string') evidenceEraStamped = true;",
+     ['src/searchAuditReplay.test.ts']),
+
+    # B1-a: the replay must agree with the scorer about PRESENCE.
+    ('M162-unretained-collapsed-into-unavailable', 'src/searchAuditReplay.ts',
+     "    return { ...base, envelope: owed ? 'unretained' : 'unavailable' };",
      "    return { ...base, envelope: 'unavailable' };",
      ['src/searchAuditReplay.test.ts']),
+    ('M163-unretained-does-not-block', 'src/searchAuditReplay.ts',
+     "  unretained: 'unretained',",
+     "  unretained: 'clean',",
+     ['src/searchAuditReplay.test.ts']),
+    ('M164-quiet-prints-every-leg', 'src/searchAuditReplay.ts',
+     "      if (quiet ? !isBlockingState(leg.envelope) : leg.envelope === 'retained' && !leg.changed) continue;",
+     "      if (!quiet && leg.envelope === 'retained' && !leg.changed) continue;",
+     ['src/searchAuditReplay.test.ts']),
+    ('M165-unreadable-file-passes-silently', 'src/searchAuditReplay.ts',
+     ("      deps.log.line(`${file}: unreadable run file: ${error instanceof Error ? error.message : String(error)}`);\n"
+      '      blocking += 1;'),
+     ('      deps.log.line(`${file}: unreadable run file: ${error instanceof Error ? error.message : String(error)}`);\n'
+      '      blocking += 0;'),
+     ['src/searchAuditReplay.test.ts']),
+
+    # B2: a 2xx is a receipt, and its body is retained.
+    ('M166-2xx-receipt-not-counted', 'src/providers/responseEnvelope.ts',
+     '    (signals.httpStatus !== null && signals.httpStatus >= 200 && signals.httpStatus < 300)',
+     '    false',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts',
+      'src/searchAuditReplay.test.ts']),
+    ('M167-2xx-receipt-bound-widened-to-4xx', 'src/providers/responseEnvelope.ts',
+     '    (signals.httpStatus !== null && signals.httpStatus >= 200 && signals.httpStatus < 300)',
+     '    signals.httpStatus !== null',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M168-content-predicate-widened-to-the-status', 'src/providers/responseEnvelope.ts',
+     ('export function reachedProviderByContent(signals: ReceiptSignals): boolean {\n'
+      '  return (\n'
+      '    signals.answerText !== null ||'),
+     ('export function reachedProviderByContent(signals: ReceiptSignals): boolean {\n'
+      '  return (\n'
+      '    signals.httpStatus !== null ||\n'
+      '    signals.answerText !== null ||'),
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M169-http-discards-an-unparseable-2xx-body', 'src/providers/http.ts',
+     '        sealResponseEnvelope(text),',
+     '        null,',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M170-http-retains-a-non-2xx-body', 'src/providers/http.ts',
+     '        redactAndTruncate(text, 2000),\n      );',
+     '        redactAndTruncate(text, 2000),\n        sealResponseEnvelope(text),\n      );',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M171-runner-drops-the-http-error-envelope', 'src/runner.ts',
+     '            responseEnvelope:\n              error instanceof ProviderHttpError ? error.responseEnvelope : null,',
+     '            responseEnvelope: null,',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+
+    # B1-c: exactly one answer name.
+    ('M172-both-answer-names-accepted', 'src/scoring.ts',
+     '    if (value.answerText !== undefined && value.rawResponse !== undefined) {',
+     '    if (false) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Rule 3g-both: a rule written "refuse when they DIFFER" agrees with the
+    # shipped rule on the differing fixture and disagrees on the byte-equal one.
+    # Only the byte-equal fixture can kill this.
+    ('M173-both-names-refused-only-when-they-differ', 'src/scoring.ts',
+     '    if (value.answerText !== undefined && value.rawResponse !== undefined) {',
+     '    if (value.answerText !== undefined && value.rawResponse !== undefined && value.answerText !== value.rawResponse) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
 ]
 
 

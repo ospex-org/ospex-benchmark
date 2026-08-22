@@ -39,6 +39,60 @@ export function fixtureEnvelope(answerText: string): ProviderResponseEnvelope {
   );
 }
 
+/**
+ * Ways a retained envelope can be DAMAGED, each isolating one rule of
+ * `responseEnvelopeSchema` — the boundary fixtures the scorer and the replay
+ * are both swept over, so "the two readers agree" is measured on the same
+ * inputs rather than asserted twice from different ones.
+ *
+ * Every entry is a BOUNDARY value, not an extreme one (rule 3g-both): each
+ * leaves the other two fields correct and the digest reproducible, so exactly
+ * one schema rule can refuse it. A fixture that violates several rules at once
+ * — the deleted `sha256` this table replaced — is refused by every candidate
+ * implementation and therefore discriminates none of them.
+ *
+ * `whyOnlyThisRuleRefusesIt` is asserted in the tests, not decoration: it is
+ * what stops a later edit from quietly un-discriminating a case.
+ */
+export const ENVELOPE_DAMAGE = {
+  /** A key nobody planned for. `body`, `sha256` and `bytes` are all present,
+   *  correctly typed and self-consistent, so only `.strict()` can refuse it —
+   *  and a reader built from three `typeof` checks accepted it outright. */
+  'extra-key': (sealed: ProviderResponseEnvelope): Record<string, unknown> => ({
+    ...sealed,
+    provenanceNote: 'added by hand after the run',
+  }),
+  /** The digest in UPPER-CASE hex. `typeof sha256 === 'string'` accepts it;
+   *  only the `^[0-9a-f]{64}$` pattern refuses it as a SHAPE. */
+  'upper-case-sha256': (sealed: ProviderResponseEnvelope): Record<string, unknown> => ({
+    ...sealed,
+    sha256: sealed.sha256.toUpperCase(),
+  }),
+  /** A fractional byte count. `typeof bytes === 'number'` accepts it; only
+   *  `.int()` refuses it. */
+  'fractional-bytes': (sealed: ProviderResponseEnvelope): Record<string, unknown> => ({
+    ...sealed,
+    bytes: sealed.bytes + 0.5,
+  }),
+  /** No `sha256` at all. The coarsest damage and the one every reader has
+   *  always refused — kept as the control that the sweep is not passing only
+   *  on its subtle members. */
+  'missing-sha256': (sealed: ProviderResponseEnvelope): Record<string, unknown> => ({
+    body: sealed.body,
+    bytes: sealed.bytes,
+  }),
+} as const;
+
+export type EnvelopeDamage = keyof typeof ENVELOPE_DAMAGE;
+
+/** Apply one damage to a sealed envelope. */
+export function damageEnvelope(
+  sealed: ProviderResponseEnvelope,
+  damage: EnvelopeDamage,
+): Record<string, unknown> {
+  return ENVELOPE_DAMAGE[damage](sealed);
+}
+
 export const TEST_ARM: ArmSpec = {
   participantId: 'stub-openai',
   provider: 'openai',

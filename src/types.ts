@@ -331,8 +331,8 @@ export interface SearchAudit {
  * to the retained text is detectable; `bytes` is that same string's UTF-8
  * length (characters and bytes disagree on any non-ASCII body).
  *
- * Retained for the 2xx-with-parseable-JSON path only — the path this evidence
- * gap was found on. Non-2xx bodies and 200s that are not JSON keep their
+ * Retained on EVERY 2xx, whether or not the body parses as JSON and whether or
+ * not the parse is an object. Non-2xx bodies retain nothing and keep their
  * existing truncated error detail; see `postJson`.
  *
  * PRIVATE evidence. It stays in the run NDJSON under `out/` (gitignored), and
@@ -428,9 +428,11 @@ export interface AttemptRecord {
   rawText: string | null;
   /**
    * The complete provider response body for this attempt, or `null` when no
-   * body was received (unsent, timeout, transport failure, non-2xx). Serialized
-   * as `responseEnvelope`, beside `answerText` — which holds the extracted
-   * answer only.
+   * body was retained: unsent, timeout, transport failure, or a non-2xx status
+   * (whose body is deliberately not kept — see `postJson`). A 2xx retains one
+   * whatever its body turned out to be, including a body that did not parse.
+   * Serialized as `responseEnvelope`, beside `answerText` — which holds the
+   * extracted answer only.
    */
   responseEnvelope: ProviderResponseEnvelope | null;
   reportedModelId: string | null;
