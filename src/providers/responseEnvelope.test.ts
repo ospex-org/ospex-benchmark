@@ -10,6 +10,8 @@ import {
   ProviderUnfinishedTurnError,
   ProviderUnreadableResponseError,
 } from './errors.js';
+import { postJsonAndRead } from './http.js';
+import type { ProviderRequest, ReceivedResponse } from './http.js';
 import { createRealAdapters } from './index.js';
 import {
   archiveEraSignals,
@@ -1112,4 +1114,88 @@ test('a well-formed finished turn still RETURNS — the negative control for the
   assert.equal(result.httpStatus, 200);
   assert.equal(result.responseEnvelope.body, fixture.body);
   assert.equal(result.rawText, 'answer-anthropic');
+});
+
+// ---------------------------------------------------------------------------
+// The guard covers an ASYNC read on the same terms as a synchronous one
+// ---------------------------------------------------------------------------
+
+/**
+ * `postJsonAndRead` says in prose that the read is AWAITED inside the try, so
+ * an extractor returning a promise is covered on the same terms. Every current
+ * extractor is synchronous, so nothing in the sweeps above exercises that
+ * sentence — and a build changing `return await read(...)` to `return read(...)`
+ * passed the whole suite. These two cases are what redden when the sentence
+ * stops being true.
+ *
+ * WHY THE SYNCHRONOUS THROW CANNOT DISCRIMINATE (rule 3b): a `read` that throws
+ * before returning throws inside the `try` whether or not its result is
+ * awaited, so the adapter sweeps above convert identically under both builds.
+ * Only a read that returns a REJECTED PROMISE tells them apart — without the
+ * await, that rejection is handed back to the caller unconverted.
+ */
+const ASYNC_PROBE_BODY = '{\n  "shape": "parses, and this build cannot walk it"\n}';
+
+function probeRequest(): ProviderRequest {
+  return {
+    provider: 'probe',
+    url: 'https://provider.invalid/v1/probe',
+    headers: {},
+    body: { probe: true },
+    timeoutMs: 5_000,
+  };
+}
+
+/** Call the exported `postJsonAndRead` against a canned 2xx, reporting what
+ *  came back ALONGSIDE proof a request was actually sent (rule 3b-reach). */
+async function underGuard<T>(
+  read: (received: ReceivedResponse) => T | Promise<T>,
+): Promise<{ value: T | undefined; thrown: unknown; calls: number }> {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response(ASYNC_PROBE_BODY, { status: 200 });
+  }) as typeof fetch;
+  try {
+    try {
+      return { value: await postJsonAndRead(probeRequest(), read), thrown: null, calls };
+    } catch (thrown: unknown) {
+      return { value: undefined, thrown, calls };
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test('an ASYNC read that rejects is converted too, with its bytes and its status', async () => {
+  const { thrown, calls } = await underGuard(async () => {
+    // A macrotask boundary, so the rejection genuinely settles after the call
+    // returns rather than throwing synchronously inside the async function's
+    // first tick — which would be caught even without the await.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    throw new TypeError("Cannot read properties of null (reading 'output')");
+  });
+  assert.equal(calls, 1, 'the request really went out, so the case is not vacuous');
+  assert.ok(
+    thrown instanceof ProviderUnreadableResponseError,
+    `expected the typed unreadable-response failure, got ${String(thrown)}`,
+  );
+  assert.equal(thrown.httpStatus, 200, 'the status the body arrived with');
+  assert.equal(thrown.responseEnvelope.body, ASYNC_PROBE_BODY, 'the received bytes, unaltered');
+  assert.equal(thrown.responseEnvelope.sha256, sha256Hex(ASYNC_PROBE_BODY));
+  assert.deepEqual(envelopeVerificationFailures(thrown.responseEnvelope), []);
+  assert.equal(statusFromErrorDetail(thrown.message), 200, thrown.message);
+});
+
+test('an ASYNC read that RESOLVES returns its value — the negative control', async () => {
+  // Rule 5: a guard that converted every read into a typed failure would pass
+  // the case above. The resolved value must come back, and come back unwrapped.
+  const { value, thrown, calls } = await underGuard(async (received) => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return `walked:${received.status}:${received.responseEnvelope.bytes}`;
+  });
+  assert.equal(calls, 1);
+  assert.equal(thrown, null, 'a readable body is not a failure');
+  assert.equal(value, `walked:200:${Buffer.byteLength(ASYNC_PROBE_BODY, 'utf8')}`);
 });
