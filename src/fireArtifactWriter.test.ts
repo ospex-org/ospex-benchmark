@@ -44,6 +44,7 @@ import type {
   ProviderResponse,
   SlateBundle,
 } from './types.js';
+import { fixtureEnvelope } from './testFactories.js';
 
 /**
  * The fire-artifact write path (SPEC §4/§5): serialize / parse / replay / write. Each
@@ -168,6 +169,7 @@ function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): Bench
 function stubResponse(rawText: string, reportedModelId: string): ProviderResponse {
   return {
     rawText,
+    responseEnvelope: fixtureEnvelope(rawText),
     reportedModelId,
     providerResponseId: 'stub-response',
     httpStatus: 200,

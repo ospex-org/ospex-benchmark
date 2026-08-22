@@ -29,6 +29,7 @@ const MARKET_BLOCK: Record<MarketKey, 'moneyline' | 'runLine' | 'total'> = {
 
 const STUB_ATTEMPT: AttemptRecord = {
   rawText: null,
+  responseEnvelope: null,
   reportedModelId: null,
   providerResponseId: null,
   httpStatus: null,

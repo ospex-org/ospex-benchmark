@@ -6,6 +6,15 @@ import { favorableLineMovement } from './clv.js';
 import { LADDER_VERSION, scoreTotalsLadder } from './ladder.js';
 import { instantMs, isParseableInstant } from './time.js';
 import { checkProviderCollision } from './providers/family.js';
+import {
+  archiveEraSignals,
+  envelopeVerificationFailures,
+  isCoherentPreRetentionArchive,
+  receivedProviderResponse,
+  recordsHttpStatus,
+  responseEnvelopeSchema,
+} from './providers/responseEnvelope.js';
+import type { ArchiveEraSignals } from './providers/responseEnvelope.js';
 import { approvedReportedModelIds, ARMS } from './providers/index.js';
 import {
   CONFIGURATION_DIGEST_VERSION,
@@ -27,7 +36,15 @@ import type { ResponseSchemaVersion } from './schema.js';
 import type { BaselinePolicyVersion } from './baselines.js';
 import type { ClvResult, CloseQuote, SelectedSide } from './clv.js';
 import type { LadderParams, TotalsLadderResult } from './ladder.js';
-import type { ArmSpec, AxisName, ClosingLineRow, MarketKey, ProviderName, SlateBundle } from './types.js';
+import type {
+  ArmSpec,
+  AxisName,
+  ClosingLineRow,
+  MarketKey,
+  ProviderName,
+  ProviderResponseEnvelope,
+  SlateBundle,
+} from './types.js';
 
 /**
  * Pure scoring assembly, no I/O: parse a run's records, VERIFY THE RUN'S
@@ -147,6 +164,16 @@ const runMetaSchema = z
     baselineDecisionCount: z.number().int().nonnegative(),
     baselinePolicyVersion: z.string().min(1).optional(),
     promptScaffoldVersion: z.string().min(1).optional(),
+    // The EVIDENCE ERA this run was produced under. It NAMES the era in a
+    // violation message and nothing more: its absence does not exempt a file
+    // from the envelope-presence rule, because it is one optional field and
+    // deleting it used to switch that rule off. Exemption is decided over the
+    // whole file by `isCoherentPreRetentionArchive`.
+    //
+    // Any non-empty value is treated as in force. A later era can only add to
+    // what is retained, so a build that does not recognize the name still
+    // knows an envelope was promised.
+    evidenceEra: z.string().min(1).optional(),
     watch: watchProvenanceSchema.optional(),
     // The run's own account of who competed and under what. OPTIONAL because
     // every artifact written before this stamp existed is still scoreable —
@@ -231,7 +258,30 @@ const attemptFieldsSchema = z
   .object({
     reportedModelId: z.string().nullable(),
     providerResponseId: z.string().nullable(),
-    rawResponse: z.string().nullable(),
+    // The extracted ANSWER TEXT. `answerText` is the name new files write;
+    // `rawResponse` is what files written before #92 called the same value, and
+    // both are read so an archived run stays scoreable. Each is optional on its
+    // own because a file carries one name or the other, never neither.
+    answerText: z.string().nullable().optional(),
+    rawResponse: z.string().nullable().optional(),
+    // The COMPLETE provider response body this answer was extracted from, with
+    // the digest it was stored under. Absent on any file written before
+    // retention existed; verified whenever present, and REQUIRED on every leg
+    // that received a response unless the whole file reads as a pre-retention
+    // archive (see verifyRunIntegrity).
+    responseEnvelope: responseEnvelopeSchema.nullable().optional(),
+    // The HTTP status this leg settled on. Read as a RECEIPT: a 2xx says a body
+    // arrived even when nothing identifying survived it, which is the one thing
+    // that separates a discarded 200 from a call that never landed. Optional
+    // because the field has always been written but has never before been read
+    // — and its ABSENCE is read fail-closed rather than as "no status", because
+    // every build that has written a leg wrote this key.
+    httpStatus: z.number().nullable().optional(),
+    // The leg's own error text. Read only as a SECOND carrier of the status
+    // above: `ProviderHttpError` states it in prose ("<provider> returned HTTP
+    // 200: …"), so nulling the numeric field alone no longer erases the fact
+    // that a body arrived.
+    errorDetail: z.string().nullable().optional(),
     requestAt: z.string().nullable(),
     responseAt: z.string().nullable(),
     latencyMs: z.number().nullable(),
@@ -247,7 +297,29 @@ const attemptFieldsSchema = z
     // predates the reader should not become unscoreable for it.
     requestParams: z.record(z.unknown()).nullable().optional(),
   })
-  .passthrough();
+  .passthrough()
+  // EXACTLY ONE of the two names, never zero and never both. Before the rename
+  // the answer field was one REQUIRED key, so a record missing it was refused
+  // at the parse; two independent optionals accept a record carrying NEITHER
+  // name and read it as a null answer — a fail-closed rule turned fail-open by
+  // a rename — and equally a record carrying BOTH, where every reader takes
+  // `answerText` and the value under `rawResponse` is never looked at again.
+  // A file carries the name its era wrote; carrying two is a file that states
+  // its own answer twice and cannot be held to either.
+  .superRefine((value, ctx) => {
+    if (value.answerText === undefined && value.rawResponse === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'an attempt records its answer under "answerText" (or the archived name "rawResponse"); neither is present',
+      });
+    }
+    if (value.answerText !== undefined && value.rawResponse !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'an attempt records its answer under exactly one name; both "answerText" and "rawResponse" are present',
+      });
+    }
+  });
 
 const armResponseSchema = z
   .object({
@@ -409,7 +481,27 @@ export interface SourcePick {
 export interface ArchivedAttempt {
   reportedModelId: string | null;
   providerResponseId: string | null;
-  rawResponse: string | null;
+  answerText: string | null;
+  /**
+   * The complete provider response body retained for this attempt. `null` when
+   * no body was received, and `null` on every leg of a file written before
+   * retention existed — which is why the presence requirement is waived only
+   * for a file that reads as a coherent pre-retention archive as a WHOLE (see
+   * `isCoherentPreRetentionArchive`), never on this field alone.
+   */
+  responseEnvelope: ProviderResponseEnvelope | null;
+  /** The HTTP status this leg settled on; `null` when the call never got one.
+   *  A 2xx is a receipt that a body arrived, whatever survived of it. */
+  httpStatus: number | null;
+  /** Whether the record carried an `httpStatus` KEY at all — presence, not
+   *  value. Absence is an edit rather than an era, and is read fail-closed. */
+  httpStatusRecorded: boolean;
+  /** The leg's own error text; `null` when the call did not fail or the archive
+   *  predates the field. A second carrier of the HTTP status, in prose. */
+  errorDetail: string | null;
+  /** Which era-marking KEYS this leg's record carried — presence, not value.
+   *  Read only by the whole-file archive predicate. */
+  archiveEra: ArchiveEraSignals;
   requestAt: string | null;
   responseAt: string | null;
   latencyMs: number | null;
@@ -445,7 +537,7 @@ export interface ArmResponseRef {
   accepted: {
     reportedModelId: string | null;
     providerResponseId: string | null;
-    rawResponse: string | null;
+    answerText: string | null;
   };
 }
 
@@ -458,12 +550,24 @@ export type ArmRosterEntry = z.infer<typeof armRosterEntrySchema>;
  * leg carrying one but no `requestParams` is a record that has lost evidence
  * rather than one that never had any. A timeout or transport failure has all
  * three null.
+ *
+ * This is the CONTENT-only reading. The envelope-presence rule uses the wider
+ * `receivedProviderResponse`, which also counts a bare 2xx status; the
+ * request-parameter rule below keeps this one deliberately.
  */
 function reachedProvider(attempt: ArchivedAttempt): boolean {
   return (
-    attempt.rawResponse !== null ||
+    attempt.answerText !== null ||
     attempt.reportedModelId !== null ||
     attempt.providerResponseId !== null
+  );
+}
+
+/** Every leg of a run, in file order — the unit both the envelope-presence rule
+ *  and the archive predicate are stated over. */
+function archivedLegs(run: SourceRun): ArchivedAttempt[] {
+  return run.armResponses.flatMap((response) =>
+    response.repair === null ? [response.attempt] : [response.attempt, response.repair],
   );
 }
 
@@ -485,6 +589,14 @@ export interface SourceRun {
   /** Prompt scaffold version stamped at write time; null on legacy archives.
    *  Selects the response-schema era the integrity checks re-validate under. */
   promptScaffoldVersion: string | null;
+  /**
+   * The run's evidence-era stamp; `null` when run_meta carries none. It names
+   * the era in a violation message. It does NOT decide whether the
+   * envelope-presence check runs — see `isCoherentPreRetentionArchive`, which
+   * reads the whole file and can only be satisfied when this is null AND every
+   * leg is in the pre-#92 shape.
+   */
+  evidenceEra: string | null;
   /** Watch-mode gate provenance; required (and verified) for watch runs. */
   watch: WatchProvenanceMeta | null;
   /**
@@ -581,6 +693,10 @@ export function parseRunRecords(lines: string[]): SourceRun {
       }
       case 'arm_game_response': {
         const response = armResponseSchema.parse(record);
+        // Era signals come off the RAW record, before the schema: an optional
+        // field's absence and its explicit `null` are the same value in the
+        // schema's output, and telling those two apart is the whole job here.
+        const rawLegs = record as { attempt?: unknown; repair?: unknown };
         const accepted = response.repairUsed && response.repair !== null ? response.repair : response.attempt;
         identities.push({
           ref: `arm_game_response:${response.participantId}:${response.gameId}`,
@@ -603,7 +719,12 @@ export function parseRunRecords(lines: string[]): SourceRun {
           attempt: {
             reportedModelId: response.attempt.reportedModelId,
             providerResponseId: response.attempt.providerResponseId,
-            rawResponse: response.attempt.rawResponse,
+            answerText: response.attempt.answerText ?? response.attempt.rawResponse ?? null,
+            responseEnvelope: response.attempt.responseEnvelope ?? null,
+            httpStatus: response.attempt.httpStatus ?? null,
+            httpStatusRecorded: recordsHttpStatus(rawLegs.attempt),
+            errorDetail: response.attempt.errorDetail ?? null,
+            archiveEra: archiveEraSignals(rawLegs.attempt),
             requestAt: response.attempt.requestAt,
             responseAt: response.attempt.responseAt,
             latencyMs: response.attempt.latencyMs,
@@ -617,7 +738,12 @@ export function parseRunRecords(lines: string[]): SourceRun {
               : {
                   reportedModelId: response.repair.reportedModelId,
                   providerResponseId: response.repair.providerResponseId,
-                  rawResponse: response.repair.rawResponse,
+                  answerText: response.repair.answerText ?? response.repair.rawResponse ?? null,
+                  responseEnvelope: response.repair.responseEnvelope ?? null,
+                  httpStatus: response.repair.httpStatus ?? null,
+                  httpStatusRecorded: recordsHttpStatus(rawLegs.repair),
+                  errorDetail: response.repair.errorDetail ?? null,
+                  archiveEra: archiveEraSignals(rawLegs.repair),
                   requestAt: response.repair.requestAt,
                   responseAt: response.repair.responseAt,
                   latencyMs: response.repair.latencyMs,
@@ -628,7 +754,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
           accepted: {
             reportedModelId: accepted.reportedModelId,
             providerResponseId: accepted.providerResponseId,
-            rawResponse: accepted.rawResponse,
+            answerText: accepted.answerText ?? accepted.rawResponse ?? null,
           },
         });
         break;
@@ -738,6 +864,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
     baselineDecisionCount: meta.baselineDecisionCount,
     baselinePolicyVersion: meta.baselinePolicyVersion ?? null,
     promptScaffoldVersion: meta.promptScaffoldVersion ?? null,
+    evidenceEra: meta.evidenceEra ?? null,
     watch: meta.watch ?? null,
     armRoster: meta.armRoster ?? null,
     games,
@@ -1206,7 +1333,7 @@ export function verifyRunIntegrity(
       violations.push(`${key}: expected exactly one decision per market, found ${list.length}`);
     }
 
-    if (response.accepted.rawResponse === null) {
+    if (response.accepted.answerText === null) {
       violations.push(`${key}: accepted response retains no raw text — decisions cannot be re-derived`);
       continue;
     }
@@ -1232,7 +1359,7 @@ export function verifyRunIntegrity(
       configuration: {},
     };
     const revalidation = validateResponseText(
-      response.accepted.rawResponse,
+      response.accepted.answerText,
       requestBundle,
       game.requestSha256,
       armSpecForValidation,
@@ -1249,7 +1376,7 @@ export function verifyRunIntegrity(
       // The repair-acceptance rules re-run from the archived attempts: the
       // initial must have failed validation with a complete fingerprint the
       // accepted repair preserves exactly.
-      const initialRaw = response.attempt.rawResponse;
+      const initialRaw = response.attempt.answerText;
       if (initialRaw === null) {
         violations.push(`${key}: repair was used but no initial raw response is archived`);
       } else {
@@ -1391,7 +1518,7 @@ export function verifyRunIntegrity(
       ...(response.repair !== null ? ([[response.repair, `${key} repair attempt`]] as Array<[ArchivedAttempt, string]>) : []),
     ];
     for (const [attempt, label] of bodyBearing) {
-      if (attempt.rawResponse !== null) {
+      if (attempt.answerText !== null) {
         const completeness = timingCompleteness(attempt, label);
         if (completeness !== null) violations.push(completeness);
       }
@@ -1417,7 +1544,7 @@ export function verifyRunIntegrity(
       configuration: {},
     };
     if (response.outcome === 'invalid_schema') {
-      const initialRaw = response.attempt.rawResponse;
+      const initialRaw = response.attempt.answerText;
       if (initialRaw === null) {
         violations.push(`${key}: invalid_schema outcome with no archived initial response`);
         continue;
@@ -1436,7 +1563,7 @@ export function verifyRunIntegrity(
         );
         continue;
       }
-      const repairRaw = response.repair?.rawResponse ?? null;
+      const repairRaw = response.repair?.answerText ?? null;
       // The claim "this repair should have been valid" holds only for a repair
       // whose transport settled ok AND whose archived provider state does not
       // show a NON-FINAL turn: an unfinished repair turn (the provider said
@@ -1490,7 +1617,7 @@ export function verifyRunIntegrity(
       response.outcome === 'rate_limited' ||
       response.outcome === 'credential_missing'
     ) {
-      if (response.attempt.rawResponse !== null || (response.repair?.rawResponse ?? null) !== null) {
+      if (response.attempt.answerText !== null || (response.repair?.answerText ?? null) !== null) {
         violations.push(`${key}: transport outcome ${response.outcome} cannot carry a response body`);
       }
     } else if (response.outcome === 'provider_error') {
@@ -1501,12 +1628,12 @@ export function verifyRunIntegrity(
       // can never be is a VALIDATING body (a valid response cannot be demoted
       // to a provider failure), and no repair is ever dispatched after a
       // failed initial, so a repair body under this outcome is fabricated.
-      if ((response.repair?.rawResponse ?? null) !== null) {
+      if ((response.repair?.answerText ?? null) !== null) {
         violations.push(
           `${key}: provider_error cannot carry a repair body — no repair is dispatched after a failed initial`,
         );
       }
-      const initialRaw = response.attempt.rawResponse;
+      const initialRaw = response.attempt.answerText;
       if (initialRaw !== null) {
         // Provider completion status is AUTHORITATIVE over body shape: a
         // provider can declare a turn non-final (root status "incomplete",
@@ -1543,7 +1670,7 @@ export function verifyRunIntegrity(
       // timing failure. (Legitimate cases pass: no response at dispatch,
       // response after cutoff, or an invalid-before-cutoff response whose
       // repair window closed or whose repair arrived late.)
-      const initialRaw = response.attempt.rawResponse;
+      const initialRaw = response.attempt.answerText;
       const responseMs =
         response.attempt.responseAt === null ? Number.NaN : Date.parse(response.attempt.responseAt);
       if (initialRaw !== null && !Number.isNaN(responseMs) && responseMs < cutoffMs) {
@@ -1582,7 +1709,7 @@ export function verifyRunIntegrity(
     for (const attempt of [response.attempt, response.repair]) {
       if (attempt === null) continue;
       if (attempt.reportedModelId !== null) reported.add(attempt.reportedModelId);
-      if (attempt.rawResponse !== null && attempt.reportedModelId === null) {
+      if (attempt.answerText !== null && attempt.reportedModelId === null) {
         unidentifiedByArm.set(response.participantId, (unidentifiedByArm.get(response.participantId) ?? 0) + 1);
       }
     }
@@ -1709,6 +1836,68 @@ export function verifyRunIntegrity(
         violations.push(
           `${pick.participantId}:${pick.gameId}:${pick.market}: decision configuration ${pick.configurationSha256} is not this arm's ${entry.configurationSha256}`,
         );
+      }
+    }
+  }
+
+  // RETAINED RESPONSE ENVELOPES: the complete provider body behind each attempt.
+  //
+  // Normalized evidence is a summary written by the parser of the day. When a
+  // provider ships a shape that parser does not recognize, the summary is
+  // empty and — before envelopes were retained — that was indistinguishable
+  // from a model that simply did not search (#92). Keeping the body makes the
+  // extraction REPLAYABLE, which only holds if the body is still the body: the
+  // digest is checked here, so an artifact edited after the fact does not
+  // describe itself.
+  //
+  // Two separate rules, because they answer different questions:
+  //   1. PRESENCE is required by DEFAULT and waived only for a file that reads
+  //      as a coherent pre-retention archive as a whole — no era stamp, every
+  //      leg's answer under the pre-#92 name `rawResponse`, and no
+  //      `responseEnvelope` key anywhere. Anything else is a retaining-era run
+  //      and is enforced. The era stamp NAMES the era in the message; it no
+  //      longer switches the rule off, because it was one optional field and
+  //      deleting it exempted a whole modern artifact.
+  //   2. INTEGRITY is unconditional. A present envelope is verified whatever
+  //      the era — a stamp that is present and wrong is always a violation.
+  //
+  // The archive predicate is a property of the FILE, so it is computed once
+  // here rather than re-derived per leg.
+  const preRetentionArchive = isCoherentPreRetentionArchive({
+    evidenceEraStamped: run.evidenceEra !== null,
+    legs: archivedLegs(run).map((attempt) => attempt.archiveEra),
+  });
+  for (const response of run.armResponses) {
+    const legs = [
+      ['attempt', response.attempt],
+      ['repair', response.repair],
+    ] as const;
+    for (const [leg, attempt] of legs) {
+      if (attempt === null) continue;
+      const where = `${response.participantId}:${response.gameId}:${leg}`;
+      if (attempt.responseEnvelope === null) {
+        // The two cases this skip is FOR, and no others: a file that predates
+        // retention entirely, and a leg where nothing came back — unsent, a
+        // timeout, a transport failure, a body that dropped mid-read (status
+        // 0), or a non-2xx status, none of which leaves a body to retain. A
+        // 2xx counts as a receipt even with every content field null, so a 200
+        // whose body was discarded no longer exempts itself by looking like
+        // silence — and the 2xx is read from the status, from the prose in
+        // `errorDetail`, and from the absence of the status key, so no one
+        // field switches it off.
+        if (!preRetentionArchive && receivedProviderResponse(attempt)) {
+          violations.push(
+            `${where}: a response was received but no response envelope was retained (${
+              run.evidenceEra !== null
+                ? `evidence era ${run.evidenceEra}`
+                : 'no evidence-era stamp, and this file is not a coherent pre-retention archive'
+            })`,
+          );
+        }
+        continue;
+      }
+      for (const failure of envelopeVerificationFailures(attempt.responseEnvelope)) {
+        violations.push(`${where}: ${failure}`);
       }
     }
   }

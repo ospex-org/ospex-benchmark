@@ -280,7 +280,7 @@ MUTANTS = [
      '        if (false) {',
      ['src/scoring.test.ts']),
     ('M54-reached-provider-always-false', 'src/scoring.ts',
-     '    attempt.rawResponse !== null ||',
+     '    attempt.answerText !== null ||',
      '    false ||',
      ['src/scoring.test.ts']),
 # --- the empty-key / path-encoding correction -----------------------------
@@ -790,6 +790,345 @@ MUTANTS = [
      '`${violating.length} executable as their owner: ${shown.join(\', \')}`',
      '`${shown.length} executable as their owner: ${shown.join(\', \')}`',
      ['src/servingSchemaGate.test.ts']),
+# --- #92: retained provider response envelopes ----------------------------
+# Every mutant below disables ONE stated guarantee of the retention change.
+    # The enabling defect itself: with the received text unreachable, nothing
+    # downstream can retain anything.
+    ('M130-http-discards-the-received-body', 'src/providers/http.ts',
+     "      return { status: response.status, json: JSON.parse(text) as unknown, bodyText: text };",
+     "      return { status: response.status, json: JSON.parse(text) as unknown, bodyText: '' };",
+     ['src/providers/responseEnvelope.test.ts']),
+    # Byte fidelity. Killed only by a fixture whose received bytes differ from
+    # its own JSON round trip -- NON_CANONICAL_BODY exists for exactly this.
+    ('M131-envelope-stored-canonicalized', 'src/providers/responseEnvelope.ts',
+     '  const body = redactSecrets(receivedBodyText);',
+     '  const body = redactSecrets(JSON.stringify(JSON.parse(receivedBodyText)));',
+     ['src/providers/responseEnvelope.test.ts']),
+    # The digest must cover what is STORED. With no credential present,
+    # redaction is the identity and this mutant is equivalent -- the credential
+    # case is the only thing in the suite that discriminates it.
+    ('M132-digest-taken-before-redaction', 'src/providers/responseEnvelope.ts',
+     '    sha256: sha256Hex(body),',
+     '    sha256: sha256Hex(receivedBodyText),',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M133-bytes-counts-characters', 'src/providers/responseEnvelope.ts',
+     "    bytes: Buffer.byteLength(body, 'utf8'),",
+     '    bytes: body.length,',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M134-digest-never-verified', 'src/providers/responseEnvelope.ts',
+     "  if (sha256Hex(envelope.body) !== envelope.sha256) failures.push(ENVELOPE_VIOLATION.DIGEST);",
+     '  if (false) failures.push(ENVELOPE_VIOLATION.DIGEST);',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    ('M135-byte-length-never-verified', 'src/providers/responseEnvelope.ts',
+     "  if (Buffer.byteLength(envelope.body, 'utf8') !== envelope.bytes) {",
+     '  if (false) {',
+     ['src/providers/responseEnvelope.test.ts']),
+    # An unfinished turn is a paid response and must retain its body too.
+    ('M136-unfinished-turn-loses-its-envelope', 'src/runner.ts',
+     '            responseEnvelope: error.responseEnvelope,',
+     '            responseEnvelope: null,',
+     ['src/runner.test.ts']),
+    # The repair leg ONLY. A build that kept the initial envelope and dropped
+    # the repair's would leave the ACCEPTED attempt unverifiable.
+    ('M137-repair-envelope-dropped', 'src/records.ts',
+     '      repair: result.repair === null ? null : attemptFields(result.repair),',
+     '      repair: result.repair === null ? null : { ...attemptFields(result.repair), responseEnvelope: null },',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Rule 3d, the same-typed positional swap: each field carries the other's
+    # value, with a correctly recomputed digest so nothing fails for a
+    # bookkeeping reason. Compound, because the swap needs the seal imported.
+    ('M138-answer-and-envelope-swapped', 'src/records.ts',
+     ("import { EVIDENCE_ERA } from './providers/responseEnvelope.js';",
+      '    answerText: attempt?.rawText ?? null,',
+      '    responseEnvelope: attempt?.responseEnvelope ?? null,'),
+     ("import { EVIDENCE_ERA, sealResponseEnvelope } from './providers/responseEnvelope.js';",
+      '    answerText: attempt?.responseEnvelope?.body ?? null,',
+      '    responseEnvelope: attempt?.rawText == null ? null : sealResponseEnvelope(attempt.rawText),'),
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    ('M139-era-stamp-omitted', 'src/records.ts',
+     '    evidenceEra: EVIDENCE_ERA,',
+     '    evidenceEra: undefined,',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Rule 3k: the skip is an opt-out unless the skipped case is unreachable.
+    ('M140-missing-envelope-always-skipped', 'src/scoring.ts',
+     '        if (!preRetentionArchive && receivedProviderResponse(attempt)) {',
+     '        if (false) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The legacy field name must still be read, or every archived run stops
+    # being scoreable the moment the rename lands.
+    #
+    # Scored on the integrity suite ALONE, deliberately. scoring.test.ts also
+    # reddens under this mutant -- its whole fixture corpus uses the legacy
+    # name -- but it takes over 240s to do it: with every archived body reading
+    # as absent, the run integrity check re-derives and re-reports across the
+    # entire corpus, and the battery reported HUNG rather than a verdict.
+    # Measured 2026-08-21: 4m40s and still running, against ~20s clean. The
+    # discriminating case is the archived-parity one in the integrity suite,
+    # which fails mutated in 15s and passes clean.
+    ('M141-archived-answer-name-ignored', 'src/scoring.ts',
+     '            answerText: response.attempt.answerText ?? response.attempt.rawResponse ?? null,',
+     '            answerText: response.attempt.answerText ?? null,',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The reporting half: absence of an envelope must not be read as proof that
+    # no search ran.
+    ('M142-unavailable-backfilled-as-no-search', 'src/servingProjection.ts',
+     "  if (searchAudit === null) return envelopeReplayable ? 'no_search_evidence' : 'unknown_unproven';",
+     "  if (searchAudit === null) return 'no_search_evidence';",
+     ['src/responseEnvelopeIntegrity.test.ts', 'src/servingProjection.test.ts']),
+    # A tampered body is not evidence about the call it names, so the replay
+    # must refuse it rather than extract from it.
+    ('M143-replay-reads-a-tampered-body', 'src/searchAuditReplay.ts',
+     '  if (envelopeVerificationFailures(envelope).length > 0) {',
+     '  if (false) {',
+     ['src/searchAuditReplay.test.ts']),
+
+    # --- found by the adversarial pass, and SURVIVING before it -------------
+    # Integrity is claimed for EVERY retained envelope, and on a repaired
+    # decision the repair is the leg whose body backs the published forecast.
+    # Every digest case tampered the initial leg, so verification could be
+    # disabled for the repair alone and the whole suite stayed green.
+    ('M144-repair-envelope-integrity-unchecked', 'src/scoring.ts',
+     '      for (const failure of envelopeVerificationFailures(attempt.responseEnvelope)) {',
+     "      for (const failure of leg === 'repair' ? [] : envelopeVerificationFailures(attempt.responseEnvelope)) {",
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Rule 3k, the second half: sweep the predicate. `reachedProvider` is three
+    # OR'd signals, and every fixture reaching the presence rule carried a
+    # non-null answer text, so the other two disjuncts were dead and a build
+    # consulting one signal exempted a leg whose answer had also been stripped.
+    ('M145-presence-gate-reads-one-disjunct', 'src/scoring.ts',
+     '        if (!preRetentionArchive && receivedProviderResponse(attempt)) {',
+     '        if (!preRetentionArchive && attempt.answerText !== null) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Idempotence on its own output. Rule 4b: the suite always runs
+    # credential-free (only the entry points call `loadDotEnv`), so redaction
+    # was the identity and the test asserted seal(x) == seal(x). The state the
+    # claim is about -- a credential present, as under `yarn smoke` -- was the
+    # one never exercised.
+    ('M146-seal-not-idempotent-on-own-output', 'src/providers/responseEnvelope.ts',
+     '  const body = redactSecrets(receivedBodyText);',
+     "  const body = receivedBodyText.includes('[REDACTED]')\n    ? `${redactSecrets(receivedBodyText)} `\n    : redactSecrets(receivedBodyText);",
+     ['src/providers/responseEnvelope.test.ts']),
+    # Neither name present must be REFUSED, not read as a null answer. Both
+    # field names are optional so a file carries one or the other; a record
+    # carrying neither parsed as `answerText: null` and every rule that reads
+    # the answer went quiet.
+    ('M147-neither-answer-name-required', 'src/scoring.ts',
+     '    if (value.answerText === undefined && value.rawResponse === undefined) {',
+     '    if (false) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The replay's two nulls. An envelope that is PRESENT but not well formed
+    # was reported as `unavailable` at exit 0 -- the same conflation of "we
+    # could not see" with "there was nothing to see" that #92 exists to remove.
+    # The privacy claim: the envelope BODY reaches no published row. Scored by
+    # publishing it, which is the only way to find out whether the marker scan
+    # covers the surfaces it says it does (it scans the whole plan, not just the
+    # attempt rows the envelope is nearest to).
+    ('M149-envelope-body-published', 'src/servingProjection.ts',
+     '    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeReplayable),',
+     "    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeReplayable),\n    responseEnvelopeBody: (nested(leg, 'responseEnvelope') as { body?: string } | null)?.body ?? null,",
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    ('M148-malformed-envelope-read-as-absent', 'src/searchAuditReplay.ts',
+     "  if (read.kind === 'malformed') return { ...base, envelope: 'malformed' };",
+     "  if (read.kind === 'malformed') return { ...base, envelope: 'unavailable' };",
+     ['src/searchAuditReplay.test.ts']),
+
+    # --- PR #109 round 2: the era redesign, the shared schema, the 2xx receipt
+    # One schema, two readers (B1-b). The replay's own three `typeof` checks are
+    # what the shared schema replaced: they accept an envelope carrying extra
+    # keys, which the scorer refuses outright.
+    ('M150-replay-keeps-its-own-loose-envelope-reader', 'src/searchAuditReplay.ts',
+     ("  const parsed = responseEnvelopeSchema.safeParse(value);\n"
+      "  if (!parsed.success) return { kind: 'malformed' };\n"
+      "  return { kind: 'envelope', envelope: parsed.data };"),
+     ("  const record = asRecord(value);\n"
+      "  if (record === null) return { kind: 'malformed' };\n"
+      "  const { body, sha256, bytes } = record;\n"
+      "  if (typeof body !== 'string' || typeof sha256 !== 'string' || typeof bytes !== 'number') {\n"
+      "    return { kind: 'malformed' };\n"
+      "  }\n"
+      "  return { kind: 'envelope', envelope: { body, sha256, bytes } };"),
+     ['src/searchAuditReplay.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    # The three schema rules, one mutant each. Each is killed only by the damage
+    # case that isolates it -- an extra key, an upper-case digest, a fractional
+    # byte count -- which is why the damage table has one boundary entry per rule
+    # rather than one blunt "not an envelope" fixture.
+    ('M151-envelope-schema-not-strict', 'src/providers/responseEnvelope.ts',
+     "    bytes: z.number().int().nonnegative(),\n  })\n  .strict();",
+     '    bytes: z.number().int().nonnegative(),\n  })\n  .passthrough();',
+     ['src/providers/responseEnvelope.test.ts', 'src/searchAuditReplay.test.ts',
+      'src/responseEnvelopeIntegrity.test.ts']),
+    ('M152-digest-field-shape-unchecked', 'src/providers/responseEnvelope.ts',
+     '    sha256: z.string().regex(/^[0-9a-f]{64}$/),',
+     '    sha256: z.string(),',
+     ['src/providers/responseEnvelope.test.ts', 'src/searchAuditReplay.test.ts',
+      'src/responseEnvelopeIntegrity.test.ts']),
+    ('M153-byte-count-shape-unchecked', 'src/providers/responseEnvelope.ts',
+     '    bytes: z.number().int().nonnegative(),',
+     '    bytes: z.number(),',
+     ['src/providers/responseEnvelope.test.ts', 'src/searchAuditReplay.test.ts',
+      'src/responseEnvelopeIntegrity.test.ts']),
+
+    # B1 proper: the era redesign. The rule this replaces is the mutant --
+    # deleting one optional field from a modern artifact turned presence off.
+    ('M154-presence-gated-on-the-era-stamp-again', 'src/scoring.ts',
+     '        if (!preRetentionArchive && receivedProviderResponse(attempt)) {',
+     '        if (run.evidenceEra !== null && receivedProviderResponse(attempt)) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The conjunction, one clause per mutant. A build missing any one of the
+    # three hands the exemption to an edit that leaves the other two intact.
+    ('M155-archive-ignores-the-envelope-key', 'src/providers/responseEnvelope.ts',
+     '  return run.legs.every((leg) => leg.rawResponse && !leg.answerText && !leg.responseEnvelope);',
+     '  return run.legs.every((leg) => leg.rawResponse && !leg.answerText);',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts',
+      'src/searchAuditReplay.test.ts']),
+    ('M156-archive-ignores-the-modern-answer-name', 'src/providers/responseEnvelope.ts',
+     '  return run.legs.every((leg) => leg.rawResponse && !leg.answerText && !leg.responseEnvelope);',
+     '  return run.legs.every((leg) => !leg.responseEnvelope);',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    ('M157-archive-ignores-the-era-stamp', 'src/providers/responseEnvelope.ts',
+     '  if (run.evidenceEraStamped) return false;',
+     '  if (false) return false;',
+     ['src/providers/responseEnvelope.test.ts']),
+    # Presence, not value. `responseEnvelope: null` is a key a retaining build
+    # wrote; reading it as absent was a measured bypass.
+    ('M158-era-signals-read-value-not-presence', 'src/providers/responseEnvelope.ts',
+     "    responseEnvelope: Object.hasOwn(record, 'responseEnvelope'),",
+     "    responseEnvelope: record['responseEnvelope'] != null,",
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    # The predicate is a property of the FILE. Reading one leg lets a hand-edit
+    # downgrade every other leg and keep the exemption.
+    ('M159-archive-decided-from-one-leg', 'src/scoring.ts',
+     '    legs: archivedLegs(run).map((attempt) => attempt.archiveEra),',
+     '    legs: archivedLegs(run).slice(0, 1).map((attempt) => attempt.archiveEra),',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    ('M160-replay-archive-decided-from-one-leg', 'src/searchAuditReplay.ts',
+     '    legs: raw.map((entry) => archiveEraSignals(entry.attempt)),',
+     '    legs: raw.slice(0, 1).map((entry) => archiveEraSignals(entry.attempt)),',
+     ['src/searchAuditReplay.test.ts']),
+    ('M161-replay-era-stamp-read-by-type', 'src/searchAuditReplay.ts',
+     "      if (Object.hasOwn(record, 'evidenceEra')) evidenceEraStamped = true;",
+     "      if (typeof record['evidenceEra'] === 'string') evidenceEraStamped = true;",
+     ['src/searchAuditReplay.test.ts']),
+
+    # B1-a: the replay must agree with the scorer about PRESENCE.
+    ('M162-unretained-collapsed-into-unavailable', 'src/searchAuditReplay.ts',
+     "    return { ...base, envelope: owed ? 'unretained' : 'unavailable' };",
+     "    return { ...base, envelope: 'unavailable' };",
+     ['src/searchAuditReplay.test.ts']),
+    ('M163-unretained-does-not-block', 'src/searchAuditReplay.ts',
+     "  unretained: 'unretained',",
+     "  unretained: 'clean',",
+     ['src/searchAuditReplay.test.ts']),
+    ('M164-quiet-prints-every-leg', 'src/searchAuditReplay.ts',
+     "      if (quiet ? !isBlockingState(leg.envelope) : leg.envelope === 'retained' && !leg.changed) continue;",
+     "      if (!quiet && leg.envelope === 'retained' && !leg.changed) continue;",
+     ['src/searchAuditReplay.test.ts']),
+    ('M165-unreadable-file-passes-silently', 'src/searchAuditReplay.ts',
+     ("      deps.log.line(`${file}: unreadable run file: ${error instanceof Error ? error.message : String(error)}`);\n"
+      '      blocking += 1;'),
+     ('      deps.log.line(`${file}: unreadable run file: ${error instanceof Error ? error.message : String(error)}`);\n'
+      '      blocking += 0;'),
+     ['src/searchAuditReplay.test.ts']),
+
+    # B2: a 2xx is a receipt, and its body is retained.
+    ('M166-2xx-receipt-not-counted', 'src/providers/responseEnvelope.ts',
+     '    isSuccessStatus(signals.httpStatus) ||',
+     '    false ||',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts',
+      'src/searchAuditReplay.test.ts']),
+    ('M167-2xx-receipt-bound-widened-to-4xx', 'src/providers/responseEnvelope.ts',
+     '    isSuccessStatus(signals.httpStatus) ||',
+     '    signals.httpStatus !== null ||',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M168-content-predicate-widened-to-the-status', 'src/providers/responseEnvelope.ts',
+     ('export function reachedProviderByContent(signals: ReceiptSignals): boolean {\n'
+      '  return (\n'
+      '    signals.answerText !== null ||'),
+     ('export function reachedProviderByContent(signals: ReceiptSignals): boolean {\n'
+      '  return (\n'
+      '    signals.httpStatus !== null ||\n'
+      '    signals.answerText !== null ||'),
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M169-http-discards-an-unparseable-2xx-body', 'src/providers/http.ts',
+     '        sealResponseEnvelope(text),',
+     '        null,',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M170-http-retains-a-non-2xx-body', 'src/providers/http.ts',
+     '        redactAndTruncate(text, 2000),\n      );',
+     '        redactAndTruncate(text, 2000),\n        sealResponseEnvelope(text),\n      );',
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M171-runner-drops-the-http-error-envelope', 'src/runner.ts',
+     '            responseEnvelope:\n              error instanceof ProviderHttpError ? error.responseEnvelope : null,',
+     '            responseEnvelope: null,',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+
+    # B1-c: exactly one answer name.
+    ('M172-both-answer-names-accepted', 'src/scoring.ts',
+     '    if (value.answerText !== undefined && value.rawResponse !== undefined) {',
+     '    if (false) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # Rule 3g-both: a rule written "refuse when they DIFFER" agrees with the
+    # shipped rule on the differing fixture and disagrees on the byte-equal one.
+    # Only the byte-equal fixture can kill this.
+    ('M173-both-names-refused-only-when-they-differ', 'src/scoring.ts',
+     '    if (value.answerText !== undefined && value.rawResponse !== undefined) {',
+     '    if (value.answerText !== undefined && value.rawResponse !== undefined && value.answerText !== value.rawResponse) {',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+
+    # --- the review round after B1/B2 ---------------------------------------
+    # A body that dropped mid-read is a TRANSPORT failure. Reporting the header
+    # status made an ordinary network event a 2xx receipt owing an envelope
+    # that cannot exist, which refuses the whole run file.
+    ('M174-http-reports-the-header-status-on-a-dropped-body', 'src/providers/http.ts',
+     '        0,\n        `response body read failed:',
+     '        response.status,\n        `response body read failed:',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts']),
+    # THREE receipt carriers, because one was one edit: nulling `httpStatus` on
+    # a contentless leg switched the envelope requirement back off.
+    ('M175-receipt-ignores-the-prose-status', 'src/providers/responseEnvelope.ts',
+     '    isSuccessStatus(statusFromErrorDetail(signals.errorDetail)) ||',
+     '    false ||',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts',
+      'src/searchAuditReplay.test.ts']),
+    ('M176-prose-status-not-bounded-to-2xx', 'src/providers/responseEnvelope.ts',
+     '    isSuccessStatus(statusFromErrorDetail(signals.errorDetail)) ||',
+     '    statusFromErrorDetail(signals.errorDetail) !== null ||',
+     ['src/providers/responseEnvelope.test.ts', 'src/searchAuditReplay.test.ts']),
+    # Anchored: the leading clause is this call's own status, and a later
+    # "returned HTTP 200" is a body the provider quoted back.
+    ('M177-prose-status-read-unanchored', 'src/providers/responseEnvelope.ts',
+     "  const match = /^\\S+ returned HTTP (\\d{1,3}):/.exec(errorDetail);",
+     "  const match = /\\S+ returned HTTP (\\d{1,3}):/.exec(errorDetail);",
+     ['src/providers/responseEnvelope.test.ts']),
+    ('M178-receipt-ignores-a-deleted-status-key', 'src/providers/responseEnvelope.ts',
+     '    !signals.httpStatusRecorded',
+     '    false',
+     ['src/providers/responseEnvelope.test.ts', 'src/responseEnvelopeIntegrity.test.ts',
+      'src/searchAuditReplay.test.ts']),
+    ('M179-scorer-assumes-the-status-key-is-there', 'src/scoring.ts',
+     '            httpStatusRecorded: recordsHttpStatus(rawLegs.attempt),',
+     '            httpStatusRecorded: true,',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The scorer's OTHER install site for the era stamp. Every deletion-table
+    # row but one deletes the stamp, so a build reading the legs alone answered
+    # all of them correctly and this survived the whole suite.
+    ('M180-scorer-ignores-the-era-stamp', 'src/scoring.ts',
+     '    evidenceEraStamped: run.evidenceEra !== null,',
+     '    evidenceEraStamped: false,',
+     ['src/responseEnvelopeIntegrity.test.ts']),
+    # The replay must read the pre-#92 answer name as a receipt, or every
+    # archived leg in a file the archive predicate refuses is exempted.
+    ('M181-replay-ignores-the-archived-answer-name', 'src/searchAuditReplay.ts',
+     "    answerText: text(attempt['answerText']) ?? text(attempt['rawResponse']),",
+     "    answerText: text(attempt['answerText']),",
+     ['src/searchAuditReplay.test.ts']),
+    # Presence is not replayability: a retained HTML error page verifies against
+    # its own digest and supports no re-derivation, so publishing the provable
+    # negative `no_search_evidence` for it is a claim nothing can check.
+    ('M182-projection-reads-envelope-presence-only', 'src/servingProjection.ts',
+     "  const envelopeReplayable = envelope !== null && parsesAsJson(str(envelope, 'body'));",
+     '  const envelopeReplayable = envelope !== null;',
+     ['src/responseEnvelopeIntegrity.test.ts', 'src/servingProjection.test.ts']),
 ]
 
 

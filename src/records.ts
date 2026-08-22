@@ -7,6 +7,7 @@ import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
 import { runBaselines } from './baselines.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { authenticateRun } from './runner.js';
+import { EVIDENCE_ERA } from './providers/responseEnvelope.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
 import type { RunEnvelope } from './runner.js';
@@ -73,7 +74,20 @@ function attemptFields(attempt: AttemptRecord | null): JsonRecord {
     searchAudit: attempt?.searchAudit ?? null,
     providerResponseId: attempt?.providerResponseId ?? null,
     requestParams: attempt?.requestParams ?? null,
-    rawResponse: attempt?.rawText ?? null,
+    // The EXTRACTED answer text — the model's own words, and nothing else.
+    //
+    // Named `answerText` rather than the historical `rawResponse`, which said
+    // "raw" while carrying the adapter's extraction: the whole provider body
+    // was thrown away at the adapter, so a search audit that came back empty
+    // could never be re-read (#92). With an envelope beside it, one field
+    // called "raw response" and another called "response envelope" describing
+    // different things is the confusion that produced the defect. Readers of
+    // archived files (the scorer, the serving projection) accept either name.
+    answerText: attempt?.rawText ?? null,
+    // The COMPLETE provider response body this answer was extracted from, with
+    // its own digest. Private evidence: it lives in the run file under `out/`
+    // and no serving column carries it.
+    responseEnvelope: attempt?.responseEnvelope ?? null,
     errorDetail: attempt?.errorDetail ?? null,
     // The structured provider completion state (never prose): the non-final
     // terminal string for an unfinished turn, and whether the provider
@@ -205,6 +219,17 @@ export function buildRecords(
     slateCutoffAt: slate.cutoffAt,
     promptScaffoldVersion: PROMPT_SCAFFOLD_VERSION,
     promptScaffoldSha256: promptScaffoldSha256(),
+    // The EVIDENCE ERA this run was produced under. It DECLARES that this build
+    // retains a complete provider response envelope on every attempt that
+    // received a response, and it names that era in a violation message.
+    //
+    // It is not a switch. The scorer requires an envelope by default and
+    // exempts only a file that reads as a coherent pre-retention archive as a
+    // whole (`isCoherentPreRetentionArchive`), so deleting this line from a
+    // written artifact does not make its missing envelopes acceptable — it is
+    // one of 2N+1 era markers and every one of them can only raise
+    // enforcement.
+    evidenceEra: EVIDENCE_ERA,
     // Facts the SERVING PROJECTION freezes on its run row and then compares
     // against on every later write for that run. They are stamped here, into
     // the artifact, rather than read from constants when publishing, because

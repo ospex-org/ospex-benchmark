@@ -318,8 +318,41 @@ export interface SearchAudit {
   incomplete: string[];
 }
 
+/**
+ * The provider's complete HTTP response BODY for one attempt, retained so a
+ * search/tool audit can be re-extracted later — after a parser fix, or after
+ * the provider ships a shape the extractor of the day did not recognize.
+ *
+ * `body` is the received body text with credential values substituted out; it
+ * is NOT canonicalized and NOT re-serialized. Key order, indentation and
+ * number formatting are exactly what arrived, because those are part of the
+ * evidence: an unrecognized shape is recognizable later only if the bytes that
+ * carried it survive. `sha256` is taken over `body` as stored, so a later edit
+ * to the retained text is detectable; `bytes` is that same string's UTF-8
+ * length (characters and bytes disagree on any non-ASCII body).
+ *
+ * Retained on a 2xx WHATEVER THE BODY TURNED OUT TO BE. The bytes are sealed
+ * before any adapter reads the parse, and that read runs inside the one guard
+ * that converts a shape it cannot walk into a typed failure carrying this
+ * envelope and the status — so the retention does not depend on the extractor
+ * of the day recognizing what came back. Non-2xx bodies retain nothing and keep
+ * their existing truncated error detail; see `postJsonAndRead`.
+ *
+ * PRIVATE evidence. It stays in the run NDJSON under `out/` (gitignored), and
+ * no row the serving projection builds carries the body — attempts, decisions
+ * and run facts alike, pinned by a marker scan over the whole projection plan.
+ * What the projection takes from an envelope is whether one exists.
+ */
+export interface ProviderResponseEnvelope {
+  body: string;
+  sha256: string;
+  bytes: number;
+}
+
 export interface ProviderResponse {
   rawText: string;
+  /** The complete response body this answer text was extracted from. */
+  responseEnvelope: ProviderResponseEnvelope;
   reportedModelId: string | null;
   providerResponseId: string | null;
   httpStatus: number;
@@ -396,8 +429,26 @@ export interface ProviderAdapter {
 
 export interface AttemptRecord {
   rawText: string | null;
+  /**
+   * The complete provider response body for this attempt, or `null` when no
+   * body was retained: unsent, timeout, transport failure, a body that dropped
+   * MID-READ after the headers arrived (recorded as status 0, because a body
+   * that was never read is not a receipt), or a non-2xx status (whose body is
+   * deliberately not kept — see `postJsonAndRead`). A 2xx retains one whatever
+   * its body turned out to be: bytes that are not JSON, and JSON in a shape
+   * this build's extractor cannot walk, both keep it. Serialized as
+   * `responseEnvelope`, beside `answerText` — which holds the extracted answer
+   * only.
+   */
+  responseEnvelope: ProviderResponseEnvelope | null;
   reportedModelId: string | null;
   providerResponseId: string | null;
+  /**
+   * The status this attempt settled on; `null` when the call never got one and
+   * `0` when no HTTP exchange completed (a transport failure, or a body that
+   * dropped mid-read). The scorer reads a 2xx here as a RECEIPT that a body
+   * arrived, so the two must stay distinct.
+   */
   httpStatus: number | null;
   usage: ProviderUsage | null;
   usageRaw: unknown;

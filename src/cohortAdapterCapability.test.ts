@@ -17,6 +17,7 @@ import { buildRehearsalManifest } from './rehearsalManifest.js';
 import type { RehearsalManifestOptions } from './rehearsalManifest.js';
 import { defaultExpectedArms } from './scoring.js';
 import type { ChatTurn, ProviderAdapter, ProviderResponse } from './types.js';
+import { fixtureEnvelope } from './testFactories.js';
 
 /**
  * The opaque adapter capability's brand, capture, and immutability contract: raw maps and
@@ -34,6 +35,7 @@ function adapterFixture(marker: string): ProviderAdapter & { swapped?: boolean }
     async chat(_t: ChatTurn[], _ms: number): Promise<ProviderResponse> {
       return {
         rawText: marker,
+        responseEnvelope: fixtureEnvelope(marker),
         reportedModelId: 'claude-fable-5',
         providerResponseId: 'x',
         httpStatus: 200,

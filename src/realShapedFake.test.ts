@@ -10,6 +10,8 @@ import {
 import type { RequestPayload } from './mock.js';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { createRealShapedFakeAdapters } from './realShapedFake.js';
+import { envelopeVerificationFailures } from './providers/responseEnvelope.js';
+import type { ProviderResponse } from './types.js';
 import type { ChatTurn, GameBundle, ProviderAdapter } from './types.js';
 
 /**
@@ -19,9 +21,31 @@ import type { ChatTurn, GameBundle, ProviderAdapter } from './types.js';
  * so this suite drives each fake adapter directly and DEEP-EQUALS its COMPLETE
  * `ProviderResponse` — verbatim provider-specific `usageRaw` included. A mutation that
  * nulls or reshapes any envelope field fails here, not silently.
+ *
+ * `responseEnvelope` is the one field held out of the deep-equal and checked by
+ * its PROPERTIES instead (`envelopeOf`): pinning the retained body as a literal
+ * would restate the fake's own construction on both sides of the assertion and
+ * prove only that the value was copied. Holding it out keeps the deep-equal
+ * exhaustive — anything else added to `ProviderResponse` still fails here.
  */
 
 const GAME_ID = '00000000-0000-4000-8000-00000000ffff';
+
+/**
+ * Split the retained envelope off a complete response, verifying it on the way:
+ * it must reproduce its own digest and byte count, and its body must be the
+ * provider body the answer text came out of.
+ */
+function envelopeOf(result: ProviderResponse): Omit<ProviderResponse, 'responseEnvelope'> {
+  const { responseEnvelope, ...rest } = result;
+  assert.deepEqual(envelopeVerificationFailures(responseEnvelope), []);
+  const parsed = JSON.parse(responseEnvelope.body) as {
+    output: Array<{ content: Array<{ text: string }> }>;
+  };
+  assert.equal(parsed.output[0]!.content[0]!.text, result.rawText, 'the answer came out of that body');
+  assert.notEqual(responseEnvelope.body, result.rawText, 'the body is the envelope, not the answer');
+  return rest;
+}
 
 function gameFixture(gameId: string): GameBundle {
   return {
@@ -89,7 +113,7 @@ test('the fake rosters the four canonical arms with exact identities and credent
 test('openai fake: the COMPLETE ProviderResponse — fenced body, ids, and verbatim subset-reasoning usageRaw', async () => {
   const payload = payloadFor('openai-gpt-5.6-sol', 'gpt-5.6-sol', GAME_ID);
   const result = await fake().get('openai-gpt-5.6-sol')!.chat(turnsFor(payload), 5_000);
-  assert.deepEqual(result, {
+  assert.deepEqual(envelopeOf(result), {
     rawText: fenced(JSON.stringify(buildValidResponse(payload))),
     reportedModelId: 'gpt-5.6-sol',
     providerResponseId: 'resp_fakeffff',
@@ -129,7 +153,7 @@ test('openai fake: HTTP 429 on the fixture throttle game AND on the configured g
 test('anthropic fake: the COMPLETE ProviderResponse — verbatim usageRaw with BOTH cache fields', async () => {
   const payload = payloadFor('anthropic-claude-fable-5', 'claude-fable-5', GAME_ID);
   const result = await fake().get('anthropic-claude-fable-5')!.chat(turnsFor(payload), 5_000);
-  assert.deepEqual(result, {
+  assert.deepEqual(envelopeOf(result), {
     rawText: fenced(JSON.stringify(buildValidResponse(payload))),
     reportedModelId: 'claude-fable-5',
     providerResponseId: 'msg_fakeffff',
@@ -172,7 +196,7 @@ test('google fake initial: the COMPLETE ProviderResponse — prose+fence wrong-c
   const payload = payloadFor('google-gemini-3.1-pro-preview', 'gemini-3.1-pro-preview', GAME_ID);
   const wrongEcho = { ...buildValidResponse(payload), cohortId: 'fake-wrong-cohort' };
   const result = await fake().get('google-gemini-3.1-pro-preview')!.chat(turnsFor(payload), 5_000);
-  assert.deepEqual(result, {
+  assert.deepEqual(envelopeOf(result), {
     rawText: `Forecast batch follows.\n${fenced(JSON.stringify(wrongEcho))}\nEnd of batch.`,
     reportedModelId: 'gemini-3.1-pro-preview',
     providerResponseId: 'resp-fake-ffff',

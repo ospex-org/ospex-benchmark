@@ -37,6 +37,7 @@ import type {
   ProviderResponse,
   SlateBundle,
 } from './types.js';
+import { fixtureEnvelope } from './testFactories.js';
 
 /**
  * The fire-artifact producer (SPEC §4/§5). Every test drives real code: the
@@ -167,6 +168,7 @@ function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): Bench
 function stubResponse(rawText: string, reportedModelId: string): ProviderResponse {
   return {
     rawText,
+    responseEnvelope: fixtureEnvelope(rawText),
     reportedModelId,
     providerResponseId: 'stub-response',
     httpStatus: 200,

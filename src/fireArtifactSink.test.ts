@@ -40,6 +40,7 @@ import type {
   ProviderResponse,
   SlateBundle,
 } from './types.js';
+import { fixtureEnvelope } from './testFactories.js';
 
 /**
  * The durable fire-artifact sink. Every test drives a REAL produced `FireArtifactV1`
@@ -166,6 +167,7 @@ function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): Bench
 function stubResponse(rawText: string, reportedModelId: string): ProviderResponse {
   return {
     rawText,
+    responseEnvelope: fixtureEnvelope(rawText),
     reportedModelId,
     providerResponseId: 'stub-response',
     httpStatus: 200,

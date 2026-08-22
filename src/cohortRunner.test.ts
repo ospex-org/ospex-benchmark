@@ -54,6 +54,7 @@ import type {
   ProviderName,
   ProviderResponse,
 } from './types.js';
+import { fixtureEnvelope } from './testFactories.js';
 
 /**
  * The per-tick cohort runner loop, driven end to end over injected seams: a genuine
@@ -413,7 +414,8 @@ function smartAdapters(
       credentialEnvVar: `${arm.participantId.replace(/[^a-z0-9]/gi, '_').toUpperCase()}_KEY`,
       hasCredential: () => true,
       async chat(turns: ChatTurn[], _ms: number): Promise<ProviderResponse> {
-        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: usageRawFor ? usageRawFor(arm) : {}, requestParams: {}, searchAudit: null };
+        const body = bodyFromPrompt(turns);
+        return { rawText: body, responseEnvelope: fixtureEnvelope(body), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: usageRawFor ? usageRawFor(arm) : {}, requestParams: {}, searchAudit: null };
       },
     };
     map.set(arm.participantId, adapter);
@@ -684,7 +686,8 @@ test('B2-R2: the persisted dispatch start is the EXACT tick-clock value read at 
       hasCredential: () => true,
       async chat(turns: ChatTurn[], _ms: number): Promise<ProviderResponse> {
         dispatchStarts.push(emissions[emissions.length - 1]!);
-        return { rawText: bodyFromPrompt(turns), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {}, searchAudit: null };
+        const body = bodyFromPrompt(turns);
+        return { rawText: body, responseEnvelope: fixtureEnvelope(body), reportedModelId: arm.requestedModelId, providerResponseId: 'x', httpStatus: 200, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, usageRaw: {}, requestParams: {}, searchAudit: null };
       },
     });
   }

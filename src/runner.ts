@@ -6,7 +6,12 @@ import {
   fingerprintFromParsed,
   validateResponseText,
 } from './schema.js';
-import { ProviderHttpError, ProviderTimeoutError, ProviderUnfinishedTurnError } from './providers/errors.js';
+import {
+  ProviderHttpError,
+  ProviderTimeoutError,
+  ProviderUnfinishedTurnError,
+  ProviderUnreadableResponseError,
+} from './providers/errors.js';
 import { redactSearchAudit } from './providers/searchAudit.js';
 import { assertPrepared, prepareGameRequest } from './preparedRequest.js';
 import { BASELINE_POLICY_VERSION, type BaselinePolicyVersion } from './baselines.js';
@@ -305,6 +310,7 @@ export class ClockRequiredError extends Error {
 function emptyAttempt(): AttemptRecord {
   return {
     rawText: null,
+    responseEnvelope: null,
     reportedModelId: null,
     providerResponseId: null,
     httpStatus: null,
@@ -379,6 +385,10 @@ async function timedChat(
     const respondedAt = nowMs();
     return {
       rawText: redactSecrets(response.rawText),
+      // Carried through, not re-sealed: `sealResponseEnvelope` already redacted
+      // the body and hashed exactly what it stored, so re-hashing here would
+      // only move the one binding away from the code that produced it.
+      responseEnvelope: response.responseEnvelope,
       reportedModelId: response.reportedModelId,
       providerResponseId: response.providerResponseId,
       httpStatus: response.httpStatus,
@@ -405,7 +415,8 @@ async function timedChat(
     const detail =
       error instanceof ProviderHttpError ||
       error instanceof ProviderTimeoutError ||
-      error instanceof ProviderUnfinishedTurnError
+      error instanceof ProviderUnfinishedTurnError ||
+      error instanceof ProviderUnreadableResponseError
         ? error.message
         : describeError(error);
     const respondedAt = nowMs();
@@ -422,6 +433,10 @@ async function timedChat(
       error instanceof ProviderUnfinishedTurnError
         ? {
             rawText: redactSecrets(error.rawText),
+            // A paid, received response retains its envelope on the same terms
+            // as a returned one — and this is the path where an unrecognized
+            // provider shape is most likely to show up.
+            responseEnvelope: error.responseEnvelope,
             reportedModelId: error.reportedModelId,
             providerResponseId: error.providerResponseId,
             httpStatus: error.httpStatus,
@@ -437,7 +452,29 @@ async function timedChat(
             providerStopReason: error.stopReason,
             turnCompleted: false,
           }
-        : { httpStatus: error instanceof ProviderHttpError ? error.status : null };
+        : error instanceof ProviderUnreadableResponseError
+          ? {
+              // A 2xx whose JSON this build could not read is a received
+              // response like any other: the body arrived, `postJsonAndRead`
+              // sealed it before the read that threw, and both the status and
+              // the bytes are on the typed error. Without this branch the
+              // throw was untyped, so BOTH were dropped and the leg read as a
+              // call that never landed — with the sealed evidence already in
+              // hand.
+              httpStatus: error.httpStatus,
+              responseEnvelope: error.responseEnvelope,
+            }
+          : {
+              httpStatus: error instanceof ProviderHttpError ? error.status : null,
+              // A 2xx whose body is not JSON at all IS a received response,
+              // and the http layer seals those bytes onto the error. Carrying
+              // them here is what makes the persisted leg evidence instead of
+              // a record indistinguishable from a call that never landed. Null
+              // on every other error path, where nothing was received or
+              // nothing is retained (see ProviderHttpError.responseEnvelope).
+              responseEnvelope:
+                error instanceof ProviderHttpError ? error.responseEnvelope : null,
+            };
     return {
       ...emptyAttempt(),
       ...carried,

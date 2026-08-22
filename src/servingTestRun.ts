@@ -3,6 +3,8 @@ import { buildBundle } from './bundle.js';
 import { fireEligibleGame } from './watch.js';
 import { makeValidResponse, TEST_ARM } from './testFactories.js';
 import { ARMS } from './providers/index.js';
+import { ProviderHttpError } from './providers/errors.js';
+import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { parseRunArtifact } from './servingProjection.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
 
@@ -95,7 +97,20 @@ export function fullBoardInputs(gameId: string = GAME_ID): SlateInputs {
  * instant is only provably withheld when nothing came back, and ordinal 1 only
  * appears when a repair ran.
  */
-export type StubBehaviour = 'ok' | 'unsent' | 'transport-failure' | 'repaired';
+export type StubBehaviour =
+  | 'ok'
+  | 'unsent'
+  | 'transport-failure'
+  | 'repaired'
+  | 'unparseable-2xx';
+
+/**
+ * A 2xx body no JSON parser accepts — bytes a proxy in front of a provider
+ * really sends. Written non-canonically so "the exact bytes survived" is a
+ * checkable claim rather than something a re-serialization could reproduce.
+ */
+export const UNPARSEABLE_2XX_BODY =
+  '<!doctype html>\n  <html><head><title>504</title></head>\n  <body>upstream timeout</body></html>';
 
 function stubAdapter(
   build: BuildResult,
@@ -122,6 +137,23 @@ function stubAdapter(
       if (behaviour === 'transport-failure') {
         return Promise.reject(new Error('synthetic transport failure'));
       }
+      // A 200 whose body is not JSON. The adapter extracts nothing, so the
+      // persisted leg has every content field null and only the status says a
+      // body arrived — the shape that used to read downstream as "nothing came
+      // back". Raised as the typed error `postJson` raises, carrying the same
+      // sealed bytes, because what is under test here is what the RUNNER
+      // persists; the http layer's own half is pinned in
+      // `providers/responseEnvelope.test.ts` against a canned fetch.
+      if (behaviour === 'unparseable-2xx') {
+        return Promise.reject(
+          new ProviderHttpError(
+            arm.provider,
+            200,
+            'non-JSON response body: <!doctype html>',
+            sealResponseEnvelope(UNPARSEABLE_2XX_BODY),
+          ),
+        );
+      }
       // The repair is offered only when the initial body yields a complete
       // decision fingerprint, so that the repair can be proved to preserve it —
       // an unparseable or shape-invalid first body is refused outright and no
@@ -137,6 +169,17 @@ function stubAdapter(
           : valid();
       return Promise.resolve({
         rawText,
+        // No wire body exists here; one is composed from the values this stub
+        // reports and sealed by the same function a live adapter uses, so the
+        // artifact carries the same evidence shape a real run would.
+        responseEnvelope: sealResponseEnvelope(
+          JSON.stringify({
+            synthetic: 'serving-test-stub',
+            model: arm.requestedModelId,
+            id: 'stub-response',
+            output: [{ type: 'message', content: [{ type: 'output_text', text: rawText }] }],
+          }),
+        ),
         // The body must report the id the arm is APPROVED for, or the
         // artifact contradicts itself and the identity gate refuses it.
         reportedModelId: arm.requestedModelId,
@@ -201,6 +244,27 @@ export interface FireOptions {
   /** The fire's log sink. A case that needs the PUBLISHER's own line to throw
    *  supplies one; everything else keeps the silent default. */
   readonly log?: (line: string) => void;
+  /**
+   * Dispatch through this adapter instead of the stub.
+   *
+   * Exists so a case can drive the PRODUCTION adapter — the real request
+   * builder, the real `postJson`, the real error types — against a controlled
+   * `globalThis.fetch`, and then read what the runner wrote. Without it the
+   * http layer and the artifact are pinned by two tests that meet in the
+   * middle, and a change to what the http layer hands the runner is invisible
+   * to both. The adapter must answer to the dispatched arm's participant id.
+   */
+  readonly adapter?: ProviderAdapter;
+  /**
+   * The per-call deadline handed to the adapter. Defaults to the 60s a real
+   * fire uses.
+   *
+   * A case that wants a GENUINE `ProviderTimeoutError` — raised by the real
+   * `postJsonAndRead` against a `fetch` that never settles, rather than by a
+   * stub rejecting with the type — sets this small. Faking the rejection would
+   * test the fixture; waiting out 60s would not be run.
+   */
+  readonly timeoutMs?: number;
 }
 
 export async function firedRun(options: FireOptions): Promise<FiredRun> {
@@ -238,11 +302,14 @@ export async function firedRun(options: FireOptions): Promise<FiredRun> {
   const outcome = await fireEligibleGame(build, inputs, TEST_SLATE_DATE, provenance, {
     arms: [arm],
     adapters: new Map([
-      [arm.participantId, stubAdapter(build, TEST_COHORT_ID, options.behaviour ?? 'ok', arm)],
+      [
+        arm.participantId,
+        options.adapter ?? stubAdapter(build, TEST_COHORT_ID, options.behaviour ?? 'ok', arm),
+      ],
     ]),
     approvedReportedModelIds: () => [arm.requestedModelId],
     outDir: options.outDir,
-    timeoutMs: 60_000,
+    timeoutMs: options.timeoutMs ?? 60_000,
     maxOutputTokens: 16000,
     mode: options.mode ?? 'live',
     clockMode: 'wall',

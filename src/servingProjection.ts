@@ -553,9 +553,21 @@ function attemptFacts(
 ): AttemptFacts {
   const requestAt = str(leg, 'requestAt');
   const httpStatus = num(leg, 'httpStatus');
-  const rawResponse = str(leg, 'rawResponse');
+  // Either name: `answerText` on files written since #92, `rawResponse` on
+  // everything archived before it. Same value under both.
+  const answerText = str(leg, 'answerText') ?? str(leg, 'rawResponse');
   const tokens = nested(leg, 'tokens');
   const searchAudit = nested(leg, 'searchAudit');
+  // The envelope BODY is private evidence and no serving column carries it;
+  // what the projection needs from it is whether this attempt's audit can still
+  // be RE-DERIVED, which is what decides how far the recorded status can be
+  // trusted. So presence is not enough: retention now covers every 2xx,
+  // including the HTML error page a proxy returns, and a body no JSON parser
+  // accepts disproves nothing. Reading presence alone would publish the
+  // provable negative `no_search_evidence` on the strength of bytes nobody can
+  // replay — which is the conflation #92 exists to remove, one layer over.
+  const envelope = nested(leg, 'responseEnvelope');
+  const envelopeReplayable = envelope !== null && parsesAsJson(str(envelope, 'body'));
 
   return {
     attemptOrdinal,
@@ -576,7 +588,7 @@ function attemptFacts(
     // responseAt is stamped on timeouts and transport failures too, so it is
     // not a receipt on its own. Published only when something actually came
     // back; otherwise every timeout would claim a response it never received.
-    responseAt: rawResponse !== null || httpStatus !== null ? str(leg, 'responseAt') : null,
+    responseAt: answerText !== null || httpStatus !== null ? str(leg, 'responseAt') : null,
     latencyMs: num(leg, 'latencyMs'),
     inputTokens: tokens === null ? null : num(tokens, 'inputTokens'),
     outputTokens: tokens === null ? null : num(tokens, 'outputTokens'),
@@ -586,7 +598,7 @@ function attemptFacts(
     reasoningTokens: tokens === null ? null : num(tokens, 'reasoningTokens'),
     billableOutputTokens: tokens === null ? null : num(tokens, 'billableOutputTokens'),
     billableSearchCount: searchAudit === null ? null : num(searchAudit, 'searchCount'),
-    searchEvidenceStatus: searchEvidenceStatus(searchAudit),
+    searchEvidenceStatus: searchEvidenceStatus(searchAudit, envelopeReplayable),
     costUsd: null,
     priceVersion: null,
   };
@@ -600,9 +612,41 @@ function attemptFacts(
  * lists a reason for every gap otherwise. So "nothing ran" and "we could not
  * see what ran" never collapse into one value, and neither is ever reported as
  * a search count of zero.
+ *
+ * The absent audit needed one more distinction, which is the reporting half of
+ * #92. An empty audit is a claim made by the extractor that read the response,
+ * and that claim is only checkable while the response survives. With a
+ * REPLAYABLE envelope, `no_search_evidence` can be re-derived — and disproved —
+ * from the stored body. Without one (every file archived before retention, and
+ * every 2xx whose retained body no JSON parser accepts) the same absence is
+ * unfalsifiable, so it is reported as `unknown_unproven`: ENVELOPE-UNAVAILABLE,
+ * not "nothing ran".
+ *
+ * Replayable, not merely present, because the two came apart in this change.
+ * Retention now covers every 2xx — an HTML error page from a proxy included —
+ * so a leg can carry bytes that verify against their own digest and still
+ * support no re-derivation at all. `replay:search-audit` calls that leg
+ * `unparseable` and exits 1; publishing `no_search_evidence` for it would be
+ * this table asserting a provable negative the tool beside it refuses to make.
+ *
+ * Both values already exist in this column, which is plain `text` with no
+ * check constraint (ospex-indexer migration 073), so nothing about the schema
+ * moves.
  */
-function searchEvidenceStatus(searchAudit: JsonRecord | null): string {
-  if (searchAudit === null) return 'no_search_evidence';
+/** Whether a retained body can be parsed at all — the property that makes an
+ *  empty audit re-derivable rather than merely archived. */
+function parsesAsJson(body: string | null): boolean {
+  if (body === null) return false;
+  try {
+    JSON.parse(body);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function searchEvidenceStatus(searchAudit: JsonRecord | null, envelopeReplayable: boolean): string {
+  if (searchAudit === null) return envelopeReplayable ? 'no_search_evidence' : 'unknown_unproven';
   const incomplete = strings(searchAudit, 'incomplete');
   if (incomplete === null) return 'unknown_unproven';
   return incomplete.length === 0 ? 'complete' : 'unknown_unproven';

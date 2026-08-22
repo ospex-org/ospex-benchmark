@@ -54,6 +54,7 @@ import type {
   ProviderName,
   ProviderResponse,
 } from './types.js';
+import { fixtureEnvelope } from './testFactories.js';
 
 /**
  * The escalation-latch ACCEPTANCE battery — the exact sequence docs/CAMPAIGN-ACTIVATION.md
@@ -295,6 +296,7 @@ function respondingAdapters(
         calls += 1;
         return {
           rawText: validBody(id.participantId, id.requestedModelId, snapshot.booted.cohortId, snapshot.prepared.requestSha256, game),
+          responseEnvelope: fixtureEnvelope('escalation-latch-acceptance'),
           reportedModelId: id.requestedModelId,
           providerResponseId: 'x',
           httpStatus: 200,

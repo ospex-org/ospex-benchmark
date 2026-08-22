@@ -1,0 +1,1201 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { sha256Hex, canonicalize } from '../canonical.js';
+import { writeNdjson } from '../records.js';
+import {
+  ProviderHttpError,
+  ProviderUnfinishedTurnError,
+  ProviderUnreadableResponseError,
+} from './errors.js';
+import { postJsonAndRead } from './http.js';
+import type { ProviderRequest, ReceivedResponse } from './http.js';
+import { createRealAdapters } from './index.js';
+import {
+  archiveEraSignals,
+  ENVELOPE_VIOLATION,
+  envelopeVerificationFailures,
+  isCoherentPreRetentionArchive,
+  reachedProviderByContent,
+  receivedProviderResponse,
+  recordsHttpStatus,
+  responseEnvelopeSchema,
+  sealResponseEnvelope,
+  statusFromErrorDetail,
+} from './responseEnvelope.js';
+import { damageEnvelope, ENVELOPE_DAMAGE } from '../testFactories.js';
+import type { EnvelopeDamage } from '../testFactories.js';
+import type { ReceiptSignals } from './responseEnvelope.js';
+import type { ChatTurn, ProviderAdapter, ProviderResponse } from '../types.js';
+
+/**
+ * RETENTION of the complete provider response body (#92), at the two layers
+ * that decide whether it is worth anything: the seal itself, and the four arms
+ * that produce an attempt.
+ *
+ * The seal's two properties are the ones the issue turns on — the stored body
+ * is the received bytes rather than a re-serialization of their parse, and the
+ * digest covers exactly the string that is stored. Both are tested with
+ * fixtures chosen so a wrong implementation cannot pass: see NON_CANONICAL_BODY
+ * and the credential case.
+ *
+ * The adapter layer is exercised through the PRODUCTION registry with a
+ * controlled `globalThis.fetch`, mirroring `cannedHttp.test.ts`, so what is
+ * asserted is the body a real adapter would retain and not a re-derivation of
+ * it. No network is reachable and every credential is synthetic.
+ */
+
+const TURNS: ChatTurn[] = [
+  { role: 'system', content: 'system prompt' },
+  { role: 'user', content: 'user prompt' },
+];
+
+const SYNTHETIC_KEY = 'synthetic-test-credential';
+
+/**
+ * A body no plausible normalization leaves alone. Every one of these is a
+ * detail a canonicalizer would erase, and each dies under a DIFFERENT
+ * normalization, so the fixture discriminates byte fidelity from all of them:
+ *
+ *   - two-space indentation and newlines (any re-serialization drops them);
+ *   - `modelVersion` before `candidates`, i.e. NOT alphabetical (a key-sorting
+ *     canonicalizer reorders them);
+ *   - `1.50`, which a JSON round trip rewrites as `1.5`;
+ *   - `é` written as an ESCAPE, which a round trip rewrites as the literal
+ *     character;
+ *   - a LITERAL multibyte character elsewhere, so the byte count and the
+ *     character count of this body disagree.
+ *
+ * The assertions below state each of those disagreements before relying on
+ * them, so an edit that quietly makes the fixture canonical fails here rather
+ * than silently un-discriminating every test that uses it.
+ */
+const NON_CANONICAL_BODY = [
+  '{',
+  '  "modelVersion": "gemini-fixture-001",',
+  '  "candidates": [ { "finishReason": "STOP" } ],',
+  '  "amount": 1.50,',
+  '  "escaped": "caf\\u00e9",',
+  '  "literal": "Montréal"',
+  '}',
+].join('\n');
+
+test('the fixture body disagrees with every normalization the seal must not apply', () => {
+  const roundTripped = JSON.stringify(JSON.parse(NON_CANONICAL_BODY));
+  assert.notEqual(
+    NON_CANONICAL_BODY,
+    roundTripped,
+    'a body equal to its own JSON round trip cannot tell byte retention from re-serialization',
+  );
+  assert.notEqual(
+    NON_CANONICAL_BODY,
+    canonicalize(JSON.parse(NON_CANONICAL_BODY)),
+    'a body equal to its own canonical form cannot tell byte retention from canonicalization',
+  );
+  assert.notEqual(
+    Buffer.byteLength(NON_CANONICAL_BODY, 'utf8'),
+    NON_CANONICAL_BODY.length,
+    'a pure-ASCII body cannot tell a byte count from a character count',
+  );
+});
+
+test('sealResponseEnvelope retains the received bytes, not a re-serialization of them', () => {
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  assert.equal(sealed.body, NON_CANONICAL_BODY);
+  // Named individually so a failure says WHICH normalization crept in.
+  assert.ok(sealed.body.includes('\n  "modelVersion"'), 'indentation and key order survive');
+  assert.ok(sealed.body.includes('"amount": 1.50'), 'number formatting survives');
+  assert.ok(sealed.body.includes('caf\\u00e9'), 'the escape survives as an escape');
+});
+
+test('the digest and byte count cover exactly the stored body', () => {
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  assert.equal(sealed.sha256, sha256Hex(sealed.body));
+  assert.equal(sealed.bytes, Buffer.byteLength(sealed.body, 'utf8'));
+  assert.notEqual(sealed.bytes, sealed.body.length, 'bytes are not characters');
+  assert.deepEqual(envelopeVerificationFailures(sealed), []);
+});
+
+test('sealing an already-sealed body changes nothing — WITH a credential set', () => {
+  // Rule 4b: the environment is part of the space. With no credential present
+  // `redactSecrets` is the identity, so a credential-free version of this case
+  // asserts seal(x) === seal(x) and a seal that mangles its own output passes
+  // it. And credential-free is the state `yarn test` is ALWAYS in — only the
+  // entry points load `.env` — while the runs this claim is about (`yarn smoke`)
+  // are always the other one. So the credential goes in here explicitly.
+  const prior = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = SYNTHETIC_KEY;
+  try {
+    const received = `{"note":"upstream echoed ${SYNTHETIC_KEY} back","ok":true}`;
+    const once = sealResponseEnvelope(received);
+    assert.ok(once.body.includes('[REDACTED]'), 'the first seal really did substitute something');
+    const twice = sealResponseEnvelope(once.body);
+    assert.deepEqual(twice, once);
+  } finally {
+    if (prior === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = prior;
+  }
+});
+
+test('the write chokepoint redacts a second time and the binding still holds', () => {
+  // The property that actually fires on the way to disk, and the reason the
+  // one above is stated at all: `writeNdjson` runs `redactSecrets` over EVERY
+  // serialized line, so the stored body meets the redactor again AFTER its
+  // digest was taken. Because the seal redacted first there is nothing left to
+  // substitute, and the body read back off disk still reproduces its digest.
+  //
+  // Driven through the real writer and a real file rather than through
+  // `redactSecrets` directly — the claim is about the artifact, not the helper.
+  const prior = process.env['OPENAI_API_KEY'];
+  process.env['OPENAI_API_KEY'] = SYNTHETIC_KEY;
+  const dir = mkdtempSync(join(tmpdir(), 'envelope-write-'));
+  try {
+    const received = `{"note":"upstream echoed ${SYNTHETIC_KEY} back","ok":true}`;
+    const sealed = sealResponseEnvelope(received);
+    const path = join(dir, 'run.ndjson');
+    writeNdjson(path, [{ recordType: 'probe', responseEnvelope: sealed } as never]);
+    const onDisk = readFileSync(path, 'utf8');
+    assert.ok(!onDisk.includes(SYNTHETIC_KEY), 'the credential is not on disk');
+    const readBack = (JSON.parse(onDisk.trim()) as { responseEnvelope: typeof sealed }).responseEnvelope;
+    assert.deepEqual(readBack, sealed, 'the write pass left the envelope byte-identical');
+    assert.deepEqual(envelopeVerificationFailures(readBack), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (prior === undefined) delete process.env['OPENAI_API_KEY'];
+    else process.env['OPENAI_API_KEY'] = prior;
+  }
+});
+
+/**
+ * The credential case, and the ONLY case in this file that discriminates
+ * "digest the stored body" from "digest the received text": with no credential
+ * set, redaction is the identity and the two are the same string. A mutant
+ * that hashes before redacting survives every other assertion here.
+ */
+test('a credential echoed in the body is redacted, and the digest covers the redacted body', () => {
+  const prior = process.env['ANTHROPIC_API_KEY'];
+  process.env['ANTHROPIC_API_KEY'] = SYNTHETIC_KEY;
+  try {
+    const received = `{"note":"upstream echoed ${SYNTHETIC_KEY} back","ok":true}`;
+    const sealed = sealResponseEnvelope(received);
+    assert.ok(!sealed.body.includes(SYNTHETIC_KEY), 'the credential value is gone from the body');
+    assert.ok(sealed.body.includes('[REDACTED]'), 'and it was replaced rather than dropped silently');
+    assert.equal(sealed.sha256, sha256Hex(sealed.body), 'the digest covers what is stored');
+    assert.notEqual(
+      sealed.sha256,
+      sha256Hex(received),
+      'and NOT the pre-redaction text, which no artifact contains',
+    );
+    assert.equal(sealed.bytes, Buffer.byteLength(sealed.body, 'utf8'));
+    assert.deepEqual(envelopeVerificationFailures(sealed), []);
+  } finally {
+    if (prior === undefined) delete process.env['ANTHROPIC_API_KEY'];
+    else process.env['ANTHROPIC_API_KEY'] = prior;
+  }
+});
+
+test('a same-length edit to a retained body fails the digest', () => {
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  // Same length, so the byte-count binding still holds and the DIGEST is the
+  // only thing that can catch it — the discrimination this case exists for.
+  const tampered = { ...sealed, body: sealed.body.replace('"finishReason": "STOP"', '"finishReason": "PSOT"') };
+  assert.equal(tampered.body.length, sealed.body.length);
+  assert.deepEqual(envelopeVerificationFailures(tampered), [ENVELOPE_VIOLATION.DIGEST]);
+});
+
+test('a truncated retained body fails both bindings', () => {
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  const truncated = { ...sealed, body: sealed.body.slice(0, 20) };
+  assert.deepEqual(envelopeVerificationFailures(truncated), [
+    ENVELOPE_VIOLATION.DIGEST,
+    ENVELOPE_VIOLATION.BYTES,
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// the four arms that produce an attempt
+// ---------------------------------------------------------------------------
+
+interface RecordedCall {
+  headers: Record<string, string>;
+}
+
+function registryAdapter(participantId: string): ProviderAdapter {
+  const adapter = createRealAdapters().get(participantId);
+  if (adapter === undefined) throw new Error(`production registry has no adapter for ${participantId}`);
+  return adapter;
+}
+
+/** Serve `bodyText` VERBATIM (never a re-stringified object), record every
+ *  call's headers, and always restore `globalThis.fetch`. */
+async function withCannedBody<T>(
+  bodyText: string,
+  fn: () => Promise<T>,
+): Promise<{ result: T; calls: RecordedCall[] }> {
+  const original = globalThis.fetch;
+  const calls: RecordedCall[] = [];
+  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+    calls.push({ headers: { ...(init?.headers as Record<string, string>) } });
+    return new Response(bodyText, { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    return { result: await fn(), calls };
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+async function withEnv<T>(name: string, value: string, fn: () => Promise<T>): Promise<T> {
+  const prior = process.env[name];
+  process.env[name] = value;
+  try {
+    return await fn();
+  } finally {
+    if (prior === undefined) delete process.env[name];
+    else process.env[name] = prior;
+  }
+}
+
+/** A finished-turn body for each provider, written NON-canonically (leading
+ *  newline, two-space indent) so "the exact bytes" is a checkable claim. */
+const FINISHED_BODY: Record<string, { env: string; participantId: string; body: string }> = {
+  openai: {
+    env: 'OPENAI_API_KEY',
+    participantId: 'openai-gpt-5.6-sol',
+    body: '{\n  "id": "resp_fixture",\n  "model": "gpt-fixture",\n  "status": "completed",\n  "output": [ { "type": "message", "content": [ { "type": "output_text", "text": "answer-openai" } ] } ]\n}',
+  },
+  xai: {
+    env: 'XAI_API_KEY',
+    participantId: 'xai-grok-4.5',
+    body: '{\n  "id": "resp_fixture_x",\n  "model": "grok-fixture",\n  "status": "completed",\n  "output": [ { "type": "message", "content": [ { "type": "output_text", "text": "answer-xai" } ] } ]\n}',
+  },
+  anthropic: {
+    env: 'ANTHROPIC_API_KEY',
+    participantId: 'anthropic-claude-fable-5',
+    body: '{\n  "id": "msg_fixture",\n  "model": "claude-fixture",\n  "stop_reason": "end_turn",\n  "content": [ { "type": "text", "text": "answer-anthropic" } ]\n}',
+  },
+  google: {
+    env: 'GEMINI_API_KEY',
+    participantId: 'google-gemini-3.1-pro-preview',
+    body: '{\n  "responseId": "resp_fixture_g",\n  "modelVersion": "gemini-fixture",\n  "candidates": [ { "finishReason": "STOP", "content": { "parts": [ { "text": "answer-google" } ] } } ]\n}',
+  },
+};
+
+for (const [provider, fixture] of Object.entries(FINISHED_BODY)) {
+  test(`${provider}: a finished turn retains the exact received body`, async () => {
+    const { result, calls } = await withEnv(fixture.env, SYNTHETIC_KEY, () =>
+      withCannedBody(fixture.body, () =>
+        registryAdapter(fixture.participantId).chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+      ),
+    );
+    const response = result as ProviderResponse;
+    assert.equal(response.responseEnvelope.body, fixture.body, 'the received bytes, unaltered');
+    assert.equal(response.responseEnvelope.sha256, sha256Hex(fixture.body));
+    assert.equal(response.responseEnvelope.bytes, Buffer.byteLength(fixture.body, 'utf8'));
+    // The answer text and the envelope are DIFFERENT values, so a serializer
+    // that swaps them cannot pass unnoticed downstream.
+    assert.notEqual(response.rawText, response.responseEnvelope.body);
+    assert.ok(response.responseEnvelope.body.includes(response.rawText));
+
+    // Credentials travel in headers and are never named in evidence. Assert on
+    // BOTH sides: the header really carried the key (so the case is not vacuous
+    // for the wrong reason), and no recorded field mentions it.
+    const sentHeaders = JSON.stringify(calls[0]?.headers ?? {});
+    assert.ok(sentHeaders.includes(SYNTHETIC_KEY), 'the call really did authenticate');
+    const recorded = JSON.stringify({
+      envelope: response.responseEnvelope,
+      requestParams: response.requestParams,
+      rawText: response.rawText,
+    });
+    assert.ok(!recorded.includes(SYNTHETIC_KEY), 'and no recorded field carries the credential');
+    for (const headerName of ['authorization', 'x-api-key', 'x-goog-api-key']) {
+      assert.ok(!recorded.toLowerCase().includes(headerName), `no ${headerName} header in evidence`);
+    }
+  });
+}
+
+test('an UNFINISHED turn carries the complete body too — it is a paid response', async () => {
+  // Google `MAX_TOKENS`: HTTP 200, partial content, typed as an unfinished
+  // turn. Grounding metadata is present, so the case also shows the envelope
+  // arriving on the path where an unrecognized shape is most likely.
+  const body =
+    '{\n  "responseId": "resp_unfinished",\n  "modelVersion": "gemini-fixture",\n  "candidates": [ { "finishReason": "MAX_TOKENS", "content": { "parts": [ { "text": "partial" } ] }, "groundingMetadata": { "webSearchQueries": [ "yankees starter tonight" ] } } ],\n  "usageMetadata": { "toolUsePromptTokenCount": 42 }\n}';
+  const error = await withEnv('GEMINI_API_KEY', SYNTHETIC_KEY, async () => {
+    const { result } = await withCannedBody(body, async () => {
+      try {
+        await registryAdapter('google-gemini-3.1-pro-preview').chat(TURNS, 5_000, {
+          maxOutputTokens: 16_000,
+        });
+        return null;
+      } catch (caught: unknown) {
+        return caught;
+      }
+    });
+    return result;
+  });
+  assert.ok(error instanceof ProviderUnfinishedTurnError, 'the turn is typed as unfinished');
+  assert.equal(error.responseEnvelope.body, body);
+  assert.equal(error.responseEnvelope.sha256, sha256Hex(body));
+  assert.deepEqual(envelopeVerificationFailures(error.responseEnvelope), []);
+});
+
+test('a REPAIR call retains its own envelope, distinct from the initial call', async () => {
+  // The repair leg sends `tools: 'none'`; it is the same adapter and the same
+  // seal, and a serializer that keeps only the initial envelope would leave
+  // this one unverifiable. Two DIFFERENT bodies, so the assertion cannot pass
+  // by both legs happening to agree.
+  const initialBody = FINISHED_BODY['anthropic']!.body;
+  const repairBody = initialBody.replace('answer-anthropic', 'repaired-anthropic');
+  assert.notEqual(initialBody, repairBody);
+  const adapter = registryAdapter('anthropic-claude-fable-5');
+  const initial = await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedBody(initialBody, () => adapter.chat(TURNS, 5_000, { maxOutputTokens: 16_000 })),
+  );
+  const repair = await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedBody(repairBody, () =>
+      adapter.chat(TURNS, 5_000, { maxOutputTokens: 16_000, tools: 'none' }),
+    ),
+  );
+  assert.equal(initial.result.responseEnvelope.body, initialBody);
+  assert.equal(repair.result.responseEnvelope.body, repairBody);
+  assert.notEqual(initial.result.responseEnvelope.sha256, repair.result.responseEnvelope.sha256);
+});
+
+test('a non-2xx body is NOT retained — that path keeps its truncated error detail', async () => {
+  // Deliberately out of scope (#92 is a 200 with parseable JSON in a shape the
+  // extractor does not know). A provider error body is the likeliest place
+  // request content is echoed back, so widening retention to it would put an
+  // unbounded copy of that into evidence.
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response('{"error":{"message":"quota exceeded"}}', { status: 429 })) as typeof fetch;
+  try {
+    const thrown = await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, async () => {
+      try {
+        await registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, { maxOutputTokens: 16_000 });
+        return null;
+      } catch (error: unknown) {
+        return error;
+      }
+    });
+    assert.ok(thrown instanceof ProviderHttpError);
+    assert.ok(!(thrown instanceof ProviderUnfinishedTurnError));
+    // The field EXISTS on this type now — a 2xx that does not parse fills it —
+    // so the assertion is on its value. `hasOwnProperty` would report the
+    // widening as a pass, which is the shape of assertion this PR is removing.
+    assert.equal(thrown.responseEnvelope, null, 'a non-2xx failure retains no envelope');
+    assert.ok(thrown.message.includes('quota exceeded'), 'it keeps the truncated detail it always had');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// the ONE schema both readers apply
+// ---------------------------------------------------------------------------
+
+test('the damage table stays the four boundary cases, and each is a boundary', () => {
+  // The enumeration guard. Two test files sweep this table; dropping an entry
+  // would silently stop checking that rule in BOTH, so the key list is pinned
+  // against a literal here.
+  assert.deepEqual(Object.keys(ENVELOPE_DAMAGE).sort(), [
+    'extra-key',
+    'fractional-bytes',
+    'missing-sha256',
+    'upper-case-sha256',
+  ]);
+
+  // And each case really is a boundary rather than an extreme (rule 3g-both):
+  // three of the four leave `body`, the digest and the byte count intact, so a
+  // reader that checked only those three would ACCEPT them — which is the
+  // reader this schema replaced. Only `missing-sha256` is coarse, and it is
+  // labelled as the control.
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  const survivesThreeTypeofChecks = (damage: EnvelopeDamage): boolean => {
+    const record = damageEnvelope(sealed, damage);
+    return (
+      typeof record['body'] === 'string' &&
+      typeof record['sha256'] === 'string' &&
+      typeof record['bytes'] === 'number'
+    );
+  };
+  assert.equal(survivesThreeTypeofChecks('extra-key'), true);
+  assert.equal(survivesThreeTypeofChecks('upper-case-sha256'), true);
+  assert.equal(survivesThreeTypeofChecks('fractional-bytes'), true);
+  assert.equal(survivesThreeTypeofChecks('missing-sha256'), false, 'the coarse control');
+
+  // `extra-key` is the sharpest of them: it is identical to a good envelope in
+  // every field the digest is about, so nothing but `.strict()` can refuse it.
+  // Stated here so an edit that adds a second defect to it fails rather than
+  // quietly making the parity case vacuous.
+  const extra = damageEnvelope(sealed, 'extra-key');
+  assert.equal(extra['body'], sealed.body);
+  assert.equal(extra['sha256'], sealed.sha256);
+  assert.equal(extra['bytes'], sealed.bytes);
+});
+
+test('the schema refuses every damaged shape and accepts the sealed one', () => {
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  // Negative control FIRST: an undamaged envelope parses, so every refusal
+  // below is about the damage rather than about the fixture.
+  assert.equal(responseEnvelopeSchema.safeParse(sealed).success, true);
+  for (const damage of Object.keys(ENVELOPE_DAMAGE) as EnvelopeDamage[]) {
+    assert.equal(
+      responseEnvelopeSchema.safeParse(damageEnvelope(sealed, damage)).success,
+      false,
+      `${damage} must be refused`,
+    );
+  }
+});
+
+test('a well-formed envelope whose BODY was altered still parses; the digest is what catches it', () => {
+  // The negative control for the schema, and the reason `digest-mismatch` and
+  // `malformed` are different states downstream. Shape and binding are two
+  // questions, and a reader that answered them with one rule would report the
+  // wrong one about half the damaged files it sees.
+  const sealed = sealResponseEnvelope(NON_CANONICAL_BODY);
+  const tampered = { ...sealed, body: `${sealed.body} ` };
+  assert.equal(responseEnvelopeSchema.safeParse(tampered).success, true, 'the SHAPE is fine');
+  assert.notDeepEqual(envelopeVerificationFailures(tampered), [], 'the BINDING is not');
+});
+
+// ---------------------------------------------------------------------------
+// the whole-file archive predicate
+// ---------------------------------------------------------------------------
+
+/** A leg the way a pre-#92 build wrote it: the old answer name, and neither of
+ *  the two keys a retaining build adds. */
+const ARCHIVED_LEG = { rawResponse: 'an archived answer', reportedModelId: 'm', httpStatus: 200 };
+/** A leg the way this build writes it. */
+const MODERN_LEG = {
+  answerText: 'an answer',
+  responseEnvelope: sealResponseEnvelope('{"ok":true}'),
+  reportedModelId: 'm',
+  httpStatus: 200,
+};
+
+test('archiveEraSignals reads KEY PRESENCE, not value', () => {
+  // The distinction the whole rule rests on: `responseEnvelope: null` is a key
+  // a retaining build wrote. A reader that treated it as absent would hand the
+  // archive exemption to any modern file whose envelopes were nulled — which
+  // was a measured bypass, not a hypothetical.
+  assert.deepEqual(archiveEraSignals({ ...MODERN_LEG, responseEnvelope: null }), {
+    answerText: true,
+    rawResponse: false,
+    responseEnvelope: true,
+  });
+  assert.deepEqual(archiveEraSignals(ARCHIVED_LEG), {
+    answerText: false,
+    rawResponse: true,
+    responseEnvelope: false,
+  });
+  // A leg that is not an object at all reports every key absent rather than
+  // throwing; the caller has already decided such a record has no legs.
+  assert.deepEqual(archiveEraSignals(null), {
+    answerText: false,
+    rawResponse: false,
+    responseEnvelope: false,
+  });
+});
+
+test('recordsHttpStatus reads the KEY, so an explicit null is still recorded', () => {
+  // The same presence-not-value distinction as the era signals, one field over,
+  // and it is what stops `httpStatus: null` on an edited leg from reading as
+  // "this build never wrote a status".
+  assert.equal(recordsHttpStatus({ httpStatus: 200 }), true);
+  assert.equal(recordsHttpStatus({ httpStatus: null }), true, 'a null status is one the build wrote');
+  assert.equal(recordsHttpStatus({ reportedModelId: 'm' }), false, 'a deleted key is not');
+  assert.equal(recordsHttpStatus(null), false, 'and a leg that is not an object has no keys');
+});
+
+test('exemption needs all three clauses; each one alone withdraws it', () => {
+  // Rule 3k, swept: the predicate is a conjunction, so one case per clause,
+  // each leaving exactly one clause broken. An input that broke several at
+  // once would be refused by a build consulting any of them and would prove
+  // nothing about which one shipped.
+  const archived = archiveEraSignals(ARCHIVED_LEG);
+  const table: Array<{ name: string; stamped: boolean; legs: unknown[]; expected: boolean }> = [
+    { name: 'a genuine archive', stamped: false, legs: [ARCHIVED_LEG, ARCHIVED_LEG], expected: true },
+    { name: 'clause 1: an era stamp is present', stamped: true, legs: [ARCHIVED_LEG], expected: false },
+    {
+      name: 'clause 2: one leg carries answerText',
+      stamped: false,
+      legs: [ARCHIVED_LEG, { ...ARCHIVED_LEG, answerText: 'a modern answer' }],
+      expected: false,
+    },
+    {
+      name: 'clause 2, other half: one leg carries neither answer name',
+      stamped: false,
+      legs: [ARCHIVED_LEG, { reportedModelId: 'm' }],
+      expected: false,
+    },
+    {
+      name: 'clause 3: one leg carries a responseEnvelope key, explicitly null',
+      stamped: false,
+      legs: [ARCHIVED_LEG, { ...ARCHIVED_LEG, responseEnvelope: null }],
+      expected: false,
+    },
+    { name: 'a modern run with no stamp', stamped: false, legs: [MODERN_LEG], expected: false },
+    { name: 'a modern run with its stamp', stamped: true, legs: [MODERN_LEG], expected: false },
+  ];
+  for (const row of table) {
+    assert.equal(
+      isCoherentPreRetentionArchive({
+        evidenceEraStamped: row.stamped,
+        legs: row.legs.map(archiveEraSignals),
+      }),
+      row.expected,
+      row.name,
+    );
+  }
+  // The exemption is whole-FILE: one modern leg among archived ones withdraws
+  // it for every leg, which is what makes a per-leg edit useless.
+  assert.equal(
+    isCoherentPreRetentionArchive({
+      evidenceEraStamped: false,
+      legs: [archived, archived, archiveEraSignals(MODERN_LEG)],
+    }),
+    false,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// the receipt: what counts as "a response came back"
+// ---------------------------------------------------------------------------
+
+/** Every content signal null, the status key recorded, no error text: the state
+ *  in which the status alone decides. */
+const BARE: Omit<ReceiptSignals, 'httpStatus'> = {
+  answerText: null,
+  reportedModelId: null,
+  providerResponseId: null,
+  httpStatusRecorded: true,
+  errorDetail: null,
+};
+
+test('a bare 2xx is a receipt; the content signals and the status are independent', () => {
+  // Rule 4b, as a table with LITERAL expectations rather than derived ones.
+  // Every row has all three content signals null, the status key recorded and
+  // no error text, so the numeric status is the only thing that can decide it —
+  // a row carrying an answer would be accepted by the three-signal predicate
+  // too and would say nothing about the status disjunct, and a row carrying an
+  // error detail would be decided by the prose carrier instead (rule 3b: each
+  // carrier is swept alone below).
+  const statuses: Array<[number | null, boolean]> = [
+    [null, false],
+    [0, false],
+    [199, false],
+    [200, true],
+    [204, true],
+    [299, true],
+    [300, false],
+    [404, false],
+    [429, false],
+    [500, false],
+  ];
+  for (const [httpStatus, expected] of statuses) {
+    assert.equal(
+      receivedProviderResponse({ ...BARE, httpStatus }),
+      expected,
+      `status ${String(httpStatus)}`,
+    );
+    // And the narrow predicate ignores the status entirely — the property that
+    // keeps the request-parameter rule exactly where it was.
+    assert.equal(
+      reachedProviderByContent({ ...BARE, httpStatus }),
+      false,
+      `status ${String(httpStatus)} must not move the content-only predicate`,
+    );
+  }
+});
+
+test('each content signal alone is a receipt, and a 500 alone is not', () => {
+  const none = { ...BARE, httpStatus: 500 };
+  assert.equal(receivedProviderResponse(none), false, 'the negative control');
+  for (const signal of ['answerText', 'reportedModelId', 'providerResponseId'] as const) {
+    assert.equal(receivedProviderResponse({ ...none, [signal]: 'present' }), true, signal);
+    assert.equal(reachedProviderByContent({ ...none, [signal]: 'present' }), true, signal);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// the receipt has THREE carriers, because one was one edit
+// ---------------------------------------------------------------------------
+
+test('the status a leg states in prose is read from the START of its error text', () => {
+  // Literal expectations. The anchor is the property under test: the leading
+  // clause is this call's own status, and a "returned HTTP 200" appearing later
+  // is text a provider echoed back about some other exchange.
+  const table: Array<[string | null, number | null]> = [
+    [null, null],
+    ['openai returned HTTP 200: non-JSON response body: <!doctype html>', 200],
+    ['openai returned HTTP 0: response body read failed: ECONNRESET', 0],
+    ['anthropic returned HTTP 429: rate limited', 429],
+    // Anchored: the leading status wins, and the echoed one is not consulted.
+    ['openai returned HTTP 500: upstream said openai returned HTTP 200: ok', 500],
+    // Not this shape at all.
+    ['openai call exceeded 60000ms', null],
+    // THE ROW THAT DISCRIMINATES THE ANCHOR, and the reason it is written this
+    // way: an unfinished turn claims no status of its own, and a body it quotes
+    // back can contain anything. A reader that searched the whole string finds
+    // the echoed 200 here and calls a turn that never completed a receipt; the
+    // row above, where the leading status is a 500, cannot tell the two rules
+    // apart, because the first match is the same either way.
+    [
+      'openai returned an unfinished turn (stop_reason: max_tokens): the body said openai returned HTTP 200: ok',
+      null,
+    ],
+    // No provider token in front, so it is not the message this reads.
+    ['returned HTTP 200: something', null],
+  ];
+  for (const [detail, expected] of table) {
+    assert.equal(statusFromErrorDetail(detail), expected, JSON.stringify(detail));
+  }
+});
+
+test('EACH receipt carrier alone makes a contentless leg a receipt', () => {
+  // Rule 3b, one row per carrier: every other carrier is left in its
+  // non-receipt state, so exactly one thing in each row can produce `true`. A
+  // build consulting only the numeric status passes row 1 and fails rows 2 and
+  // 3; one consulting only the prose passes row 2 and fails 1 and 3.
+  const table: Array<{ name: string; signals: Partial<typeof BARE> & { httpStatus: number | null }; expected: boolean }> = [
+    {
+      // The negative control AND the stated bound, which here are one input:
+      // a leg whose status is null, whose status key is present and whose
+      // error text says nothing is exempt — so erasing an errored leg still
+      // works, at a cost of three mutually consistent edits instead of one.
+      // That residual is written into `receivedProviderResponse`, the README
+      // and the PR body; this row is what keeps those honest.
+      name: 'THE BOUND, and the negative control: all three carriers silent',
+      signals: { httpStatus: null },
+      expected: false,
+    },
+    {
+      name: 'carrier 1: the numeric status, with no error text',
+      signals: { httpStatus: 200 },
+      expected: true,
+    },
+    {
+      name: 'carrier 2: the prose status, with the numeric field nulled',
+      signals: { httpStatus: null, errorDetail: 'openai returned HTTP 200: non-JSON response body' },
+      expected: true,
+    },
+    {
+      name: 'carrier 3: the status key deleted, with nothing else standing',
+      signals: { httpStatus: null, httpStatusRecorded: false },
+      expected: true,
+    },
+    {
+      name: 'and the prose carrier keeps the same 2xx bound: a 429 is not a receipt',
+      signals: { httpStatus: null, errorDetail: 'openai returned HTTP 429: rate limited' },
+      expected: false,
+    },
+    {
+      name: 'nor is a transport failure that never got a status',
+      signals: { httpStatus: null, errorDetail: 'openai returned HTTP 0: response body read failed' },
+      expected: false,
+    },
+  ];
+  for (const row of table) {
+    assert.equal(receivedProviderResponse({ ...BARE, ...row.signals }), row.expected, row.name);
+    // None of the three moves the CONTENT-only predicate, which is what keeps
+    // the sibling request-parameter rule where it was.
+    assert.equal(
+      reachedProviderByContent({ ...BARE, ...row.signals }),
+      false,
+      `${row.name}: must not move the content-only predicate`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// B2: every 2xx retains its body
+// ---------------------------------------------------------------------------
+
+/** Serve an arbitrary status and body; always restore `globalThis.fetch`. */
+async function withCannedResponse<T>(
+  status: number,
+  bodyText: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(bodyText, { status })) as typeof fetch;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+async function chatError(status: number, bodyText: string): Promise<unknown> {
+  return withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, () =>
+    withCannedResponse(status, bodyText, async () => {
+      try {
+        await registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, {
+          maxOutputTokens: 16_000,
+        });
+        return null;
+      } catch (error: unknown) {
+        return error;
+      }
+    }),
+  );
+}
+
+/**
+ * The 2xx bodies that never reach the parseable path, and what each one is.
+ *
+ * The bytes are chosen so a re-serialization could not have produced them:
+ * indented HTML, a bare token, the empty string. Every one is something a
+ * provider or a proxy in front of one really sends, and every one used to be
+ * dropped on the floor.
+ */
+const UNPARSEABLE_2XX: Array<{ name: string; status: number; body: string }> = [
+  {
+    name: 'an HTML error page from a proxy',
+    status: 200,
+    body: '<!doctype html>\n  <html><body>upstream timeout</body></html>',
+  },
+  { name: 'a bare token', status: 200, body: 'OK' },
+  { name: 'an EMPTY body', status: 200, body: '' },
+  { name: 'a 202 with an unparseable body', status: 202, body: 'accepted, come back later' },
+];
+
+for (const shape of UNPARSEABLE_2XX) {
+  test(`a ${shape.status} that does not parse retains its exact bytes: ${shape.name}`, async () => {
+    const error = await chatError(shape.status, shape.body);
+    assert.ok(error instanceof ProviderHttpError, `it is still the typed HTTP failure: ${String(error)}`);
+    assert.equal(error.status, shape.status);
+    assert.ok(error.responseEnvelope !== null, 'and it carries an envelope');
+    assert.equal(error.responseEnvelope.body, shape.body, 'the received bytes, unaltered');
+    assert.equal(error.responseEnvelope.sha256, sha256Hex(shape.body));
+    assert.equal(error.responseEnvelope.bytes, Buffer.byteLength(shape.body, 'utf8'));
+    assert.deepEqual(envelopeVerificationFailures(error.responseEnvelope), []);
+    // The truncated detail a human reads is unchanged and still there; the
+    // envelope is added evidence, not a replacement for it.
+    assert.ok(error.message.includes('non-JSON response body'), error.message);
+  });
+}
+
+test('a NON-2xx still retains nothing, and 300 is the boundary', async () => {
+  // The negative control the widening needs, and the line stated as a
+  // boundary rather than as a mood: 299 retains (above), 300 does not. A
+  // provider error body is the likeliest place request content is echoed
+  // back, so the line is deliberate.
+  const refused = await chatError(500, 'not json either');
+  assert.ok(refused instanceof ProviderHttpError);
+  assert.equal(refused.responseEnvelope, null, 'a 500 retains nothing');
+  assert.ok(refused.message.includes('not json either'), 'it keeps the truncated detail');
+
+  const boundary = await chatError(300, 'not json either');
+  assert.ok(boundary instanceof ProviderHttpError);
+  assert.equal(boundary.responseEnvelope, null, '300 is outside 2xx');
+});
+
+test('a 2xx whose body drops MID-READ is a transport failure, not a receipt', async () => {
+  // An UNTAMPERED artifact from an ordinary network event. `fetch` resolves at
+  // the headers, so a connection can drop after the status line and before the
+  // body; reporting that status would make the leg a 2xx owing an envelope no
+  // code could produce, and a single such leg refuses the whole run file for
+  // scoring and for publication.
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"partial":'));
+          controller.error(new Error('ECONNRESET'));
+        },
+      }),
+      { status: 200 },
+    )) as typeof fetch;
+  let error: unknown;
+  try {
+    error = await withEnv('ANTHROPIC_API_KEY', SYNTHETIC_KEY, async () => {
+      try {
+        await registryAdapter('anthropic-claude-fable-5').chat(TURNS, 5_000, {
+          maxOutputTokens: 16_000,
+        });
+        return null;
+      } catch (thrown: unknown) {
+        return thrown;
+      }
+    });
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.ok(error instanceof ProviderHttpError, `got ${String(error)}`);
+  assert.ok(error.message.includes('response body read failed'), error.message);
+  assert.equal(error.status, 0, 'status 0 — the code for "no HTTP exchange completed"');
+  assert.equal(error.responseEnvelope, null, 'and nothing retained, because nothing was read');
+  // The CONSEQUENCE beside the mechanism: this leg owes no envelope. Every
+  // content signal is null in the record it produces, so the status is the only
+  // thing that could make it a receipt — which is what makes 0 load-bearing
+  // rather than cosmetic.
+  assert.equal(
+    receivedProviderResponse({
+      answerText: null,
+      reportedModelId: null,
+      providerResponseId: null,
+      httpStatus: error.status,
+      httpStatusRecorded: true,
+      errorDetail: error.message,
+    }),
+    false,
+    'a dropped body must not read as a 2xx receipt',
+  );
+});
+
+test('a bare number retains too — and is NOT the case that discriminates this rule', async () => {
+  // The MECHANISM this case has always measured, and it is still worth having:
+  // a body that parses to a non-object goes down the parseable path and keeps
+  // its bytes, so "a 2xx retains its body" is not secretly "a 2xx that fails to
+  // parse retains its body".
+  //
+  // What it does NOT do is reach the defect that rule was claimed against, and
+  // saying so here is what stops the fixture being weakened back. JavaScript
+  // BOXES a primitive on property access, so `(42).stop_reason` is `undefined`
+  // rather than a throw; Anthropic's extractor then finds no terminal state and
+  // settles into `ProviderUnfinishedTurnError`, which carries its envelope by
+  // construction. A build with no guard at all around the extraction passes
+  // this case exactly as a guarded one does.
+  //
+  // `null` is the discriminating input, and the sweep below is where it lives:
+  // it is the ONE JSON value that throws on any property access, and `undefined`
+  // — the other value that would — cannot be written in JSON at all.
+  const body = '  42  ';
+  const error = await chatError(200, body);
+  assert.ok(error instanceof ProviderUnfinishedTurnError, `got ${String(error)}`);
+  assert.equal(error.responseEnvelope.body, body, 'the received bytes, spaces and all');
+  assert.equal(error.responseEnvelope.sha256, sha256Hex(body));
+  // Stated rather than assumed: this fixture does not throw on the access the
+  // extractors make, so it cannot tell a guarded build from an unguarded one.
+  assert.equal((42 as unknown as { stop_reason?: unknown }).stop_reason, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// B2: a 2xx whose PARSE cannot be walked keeps its bytes and its status
+// ---------------------------------------------------------------------------
+
+/**
+ * The production registry's membership, as a LITERAL.
+ *
+ * The sweeps below take their adapter list from `createRealAdapters()`, so a
+ * fifth adapter is covered the moment it is added rather than when someone
+ * remembers to add a case. That direction is only half of it: a registry that
+ * SHRANK would make every sweep pass by having less to sweep, which is the
+ * enumeration trap one level up. So the expected side is written out here and
+ * is never derived from the registry.
+ */
+const REGISTRY_PARTICIPANTS = [
+  'anthropic-claude-fable-5',
+  'google-gemini-3.1-pro-preview',
+  'openai-gpt-5.6-sol',
+  'xai-grok-4.5',
+] as const;
+
+test('the production registry is exactly the arms the sweeps below expect', () => {
+  assert.deepEqual([...createRealAdapters().keys()].sort(), [...REGISTRY_PARTICIPANTS].sort());
+});
+
+/** Call one registry adapter against a canned 2xx, and report what came back
+ *  ALONGSIDE proof the call was actually made (rule 3b-reach: a setup failure
+ *  and a fast success are the same observation from the caller's side). */
+async function chatAgainst(
+  participantId: string,
+  status: number,
+  bodyText: string,
+): Promise<{ error: unknown; calls: number }> {
+  const adapter = registryAdapter(participantId);
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response(bodyText, { status });
+  }) as typeof fetch;
+  try {
+    const error = await withEnv(adapter.credentialEnvVar, SYNTHETIC_KEY, async () => {
+      try {
+        await adapter.chat(TURNS, 5_000, { maxOutputTokens: 16_000 });
+        return null;
+      } catch (thrown: unknown) {
+        return thrown;
+      }
+    });
+    return { error, calls };
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+/** The status and envelope a typed provider failure carries — the same three
+ *  cases the runner branches on, read here so a sweep can assert retention
+ *  without caring which typed class a shape happens to land in. */
+function receipt(error: unknown): {
+  status: number | null;
+  envelope: { body: string; sha256: string; bytes: number } | null;
+} {
+  if (error instanceof ProviderUnreadableResponseError) {
+    return { status: error.httpStatus, envelope: error.responseEnvelope };
+  }
+  if (error instanceof ProviderUnfinishedTurnError) {
+    return { status: error.httpStatus, envelope: error.responseEnvelope };
+  }
+  if (error instanceof ProviderHttpError) {
+    return { status: error.status, envelope: error.responseEnvelope };
+  }
+  return { status: null, envelope: null };
+}
+
+/**
+ * A 2xx body of literal `null`, over EVERY adapter the registry returns.
+ *
+ * `JSON.parse('null')` succeeds, so this body reaches an extractor as a
+ * successful parse and then throws on the first property access — the one
+ * shape where "the bytes were retained" and "the bytes survived to the runner"
+ * came apart. Measured before the fix, through the real registry adapters: a
+ * bare `TypeError` out of all four, and end to end a persisted leg with
+ * `httpStatus: null` and `responseEnvelope: null` that both readers called
+ * "nothing came back".
+ */
+for (const participantId of [...createRealAdapters().keys()]) {
+  test(`${participantId}: a 2xx body of literal null keeps its bytes and its status`, async () => {
+    const { error, calls } = await chatAgainst(participantId, 200, 'null');
+    assert.equal(calls, 1, 'the adapter really sent a request, so the case is not vacuous');
+    assert.ok(
+      error instanceof ProviderUnreadableResponseError,
+      `expected the typed unreadable-response failure, got ${String(error)}`,
+    );
+    assert.equal(error.httpStatus, 200, 'the status the body arrived with');
+    assert.equal(error.responseEnvelope.body, 'null', 'the received bytes, unaltered');
+    assert.equal(error.responseEnvelope.sha256, sha256Hex('null'));
+    assert.equal(error.responseEnvelope.bytes, Buffer.byteLength('null', 'utf8'));
+    assert.deepEqual(envelopeVerificationFailures(error.responseEnvelope), []);
+    // The three provider failure types are DISJOINT, and that is not a
+    // tautology pin. `classifyFailure` and the runner both branch on
+    // `instanceof ProviderHttpError`; a subclass would silently enrol every
+    // rule written for a failed HTTP exchange over legs whose exchange
+    // succeeded, and would take its nullable envelope with it.
+    assert.ok(
+      !(error instanceof ProviderHttpError),
+      'a 2xx whose shape could not be read is not a failed HTTP exchange',
+    );
+    assert.ok(
+      !(error instanceof ProviderUnfinishedTurnError),
+      'nor a turn whose provider declared it unfinished — nothing here read a terminal state',
+    );
+    // The status survives in prose as well as in the field, so a leg with no
+    // content still carries the receipt twice (see statusFromErrorDetail).
+    assert.equal(statusFromErrorDetail(error.message), 200, error.message);
+  });
+}
+
+/**
+ * Provider-specific NESTED shapes: a body that parses to an object whose
+ * expected member is null or the wrong type.
+ *
+ * These reach deeper than the top-level `null` — a `.filter()` callback, a
+ * `parts` element — which is exactly where a per-adapter fix would rot, since
+ * each provider walks its own path to its own field. The expected class per row
+ * is a LITERAL: some of these shapes settle as an unfinished turn today
+ * (`Array.isArray` refuses them before anything is dereferenced) and some throw,
+ * and writing down which is which is what makes a later adapter change that
+ * moves a row visible instead of silent.
+ *
+ * Every row asserts the same invariant whichever class it lands in: the leg
+ * keeps the received bytes and the 2xx it arrived with.
+ */
+const NESTED_SHAPES: Array<{
+  participantId: string;
+  body: string;
+  expected: 'unreadable' | 'unfinished';
+}> = [
+  // Responses API (openai + xai share this extractor, and both are swept).
+  { participantId: 'openai-gpt-5.6-sol', body: '{"output":null}', expected: 'unfinished' },
+  { participantId: 'openai-gpt-5.6-sol', body: '{"output":"not-an-array"}', expected: 'unfinished' },
+  { participantId: 'openai-gpt-5.6-sol', body: '{"output":[null]}', expected: 'unreadable' },
+  {
+    participantId: 'openai-gpt-5.6-sol',
+    body: '{"output":[{"type":"message","content":[null]}]}',
+    expected: 'unreadable',
+  },
+  {
+    // A body the provider says COMPLETED, so the extractor runs to the end and
+    // the terminal-state branch cannot catch it first (rule 3b).
+    participantId: 'openai-gpt-5.6-sol',
+    body: '{"status":"completed","output":[null]}',
+    expected: 'unreadable',
+  },
+  { participantId: 'xai-grok-4.5', body: '{"output":[null]}', expected: 'unreadable' },
+  {
+    participantId: 'xai-grok-4.5',
+    body: '{"status":"completed","output":[null]}',
+    expected: 'unreadable',
+  },
+  // Anthropic Messages.
+  { participantId: 'anthropic-claude-fable-5', body: '{"content":null}', expected: 'unfinished' },
+  {
+    participantId: 'anthropic-claude-fable-5',
+    body: '{"content":"not-an-array"}',
+    expected: 'unfinished',
+  },
+  { participantId: 'anthropic-claude-fable-5', body: '{"content":[null]}', expected: 'unreadable' },
+  {
+    participantId: 'anthropic-claude-fable-5',
+    body: '{"stop_reason":"end_turn","content":[null]}',
+    expected: 'unreadable',
+  },
+  // Google generateContent — one level deeper again, because the extractor
+  // reaches candidates[0].content.parts before it touches an element.
+  { participantId: 'google-gemini-3.1-pro-preview', body: '{"candidates":null}', expected: 'unfinished' },
+  {
+    participantId: 'google-gemini-3.1-pro-preview',
+    body: '{"candidates":"not-an-array"}',
+    expected: 'unfinished',
+  },
+  { participantId: 'google-gemini-3.1-pro-preview', body: '{"candidates":[null]}', expected: 'unfinished' },
+  {
+    participantId: 'google-gemini-3.1-pro-preview',
+    body: '{"candidates":[{"content":{"parts":[null]}}]}',
+    expected: 'unreadable',
+  },
+  {
+    participantId: 'google-gemini-3.1-pro-preview',
+    body: '{"candidates":[{"finishReason":"STOP","content":{"parts":[null]}}]}',
+    expected: 'unreadable',
+  },
+];
+
+test('the nested-shape table covers every registry adapter', () => {
+  // The table is written per provider, so it cannot be derived from the
+  // registry — which means it can fall behind it. This is the pairing check:
+  // every arm the registry returns has at least one nested row.
+  const covered = new Set(NESTED_SHAPES.map((row) => row.participantId));
+  assert.deepEqual([...covered].sort(), [...createRealAdapters().keys()].sort());
+});
+
+for (const row of NESTED_SHAPES) {
+  test(`${row.participantId}: a nested malformed shape keeps its bytes — ${row.body}`, async () => {
+    const { error, calls } = await chatAgainst(row.participantId, 200, row.body);
+    assert.equal(calls, 1, 'the adapter really sent a request');
+    if (row.expected === 'unreadable') {
+      assert.ok(
+        error instanceof ProviderUnreadableResponseError,
+        `expected the typed unreadable-response failure, got ${String(error)}`,
+      );
+    } else {
+      assert.ok(
+        error instanceof ProviderUnfinishedTurnError,
+        `expected the typed unfinished turn, got ${String(error)}`,
+      );
+    }
+    const kept = receipt(error);
+    assert.equal(kept.status, 200, 'the status the body arrived with');
+    assert.ok(kept.envelope !== null, 'and the bytes were kept');
+    assert.equal(kept.envelope.body, row.body, 'exactly as received');
+    assert.equal(kept.envelope.sha256, sha256Hex(row.body));
+    assert.deepEqual(envelopeVerificationFailures(kept.envelope), []);
+  });
+}
+
+test('a well-formed finished turn still RETURNS — the negative control for the guard', async () => {
+  // Rule 5. Every case above asserts a refusal, and a guard that converted
+  // every read into a typed failure would pass all of them. This is the same
+  // adapter, the same canned fetch, on a body its extractor can walk: it must
+  // come back as a response and not as an error at all.
+  const fixture = FINISHED_BODY['anthropic']!;
+  const { result } = await withEnv(fixture.env, SYNTHETIC_KEY, () =>
+    withCannedBody(fixture.body, () =>
+      registryAdapter(fixture.participantId).chat(TURNS, 5_000, { maxOutputTokens: 16_000 }),
+    ),
+  );
+  assert.equal(result.httpStatus, 200);
+  assert.equal(result.responseEnvelope.body, fixture.body);
+  assert.equal(result.rawText, 'answer-anthropic');
+});
+
+// ---------------------------------------------------------------------------
+// The guard covers an ASYNC read on the same terms as a synchronous one
+// ---------------------------------------------------------------------------
+
+/**
+ * `postJsonAndRead` says in prose that the read is AWAITED inside the try, so
+ * an extractor returning a promise is covered on the same terms. Every current
+ * extractor is synchronous, so nothing in the sweeps above exercises that
+ * sentence — and a build changing `return await read(...)` to `return read(...)`
+ * passed the whole suite. These two cases are what redden when the sentence
+ * stops being true.
+ *
+ * WHY THE SYNCHRONOUS THROW CANNOT DISCRIMINATE (rule 3b): a `read` that throws
+ * before returning throws inside the `try` whether or not its result is
+ * awaited, so the adapter sweeps above convert identically under both builds.
+ * Only a read that returns a REJECTED PROMISE tells them apart — without the
+ * await, that rejection is handed back to the caller unconverted.
+ */
+const ASYNC_PROBE_BODY = '{\n  "shape": "parses, and this build cannot walk it"\n}';
+
+function probeRequest(): ProviderRequest {
+  return {
+    provider: 'probe',
+    url: 'https://provider.invalid/v1/probe',
+    headers: {},
+    body: { probe: true },
+    timeoutMs: 5_000,
+  };
+}
+
+/** Call the exported `postJsonAndRead` against a canned 2xx, reporting what
+ *  came back ALONGSIDE proof a request was actually sent (rule 3b-reach). */
+async function underGuard<T>(
+  read: (received: ReceivedResponse) => T | Promise<T>,
+): Promise<{ value: T | undefined; thrown: unknown; calls: number }> {
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls += 1;
+    return new Response(ASYNC_PROBE_BODY, { status: 200 });
+  }) as typeof fetch;
+  try {
+    try {
+      return { value: await postJsonAndRead(probeRequest(), read), thrown: null, calls };
+    } catch (thrown: unknown) {
+      return { value: undefined, thrown, calls };
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test('an ASYNC read that rejects is converted too, with its bytes and its status', async () => {
+  const { thrown, calls } = await underGuard(async () => {
+    // A macrotask boundary, so the rejection genuinely settles after the call
+    // returns rather than throwing synchronously inside the async function's
+    // first tick — which would be caught even without the await.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    throw new TypeError("Cannot read properties of null (reading 'output')");
+  });
+  assert.equal(calls, 1, 'the request really went out, so the case is not vacuous');
+  assert.ok(
+    thrown instanceof ProviderUnreadableResponseError,
+    `expected the typed unreadable-response failure, got ${String(thrown)}`,
+  );
+  assert.equal(thrown.httpStatus, 200, 'the status the body arrived with');
+  assert.equal(thrown.responseEnvelope.body, ASYNC_PROBE_BODY, 'the received bytes, unaltered');
+  assert.equal(thrown.responseEnvelope.sha256, sha256Hex(ASYNC_PROBE_BODY));
+  assert.deepEqual(envelopeVerificationFailures(thrown.responseEnvelope), []);
+  assert.equal(statusFromErrorDetail(thrown.message), 200, thrown.message);
+});
+
+test('an ASYNC read that RESOLVES returns its value — the negative control', async () => {
+  // Rule 5: a guard that converted every read into a typed failure would pass
+  // the case above. The resolved value must come back, and come back unwrapped.
+  const { value, thrown, calls } = await underGuard(async (received) => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return `walked:${received.status}:${received.responseEnvelope.bytes}`;
+  });
+  assert.equal(calls, 1);
+  assert.equal(thrown, null, 'a readable body is not a failure');
+  assert.equal(value, `walked:200:${Buffer.byteLength(ASYNC_PROBE_BODY, 'utf8')}`);
+});

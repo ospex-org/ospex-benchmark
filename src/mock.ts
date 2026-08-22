@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { ProviderHttpError, ProviderTimeoutError } from './providers/errors.js';
 import { deriveComparableUsage } from './providers/comparableUsage.js';
+import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { currentOddsRowSchema, gamesEndpointRowSchema } from './wire.js';
 import { applyConfiguration } from './participantConfiguration.js';
 import type {
@@ -263,6 +264,39 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * The envelope a NON-NETWORK adapter retains. There is no wire body here, so
+ * one is composed from the same values the fake reports and sealed by the same
+ * function a live adapter uses. It keeps the shape of the evidence identical
+ * between a dry run and a live one — the scorer's envelope check then runs on
+ * every dry-run artifact rather than only on runs nobody can produce locally —
+ * and its `synthetic` marker says plainly that no provider ever sent it.
+ *
+ * One consequence worth knowing before it surprises someone: a fake's recorded
+ * `searchAudit` is a hand-built fixture, not something extracted from this
+ * body, so `yarn replay:search-audit` reports every dry-run leg as CHANGED.
+ * That is the replay working — it says this run's audits are not derivable
+ * from its retained bodies, which is true of a fake and would be a red flag on
+ * a live run.
+ */
+function syntheticEnvelope(fields: {
+  source: string;
+  model: string;
+  id: string;
+  text: string;
+  usageRaw: unknown;
+}) {
+  return sealResponseEnvelope(
+    JSON.stringify({
+      synthetic: fields.source,
+      model: fields.model,
+      id: fields.id,
+      output: [{ type: 'message', content: [{ type: 'output_text', text: fields.text }] }],
+      usage: fields.usageRaw,
+    }),
+  );
+}
+
 function mockResponse(options: {
   rawText: string;
   reportedModelId: string;
@@ -274,6 +308,13 @@ function mockResponse(options: {
 }): ProviderResponse {
   return {
     rawText: options.rawText,
+    responseEnvelope: syntheticEnvelope({
+      source: 'mock-adapter',
+      model: options.reportedModelId,
+      id: options.responseId,
+      text: options.rawText,
+      usageRaw: options.usageRaw,
+    }),
     reportedModelId: options.reportedModelId,
     providerResponseId: options.responseId,
     httpStatus: 200,
