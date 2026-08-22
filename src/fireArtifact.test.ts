@@ -10,10 +10,11 @@ import {
   persistedAttemptSchemaV1,
   toPersistedAttempts,
 } from './fireArtifact.js';
-import type { ArmDigestInputV1 } from './fireArtifact.js';
+import type { ArmDigestInputV1, PersistedAttemptV1 } from './fireArtifact.js';
+import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { forecastFingerprint } from './schema.js';
 import type { ArmGameResult, AttemptRecord, BenchmarkResponse, ForecastOutput, MarketKey } from './types.js';
-import { fixtureEnvelope } from './testFactories.js';
+import { damageEnvelope, fixtureEnvelope } from './testFactories.js';
 
 /**
  * The fire artifact's arm integrity core (SPEC §5). These fixtures are the
@@ -530,4 +531,178 @@ test('toPersistedAttempts carries the searchAudit through detached (explicit nul
   const [plain] = toPersistedAttempts(noSearch);
   assert.equal(plain!.searchAudit, null, 'no search activity persists an explicit null, not an absent key');
   assert.ok(Object.hasOwn(plain!, 'searchAudit'));
+});
+
+// --- the retained provider response envelope (#92 / #111) --------------------
+
+/**
+ * The answer text and the complete response body it was extracted from, as two
+ * DELIBERATELY different strings.
+ *
+ * The mapper writes both onto the same persisted attempt, from the same record, as
+ * strings — so a fixture where they are equal cannot tell a build that copies the
+ * envelope from one that copies the answer text twice (rule 3d). Only the envelope
+ * carries `ENVELOPE-BODY-ONLY-9c7`, and only the answer is the string the response
+ * digest is taken over.
+ *
+ * The body is multibyte on purpose: 107 characters and 110 UTF-8 bytes, so the
+ * `bytes` literal below is refused by a build that measures the body's character
+ * count (rule 3g-both — the two measures have to disagree or the case discriminates
+ * nothing).
+ */
+const ANSWER_ONLY = '{"answer":"ANSWER-TEXT-ONLY-4d2"}';
+const ENVELOPE_BODY = JSON.stringify({
+  envelope: 'ENVELOPE-BODY-ONLY-9c7 — señal',
+  wrapping: { answer: ANSWER_ONLY },
+});
+// Frozen literals, never derived from the helpers under test (rule 4b): a digest
+// computed here with the same function the mapper uses would move with a broken one.
+const ANSWER_SHA = '2ab19fe219c60a4ea4be32f8012a5959a388d093922cbf9c1f3419cc500a5232';
+const ENVELOPE_SHA = '2cbb927663c9e17885136f2a587eacb0369ab5df6048a9372c464a8a39bf84b4';
+const ENVELOPE_BYTES = 110;
+
+test('toPersistedAttempts maps the WHOLE attempt, envelope included — a marker in the body only survives', () => {
+  const persisted = first(
+    toPersistedAttempts(
+      armResult({
+        attempt: attempt({
+          rawText: ANSWER_ONLY,
+          responseEnvelope: sealResponseEnvelope(ENVELOPE_BODY),
+          reportedModelId: 'REPORTED-MODEL-ONLY',
+          httpStatus: 207,
+          usage: { inputTokens: 11, outputTokens: 22, totalTokens: 33 },
+          searchAudit: { queries: [{ query: 'SEARCH-QUERY-ONLY' }], results: [], searchCount: 1, incomplete: [] },
+          providerStopReason: 'STOP-REASON-ONLY',
+          turnCompleted: false,
+          requestAt: '2026-07-16T00:00:01.000Z',
+          responseAt: '2026-07-16T00:00:02.000Z',
+          acceptedAt: '2026-07-16T00:00:03.000Z',
+        }),
+      }),
+    ),
+  );
+  // The reproduction in #111, inverted: the marker lives ONLY in the envelope body,
+  // and the artifact used to keep the extracted answer and drop the body.
+  assert.ok(
+    JSON.stringify(persisted).includes('ENVELOPE-BODY-ONLY-9c7'),
+    'the complete response body survives the mapping',
+  );
+  assert.ok(
+    !persisted.persistedResponseBody!.includes('ENVELOPE-BODY-ONLY-9c7'),
+    'and the answer text does not carry it, so the fixture discriminates the two fields',
+  );
+  // ONE assertion over the entire map, every field carrying a value unique to it, so a
+  // positional swap between any two same-typed fields — `persistedResponseBody` and
+  // `responseEnvelope.body` above all — reddens here (rule 3d).
+  assert.deepEqual(persisted, {
+    attemptNumber: 1,
+    kind: 'initial',
+    requestStartedAt: '2026-07-16T00:00:01.000Z',
+    requestReceivedAt: '2026-07-16T00:00:02.000Z',
+    acceptedAt: '2026-07-16T00:00:03.000Z',
+    reportedModelId: 'REPORTED-MODEL-ONLY',
+    httpStatus: 207,
+    persistedResponseBody: ANSWER_ONLY,
+    responseSha256: ANSWER_SHA,
+    transport: 'ok',
+    usage: { inputTokens: 11, outputTokens: 22, totalTokens: 33 },
+    searchAudit: { queries: [{ query: 'SEARCH-QUERY-ONLY' }], results: [], searchCount: 1, incomplete: [] },
+    providerStopReason: 'STOP-REASON-ONLY',
+    turnCompleted: false,
+    responseEnvelope: { body: ENVELOPE_BODY, sha256: ENVELOPE_SHA, bytes: ENVELOPE_BYTES },
+  });
+});
+
+test('the persisted envelope is detached from the record it was mapped from', () => {
+  const live = armResult();
+  const persisted = first(toPersistedAttempts(live));
+  assert.notEqual(
+    persisted.responseEnvelope,
+    live.attempt.responseEnvelope,
+    'never an alias of live runner state — the same detachment rule usage and searchAudit follow',
+  );
+  assert.deepEqual(persisted.responseEnvelope, live.attempt.responseEnvelope, 'but the same value');
+});
+
+test('toPersistedAttempts persists an explicit null envelope when nothing came back — the negative control', () => {
+  // A timeout: no body was retained because none arrived. The KEY is still written, so
+  // "this build retains" stays readable off the attempt, and nothing is flagged.
+  const [persisted] = toPersistedAttempts(
+    armResult({
+      outcome: 'timeout',
+      attempt: attempt({ rawText: null, responseEnvelope: null, httpStatus: null, acceptedAt: null, reportedModelId: null }),
+    }),
+  );
+  assert.equal(persisted!.responseEnvelope, null, 'an explicit null, not an absent key');
+  assert.ok(Object.hasOwn(persisted!, 'responseEnvelope'), 'the key is written on every new attempt');
+  assert.equal(persisted!.transport, 'timeout');
+  // The positive half of the same contract (rule 5): a received response DOES carry one.
+  assert.notEqual(first(toPersistedAttempts(armResult())).responseEnvelope, null);
+});
+
+test('toPersistedAttempts retains the REPAIR attempt envelope too, not only the initial', () => {
+  // #92 covers every initial AND repair attempt. The two legs carry different bodies so
+  // a build that maps the initial's envelope onto both is not mistaken for a correct one.
+  const initialBody = JSON.stringify({ leg: 'INITIAL-LEG-BODY-a1' });
+  const repairBody = JSON.stringify({ leg: 'REPAIR-LEG-BODY-b2' });
+  const attempts = toPersistedAttempts(
+    armResult({
+      outcome: 'valid',
+      attempt: attempt({ acceptedAt: null, responseEnvelope: sealResponseEnvelope(initialBody) }),
+      repair: attempt({ responseEnvelope: sealResponseEnvelope(repairBody) }),
+      repairUsed: true,
+      repairTransport: 'ok',
+    }),
+  );
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0]!.kind, 'initial');
+  assert.equal(attempts[1]!.kind, 'repair');
+  assert.equal(attempts[0]!.responseEnvelope?.body, initialBody);
+  assert.equal(attempts[1]!.responseEnvelope?.body, repairBody);
+});
+
+test('the envelope is inside the armDigest domain: a body-only difference moves the digest', () => {
+  const withEnvelope = (body: string): readonly PersistedAttemptV1[] =>
+    toPersistedAttempts(armResult({ attempt: attempt({ responseEnvelope: sealResponseEnvelope(body) }) }));
+  const a = armDigest(digestInput({ orderedAttempts: withEnvelope('{"body":"A"}') }));
+  const b = armDigest(digestInput({ orderedAttempts: withEnvelope('{"body":"B"}') }));
+  assert.notEqual(a, b, 'two different response bodies cannot share an arm digest');
+
+  // Deleting the key off a new attempt is digest-DETECTED — the property the run file
+  // could not offer, and the reason this artifact needs no separate era stamp.
+  const base = structuredClone(withEnvelope('{"body":"A"}')) as unknown as Array<Record<string, unknown>>;
+  const stripped = structuredClone(base);
+  delete stripped[0]!['responseEnvelope'];
+  assert.notEqual(
+    armDigest(digestInput({ orderedAttempts: stripped as never })),
+    a,
+    'stripping the envelope off a new attempt is digest-detected',
+  );
+
+  // An absent key and an explicit null are different evidence and must not collapse.
+  const nulled = structuredClone(base);
+  nulled[0]!['responseEnvelope'] = null;
+  assert.notEqual(armDigest(digestInput({ orderedAttempts: nulled as never })), a);
+  assert.notEqual(
+    armDigest(digestInput({ orderedAttempts: stripped as never })),
+    armDigest(digestInput({ orderedAttempts: nulled as never })),
+  );
+});
+
+test('persistedAttemptSchemaV1 accepts a legacy attempt with no envelope key and refuses a malformed one', () => {
+  const modern = first(toPersistedAttempts(armResult()));
+  const legacy = { ...(modern as unknown as Record<string, unknown>) };
+  delete legacy['responseEnvelope'];
+  assert.ok(!Object.hasOwn(legacy, 'responseEnvelope'), 'the legacy fixture genuinely lacks the key');
+  assert.doesNotThrow(() => persistedAttemptSchemaV1.parse(legacy), 'a pre-field attempt still parses');
+  assert.doesNotThrow(() => persistedAttemptSchemaV1.parse({ ...legacy, responseEnvelope: null }));
+  // The imported strict envelope schema is doing the work: an extra key, an upper-case
+  // digest, a fractional byte count and a missing digest are each refused by exactly one
+  // of its rules, so accepting any of them would mean this field got its own looser shape.
+  for (const damage of ['extra-key', 'upper-case-sha256', 'fractional-bytes', 'missing-sha256'] as const) {
+    assert.throws(
+      () => persistedAttemptSchemaV1.parse({ ...legacy, responseEnvelope: damageEnvelope(modern.responseEnvelope!, damage) }),
+      `${damage} must be refused`,
+    );
+  }
 });

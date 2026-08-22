@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { toolInferenceConfigSha256 } from './toolInferenceConfig.js';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { redactSecrets } from './config.js';
 import { cohortBoot } from './cohortBoot.js';
@@ -12,13 +13,17 @@ import { armDigest } from './fireArtifact.js';
 import { buildFireArtifact } from './fireArtifactProducer.js';
 import type { FireContext, MarketFireContextV1 } from './fireArtifactProducer.js';
 import {
+  isCoherentPreRetentionFireArtifact,
   parseFireArtifactV1,
   recomputeFireArtifactDigests,
   serializeFireArtifactV1,
+  verifyFireArtifactEnvelopes,
   verifyFireArtifactReplay,
   verifyFireArtifactRelations,
   writeFireArtifactV1,
 } from './fireArtifactWriter.js';
+import { ProviderTimeoutError } from './providers/errors.js';
+import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { checkPublication } from './manifestPublication.js';
 import { MARKET_POLICY_DIGEST, MARKET_POLICY_VERSION } from './marketPolicy.js';
 import { MODEL_PRICE_TABLE_DIGEST, MODEL_PRICE_TABLE_VERSION } from './modelPriceTable.js';
@@ -42,6 +47,7 @@ import type {
   ProviderAdapter,
   ProviderName,
   ProviderResponse,
+  ProviderResponseEnvelope,
   SlateBundle,
 } from './types.js';
 import { fixtureEnvelope } from './testFactories.js';
@@ -166,10 +172,14 @@ function scopedResponse(req: GameRequest, arm: ArmSpec, cohortId: string): Bench
   };
 }
 
-function stubResponse(rawText: string, reportedModelId: string): ProviderResponse {
+function stubResponse(
+  rawText: string,
+  reportedModelId: string,
+  responseEnvelope: ProviderResponseEnvelope = fixtureEnvelope(rawText),
+): ProviderResponse {
   return {
     rawText,
-    responseEnvelope: fixtureEnvelope(rawText),
+    responseEnvelope,
     reportedModelId,
     providerResponseId: 'stub-response',
     httpStatus: 200,
@@ -286,9 +296,25 @@ function marketCtx(market: MarketKey, cohortId: string, fireId: string): MarketF
   };
 }
 
-async function producedFire(
-  opts: { markets?: readonly MarketKey[]; awayTeam?: string } = {},
-): Promise<FireArtifactV1> {
+interface FireOpts {
+  markets?: readonly MarketKey[];
+  awayTeam?: string;
+  /**
+   * What each arm's provider does. `repair` echoes a wrong cohort id first (schema-
+   * invalid, fingerprint-preserving) so `runSlate` sends a real second leg; `timeout`
+   * throws the typed timeout so the arm settles with nothing received.
+   */
+  behaviourFor?: (arm: ArmSpec) => 'valid' | 'repair' | 'timeout';
+  /** Override the retained response envelope, given the answer text and the leg. */
+  envelopeFor?: (rawText: string, leg: 'initial' | 'repair') => ProviderResponseEnvelope;
+}
+
+/**
+ * The two halves of a produced fire, kept separable so a test can run the SLATE under
+ * one environment and the ARTIFACT BUILD under another — which is the only way to hand
+ * the mapper a response body that was sealed before a credential was configured.
+ */
+async function fireParts(opts: FireOpts = {}): Promise<{ env: RunEnvelope; ctx: FireContext }> {
   const markets = opts.markets ?? (['moneyline', 'total'] as const);
   const awayTeam = opts.awayTeam ?? AWAY_TEAM;
   const json = manifestJson();
@@ -298,7 +324,23 @@ async function producedFire(
   const request = scopedRequest(markets, awayTeam);
   const adapters = new Map<string, ProviderAdapter>();
   for (const arm of ARMS) {
-    adapters.set(arm.participantId, stubAdapter(arm, () => stubResponse(JSON.stringify(scopedResponse(request, arm, cohortId)), arm.requestedModelId)));
+    const behaviour = opts.behaviourFor?.(arm) ?? 'valid';
+    let calls = 0;
+    adapters.set(
+      arm.participantId,
+      stubAdapter(arm, () => {
+        calls += 1;
+        if (behaviour === 'timeout') throw new ProviderTimeoutError(arm.provider, 600_000);
+        // The leg this call IS, not the behaviour that produced it: a repair is only
+        // ever the second call, so the label matches the persisted attempt's `kind`.
+        const leg: 'initial' | 'repair' = calls === 1 ? 'initial' : 'repair';
+        const body = scopedResponse(request, arm, cohortId);
+        // A wrong cohort echo fails validation while preserving the decision
+        // fingerprint exactly, which is what makes the repair leg admissible.
+        const answer = JSON.stringify(behaviour === 'repair' && calls === 1 ? { ...body, cohortId: 'wrong-cohort-echo' } : body);
+        return stubResponse(answer, arm.requestedModelId, opts.envelopeFor?.(answer, leg) ?? fixtureEnvelope(answer));
+      }),
+    );
   }
   const env: RunEnvelope = await runSlate([...ARMS], adapters, [request], {
     cohortId,
@@ -316,11 +358,16 @@ async function producedFire(
     bundleBuiltAt: BUNDLE_BUILT_AT,
     perMarket: markets.map((m) => marketCtx(m, cohortId, 'fire-1')),
   };
+  return { env, ctx };
+}
+
+async function producedFire(opts: FireOpts = {}): Promise<FireArtifactV1> {
+  const { env, ctx } = await fireParts(opts);
   return buildFireArtifact(env, ctx);
 }
 
 /** Parse a produced artifact into a mutable, unbranded value (a persisted read-back). */
-async function parsedFire(opts?: { markets?: readonly MarketKey[]; awayTeam?: string }): Promise<FireArtifactV1> {
+async function parsedFire(opts?: FireOpts): Promise<FireArtifactV1> {
   const artifact = await producedFire(opts);
   return parseFireArtifactV1(serializeFireArtifactV1(artifact));
 }
@@ -357,6 +404,48 @@ function withEnv(name: string, value: string, fn: () => void): void {
     if (original === undefined) delete process.env[name];
     else process.env[name] = original;
   }
+}
+
+/** Run with a credential variable definitively UNSET. Named rather than folded into
+ *  `withEnv` because "absent" is a state the redaction cases have to control: a value
+ *  left over in the developer's shell would silently change what redaction does, and
+ *  the negative control that proves redaction is doing the work depends on it (rule 4c). */
+function withEnvAbsent(name: string, fn: () => void): void {
+  const original = process.env[name];
+  delete process.env[name];
+  try {
+    fn();
+  } finally {
+    if (original !== undefined) process.env[name] = original;
+  }
+}
+
+/** The async form: the environment has to cover the whole slate run, not just the call
+ *  that starts it. */
+async function withEnvAsync<T>(name: string, value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const original = process.env[name];
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+  try {
+    return await fn();
+  } finally {
+    if (original === undefined) delete process.env[name];
+    else process.env[name] = original;
+  }
+}
+
+/** The fire artifacts this machine has actually written. `.fire-artifacts/` is
+ *  gitignored, so this is local evidence and may legitimately be empty elsewhere. */
+function archivedFireArtifacts(): string[] {
+  const base = fileURLToPath(new URL('../.fire-artifacts', import.meta.url));
+  if (!existsSync(base)) return [];
+  return readdirSync(base, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .flatMap((entry) =>
+      readdirSync(join(base, entry.name))
+        .filter((name) => name.startsWith('fire-') && name.endsWith('.json'))
+        .map((name) => join(base, entry.name, name)),
+    );
 }
 
 // --- happy path -------------------------------------------------------------
@@ -564,5 +653,533 @@ test('replay catches baseline decisions that do not rederive from the retained r
 test('replay is empty for a produced non-scope-covering check across all legal scopes', async () => {
   for (const markets of [['moneyline'], ['total'], ['moneyline', 'total']] as MarketKey[][]) {
     assert.deepEqual(recomputeFireArtifactDigests(await parsedFire({ markets })), []);
+  }
+});
+
+// --- retained response envelopes (#92 / #111) -------------------------------
+
+/**
+ * A produced fire with all three attempt shapes present at once: an arm that
+ * answered on the first try, an arm that needed a repair (two sent legs), and an
+ * arm that timed out (a sent leg where nothing came back). Every case below is
+ * built on this so the presence rule is exercised against initial legs, repair
+ * legs and no-receipt legs in one artifact rather than three tidy ones.
+ */
+async function mixedFire(opts: Omit<FireOpts, 'behaviourFor'> = {}): Promise<FireArtifactV1> {
+  return producedFire({
+    ...opts,
+    behaviourFor: (arm) =>
+      arm.participantId === ARMS[0]!.participantId
+        ? 'repair'
+        : arm.participantId === ARMS[ARMS.length - 1]!.participantId
+          ? 'timeout'
+          : 'valid',
+  });
+}
+
+/** A raw persisted artifact as plain JSON — the shape a hand-edit actually reaches. */
+type RawFire = Record<string, any>;
+
+function rawOf(artifact: FireArtifactV1): RawFire {
+  return JSON.parse(serializeFireArtifactV1(artifact)) as RawFire;
+}
+
+/** Re-parse edited raw JSON through the production parser, so an absent key is
+ *  absent because the BYTES lack it, not because a test built the object that way. */
+function reparse(raw: RawFire): FireArtifactV1 {
+  return parseFireArtifactV1(JSON.stringify(raw));
+}
+
+/** Recompute EVERY arm's digest over its edited domain, so a row proves the presence
+ *  rule alone rather than riding on a stale digest. */
+function recomputeAllArmDigests(raw: RawFire): void {
+  for (const arm of raw['arms'] as RawFire[]) {
+    arm['armDigest'] = armDigest({
+      cohortId: raw['cohortId'],
+      fireId: raw['fireId'],
+      runId: raw['runId'],
+      participantId: arm['expectedArmIdentity'].participantId,
+      requestSha256: raw['requestSha256'],
+      expectedArmIdentity: arm['expectedArmIdentity'],
+      orderedAttempts: arm['orderedAttempts'],
+      terminalOutcome: arm['terminalOutcome'],
+      acceptedResponseDigestOrNull: arm['acceptedResponseDigest'],
+      acceptedDecisionFingerprintOrNull: arm['acceptedDecisionFingerprint'],
+    });
+  }
+}
+
+function everyAttempt(raw: RawFire): RawFire[] {
+  return (raw['arms'] as RawFire[]).flatMap((arm) => arm['orderedAttempts'] as RawFire[]);
+}
+
+/** The repair arm's two legs — the only arm with a second sent attempt. */
+function repairArm(raw: RawFire): RawFire {
+  const arm = (raw['arms'] as RawFire[]).find((a) => (a['orderedAttempts'] as RawFire[]).length === 2);
+  assert.ok(arm !== undefined, 'the mixed fixture must contain an arm with a repair leg');
+  return arm;
+}
+
+const OPTIONAL_KEYS = ['searchAudit', 'providerStopReason', 'turnCompleted', 'responseEnvelope'] as const;
+
+test('a produced fire retains a complete response envelope on every leg that received one', async () => {
+  const artifact = await mixedFire();
+  const parsed = parseFireArtifactV1(serializeFireArtifactV1(artifact));
+
+  // Fixture reach (rule 3b-reach): the shapes this file's cases depend on are really here.
+  const legCounts = parsed.arms.map((a) => a.orderedAttempts.length).sort();
+  assert.ok(legCounts.includes(2), 'one arm sent a repair leg');
+  const timedOut = parsed.arms.find((a) => a.terminalOutcome === 'timeout');
+  assert.ok(timedOut !== undefined, 'one arm timed out');
+  assert.equal(timedOut.orderedAttempts[0]!.transport, 'timeout');
+
+  for (const arm of parsed.arms) {
+    for (const attempt of arm.orderedAttempts) {
+      const where = `${arm.expectedArmIdentity.participantId}#${attempt.attemptNumber}`;
+      assert.ok(Object.hasOwn(attempt, 'responseEnvelope'), `${where} carries the key explicitly`);
+      if (attempt.transport === 'ok') {
+        assert.ok(attempt.responseEnvelope != null, `${where} received a response, so it retains a body`);
+        assert.equal(sha256Hex(attempt.responseEnvelope.body), attempt.responseEnvelope.sha256);
+        assert.equal(Buffer.byteLength(attempt.responseEnvelope.body, 'utf8'), attempt.responseEnvelope.bytes);
+      } else {
+        // The NEGATIVE CONTROL (rule 5): nothing came back, so nothing is retained —
+        // and that leg is NOT flagged.
+        assert.equal(attempt.responseEnvelope, null, `${where} received nothing, so it retains nothing`);
+      }
+    }
+  }
+  assert.deepEqual(verifyFireArtifactEnvelopes(parsed), []);
+  assert.deepEqual(verifyFireArtifactReplay(parsed), []);
+  assert.equal(isCoherentPreRetentionFireArtifact(parsed), false, 'a retaining build is never exempt');
+});
+
+test('a marker present ONLY in the response body survives into the WRITTEN artifact file', async () => {
+  // The inverse of the reproduction in #111. The marker is in the envelope's wrapper
+  // and NOWHERE in the answer text, so a build that persists only the extracted answer
+  // loses it — which is exactly what the artifact used to do.
+  const MARKER = 'envelope-only-marker-6b1f9c';
+  const artifact = await mixedFire({
+    envelopeFor: (answer, leg) =>
+      sealResponseEnvelope(
+        JSON.stringify({ providerWrapper: MARKER, leg, output: [{ type: 'message', content: [{ type: 'output_text', text: answer }] }] }),
+      ),
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'ospex-fire-'));
+  try {
+    const filePath = join(dir, 'fire-marker.json');
+    writeFireArtifactV1(filePath, artifact);
+    const bytes = readFileSync(filePath, 'utf8');
+    // Rule 2: the claim is about the artifact on disk, not the mapper's return value.
+    assert.ok(bytes.includes(MARKER), 'the durable file carries the complete response body');
+
+    const parsed = parseFireArtifactV1(bytes);
+    let received = 0;
+    for (const arm of parsed.arms) {
+      for (const attempt of arm.orderedAttempts) {
+        assert.ok(
+          !(attempt.persistedResponseBody ?? '').includes(MARKER),
+          'the answer text does not carry the marker, so this fixture discriminates the two fields',
+        );
+        if (attempt.responseEnvelope == null) continue;
+        received += 1;
+        assert.ok(attempt.responseEnvelope.body.includes(MARKER), 'the retained body carries the marker');
+        assert.ok(
+          attempt.responseEnvelope.body.includes(`"leg":"${attempt.kind}"`),
+          'each leg retains ITS OWN body — a repair is not persisted with a copy of the initial one',
+        );
+      }
+    }
+    assert.ok(received >= 4, `every received leg retained a body (${received})`);
+    assert.deepEqual(verifyFireArtifactReplay(parsed), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the persisted envelope and the persisted answer are distinct strings, each bound to its own digest', async () => {
+  // Rule 3d: both are strings written onto the same attempt from the same record, so a
+  // positional swap is invisible unless the two carry different values and each is
+  // checked against its own digest.
+  const artifact = await mixedFire();
+  const parsed = parseFireArtifactV1(serializeFireArtifactV1(artifact));
+  let checked = 0;
+  for (const arm of parsed.arms) {
+    for (const attempt of arm.orderedAttempts) {
+      if (attempt.responseEnvelope == null || attempt.persistedResponseBody === null) continue;
+      checked += 1;
+      assert.notEqual(attempt.persistedResponseBody, attempt.responseEnvelope.body);
+      assert.equal(attempt.responseSha256, sha256Hex(attempt.persistedResponseBody));
+      assert.equal(attempt.responseEnvelope.sha256, sha256Hex(attempt.responseEnvelope.body));
+      assert.notEqual(attempt.responseSha256, attempt.responseEnvelope.sha256);
+      // And the answer is the thing that re-validates as a benchmark response, while
+      // the envelope is the wrapper it arrived inside — so a swap changes which string
+      // the scorer would read as the decision.
+      assert.doesNotThrow(() => JSON.parse(attempt.persistedResponseBody!).games as unknown);
+      assert.ok(attempt.responseEnvelope.body.includes('"fixture":"test-factory"'), 'the envelope is the wrapper');
+    }
+  }
+  assert.ok(checked >= 4, `the fixture reached the attempts under test (${checked})`);
+});
+
+test('the retained body goes through the artifact redaction pass, proven on the WRITTEN file', async () => {
+  // The slate runs with the credential ABSENT, so the runner seals a body carrying the
+  // literal value; the artifact is then built and written with it CONFIGURED. That is
+  // the only ordering under which the mapper's own redaction pass is the thing being
+  // measured — sealed-then-configured, exactly like `persistedResponseBody`.
+  const SECRET = 'xai-synthetic-credential-8842';
+  const build = async (): Promise<{ env: RunEnvelope; ctx: FireContext }> =>
+    withEnvAsync('XAI_API_KEY', undefined, () =>
+      fireParts({
+        behaviourFor: (arm) => (arm.participantId === ARMS[ARMS.length - 1]!.participantId ? 'timeout' : 'valid'),
+        envelopeFor: (answer) => sealResponseEnvelope(JSON.stringify({ providerWrapper: SECRET, output: answer })),
+      }),
+    );
+
+  // Negative control first (rule 5): with nothing configured the value is written
+  // verbatim, so the assertion below is about redaction and not about a string that
+  // never reaches the file.
+  const clean = await build();
+  const cleanDir = mkdtempSync(join(tmpdir(), 'ospex-fire-'));
+  try {
+    const p = join(cleanDir, 'clean.json');
+    withEnvAbsent('XAI_API_KEY', () => {
+      writeFireArtifactV1(p, buildFireArtifact(clean.env, clean.ctx));
+    });
+    assert.ok(readFileSync(p, 'utf8').includes(SECRET), 'unconfigured, the value is retained verbatim');
+  } finally {
+    rmSync(cleanDir, { recursive: true, force: true });
+  }
+
+  const parts = await build();
+  const dir = mkdtempSync(join(tmpdir(), 'ospex-fire-'));
+  try {
+    const filePath = join(dir, 'fire-redacted.json');
+    withEnv('XAI_API_KEY', SECRET, () => {
+      writeFireArtifactV1(filePath, buildFireArtifact(parts.env, parts.ctx));
+    });
+    const bytes = readFileSync(filePath, 'utf8');
+    assert.ok(!bytes.includes(SECRET), 'the configured credential is nowhere in the durable file');
+    assert.ok(bytes.includes('[REDACTED]'), 'and it was substituted rather than the whole body dropped');
+    const parsed = parseFireArtifactV1(bytes);
+    for (const arm of parsed.arms) {
+      for (const attempt of arm.orderedAttempts) {
+        if (attempt.responseEnvelope == null) continue;
+        assert.ok(attempt.responseEnvelope.body.includes('[REDACTED]'), 'the retained body was substituted, not dropped');
+        // Redact-then-digest: the recorded digest and length describe the string that
+        // is actually stored, so the retained body still verifies against itself.
+        assert.equal(sha256Hex(attempt.responseEnvelope.body), attempt.responseEnvelope.sha256);
+        assert.equal(Buffer.byteLength(attempt.responseEnvelope.body, 'utf8'), attempt.responseEnvelope.bytes);
+      }
+    }
+    assert.deepEqual(verifyFireArtifactReplay(parsed), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- the deletion table: no single edit downgrades enforcement ---------------
+
+/**
+ * Each row is one hand-edit of a persisted artifact and the LITERAL outcome it must
+ * produce. The table is the specification of the presence rule: what has to stay true
+ * however the file is edited, and — the two `CLEAN` rows — exactly what it does NOT
+ * claim.
+ *
+ * Every row that edits an attempt also recomputes every `armDigest`, unless the row's
+ * whole point is that it did not. Without that, a row would pass on the digest check
+ * alone and prove nothing about the presence rule (rule 3b).
+ */
+interface DeletionRow {
+  readonly name: string;
+  readonly edit: (raw: RawFire) => void;
+  /** `CLEAN`, `PARSE_THROWS`, or the needles that must ALL appear in the violations. */
+  readonly expect: 'CLEAN' | 'PARSE_THROWS' | readonly string[];
+}
+
+const NO_ENVELOPE = 'no response envelope was retained';
+
+const DELETION_TABLE: readonly DeletionRow[] = [
+  {
+    name: 'no edit at all — the control that the rule is not always-failing',
+    edit: () => {},
+    expect: 'CLEAN',
+  },
+  {
+    name: 'delete the envelope from one received leg, leaving the digest alone',
+    edit: (raw) => {
+      delete (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!['responseEnvelope'];
+    },
+    // Two independent checks fire. The digest one is what this surface has and the run
+    // file does not: the deletion is DETECTABLE, not merely refused.
+    expect: ['armDigest does not recompute', NO_ENVELOPE],
+  },
+  {
+    name: 'delete the envelope from one received leg AND forge that arm digest',
+    edit: (raw) => {
+      delete (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!['responseEnvelope'];
+      recomputeAllArmDigests(raw);
+    },
+    expect: [NO_ENVELOPE],
+  },
+  {
+    name: 'null the envelope on one received leg AND forge that arm digest',
+    edit: (raw) => {
+      (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!['responseEnvelope'] = null;
+      recomputeAllArmDigests(raw);
+    },
+    expect: [NO_ENVELOPE],
+  },
+  {
+    name: 'delete the envelope from the REPAIR leg only, and forge the digests',
+    edit: (raw) => {
+      delete (repairArm(raw)['orderedAttempts'] as RawFire[])[1]!['responseEnvelope'];
+      recomputeAllArmDigests(raw);
+    },
+    // #92 covers every initial AND repair attempt, so the message must name the repair.
+    expect: ['attempt 2 (repair)', NO_ENVELOPE],
+  },
+  {
+    name: 'delete the envelope from EVERY leg and forge every digest — the sibling keys still place the file',
+    edit: (raw) => {
+      for (const attempt of everyAttempt(raw)) delete attempt['responseEnvelope'];
+      recomputeAllArmDigests(raw);
+    },
+    expect: [NO_ENVELOPE],
+  },
+  {
+    name: 'strip all four optional keys from ONE leg only and forge every digest',
+    edit: (raw) => {
+      const attempt = (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!;
+      for (const key of OPTIONAL_KEYS) delete attempt[key];
+      recomputeAllArmDigests(raw);
+    },
+    // A local rewrite buys nothing: exemption is a property of the WHOLE artifact.
+    expect: [NO_ENVELOPE],
+  },
+  {
+    name: 'null httpStatus and drop the envelope — the answer text and transport still say a response came back',
+    edit: (raw) => {
+      const attempt = (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!;
+      delete attempt['responseEnvelope'];
+      attempt['httpStatus'] = null;
+      recomputeAllArmDigests(raw);
+    },
+    expect: [NO_ENVELOPE],
+  },
+  // The four receipt carriers, one row each, every row leaving exactly ONE standing
+  // (rule 3k). Without this sweep a predicate consulting only some of them survives.
+  {
+    name: 'receipt carried by the answer text alone',
+    edit: (raw) => {
+      const attempt = (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!;
+      delete attempt['responseEnvelope'];
+      attempt['reportedModelId'] = null;
+      attempt['httpStatus'] = null;
+      attempt['transport'] = 'provider_error';
+      recomputeAllArmDigests(raw);
+    },
+    expect: [NO_ENVELOPE],
+  },
+  {
+    name: 'receipt carried by the reported model id alone',
+    edit: (raw) => {
+      const attempt = (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!;
+      delete attempt['responseEnvelope'];
+      attempt['persistedResponseBody'] = null;
+      attempt['responseSha256'] = null;
+      attempt['httpStatus'] = null;
+      attempt['transport'] = 'provider_error';
+      recomputeAllArmDigests(raw);
+    },
+    expect: [NO_ENVELOPE],
+  },
+  {
+    name: 'receipt carried by the 2xx status alone',
+    edit: (raw) => {
+      const attempt = (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!;
+      delete attempt['responseEnvelope'];
+      attempt['persistedResponseBody'] = null;
+      attempt['responseSha256'] = null;
+      attempt['reportedModelId'] = null;
+      attempt['transport'] = 'provider_error';
+      recomputeAllArmDigests(raw);
+    },
+    expect: [NO_ENVELOPE],
+  },
+  {
+    name: 'receipt carried by the ok transport alone',
+    edit: (raw) => {
+      const attempt = (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!;
+      delete attempt['responseEnvelope'];
+      attempt['persistedResponseBody'] = null;
+      attempt['responseSha256'] = null;
+      attempt['reportedModelId'] = null;
+      attempt['httpStatus'] = null;
+      recomputeAllArmDigests(raw);
+    },
+    expect: [NO_ENVELOPE],
+  },
+  {
+    name: 'delete the httpStatus KEY — required by the strict schema, so it never reaches the rule',
+    edit: (raw) => {
+      // No digest recomputation: `armDigest` strict-parses its own domain, so an attempt
+      // missing a required field cannot even be re-digested. The forger has nothing to
+      // forge here, which is a stronger position than the run path's fail-closed read.
+      delete (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!['httpStatus'];
+    },
+    // The run path had to read an absent status key fail-closed. Here the schema does it.
+    expect: 'PARSE_THROWS',
+  },
+  {
+    name: 'edit the retained body and leave its digest',
+    edit: (raw) => {
+      (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!['responseEnvelope'].body += ' tampered';
+    },
+    expect: ['does not match its recorded sha256', 'armDigest does not recompute'],
+  },
+  {
+    name: 'edit the retained body and forge its sha256 but not its byte length',
+    edit: (raw) => {
+      const envelope = (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!['responseEnvelope'];
+      envelope.body += ' tampered';
+      envelope.sha256 = sha256Hex(envelope.body);
+      recomputeAllArmDigests(raw);
+    },
+    expect: ['does not match its recorded byte length'],
+  },
+  // --- the two rows that say what this does NOT buy --------------------------
+  {
+    name: 'BOUND: re-seal an invented body coherently and forge every digest',
+    edit: (raw) => {
+      const envelope = (repairArm(raw)['orderedAttempts'] as RawFire[])[0]!['responseEnvelope'];
+      envelope.body = JSON.stringify({ invented: 'a body nobody ever received' });
+      envelope.sha256 = sha256Hex(envelope.body);
+      envelope.bytes = Buffer.byteLength(envelope.body, 'utf8');
+      recomputeAllArmDigests(raw);
+    },
+    // The envelope binds to nothing outside the file, so a coherent rewrite verifies —
+    // the same residual the run path names. This is integrity, not tamper resistance.
+    expect: 'CLEAN',
+  },
+  {
+    name: 'BOUND: strip all four optional keys from EVERY leg and forge every digest',
+    edit: (raw) => {
+      for (const attempt of everyAttempt(raw)) for (const key of OPTIONAL_KEYS) delete attempt[key];
+      recomputeAllArmDigests(raw);
+    },
+    // The exemption, earned the only way it can be: 4 keys on every attempt plus one
+    // forged digest per arm. That is the whole point — no SINGLE deletion reaches it.
+    expect: 'CLEAN',
+  },
+];
+
+test('deletion table: no single field deletion or nulling downgrades envelope enforcement', async () => {
+  const base = rawOf(await mixedFire());
+  // The fixture must be one the rule actually applies to, or every row passes vacuously.
+  assert.equal(isCoherentPreRetentionFireArtifact(reparse(base)), false);
+  assert.ok(
+    everyAttempt(base).filter((a) => a['responseEnvelope'] !== null).length >= 4,
+    'the fixture retains bodies on at least four legs, or the rows below discriminate nothing',
+  );
+
+  for (const row of DELETION_TABLE) {
+    const raw = JSON.parse(JSON.stringify(base)) as RawFire;
+    row.edit(raw);
+    if (row.expect === 'PARSE_THROWS') {
+      assert.throws(() => reparse(raw), `${row.name}: must fail the strict parse`);
+      continue;
+    }
+    const violations = verifyFireArtifactReplay(reparse(raw));
+    if (row.expect === 'CLEAN') {
+      assert.deepEqual(violations, [], `${row.name}: must verify clean`);
+      continue;
+    }
+    for (const needle of row.expect) {
+      assert.ok(has(violations, needle), `${row.name}: expected a violation containing "${needle}", got ${JSON.stringify(violations)}`);
+    }
+  }
+});
+
+// --- backward compatibility --------------------------------------------------
+
+test('a PRE-RETENTION artifact — no optional attempt key anywhere — parses, is exempt, and replays clean', async () => {
+  // The CI-meaningful half of backward compatibility: `.fire-artifacts/` is gitignored,
+  // so no runner outside this machine has the real archive, and a test that depended on
+  // it would be green for the wrong reason (nothing to iterate) everywhere else. This
+  // reconstructs the archived shape from a real produced artifact instead.
+  const raw = rawOf(await mixedFire());
+  for (const attempt of everyAttempt(raw)) for (const key of OPTIONAL_KEYS) delete attempt[key];
+  recomputeAllArmDigests(raw);
+  const parsed = reparse(raw);
+  assert.equal(isCoherentPreRetentionFireArtifact(parsed), true);
+  assert.deepEqual(verifyFireArtifactEnvelopes(parsed), []);
+  assert.deepEqual(verifyFireArtifactReplay(parsed), []);
+  for (const arm of parsed.arms) {
+    for (const attempt of arm.orderedAttempts) {
+      // 11 keys — the exact per-attempt shape measured on the three archived artifacts
+      // on 2026-08-22, so this reconstruction is the archive's shape and not a guess.
+      assert.equal(Object.keys(attempt).length, 11, JSON.stringify(Object.keys(attempt)));
+    }
+  }
+});
+
+test('every fire artifact already written to .fire-artifacts/ still replays clean', (t) => {
+  // The local half: the real files this machine produced before any of the optional
+  // attempt fields existed. The directory is gitignored, so an empty one is "nothing to
+  // check here" rather than a failure — the property itself is pinned by the
+  // reconstructed case above, which runs everywhere.
+  const files = archivedFireArtifacts();
+  if (files.length === 0) {
+    t.diagnostic('no archived fire artifacts on this machine — the reconstructed pre-retention case covers the property');
+    return;
+  }
+  for (const file of files) {
+    const parsed = parseFireArtifactV1(readFileSync(file, 'utf8'));
+    assert.ok(
+      isCoherentPreRetentionFireArtifact(parsed),
+      `${file}: carries none of the optional attempt fields, so it predates retention`,
+    );
+    assert.deepEqual(verifyFireArtifactEnvelopes(parsed), [], `${file}: exempt, not enforced`);
+    assert.deepEqual(verifyFireArtifactReplay(parsed), [], `${file}: replays clean`);
+    // And the digests recompute BYTE-IDENTICALLY over a domain that now has one more
+    // optional field: an absent key contributes nothing to `canonicalize`.
+    for (const arm of parsed.arms) {
+      assert.equal(
+        armDigest({
+          cohortId: parsed.cohortId,
+          fireId: parsed.fireId,
+          runId: parsed.runId,
+          participantId: arm.expectedArmIdentity.participantId,
+          requestSha256: parsed.requestSha256,
+          expectedArmIdentity: arm.expectedArmIdentity,
+          orderedAttempts: arm.orderedAttempts,
+          terminalOutcome: arm.terminalOutcome,
+          acceptedResponseDigestOrNull: arm.acceptedResponseDigest,
+          acceptedDecisionFingerprintOrNull: arm.acceptedDecisionFingerprint,
+        }),
+        arm.armDigest,
+        `${file}: ${arm.expectedArmIdentity.participantId} armDigest is unchanged by the new field`,
+      );
+    }
+  }
+});
+
+test('a pre-retention artifact stops being exempt the moment any optional key appears on it', async () => {
+  // The exemption is not "old file, never mind": it is a claim the whole artifact has to
+  // support. One modern key anywhere makes the file a retaining-era artifact, and then
+  // every received leg owes a body. Each of the four keys is checked on its own, so no
+  // single one carries the classification.
+  const raw = rawOf(await mixedFire());
+  for (const attempt of everyAttempt(raw)) for (const key of OPTIONAL_KEYS) delete attempt[key];
+  recomputeAllArmDigests(raw);
+  assert.equal(isCoherentPreRetentionFireArtifact(reparse(raw)), true, 'the starting point is exempt');
+  for (const key of OPTIONAL_KEYS) {
+    const edited = JSON.parse(JSON.stringify(raw)) as RawFire;
+    const attempt = (edited['arms'] as RawFire[])[0]!['orderedAttempts'][0]!;
+    attempt[key] = null;
+    recomputeAllArmDigests(edited);
+    const parsed = reparse(edited);
+    assert.equal(isCoherentPreRetentionFireArtifact(parsed), false, `${key} places the file in the retaining era`);
+    assert.ok(has(verifyFireArtifactReplay(parsed), NO_ENVELOPE), `${key}: the file is now enforced`);
   }
 });
