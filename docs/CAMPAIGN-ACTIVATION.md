@@ -132,6 +132,37 @@ Everything below states the contract that holds it.
    dispatch budget). Any other failure journals `loud_failure` best-effort and
    propagates (exit 1).
 
+**What the fire artifact has to carry, because nothing else will.** This path writes no
+run NDJSON. The fire artifact and its spend sidecar are the only durable records a tick
+produces, so anything not in the artifact does not survive process exit — and a cohort is
+armed at most once, ever, so evidence a campaign did not retain cannot be recovered
+afterwards by any later build. Each sent attempt therefore retains the **complete provider
+response body** it answered with, beside the extracted answer, sealed with its own digest
+and byte length (`responseEnvelope`). The sink refuses to install an artifact where an
+attempt records having received a response and retains no body; the rule, its one
+exemption for pre-retention artifacts, and the bounds on both are specified in
+[`SPEC-line-open-evidence-model.md`](./SPEC-line-open-evidence-model.md) §"Per-attempt
+provenance and the arm digest".
+
+**The consequence of that rule is not confined to new installs, so read this before
+deploying a build that changes it.** Every tick's escalation scan replays the artifacts
+ALREADY installed under the cohort's evidence root: a spend sidecar claiming a clean pass
+only earns the clear reading if its paired artifact strict-parses and replays clean.
+So a build that would refuse an artifact an earlier build legitimately wrote does not
+merely refuse the next install — it turns every subsequent tick into an
+`unverified_evidence` latch cause, and the recovery for a tripped latch is
+`campaign:stop`. **A stopped campaign is over**: a cohort is armed at most once, ever.
+The envelope-presence rule is written to avoid exactly that — its exemption reads only
+the `responseEnvelope` key, so every artifact written by any earlier build is exempt and
+keeps verifying — but the general rule stands for the next change to the persisted
+artifact shape: **before deploying one mid-campaign, check `campaign:status` and confirm
+that the artifacts already installed under the evidence root still replay under the new
+build.** The safe window is between campaigns.
+
+**Arming is the deadline, not the deploy.** Evidence a campaign did not retain cannot be
+added afterwards by any later build, so a retention change has to land BEFORE the arm to
+reach that campaign at all.
+
 ## The durable escalation latch
 
 A spend-guard escalation means the spend model is not holding; it must not be able to

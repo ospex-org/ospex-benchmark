@@ -1799,6 +1799,13 @@ function collectDiffPaths(a: unknown, b: unknown, path: string, out: string[]): 
 const PARITY_ALLOWED_LEAF_PATTERNS: readonly RegExp[] = [
   // The response text itself...
   /^arms\[\d+\]\.orderedAttempts\[\d+\]\.persistedResponseBody$/,
+  // ...the complete retained body it was extracted from, plus that envelope's own two
+  // derived fields. A legitimate difference for exactly the same reason as the answer
+  // text: the two capabilities construct different response bodies. Not a hole — the
+  // envelope's `sha256` and `bytes` are RECOMPUTED against the stored `body` by
+  // `verifyFireArtifactEnvelopes` below, so an allowed-to-differ envelope is still
+  // proven internally correct, and its presence is asserted separately.
+  /^arms\[\d+\]\.orderedAttempts\[\d+\]\.responseEnvelope\.(body|sha256|bytes)$/,
   // ...and its exact transitive digest dependencies:
   /^arms\[\d+\]\.orderedAttempts\[\d+\]\.responseSha256$/,
   /^arms\[\d+\]\.acceptedResponseDigest$/,
@@ -1863,6 +1870,13 @@ test('dry vs real-shaped parity: same fire, byte-identical artifacts outside the
   assert.ok(
     diffs.some((d) => /armDigest$/.test(d)),
     'a text difference transitively moves the arm digest',
+  );
+  // The envelope allow-list entry above must be earning its place: if the artifacts
+  // carried no retained body at all, that pattern would match nothing and would quietly
+  // become dead. Both capabilities go through the real dispatch path, so both retain one.
+  assert.ok(
+    diffs.some((d) => /responseEnvelope\.body$/.test(d)),
+    'both capabilities retain a complete response body, and the two bodies differ',
   );
   // Load-bearing EQUALITIES: decisions, outcomes, identity, and usage are byte-identical.
   const mockJson = JSON.parse(serializeFireArtifactV1(mockArtifact)) as FireArtifactV1;

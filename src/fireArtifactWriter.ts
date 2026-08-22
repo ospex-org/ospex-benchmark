@@ -6,6 +6,7 @@ import { redactSecrets } from './config.js';
 import { verifyAttemptOrdering } from './attemptProvenance.js';
 import { armDigest, decisionFingerprint } from './fireArtifact.js';
 import { assertFireArtifact, fireArtifactV1Schema } from './fireArtifactProducer.js';
+import { envelopeVerificationFailures, receivedProviderResponse } from './providers/responseEnvelope.js';
 import { RESPONSE_SCHEMA_VERSIONS, validateResponseText } from './schema.js';
 import { instantMs } from './time.js';
 import { MARKET_ORDINAL } from './fireArtifact.js';
@@ -21,10 +22,12 @@ import type { ArmSpec, GameBundle, MarketKey, ProviderName, SlateBundle } from '
  *
  * The producer brand is gone once bytes are parsed back, by design — so the durable
  * evidence must be self-verifying. `verifyFireArtifactReplay` re-derives every
- * recomputable digest AND re-checks every persisted bijection / identity / timing
- * relation the producer enforced, from the reloaded value alone, reusing the
- * canonical owners (`validateResponseText`, `decisionFingerprint`,
- * `verifyAttemptOrdering`, `runBaselines`). It is NOT the entry/model/coverage
+ * recomputable digest, re-checks every persisted bijection / identity / timing
+ * relation the producer enforced, AND requires + verifies the retained provider
+ * response envelope behind every attempt that received one — from the reloaded value
+ * alone, reusing the canonical owners (`validateResponseText`, `decisionFingerprint`,
+ * `verifyAttemptOrdering`, `runBaselines`, `receivedProviderResponse`,
+ * `envelopeVerificationFailures`). It is NOT the entry/model/coverage
  * verifier — external odds-history V1/V2 admission, approved-reported-model / family
  * collision, coverage, close, and CLV stay a later phase; a replay-consistent
  * artifact may still be marked entry-invalid there.
@@ -386,12 +389,183 @@ function safe<T>(fn: () => T): T | undefined {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Retained response envelopes (#92 / #111)
+// ---------------------------------------------------------------------------
+
+/** One persisted attempt as it comes back off disk. Taken from the schema's own
+ *  inference so an optional field's ABSENCE survives into this type rather than
+ *  being flattened by a hand-written mirror. */
+type PersistedAttemptRead = FireArtifactV1['arms'][number]['orderedAttempts'][number];
+
+/** Every persisted attempt in the artifact, flattened — the presence rules below are
+ *  properties of the WHOLE FILE, not of one arm. */
+function allAttempts(artifact: FireArtifactV1): PersistedAttemptRead[] {
+  return artifact.arms.flatMap((arm) => [...arm.orderedAttempts]);
+}
+
 /**
- * The complete persisted-artifact replay: the digest/accepted-body closure plus the
- * relational closure. A persisted artifact is self-consistent iff this is empty.
+ * The one optional attempt field this rule reads, and it is read as a KEY, never as a
+ * value. A `responseEnvelope` explicitly set to `null` is still a key a retaining build
+ * wrote, and reading that as "absent" is exactly the downgrade this exists to refuse.
+ */
+const RESPONSE_ENVELOPE_KEY = 'responseEnvelope';
+
+/**
+ * Whether the artifact is a COHERENT PRE-RETENTION FIRE ARTIFACT — the one shape
+ * exempt from the envelope-presence requirement.
+ *
+ * WHY IT IS SHAPED THIS WAY. The run-file version of this rule started as a single
+ * self-asserted field (`run_meta.evidenceEra`) and a reviewer switched the whole
+ * requirement off by deleting it. The correction was to make retention the DEFAULT
+ * and force exemption to be earned by a claim the WHOLE FILE has to support. The same
+ * standard applies here, so: no era stamp is added to the fire artifact at all. Under
+ * this polarity a stamp could only ever make the rule stricter, so it would carry
+ * nothing — and it would be the one field in the artifact outside every `armDigest`.
+ *
+ * Exemption is earned only when NO persisted attempt in the artifact carries the
+ * `responseEnvelope` KEY. A retaining build writes that key on every sent attempt —
+ * explicit `null` when nothing came back — so an artifact it produced is never exempt,
+ * and buying the exemption means deleting the key from EVERY attempt and forging one
+ * `armDigest` per arm: N deletions for N attempts, not one.
+ *
+ * WHY THE ENVELOPE KEY ALONE, AND WHAT THAT COSTS. The first draft of this predicate
+ * required every attempt to carry none of the FOUR optional fields (`searchAudit`,
+ * `providerStopReason`, `turnCompleted`, `responseEnvelope`) — 4N keys rather than N.
+ * It was narrowed for an operational reason that outweighs the extra 3N: the build in
+ * between (`searchAudit` and its two siblings landed 2026-08-07 in 68dfc6e, envelope
+ * retention only now) wrote the first three and not the fourth, so EVERY artifact that
+ * build produced would have been enforced and refused. On the live campaign path that
+ * refusal is not a write refusal — `verifySpendEvidence` replays every installed
+ * artifact whose spend sidecar claims a clean pass, so one already-installed artifact
+ * from that build turns every subsequent tick's evidence scan into an
+ * `unverified_evidence` latch cause, and the documented recovery for a tripped latch is
+ * `campaign:stop`, which ends a cohort that can never be re-armed. Measured
+ * 2026-08-22: an artifact in exactly that shape produced 4 presence violations under
+ * the four-field clause and 0 under this one.
+ *
+ * What the narrower clause gives up, stated so it reads as a choice rather than an
+ * oversight: a FUTURE build that stops writing the key produces artifacts this
+ * predicate reads as pre-retention instead of refusing them. That regression is caught
+ * by the suite — a mapper that stops binding the envelope reddens cases in
+ * `fireArtifact.test.ts` and in this module's tests — not by this function.
+ *
+ * THE OTHER BOUND, the same one the run path names: a COHERENT whole-artifact rewrite
+ * still passes. Delete the key from every attempt, recompute every `armDigest`, and
+ * this predicate reads the result as a genuine pre-retention artifact. What the rule
+ * buys is that no SINGLE deletion downgrades enforcement on an artifact carrying more
+ * than one persisted attempt, and that every edit which tries has to move a digest. It
+ * is not tamper resistance.
+ *
+ * An artifact with no attempts at all satisfies the clause vacuously, which changes
+ * nothing: with no attempt to enforce on, both branches produce the same empty result.
+ */
+export function isCoherentPreRetentionFireArtifact(artifact: FireArtifactV1): boolean {
+  return allAttempts(artifact).every((attempt) => !Object.hasOwn(attempt, RESPONSE_ENVELOPE_KEY));
+}
+
+/**
+ * Whether a persisted attempt records that a provider response came back.
+ *
+ * The shared owner `receivedProviderResponse` decides this for a run leg and is reused
+ * verbatim so the two surfaces cannot drift about what "a response came back" means —
+ * the same argument that put `responseEnvelopeSchema` in one module with two importers.
+ * Three of its disjuncts cannot fire here, and that is not a gap: a fire attempt
+ * persists no `providerResponseId` and no `errorDetail`, and its `httpStatus` key is
+ * REQUIRED by `persistedAttemptSchemaV1`, so deleting it fails the strict parse outright
+ * instead of needing the run path's fail-closed read of an absent key.
+ *
+ * `transport` is the carrier this surface adds. It is set to `ok` from exactly the same
+ * fact that fills `persistedResponseBody`, so on an ordinary received leg four fields
+ * state one thing and nulling any one of them does not make a received response look
+ * like silence.
+ *
+ * UP TO four, and the bound matters because it runs out on the leg class #92 exists to
+ * preserve. A 2xx whose body the extractor could NOT read
+ * (`ProviderUnreadableResponseError`, and the non-JSON 2xx `ProviderHttpError` beside
+ * it) persists with `persistedResponseBody`, `reportedModelId` and an `ok` `transport`
+ * all absent, so the numeric `httpStatus` is the ONLY carrier standing there: deleting
+ * that leg's envelope and nulling its status is two field edits plus a forged digest,
+ * against three on the run path — which persists an `errorDetail` naming the status in
+ * prose and reads it with `statusFromErrorDetail`. A fire attempt persists no
+ * `errorDetail` at all, so this surface is one carrier short exactly there, and that is
+ * the one place it is weaker than the run file rather than stronger. Both halves are
+ * pinned by the deletion table's two `unreadable` rows and by the bound case beside
+ * them. Persisting a second status carrier on the attempt would close it and is a change
+ * to the persisted shape, not part of this rule.
+ */
+function attemptReceivedResponse(attempt: PersistedAttemptRead): boolean {
+  return (
+    receivedProviderResponse({
+      answerText: attempt.persistedResponseBody,
+      reportedModelId: attempt.reportedModelId,
+      providerResponseId: null,
+      httpStatus: attempt.httpStatus,
+      httpStatusRecorded: true,
+      errorDetail: null,
+    }) || attempt.transport === 'ok'
+  );
+}
+
+/**
+ * PRESENCE and INTEGRITY of the retained provider response bodies (empty = consistent).
+ *
+ * Two rules, because they answer different questions — the same split the run path
+ * makes:
+ *
+ *  1. PRESENCE is required BY DEFAULT on every attempt that records having received a
+ *     response, initial and repair alike, and waived only for an artifact that reads as
+ *     a coherent pre-retention artifact AS A WHOLE.
+ *  2. INTEGRITY is unconditional. A present envelope is verified whatever era the
+ *     artifact is from, so a body edited after the fact no longer describes itself.
+ *
+ * WHAT THIS SURFACE HAS THAT THE RUN FILE DOES NOT. `orderedAttempts` is one of
+ * `armDigest`'s ten domain fields and every arm persists its digest, so removing,
+ * nulling or editing an envelope CHANGES the digest that `recomputeFireArtifactDigests`
+ * already recomputes on every parse, write and install. On the run file a deletion is
+ * merely refused by a rule; here it is also DETECTABLE, and the two checks are
+ * independent — an edit has to defeat both. That is why the exemption above can be a
+ * property of the attempts alone, with no stamp to delete.
+ */
+export function verifyFireArtifactEnvelopes(artifact: FireArtifactV1): string[] {
+  const violations: string[] = [];
+  // A property of the FILE, so it is computed once rather than re-derived per attempt.
+  const preRetention = isCoherentPreRetentionFireArtifact(artifact);
+  for (const arm of artifact.arms) {
+    const who = arm.expectedArmIdentity.participantId;
+    for (const attempt of arm.orderedAttempts) {
+      const where = `arm ${who} attempt ${attempt.attemptNumber} (${attempt.kind})`;
+      // `== null` covers the absent key and the explicit null together: neither is a
+      // retained body, and both are owed one when a response came back.
+      if (attempt.responseEnvelope == null) {
+        // The two cases this skip is FOR, and no others: an artifact that predates
+        // retention entirely, and an attempt where nothing came back — a timeout, a
+        // transport failure, a body that dropped mid-read (status 0), or a non-2xx,
+        // none of which leaves a body to retain.
+        if (!preRetention && attemptReceivedResponse(attempt)) {
+          violations.push(`${where}: a response was received but no response envelope was retained`);
+        }
+        continue;
+      }
+      for (const failure of envelopeVerificationFailures(attempt.responseEnvelope)) {
+        violations.push(`${where}: ${failure}`);
+      }
+    }
+  }
+  return violations;
+}
+
+/**
+ * The complete persisted-artifact replay: the digest/accepted-body closure, the
+ * relational closure, and the retained-envelope closure. A persisted artifact is
+ * self-consistent iff this is empty.
  */
 export function verifyFireArtifactReplay(artifact: FireArtifactV1): string[] {
-  return [...recomputeFireArtifactDigests(artifact), ...verifyFireArtifactRelations(artifact)];
+  return [
+    ...recomputeFireArtifactDigests(artifact),
+    ...verifyFireArtifactRelations(artifact),
+    ...verifyFireArtifactEnvelopes(artifact),
+  ];
 }
 
 // ---------------------------------------------------------------------------

@@ -655,18 +655,73 @@ to substantiate it. Each attempt records:
   `acceptedAt`, in **full causal order** —
   `requestStartedAt ≤ requestReceivedAt ≤ acceptedAt` (the `acceptedAt` bound when present) —
   and across attempts `repair.requestStartedAt ≥ initial.requestReceivedAt`;
-- `requestSha256`, the exact persisted response body, `responseSha256`;
+- `requestSha256`, the exact persisted **answer text** the adapter extracted, `responseSha256`;
+- the **complete provider response body** that answer came out of, retained as
+  `responseEnvelope` on every attempt that received one — digest-bound when present,
+  absent on attempts persisted before the field existed;
 - transport status, usage/token metadata (including the derived reasoningTokens / billableOutputTokens comparable fields on new records), the per-attempt web-search audit (executed queries + result references; digest-bound when present, absent on pre-search records), and repair linkage.
 
-**Persisted response bytes (one exact rule).**
+**Persisted response bytes (two exact rules, over two different strings).**
 
 ```
-persistedResponseBytes = UTF8(the exact post-redaction retained response body)
-responseSha256         = sha256Hex(persistedResponseBytes)
+persistedResponseBytes  = UTF8(the exact post-redaction ANSWER TEXT the adapter extracted)
+responseSha256          = sha256Hex(persistedResponseBytes)
+
+responseEnvelope.body   = the exact post-redaction COMPLETE provider response body
+responseEnvelope.sha256 = sha256Hex(UTF8(responseEnvelope.body))
+responseEnvelope.bytes  = UTF8 length of responseEnvelope.body
 ```
 
-The scorer recomputes `responseSha256` from those **exact persisted bytes**. Any
-unpersisted raw-provider digest kept for diagnostics is **not** an integrity proof.
+Both are redact-then-digest, so each digest covers exactly the string stored beside it.
+The two strings are different — the answer is one field inside the body — and
+`acceptedResponseDigest` stays the **answer's** digest; the envelope carries its own.
+
+The scorer recomputes `responseSha256` from those **exact persisted bytes**, and re-hashes
+every retained envelope from the body stored beside it. Any unpersisted raw-provider digest
+kept for diagnostics is **not** an integrity proof.
+
+**Retained response bodies are REQUIRED, and that requirement fails closed.** The
+per-attempt web-search audit is one parser's reading of a response; without the body, a
+provider shape that parser did not recognize is indistinguishable from a model that never
+searched, and no later build can tell the two apart. So an attempt whose record says a
+response came back — an answer, a reported model ID, a 2xx status, or an `ok` transport,
+any one of them — must retain the body it came from. An attempt that received nothing (a
+timeout, a transport failure, a body that dropped mid-read, or a non-2xx, whose body is
+deliberately not kept) retains an explicit `null`, which is not a violation.
+
+Retention is the DEFAULT. The one exemption is an artifact that reads as a coherent
+**pre-retention** artifact as a whole: **no** attempt in it carries a `responseEnvelope`
+KEY. A retaining build writes that key on every sent attempt — explicit `null` when
+nothing came back — so one key anywhere makes the file a retaining-era artifact and every
+received leg in it owes a body. This is deliberately not a single stamp a single deletion
+can remove: buying the exemption means deleting the key from every attempt and forging
+one `armDigest` per arm.
+
+**The exemption reads the envelope key alone, and that is a deliberate narrowing.** An
+earlier draft required every attempt to carry none of the four optional attempt fields
+(`searchAudit`, `providerStopReason`, `turnCompleted`, `responseEnvelope`). The first
+three landed together on 2026-08-07 and envelope retention only afterwards, so the build
+in between produced artifacts carrying three of the four — which the wider clause would
+have enforced and therefore refused. On the campaign path that refusal is not a write
+refusal: an already-installed artifact is replayed by every later tick's evidence scan,
+so one such file under a cohort's evidence root latches the campaign, and a latch's
+recovery ends a cohort that is armed at most once. What the narrowing gives up is stated
+with it: a FUTURE build that stops writing the key produces artifacts this rule reads as
+pre-retention rather than refusing them. That regression is caught by the test suite, not
+by this rule.
+
+**Two further bounds, stated rather than left to be found.** A COHERENT whole-artifact
+rewrite still verifies: delete the key from every attempt and recompute every `armDigest`,
+or re-seal an invented body and recompute the digests, and the file describes itself
+consistently. And the receipt carriers run out on one leg class: a 2xx whose body the
+extractor could not read persists with answer text, reported model ID and `ok` transport
+all absent, so its numeric status is the only carrier left — deleting that leg's envelope
+and nulling its status is two field edits plus a forged digest, where the run file needs
+three because it also names the status in prose in `errorDetail`, which a fire attempt
+does not persist. That is the one place this surface is weaker than the run file. What
+the rule buys is that no SINGLE deletion downgrades enforcement on an artifact carrying
+more than one attempt, and that every edit which tries has to move a digest. It is
+integrity, not tamper resistance.
 
 **Arm digest (domain-bound to its enclosing identity).**
 
@@ -680,6 +735,12 @@ armDigest = sha256Hex(canonicalize({
   acceptedDecisionFingerprintOrNull
 }))
 ```
+
+`orderedAttempts` carries each attempt's retained `responseEnvelope`, so this digest binds
+the complete response bodies as well as the answers: removing, nulling or editing one
+changes a digest the scorer already recomputes. On this surface a deleted body is
+DETECTABLE, not merely refused — which is why the exemption above can be a property of the
+attempts themselves, with no era stamp to delete.
 
 The scorer **recomputes** `armDigest`. Mutating the persisted response bytes, the enclosing
 fire/run identity, an attempt's order, or an attempt timestamp must **fail** integrity. The

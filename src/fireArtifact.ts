@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { redactSecrets } from './config.js';
 import { deepFreeze } from './freeze.js';
+import { responseEnvelopeSchema, sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { forecastFingerprint } from './schema.js';
 import type { CohortManifestV1 } from './manifest.js';
 import { AXIS_NAMES } from './types.js';
@@ -13,6 +14,7 @@ import type {
   AxisName,
   BenchmarkResponse,
   MarketKey,
+  ProviderResponseEnvelope,
   ProviderUsage,
   SearchAudit,
 } from './types.js';
@@ -279,11 +281,11 @@ export interface PersistedAttemptV1 {
    * text came out of the call — which includes a received 2xx whose body did
    * not parse, so "null here" is not the same claim as "nothing came back".
    * The name predates the distinction and overstates what the field holds: it
-   * is not the provider's HTTP response body. That body is retained on the run
-   * NDJSON's attempt records as `responseEnvelope` (#92), on every 2xx; this
-   * artifact's schema is `.strict()` and its field feeds `armDigest`, so
-   * renaming or extending it would invalidate every fire artifact already
-   * written, and neither is in the scope of that change.
+   * is not the provider's HTTP response body. The body it was extracted FROM
+   * is the sibling `responseEnvelope` below, added additively rather than by
+   * widening this field — this schema is `.strict()` and this field feeds
+   * `armDigest`, so renaming it or changing what it holds would invalidate
+   * every fire artifact already written.
    */
   persistedResponseBody: string | null;
   /** `sha256Hex(persistedResponseBody)`, or `null` with no body. */
@@ -307,6 +309,27 @@ export interface PersistedAttemptV1 {
    */
   providerStopReason?: string | null | undefined;
   turnCompleted?: boolean | null | undefined;
+  /**
+   * The COMPLETE provider response body this attempt's answer was extracted
+   * from, sealed with its own digest and byte length — `null` when no body was
+   * retained (unsent, timeout, transport failure, a body that dropped mid-read,
+   * or a non-2xx, whose body is deliberately not kept).
+   *
+   * This is what makes the attempt REPLAYABLE (#92). `searchAudit` beside it is
+   * the extractor-of-the-day's READING of this body; without the body, a
+   * provider shape that extractor does not recognize is indistinguishable from
+   * a model that ran no search, and no later build can tell the two apart. The
+   * campaign path writes no run NDJSON, so this field is the only place a fire's
+   * response bodies survive process exit (#111).
+   *
+   * OPTIONAL for the same reason as the three fields above: absent on attempts
+   * persisted before it existed, whose digests recompute unchanged; explicit on
+   * every new attempt; and digest-bound whenever present, because
+   * `orderedAttempts` is one of `armDigest`'s ten fields. That last property is
+   * why no separate "this build retains" stamp is carried — see
+   * `verifyFireArtifactEnvelopes`.
+   */
+  responseEnvelope?: ProviderResponseEnvelope | null | undefined;
 }
 
 export const persistedAttemptSchemaV1 = z
@@ -325,6 +348,11 @@ export const persistedAttemptSchemaV1 = z
     searchAudit: searchAuditSchemaV1.nullable().optional(),
     providerStopReason: z.string().min(1).nullable().optional(),
     turnCompleted: z.boolean().nullable().optional(),
+    // The ONE envelope definition, imported rather than restated: the scorer's
+    // run parser, the offline search-audit replay and this artifact all read
+    // these bytes, and a second `.strict()` shape here is the drift that
+    // definition exists to prevent.
+    responseEnvelope: responseEnvelopeSchema.nullable().optional(),
   })
   .strict();
 
@@ -341,8 +369,10 @@ export const persistedAttemptSchemaV1 = z
  * settle with neither means no receipt (`null`). The response digest follows the
  * response-digest byte rule: `sha256Hex(redactSecrets(rawText))` (idempotent — the runner
  * already redacts), or `null` with no body. Each sent attempt also retains its typed
- * transport (so a timeout is distinct from a provider error) and detached normalized
- * usage. The result is detached and deep-frozen.
+ * transport (so a timeout is distinct from a provider error), detached normalized
+ * usage, and — the part that makes the attempt replayable rather than merely summarized —
+ * the COMPLETE provider response body as a re-sealed `responseEnvelope` (#111). The
+ * result is detached and deep-frozen.
  */
 export function toPersistedAttempts(result: ArmGameResult): readonly PersistedAttemptV1[] {
   const attempts: PersistedAttemptV1[] = [];
@@ -385,6 +415,21 @@ export function toPersistedAttempts(result: ArmGameResult): readonly PersistedAt
       // non-valid outcome was the provider's verdict.
       providerStopReason: record.providerStopReason,
       turnCompleted: record.turnCompleted,
+      // The complete response body, RE-SEALED rather than copied. Sealing is
+      // redact-then-digest, so this applies the artifact's own redaction pass
+      // to the body and leaves `sha256`/`bytes` describing the string that is
+      // actually stored — the same treatment `persistedResponseBody` gets one
+      // line above, and the reason the two cannot disagree about what was
+      // redacted. On an already-sealed clean body it is the identity (the seal
+      // is idempotent, pinned in providers/responseEnvelope.test.ts), so the
+      // persisted envelope reproduces the runner's byte for byte.
+      //
+      // It is NOT a check on the runner: a re-seal makes the record coherent by
+      // construction, so it can never fail. What checks a PERSISTED envelope is
+      // `verifyFireArtifactEnvelopes`, which runs on every parse, write and
+      // install — the only place an envelope can have been edited after the fact.
+      responseEnvelope:
+        record.responseEnvelope === null ? null : sealResponseEnvelope(record.responseEnvelope.body),
     });
   };
   mapOne(result.attempt, 1, 'initial');

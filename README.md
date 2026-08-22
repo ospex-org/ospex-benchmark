@@ -335,6 +335,30 @@ Not wired, and worth saying so explicitly: the line-open speculation runner and
 the campaign path (`yarn runner:fire`, `yarn campaign:tick`) emit *fire artifacts*,
 a different shape the projection has no table for. Nothing there publishes.
 
+Those paths write **no run NDJSON at all**, so the fire artifact is the only place
+their evidence survives process exit — and a cohort is armed once, ever, so what a
+campaign did not retain cannot be recovered later. Each sent attempt there keeps the
+**complete provider response body** beside the extracted answer, sealed with its own
+`sha256` and UTF-8 length, and every one of those bodies is inside the `armDigest`
+domain. The write, the sink install and every re-parse re-hash each retained body and
+**require** one on any attempt whose record says a response came back — an answer, a
+reported model ID, a 2xx status, or an `ok` transport, read as separate carriers so
+nulling one does not make a received response look like silence. The one waiver is an
+artifact where no attempt carries a `responseEnvelope` key at all, which is what every
+artifact written before this looks like; unlike the run file's rule this one has no era
+stamp to delete, because deleting a body moves a digest that is already recomputed.
+
+Two bounds, both worth repeating rather than discovering. A *coherent* whole-file
+rewrite — the key deleted from every attempt and every arm digest forged, or a body
+re-sealed — still verifies: this is integrity, not tamper resistance. And the carriers
+run out on exactly one leg class: a 2xx whose body the extractor could not read persists
+with answer text, reported model ID and `ok` transport all absent, so its numeric status
+is the only carrier standing, and erasing that leg's body takes two field edits plus a
+forged digest instead of three. The run file keeps a second carrier there (`errorDetail`
+names the status in prose); a fire artifact does not persist one, and that is the one
+place this surface is weaker rather than stronger. `docs/SPEC-line-open-evidence-model.md`
+specifies both rules.
+
 ### Before enabling it against a database
 
 ```bash
