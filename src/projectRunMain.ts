@@ -93,6 +93,25 @@ export interface ProjectMainDeps {
     runFile: string,
     log: PublishLog,
   ) => Promise<PublishSummary>;
+  /**
+   * One more publication, ACROSS the files, after every file has been published
+   * on its own. Optional and absent on the run path: only the scored path has a
+   * write whose grain is wider than one artifact, because
+   * `benchmark_scoring_runs` is keyed by cohort while a scored artifact is per
+   * run file. Returns the same failure count `unpublishedCount` does, so a
+   * cohort row that did not land fails the command exactly like a row that did
+   * not — this command exists only to publish.
+   *
+   * It runs INSIDE the try, so the handle is closed either way, and only after
+   * the per-file loop: the coverage row summarises a pass whose rows have just
+   * been written, and ordering it first would put the summary before the thing
+   * it summarises for no gain.
+   */
+  readonly finish?: (
+    port: BenchmarkServingPort,
+    files: readonly string[],
+    log: PublishLog,
+  ) => Promise<number>;
   readonly log: PublishLog;
 }
 
@@ -149,6 +168,7 @@ export async function runProjectionCli(
       // `unpublishedCount`. Everything short of full publication counts.
       failed += unpublishedCount(summary, file, deps.log);
     }
+    if (deps.finish !== undefined) failed += await deps.finish(serving.port, files, deps.log);
   } finally {
     await serving.close();
   }

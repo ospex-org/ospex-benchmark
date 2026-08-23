@@ -300,6 +300,61 @@ namespace, or in a format older than the current scorer are refused with a
 reason — a scored artifact is derived, so re-running `yarn score` over the
 canonical run file regenerates it in the current format.
 
+#### The cohort's scoring run, and the ranking brake
+
+`benchmark_scoring_runs` holds one row per `(cohort, scoring policy version)`:
+the cohort's coverage counts and `ranking_allowed`, the flag every read path
+that serves CLV must honour. A UI must not order participants when it is false,
+and must read a missing row as false.
+
+It is **opt-in**, because its grain is wider than one artifact:
+
+```bash
+yarn project:scores --scoring-run out/watch-v0-2026-08-15-*-scored.ndjson
+```
+
+A watch cohort is a DATE and the watcher writes one artifact per fired game, so
+a fifteen-game slate is fifteen scored files under one `cohort_id`. The row is
+therefore summed over the artifacts the command is given, one row per cohort
+found among them — and only the caller knows whether those are the whole
+cohort, which is why it is a flag rather than a side effect of publishing
+scores. Pass every one of that cohort's scored artifacts. The counts and the
+artifact count are printed before the write so they can be checked.
+
+The counts, in the vocabulary the scorer already uses:
+
+| column | means |
+|---|---|
+| `eligible` | market-decision **opportunities** — supplied markets summed over dispatched arm-games, so an arm that failed stays in the denominator |
+| `scored` | in the primary stratum **and** carrying a value (`primaryScoreableCount`) |
+| `refused` | turned away by a close-quality or selection gate, tagged or not |
+| `schedule_held_out` | what the reschedule tag **removed** from the estimate: tagged **and** carrying a value (`heldOutOfPrimary`) |
+
+The three buckets partition the picks, and `eligible` minus the picks is exactly
+the opportunities that produced no decision. ⚠ `schedule_held_out` is **not**
+the same population as `benchmark_scores.held_out_of_primary`, which is the raw
+stratum tag and is therefore also true on tagged rows an earlier gate had
+already refused: a query reproducing the scalar wants
+`count(*) filter (where held_out_of_primary and not refused)`.
+
+`cost_per_pick_comparable` and `benchmark_commit` are **null by contract** on
+this path. Nothing in a scored artifact measures cost, and the build stamp lives
+on the run artifact — `benchmark_runs.benchmark_commit`, joinable on the cohort
+— so resolving it here would record the machine that happened to publish rather
+than the build that produced the scores.
+
+`--ranking-allowed` publishes the row with the gate **open**, and
+`--ranking-reason=<text>` sets the wording beside it. The default is closed,
+with `label: watch-v0 pending operator publication decision`. Opening the gate
+is a one-shot decision per `(cohort, policy version)`: the row is insert-once
+with no `UPDATE` grant, and republishing it with the flag flipped is reported as
+a `contradiction` naming `scoringRun.rankingAllowed` — measured, and loud on
+purpose, because the same republish used to report `duplicate` and change
+nothing. The same idempotency rule as the score rows otherwise holds: a
+regenerated identical pass replays as `duplicate` (the scoring instant, the file
+name, the file digest and the build commit are pass provenance and are not
+compared), while any changed count contradicts.
+
 The scores path requires serving-schema capability **3** (the label column);
 the run paths above require 2 and are deliberately unaffected — a watch night
 must not be held hostage to a scores migration.

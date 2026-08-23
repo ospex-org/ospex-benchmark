@@ -4,7 +4,13 @@ ADVISORY. Run by hand, never in CI, and it gates nothing: it reports which
 stated guarantees are enforced by a test and which are only asserted in prose.
 
     python tools/mutation-battery.py            # all mutants
-    python tools/mutation-battery.py M07 M25    # named mutants only
+    python tools/mutation-battery.py M07-size-bound-in-characters   # named only
+
+Selection is an EXACT match on the whole id, not a prefix: `M07` selects
+nothing and prints only the control, which reads like a clean run. (This line
+used to show the prefix form; it never worked.) Note also that the M00 control
+runs the union of EVERY mutant's test files regardless of the subset chosen,
+and refuses to proceed unless that union is green.
 
 Every mutation disables ONE stated guarantee. A guarantee whose mutant SURVIVES
 is a claim no test enforces, and the claim -- not the test -- is what gets
@@ -1148,6 +1154,130 @@ MUTANTS = [
      '  return version >= EXECUTION_SURFACE_CAPABILITY',
      '  return false',
      ['src/servingSchemaGate.test.ts']),
+    # --- The cohort-scalar scoring run (benchmark_scoring_runs) --------------
+    # The publication brake. Until the drift CTE existed, a republish flipping
+    # ranking_allowed from false to true reported `duplicate` -- success -- and
+    # left the stored row saying false; measured on PostgreSQL 17.10. The row
+    # is insert-once with no UPDATE grant, so whatever lands is what a public
+    # read path serves forever.
+    ('M185-scoring-run-insert-not-gated-on-drift', 'src/servingStore.ts',
+     ('    from input\n   where not exists (select 1 from drift)',),
+     ('    from input',),
+     ['src/servingStore.test.ts']),
+    # A name+flag PAIR leaving the comparison keeps the two unnest arrays equal
+    # in length, so the cardinality check cannot see it -- only holding the
+    # drift names against the INSERT list can.
+    ('M186-ranking-brake-leaves-the-drift-comparison', 'src/servingStore.ts',
+     ("                 'scoringRun.rankingAllowed','scoringRun.rankingReason',",
+      '                 r.ranking_allowed          is distinct from input.ranking_allowed,\n'),
+     ("                 'scoringRun.rankingReason',", ''),
+     ['src/servingStore.test.ts']),
+    # A drift NAME labelling another column's comparison: the set stays right,
+    # the arrays stay parallel, and the operator flipping the brake is told the
+    # wrong field moved.
+    ('M187-scoring-run-drift-name-misattributed', 'src/servingStore.ts',
+     ('           array[r.eligible                 is distinct from input.eligible,\n'
+      '                 r.scored                   is distinct from input.scored,',),
+     ('           array[r.scored                   is distinct from input.scored,\n'
+      '                 r.eligible                 is distinct from input.eligible,',),
+     ['src/servingStore.test.ts']),
+    # The drift check without the lock reads a snapshot taken before the
+    # statement began, so a concurrent writer's different row is invisible and
+    # absorbed as `duplicate`. Measured elsewhere in this file as 58 of 100
+    # races writing anyway; a drift check without the lock LOOKS like a
+    # guarantee and is not one.
+    ('M188-scoring-run-not-serialized', 'src/servingStore.ts',
+     ('    return this.publish(SCORING_RUN_SQL, () => scoringRunPayload(run), true);',),
+     ('    return this.publish(SCORING_RUN_SQL, () => scoringRunPayload(run));',),
+     ['src/servingStore.test.ts']),
+    # `eligible` is the OPPORTUNITY denominator -- supplied markets over
+    # dispatched arm-games, so an arm that failed stays in it. Counting picks
+    # instead publishes coverage computed over successes only, which is the
+    # failure the run publisher's own contract names first.
+    ('M189-eligible-counts-picks-not-opportunities', 'src/scoredProjection.ts',
+     ('    eligible += artifact.eligibleMarkets;',),
+     ('    eligible += artifact.decisions.length;',),
+     ['src/scoredProjection.test.ts']),
+    # `schedule_held_out` is what the reschedule tag REMOVED (tagged AND
+    # carrying a value), not the raw stratum size. Taking the raw size
+    # double-counts every pick that is both tagged and already refused, so the
+    # coverage columns stop accounting for the picks. Only a fixture carrying
+    # such a pick can tell the two readings apart.
+    ('M190-held-out-is-the-raw-stratum-tag', 'src/scoredProjection.ts',
+     ('        refused += 1;\n        refusalReasons[decision.unscoredReason] =',),
+     ('        refused += 1;\n        if (!decision.inPrimaryStratum) scheduleHeldOut += 1;\n'
+      '        refusalReasons[decision.unscoredReason] =',),
+     ['src/scoredProjection.test.ts']),
+    # A pick in no bucket folded into silence. `unscoredReason === null` implies
+    # a primary value on every path the scorer can take, so a pick with neither
+    # means the file is not its output -- and the scorer models the same
+    # residual itself, calling it `unexplained`.
+    ('M191-unexplained-picks-folded-away', 'src/scoredProjection.ts',
+     ('  const unexplained = picks - scored - refused - scheduleHeldOut;',),
+     ('  const unexplained = 0;',),
+     ['src/scoredProjection.test.ts']),
+    # The gate holds the artifact to its OWN declared coverage. Without it, a
+    # meta spliced from another pass -- or records edited under a meta that was
+    # not -- becomes the cohort coverage a public read path serves.
+    ('M192-declared-coverage-unchecked', 'src/scoredProjection.ts',
+     ('    if (declared !== derived) {',),
+     ('    if (false) {',),
+     ['src/scoredProjection.test.ts']),
+    # One cohort per row, because (cohort, policy version) IS the key. A mixed
+    # set would publish one cohort's numbers under the other's name, and the
+    # write could not tell: the key it lands on is whichever header was read
+    # first.
+    ('M193-cohort-coherence-unchecked', 'src/scoredProjection.ts',
+     ('    if (header.cohortId !== first.cohortId) {',),
+     ('    if (false) {',),
+     ['src/scoredProjection.test.ts']),
+    # The same artifact supplied twice doubles every count, which is what
+    # naming a file and its copy, or two overlapping globs, actually does.
+    ('M194-duplicate-artifact-unchecked', 'src/scoredProjection.ts',
+     ('    if (runIds.has(header.runId)) {',),
+     ('    if (false) {',),
+     ['src/scoredProjection.test.ts']),
+    # The default brake OPENS. `ranking_allowed` decides whether a public read
+    # path may order a leaderboard at all, and the row is insert-once, so a
+    # default that opens cannot be taken back through the publisher.
+    ('M195-default-ranking-brake-opens', 'src/scoredProjection.ts',
+     ("  allowed: false,\n  reason: 'label: watch-v0 pending operator publication decision',",),
+     ("  allowed: true,\n  reason: 'label: watch-v0 pending operator publication decision',",),
+     ['src/scoredProjection.test.ts', 'src/projectScoresMain.test.ts']),
+    # ...and the same brake, one layer up: an argv the parser does not
+    # understand must leave the gate shut rather than open it.
+    ('M196-cli-ranking-flag-inverted', 'src/projectScoresMain.ts',
+     ("    allowed: argv.includes('--ranking-allowed'),",),
+     ("    allowed: !argv.includes('--ranking-allowed'),",),
+     ['src/projectScoresMain.test.ts']),
+    # The cohort pass must see EVERY file the command was given -- the row is a
+    # sum across them, and a pass over one file of a fifteen-game cohort
+    # publishes one game's coverage as the whole day's.
+    ('M197-cohort-pass-sees-one-file', 'src/projectRunMain.ts',
+     ('    if (deps.finish !== undefined) failed += await deps.finish(serving.port, files, deps.log);',),
+     ('    if (deps.finish !== undefined) failed += await deps.finish(serving.port, files.slice(0, 1), deps.log);',),
+     ['src/projectScoresMain.test.ts']),
+    # ...and its failures must reach the exit code. This command exists only to
+    # publish, so a coverage row that did not land is its failure.
+    ('M198-cohort-pass-failures-swallowed', 'src/projectRunMain.ts',
+     ('    if (deps.finish !== undefined) failed += await deps.finish(serving.port, files, deps.log);',),
+     ('    if (deps.finish !== undefined) await deps.finish(serving.port, files, deps.log);',),
+     ['src/projectScoresMain.test.ts']),
+    # The manifest a cohort row cites must be order-independent: the shell's
+    # glob order is not a property of the cohort, and two invocations over the
+    # same files must produce the same digest and the same path list.
+    ('M199-manifest-not-sorted', 'src/servingPublisher.ts',
+     ('    .sort();\n  return {\n    sourcePath: [...names].sort().join(\' \'),',),
+     ('    ;\n  return {\n    sourcePath: [...names].join(\' \'),',),
+     ['src/servingPublisher.test.ts']),
+    # A file the scored gate refused must be EXCLUDED from the cohort AND
+    # reported -- its picks are not in the projection either, so counting it
+    # would publish a denominator for rows nobody can look up, and dropping it
+    # silently would let the command exit 0 on a partial cohort.
+    ('M200-refused-artifact-silently-dropped', 'src/servingPublisher.ts',
+     ('      tally.skipped.push(`${basename(file)} is not publishable (${read.reason})`);',),
+     ('      // dropped',),
+     ['src/servingPublisher.test.ts']),
 ]
 
 

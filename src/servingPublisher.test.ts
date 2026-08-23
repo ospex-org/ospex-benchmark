@@ -12,12 +12,14 @@ import {
   publishRunArtifact,
   publishScoredArtifact,
   publishScores,
+  publishScoringRuns,
   unpublishedCount,
 } from './servingPublisher.js';
 import {
   parseScoredArtifact,
   projectScoredRun,
   publishableScoredRun,
+  RANKING_WITHHELD,
 } from './scoredProjection.js';
 import { parseRunArtifact, projectRun, publishableRun } from './servingProjection.js';
 import { SqlBenchmarkServingPort } from './servingStore.js';
@@ -780,7 +782,14 @@ function scoredArtifactLines(
     scoredAt: '2026-08-20T04:00:00.000Z', scoringPolicyVersion: 'scoring-v0.6.0',
     integrityVerified: true,
     picks: 2 + (over.extraGames?.length ?? 0),
-    participantScorecards: 0,
+    // One scorecard, carrying the OPPORTUNITY denominator the cohort row needs.
+    // Three markets per game rather than one per pick, so a build that used the
+    // pick count as the denominator produces a different number (the fixture
+    // has to sit where the two candidate definitions disagree, or it cannot
+    // tell them apart).
+    participantScorecards: 1,
+    primaryScoreable: 1,
+    scheduleChangedExcluded: 0,
     ladder: { version: 'TOTALS_V1_PROVISIONAL', parameterVersion: 'retrosheet-2023-25-v1' },
     ...over.meta,
   };
@@ -791,8 +800,14 @@ function scoredArtifactLines(
     devigMethod: 'proportional-v1', scheduleChanged: false, inPrimaryStratum: true,
     unscoredReason: null, lineMovementFavorable: null,
   };
+  const scorecard = {
+    recordType: 'participant_scorecard', label: 'SMOKE_V0_NOT_A_COHORT', runId: 'run-77',
+    scoredAt: '2026-08-20T04:00:00.000Z', scoringPolicyVersion: 'scoring-v0.6.0',
+    participantId: 'lab-alpha', eligibleMarkets: 3 * (2 + (over.extraGames?.length ?? 0)),
+  };
   return [
     JSON.stringify(meta),
+    JSON.stringify(scorecard),
     JSON.stringify({
       ...shared, gameId: 'game-1', selection: 'Away Team',
       closing: { line: null, awayDecimal: 2.05, homeDecimal: 1.87 },
@@ -865,8 +880,10 @@ test('a TRUNCATED scored artifact refuses before anything is sent — the CLI tu
   // file carries. Nothing may reach the port, and the summary must be the
   // gateRefusal shape `unpublishedCount` counts as a failure — which is what
   // makes `yarn project:scores` and `yarn score --publish` exit nonzero on it.
-  const lines = scoredArtifactLines();
-  const file = writeScoredArtifact([lines[0]!, lines[1]!]); // meta declares 2, carries 1
+  // The LAST line dropped, which is what a truncated write actually looks
+  // like — and it stays a truncation whatever else the fixture grows at the
+  // front, unlike a positional slice of the first two lines.
+  const file = writeScoredArtifact(scoredArtifactLines().slice(0, -1)); // declares 2, carries 1
   const port = new RecordingPort();
   const { log } = collector();
   const summary = await publishScoredArtifact(port, file, log);
@@ -993,4 +1010,212 @@ test('the scores DEFAULT deadline still binds when the wall clock runs backwards
   } finally {
     Date.now = realNow;
   }
+});
+
+// ---------------------------------------------------------------------------
+// The cohort-scalar scoring run
+// ---------------------------------------------------------------------------
+
+/** A scored artifact under a chosen file name, so a case can hand the cohort
+ *  publisher several files and see which ones it aggregated. */
+function writeNamedScoredArtifact(dir: string, name: string, lines: string[]): string {
+  const file = join(dir, name);
+  writeFileSync(file, lines.join('\n'), 'utf8');
+  return file;
+}
+
+/** The scored artifact of one run of a cohort: distinct runId, distinct game,
+ *  everything else coherent with it. */
+function cohortArtifactLines(runId: string, cohortId: string, gameId: string): string[] {
+  return scoredArtifactLines()
+    .map((line) => JSON.parse(line) as Record<string, unknown>)
+    .map((record) => ({
+      ...record,
+      runId,
+      ...(record['recordType'] === 'scored_run_meta' ? { cohortId } : {}),
+      ...(record['recordType'] === 'scored_decision'
+        ? { gameId: `${gameId}-${String(record['gameId'])}` }
+        : {}),
+    }))
+    .map((record) => JSON.stringify(record));
+}
+
+test('the scoring run is ONE row per cohort, summed over the artifacts it was given', async () => {
+  // The grain the row is keyed at. A watch cohort is a DATE with one artifact
+  // per fired game, so two artifacts of one cohort must produce ONE row whose
+  // counts cover both — a per-artifact producer would send two rows, and the
+  // second would be refused as a contradiction against the first.
+  const dir = tempDir('serving-cohort-');
+  const files = [
+    writeNamedScoredArtifact(dir, 'a-scored.ndjson', cohortArtifactLines('run-a', 'smoke-v0-2026-08-19', 'a')),
+    writeNamedScoredArtifact(dir, 'b-scored.ndjson', cohortArtifactLines('run-b', 'smoke-v0-2026-08-19', 'b')),
+  ];
+  const port = new RecordingPort();
+  const { log, lines: printed } = collector();
+
+  const summary = await publishScoringRuns(port, files, RANKING_WITHHELD, log);
+
+  assert.deepEqual(port.calls.map((call) => call.kind), ['scoringRun']);
+  // What was SENT, not what this test would have sent. Each artifact carries
+  // two picks — one scoreable, one refused close_missing — and a scorecard
+  // declaring six eligible markets, so every number below is a SUM that a
+  // single-artifact producer could not reach.
+  const sent = port.calls[0]!.payload as unknown as ScoringRun;
+  assert.equal(sent.cohortId, 'smoke-v0-2026-08-19');
+  assert.equal(sent.scoringPolicyVersion, 'scoring-v0.6.0');
+  assert.equal(sent.eligible, 12);
+  assert.equal(sent.scored, 2);
+  assert.equal(sent.refused, 2);
+  assert.equal(sent.scheduleHeldOut, 0);
+  assert.deepEqual(sent.refusalReasons, { close_missing: 2 });
+  assert.equal(sent.rankingAllowed, false);
+  assert.equal(summary.published, 1);
+  // The operator is the only thing that can judge whether the set is complete,
+  // so the numbers and the artifact count are printed before the write.
+  assert.ok(
+    printed.some((line) => line.includes('over 2 artifact(s)') && line.includes('ranking WITHHELD')),
+    `printed: ${printed.join(' | ')}`,
+  );
+});
+
+test('the row cites a manifest of the files it was computed from, not one of them', async () => {
+  // Every other row's `source_sha256` is the sha256 of the ONE file it came
+  // from. A cohort row has N, so it cites the digest of a sha256sum-format
+  // manifest — reproducible as `sha256sum *-scored.ndjson | sort | sha256sum`
+  // — and names the files so a reader knows which N to hash. Derived here from
+  // the BYTES ON DISK rather than from anything the publisher returned.
+  const dir = tempDir('serving-cohort-manifest-');
+  const written = [
+    ['b-scored.ndjson', cohortArtifactLines('run-b', 'smoke-v0-2026-08-19', 'b')],
+    ['a-scored.ndjson', cohortArtifactLines('run-a', 'smoke-v0-2026-08-19', 'a')],
+  ] as const;
+  const files = written.map(([name, lines]) => writeNamedScoredArtifact(dir, name, lines));
+  const port = new RecordingPort();
+
+  await publishScoringRuns(port, files, RANKING_WITHHELD, collector().log);
+
+  const sent = port.calls[0]!.payload as unknown as ScoringRun;
+  const manifest = files
+    .map((file) => `${sha256Hex(readFileSync(file, 'utf8'))}  ${basename(file)}`)
+    .sort()
+    .join('\n');
+  assert.equal(sent.source.sourceSha256, sha256Hex(`${manifest}\n`));
+  // Sorted, so the order the shell expanded the glob in cannot change either
+  // field — the files were handed over b-then-a on purpose.
+  assert.equal(sent.source.sourcePath, 'a-scored.ndjson b-scored.ndjson');
+});
+
+test('artifacts of DIFFERENT cohorts get a row each, in a stable order', async () => {
+  const dir = tempDir('serving-cohort-split-');
+  const files = [
+    writeNamedScoredArtifact(dir, 'w-scored.ndjson', cohortArtifactLines('run-w', 'watch-v0-2026-08-20', 'w')),
+    writeNamedScoredArtifact(dir, 's-scored.ndjson', cohortArtifactLines('run-s', 'smoke-v0-2026-08-19', 's')),
+  ];
+  const port = new RecordingPort();
+
+  const summary = await publishScoringRuns(port, files, RANKING_WITHHELD, collector().log);
+
+  assert.deepEqual(port.calls.map((call) => call.key), [
+    'smoke-v0-2026-08-19',
+    'watch-v0-2026-08-20',
+  ]);
+  assert.equal(summary.published, 2);
+});
+
+test('a file the scored gate refuses is EXCLUDED from the cohort and fails the command', async () => {
+  // Its picks are not in the projection either, so counting them would publish
+  // a denominator for rows nobody can look up. Reported, excluded, and counted
+  // as a failure so the CLI exits non-zero — never silently dropped.
+  const dir = tempDir('serving-cohort-bad-');
+  const files = [
+    writeNamedScoredArtifact(dir, 'good-scored.ndjson', cohortArtifactLines('run-a', 'smoke-v0-2026-08-19', 'a')),
+    writeNamedScoredArtifact(
+      dir,
+      'dry-scored.ndjson',
+      cohortArtifactLines('run-b', 'smoke-v0-2026-08-19', 'b').map((line) =>
+        line.replace('"sourceMode":"live"', '"sourceMode":"dry-run"'),
+      ),
+    ),
+  ];
+  const port = new RecordingPort();
+  const { log, errors } = collector();
+
+  const summary = await publishScoringRuns(port, files, RANKING_WITHHELD, log);
+
+  const sent = port.calls[0]!.payload as unknown as ScoringRun;
+  assert.equal(sent.eligible, 6, 'only the publishable artifact is counted');
+  assert.equal(summary.published, 1);
+  assert.ok(summary.skipped.some((reason) => reason.includes('dry-scored.ndjson')), summary.skipped.join(' | '));
+  assert.ok(errors.some((line) => line.includes('not a live run')), errors.join(' | '));
+  assert.ok(
+    unpublishedCount(summary, 'the cohort scoring run', collector().log) > 0,
+    'an excluded artifact must reach the exit code',
+  );
+});
+
+test('a cohort the projector refuses sends nothing for that cohort, and says why', async () => {
+  // Two artifacts of one cohort under DIFFERENT scoring policy versions: a
+  // rescore under a new version is its own row, so summing them would publish
+  // one row under whichever version was read first.
+  const dir = tempDir('serving-cohort-mixed-');
+  const files = [
+    writeNamedScoredArtifact(dir, 'a-scored.ndjson', cohortArtifactLines('run-a', 'smoke-v0-2026-08-19', 'a')),
+    writeNamedScoredArtifact(
+      dir,
+      'b-scored.ndjson',
+      cohortArtifactLines('run-b', 'smoke-v0-2026-08-19', 'b').map((line) =>
+        line.replaceAll('"scoringPolicyVersion":"scoring-v0.6.0"', '"scoringPolicyVersion":"scoring-v0.7.0"'),
+      ),
+    ),
+  ];
+  const port = new RecordingPort();
+  const { log, errors } = collector();
+
+  const summary = await publishScoringRuns(port, files, RANKING_WITHHELD, log);
+
+  assert.equal(port.calls.length, 0, 'nothing may be sent for a cohort the projector refused');
+  assert.ok(errors.some((line) => line.includes('span two scoring policy versions')), errors.join(' | '));
+  assert.ok(unpublishedCount(summary, 'the cohort scoring run', collector().log) > 0);
+});
+
+test('the operator\'s ranking decision reaches the row verbatim', async () => {
+  const dir = tempDir('serving-cohort-ranking-');
+  const files = [
+    writeNamedScoredArtifact(dir, 'a-scored.ndjson', cohortArtifactLines('run-a', 'smoke-v0-2026-08-19', 'a')),
+  ];
+  const port = new RecordingPort();
+  const { log, lines: printed } = collector();
+
+  await publishScoringRuns(
+    port,
+    files,
+    { allowed: true, reason: 'operator published: n is adequate' },
+    log,
+  );
+
+  const sent = port.calls[0]!.payload as unknown as ScoringRun;
+  assert.equal(sent.rankingAllowed, true);
+  assert.equal(sent.rankingReason, 'operator published: n is adequate');
+  assert.ok(printed.some((line) => line.includes('ranking ALLOWED')), printed.join(' | '));
+});
+
+test('the cohort write is bounded by the same deadline as everything else', async () => {
+  // The publication cannot hold a command open on a port that never answers.
+  const dir = tempDir('serving-cohort-deadline-');
+  const files = [
+    writeNamedScoredArtifact(dir, 'a-scored.ndjson', cohortArtifactLines('run-a', 'smoke-v0-2026-08-19', 'a')),
+  ];
+  const hanging = {
+    publishScoringRun: () => new Promise<never>(() => undefined),
+  } as unknown as BenchmarkServingPort;
+  const { log, errors } = collector();
+
+  const summary = await publishScoringRuns(hanging, files, RANKING_WITHHELD, log, {
+    deadlineMs: 40,
+    perWriteTimeoutMs: 10,
+  });
+
+  assert.equal(summary.rejected['unavailable'], 1, 'the write is reported, not awaited forever');
+  assert.ok(errors.length >= 0);
+  assert.equal(summary.published, 0);
 });

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { parseNdjsonObjects, publishableCohortId } from './servingProjection.js';
 import type { JsonRecord } from './servingProjection.js';
-import type { DecisionScore, SourceRef } from './servingStore.js';
+import type { DecisionScore, ScoringRun, SourceRef } from './servingStore.js';
 
 /**
  * Project a SCORED artifact (`<runId>-scored.ndjson`, written by `yarn score`)
@@ -56,6 +56,15 @@ const scoredRunMetaSchema = z
     // numbers — a truncated artifact is caught disagreeing with itself.
     picks: z.number().int().nonnegative(),
     participantScorecards: z.number().int().nonnegative(),
+    // The scorer's OWN cohort-scalar coverage figures. The projector never
+    // reads them: it derives the same two numbers from the scored_decision
+    // records and REQUIRES agreement. Declaring them is what turns a meta
+    // record spliced from another pass — or a file whose records were edited
+    // under a meta that was not — into a refusal, rather than into the cohort
+    // coverage a public read path serves. Same cross-check as the picks and
+    // participantScorecards counts below, one level up from record counting.
+    primaryScoreable: z.number().int().nonnegative(),
+    scheduleChangedExcluded: z.number().int().nonnegative(),
     ladder: z
       .object({
         version: z.string().min(1),
@@ -103,19 +112,32 @@ const scoredDecisionSchema = z
 export type ScoredDecisionRecord = z.infer<typeof scoredDecisionSchema>;
 
 /**
- * The identity fields a participant_scorecard record shares with the pass. It
- * is never projected, but it IS part of the artifact `source_sha256` binds to
- * every published row — so a scorecard spliced in from a different pass would
- * make the canonical record disagree with the rows citing it, permanently and
- * silently. The gate holds it to the same one-file-one-pass rule.
+ * The identity fields a participant_scorecard record shares with the pass, plus
+ * the one coverage number that lives nowhere else.
+ *
+ * The identity half: the per-participant aggregates are never projected, but
+ * they ARE part of the artifact `source_sha256` binds to every published row —
+ * so a scorecard spliced in from a different pass would make the canonical
+ * record disagree with the rows citing it, permanently and silently. The gate
+ * holds it to the same one-file-one-pass rule.
+ *
+ * The coverage half: `eligibleMarkets` is the OPPORTUNITY denominator, and no
+ * scored_decision record can supply it. An arm that failed produced no pick, so
+ * a denominator counted over picks is coverage computed over successes only —
+ * the failure the run publisher's own contract names first ("a failed arm has
+ * to be representable"). 073 names the same quantity on the database side as
+ * `benchmark_arm_attempts.supplied_markets` at `attempt_ordinal = 0`, and the
+ * scorer reaches it the same way: the supplied-market count summed over the
+ * arm's dispatched games, one per pick for a control.
  */
-const scorecardIdentitySchema = z
+const scorecardCoverageSchema = z
   .object({
     recordType: z.literal('participant_scorecard'),
     label: z.string().min(1),
     runId: z.string().min(1),
     scoredAt: z.string().min(1),
     scoringPolicyVersion: z.string().min(1),
+    eligibleMarkets: z.number().int().nonnegative(),
   })
   .passthrough();
 
@@ -140,19 +162,30 @@ export interface ScoredHeader {
   readonly ladderParamVersion: string;
 }
 
+/**
+ * One gate-accepted scored artifact, as everything downstream sees it.
+ *
+ * Named because the cohort-scalar projection takes a LIST of these: a scoring
+ * run is keyed (cohort, scoring policy version) while a scored artifact is per
+ * RUN FILE, and a watch cohort is a DATE with one artifact per fired game.
+ */
+export interface ScoredArtifact {
+  readonly header: ScoredHeader;
+  /**
+   * The gate's OWN parse of every scored_decision, handed onward so the
+   * projector cannot disagree with the gate about what a record says. The
+   * run path re-reads instead; here the gate already had to parse every
+   * record to check identity coherence, and a second parse would only be a
+   * second opinion.
+   */
+  readonly decisions: readonly ScoredDecisionRecord[];
+  /** Summed over the file's participant_scorecard records — the opportunity
+   *  denominator, including arms that were dispatched and produced nothing. */
+  readonly eligibleMarkets: number;
+}
+
 export type ScoredGate =
-  | {
-      readonly publishable: true;
-      readonly header: ScoredHeader;
-      /**
-       * The gate's OWN parse of every scored_decision, handed onward so the
-       * projector cannot disagree with the gate about what a record says. The
-       * run path re-reads instead; here the gate already had to parse every
-       * record to check identity coherence, and a second parse would only be a
-       * second opinion.
-       */
-      readonly decisions: readonly ScoredDecisionRecord[];
-    }
+  | ({ readonly publishable: true } & ScoredArtifact)
   | { readonly publishable: false; readonly reason: string };
 
 const describeIssue = (error: z.ZodError): string => {
@@ -291,13 +324,41 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
 
   if (decisions.length === 0) return no('the artifact contains no scored decisions');
 
-  // Scorecard records are tolerated and never projected, but they are part of
-  // the file `source_sha256` stamps on every published row — the same
-  // one-file-one-pass rule holds them too, or the canonical record the rows
-  // cite carries another pass's aggregates with nothing ever detecting it.
+  // The file held to its OWN declared coverage, the same way it is already held
+  // to its own declared record counts, and derived from the records rather than
+  // read off the meta. A meta spliced from another pass, or records edited
+  // under a meta that was not, disagrees here instead of quietly becoming the
+  // cohort coverage a public read path serves.
+  //
+  // Both predicates are the scorer's, reproduced field for field:
+  // `primaryScoreableCount` is `inPrimaryStratum && primaryClvPct !== null` and
+  // `heldOutOfPrimary` is its complement on the stratum with the same value
+  // conjunct — and the artifact carries `inPrimaryStratum` per record, so this
+  // is a comparison rather than a second opinion about the stratum rule.
+  const scored = decisions.filter((d) => d.inPrimaryStratum && d.primaryClvPct !== null).length;
+  const heldOut = decisions.filter((d) => !d.inPrimaryStratum && d.primaryClvPct !== null).length;
+  for (const [field, declared, derived] of [
+    ['primaryScoreable', meta.primaryScoreable, scored],
+    ['scheduleChangedExcluded', meta.scheduleChangedExcluded, heldOut],
+  ] as const) {
+    if (declared !== derived) {
+      return no(
+        `the artifact declares ${field} = ${declared} but its scored_decision records carry ` +
+          `${derived} — spliced, edited, or not the scorer's output`,
+      );
+    }
+  }
+
+  // Scorecard records are tolerated and never projected AS AGGREGATES, but they
+  // are part of the file `source_sha256` stamps on every published row — the
+  // same one-file-one-pass rule holds them too, or the canonical record the
+  // rows cite carries another pass's aggregates with nothing ever detecting it.
+  // One number IS taken from them: `eligibleMarkets`, summed, because it is the
+  // opportunity denominator and no other record in the file carries it.
+  let eligibleMarkets = 0;
   for (const [index, record] of records.entries()) {
     if (record['recordType'] !== 'participant_scorecard') continue;
-    const parsed = scorecardIdentitySchema.safeParse(record);
+    const parsed = scorecardCoverageSchema.safeParse(record);
     if (!parsed.success) {
       return no(
         `participant_scorecard record ${index + 1} does not match the current scorer format ` +
@@ -314,10 +375,18 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
         return no(`participant_scorecard record ${index + 1} disagrees with scored_run_meta on ${field}`);
       }
     }
+    eligibleMarkets += parsed.data.eligibleMarkets;
   }
 
+  // ⚠ NOT checked here: whether that sum is a plausible denominator for the
+  //   picks. It is checked in `projectScoringRun`, because this gate also
+  //   admits the PER-PICK path, and refusing the whole file over an
+  //   opportunity denominator would block scores whose own rows are perfectly
+  //   publishable. A defect in a number only one of two consumers reads
+  //   belongs to that consumer.
   return {
     publishable: true,
+    eligibleMarkets,
     header: {
       runId: meta.runId,
       cohortId: meta.cohortId,
@@ -392,4 +461,214 @@ export function projectScoredRun(
     scoredAt: record.scoredAt,
     source,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// The cohort-scalar scoring run
+// ---------------------------------------------------------------------------
+
+/**
+ * The publication brake, as an operator states it.
+ *
+ * `benchmark_scoring_runs.ranking_allowed` is NOT NULL and 073 calls it a
+ * first-class field rather than a note: a read path that serves CLV without it
+ * lets a UI render a ranking the methodology forbids, and a NULL there must be
+ * read as false. Nothing in an artifact can decide it — whether a sample
+ * supports a ranking is a methodology judgment about the cohort — so it is
+ * supplied, and it defaults to closed.
+ */
+export interface RankingDecision {
+  readonly allowed: boolean;
+  readonly reason: string;
+}
+
+/**
+ * The default: closed, with the reason the work order specifies, verbatim.
+ *
+ * The row is INSERT-ONCE with no UPDATE grant, so publishing it is a one-shot
+ * act per (cohort, scoring policy version) — opening the gate afterwards is an
+ * owner-side correction, exactly as for a reveal. Measured on PostgreSQL 17.10:
+ * republishing the same row with `ranking_allowed` flipped is refused as a
+ * contradiction naming that field, which is the loud version of a lever that
+ * used to report success and change nothing.
+ */
+export const RANKING_WITHHELD: RankingDecision = Object.freeze({
+  allowed: false,
+  reason: 'label: watch-v0 pending operator publication decision',
+});
+
+export type ScoringRunProjection =
+  | { readonly publishable: true; readonly run: ScoringRun }
+  | { readonly publishable: false; readonly reason: string };
+
+/** ISO-8601 with an explicit offset, as `new Date().toISOString()` writes it.
+ *  Checked here because MAX needs an order and `Date.parse` answers NaN
+ *  silently — the gate's own `scoredAt` check is only "a non-empty string". */
+function instantMs(value: string): number | null {
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Project one cohort's scored artifacts onto its single coverage-and-brake row.
+ *
+ * ── WHY IT TAKES A LIST ──────────────────────────────────────────────────────
+ * `benchmark_scoring_runs` is keyed `(cohort_id, scoring_policy_version)` while
+ * a scored artifact is per RUN FILE, and the two grains are 1:N by construction:
+ * `fireEligibleGame` mints `runId = watch-v0-<date>-<hex>` inside
+ * `cohortId = watch-v0-<date>` once per fired game, so a fifteen-game slate is
+ * fifteen artifacts under one cohort. A per-artifact producer would write the
+ * first game's coverage and report every later game as a benign duplicate — the
+ * whole day's published coverage frozen to whichever game fired first.
+ *
+ * So the caller supplies the artifacts it means to summarise, and this refuses
+ * anything that is not one coherent cohort. Nothing here can know whether the
+ * SET is complete — that is the operator's statement, and it is why the row is
+ * published deliberately rather than as a side effect of publishing scores. An
+ * incomplete set is not silent, though: the row is insert-once and the write
+ * drift-compares every fact it asserts, so publishing fourteen of fifteen and
+ * then all fifteen reports a contradiction naming the first field that moved.
+ *
+ * ── EVERY VALUE IS A PURE FUNCTION OF THE ARTIFACTS' BYTES ───────────────────
+ * The same rule the scored path runs under, so a fresh publish and a recovery
+ * republish over the same files are the same call. `ranking` is the one input
+ * from outside, and it is the operator's own statement rather than a clock read
+ * or an environment read.
+ */
+export function projectScoringRun(
+  artifacts: readonly ScoredArtifact[],
+  ranking: RankingDecision,
+  source: SourceRef,
+): ScoringRunProjection {
+  const no = (reason: string): ScoringRunProjection => ({ publishable: false, reason });
+
+  if (artifacts.length === 0) return no('no scored artifacts were supplied');
+
+  const first = artifacts[0]!.header;
+  const runIds = new Set<string>();
+  for (const { header } of artifacts) {
+    // One cohort and one policy version, because those two ARE the row's key. A
+    // mixed set would publish one cohort's numbers under the other's name, and
+    // the write could not tell: the key it lands on is whichever header
+    // happened to be read first.
+    if (header.cohortId !== first.cohortId) {
+      return no(
+        `the artifacts span two cohorts (${first.cohortId} and ${header.cohortId}) — a scoring ` +
+          'run is one cohort',
+      );
+    }
+    if (header.scoringPolicyVersion !== first.scoringPolicyVersion) {
+      return no(
+        `the artifacts span two scoring policy versions (${first.scoringPolicyVersion} and ` +
+          `${header.scoringPolicyVersion}) — a rescore under a new version is its own row`,
+      );
+    }
+    // The same run twice doubles every count, and naming both a file and its
+    // copy, or expanding two overlapping globs, is the ordinary way it happens.
+    if (runIds.has(header.runId)) {
+      return no(`run ${header.runId} was supplied twice, which would double-count its picks`);
+    }
+    runIds.add(header.runId);
+    if (instantMs(header.scoredAt) === null) {
+      return no(`run ${header.runId} carries an unparseable scoredAt (${header.scoredAt})`);
+    }
+  }
+
+  let eligible = 0;
+  let scored = 0;
+  let refused = 0;
+  let scheduleHeldOut = 0;
+  let picks = 0;
+  const refusalReasons: Record<string, number> = {};
+  for (const artifact of artifacts) {
+    eligible += artifact.eligibleMarkets;
+    picks += artifact.decisions.length;
+    for (const decision of artifact.decisions) {
+      if (decision.unscoredReason !== null) {
+        refused += 1;
+        refusalReasons[decision.unscoredReason] =
+          (refusalReasons[decision.unscoredReason] ?? 0) + 1;
+        continue;
+      }
+      // Neither refused nor valued: left out of all three buckets on purpose,
+      // and caught by the partition check below rather than absorbed.
+      if (decision.primaryClvPct === null) continue;
+      if (decision.inPrimaryStratum) scored += 1;
+      else scheduleHeldOut += 1;
+    }
+  }
+
+  // THE PARTITION, asserted rather than assumed. `unscoredReason === null`
+  // implies a primary value on every path the scorer can take — `scoreDecision`
+  // either refuses with a reason and nulls both metrics, or fills them — so a
+  // pick in no bucket means the file is not the scorer's output. The scorer
+  // models the same residual and calls it `unexplained`; folding it silently
+  // into `refused` would publish a refusal count with no reason behind it, into
+  // a column a public read path divides by.
+  const unexplained = picks - scored - refused - scheduleHeldOut;
+  if (unexplained !== 0) {
+    return no(
+      `${unexplained} pick(s) carry neither a refusal reason nor a primary CLV value — the ` +
+        'coverage columns would not account for them',
+    );
+  }
+
+  // An opportunity denominator below the picks taken against it is not a small
+  // discrepancy; it is a denominator that cannot be what it says, and this row
+  // is insert-once, so it is refused rather than clamped. Checked HERE and not
+  // in the artifact gate: the gate also admits the per-pick path, where this
+  // number is not read at all.
+  if (eligible < picks) {
+    return no(
+      `the scorecards sum to ${eligible} eligible market(s) across ${artifacts.length} ` +
+        `artifact(s) while they carry ${picks} pick(s) — the opportunity denominator cannot be ` +
+        'smaller than the picks taken against it',
+    );
+  }
+
+  return {
+    publishable: true,
+    run: {
+      cohortId: first.cohortId,
+      scoringPolicyVersion: first.scoringPolicyVersion,
+      // The OPPORTUNITY denominator: supplied markets over dispatched arm-games,
+      // so an arm that failed stays in it. `eligible - picks` is exactly the
+      // opportunities that produced no decision.
+      eligible,
+      // In the primary stratum AND carrying a value — `primaryScoreableCount`.
+      scored,
+      // Refused by a close-quality or selection gate, tagged or not.
+      refused,
+      // What the reschedule tag actually REMOVED from the primary estimate:
+      // tagged AND carrying a value, which is the scorer's own
+      // `heldOutOfPrimary`. ⚠ NOT the same population as
+      // `benchmark_scores.held_out_of_primary`, which is the raw stratum tag and
+      // is therefore also true on tagged rows an earlier gate had refused. A
+      // read path reproducing this scalar wants
+      // `count(*) filter (where held_out_of_primary and not refused)`.
+      scheduleHeldOut,
+      refusalReasons,
+      rankingAllowed: ranking.allowed,
+      rankingReason: ranking.reason,
+      // No artifact measures cost, so this pass establishes nothing about
+      // whether cost per pick is comparable across entrants. NULL says that;
+      // `false` would be a claim.
+      costPerPickComparable: null,
+      // Absent from the scored artifact, and deliberately not resolved here.
+      // `resolveBenchmarkCommit()` reads the machine that happens to be
+      // publishing, which is not the build that produced these scores, and it
+      // would break the property that a republish is the same call over the
+      // same bytes — the reasoning `benchmarkCommit.ts` gives for stamping the
+      // value into the run artifact instead. A reader who wants it joins
+      // `benchmark_runs.benchmark_commit` on the cohort.
+      benchmarkCommit: null,
+      // The latest pass over the set: the instant by which all of these had been
+      // scored. Outside the write's drift comparison, so a re-scored file moving
+      // it does not close the recovery republish.
+      scoredAt: new Date(
+        Math.max(...artifacts.map(({ header }) => instantMs(header.scoredAt) ?? 0)),
+      ).toISOString(),
+      source,
+    },
+  };
 }
