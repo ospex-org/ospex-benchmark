@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   dialsThisMachine,
   DECLARED_DEFINER_EXEMPTIONS,
+  EXECUTION_SURFACE_TABLES,
   GATE_EXIT,
   GATE_STARTUP_OPTIONS,
   isExemptDefiner,
@@ -336,6 +337,135 @@ test('--help is not a failure and opens nothing', async () => {
   assert.equal(await runSchemaGate(it.deps), GATE_EXIT.ok);
   assert.equal(opened, 0);
   assert.ok(it.lines.some((line) => line.includes('usage: yarn gate:serving')));
+});
+
+// ---------------------------------------------------------------------------
+// The expected surface, which is capability-dependent
+// ---------------------------------------------------------------------------
+
+/** Answers the capability select with `version`, and every table question with
+ *  a clean row per table it was asked about, recording the parameters. */
+function atCapability(version: unknown): { query: GateQuery; sent: unknown[][] } {
+  const sent: unknown[][] = [];
+  const query: GateQuery = async (sql, params) => {
+    sent.push([...(params ?? [])]);
+    if (sql.includes('from public.benchmark_schema_capability')) return [{ version }];
+    return [];
+  };
+  return { query, sent };
+}
+
+/** The table list a check sent, from the first parameter that is an array of
+ *  strings — read from what the code SENT rather than from a literal this test
+ *  also supplies, so a check that ignored the resolved set could not pass. */
+function tablesAsked(sent: unknown[][]): readonly string[] {
+  const found = sent
+    .flat()
+    .filter((p): p is string[] => Array.isArray(p) && p.every((x) => typeof x === 'string'))
+    .find((p) => p.includes('benchmark_decisions'));
+  assert.ok(found, 'no check asked about the projection tables at all');
+  return found;
+}
+
+test('the expected surface widens ONLY when the schema says it holds the execution tables', async () => {
+  // 079 adds three tables to this role's grid and raises serving_projection to
+  // 4. Naming them unconditionally is not an option: has_table_privilege casts
+  // its argument to regclass, so a name that does not exist raises 42P01 and
+  // takes the whole statement with it — measured, an unconditional list turns
+  // the privilege grid, the browser-key check and the row-count bookend red
+  // against a perfectly good pre-079 database.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('reaches nothing'));
+  assert.ok(check, 'the reach check is gone');
+
+  const before = atCapability(3);
+  await check.run(before.query);
+  assert.deepEqual(
+    tablesAsked(before.sent),
+    [...SERVING_TABLES],
+    'at capability 3 the gate must ask about the ten it has always asked about',
+  );
+
+  const after = atCapability(4);
+  await check.run(after.query);
+  assert.deepEqual(
+    tablesAsked(after.sent),
+    [...SERVING_TABLES, ...EXECUTION_SURFACE_TABLES],
+    'at capability 4 the execution surface is part of the projection',
+  );
+});
+
+test('an unreadable capability narrows the surface, and does not throw', async () => {
+  // Fail-safe direction, and it has to be a decision rather than an accident:
+  // on a post-079 database the reach check then reports the three as
+  // unexpected — a loud, wrong-in-the-safe-direction answer — instead of
+  // certifying a grid whose size it could not establish. The capability check
+  // has its own line and says why.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('reaches nothing'));
+  assert.ok(check, 'the reach check is gone');
+  const sent: unknown[][] = [];
+  const query: GateQuery = async (sql, params) => {
+    sent.push([...(params ?? [])]);
+    if (sql.includes('from public.benchmark_schema_capability')) {
+      throw Object.assign(new Error('permission denied for table benchmark_schema_capability'), {
+        code: '42501',
+      });
+    }
+    return [];
+  };
+  const verdict = await check.run(query);
+  assert.equal(verdict.ok, true, 'the check must still run');
+  assert.deepEqual(tablesAsked(sent), [...SERVING_TABLES]);
+});
+
+test('a non-integer capability is not a widened surface', async () => {
+  // The column is an integer, so a string is a driver or a schema surprise
+  // rather than a version — and coercing it would be a silent widening. Same
+  // reading the publisher's own client takes.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('reaches nothing'));
+  assert.ok(check, 'the reach check is gone');
+  for (const odd of ['4', 4.5, null, undefined]) {
+    const probe = atCapability(odd);
+    await check.run(probe.query);
+    assert.deepEqual(tablesAsked(probe.sent), [...SERVING_TABLES], `widened on ${String(odd)}`);
+  }
+});
+
+test('the execution surface is INSERT-able and the capability table is not', async () => {
+  // The writable set is derived now rather than a frozen Set, so both
+  // directions need pinning: a new table that the writer must be able to
+  // append to, and the one table it must never be able to write, since a
+  // publisher that can write the capability row authorises its own writes.
+  const check = SERVING_SCHEMA_CHECKS.find((entry) =>
+    entry.name.includes('exactly the privileges'),
+  );
+  assert.ok(check, 'the privilege grid check is gone');
+  const grid = (overrides: Record<string, boolean>): GateQuery => async (sql, params) => {
+    if (sql.includes('from public.benchmark_schema_capability')) return [{ version: 4 }];
+    const tables = (params?.[0] ?? []) as string[];
+    return tables.map((name) => ({
+      name,
+      SELECT: true,
+      INSERT: overrides[name] ?? name !== 'benchmark_schema_capability',
+      UPDATE: false,
+      DELETE: false,
+      TRUNCATE: false,
+      REFERENCES: false,
+      TRIGGER: false,
+    }));
+  };
+
+  const clean = await check.run(grid({}));
+  assert.equal(clean.ok, true, clean.detail);
+  assert.match(clean.detail, /13 tables/);
+  assert.match(clean.detail, /INSERT on 12/);
+
+  const noInsert = await check.run(grid({ benchmark_execution_fills: false }));
+  assert.equal(noInsert.ok, false, 'a writer that cannot append a fill must be reported');
+  assert.match(noInsert.detail, /benchmark_execution_fills/);
+
+  const writableCapability = await check.run(grid({ benchmark_schema_capability: true }));
+  assert.equal(writableCapability.ok, false, 'the capability row must stay unwritable');
+  assert.match(writableCapability.detail, /authorises its own writes/);
 });
 
 test('the exit codes are distinct, so a wrapper can tell them apart', () => {
