@@ -247,9 +247,66 @@ export async function readRowCounts(query: GateQuery): Promise<string> {
  * omission.
  */
 const CAPABILITY_TABLE = 'benchmark_schema_capability';
-const WRITABLE: ReadonlySet<string> = new Set(
-  SERVING_TABLES.filter((table) => table !== CAPABILITY_TABLE),
-);
+const needsInsert = (table: string): boolean => table !== CAPABILITY_TABLE;
+
+/**
+ * The relations indexer migration 079 adds to this role's grid: SELECT+INSERT,
+ * RLS with the same two role-scoped policies as the rest of the projection.
+ *
+ * They are NOT in SERVING_TABLES, and that is the point of the separate name:
+ * that list lives beside the statements that write it, and nothing in this
+ * repo writes these three — an operator-side publisher does. What they are to
+ * this gate is grid, not write surface.
+ */
+export const EXECUTION_SURFACE_TABLES: readonly string[] = Object.freeze([
+  'benchmark_cohort_wallets',
+  'benchmark_execution_fills',
+  'benchmark_site_stats',
+]);
+
+/**
+ * The capability at which the schema HOLDS those three. Deliberately not a
+ * requirement and deliberately not SCORES_SERVING_CAPABILITY: this build
+ * writes none of them, so a database at 3 is perfectly fine for everything
+ * this repo does, and raising the required version would fail-soft-HOLD every
+ * scores publication over a migration it never touches.
+ */
+const EXECUTION_SURFACE_CAPABILITY = 4;
+
+/**
+ * Every relation this role's grid must cover, at the capability the schema
+ * REPORTS — so one build reads a pre-079 and a post-079 database correctly.
+ *
+ * ⚠ THE SET CANNOT BE A CONSTANT, and the reason is a Postgres detail rather
+ *   than a preference. `has_table_privilege('public.' || t, …)` casts its
+ *   argument to regclass, so a name that does not exist raises 42P01 and takes
+ *   the whole statement with it — it does not answer false. Adding the three
+ *   unconditionally therefore does not merely over-state the surface against a
+ *   pre-079 database; it aborts the privilege grid, the browser-key check and
+ *   the row-count bookend, and the gate reports three failures that have
+ *   nothing to do with the schema in front of it.
+ *
+ * An unreadable capability row resolves to the NARROW set, which is the
+ * fail-safe direction: on a post-079 database the reach check then reports the
+ * three as unexpected rather than certifying a grid it could not size, and the
+ * capability check above says why in its own line.
+ */
+async function projectionTables(query: GateQuery): Promise<readonly string[]> {
+  let version = 0;
+  try {
+    const rows = await query(
+      `select version from public.${CAPABILITY_TABLE} where capability = $1`,
+      ['serving_projection'],
+    );
+    const answered = rows[0]?.['version'];
+    if (typeof answered === 'number' && Number.isInteger(answered)) version = answered;
+  } catch {
+    // Unreadable is version 0 — see above.
+  }
+  return version >= EXECUTION_SURFACE_CAPABILITY
+    ? [...SERVING_TABLES, ...EXECUTION_SURFACE_TABLES]
+    : SERVING_TABLES;
+}
 
 /** Verbs no projection writer may hold on any of these tables, ever. */
 const FORBIDDEN_VERBS = ['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'] as const;
@@ -559,6 +616,7 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
   {
     name: 'the role holds exactly the privileges the design gives it',
     async run(query) {
+      const tables = await projectionTables(query);
       // Column-level as well as table-level. A column-scoped UPDATE is invisible
       // to has_table_privilege, and one column of UPDATE is all it takes for a
       // sealed forecast to stop being immutable.
@@ -572,10 +630,10 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
                 has_any_column_privilege('public.' || t, 'REFERENCES')        as "REFERENCES",
                 has_table_privilege('public.' || t, 'TRIGGER')                as "TRIGGER"
            from unnest($1::text[]) as t`,
-        [[...SERVING_TABLES]],
+        [[...tables]],
       );
-      if (rows.length !== SERVING_TABLES.length) {
-        return { ok: false, detail: `asked about ${SERVING_TABLES.length} tables, the catalog answered for ${rows.length}` };
+      if (rows.length !== tables.length) {
+        return { ok: false, detail: `asked about ${tables.length} tables, the catalog answered for ${rows.length}` };
       }
       const wrong: string[] = [];
       for (const row of rows) {
@@ -583,10 +641,10 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
         if (row['SELECT'] !== true) {
           wrong.push(`${table}: no SELECT, and every statement reads the stored row to detect drift`);
         }
-        const needsInsert = WRITABLE.has(table);
-        if (row['INSERT'] !== needsInsert) {
+        const insertable = needsInsert(table);
+        if (row['INSERT'] !== insertable) {
           wrong.push(
-            needsInsert
+            insertable
               ? `${table}: no INSERT, so every row for it would be refused`
               : `${table}: holds INSERT, and must not — this role could write the capability row that authorises its own writes`,
           );
@@ -598,7 +656,7 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
       return wrong.length === 0
         ? {
             ok: true,
-            detail: `${rows.length} tables: SELECT on all, INSERT on ${WRITABLE.size}, and no mutating verb anywhere (table or column level)`,
+            detail: `${rows.length} tables: SELECT on all, INSERT on ${tables.filter(needsInsert).length}, and no mutating verb anywhere (table or column level)`,
           }
         : { ok: false, detail: wrong.join(' | ') };
     },
@@ -607,6 +665,7 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
   {
     name: 'the role reaches nothing outside the projection',
     async run(query) {
+      const tables = await projectionTables(query);
       // The only justification for a scoped login instead of the widely-held
       // service key is that it cannot reach protocol state. A single grant
       // elsewhere removes that, and sequences are the class a table-and-view
@@ -636,7 +695,7 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
                    or has_table_privilege(c.oid, 'TRIGGER')
                  end
           order by c.relname limit 25`,
-        [[...SERVING_TABLES]],
+        [[...tables]],
       );
       return rows.length === 0
         ? { ok: true, detail: 'no relation outside the projection is readable or writable by this role' }
@@ -757,6 +816,7 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
   {
     name: 'the public read keys reach only what they should',
     async run(query) {
+      const tables = await projectionTables(query);
       // Two separate properties, checked together because both are grants held
       // by roles OTHER than the one connected. Any role may ask about another's
       // privileges, so this is answerable from here — and it has to be asked
@@ -778,7 +838,7 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
             where case when v in ('DELETE', 'TRUNCATE', 'TRIGGER')
                        then has_table_privilege(r, 'public.' || t, v)
                        else has_any_column_privilege(r, 'public.' || t, v) end`,
-          [browserKeys, [...SERVING_TABLES], [...ALL_VERBS]],
+          [browserKeys, [...tables], [...ALL_VERBS]],
         );
         for (const row of reach) {
           faults.push(`${String(row['role'])} holds ${String(row['verb'])} on ${String(row['name'])}`);
@@ -816,13 +876,14 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
   {
     name: 'row level security is enabled on every projection table',
     async run(query) {
+      const tables = await projectionTables(query);
       const rows = await query(
         `select c.relname as name from pg_class c join pg_namespace n on n.oid = c.relnamespace
           where n.nspname = 'public' and c.relname = any($1::text[]) and c.relrowsecurity = false`,
-        [[...SERVING_TABLES]],
+        [[...tables]],
       );
       return rows.length === 0
-        ? { ok: true, detail: `RLS on all ${SERVING_TABLES.length}` }
+        ? { ok: true, detail: `RLS on all ${tables.length}` }
         : { ok: false, detail: `off on ${rows.map((row) => String(row['name'])).join(', ')}` };
     },
   },
@@ -830,6 +891,7 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
   {
     name: 'the writer can actually write THROUGH row level security',
     async run(query) {
+      const tables = await projectionTables(query);
       // RLS being ENABLED is not the same as this role being able to write. A
       // table whose only permissive policy stops naming the writer denies every
       // insert while every grant in the grid still says yes — measured: the gate
@@ -864,17 +926,17 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
            left join pg_policy p on p.polrelid = c.oid
           where n.nspname = 'public' and c.relname = any($1::text[]) and c.relrowsecurity
           group by c.relname order by c.relname`,
-        [[...SERVING_TABLES]],
+        [[...tables]],
       );
       const faults: string[] = [];
       for (const row of rows) {
         const table = String(row['name']);
-        const needsWrite = WRITABLE.has(table);
+        const needsWrite = needsInsert(table);
         if (needsWrite && Number(row['writable']) === 0) {
           faults.push(`${table}: no permissive policy lets this role INSERT — ${String(row['policies'])}`);
         }
         // Every statement reads the stored row to detect drift, so SELECT is
-        // required on all ten, the capability table included.
+        // required on every one of them, the capability table included.
         if (Number(row['readable']) === 0) {
           faults.push(`${table}: no permissive policy lets this role SELECT — ${String(row['policies'])}`);
         }

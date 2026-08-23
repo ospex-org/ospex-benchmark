@@ -1129,6 +1129,25 @@ MUTANTS = [
      "  const envelopeReplayable = envelope !== null && parsesAsJson(str(envelope, 'body'));",
      '  const envelopeReplayable = envelope !== null;',
      ['src/responseEnvelopeIntegrity.test.ts', 'src/servingProjection.test.ts']),
+    # --- Execution surface, capability-gated (indexer migration 079) ---------
+    # The expected surface must widen ONLY when the schema reports capability 4.
+    # Always widening is not a cosmetic over-statement: has_table_privilege
+    # casts to regclass, so naming a table that does not exist raises 42P01 and
+    # takes the whole statement with it. Measured against a real pre-079
+    # database, this mutant turns the privilege grid and the browser-key check
+    # red with `relation "public.benchmark_cohort_wallets" does not exist` —
+    # two decisive failures about a schema that is perfectly fine.
+    ('M183-execution-surface-always-expected', 'src/servingSchemaGate.ts',
+     '  return version >= EXECUTION_SURFACE_CAPABILITY',
+     '  return true',
+     ['src/servingSchemaGate.test.ts']),
+    # ...and the other direction: never widening leaves the three tables
+    # outside the projection, so the reach check reports them as relations this
+    # role should not touch on every post-079 database.
+    ('M184-execution-surface-never-expected', 'src/servingSchemaGate.ts',
+     '  return version >= EXECUTION_SURFACE_CAPABILITY',
+     '  return false',
+     ['src/servingSchemaGate.test.ts']),
 ]
 
 
