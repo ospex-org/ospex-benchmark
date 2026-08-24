@@ -425,9 +425,15 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
   //   perfectly publishable set of SCORES, and this gate serves that path too.
   //   `projectScoringRun` requires presence, because that is where the
   //   opportunity denominator is built and where a missing scorecard is a hole.
-  for (const [participantId, derived] of scoreableByParticipant) {
-    const declared = scorecards.get(participantId);
-    if (declared === undefined) continue;
+  // OVER THE SCORECARDS, not over the decisions. A scorecard for a participant
+  // with NO decisions is the whole point of the denominator — a dispatched arm
+  // that produced nothing — so it must reconcile to ZERO rather than being
+  // skipped for having nothing to compare against. Iterating the decisions
+  // instead left exactly that participant unchecked: a reviewer found a
+  // scorecard-only arm declaring primaryScoreable = 7 accepted, against a
+  // comment three lines up that said it had to reconcile to zero.
+  for (const [participantId, declared] of scorecards) {
+    const derived = scoreableByParticipant.get(participantId) ?? 0;
     if (declared !== derived) {
       return no(
         `${participantId}'s scorecard declares primaryScoreable = ${declared} but its ` +

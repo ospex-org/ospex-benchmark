@@ -1325,9 +1325,20 @@ MUTANTS = [
      ['src/scoredProjection.test.ts']),
     # ...and the scorecard's own count must answer to the records beside it,
     # or it is a number nothing corroborates.
+    # A scorecard for a dispatched-but-scoreless arm is the one with nothing in
+    # the file to compare against, so reconciling over the DECISIONS skips it.
+    # A reviewer found such a scorecard declaring primaryScoreable = 7 accepted.
+    ('M207-scoreless-arm-scorecard-unreconciled', 'src/scoredProjection.ts',
+     ('  for (const [participantId, declared] of scorecards) {\n'
+      '    const derived = scoreableByParticipant.get(participantId) ?? 0;',),
+     ('  for (const [participantId, derived] of scoreableByParticipant) {\n'
+      '    const declared = scorecards.get(participantId) ?? derived;',),
+     ['src/scoredProjection.test.ts']),
     ('M206-scorecard-count-unreconciled', 'src/scoredProjection.ts',
-     ('    if (declared === undefined) continue;\n    if (declared !== derived) {',),
-     ('    if (declared === undefined) continue;\n    if (false) {',),
+     ('    const derived = scoreableByParticipant.get(participantId) ?? 0;\n'
+      '    if (declared !== derived) {',),
+     ('    const derived = scoreableByParticipant.get(participantId) ?? 0;\n'
+      '    if (false) {',),
      ['src/scoredProjection.test.ts']),
 ]
 

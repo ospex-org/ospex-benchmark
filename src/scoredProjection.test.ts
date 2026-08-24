@@ -766,6 +766,27 @@ test("a scorecard's own scoreable count is reconciled against the records beside
   headerOf([meta({ participantScorecards: 1 }), scorecard({ primaryScoreable: 1 }), decision()]);
 });
 
+test('a scorecard for an arm that took NO picks must reconcile to zero', () => {
+  // The dispatched-but-scoreless arm is the whole point of the denominator, so
+  // it is the one scorecard with nothing in the file to compare against — and
+  // reconciling over the DECISIONS instead of over the scorecards skipped it
+  // entirely. A reviewer found one declaring primaryScoreable = 7 accepted,
+  // against a comment that said it had to reconcile to zero.
+  const failed = (primaryScoreable: number): JsonRecord =>
+    scorecard({ participantId: 'lab-failed', eligibleMarkets: 3, primaryScoreable });
+  assert.match(
+    reasonOf([meta({ participantScorecards: 2 }), scorecard(), failed(7), decision()]),
+    /lab-failed's scorecard declares primaryScoreable = 7 but its scored_decision records carry 0/,
+  );
+  // NEGATIVE CONTROL, and it is the case the denominator exists for: the same
+  // scoreless arm declaring zero is accepted AND its three opportunities stay
+  // in `eligible`. Without this the rule above could be satisfied by refusing
+  // every scoreless arm, which would reinstate the survivor bias.
+  const honest = gateOf([meta({ participantScorecards: 2 }), scorecard(), failed(0), decision()]);
+  assert.equal(honest.publishable, true, honest.publishable ? '' : honest.reason);
+  assert.equal(honest.publishable ? honest.eligibleMarkets : 0, 6);
+});
+
 test('a pick with no scorecard behind it refuses — a denominator missing an arm', () => {
   // The survivor-bias hole a reviewer found: the sum is over scorecards, so an
   // artifact that drops one silently drops that arm's opportunities. Here the
