@@ -65,6 +65,12 @@ const scoredRunMetaSchema = z
     // participantScorecards counts below, one level up from record counting.
     primaryScoreable: z.number().int().nonnegative(),
     scheduleChangedExcluded: z.number().int().nonnegative(),
+    // The roster the RUN carried, which is the only thing in this file that
+    // witnesses a dispatched arm independently of that arm's own scorecard.
+    // The scorer derives it from the run's arm responses and picks rather than
+    // from the aggregates the scorecards are built from, so the two disagree
+    // when the aggregation drops or mis-keys a participant.
+    participants: z.array(z.string().min(1)).nonempty(),
     ladder: z
       .object({
         version: z.string().min(1),
@@ -198,6 +204,12 @@ export interface ScoredArtifact {
   /** Which participants the file carries a scorecard for. The projector needs
    *  it to tell a complete denominator from one that is merely a sum. */
   readonly scorecardParticipants: readonly string[];
+  /** Which participants the RUN covered, as the meta declares. Derived by the
+   *  scorer from the run's arm responses and picks rather than from the
+   *  aggregates the scorecards come from, so it is the one thing in the file
+   *  that witnesses a scoreless arm independently of that arm's own
+   *  scorecard. */
+  readonly runParticipants: readonly string[];
 }
 
 export type ScoredGate =
@@ -452,6 +464,7 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
     publishable: true,
     eligibleMarkets,
     scorecardParticipants: [...scorecards.keys()],
+    runParticipants: meta.participants,
     header: {
       runId: meta.runId,
       cohortId: meta.cohortId,
@@ -652,6 +665,19 @@ export function projectScoringRun(
   // exists to prevent. Required here rather than in the gate: a scorecard-less
   // file is still a publishable set of SCORES, and the gate serves that path.
   for (const artifact of artifacts) {
+    // THE SAME SET, not the same COUNT — a count is exactly what a substitution
+    // preserves. Without this a scoreless arm's scorecard can be replaced by
+    // one carrying any fresh identity and its opportunities leave the
+    // denominator with every other check satisfied: measured, 6 became 4.
+    const declared = [...artifact.runParticipants].sort();
+    const carriedIds = [...artifact.scorecardParticipants].sort();
+    if (declared.length !== carriedIds.length ||
+        declared.some((id, index) => id !== carriedIds[index])) {
+      return no(
+        `run ${artifact.header.runId} covered [${declared.join(', ')}] but carries scorecards ` +
+          `for [${carriedIds.join(', ')}]`,
+      );
+    }
     const carried = new Set(artifact.scorecardParticipants);
     for (const decision of artifact.decisions) {
       if (carried.has(decision.participantId)) continue;

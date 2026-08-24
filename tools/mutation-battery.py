@@ -1325,6 +1325,16 @@ MUTANTS = [
      ['src/scoredProjection.test.ts']),
     # ...and the scorecard's own count must answer to the records beside it,
     # or it is a number nothing corroborates.
+    # A COUNT is exactly what a substitution preserves. Without set equality
+    # against the roster the run covered, a scoreless arm's scorecard can be
+    # replaced by one carrying an unused identity: no duplicate, the declared
+    # count intact, reconciles to zero, and its opportunities leave the
+    # denominator. Measured before the roster existed — eligible 6 became 4.
+    ('M208-scorecard-roster-unbound', 'src/scoredProjection.ts',
+     ('    if (declared.length !== carriedIds.length ||\n'
+      '        declared.some((id, index) => id !== carriedIds[index])) {',),
+     ('    if (false) {',),
+     ['src/scoredProjection.test.ts']),
     # A scorecard for a dispatched-but-scoreless arm is the one with nothing in
     # the file to compare against, so reconciling over the DECISIONS skips it.
     # A reviewer found such a scorecard declaring primaryScoreable = 7 accepted.

@@ -94,7 +94,7 @@ import type {
  * changes; the bump exists because the meta record's shape is part of the
  * artifact contract and readers key strictness off this identity.
  */
-export const SCORING_POLICY_VERSION = 'scoring-v0.6.1';
+export const SCORING_POLICY_VERSION = 'scoring-v0.6.2';
 
 /**
  * Schedule-change tolerance for the `yarn score` path, in milliseconds.
@@ -2980,6 +2980,24 @@ export function scoredRecords(
     // trailing truncation has to be detectable from the file alone — the same
     // count-vs-records cross-check the run artifact's canonical reader does.
     participantScorecards: stats.length,
+    // WHO the pass covered, by name rather than by count, derived from the RUN
+    // rather than from `stats`.
+    //
+    // A dispatched arm that took no picks leaves only its own scorecard in this
+    // file — no decisions, by definition, which is exactly why it belongs in
+    // the opportunity denominator. So the scorecards are otherwise the sole
+    // authority on their own membership: swapping one for another identity
+    // keeps every count intact and quietly removes that arm's opportunities
+    // from coverage. Measured on a fixture, 6 eligible markets became 4.
+    //
+    // Derived from `run.armResponses` and `run.picks` and NOT from `stats`,
+    // which is the whole point: `stats` is where the scorecards come from, so a
+    // roster taken from it would be the same witness written twice and would
+    // agree with a mis-keyed aggregation rather than catching it.
+    participants: [...new Set([
+      ...run.armResponses.map((response) => response.participantId),
+      ...run.picks.map((pick) => pick.participantId),
+    ])].sort(),
     // Stratum-aware, to agree with the per-participant aggregates: a
     // rescheduled pick is not a member of the primary estimate even though
     // its CLV is present on its own record.

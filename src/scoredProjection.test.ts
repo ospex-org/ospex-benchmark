@@ -43,6 +43,8 @@ function meta(over: Record<string, unknown> = {}): JsonRecord {
     // value. A test whose decisions differ states its own numbers.
     primaryScoreable: 1,
     scheduleChangedExcluded: 0,
+    // The roster the RUN covered, independent of the scorecards.
+    participants: ['lab-alpha'],
     metric: 'reference-closing CLV',
     ladder: { version: 'TOTALS_V1_PROVISIONAL', parameterVersion: 'retrosheet-2023-25-v1', k: 8.101 },
     ...over,
@@ -512,6 +514,7 @@ function artifactOf(records: JsonRecord[]): ScoredArtifact {
         decisions: gate.decisions,
         eligibleMarkets: gate.eligibleMarkets,
         scorecardParticipants: gate.scorecardParticipants,
+        runParticipants: gate.runParticipants,
       }
     : ({} as ScoredArtifact);
 }
@@ -785,6 +788,30 @@ test('a scorecard for an arm that took NO picks must reconcile to zero', () => {
   const honest = gateOf([meta({ participantScorecards: 2 }), scorecard(), failed(0), decision()]);
   assert.equal(honest.publishable, true, honest.publishable ? '' : honest.reason);
   assert.equal(honest.publishable ? honest.eligibleMarkets : 0, 6);
+});
+
+test('substituting a scoreless arm for a FRESH identity refuses — count is not identity', () => {
+  // The reviewer's boundary, and the reason a count check is not enough: a
+  // dispatched arm that took no picks leaves only its own scorecard behind, so
+  // swapping that scorecard for one carrying an unused id keeps the declared
+  // count intact, introduces no duplicate, and reconciles to zero — while its
+  // opportunities silently leave the denominator. Measured before the roster
+  // existed: eligible went from 6 to 4.
+  const failed = scorecard({ participantId: 'lab-failed', eligibleMarkets: 3, primaryScoreable: 0 });
+  const impostor = scorecard({ participantId: 'lab-impostor', eligibleMarkets: 1, primaryScoreable: 0 });
+  const head = { participantScorecards: 2, participants: ['lab-alpha', 'lab-failed'] };
+
+  // The HONEST artifact publishes, and keeps the scoreless arm's three
+  // opportunities — without this the rule could be satisfied by refusing every
+  // scoreless arm, which is the survivor bias it exists to prevent.
+  const honest = artifactOf([meta(head), scorecard(), failed, decision()]);
+  assert.equal(honest.eligibleMarkets, 6);
+  assert.equal(runOf([honest]).eligible, 6);
+
+  // The substitution is refused, and refused for ITS OWN reason: the roster the
+  // run covered and the scorecards carried name different sets.
+  const swapped = artifactOf([meta(head), scorecard(), impostor, decision()]);
+  assert.match(refusalOf([swapped]), /covered \[lab-alpha, lab-failed\] but carries scorecards for \[lab-alpha, lab-impostor\]/);
 });
 
 test('a pick with no scorecard behind it refuses — a denominator missing an arm', () => {

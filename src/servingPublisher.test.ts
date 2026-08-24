@@ -791,6 +791,7 @@ function scoredArtifactLines(
     participantScorecards: 1,
     primaryScoreable: 1,
     scheduleChangedExcluded: 0,
+    participants: ['lab-alpha'],
     ladder: { version: 'TOTALS_V1_PROVISIONAL', parameterVersion: 'retrosheet-2023-25-v1' },
     ...over.meta,
   };

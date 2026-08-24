@@ -607,6 +607,7 @@ function readScoredArtifact(scoredFile: string): ScoredRead {
       decisions: gate.decisions,
       eligibleMarkets: gate.eligibleMarkets,
       scorecardParticipants: gate.scorecardParticipants,
+      runParticipants: gate.runParticipants,
     },
     source: {
       // The basename, never the full path — same reasoning as the run path: an

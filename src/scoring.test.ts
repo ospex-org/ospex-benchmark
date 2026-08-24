@@ -1420,7 +1420,7 @@ test('scoredRecords carry provenance (reported model, response id, hashes) and t
 test('the scoring policy version is pinned to its literal value', () => {
   // A bump must be a conscious edit HERE too. 'scoring-v0.1.0' is reserved
   // for pre-stamp output by definition and must never be emitted.
-  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.6.1');
+  assert.equal(SCORING_POLICY_VERSION, 'scoring-v0.6.2');
 });
 
 test('every scored record type is stamped with the scoring policy version', () => {
