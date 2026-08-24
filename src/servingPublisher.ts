@@ -5,8 +5,10 @@ import { describeError } from './config.js';
 import {
   parseScoredArtifact,
   projectScoredRun,
+  projectScoringRun,
   publishableScoredRun,
 } from './scoredProjection.js';
+import type { RankingDecision, ScoredArtifact } from './scoredProjection.js';
 import {
   parseRunArtifact,
   projectRun,
@@ -544,46 +546,241 @@ export async function publishScoredArtifact(
   scoredFile: string,
   log: PublishLog,
 ): Promise<PublishSummary> {
-  const refuse = (reason: string): PublishSummary => {
-    log.line(`serving projection: skipped this scored artifact (${reason})`);
+  const read = readScoredArtifact(scoredFile);
+  if (!read.ok) {
+    log.line(`serving projection: skipped this scored artifact (${read.reason})`);
     return {
       published: 0,
       duplicate: 0,
       rejected: {},
-      skipped: [reason],
+      skipped: [read.reason],
       disabled: false,
-      gateRefusal: reason,
+      gateRefusal: read.reason,
     };
-  };
+  }
 
+  const summary = await publishScores(
+    port,
+    projectScoredRun(read.artifact.header, read.artifact.decisions, read.source),
+    log,
+  );
+  log.line(describeSummary(summary));
+  for (const reason of summary.skipped) log.line(`  not published — ${reason}`);
+  return summary;
+}
+
+/**
+ * Read one scored artifact off disk and put it through the gate.
+ *
+ * The ONE place that happens. The per-pick path and the cohort-scalar path both
+ * come through here, so they cannot disagree about what a file says, about
+ * which files are publishable at all, or about the provenance a row cites —
+ * three chances for a divergence that would only ever show up as two published
+ * rows contradicting each other.
+ */
+type ScoredRead =
+  | { readonly ok: true; readonly artifact: ScoredArtifact; readonly source: SourceRef }
+  | { readonly ok: false; readonly reason: string };
+
+function readScoredArtifact(scoredFile: string): ScoredRead {
   let text: string;
   try {
     text = readFileSync(scoredFile, 'utf8');
   } catch (error) {
-    return refuse(`the artifact could not be read (${describeError(error)})`);
+    return { ok: false, reason: `the artifact could not be read (${describeError(error)})` };
   }
 
   let records: ReturnType<typeof parseScoredArtifact>;
   try {
     records = parseScoredArtifact(text);
   } catch (error) {
-    return refuse(describeError(error));
+    return { ok: false, reason: describeError(error) };
   }
 
   const gate = publishableScoredRun(records);
-  if (!gate.publishable) return refuse(gate.reason);
+  if (!gate.publishable) return { ok: false, reason: gate.reason };
 
-  const source: SourceRef = {
-    // The basename, never the full path — same reasoning as the run path: an
-    // absolute path here is an operator's home directory destined for a public
-    // page, and redaction knows nothing about usernames.
-    sourcePath: basename(scoredFile),
-    sourceSha256: sha256Hex(text),
+  return {
+    ok: true,
+    artifact: {
+      header: gate.header,
+      decisions: gate.decisions,
+      eligibleMarkets: gate.eligibleMarkets,
+      scorecardParticipants: gate.scorecardParticipants,
+      runParticipants: gate.runParticipants,
+    },
+    source: {
+      // The basename, never the full path — same reasoning as the run path: an
+      // absolute path here is an operator's home directory destined for a public
+      // page, and redaction knows nothing about usernames.
+      sourcePath: basename(scoredFile),
+      sourceSha256: sha256Hex(text),
+    },
   };
+}
 
-  const summary = await publishScores(port, projectScoredRun(gate.header, gate.decisions, source), log);
+/**
+ * What a cohort row cites, given the SET of files it was computed from.
+ *
+ * `source_sha256` on every other row means "the sha256 of the file this row
+ * came from", and a reader checks it by hashing that file. A cohort row has N
+ * files, so it cites the same thing one level up: the digest of a
+ * `sha256sum`-format manifest of them. A reader holding the N artifacts
+ * reproduces it exactly with
+ *
+ *     sha256sum *-scored.ndjson | sort | sha256sum
+ *
+ * Sorted, so the shell's glob order cannot change the digest; and `source_path`
+ * names the files, so a reader knows WHICH N to hash rather than having to
+ * guess the set — which is the whole difficulty with a row summarising many.
+ */
+function manifestSource(reads: readonly { readonly source: SourceRef }[]): SourceRef {
+  const names = reads.map((read) => read.source.sourcePath ?? '(unnamed)');
+  const lines = reads
+    .map((read) => `${read.source.sourceSha256 ?? ''}  ${read.source.sourcePath ?? '(unnamed)'}`)
+    .sort();
+  return {
+    sourcePath: [...names].sort().join(' '),
+    sourceSha256: sha256Hex(`${lines.join('\n')}\n`),
+  };
+}
+
+/**
+ * Publish the cohort-scalar coverage-and-brake row for the artifacts supplied.
+ *
+ * ── WHY THIS IS ITS OWN PASS, AND WHY IT IS OPT-IN ───────────────────────────
+ * `benchmark_scoring_runs` is keyed `(cohort_id, scoring_policy_version)`, and
+ * a watch cohort is a DATE with one scored artifact per fired game — so the row
+ * cannot be a by-product of publishing one artifact. A per-artifact producer
+ * would write whichever game finished first as the whole day's coverage, and
+ * (now that the write drift-compares) report every later game as a
+ * contradiction. Measured grain: `fireEligibleGame` mints
+ * `runId = watch-v0-<date>-<hex>` inside `cohortId = watch-v0-<date>`.
+ *
+ * Nothing here can know whether the supplied set is the WHOLE cohort. That is
+ * the operator's statement, which is why publishing this row is a deliberate
+ * flag rather than a default — and it is also the row that carries
+ * `ranking_allowed`, i.e. the publication brake, which is an operator decision
+ * by construction.
+ *
+ * ⚠ A file that does not pass the scored gate stops the WHOLE publication, and
+ *   an earlier build got this wrong in a way worth recording: it excluded the
+ *   bad artifact and published a row from the survivors, on the reasoning that
+ *   a later, larger set would be refused as a contradiction. Backwards. The row
+ *   is insert-once, so the partial row is the one that lands and the correct
+ *   set is the one refused afterwards; a non-zero exit does not undo a durable
+ *   row. Measured before the fix — one valid artifact beside one refused
+ *   artifact published `eligible=3 scored=1 rankingAllowed=true`.
+ */
+export async function publishScoringRuns(
+  port: BenchmarkServingPort,
+  files: readonly string[],
+  ranking: RankingDecision,
+  log: PublishLog,
+  timing: PublishTiming = {},
+): Promise<PublishSummary> {
+  const nowMs = timing.nowMs ?? publicationNowMs;
+  const deadlineMs = timing.deadlineMs ?? PUBLICATION_DEADLINE_MS;
+  const perWriteTimeoutMs = timing.perWriteTimeoutMs ?? PER_WRITE_TIMEOUT_MS;
+  const tally = new Tally();
+  const budget = new Budget(nowMs, nowMs() + deadlineMs, perWriteTimeoutMs);
+
+  // ── ALL OR NOTHING, AND THE FIRST WRITE IS THE ONE THAT COUNTS ────────────
+  // An earlier build excluded an unpublishable artifact and published a row
+  // from the survivors, on the reasoning that a later, larger set would report
+  // a contradiction. That reasoning is backwards, and a reviewer reproduced it:
+  // the row is INSERT-ONCE, so the partial row is the one that lands and the
+  // one a read path serves, and the drift check then refuses the CORRECT set.
+  // Measured on this branch — one valid artifact beside one refused artifact,
+  // with the brake explicitly open, published `eligible=3 scored=1
+  // rankingAllowed=true`. So: if any named artifact is not publishable, no
+  // cohort row is written at all.
+  const snapshots: ScoredSnapshot[] = [];
+  const unreadable: string[] = [];
+  for (const file of files) {
+    const read = readScoredArtifact(file);
+    if (!read.ok) {
+      unreadable.push(`${basename(file)} (${read.reason})`);
+      continue;
+    }
+    snapshots.push({ file, artifact: read.artifact, source: read.source });
+  }
+  if (unreadable.length > 0) {
+    for (const reason of unreadable) {
+      tally.skipped.push(`no scoring run: ${reason} is not publishable`);
+      log.error(`serving projection: no scoring run — ${reason} is not publishable`);
+    }
+    return tally.summary();
+  }
+
+  return publishCohortRows(port, snapshots, ranking, log, tally, budget, deadlineMs);
+}
+
+/** One gate-accepted artifact and where it came from, carried between the two
+ *  phases of a publication so both describe the SAME bytes. */
+export interface ScoredSnapshot {
+  readonly file: string;
+  readonly artifact: ScoredArtifact;
+  readonly source: SourceRef;
+}
+
+async function publishCohortRows(
+  port: BenchmarkServingPort,
+  snapshots: readonly ScoredSnapshot[],
+  ranking: RankingDecision,
+  log: PublishLog,
+  tally: Tally,
+  budget: Budget,
+  deadlineMs: number,
+): Promise<PublishSummary> {
+  const byCohort = new Map<string, ScoredSnapshot[]>();
+  for (const snapshot of snapshots) {
+    const cohortId = snapshot.artifact.header.cohortId;
+    byCohort.set(cohortId, [...(byCohort.get(cohortId) ?? []), snapshot]);
+  }
+
+  // Sorted, so a run over several dates reports them in a stable order and two
+  // invocations over the same glob print the same thing.
+  for (const cohortId of [...byCohort.keys()].sort()) {
+    const group = byCohort.get(cohortId)!;
+    const projection = projectScoringRun(
+      group.map((entry) => entry.artifact),
+      ranking,
+      manifestSource(group),
+    );
+    if (!projection.publishable) {
+      tally.skipped.push(`${cohortId}: ${projection.reason}`);
+      log.error(`serving projection: no scoring run for ${cohortId} — ${projection.reason}`);
+      continue;
+    }
+    const run = projection.run;
+    // Printed BEFORE the write, and in full: the operator is the only thing
+    // that can tell whether this is the whole cohort, and these numbers plus
+    // the artifact count are what they check it against.
+    log.line(
+      `serving projection: scoring run ${cohortId} / ${run.scoringPolicyVersion} over ` +
+        `${group.length} artifact(s) — ${run.eligible} eligible, ${run.scored} scored, ` +
+        `${run.refused} refused, ${run.scheduleHeldOut} held out; ranking ` +
+        `${run.rankingAllowed ? 'ALLOWED' : 'WITHHELD'} (${run.rankingReason})`,
+    );
+    if (budget.spent()) continue;
+    tally.record(
+      await settle(() => port.publishScoringRun(run), budget.slice()),
+      `scoring run ${cohortId} / ${run.scoringPolicyVersion}`,
+      log,
+    );
+  }
+
+  if (budget.abandoned > 0) {
+    const reason =
+      `${budget.abandoned} scoring-run write(s) abandoned — the projection did not finish ` +
+      `within ${deadlineMs}ms. Re-run this command to complete it.`;
+    tally.skipped.push(reason);
+    log.error(`serving projection: ${reason}`);
+  }
+
+  const summary = tally.summary();
   log.line(describeSummary(summary));
-  for (const reason of summary.skipped) log.line(`  not published — ${reason}`);
   return summary;
 }
 
@@ -641,4 +838,95 @@ export function describeSummary(summary: PublishSummary): string {
   if (rejected !== '') parts.push(`REFUSED: ${rejected}`);
   if (summary.skipped.length > 0) parts.push(`${summary.skipped.length} not sent`);
   return `serving projection: ${parts.join(', ')}`;
+}
+
+/**
+ * The two phases of `yarn project:scores`, sharing ONE parse of each artifact.
+ *
+ * The per-file score publication and the cohort-scalar coverage row are
+ * separate writes at different grains, and before this they each read the file
+ * from disk. Two reads are two answers: a re-score landing between them would
+ * put the scores and the coverage row on different bytes, each citing its own
+ * `source_sha256`, with nothing refusing either. Reading once removes the
+ * window rather than detecting it afterwards.
+ *
+ * The session is also what enforces the ordering rule the CLI states: the
+ * cohort row is written only after every artifact has published in full, and
+ * `publishCohorts` refuses outright if it is handed a file the first phase
+ * never accepted.
+ */
+export interface ScoredPublication {
+  /** Phase one, once per file: parse, gate, publish that artifact's scores. */
+  publishFile(port: BenchmarkServingPort, file: string, log: PublishLog): Promise<PublishSummary>;
+  /** Phase two, once: the cohort-scalar row, from the SAME parses. Returns the
+   *  same failure count `unpublishedCount` does. */
+  publishCohorts(
+    port: BenchmarkServingPort,
+    files: readonly string[],
+    log: PublishLog,
+  ): Promise<number>;
+}
+
+export function scoredPublication(
+  ranking: RankingDecision,
+  timing: PublishTiming = {},
+): ScoredPublication {
+  const accepted = new Map<string, ScoredSnapshot>();
+
+  return {
+    async publishFile(port, file, log) {
+      const read = readScoredArtifact(file);
+      if (!read.ok) {
+        log.line(`serving projection: skipped this scored artifact (${read.reason})`);
+        return {
+          published: 0,
+          duplicate: 0,
+          rejected: {},
+          skipped: [read.reason],
+          disabled: false,
+          gateRefusal: read.reason,
+        };
+      }
+      accepted.set(file, { file, artifact: read.artifact, source: read.source });
+      const summary = await publishScores(
+        port,
+        projectScoredRun(read.artifact.header, read.artifact.decisions, read.source),
+        log,
+      );
+      log.line(describeSummary(summary));
+      for (const reason of summary.skipped) log.line(`  not published — ${reason}`);
+      return summary;
+    },
+
+    async publishCohorts(port, files, log) {
+      // Every named file must have come through phase one. The CLI already
+      // guarantees it by only calling this when nothing failed; this is the
+      // half that does not depend on the caller getting that right.
+      const snapshots: ScoredSnapshot[] = [];
+      for (const file of files) {
+        const snapshot = accepted.get(file);
+        if (snapshot === undefined) {
+          log.error(
+            `serving projection: no scoring run — ${basename(file)} was never accepted by the ` +
+              'scored gate in this pass',
+          );
+          return 1;
+        }
+        snapshots.push(snapshot);
+      }
+      const nowMs = timing.nowMs ?? publicationNowMs;
+      const deadlineMs = timing.deadlineMs ?? PUBLICATION_DEADLINE_MS;
+      const perWriteTimeoutMs = timing.perWriteTimeoutMs ?? PER_WRITE_TIMEOUT_MS;
+      const summary = await publishCohortRows(
+        port,
+        snapshots,
+        ranking,
+        log,
+        new Tally(),
+        new Budget(nowMs, nowMs() + deadlineMs, perWriteTimeoutMs),
+        deadlineMs,
+      );
+      return unpublishedCount(summary, 'the cohort scoring run', log);
+    },
+  };
 }

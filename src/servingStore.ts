@@ -1655,7 +1655,20 @@ select (select min(f) from drift)          as contradiction,
 /**
  * Cohort-level coverage and the publication brake. It has no parent to find, so
  * `parent_found` is a literal 1 â€” the outcome mapping is shared with the others
- * and would otherwise read this as `parent_missing`.
+ * and would otherwise read this as `parent_missing`. That literal stays correct
+ * beside the drift CTE below, because `drift_rows` is read FIRST and a drift row
+ * suppresses the write through its own `not exists` guard rather than through
+ * `parent_found`.
+ *
+ * WHAT IS COMPARED, AND WHAT IS NOT. Inside: the eight facts the row asserts
+ * about the cohort's scoring pass. Outside: the key itself, plus `scored_at`,
+ * `source_path`, `source_sha256` and `benchmark_commit` â€” for the same reason
+ * SCORE_SQL gives above, one step stronger. A scored artifact is DERIVED, so
+ * re-running `yarn score` over the same run files regenerates it with a fresh
+ * timestamp, in a fresh file, possibly from a newer build. All four move on a
+ * legitimate recovery republish while the facts do not, and comparing them
+ * would turn the one republish path a fail-soft publisher cannot afford to
+ * close into a permanent contradiction.
  */
 const SCORING_RUN_SQL = `
 with input as (
@@ -1664,6 +1677,40 @@ with input as (
     refused integer, schedule_held_out integer, refusal_reasons jsonb,
     ranking_allowed boolean, ranking_reason text, cost_per_pick_comparable boolean,
     benchmark_commit text, scored_at timestamptz, source_path text, source_sha256 text)
+), drift as (
+  -- The same DURABLE-FACT DRIFT rule as every other statement here, and this
+  -- row needs it most: it is the PUBLICATION BRAKE, insert-once, with no
+  -- UPDATE grant behind it. Measured on PostgreSQL 17.10 before this CTE
+  -- existed: a republish flipping ranking_allowed from false to true reported
+  -- "duplicate", i.e. success, and the stored row still said false. The lever
+  -- the operator was pulling did nothing and said so in no way.
+  --
+  -- It is also what makes an INCOMPLETE aggregation loud. The row is
+  -- cohort-scalar while a scored artifact is per run file, so its counts are
+  -- summed over a SET of artifacts the operator supplies; publishing over
+  -- fourteen of a cohort's fifteen and then over all fifteen is a real
+  -- mistake, and without this it reports success twice.
+  select coalesce(t.f, 'drift.unlabelled') as f
+    from public.benchmark_scoring_runs r, input,
+         lateral unnest(
+           array['scoringRun.eligible','scoringRun.scored','scoringRun.refused',
+                 'scoringRun.scheduleHeldOut','scoringRun.refusalReasons',
+                 'scoringRun.rankingAllowed','scoringRun.rankingReason',
+                 'scoringRun.costPerPickComparable'],
+           -- jsonb "is distinct from" compares by value, so a histogram whose
+           -- keys were serialised in another order is NOT a disagreement.
+           array[r.eligible                 is distinct from input.eligible,
+                 r.scored                   is distinct from input.scored,
+                 r.refused                  is distinct from input.refused,
+                 r.schedule_held_out        is distinct from input.schedule_held_out,
+                 r.refusal_reasons          is distinct from input.refusal_reasons,
+                 r.ranking_allowed          is distinct from input.ranking_allowed,
+                 r.ranking_reason           is distinct from input.ranking_reason,
+                 r.cost_per_pick_comparable is distinct from input.cost_per_pick_comparable]
+         ) as t(f, differs)
+   where r.cohort_id = input.cohort_id
+     and r.scoring_policy_version = input.scoring_policy_version
+     and coalesce(t.differs, true)
 ), ins as (
   insert into public.benchmark_scoring_runs
     (cohort_id, scoring_policy_version, eligible, scored, refused, schedule_held_out,
@@ -1673,14 +1720,15 @@ with input as (
          refusal_reasons, ranking_allowed, ranking_reason, cost_per_pick_comparable,
          benchmark_commit, scored_at, source_path, source_sha256
     from input
+   where not exists (select 1 from drift)
   on conflict (cohort_id, scoring_policy_version) do nothing
   returning 1
 )
-select null::text                       as contradiction,
-       0                                as drift_rows,
-       null::text                       as ineligible_reason,
-       1                                as parent_found,
-       (select count(*) from ins)::int  as inserted`;
+select (select min(f) from drift)          as contradiction,
+       (select count(*) from drift)::int   as drift_rows,
+       null::text                          as ineligible_reason,
+       1                                   as parent_found,
+       (select count(*) from ins)::int     as inserted`;
 
 /**
  * Every relation the projection is made of, in dependency order.
@@ -1897,7 +1945,21 @@ export class SqlBenchmarkServingPort implements BenchmarkServingPort {
   }
 
   publishScoringRun(run: ScoringRun): Promise<PublishOutcome> {
-    return this.publish(SCORING_RUN_SQL, () => scoringRunPayload(run));
+    // Serialized for exactly the reason a score is: the statement now
+    // drift-compares the stored row, and inside a lone statement that read uses
+    // a snapshot taken before the statement began, so a concurrent writer's
+    // different row is invisible and absorbed as `duplicate`. A drift check
+    // without the lock is the shape that measured 58 of 100 races writing
+    // anyway (see LOCK_SQL) — adding one without the other would look like a
+    // guarantee and not be one.
+    //
+    // The payload carries no `participant_id`, so `lockKeys` supplies the empty
+    // participant key and the cohort key does the ordering. That is a SUPERSET
+    // lock — every scoring-run publish, of every cohort, contends on the one
+    // empty participant key — which costs a queue of at most one write per
+    // publication and preserves the participant-then-cohort acquisition order
+    // every other writer uses, so no cycle can form.
+    return this.publish(SCORING_RUN_SQL, () => scoringRunPayload(run), true);
   }
 
   /**

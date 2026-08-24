@@ -8,8 +8,12 @@ import { describeErrorWithStack } from './config.js';
 import { loadDotEnv } from './env.js';
 import { printError, printLine } from './console.js';
 import { PROJECT_EXIT, runProjectionCli } from './projectRunMain.js';
-import { publishScoredArtifact } from './servingPublisher.js';
+import { RANKING_WITHHELD } from './scoredProjection.js';
+import type { RankingDecision } from './scoredProjection.js';
+import { publishScoredArtifact, scoredPublication } from './servingPublisher.js';
 import type { ProjectMainDeps } from './projectRunMain.js';
+import type { PublishLog } from './servingPublisher.js';
+import type { BenchmarkServingPort } from './servingStore.js';
 
 /**
  * Publish a scored artifact that is already on disk.
@@ -30,7 +34,7 @@ import type { ProjectMainDeps } from './projectRunMain.js';
  * <run file>` first.
  */
 
-const USAGE = `usage: yarn project:scores <run-scored.ndjson> [more-scored.ndjson ...]
+const USAGE = `usage: yarn project:scores [--scoring-run] <run-scored.ndjson> [more ...]
 
 Publish written scored artifacts (the output of \`yarn score\`) onto the
 benchmark serving projection as benchmark_scores rows.
@@ -44,6 +48,28 @@ current scorer to regenerate them.
 A score lands against the decision row \`yarn project\` published for the same
 run; publish the run artifact first or every row reports parent_missing.
 
+  --scoring-run
+      Additionally publish the cohort's benchmark_scoring_runs row: its
+      coverage counts and its ranking brake, one row per cohort found among
+      the files given. OPT-IN, because that row is keyed by COHORT while a
+      scored artifact is per run file — a watch cohort is a date with one
+      artifact per fired game — so only the caller knows whether the files
+      it named are the whole cohort. Pass every one of that cohort's scored
+      artifacts. The row is insert-once, so it is all-or-nothing: nothing is
+      written unless every named artifact passes the gate and every one of
+      them publishes its scores in full. The counts are printed before the
+      write so they can be checked.
+
+  --ranking-allowed
+      Publish that row with ranking_allowed = true. The default is FALSE —
+      the gate stays closed until the operator opens it deliberately — and
+      the value cannot be changed afterwards by republishing, because the row
+      has no UPDATE grant behind it.
+
+  --ranking-reason=<text>
+      The reason stored beside it. Defaults to the withheld wording. Spelled
+      with an equals sign because a bare value would be read as another file.
+
 Exit codes:
   0  every row in every file is published or already present
   1  publication was attempted and something did not land
@@ -52,6 +78,28 @@ Exit codes:
   4  configured, but the publisher was refused (bad connection settings, or a
      schema that cannot yet record the score label)
   5  the command itself failed`;
+
+/**
+ * The ranking brake an invocation carries, read off the command line.
+ *
+ * Exported for its own test: `ranking_allowed` is the field a public read path
+ * uses to decide whether a leaderboard may be ordered at all, the row it lands
+ * on is insert-once, and the default has to be the closed one whatever the
+ * argument parsing does.
+ */
+export function rankingDecisionFrom(argv: readonly string[]): RankingDecision {
+  const supplied = argv.find((argument) => argument.startsWith('--ranking-reason='));
+  const reason =
+    supplied === undefined ? RANKING_WITHHELD.reason : supplied.slice('--ranking-reason='.length);
+  return {
+    allowed: argv.includes('--ranking-allowed'),
+    // An empty --ranking-reason= would land as '' in a NOT NULL column that
+    // exists to explain the brake. Falls back rather than refusing: the value
+    // that matters is `allowed`, and losing the whole publication over a typo
+    // in prose would be the tail wagging the dog.
+    reason: reason === '' ? RANKING_WITHHELD.reason : reason,
+  };
+}
 
 export async function runProjectScoresMain(deps: ProjectMainDeps): Promise<number> {
   return runProjectionCli(deps, { usage: USAGE, missingNoun: 'scored artifact' });
@@ -71,8 +119,13 @@ function isMainModule(): boolean {
 
 if (isMainModule()) {
   loadDotEnv();
+  // ONE reading of the arguments, shared by the deps and by the flags below.
+  // Two `process.argv` reads would differ by the interpreter and script paths,
+  // which is a way for a flag to be seen in one place and not the other.
+  const argv = process.argv.slice(2);
+  const session = scoredPublication(rankingDecisionFrom(argv));
   runProjectScoresMain({
-    argv: process.argv.slice(2),
+    argv,
     exists: existsSync,
     // The scores statement names the label column, which only capability 3
     // schemas hold. Asking for it here turns "every write refuses with a
@@ -82,7 +135,20 @@ if (isMainModule()) {
         onError: printError,
         requiredCapability: SCORES_SERVING_CAPABILITY,
       }),
-    publish: publishScoredArtifact,
+    // Only when asked. Absent, this command behaves exactly as it did: the
+    // cohort row is a wider-grained, operator-decided write and it does not
+    // ride along with publishing one artifact's scores.
+    //
+    // When it IS asked for, both phases run off ONE session so they share a
+    // single parse of each artifact — the per-file scores and the cohort row
+    // then describe the same bytes by construction rather than by two reads
+    // agreeing. Spread rather than `: undefined`, because
+    // `exactOptionalPropertyTypes` distinguishes an absent optional property
+    // from one explicitly set to undefined, and the run path's contract is
+    // that the key is ABSENT.
+    ...(argv.includes('--scoring-run')
+      ? { publish: session.publishFile, finish: session.publishCohorts }
+      : { publish: publishScoredArtifact }),
     log: { line: printLine, error: printError },
   })
     .then((code) => {

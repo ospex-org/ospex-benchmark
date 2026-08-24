@@ -662,16 +662,30 @@ function searchEvidenceStatus(searchAudit: JsonRecord | null, envelopeReplayable
  */
 function rosterFacts(): RosterFacts {
   return {
-    // No wallet exists to bind: this repo holds no key material and a CLV
+    // ── NULL BY CONTRACT, AND IT STAYS NULL ─────────────────────────────────
+    // No wallet exists to bind HERE: this repo holds no key material and a CLV
     // forecast is never filled, so there is no position to join to. A
     // placeholder would be worse than absent — one shared address across
     // participants trips the roster's own uniqueness index and takes the whole
     // statement, attempt and run row included, down with it.
     //
+    // Nothing backfills it later, either, and that is a design decision rather
+    // than a gap. The model↔wallet binding lives on its OWN table —
+    // `benchmark_cohort_wallets (cohort_id, participant_id, wallet_address)`,
+    // added by ospex-indexer migration 079 — written per cohort-day by the
+    // operator-side publisher that actually places the fills. A read path
+    // joins it on (cohort_id, participant_id); it does not read this column.
+    //
+    // The binding was deliberately NOT made a writable column here. This row is
+    // insert-once and the writer holds SELECT + INSERT and no mutating verb, so
+    // an UPDATE would have to be granted back to make a backfill possible — and
+    // a rewritable binding is a public attribution of an on-chain fill that
+    // could be moved between models after the fact. A separate insert-once
+    // table buys the same join without that.
+    //
     // ⚠ FIRST WRITE WINS, per (cohort, participant). Supplying an address later
     //   in the same cohort is reported as a contradiction and drops the child
-    //   row. Bind it on a cohort's first write or not at all; cohorts roll
-    //   daily, so the cost of the null is one slate.
+    //   row — which is what makes the null durable rather than merely current.
     walletAddress: null,
   };
 }
@@ -783,9 +797,26 @@ function projectModelDecision(
     // The artifact's own v1/v2 discriminator, so replaying an older body stamps
     // what that body was rather than what the validator accepts today.
     responseSchemaVersion: axes === null ? 1 : 2,
+    // ── NULL BY CONTRACT, AND BOTH STAY NULL ────────────────────────────────
     // Not in the artifact, so a republish could not reproduce it — and a
     // contest id is not a durable join key anyway: the counter restarted at R5
     // and will restart again. The spine is (network, gameId).
+    //
+    // Nor are they backfilled after the fact. The execution ids live on
+    // `benchmark_execution_fills` (ospex-indexer migration 079), which carries
+    // `contest_id` and `speculation_id` alongside the tx hash under the sealed
+    // decision's own identity — so a read path gets them from
+    // `benchmark_decisions LEFT JOIN benchmark_execution_fills` and nothing is
+    // lost by their absence here.
+    //
+    // A backfill was specified and then withdrawn, for two independent reasons
+    // and either would be enough. (1) The publisher connects as a role holding
+    // SELECT + INSERT and no mutating verb — taking the mutating verbs away IS
+    // the immutability story since migrations 073/074 — so an UPDATE grant
+    // would have to be handed back, column-scoped or not, to make a sealed row
+    // rewritable. (2) The runner drift-compares these two fields on replay, so
+    // a later non-null would be reported as a contradiction against the row it
+    // was meant to complete.
     contestId: null,
     // A line-open concept. This path opens no speculation, and a value here
     // would assert a market placement that never happened.
@@ -908,6 +939,10 @@ function projectBaselineDecision(
       bundleSha256: str(record, 'requestSha256'),
       // A control validated no response.
       responseSchemaVersion: null,
+      // Null by contract and durably so, for the same reasons set out at the
+      // model seal above — the execution ids live on `benchmark_execution_fills`
+      // and nothing backfills them here. Stated by reference rather than
+      // restated, so the two sites cannot drift apart.
       contestId: null,
       speculationId: null,
       source,

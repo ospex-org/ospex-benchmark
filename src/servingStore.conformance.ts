@@ -60,14 +60,24 @@ import {
 import type { ParticipantConfiguration } from './participantConfiguration.js';
 import type {
   ArmAttempt, AttemptFacts, DecisionScore, DecisionSeal, ParticipantFacts, PublishOutcome, RunFacts,
+  ScoringRun,
 } from './servingStore.js';
 import { sha256Hex } from './canonical.js';
 import { loadLadderParams } from './ladder.js';
 import { writeNdjson } from './records.js';
 import { forecastDigest } from './schema.js';
-import { aggregateByParticipant, parseRunRecords, scoredRecords, scoreRun } from './scoring.js';
+import {
+  aggregateByParticipant,
+  heldOutOfPrimary,
+  parseRunRecords,
+  primaryScoreableCount,
+  SCORING_POLICY_VERSION,
+  scoredRecords,
+  scoreRun,
+} from './scoring.js';
 import { PROJECTION_PARTICIPANTS } from './servingIdentity.js';
-import { publishScoredArtifact } from './servingPublisher.js';
+import { publishScoredArtifact, publishScoringRuns } from './servingPublisher.js';
+import { RANKING_WITHHELD } from './scoredProjection.js';
 import { firedRun } from './servingTestRun.js';
 import { makeOverScaleAccepted, makeOverScalePushAccepted } from './testFactories.js';
 import type { ClosingLineRow, ForecastOutput } from './types.js';
@@ -997,6 +1007,127 @@ async function main(): Promise<void> {
     }
   });
 
+  await check('EVERY scoring-run column lands where its INSERT list says it does', async () => {
+    // The record -> INSERT hop is POSITIONAL and no string test can see two
+    // same-typed entries swapped: a consistently-swapped write and a
+    // consistently-swapped drift comparison agree with each other. This is the
+    // only table in the projection that had no column-by-column round-trip, so
+    // swapping scored/refused, or ranking_allowed/cost_per_pick_comparable, or
+    // benchmark_commit/source_path, left the whole suite green.
+    //
+    // Every column therefore carries a value unique to it, the whole row is
+    // read back, and the entire map is compared at once — one assertion per
+    // table rather than one per column, which is what kills the class.
+    const cohortId = cohortName('runcolumns');
+    expect(await port.publishScoringRun({
+      cohortId,
+      scoringPolicyVersion: 'policy-version-column',
+      eligible: 41,
+      scored: 23,
+      refused: 11,
+      scheduleHeldOut: 7,
+      refusalReasons: { close_missing: 5, close_stale: 6 },
+      // The two booleans differ, so transposing them is visible. A row where
+      // both were false would be identical under the swap.
+      rankingAllowed: false,
+      rankingReason: 'ranking-reason-column',
+      costPerPickComparable: true,
+      benchmarkCommit: 'benchmark-commit-column',
+      scoredAt: '2026-08-11T07:08:09.000Z',
+      source: { sourcePath: 'source-path-column', sourceSha256: sha256Hex('source-sha-column') },
+    }), 'published', 'the column-identifying row');
+
+    const rows = await query(
+      `select scoring_policy_version, eligible, scored, refused, schedule_held_out,
+              refusal_reasons, ranking_allowed, ranking_reason, cost_per_pick_comparable,
+              benchmark_commit, source_path, source_sha256,
+              to_char(scored_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS') as scored_at
+         from public.benchmark_scoring_runs where cohort_id = $1`,
+      [cohortId]);
+    assert.equal(rows.length, 1);
+    assert.deepEqual(rows[0], {
+      scoring_policy_version: 'policy-version-column',
+      eligible: 41,
+      scored: 23,
+      refused: 11,
+      schedule_held_out: 7,
+      refusal_reasons: { close_missing: 5, close_stale: 6 },
+      ranking_allowed: false,
+      ranking_reason: 'ranking-reason-column',
+      cost_per_pick_comparable: true,
+      benchmark_commit: 'benchmark-commit-column',
+      source_path: 'source-path-column',
+      source_sha256: sha256Hex('source-sha-column'),
+      scored_at: '2026-08-11T07:08:09',
+    });
+  });
+
+  await check('EVERY drift-compared scoring-run fact reddens on its own, named exactly', async () => {
+    // The same per-arm drive the score statement gets. The unit tier proves
+    // each drift NAME sits beside the comparison of its own column; this proves
+    // every ARM against real PostgreSQL, and that the excluded four really are
+    // excluded — a republish differing only in pass provenance must still be a
+    // benign `duplicate`, or the recovery path closes.
+    const cohortId = cohortName('runarms');
+    const base = {
+      cohortId, eligible: 41, scored: 23, refused: 11, scheduleHeldOut: 7,
+      refusalReasons: { close_missing: 5, close_stale: 6 }, rankingAllowed: false,
+      rankingReason: 'pending', costPerPickComparable: true, benchmarkCommit: 'abc',
+      scoredAt: '2026-08-10T04:00:00.000Z',
+      source: { sourcePath: 'a-scored.ndjson', sourceSha256: sha256Hex('a') },
+    };
+    const arms: Array<[string, Partial<ScoringRun>, string]> = [
+      ['eligible', { eligible: 42 }, 'scoringRun.eligible'],
+      ['scored', { scored: 24 }, 'scoringRun.scored'],
+      ['refused', { refused: 12 }, 'scoringRun.refused'],
+      ['scheduleHeldOut', { scheduleHeldOut: 8 }, 'scoringRun.scheduleHeldOut'],
+      ['refusalReasons', { refusalReasons: { close_missing: 5, close_stale: 7 } },
+        'scoringRun.refusalReasons'],
+      // THE ONE THAT MATTERS MOST: the publication brake. Before the drift CTE
+      // existed this reported `duplicate` and left the stored row saying false.
+      ['rankingAllowed', { rankingAllowed: true }, 'scoringRun.rankingAllowed'],
+      ['rankingReason', { rankingReason: 'operator published' }, 'scoringRun.rankingReason'],
+      ['costPerPickComparable', { costPerPickComparable: false },
+        'scoringRun.costPerPickComparable'],
+    ];
+    for (const [name, mutation, expectedField] of arms) {
+      const version = `drift-${name}`;
+      expect(await port.publishScoringRun({ ...base, scoringPolicyVersion: version }),
+        'published', `${name}: base`);
+      const outcome = await port.publishScoringRun({ ...base, scoringPolicyVersion: version, ...mutation });
+      expect(outcome, 'contradiction', `${name}: mutated republish`);
+      assert.equal(
+        outcome.outcome === 'contradiction' ? outcome.field : null,
+        expectedField,
+        `${name}: the contradiction names its own field`,
+      );
+      // ...and nothing was written: the stored row still says what it said.
+      const stored = await query(
+        `select eligible, ranking_allowed from public.benchmark_scoring_runs
+          where cohort_id = $1 and scoring_policy_version = $2`,
+        [cohortId, version]);
+      assert.deepEqual(stored, [{ eligible: 41, ranking_allowed: false }],
+        `${name}: a contradiction must write nothing`);
+    }
+
+    // THE EXCLUDED SET, one at a time so no field can be carried by another.
+    // Each of these moves on a legitimate re-score of the same run files.
+    const provenance: Array<[string, Partial<ScoringRun>]> = [
+      ['scoredAt', { scoredAt: '2026-08-12T22:15:00.000Z' }],
+      ['sourcePath', { source: { sourcePath: 'b-scored.ndjson', sourceSha256: sha256Hex('a') } }],
+      ['sourceSha256', { source: { sourcePath: 'a-scored.ndjson', sourceSha256: sha256Hex('b') } }],
+      ['benchmarkCommit', { benchmarkCommit: 'def' }],
+    ];
+    for (const [name, mutation] of provenance) {
+      expect(await port.publishScoringRun({ ...base, scoringPolicyVersion: 'drift-eligible', ...mutation }),
+        'duplicate', `${name} is pass provenance and must replay clean`);
+    }
+    // NEGATIVE CONTROL on the key itself: a rescore under a NEW policy version
+    // is a row BESIDE the old one, never judged against it.
+    expect(await port.publishScoringRun({ ...base, scoringPolicyVersion: 'v-next', scored: 99 }),
+      'published', 'a new policy version is its own row');
+  });
+
   await check('a child whose decision does not exist is parent_missing, not an error', async () => {
     const decision = { cohortId: cohortName('nodecision'), participantId: 'nobody', gameId: 'g', market: 'total' as const };
     expect(await port.publishRationale({ decision, rationale: 'x', evidenceRefs: [], source: NO_SOURCE }),
@@ -1540,6 +1671,78 @@ async function main(): Promise<void> {
       // The premise the comparison rides on: at least one participant actually
       // carried CLV values, or every assertion above compared empty sets.
       assert.ok(comparedValues > 0, 'no participant had a scoreable pick — the fixture closes never matched');
+
+      // THE PART 2 ACCEPTANCE, over the same real artifact: the cohort's
+      // scoring-run row lands, its counts reproduce the scorer's OWN figures,
+      // and re-running the command changes nothing.
+      const runSummary = await publishScoringRuns(port, [scoredFile], RANKING_WITHHELD, log);
+      // PRESENT, written now or already there. Unlike every other row this
+      // suite writes, the coverage row cannot be given a fresh key per run:
+      // it is keyed by COHORT, and the fixture's cohort is derived from the
+      // slate date and is deliberately the same on every run (see FireOptions
+      // in servingTestRun.ts). So the second run of this suite finds the row
+      // standing — and that is only a `duplicate` if its counts still agree,
+      // because a disagreement comes back as a contradiction and fails here.
+      assert.equal(runSummary.published + runSummary.duplicate, 1, JSON.stringify(runSummary));
+
+      const coverage = await query(
+        `select eligible, scored, refused, schedule_held_out, refusal_reasons,
+                ranking_allowed, ranking_reason, cost_per_pick_comparable, benchmark_commit
+           from public.benchmark_scoring_runs
+          where cohort_id = $1 and scoring_policy_version = $2`,
+        [fired.cohortId, SCORING_POLICY_VERSION],
+      );
+      assert.equal(coverage.length, 1, 'exactly one coverage row for this cohort and policy version');
+      const reasons: Record<string, number> = {};
+      for (const pick of scored) {
+        if (pick.result.unscoredReason === null) continue;
+        reasons[pick.result.unscoredReason] = (reasons[pick.result.unscoredReason] ?? 0) + 1;
+      }
+      assert.deepEqual(coverage[0], {
+        // Computed from the scorer's in-memory output, through the scorer's own
+        // exported predicates rather than through a copy of them — the same
+        // relation the standings query above rides on.
+        eligible: stats.reduce((sum, stat) => sum + stat.eligibleMarkets, 0),
+        scored: primaryScoreableCount(scored),
+        refused: scored.filter((pick) => pick.result.unscoredReason !== null).length,
+        schedule_held_out: heldOutOfPrimary(scored),
+        refusal_reasons: reasons,
+        ranking_allowed: false,
+        ranking_reason: 'label: watch-v0 pending operator publication decision',
+        // No artifact measures cost, and the scored artifact carries no build
+        // stamp — both are NULL BY CONTRACT rather than by omission.
+        cost_per_pick_comparable: null,
+        benchmark_commit: null,
+      });
+      // The premise: a coverage row of all zeros would satisfy the shape above
+      // while proving nothing, so the fixture has to have produced picks.
+      assert.ok(Number(coverage[0]!['eligible']) > 0 && scored.length > 0,
+        'the fixture produced no coverage, so the comparison is vacuous');
+
+      // Re-published, it is a no-op — and it must be a DUPLICATE rather than a
+      // contradiction, because nothing about the file changed.
+      const runReplay = await publishScoringRuns(port, [scoredFile], RANKING_WITHHELD, {
+        line: () => {}, error: () => {},
+      });
+      assert.deepEqual(
+        { published: runReplay.published, duplicate: runReplay.duplicate },
+        { published: 0, duplicate: 1 },
+      );
+      // ...and the operator flipping the brake by republishing is REFUSED,
+      // loudly, rather than reported as success while the row stays closed.
+      const flipped = await publishScoringRuns(
+        port,
+        [scoredFile],
+        { allowed: true, reason: 'operator published' },
+        { line: () => {}, error: () => {} },
+      );
+      assert.deepEqual(flipped.rejected, { contradiction: 1 },
+        `flipping ranking_allowed by republishing must contradict: ${JSON.stringify(flipped)}`);
+      const stillClosed = await query(
+        `select ranking_allowed from public.benchmark_scoring_runs
+          where cohort_id = $1 and scoring_policy_version = $2`,
+        [fired.cohortId, SCORING_POLICY_VERSION]);
+      assert.deepEqual(stillClosed, [{ ranking_allowed: false }], 'and nothing was written');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

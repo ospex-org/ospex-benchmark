@@ -301,6 +301,34 @@ test('the participant is the ARM, with the lab and the model in their own fields
   assert.deepEqual(attempt.roster, { walletAddress: null });
 });
 
+test('the wallet and the two execution ids are null on EVERY seal, of both kinds', async () => {
+  // The three columns this projector deliberately leaves empty, pinned as a
+  // CONTRACT rather than as an observation — the comments at those sites say
+  // they stay null, and nothing else in the suite goes red if one starts
+  // carrying a value. What fills them lives elsewhere by design: the wallet on
+  // `benchmark_cohort_wallets`, the execution ids on
+  // `benchmark_execution_fills`, both keyed so a read path joins them.
+  //
+  // EVERY seal, because there are two independent sites — projectModelDecision
+  // and the baseline branch — and a case that exercised one would leave the
+  // other's `contestId: null` free to change with nothing reddening.
+  const run = await fire({ enrolled: true });
+  const plan = planOf(run.records);
+
+  const kinds = new Set(plan.decisions.map((d) => d.seal.participant.kind));
+  assert.deepEqual([...kinds].sort(), ['baseline', 'model'], 'both sites must be exercised');
+
+  for (const { seal } of plan.decisions) {
+    const where = `${seal.participant.kind} ${seal.participant.participantId} / ${seal.market}`;
+    assert.equal(seal.contestId, null, `contestId is not null on ${where}`);
+    assert.equal(seal.speculationId, null, `speculationId is not null on ${where}`);
+    assert.equal(seal.roster.walletAddress, null, `walletAddress is not null on ${where}`);
+  }
+  // ...and the attempts, which carry their own copy of the roster facts.
+  assert.ok(plan.attempts.length > 0, 'no attempts, so the roster site is untested here');
+  for (const attempt of plan.attempts) assert.equal(attempt.roster.walletAddress, null);
+});
+
 // ---------------------------------------------------------------------------
 // The commitment
 // ---------------------------------------------------------------------------

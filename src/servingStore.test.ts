@@ -225,7 +225,9 @@ const EVERY_METHOD: ReadonlyArray<readonly [string, (p: SqlBenchmarkServingPort)
   ['publishScoringRun', (p) => p.publishScoringRun(scoringRun())],
 ];
 
-/** The four with a decision parent, which are the ones that can report it missing. */
+/** The three with a decision parent, which are the ones that can report it missing.
+ *  A POSITIONAL slice of EVERY_METHOD: inserting a method above index 5 silently
+ *  changes which methods this property is asserted over. */
 const CHILD_METHODS = EVERY_METHOD.slice(2, 5);
 
 // ---------------------------------------------------------------------------
@@ -1217,16 +1219,27 @@ test('every drift-comparing write takes the lock BEFORE the write; the others do
   // un-commit it. Measured before this: a hundred conflicting-wallet races all
   // reported `contradiction` and 58 had written their child anyway.
   //
-  // The membership rule is drift, not tier: a score drift-compares the stored
-  // row for its policy version, so an unserialized score race would absorb a
-  // concurrent DIFFERENT score as `duplicate` — the exact silent shape above.
-  // The reveal and the rationale carry no drift source of their own that a
-  // fresh snapshot would change (the rationale compares the parent's own
-  // immutable digest), so they stay lone statements.
+  // THE MEMBERSHIP RULE, stated so the list below can be checked rather than
+  // trusted: a statement is serialized exactly when its drift check reads THE
+  // ROW IT IS ABOUT TO INSERT, because that is the row a concurrent writer can
+  // commit in the window. A score drift-compares the stored score for its
+  // policy version, so an unserialized score race would absorb a concurrent
+  // DIFFERENT score as `duplicate` — the exact silent shape above; the scoring
+  // run does the same against `benchmark_scoring_runs` on its own primary key,
+  // and its row is the publication brake, so it joins them. The reveal and the
+  // rationale carry no drift source a fresh snapshot would change (the
+  // rationale compares the PARENT's own immutable digest, not its own row), so
+  // they stay lone statements.
+  const SERIALIZED = new Set([
+    'publishAttempt',
+    'sealDecision',
+    'publishScore',
+    'publishScoringRun',
+  ]);
   for (const [name, call] of EVERY_METHOD) {
     const s = scriptedQuery([OK]);
     await call(new SqlBenchmarkServingPort(s.deps));
-    const serialized = name === 'sealDecision' || name === 'publishAttempt' || name === 'publishScore';
+    const serialized = SERIALIZED.has(name);
     assert.equal(s.locks(), serialized ? 1 : 0, `${name} locks`);
     if (serialized) {
       assert.equal(s.calls[0]!.sql, SERVING_STATEMENTS.lock, `${name}: lock comes FIRST`);
@@ -1341,13 +1354,20 @@ test('every drift source LABELS its padded row, so min() can never drop one', ()
   const LABELLED = /select coalesce\(t\.f, '[a-z.]+'\) as f\s*\n\s*from (?:public\.\w+|cited)[^\n]*,/g;
   const BARE = /select t\.f\s*\n\s*from (?:public\.\w+|cited)[^\n]*,/g;
 
+  // EVERY statement carrying a drift CTE, not the two that had one when this
+  // was written — the whole point is to catch a source added later without the
+  // coalesce, and a hand-maintained pair cannot do that for a third statement.
   for (const [name, sql] of [
     ['attempt', SERVING_STATEMENTS.attempt],
     ['seal', SERVING_STATEMENTS.seal],
+    ['score', SERVING_STATEMENTS.score],
+    ['scoringRun', SERVING_STATEMENTS.scoringRun],
   ] as const) {
     const bare = sql.match(BARE) ?? [];
     assert.deepEqual(bare, [], `${name} has an unlabelled drift source: ${bare.join(' | ')}`);
   }
+  assert.ok((SERVING_STATEMENTS.scoringRun.match(LABELLED) ?? []).length >= 1,
+    'the scoring-run statement labels its one drift source');
   // A floor, so deleting a whole drift source reddens. The attempt statement
   // labels run, participant, roster and the attempt facts; the seal labels the
   // first three plus its eligibility reasons.
@@ -1509,6 +1529,120 @@ test('every drift NAME pairs with the comparison of ITS OWN column, positionally
       flags[index]!,
       new RegExp(`^s\\.${column}\\s+is distinct from input\\.${column}$`),
       `'score.${name}' must label the comparison of ${column} on both sides; got: ${flags[index]}`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The scoring run's drift comparison
+// ---------------------------------------------------------------------------
+//
+// The same three guards the score statement carries, on the statement that
+// needs them most. `benchmark_scoring_runs` holds the PUBLICATION BRAKE, it is
+// insert-once with no UPDATE grant, and until this drift CTE existed a
+// republish flipping `ranking_allowed` from false to true reported `duplicate`
+// — success — and left the stored row saying false. Measured on PostgreSQL
+// 17.10; the conformance suite drives every arm behaviourally and these are the
+// no-database half.
+
+test('the scoring-run statement gates its insert on drift, keyed on the whole row key', () => {
+  const sql = SERVING_STATEMENTS.scoringRun;
+  assert.match(
+    sql,
+    /from input\n\s*where not exists \(select 1 from drift\)/,
+    'the insert must be suppressed whenever any drift row exists',
+  );
+  // BOTH key columns. Keying the comparison on the cohort alone would report a
+  // rescore under a NEW policy version as a contradiction against the old row,
+  // which is exactly the case that must land beside it instead.
+  assert.match(
+    sql,
+    /where r\.cohort_id = input\.cohort_id\n\s*and r\.scoring_policy_version = input\.scoring_policy_version/,
+    'drift is judged within one (cohort, scoring policy version)',
+  );
+});
+
+test('every scoring-run fact except pass provenance is drift-compared', () => {
+  // The set relation, not a sample — same reasoning as the score statement's
+  // copy above: a deleted name+flag PAIR keeps the two unnest arrays equal in
+  // length, so the cardinality test cannot see one column quietly leaving the
+  // comparison. Only holding the drift names against the INSERT list can.
+  const sql = SERVING_STATEMENTS.scoringRun;
+  const insertMatch = /insert into public\.benchmark_scoring_runs\n\s*\(([^)]+)\)/.exec(sql);
+  assert.ok(insertMatch, 'the insert column list parses');
+  const columns = insertMatch![1]!.split(',').map((column) => column.trim());
+  const driftMatch = /array\[((?:'scoringRun\.[^']+',?\s*)+)\]/.exec(sql);
+  assert.ok(driftMatch, 'the drift name array parses');
+  const driftNames = new Set(
+    [...driftMatch![1]!.matchAll(/'scoringRun\.([^']+)'/g)].map((m) => m[1]!),
+  );
+
+  // The key, plus everything that describes the PASS rather than the coverage.
+  // `benchmark_commit` is the deliberate call here and it goes with the other
+  // three: a scored artifact is DERIVED, so re-running `yarn score` over the
+  // same run files regenerates it with a fresh timestamp, in a fresh file,
+  // possibly from a newer build. All four move on a legitimate recovery
+  // republish while the eight facts do not. (Contrast `benchmark_runs`, where
+  // the same column IS compared — a run artifact is primary evidence and its
+  // stamp never regenerates.)
+  const passProvenance = new Set([
+    'cohort_id',
+    'scoring_policy_version',
+    'scored_at',
+    'source_path',
+    'source_sha256',
+    'benchmark_commit',
+  ]);
+  const camel = (snake: string): string => snake.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+  for (const column of columns) {
+    if (passProvenance.has(column)) {
+      assert.ok(
+        !driftNames.has(camel(column)),
+        `${column} is the key or pass provenance and must NOT be drift-compared`,
+      );
+      continue;
+    }
+    assert.ok(
+      driftNames.has(camel(column)),
+      `${column} is inserted but not drift-compared — a second pass disagreeing about it would be absorbed as duplicate`,
+    );
+  }
+  // And nothing is compared that is not inserted.
+  const columnCamels = new Set(columns.map(camel));
+  for (const name of driftNames) {
+    assert.ok(columnCamels.has(name), `drift compares '${name}', which the insert does not carry`);
+  }
+  // A floor on the comparison, so deleting the whole CTE cannot pass by
+  // vacuously satisfying both loops with an empty name set.
+  assert.equal(driftNames.size, 8, `the eight coverage-and-brake facts: ${[...driftNames].join(', ')}`);
+});
+
+test('every scoring-run drift NAME pairs with the comparison of ITS OWN column, positionally', () => {
+  // The set test above proves the right names exist; this proves each name sits
+  // beside a flag comparing the column it names. Without it `'scoringRun.
+  // rankingAllowed'` could label a comparison of two other columns and every
+  // green would stand — the arrays stay parallel, the set stays right, and the
+  // operator flipping the publication brake is told the wrong field moved.
+  const sql = SERVING_STATEMENTS.scoringRun;
+  const driftStart = sql.indexOf("array['scoringRun.");
+  assert.notEqual(driftStart, -1);
+  const namesEnd = sql.indexOf(']', driftStart);
+  const names = [...sql.slice(driftStart, namesEnd).matchAll(/'scoringRun\.([^']+)'/g)].map((m) => m[1]!);
+  const flagsStart = sql.indexOf('array[', namesEnd);
+  const flagsEnd = sql.indexOf(']\n         ) as t(f, differs)', flagsStart);
+  assert.notEqual(flagsEnd, -1, 'the flags array terminator parses');
+  const flags = sql
+    .slice(flagsStart + 'array['.length, flagsEnd)
+    .split(',\n')
+    .map((flag) => flag.trim().replace(/,$/, ''));
+  assert.equal(flags.length, names.length, 'one flag per name');
+  const snake = (camel: string): string => camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+  for (const [index, name] of names.entries()) {
+    const column = snake(name);
+    assert.match(
+      flags[index]!,
+      new RegExp(`^r\\.${column}\\s+is distinct from input\\.${column}$`),
+      `'scoringRun.${name}' must label the comparison of ${column} on both sides; got: ${flags[index]}`,
     );
   }
 });
