@@ -321,6 +321,14 @@ cohort, which is why it is a flag rather than a side effect of publishing
 scores. Pass every one of that cohort's scored artifacts. The counts and the
 artifact count are printed before the write so they can be checked.
 
+It is **all or nothing**. No cohort row is written unless every named artifact
+passes the scored gate *and* every one of them publishes its scores in full,
+because the row is insert-once: a row written from a partial pass is the row a
+read path serves, permanently, and the correct set is then refused as a
+contradiction against it. A non-zero exit does not undo a durable row. Both
+phases also run off a single parse of each artifact, so the scores and the
+coverage row describe the same bytes rather than two reads that agree.
+
 The counts, in the vocabulary the scorer already uses:
 
 | column | means |

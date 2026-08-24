@@ -10,11 +10,7 @@ import { printError, printLine } from './console.js';
 import { PROJECT_EXIT, runProjectionCli } from './projectRunMain.js';
 import { RANKING_WITHHELD } from './scoredProjection.js';
 import type { RankingDecision } from './scoredProjection.js';
-import {
-  publishScoredArtifact,
-  publishScoringRuns,
-  unpublishedCount,
-} from './servingPublisher.js';
+import { publishScoredArtifact, scoredPublication } from './servingPublisher.js';
 import type { ProjectMainDeps } from './projectRunMain.js';
 import type { PublishLog } from './servingPublisher.js';
 import type { BenchmarkServingPort } from './servingStore.js';
@@ -59,9 +55,10 @@ run; publish the run artifact first or every row reports parent_missing.
       scored artifact is per run file — a watch cohort is a date with one
       artifact per fired game — so only the caller knows whether the files
       it named are the whole cohort. Pass every one of that cohort's scored
-      artifacts. The row is insert-once: a later, larger set is refused as a
-      contradiction rather than absorbed, and the counts are printed before
-      the write so they can be checked.
+      artifacts. The row is insert-once, so it is all-or-nothing: nothing is
+      written unless every named artifact passes the gate and every one of
+      them publishes its scores in full. The counts are printed before the
+      write so they can be checked.
 
   --ranking-allowed
       Publish that row with ranking_allowed = true. The default is FALSE —
@@ -126,6 +123,7 @@ if (isMainModule()) {
   // Two `process.argv` reads would differ by the interpreter and script paths,
   // which is a way for a flag to be seen in one place and not the other.
   const argv = process.argv.slice(2);
+  const session = scoredPublication(rankingDecisionFrom(argv));
   runProjectScoresMain({
     argv,
     exists: existsSync,
@@ -137,23 +135,20 @@ if (isMainModule()) {
         onError: printError,
         requiredCapability: SCORES_SERVING_CAPABILITY,
       }),
-    publish: publishScoredArtifact,
     // Only when asked. Absent, this command behaves exactly as it did: the
     // cohort row is a wider-grained, operator-decided write and it does not
     // ride along with publishing one artifact's scores.
-    // Spread rather than `: undefined`, because `exactOptionalPropertyTypes`
-    // distinguishes an absent optional property from one explicitly set to
-    // undefined, and the run path's contract is that the key is ABSENT.
+    //
+    // When it IS asked for, both phases run off ONE session so they share a
+    // single parse of each artifact — the per-file scores and the cohort row
+    // then describe the same bytes by construction rather than by two reads
+    // agreeing. Spread rather than `: undefined`, because
+    // `exactOptionalPropertyTypes` distinguishes an absent optional property
+    // from one explicitly set to undefined, and the run path's contract is
+    // that the key is ABSENT.
     ...(argv.includes('--scoring-run')
-      ? {
-          finish: async (port: BenchmarkServingPort, files: readonly string[], log: PublishLog) =>
-            unpublishedCount(
-              await publishScoringRuns(port, files, rankingDecisionFrom(argv), log),
-              'the cohort scoring run',
-              log,
-            ),
-        }
-      : {}),
+      ? { publish: session.publishFile, finish: session.publishCohorts }
+      : { publish: publishScoredArtifact }),
     log: { line: printLine, error: printError },
   })
     .then((code) => {

@@ -189,3 +189,53 @@ test('the cohort pass is skipped entirely when the publisher was never enabled',
   );
   assert.equal(ran, false, 'nothing may be attempted against a publisher that was never opened');
 });
+
+test('a file that did not publish in full STOPS the cohort row being written at all', async () => {
+  // The row is insert-once, so a non-zero exit does not undo it: whatever a
+  // partial pass wrote is what a read path serves, permanently, and the correct
+  // set is then refused as a contradiction against it. The guard therefore has
+  // to sit BEFORE the write rather than in the exit code after it.
+  //
+  // Every shape `unpublishedCount` counts as short of full publication, one at
+  // a time — a gate refusal, a rejected row, a skipped row, and a publisher
+  // that wrote nothing at all — because each reaches the guard through a
+  // different field of the summary and one case would leave the rest free.
+  const partials: ReadonlyArray<readonly [string, PublishSummary]> = [
+    ['gate refusal', { ...OK_SUMMARY, published: 0, gateRefusal: 'not a live run' }],
+    ['a rejected row', { ...OK_SUMMARY, rejected: { contradiction: 1 } }],
+    ['a skipped row', { ...OK_SUMMARY, skipped: ['abandoned at the deadline'] }],
+    ['nothing written', { ...OK_SUMMARY, published: 0, duplicate: 0 }],
+  ];
+  for (const [label, summary] of partials) {
+    let ran = false;
+    const code = await runProjectScoresMain(
+      deps({
+        argv: ['a-scored.ndjson', '--scoring-run'],
+        publish: async () => summary,
+        finish: async () => {
+          ran = true;
+          return 0;
+        },
+      }),
+    );
+    assert.equal(ran, false, `${label}: the cohort row must not be attempted`);
+    assert.equal(code, PROJECT_EXIT.publishFailed, `${label}: and the command still fails`);
+  }
+
+  // NEGATIVE CONTROL: with every file fully published the hook DOES run, so the
+  // guard is a condition and not a way of never writing the row at all.
+  let ranClean = false;
+  assert.equal(
+    await runProjectScoresMain(
+      deps({
+        argv: ['a-scored.ndjson', '--scoring-run'],
+        finish: async () => {
+          ranClean = true;
+          return 0;
+        },
+      }),
+    ),
+    PROJECT_EXIT.ok,
+  );
+  assert.equal(ranClean, true);
+});

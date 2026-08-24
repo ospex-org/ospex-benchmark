@@ -168,7 +168,22 @@ export async function runProjectionCli(
       // `unpublishedCount`. Everything short of full publication counts.
       failed += unpublishedCount(summary, file, deps.log);
     }
-    if (deps.finish !== undefined) failed += await deps.finish(serving.port, files, deps.log);
+    // ONLY WHEN EVERY FILE LANDED IN FULL. The wider-grained write is
+    // insert-once, so a row published from a partial pass is the row a read
+    // path serves and the correct one can never replace it — a reviewer
+    // reproduced exactly that: one refused artifact beside one good one still
+    // published a cohort row, with the ranking brake open. A non-zero exit
+    // does not undo a durable row, so the guard has to be BEFORE the write.
+    if (deps.finish !== undefined) {
+      if (failed === 0) {
+        failed += await deps.finish(serving.port, files, deps.log);
+      } else {
+        printError(
+          `${failed} file(s) did not publish in full, so nothing wider than a single artifact ` +
+            'was written. Fix those and re-run the same command.',
+        );
+      }
+    }
   } finally {
     await serving.close();
   }

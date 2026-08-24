@@ -137,7 +137,20 @@ const scorecardCoverageSchema = z
     runId: z.string().min(1),
     scoredAt: z.string().min(1),
     scoringPolicyVersion: z.string().min(1),
+    // WHO the opportunities belong to. Without it the scorecards are an
+    // anonymous bag of numbers and the denominator is whatever they sum to:
+    // measured on this branch, replacing a dispatched-but-scoreless arm's
+    // scorecard with a duplicate of a surviving participant's kept the
+    // declared `participantScorecards` count intact and quietly dropped that
+    // arm's opportunities out of `eligible` — the exact survivor bias the
+    // denominator exists to prevent.
+    participantId: z.string().min(1),
+    kind: z.enum(['model', 'baseline']),
     eligibleMarkets: z.number().int().nonnegative(),
+    // The scorer's per-participant scoreable count, reconciled below against
+    // the decisions the same file carries. It is what ties a scorecard to
+    // records rather than letting it assert a number nothing corroborates.
+    primaryScoreable: z.number().int().nonnegative(),
   })
   .passthrough();
 
@@ -182,6 +195,9 @@ export interface ScoredArtifact {
   /** Summed over the file's participant_scorecard records — the opportunity
    *  denominator, including arms that were dispatched and produced nothing. */
   readonly eligibleMarkets: number;
+  /** Which participants the file carries a scorecard for. The projector needs
+   *  it to tell a complete denominator from one that is merely a sum. */
+  readonly scorecardParticipants: readonly string[];
 }
 
 export type ScoredGate =
@@ -356,6 +372,7 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
   // One number IS taken from them: `eligibleMarkets`, summed, because it is the
   // opportunity denominator and no other record in the file carries it.
   let eligibleMarkets = 0;
+  const scorecards = new Map<string, number>();
   for (const [index, record] of records.entries()) {
     if (record['recordType'] !== 'participant_scorecard') continue;
     const parsed = scorecardCoverageSchema.safeParse(record);
@@ -375,7 +392,48 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
         return no(`participant_scorecard record ${index + 1} disagrees with scored_run_meta on ${field}`);
       }
     }
+    // ONE scorecard per participant. A duplicate would double that
+    // participant's opportunities AND — because the meta's declared
+    // scorecard count still matches — silently take some other participant's
+    // out of the sum. Measured on this branch before the check existed:
+    // swapping a scoreless arm's scorecard for a copy of a surviving one
+    // dropped `eligible` from 6 to 4 and the gate accepted the file.
+    if (scorecards.has(parsed.data.participantId)) {
+      return no(
+        `two participant_scorecard records claim ${parsed.data.participantId} — the coverage ` +
+          'denominator would count one participant twice and another not at all',
+      );
+    }
+    scorecards.set(parsed.data.participantId, parsed.data.primaryScoreable);
     eligibleMarkets += parsed.data.eligibleMarkets;
+  }
+
+  // Every participant that took a pick must have a scorecard, and that
+  // scorecard's own scoreable count must be the one its records add up to.
+  // This is what stops the denominator being an unattached number: a scorecard
+  // that cannot be reconciled against the decisions beside it is not evidence
+  // about coverage. (A participant with a scorecard and NO decisions is the
+  // point of the denominator — a dispatched arm that produced nothing — so it
+  // is required to reconcile to zero, not required to be absent.)
+  const scoreableByParticipant = new Map<string, number>();
+  for (const decision of decisions) {
+    const current = scoreableByParticipant.get(decision.participantId) ?? 0;
+    const adds = decision.inPrimaryStratum && decision.primaryClvPct !== null ? 1 : 0;
+    scoreableByParticipant.set(decision.participantId, current + adds);
+  }
+  // ⚠ PRESENCE is NOT required here — a scorecard-less file is still a
+  //   perfectly publishable set of SCORES, and this gate serves that path too.
+  //   `projectScoringRun` requires presence, because that is where the
+  //   opportunity denominator is built and where a missing scorecard is a hole.
+  for (const [participantId, derived] of scoreableByParticipant) {
+    const declared = scorecards.get(participantId);
+    if (declared === undefined) continue;
+    if (declared !== derived) {
+      return no(
+        `${participantId}'s scorecard declares primaryScoreable = ${declared} but its ` +
+          `scored_decision records carry ${derived}`,
+      );
+    }
   }
 
   // ⚠ NOT checked here: whether that sum is a plausible denominator for the
@@ -387,6 +445,7 @@ export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate
   return {
     publishable: true,
     eligibleMarkets,
+    scorecardParticipants: [...scorecards.keys()],
     header: {
       runId: meta.runId,
       cohortId: meta.cohortId,
@@ -524,10 +583,17 @@ function instantMs(value: string): number | null {
  * So the caller supplies the artifacts it means to summarise, and this refuses
  * anything that is not one coherent cohort. Nothing here can know whether the
  * SET is complete — that is the operator's statement, and it is why the row is
- * published deliberately rather than as a side effect of publishing scores. An
- * incomplete set is not silent, though: the row is insert-once and the write
- * drift-compares every fact it asserts, so publishing fourteen of fifteen and
- * then all fifteen reports a contradiction naming the first field that moved.
+ * published deliberately rather than as a side effect of publishing scores.
+ *
+ * ⚠ AN EARLIER VERSION OF THIS COMMENT ARGUED THAT AN INCOMPLETE SET WAS SAFE
+ *   because a later, larger one would be refused as a contradiction. That is
+ *   backwards, and a reviewer reproduced it: the row is INSERT-ONCE, so the
+ *   partial row is the one that lands and the one a read path serves, and the
+ *   drift check then refuses the CORRECT set. Everything upstream of here is
+ *   therefore all-or-nothing — the publisher writes no cohort row unless every
+ *   named artifact passed the gate and every artifact's scores published in
+ *   full — and the drift check is what catches a LATER pass disagreeing, not a
+ *   licence to publish a partial one now.
  *
  * ── EVERY VALUE IS A PURE FUNCTION OF THE ARTIFACTS' BYTES ───────────────────
  * The same rule the scored path runs under, so a fresh publish and a recovery
@@ -571,6 +637,25 @@ export function projectScoringRun(
     runIds.add(header.runId);
     if (instantMs(header.scoredAt) === null) {
       return no(`run ${header.runId} carries an unparseable scoredAt (${header.scoredAt})`);
+    }
+  }
+
+  // A DENOMINATOR IS ONLY COMPLETE IF EVERY ARM IT SHOULD COUNT IS IN IT.
+  // The sum is over scorecards, so an artifact missing one silently drops that
+  // arm's opportunities — survivor bias, which is the one thing `eligible`
+  // exists to prevent. Required here rather than in the gate: a scorecard-less
+  // file is still a publishable set of SCORES, and the gate serves that path.
+  for (const artifact of artifacts) {
+    const carried = new Set(artifact.scorecardParticipants);
+    for (const decision of artifact.decisions) {
+      if (carried.has(decision.participantId)) continue;
+      return no(
+        `run ${artifact.header.runId} carries picks for ${decision.participantId} but no ` +
+          'participant_scorecard for it, so the opportunity denominator is missing an arm',
+      );
+    }
+    if (artifact.decisions.length > 0 && carried.size === 0) {
+      return no(`run ${artifact.header.runId} carries no participant_scorecard at all`);
     }
   }
 

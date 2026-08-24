@@ -1220,8 +1220,12 @@ MUTANTS = [
     # meta spliced from another pass -- or records edited under a meta that was
     # not -- becomes the cohort coverage a public read path serves.
     ('M192-declared-coverage-unchecked', 'src/scoredProjection.ts',
-     ('    if (declared !== derived) {',),
-     ('    if (false) {',),
+     ("    ['scheduleChangedExcluded', meta.scheduleChangedExcluded, heldOut],\n"
+      '  ] as const) {\n'
+      '    if (declared !== derived) {',),
+     ("    ['scheduleChangedExcluded', meta.scheduleChangedExcluded, heldOut],\n"
+      '  ] as const) {\n'
+      '    if (false) {',),
      ['src/scoredProjection.test.ts']),
     # One cohort per row, because (cohort, policy version) IS the key. A mixed
     # set would publish one cohort's numbers under the other's name, and the
@@ -1254,14 +1258,14 @@ MUTANTS = [
     # sum across them, and a pass over one file of a fifteen-game cohort
     # publishes one game's coverage as the whole day's.
     ('M197-cohort-pass-sees-one-file', 'src/projectRunMain.ts',
-     ('    if (deps.finish !== undefined) failed += await deps.finish(serving.port, files, deps.log);',),
-     ('    if (deps.finish !== undefined) failed += await deps.finish(serving.port, files.slice(0, 1), deps.log);',),
+     ('        failed += await deps.finish(serving.port, files, deps.log);',),
+     ('        failed += await deps.finish(serving.port, files.slice(0, 1), deps.log);',),
      ['src/projectScoresMain.test.ts']),
     # ...and its failures must reach the exit code. This command exists only to
     # publish, so a coverage row that did not land is its failure.
     ('M198-cohort-pass-failures-swallowed', 'src/projectRunMain.ts',
-     ('    if (deps.finish !== undefined) failed += await deps.finish(serving.port, files, deps.log);',),
-     ('    if (deps.finish !== undefined) await deps.finish(serving.port, files, deps.log);',),
+     ('        failed += await deps.finish(serving.port, files, deps.log);',),
+     ('        await deps.finish(serving.port, files, deps.log);',),
      ['src/projectScoresMain.test.ts']),
     # The manifest a cohort row cites must be order-independent: the shell's
     # glob order is not a property of the cohort, and two invocations over the
@@ -1275,9 +1279,56 @@ MUTANTS = [
     # would publish a denominator for rows nobody can look up, and dropping it
     # silently would let the command exit 0 on a partial cohort.
     ('M200-refused-artifact-silently-dropped', 'src/servingPublisher.ts',
-     ('      tally.skipped.push(`${basename(file)} is not publishable (${read.reason})`);',),
+     ('      tally.skipped.push(`no scoring run: ${reason} is not publishable`);',),
      ('      // dropped',),
      ['src/servingPublisher.test.ts']),
+    # --- The two PR #114 review blockers (Hermes, exact head 2bc3999) --------
+    # BLOCKER 1a: the cohort row is written even though a file did not publish
+    # in full. The row is insert-once, so the partial row is the one a read
+    # path serves and the CORRECT set is refused against it afterwards; a
+    # non-zero exit does not undo a durable row. Reproduced by the reviewer and
+    # again here before the guard existed.
+    ('M201-cohort-row-written-after-a-partial-pass', 'src/projectRunMain.ts',
+     ('      if (failed === 0) {',),
+     ('      if (true) {',),
+     ['src/projectScoresMain.test.ts']),
+    # BLOCKER 1b: the same hole one layer down — excluding the unpublishable
+    # artifact and publishing a row from the survivors. Measured before the
+    # fix: one valid artifact beside one refused artifact published
+    # `eligible=3 scored=1 rankingAllowed=true`.
+    ('M202-partial-set-still-publishes-a-cohort-row', 'src/servingPublisher.ts',
+     ('  if (unreadable.length > 0) {',),
+     ('  if (false) {',),
+     ['src/servingPublisher.test.ts']),
+    # The two phases must run off ONE parse. A build that goes back to disk for
+    # the cohort row can summarise different bytes than the scores cited.
+    ('M203-cohort-phase-rereads-from-disk', 'src/servingPublisher.ts',
+     ('        const snapshot = accepted.get(file);',),
+     ('        const reread = readScoredArtifact(file);\n'
+      '        const snapshot = reread.ok\n'
+      '          ? { file, artifact: reread.artifact, source: reread.source }\n'
+      '          : undefined;',),
+     ['src/servingPublisher.test.ts']),
+    # BLOCKER 2a: scorecards without identity are an anonymous bag of numbers,
+    # so a duplicate silently substitutes for a dispatched-but-scoreless arm and
+    # its opportunities leave the denominator — survivor bias, which is the one
+    # thing `eligible` exists to prevent.
+    ('M204-duplicate-scorecards-admitted', 'src/scoredProjection.ts',
+     ('    if (scorecards.has(parsed.data.participantId)) {',),
+     ('    if (false) {',),
+     ['src/scoredProjection.test.ts']),
+    # BLOCKER 2b: a participant with picks and no scorecard leaves a hole in the
+    # denominator that nothing else can see.
+    ('M205-denominator-missing-an-arm-admitted', 'src/scoredProjection.ts',
+     ('      if (carried.has(decision.participantId)) continue;',),
+     ('      if (true) continue;',),
+     ['src/scoredProjection.test.ts']),
+    # ...and the scorecard's own count must answer to the records beside it,
+    # or it is a number nothing corroborates.
+    ('M206-scorecard-count-unreconciled', 'src/scoredProjection.ts',
+     ('    if (declared === undefined) continue;\n    if (declared !== derived) {',),
+     ('    if (declared === undefined) continue;\n    if (false) {',),
+     ['src/scoredProjection.test.ts']),
 ]
 
 

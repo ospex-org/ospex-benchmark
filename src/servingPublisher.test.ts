@@ -13,6 +13,7 @@ import {
   publishScoredArtifact,
   publishScores,
   publishScoringRuns,
+  scoredPublication,
   unpublishedCount,
 } from './servingPublisher.js';
 import {
@@ -803,7 +804,10 @@ function scoredArtifactLines(
   const scorecard = {
     recordType: 'participant_scorecard', label: 'SMOKE_V0_NOT_A_COHORT', runId: 'run-77',
     scoredAt: '2026-08-20T04:00:00.000Z', scoringPolicyVersion: 'scoring-v0.6.0',
-    participantId: 'lab-alpha', eligibleMarkets: 3 * (2 + (over.extraGames?.length ?? 0)),
+    participantId: 'lab-alpha', kind: 'model',
+    eligibleMarkets: 3 * (2 + (over.extraGames?.length ?? 0)),
+    // One scoreable pick in the fixture; every extra game is a close_missing.
+    primaryScoreable: 1,
   };
   return [
     JSON.stringify(meta),
@@ -1122,10 +1126,13 @@ test('artifacts of DIFFERENT cohorts get a row each, in a stable order', async (
   assert.equal(summary.published, 2);
 });
 
-test('a file the scored gate refuses is EXCLUDED from the cohort and fails the command', async () => {
-  // Its picks are not in the projection either, so counting them would publish
-  // a denominator for rows nobody can look up. Reported, excluded, and counted
-  // as a failure so the CLI exits non-zero — never silently dropped.
+test('a file the scored gate refuses means NO cohort row at all', async () => {
+  // ALL OR NOTHING. An earlier build excluded the bad artifact and published a
+  // row from the survivors, reasoning that a later, larger set would report a
+  // contradiction. Backwards: the row is insert-once, so the PARTIAL row is the
+  // one that lands and the correct set is the one that gets refused afterwards.
+  // A reviewer reproduced it — one refused artifact beside one good one still
+  // published `eligible=3 scored=1`, with the ranking brake open.
   const dir = tempDir('serving-cohort-bad-');
   const files = [
     writeNamedScoredArtifact(dir, 'good-scored.ndjson', cohortArtifactLines('run-a', 'smoke-v0-2026-08-19', 'a')),
@@ -1142,11 +1149,15 @@ test('a file the scored gate refuses is EXCLUDED from the cohort and fails the c
 
   const summary = await publishScoringRuns(port, files, RANKING_WITHHELD, log);
 
-  const sent = port.calls[0]!.payload as unknown as ScoringRun;
-  assert.equal(sent.eligible, 6, 'only the publishable artifact is counted');
-  assert.equal(summary.published, 1);
+  assert.equal(port.calls.length, 0, 'nothing may be sent when any named artifact is refused');
+  assert.equal(summary.published, 0);
   assert.ok(summary.skipped.some((reason) => reason.includes('dry-scored.ndjson')), summary.skipped.join(' | '));
   assert.ok(errors.some((line) => line.includes('not a live run')), errors.join(' | '));
+  // NEGATIVE CONTROL: the SAME good artifact on its own does publish, so this
+  // is the refusal doing the work rather than the good file being unusable.
+  const alone = new RecordingPort();
+  await publishScoringRuns(alone, [files[0]!], RANKING_WITHHELD, collector().log);
+  assert.equal(alone.calls.length, 1);
   assert.ok(
     unpublishedCount(summary, 'the cohort scoring run', collector().log) > 0,
     'an excluded artifact must reach the exit code',
@@ -1218,4 +1229,51 @@ test('the cohort write is bounded by the same deadline as everything else', asyn
   assert.equal(summary.rejected['unavailable'], 1, 'the write is reported, not awaited forever');
   assert.ok(errors.length >= 0);
   assert.equal(summary.published, 0);
+});
+
+test('both phases of a scored publication run off ONE parse of each artifact', async () => {
+  // The per-file scores and the cohort row are separate writes at different
+  // grains. Reading the file twice is two answers: a re-score landing between
+  // them would put the two rows on different bytes, each citing its own
+  // `source_sha256`, with nothing refusing either.
+  //
+  // The proof is destructive and leaves no room for a second reading: DELETE
+  // the artifact between the phases. A build that went back to disk fails; one
+  // that kept the parse publishes the cohort row unchanged.
+  const dir = tempDir('scored-session-');
+  const file = join(dir, 'run-77-scored.ndjson');
+  writeFileSync(file, scoredArtifactLines().join('\n'), 'utf8');
+
+  const session = scoredPublication(RANKING_WITHHELD);
+  const port = new RecordingPort();
+  const { log } = collector();
+
+  const summary = await session.publishFile(port, file, log);
+  assert.equal(summary.gateRefusal, null, `phase one refused: ${summary.gateRefusal}`);
+  assert.equal(summary.published, 2, 'both picks published from the parse');
+
+  rmSync(file, { force: true });
+  assert.equal(await session.publishCohorts(port, [file], log), 0, 'the cohort row still lands');
+  assert.deepEqual(
+    port.calls.map((call) => call.kind),
+    ['score', 'score', 'scoringRun'],
+    'scores first, then exactly one cohort row',
+  );
+  // ...and it summarises the artifact phase one actually read.
+  const sent = port.calls[2]!.payload as unknown as ScoringRun;
+  assert.equal(sent.cohortId, 'smoke-v0-2026-08-19');
+  assert.equal(sent.eligible, 6);
+});
+
+test('the cohort phase refuses a file the gate never accepted in this pass', async () => {
+  // The half that does not rely on the CLI getting its ordering right: if a
+  // named file has no snapshot there is nothing honest to summarise, and the
+  // row must not be invented from whichever files do have one.
+  const session = scoredPublication(RANKING_WITHHELD);
+  const port = new RecordingPort();
+  const { log, errors } = collector();
+
+  assert.equal(await session.publishCohorts(port, ['never-seen-scored.ndjson'], log), 1);
+  assert.equal(port.calls.length, 0);
+  assert.ok(errors.some((line) => line.includes('never accepted')), errors.join(' | '));
 });

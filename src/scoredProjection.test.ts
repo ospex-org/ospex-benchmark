@@ -181,7 +181,9 @@ function scorecard(over: Record<string, unknown> = {}): JsonRecord {
     scoredAt: '2026-08-20T04:00:00.000Z',
     scoringPolicyVersion: 'scoring-v0.6.0',
     participantId: 'lab-alpha',
+    kind: 'model',
     eligibleMarkets: 3,
+    primaryScoreable: 1,
     ...over,
   };
 }
@@ -505,7 +507,12 @@ function artifactOf(records: JsonRecord[]): ScoredArtifact {
   const gate = gateOf(records);
   assert.ok(gate.publishable, `expected publishable: ${gate.publishable ? '' : gate.reason}`);
   return gate.publishable
-    ? { header: gate.header, decisions: gate.decisions, eligibleMarkets: gate.eligibleMarkets }
+    ? {
+        header: gate.header,
+        decisions: gate.decisions,
+        eligibleMarkets: gate.eligibleMarkets,
+        scorecardParticipants: gate.scorecardParticipants,
+      }
     : ({} as ScoredArtifact);
 }
 
@@ -541,7 +548,18 @@ function artifactRecords(
     scoredAt: head['scoredAt'],
     scoringPolicyVersion: head['scoringPolicyVersion'],
   });
-  return [head, rebind(scorecard({ eligibleMarkets })), ...decisions.map(rebind)];
+  // The helper emits ONE scorecard, for the default participant, so its
+  // declared count is that participant's own — not the file's total, which is
+  // what the meta carries.
+  const scoreable = decisions.filter(
+    (d) => d['participantId'] === 'lab-alpha'
+      && d['inPrimaryStratum'] === true && d['primaryClvPct'] !== null,
+  ).length;
+  return [
+    head,
+    rebind(scorecard({ eligibleMarkets, primaryScoreable: scoreable })),
+    ...decisions.map(rebind),
+  ];
 }
 
 const OPEN: RankingDecision = { allowed: true, reason: 'operator published: n is adequate' };
@@ -698,15 +716,66 @@ test('a pick in no bucket refuses the projection rather than being folded into r
 });
 
 test('a denominator smaller than the picks refuses — the row is insert-once', () => {
+  // A scorecard IS present, and it names the participant that took the picks —
+  // so the presence check below cannot be what fires, and this case still
+  // discriminates the arithmetic rule it is named for.
   const artifact = artifactOf(
     artifactRecords(
       'run-a',
       [decision(), decision({ gameId: 'game-2' }), decision({ gameId: 'game-3' }), decision({ gameId: 'game-4' })],
-      { participantScorecards: 0 },
-    ).filter((record) => record['recordType'] !== 'participant_scorecard'),
+      { eligibleMarkets: 2 },
+    ),
   );
-  assert.equal(artifact.eligibleMarkets, 0, 'no scorecards, so no denominator');
+  assert.equal(artifact.decisions.length, 4);
+  assert.equal(artifact.eligibleMarkets, 2, 'fewer opportunities than picks, which cannot be');
+  assert.deepEqual(artifact.scorecardParticipants, ['lab-alpha'], 'a scorecard IS present');
   assert.match(refusalOf([artifact]), /opportunity denominator cannot be smaller/);
+});
+
+test('a DUPLICATED scorecard refuses — it would erase a dispatched arm from the denominator', () => {
+  // The reviewer's reproduction. Replacing a dispatched-but-scoreless arm's
+  // scorecard with a copy of a surviving participant's keeps the declared
+  // `participantScorecards` count intact, so every count check still passes,
+  // and quietly drops that arm's opportunities out of `eligible` — survivor
+  // bias, which is the one thing this denominator exists to prevent.
+  const failedArm = scorecard({ participantId: 'lab-failed', eligibleMarkets: 3, primaryScoreable: 0 });
+  const honest = [meta({ participantScorecards: 2 }), scorecard(), failedArm, decision()];
+  const tampered = [meta({ participantScorecards: 2 }), scorecard(), scorecard({ eligibleMarkets: 1 }), decision()];
+
+  // The HONEST file must still publish, and must carry the failed arm's three
+  // opportunities — otherwise this case proves nothing about the duplicate.
+  const good = gateOf(honest);
+  assert.equal(good.publishable, true, good.publishable ? '' : good.reason);
+  assert.equal(good.publishable ? good.eligibleMarkets : 0, 6, 'the scoreless arm stays in the denominator');
+
+  assert.match(reasonOf(tampered), /two participant_scorecard records claim lab-alpha/);
+});
+
+test("a scorecard's own scoreable count is reconciled against the records beside it", () => {
+  // A scorecard that asserts a number nothing in the file corroborates is not
+  // evidence about coverage — it is just a number, and `eligible` is summed
+  // from the same records. One arm at a time: the count too high, then too low.
+  for (const declared of [2, 0]) {
+    assert.match(
+      reasonOf([meta(), scorecard({ primaryScoreable: declared }), decision()].map((r, i) =>
+        i === 0 ? { ...r, participantScorecards: 1 } : r)),
+      new RegExp(`declares primaryScoreable = ${declared} but its scored_decision records carry 1`),
+    );
+  }
+  // NEGATIVE CONTROL: the honest count is accepted.
+  headerOf([meta({ participantScorecards: 1 }), scorecard({ primaryScoreable: 1 }), decision()]);
+});
+
+test('a pick with no scorecard behind it refuses — a denominator missing an arm', () => {
+  // The survivor-bias hole a reviewer found: the sum is over scorecards, so an
+  // artifact that drops one silently drops that arm's opportunities. Here the
+  // pick belongs to a participant no scorecard names.
+  const artifact = artifactOf(
+    artifactRecords('run-a', [decision(), decision({ gameId: 'g2', participantId: 'lab-beta' })], {
+      primaryScoreable: 2,
+    }),
+  );
+  assert.match(refusalOf([artifact]), /no participant_scorecard for it/);
 });
 
 test('the artifacts must be ONE cohort and ONE policy version, and none supplied twice', () => {
