@@ -7,6 +7,7 @@ import {
   GATE_EXIT,
   GATE_STARTUP_OPTIONS,
   isExemptDefiner,
+  observeClientTls,
   proveEncrypted,
   proveReadOnly,
   READ_ONLY_SESSION_SQL,
@@ -85,16 +86,28 @@ test('a refusal for some OTHER reason does not count as proof', async () => {
 // ---------------------------------------------------------------------------
 
 test('an unencrypted session is refused unless the target is this machine', () => {
-  assert.equal(proveEncrypted({ ssl: true, version: 'TLSv1.3' }, false).ok, true);
-  assert.equal(proveEncrypted({ ssl: true, version: 'TLSv1.3' }, true).ok, true);
-  assert.equal(proveEncrypted({ ssl: false, version: null }, true).ok, true);
+  assert.equal(proveEncrypted({ encrypted: true, protocol: 'TLSv1.3' }, false).ok, true);
+  assert.equal(proveEncrypted({ encrypted: true, protocol: 'TLSv1.3' }, true).ok, true);
+  assert.equal(proveEncrypted({ encrypted: false, protocol: null }, true).ok, true);
 
-  const remote = proveEncrypted({ ssl: false, version: null }, false);
+  const remote = proveEncrypted({ encrypted: false, protocol: null }, false);
   assert.equal(remote.ok, false);
   assert.match(remote.detail, /in the clear/);
+});
 
-  // A server that answers nothing is not an encrypted server.
-  assert.equal(proveEncrypted({ ssl: undefined, version: undefined }, false).ok, false);
+test('client TLS observation reads the live socket, never the requested configuration', () => {
+  assert.deepEqual(
+    observeClientTls({
+      ssl: true,
+      connection: { stream: { encrypted: true, getProtocol: () => 'TLSv1.3' } },
+    }),
+    { encrypted: true, protocol: 'TLSv1.3' },
+  );
+  assert.deepEqual(
+    observeClientTls({ ssl: true, connection: { stream: { encrypted: false } } }),
+    { encrypted: false, protocol: null },
+  );
+  assert.deepEqual(observeClientTls({ ssl: true }), { encrypted: false, protocol: null });
 });
 
 test('local is decided by the host DIALLED, and an unknown host is remote', () => {
@@ -215,6 +228,7 @@ function harness(
   const counts = { value: 'benchmark_runs=0' };
   const ready: GateConnection = {
     kind: 'ready',
+    clientTls: { encrypted: true, protocol: 'TLSv1.3' },
     localTarget: true,
     query: async (sql) => {
       queries.push(sql);
@@ -249,6 +263,24 @@ test('the gate explicitly enables read-only before it runs the refusal probe', a
   assert.match(it.queries[1] ?? '', /^insert into public\.benchmark_runs/);
 });
 
+test('client TLS decides the verdict when pg_stat_ssl reports a plaintext pooler backend leg', async () => {
+  const connection = {
+    kind: 'ready' as const,
+    localTarget: false,
+    clientTls: { encrypted: true, protocol: 'TLSv1.3' },
+    query: async (sql: string): Promise<ReadonlyArray<Record<string, unknown>>> => {
+      if (sql.startsWith('insert')) throw Object.assign(new Error('ro'), { code: '25006' });
+      if (sql.includes('pg_stat_ssl')) return [{ ssl: false, version: null }];
+      return [];
+    },
+    close: async () => {},
+  };
+  const it = harness({ connection });
+  assert.equal(await runSchemaGate(it.deps), GATE_EXIT.ok);
+  assert.ok(it.lines.some((line) => line.includes('client-to-pooler') && line.includes('TLSv1.3')));
+  assert.ok(it.lines.some((line) => line.startsWith('note') && line.includes('pg_stat_ssl')));
+});
+
 test('a clean run exits 0 and closes the connection', async () => {
   const it = harness();
   assert.equal(await runSchemaGate(it.deps), GATE_EXIT.ok);
@@ -280,6 +312,7 @@ test('a connection that could write is refused before a single check runs', asyn
     checks: [{ name: 'must not run', run: async () => { ran += 1; return { ok: true, detail: '' }; } }],
     connection: {
       kind: 'ready',
+      clientTls: { encrypted: false, protocol: null },
       localTarget: true,
       // Accepts everything, including the write probe.
       query: async () => [],
@@ -290,14 +323,15 @@ test('a connection that could write is refused before a single check runs', asyn
   assert.equal(ran, 0, 'no check may run against a connection that can write');
 });
 
-test('an unencrypted remote session fails the gate even when every check passes', async () => {
+test('an unencrypted remote client leg fails even when pg_stat_ssl reports server-side TLS', async () => {
   const it = harness({
     connection: {
       kind: 'ready',
+      clientTls: { encrypted: false, protocol: null },
       localTarget: false,
       query: async (sql) => {
         if (sql.startsWith('insert')) throw Object.assign(new Error('ro'), { code: '25006' });
-        if (sql.includes('pg_stat_ssl')) return [{ ssl: false, version: null }];
+        if (sql.includes('pg_stat_ssl')) return [{ ssl: true, version: 'TLSv1.3' }];
         return [];
       },
       close: async () => {},
@@ -314,6 +348,7 @@ test('row counts that MOVED fail the gate — the gate must change nothing', asy
   const it = harness({
     connection: {
       kind: 'ready',
+      clientTls: { encrypted: true, protocol: 'TLSv1.3' },
       localTarget: true,
       query: async (sql) => {
         if (sql.startsWith('insert')) throw Object.assign(new Error('ro'), { code: '25006' });
@@ -532,6 +567,7 @@ test('row counts that cannot be READ are not reported as unchanged', async () =>
   const it = harness({
     connection: {
       kind: 'ready',
+      clientTls: { encrypted: true, protocol: 'TLSv1.3' },
       localTarget: true,
       query: async (sql) => {
         if (sql.startsWith('insert')) throw Object.assign(new Error('ro'), { code: '25006' });
