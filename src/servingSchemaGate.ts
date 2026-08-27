@@ -31,14 +31,16 @@ import type { BenchmarkWriterConnection } from './benchmarkServingConfig.js';
  * reasons has no business standing between a slate and a fire.
  *
  * ── IT CANNOT WRITE, AND THE SERVER IS WHAT ENFORCES THAT ────────────────────
- * The connection carries `default_transaction_read_only=on` as a startup
- * parameter, so PostgreSQL refuses any write with 25006. That is PROVEN rather
- * than assumed — a pooler is free to drop a startup option, and a gate that
- * believed its own configuration would be exactly as safe as no gate. Before any
- * check runs, the connection must demonstrate the refusal, using a statement
- * that is a no-op even if it executes (measured: on a writable connection the
- * same statement reports `INSERT 0` and the row count does not move). The check
- * that a write is refused cannot itself be the write that gets through.
+ * The connection requests `default_transaction_read_only=on` as a startup
+ * parameter, then explicitly SETs the same GUC after checking out the one client
+ * this gate holds. PostgreSQL then refuses any write with 25006. That is PROVEN
+ * rather than assumed — a pooler is free to drop a startup option, and a gate
+ * that believed its own configuration would be exactly as safe as no gate.
+ * Before any check runs, the connection must demonstrate the refusal, using a
+ * statement that is a no-op even if it executes (measured: on a writable
+ * connection the same statement reports `INSERT 0` and the row count does not
+ * move). The check that a write is refused cannot itself be the write that gets
+ * through.
  *
  * As a second, independent proof, the row counts are read at the start and again
  * at the end and must be identical. Nothing the gate did may have moved them.
@@ -52,8 +54,12 @@ import type { BenchmarkWriterConnection } from './benchmarkServingConfig.js';
  * itself.
  */
 
-/** The startup parameter that makes this connection incapable of writing. */
+/** Startup defence in depth. A pooler may drop it; the explicit SET and probe
+ * below are the authoritative guard. */
 export const READ_ONLY_STARTUP_OPTION = '-c default_transaction_read_only=on';
+
+/** Applied to the checked-out client before any probe or schema question. */
+export const READ_ONLY_SESSION_SQL = 'set default_transaction_read_only = on';
 
 /**
  * The startup parameter that PINS the schema search path to `public`.
@@ -155,9 +161,9 @@ function normalise(text: string): string {
 /**
  * Prove the connection refuses writes, or refuse to use it.
  *
- * Measured rather than read back from `show`: `show` reports what the server was
- * TOLD, and this reports what the server DOES. They agree today. The one that
- * keeps agreeing after a connection pooler is introduced is the one that tried.
+ * Measured rather than inferred from the startup option or explicit SET: either
+ * can be acknowledged or dropped by connection infrastructure, while this
+ * reports what the server DOES on the checked-out client.
  */
 export async function proveReadOnly(query: GateQuery): Promise<GateVerdict> {
   try {
@@ -1090,9 +1096,10 @@ const USAGE = `usage: yarn gate:serving
 
 Ask the configured serving database whether it can hold this publisher's writes.
 
-Read-only: the connection carries default_transaction_read_only=on, the server is
-made to prove it refuses a write before anything else is asked, and the row counts
-are compared before and after to confirm nothing moved.
+Read-only: after connecting through the pool, the checked-out client explicitly
+sets default_transaction_read_only=on. The startup option remains as defence in
+depth; the server must still prove it refuses a write before anything else is
+asked, and row counts are compared before and after to confirm nothing moved.
 
 Run this by hand before enabling publication against a database for the first
 time. Nothing in yarn watch / yarn smoke / yarn project calls it, deliberately.
@@ -1142,9 +1149,13 @@ export async function runSchemaGate(deps: SchemaGateDeps): Promise<number> {
   }
 
   try {
-    // Before ANY check: prove this connection cannot write. A gate that could
-    // write would be running statements against a database whose rows can never
-    // be deleted, in order to find out whether that was safe.
+    // A pooler can drop startup GUCs. Apply the guard after connecting, on the
+    // same checked-out client that every probe and check below will use.
+    await connection.query(READ_ONLY_SESSION_SQL);
+
+    // Before ANY check: prove the explicit guard actually makes writes fail. A
+    // gate that could write would be running statements against a database whose
+    // rows can never be deleted, in order to find out whether that was safe.
     const readOnly = await proveReadOnly(connection.query);
     line(`${readOnly.ok ? 'ok  ' : 'FAIL'}  the connection is read-only: ${readOnly.detail}`);
     if (!readOnly.ok) return GATE_EXIT.refused;
@@ -1276,30 +1287,37 @@ async function openGateConnection(): Promise<GateConnection> {
   const pool = new driver.Pool({
     ...servingPoolConfig(resolution.connection),
     options: GATE_STARTUP_OPTIONS,
-    // One connection: the checks are sequential and every one of them must run
-    // against a connection that carried the read-only option and the pinned
-    // search path.
+    // One connection: the gate checks out and holds it so the explicit SET, the
+    // refusal probe and every schema question share one session.
     max: 1,
   });
   // Without this, a reset while the gate is running is an uncaught exception
   // rather than a failed check — the same hazard the publisher's pool carries,
   // and here it would abandon a preflight halfway with no verdict at all.
-  pool.on('error', (error: unknown) => {
+  const reportConnectionError = (error: unknown): void => {
     try {
       printError(`serving schema gate: the connection failed (${describeError(error)})`);
     } catch {
       // Same reason as the publisher's listener: this runs in an event handler,
       // so a sink that throws is an uncaught exception rather than a lost line.
     }
+  };
+  pool.on('error', reportConnectionError);
+  const client = await pool.connect().catch(async (caught: unknown) => {
+    await pool.end().catch(() => undefined);
+    throw caught;
   });
+  // A checked-out client emits its own idle socket errors rather than routing
+  // them through the pool's listener.
+  client.on('error', reportConnectionError);
   return {
     kind: 'ready',
     localTarget: dialsThisMachine(resolution.connection),
     query: async (sql, params) =>
-      (await pool.query(sql, params === undefined ? undefined : [...params])).rows,
+      (await client.query(sql, params === undefined ? undefined : [...params])).rows,
     close: async () => {
-      // This pool holds no long write, so draining is enough — but it still has
-      // to happen, or the command does not exit.
+      client.removeListener('error', reportConnectionError);
+      client.release();
       await pool.end().catch(() => undefined);
     },
   };

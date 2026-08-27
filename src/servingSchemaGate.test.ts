@@ -9,6 +9,7 @@ import {
   isExemptDefiner,
   proveEncrypted,
   proveReadOnly,
+  READ_ONLY_SESSION_SQL,
   READ_ONLY_STARTUP_OPTION,
   readRowCounts,
   runChecks,
@@ -179,10 +180,11 @@ test('every check has a distinct name, because the report is read by name', () =
   assert.equal(SERVING_SCHEMA_CHECKS.filter((check) => check.informational === true).length, 1);
 });
 
-test('the read-only option is the startup parameter, not a SET', () => {
-  // A `SET` issued once reaches whichever pooled connection happened to serve
-  // it; a startup option is applied by the server to every connection it opens.
+test('the startup option remains as defence in depth beside the explicit session guard', () => {
+  // The pooler may drop the startup option, so the gate also issues this SET on
+  // the one checked-out client it holds for the complete run.
   assert.equal(READ_ONLY_STARTUP_OPTION, '-c default_transaction_read_only=on');
+  assert.equal(READ_ONLY_SESSION_SQL, 'set default_transaction_read_only = on');
 });
 
 test('the gate pins search_path, and carries both startup options together', () => {
@@ -206,14 +208,16 @@ const PASSING: GateCheck[] = [{ name: 'fine', run: async () => ({ ok: true, deta
 
 function harness(
   over: Partial<SchemaGateDeps> & { connection?: GateConnection } = {},
-): { deps: SchemaGateDeps; lines: string[]; closed: () => number } {
+): { deps: SchemaGateDeps; lines: string[]; queries: string[]; closed: () => number } {
   const lines: string[] = [];
+  const queries: string[] = [];
   let closes = 0;
   const counts = { value: 'benchmark_runs=0' };
   const ready: GateConnection = {
     kind: 'ready',
     localTarget: true,
     query: async (sql) => {
+      queries.push(sql);
       if (sql.startsWith('insert')) {
         throw Object.assign(new Error('read only'), { code: '25006' });
       }
@@ -233,9 +237,17 @@ function harness(
       ...rest,
     },
     lines,
+    queries,
     closed: () => closes,
   };
 }
+
+test('the gate explicitly enables read-only before it runs the refusal probe', async () => {
+  const it = harness();
+  assert.equal(await runSchemaGate(it.deps), GATE_EXIT.ok);
+  assert.equal(it.queries[0], READ_ONLY_SESSION_SQL);
+  assert.match(it.queries[1] ?? '', /^insert into public\.benchmark_runs/);
+});
 
 test('a clean run exits 0 and closes the connection', async () => {
   const it = harness();
