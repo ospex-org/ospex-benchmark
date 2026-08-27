@@ -124,6 +124,11 @@ export interface GateVerdict {
   readonly detail: string;
 }
 
+export interface ClientTlsObservation {
+  readonly encrypted: boolean;
+  readonly protocol: string | null;
+}
+
 export interface GateCheck {
   readonly name: string;
   /**
@@ -197,33 +202,51 @@ export async function proveReadOnly(query: GateQuery): Promise<GateVerdict> {
  * A property of the CONNECTION rather than of the schema, which is why it sits
  * here beside the read-only proof instead of among the checks.
  *
- * ⚠ WHETHER THE TARGET IS LOCAL IS A CLIENT-SIDE QUESTION AND THE SERVER CANNOT
- *   ANSWER IT. The obvious source, `pg_stat_activity.client_addr`, reports what
- *   the SERVER sees — and a container with a published port sees the runtime's
- *   NAT gateway, not loopback. Measured: dialling localhost:5436 against a
- *   Docker PostgreSQL presents as 172.x, so a gate reading `client_addr`
- *   declares a connection that never left the machine to be remote and
- *   unencrypted. `isLocalHost` answers the question that was actually asked —
- *   which host did this process dial — and it is the reviewed implementation,
- *   loopback by address rather than by string prefix.
+ * ⚠ BOTH PARTS OF THIS VERDICT ARE CLIENT-SIDE QUESTIONS. Through a pooler,
+ *   `pg_stat_ssl` reports the pooler-to-database leg, not this process's
+ *   client-to-pooler socket. Likewise, `pg_stat_activity.client_addr` reports
+ *   what the SERVER sees — and a container with a published port sees the
+ *   runtime's NAT gateway, not loopback. The checked-out node-postgres client's
+ *   live stream supplies the TLS observation; `isLocalHost` answers which host
+ *   this process actually dialled.
  */
-export function proveEncrypted(session: {
-  readonly ssl: unknown;
-  readonly version: unknown;
-}, localTarget: boolean): GateVerdict {
-  if (session.ssl === true) return { ok: true, detail: `TLS ${String(session.version)}` };
+export function proveEncrypted(observation: ClientTlsObservation, localTarget: boolean): GateVerdict {
+  if (observation.encrypted) {
+    return {
+      ok: true,
+      detail: `client-to-pooler TLS${observation.protocol === null ? '' : ` ${observation.protocol}`}`,
+    };
+  }
   if (localTarget) {
     return { ok: true, detail: 'not encrypted, and the target is this machine — nothing reaches a wire' };
   }
   return {
     ok: false,
     detail:
-      'this session is NOT encrypted and the target is not this machine. The connection ' +
+      'the client leg is NOT encrypted and the target is not this machine. The connection ' +
       "string carries this role's password, so it went out in the clear.",
   };
 }
 
-/** What the server reports about the current session's transport. */
+/** Observe the checked-out node-postgres client's actual socket, not its TLS config. */
+export function observeClientTls(client: unknown): ClientTlsObservation {
+  const stream = (client as { connection?: { stream?: unknown } } | null)?.connection?.stream as
+    | { encrypted?: unknown; getProtocol?: unknown }
+    | undefined;
+  if (stream?.encrypted !== true) return { encrypted: false, protocol: null };
+  if (typeof stream.getProtocol !== 'function') return { encrypted: true, protocol: null };
+  try {
+    const protocol = stream.getProtocol.call(stream);
+    return {
+      encrypted: true,
+      protocol: typeof protocol === 'string' && protocol.length > 0 ? protocol : null,
+    };
+  } catch {
+    return { encrypted: true, protocol: null };
+  }
+}
+
+/** What the database server reports about its own leg; informational only. */
 export async function readSession(query: GateQuery): Promise<{ ssl: unknown; version: unknown }> {
   const rows = await query('select ssl, version from pg_stat_ssl where pid = pg_backend_pid()');
   return { ssl: rows[0]?.['ssl'], version: rows[0]?.['version'] };
@@ -1101,6 +1124,9 @@ sets default_transaction_read_only=on. The startup option remains as defence in
 depth; the server must still prove it refuses a write before anything else is
 asked, and row counts are compared before and after to confirm nothing moved.
 
+TLS: the verdict comes from the checked-out client's live socket. pg_stat_ssl is
+reported separately as database-side information and never decides the verdict.
+
 Run this by hand before enabling publication against a database for the first
 time. Nothing in yarn watch / yarn smoke / yarn project calls it, deliberately.
 
@@ -1116,6 +1142,8 @@ export type GateConnection =
   | {
       readonly kind: 'ready';
       readonly query: GateQuery;
+      /** TLS observed on the checked-out client's live socket. */
+      readonly clientTls: ClientTlsObservation;
       /** Whether the host this process DIALLED is this machine. Client-side
        *  knowledge; see proveEncrypted for why the server cannot supply it. */
       readonly localTarget: boolean;
@@ -1160,8 +1188,22 @@ export async function runSchemaGate(deps: SchemaGateDeps): Promise<number> {
     line(`${readOnly.ok ? 'ok  ' : 'FAIL'}  the connection is read-only: ${readOnly.detail}`);
     if (!readOnly.ok) return GATE_EXIT.refused;
 
-    const encrypted = proveEncrypted(await readSession(connection.query), connection.localTarget);
+    const encrypted = proveEncrypted(connection.clientTls, connection.localTarget);
     line(`${encrypted.ok ? 'ok  ' : 'FAIL'}  the session is encrypted: ${encrypted.detail}`);
+    try {
+      const serverSession = await readSession(connection.query);
+      line(
+        'note  database-side transport (informational only): pg_stat_ssl ' +
+          (serverSession.ssl === true
+            ? `reports TLS ${String(serverSession.version)}`
+            : 'reports no TLS on the database-facing leg'),
+      );
+    } catch (caught) {
+      line(
+        'note  database-side transport (informational only): pg_stat_ssl could not be read ' +
+          `(${describeError(caught)})`,
+      );
+    }
 
     // Read through a catch: an unreadable count is a FINDING, not a crash. The
     // command exists to report on a database that may be misconfigured, and the
@@ -1312,6 +1354,7 @@ async function openGateConnection(): Promise<GateConnection> {
   client.on('error', reportConnectionError);
   return {
     kind: 'ready',
+    clientTls: observeClientTls(client),
     localTarget: dialsThisMachine(resolution.connection),
     query: async (sql, params) =>
       (await client.query(sql, params === undefined ? undefined : [...params])).rows,
