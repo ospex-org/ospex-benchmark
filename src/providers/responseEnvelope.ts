@@ -110,8 +110,13 @@ export function recordsHttpStatus(rawLeg: unknown): boolean {
  *   2. every leg carries `rawResponse` and no leg carries `answerText`;
  *   3. no leg carries a `responseEnvelope` key at all.
  *
- * Measured over the 47 run files in this repo's `out/` on 2026-08-22: 44
- * separate as coherent archives, 3 as era-stamped, none mixed.
+ * Measured over the 42 run files in this repo's `out/` on 2026-08-22: 39
+ * separate as coherent archives, 3 as era-stamped, none mixed. (The directory
+ * holds 47 `.ndjson`; the other five are not run files and are now refused
+ * before this predicate is reached. The earlier figure here — 44 over 47 —
+ * counted those five, each of which reached this predicate with zero legs and
+ * was classified an archive vacuously. It was the defect below being measured
+ * as if it were data.)
  *
  * WHAT THIS IS NOT. A coherent whole-file rewrite still passes. The envelope is
  * bound to nothing outside the file, so re-sealing an invented body (new text,
@@ -125,9 +130,19 @@ export function recordsHttpStatus(rawLeg: unknown): boolean {
  * SINGLE field decides the exemption; it is not tamper resistance, and nothing
  * here should be read as claiming it.
  *
- * A file with no legs satisfies clause 2 and 3 vacuously, which changes
- * nothing: with no leg to enforce on, both branches produce the same empty
- * result.
+ * ⚠ A file with no legs satisfies clause 2 and 3 vacuously, which changes
+ * nothing HERE: with no leg to enforce on, both branches produce the same empty
+ * result. That is only harmless because every caller establishes the file IS a
+ * run file before asking — `parseRunRecords` by refusing a file with no
+ * `run_meta`, `replaySearchAudits` by the same marker.
+ *
+ * It was NOT harmless before that second check existed, and this sentence used
+ * to stop at "which changes nothing", which is where it went wrong: a fire
+ * artifact is a single JSON object carrying no `arm_game_response` record, so
+ * it reached this predicate with an empty `legs` array and was reported a
+ * coherent pre-retention archive — "envelopes unavailable", at exit 0, about a
+ * file whose bytes had never been read as evidence. The function was correct;
+ * the claim one layer up was not. A new caller owes the same shape check.
  */
 export function isCoherentPreRetentionArchive(run: {
   evidenceEraStamped: boolean;

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
 import { EVIDENCE_ERA, sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { extractGoogleSearchAudit } from './providers/searchAudit.js';
 import { AUDIT_REASON } from './providers/searchAudit.js';
@@ -9,6 +10,8 @@ import {
   REPLAY_ENVELOPE_STATES,
   REPLAY_EXIT,
   replaySearchAudits,
+  RUN_MANIFEST_COUNTS,
+  RUN_RECORD_TYPES,
   runReplayMain,
 } from './searchAuditReplay.js';
 import { damageEnvelope, ENVELOPE_DAMAGE } from './testFactories.js';
@@ -99,8 +102,37 @@ function attemptRecord(fixture: LegFixture): Record<string, unknown> {
   return record;
 }
 
+/**
+ * A `run_meta` line carrying the manifest the completeness gate requires.
+ * HAND-BUILT fixtures must use this: a meta without the manifest blocks, which
+ * is the gate working rather than a fixture bug, and every case below that is
+ * about something else needs to get past it.
+ */
+const metaLine = (extra: Record<string, unknown>, armRecords = 1): string =>
+  JSON.stringify({
+    recordType: 'run_meta',
+    runId: RUN_ID,
+    eligibleGames: 0,
+    armGameResults: armRecords,
+    baselineDecisionCount: 0,
+    excludedGames: 0,
+    ...extra,
+  });
+
 function runLines(fixtures: LegFixture[], options: { era?: boolean } = {}): string[] {
-  const meta: Record<string, unknown> = { recordType: 'run_meta', runId: RUN_ID };
+  // ⚠ THE MANIFEST AGREES BY CONSTRUCTION HERE, and that makes every fixture
+  //   built from this helper a PASS control rather than a test of the
+  //   completeness gate. Any case that must BLOCK has to create the mismatch
+  //   EXPLICITLY — delete a record line without touching the meta — or it is
+  //   asserting against a file this helper could never produce.
+  const meta: Record<string, unknown> = {
+    recordType: 'run_meta',
+    runId: RUN_ID,
+    eligibleGames: 0,
+    armGameResults: fixtures.length,
+    baselineDecisionCount: 0,
+    excludedGames: 0,
+  };
   if (options.era !== false) meta['evidenceEra'] = EVIDENCE_ERA;
   return [
     JSON.stringify(meta),
@@ -466,7 +498,7 @@ test('an era key of the WRONG TYPE is still a stamp — presence, not type', () 
   // are archive-shaped, so nothing but how the stamp is READ can decide this:
   // by presence the file is not an archive and is enforced, by type it would
   // be exempt. Every era carrier can only raise enforcement.
-  const meta = JSON.stringify({ recordType: 'run_meta', runId: RUN_ID, evidenceEra: null });
+  const meta = metaLine({ evidenceEra: null });
   const legLine = JSON.stringify({
     recordType: 'arm_game_response',
     runId: RUN_ID,
@@ -624,7 +656,7 @@ test('the repair leg is replayed too, with its own envelope', () => {
     answerText: 'grounded answer',
   });
   const report = replaySearchAudits([
-    JSON.stringify({ recordType: 'run_meta', runId: RUN_ID, evidenceEra: EVIDENCE_ERA }),
+    metaLine({ evidenceEra: EVIDENCE_ERA }),
     JSON.stringify({
       recordType: 'arm_game_response',
       runId: RUN_ID,
@@ -825,4 +857,329 @@ test('a file that cannot be parsed is named and counted, and the rest still run'
   assert.equal(code, REPLAY_EXIT.blocking);
   assert.equal(out.length, 1, out.join('\n'));
   assert.ok(out[0]!.startsWith('broken.ndjson: unreadable run file: '), out[0]);
+});
+
+// ── shape before verdict — #92 ──────────────────────────────────────────────
+// A fire artifact is a single JSON object with no `arm_game_response` record,
+// so it collected zero legs, `isCoherentPreRetentionArchive` was vacuously true
+// over them, and the command reported "PRE-RETENTION (envelopes unavailable),
+// 0 replayed" at exit 0 — silent under `--quiet`. Reproduced on the real
+// artifact before the fix; that is an evidence verdict about bytes never read
+// as evidence, which is the one conflation this command exists to prevent.
+
+/** A single JSON object on ONE line — the shape a fire artifact actually has. */
+const oneLineObject = (): string => JSON.stringify({ artifactSchemaVersion: 1, arms: [] });
+
+test('a single-JSON-object artifact is REFUSED, not reported as a clean archive', () => {
+  // ⚠ THE FIXTURE MUST BE ONE LINE, and this asserts it before anything else.
+  //   Measured: `JSON.stringify(artifact, null, 2)` is 377 lines, and a
+  //   pretty-printed fixture is already refused on the UNFIXED build — the
+  //   per-line `JSON.parse` throws and the existing catch exits 1. A test
+  //   written that way passes with this whole gate deleted, and would score its
+  //   mutant KILLED while it survived. Only the one-line form discriminates.
+  const text = oneLineObject();
+  assert.equal(text.split('\n').length, 1, 'or the per-line JSON.parse refuses it instead and this proves nothing');
+
+  const { code, out } = cli({ 'fire.json': text }, ['fire.json']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(
+    out.some((line) => line.includes('no NDJSON record carried a recordType')),
+    out.join('\n'),
+  );
+  // ⚠ ASSERTED IN DEFAULT MODE ON PURPOSE. Under `--quiet` this file printed
+  //   nothing at all before the fix, so an absence assertion there is satisfied
+  //   by the broken build. Default mode is where PRE-RETENTION genuinely was
+  //   printed, so this is the line that reddens without the gate.
+  assert.ok(!out.some((line) => line.includes('PRE-RETENTION')), out.join('\n'));
+  assert.ok(!out.some((line) => line.includes('0 replayed')), out.join('\n'));
+});
+
+test('a single-JSON-object artifact is named under --quiet too, and blocks', () => {
+  // Its negative pair is the existing '--quiet prints NOTHING and exits 0 on a
+  // clean file' above: this is refused loudly, that stays silent.
+  const { code, out } = cli({ 'fire.json': oneLineObject() }, ['--quiet', 'fire.json']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.equal(out.length, 1, out.join('\n'));
+  assert.ok(out[0]!.startsWith('fire.json: unreadable run file: '), out[0]);
+});
+
+test('a SIBLING record stream is named but does NOT block', () => {
+  // ⚠ THIS CASE IS THE CONTROL FOR THE WHOLE DESIGN, and the only input that
+  //   separates the shipped gate from the obvious one. Keying the refusal on a
+  //   missing `run_meta` instead of a missing `recordType` agrees with this
+  //   build on all 42 run files and on every other fixture in this suite — and
+  //   would refuse the `-scored.ndjson` that `yarn score` writes beside its
+  //   input BY DEFAULT, plus the close-schedule audits, i.e. 5 files sitting in
+  //   `out/` today and one more per scored run forever. `--quiet out/*.ndjson`
+  //   is the documented directory sweep and is silent at exit 0 today; that
+  //   contract is what this case protects.
+  const scored = '{"recordType":"scored_run_meta","runId":"r"}\n{"recordType":"scored_decision"}\n';
+
+  const { code, out } = cli({ 'r-scored.ndjson': scored }, ['r-scored.ndjson']);
+  assert.equal(code, REPLAY_EXIT.ok, out.join('\n'));
+  assert.ok(out.some((line) => line.includes('not a harness run file')), out.join('\n'));
+  // Named, but still given no envelope verdict — the whole point of the tier.
+  assert.ok(!out.some((line) => line.includes('PRE-RETENTION')), out.join('\n'));
+
+  const quiet = cli({ 'r-scored.ndjson': scored }, ['--quiet', 'r-scored.ndjson']);
+  assert.equal(quiet.code, REPLAY_EXIT.ok);
+  assert.equal(quiet.out.length, 0, quiet.out.join('\n'));
+});
+
+test('a refused artifact does not abort the sweep', () => {
+  // The refusal must `continue`, like the parse failure above — not short-
+  // circuit the way a missing file does at REPLAY_EXIT.usage. The clean file
+  // after it is the control: if the sweep aborted, its legs would go unread.
+  const good = `${runLines([archivedLeg()], { era: false }).join('\n')}\n`;
+  const { code, out } = cli({ 'fire.json': oneLineObject(), 'good.ndjson': good }, [
+    '--quiet',
+    'fire.json',
+    'good.ndjson',
+  ]);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.equal(out.length, 1, out.join('\n'));
+  assert.ok(out[0]!.startsWith('fire.json: unreadable run file: '), out[0]);
+});
+
+// ── a truncated run must not pass as somebody else's stream ────────────────
+// ⚠ A REVIEWER'S BLOCKER, kept closed here. The first version of this gate
+//   asked only whether ANY `recordType` was present. A reviewer deleted ONLY
+//   the `run_meta` line from a real 62-record run — 12 arm_game_response, 3
+//   bundle_game, 21 decision, 24 baseline_decision — and the remainder was
+//   reported "not a harness run file … no envelope verdict" at exit 0, silent
+//   under `--quiet`, hiding the 15 legs the intact file replays. Reproduced
+//   before the fix. Whole-record truncation must not be able to disguise
+//   run-shaped evidence as a benign sibling.
+
+/** A run file with its `run_meta` line removed — `runLines` always emits one
+ *  first, so dropping index 0 is the truncation, and nothing else changes. */
+const truncatedRun = (): string => `${runLines([archivedLeg()], { era: false }).slice(1).join('\n')}\n`;
+
+test('a run file whose run_meta was deleted BLOCKS, and is not called a sibling', () => {
+  const text = truncatedRun();
+  // ⚠ THE FIXTURE MUST STILL CARRY A recordType, or this passes through the
+  //   fire-artifact tier instead and proves nothing about truncation.
+  assert.ok(text.includes('"recordType":"arm_game_response"'), 'or the run-shape tier is never reached');
+  assert.ok(!text.includes('"recordType":"run_meta"'), 'the truncation must actually have happened');
+
+  const { code, out } = cli({ 'truncated.ndjson': text }, ['truncated.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  // ⚠ THE MESSAGE, not just the exit code: a fixture that accidentally carried
+  //   no recordType at all would also exit 1, via the fire-artifact tier, and
+  //   this test would pass for a reason unrelated to truncation.
+  assert.ok(
+    out.some((line) => line.includes('carrying 0 run_meta records')),
+    out.join('\n'),
+  );
+  assert.ok(!out.some((line) => line.includes('not a harness run file')), out.join('\n'));
+});
+
+test('a truncated run is named under --quiet too', () => {
+  const { code, out } = cli({ 'truncated.ndjson': truncatedRun() }, ['--quiet', 'truncated.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.equal(out.length, 1, out.join('\n'));
+  assert.ok(out[0]!.startsWith('truncated.ndjson: unreadable run file: '), out[0]);
+});
+
+test('a MIXED stream — sibling records beside run records — blocks on the run records', () => {
+  // The case the two tiers can disagree about. A sibling family is silent, run
+  // records are not, and a stream carrying both is a run file with something
+  // else concatenated onto it — never a reason to go quiet.
+  const mixed = `{"recordType":"scored_run_meta","runId":"r"}\n${truncatedRun()}`;
+  const { code, out } = cli({ 'mixed.ndjson': mixed }, ['mixed.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(out.some((line) => line.includes('carrying 0 run_meta records')), out.join('\n'));
+});
+
+test('a run file carrying TWO run_meta records blocks — identity is ambiguous', () => {
+  // The other half of "exactly one". The scorer refuses this outright; a reader
+  // that silently took the last one would attribute legs to whichever record
+  // happened to sort later.
+  const lines = runLines([archivedLeg()], { era: false });
+  const doubled = `${[lines[0]!, ...lines].join('\n')}\n`;
+  const { code, out } = cli({ 'doubled.ndjson': doubled }, ['doubled.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(out.some((line) => line.includes('carrying 2 run_meta records')), out.join('\n'));
+});
+
+test('...and the negative control: exactly one run_meta still replays normally', () => {
+  // Without this, every case above passes on a build that blocks everything —
+  // which is the regression the sibling tier exists to prevent.
+  const { code, out } = cli({ 'good.ndjson': `${runLines([archivedLeg()], { era: false }).join('\n')}\n` }, [
+    'good.ndjson',
+  ]);
+  assert.equal(code, REPLAY_EXIT.ok, out.join('\n'));
+  assert.ok(out.some((line) => line.includes('PRE-RETENTION')), out.join('\n'));
+});
+
+test('a run_meta with no runId still reports its legs, under "run (unknown)"', () => {
+  // ⚠ THE OVER-BLOCKING CONTROL for the three cases above, and a deliberate
+  //   limit on how strict this gate gets. The blocker they close is evidence
+  //   being HIDDEN; a damaged identity record hides nothing — every leg is still
+  //   read and reported. Refusing it would throw away a readable evidence report
+  //   over a cosmetic defect and make this reader stricter than the shapes it
+  //   exists to read. The scorer, whose subject IS the run rather than the legs,
+  //   strict-parses run_meta and is the right place for that.
+  //
+  //   Asked adversarially rather than assumed: what does tolerating this let
+  //   someone do that "run-shaped evidence cannot be disguised" forbids?
+  //   Nothing — the legs are all reported, and the identity is printed as
+  //   unknown rather than guessed.
+  const lines = runLines([archivedLeg()], { era: false });
+  const meta = JSON.parse(lines[0]!) as Record<string, unknown>;
+  delete meta['runId'];
+  const text = `${[JSON.stringify(meta), ...lines.slice(1)].join('\n')}\n`;
+
+  const { code, out } = cli({ 'noid.ndjson': text }, ['noid.ndjson']);
+  assert.equal(code, REPLAY_EXIT.ok, out.join('\n'));
+  assert.ok(out.some((line) => line.includes('run (unknown)')), out.join('\n'));
+  // The legs are the point: a build that blocked here would report none.
+  assert.ok(out.some((line) => line.includes('1 envelope-unavailable')), out.join('\n'));
+});
+
+// ── a run file that kept its identity and lost its EVIDENCE ────────────────
+// ⚠ THE SECOND BLOCKER, and the sharper one. `run_meta` is line 1; the
+//   `arm_game_response` records run through the tail. So TAIL truncation — a
+//   full disk, `head -n`, an interrupted copy — keeps the identity record and
+//   destroys the evidence, and the gate above only guards identity.
+//
+//   Measured on a real 62-record run before this existed: truncating from the
+//   end walked the leg count 15 → 14 → 12 → 9 → 2 → 0 with exit 0 and ZERO
+//   bytes under `--quiet` at EVERY rung. On the era-stamped run it printed
+//   "evidence era response-envelope-v1, 0 replayed, 0 unretained, 0 unreadable"
+//   — an affirmative clean verdict carrying a real runId, on a file that had
+//   lost all 15 legs. That is the same output the fire-artifact case above
+//   asserts must never appear.
+//
+//   Root cause: every blocking signal is PER-LEG, so a file with zero legs
+//   cannot block, and deleting evidence is the one corruption that makes a file
+//   quieter. Only the shape gate can carry it.
+
+test('a run file whose RECORDS were truncated blocks, at the first missing one', () => {
+  // The mismatch is created EXPLICITLY — a record line deleted without touching
+  // the meta — because `runLines` makes the manifest agree by construction, so
+  // a fixture built any other way would be asserting against a file this helper
+  // could never produce.
+  const lines = runLines([archivedLeg(), archivedLeg()], { era: false });
+  assert.equal(lines.length, 3, 'one meta and two arm records, or the truncation below is not one');
+  const truncated = `${lines.slice(0, -1).join('\n')}\n`;
+
+  const { code, out } = cli({ 'cut.ndjson': truncated }, ['cut.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(
+    out.some((line) => line.includes('says 2 armGameResults but 1 arm_game_response records survive')),
+    out.join('\n'),
+  );
+  // The verdict the intact file would have printed must NOT appear: naming the
+  // count is the point, and a partial envelope verdict beside it would be the
+  // thing this gate exists to prevent.
+  assert.ok(!out.some((line) => line.includes('replayed,')), out.join('\n'));
+});
+
+test('a truncated run cannot be restored by appending a bare run_meta', () => {
+  // The cheapest bypass of the identity gate, and it is 26 bytes: a truncated
+  // run has no `run_meta`, so appending an empty one makes the count exactly
+  // one and the file reads as whole again. The manifest is what closes it —
+  // absence blocks, because records.ts writes all four unconditionally and
+  // three are required by the scorer's own schema.
+  const truncated = runLines([archivedLeg()], { era: false }).slice(1).join('\n');
+  const bypass = `${truncated}\n{"recordType":"run_meta"}\n`;
+
+  const { code, out } = cli({ 'bypass.ndjson': bypass }, ['--quiet', 'bypass.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(out.some((line) => line.includes('declares no armGameResults')), out.join('\n'));
+});
+
+test('...and NO FLOOR is imposed: a run that produced no arm records is whole', () => {
+  // The over-blocking control for the two cases above. A run where every arm
+  // failed identity binding legitimately declares `armGameResults: 0` and
+  // carries no arm records. Blocking it would refuse a real run for having
+  // nothing to say, which is a different claim from having lost what it said.
+  const empty = `${metaLine({ evidenceEra: EVIDENCE_ERA }, 0)}\n`;
+  const { code, out } = cli({ 'empty.ndjson': empty }, ['empty.ndjson']);
+  assert.equal(code, REPLAY_EXIT.ok, out.join('\n'));
+  assert.ok(out.some((line) => line.includes('0 replayed')), out.join('\n'));
+});
+
+test('an arm record with no readable initial attempt blocks, in all three shapes', () => {
+  // ⚠ A REVIEWER'S BLOCKER. The record still carries `recordType`, so it counts
+  //   toward `armGameResults` and the manifest keeps AGREEING while the leg it
+  //   is counting is gone. Measured on a real 376-record run: each of these
+  //   three left exit 0 with zero bytes under `--quiet`. The scorer refuses all
+  //   three ("Expected object, received null" / "Required").
+  const [meta, arm] = runLines([archivedLeg()], { era: false });
+  const record = JSON.parse(arm!) as Record<string, unknown>;
+  const absent = { ...record };
+  delete absent['attempt'];
+  const shapes: Array<[string, string]> = [
+    ['attempt: null', JSON.stringify({ ...record, attempt: null })],
+    ['attempt absent', JSON.stringify(absent)],
+    ['bare record', JSON.stringify({ recordType: 'arm_game_response' })],
+  ];
+  for (const [name, line] of shapes) {
+    const text = [meta!, line, ''].join('\n');
+    const { code, out } = cli({ 'arm.ndjson': text }, ['--quiet', 'arm.ndjson']);
+    assert.equal(code, REPLAY_EXIT.blocking, `${name}: ${out.join(' | ')}`);
+    assert.ok(
+      out.some((l) => l.includes('carry no readable initial attempt')),
+      `${name}: ${out.join(' | ')}`,
+    );
+  }
+});
+
+test('...and a null REPAIR stays legitimate — every clean record carries one', () => {
+  // The over-blocking control. `records.ts` writes `repair: null` for every
+  // attempt that needed none, so applying the same rule to both legs would
+  // refuse every run file in existence.
+  const text = [...runLines([archivedLeg()], { era: false }), ''].join('\n');
+  assert.ok(text.includes('"repair":null'), 'or this control does not exercise the case');
+  const { code, out } = cli({ 'ok.ndjson': text }, ['--quiet', 'ok.ndjson']);
+  assert.equal(code, REPLAY_EXIT.ok, out.join(' | '));
+});
+
+test('RUN_MANIFEST_COUNTS is coupled to both of its sources', () => {
+  // Two drift assertions, because the map has two ends and either can rot.
+  const source = readFileSync(new URL('./records.ts', import.meta.url), 'utf8')
+    .split('\n')
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join('\n');
+  for (const field of RUN_MANIFEST_COUNTS.keys()) {
+    // KEY end: the field must still be one records.ts writes into run_meta. If
+    // it stops writing one, this reddens in CI rather than blocking an operator
+    // at runtime — CI and the runtime gate must not disagree.
+    assert.ok(source.includes(`${field}:`), `records.ts no longer writes ${field}`);
+  }
+  for (const recordType of RUN_MANIFEST_COUNTS.values()) {
+    // VALUE end: counting a record type the shape gate does not recognise would
+    // let the two sets drift apart independently.
+    assert.ok(RUN_RECORD_TYPES.has(recordType), `${recordType} is not a run record type`);
+  }
+});
+
+test('RUN_RECORD_TYPES tracks what records.ts actually writes', () => {
+  // Drift guard, anchored on executable object-literal syntax rather than on
+  // prose. `records.ts` is the only producer of a run file, so its
+  // `recordType: '…'` literals ARE the run vocabulary — and it is the right
+  // authority rather than the scorer's switch, whose `default: break` means it
+  // TOLERATES types it does not know. If records.ts gains one and this set does
+  // not, a stream carrying only that new type stops counting as run-shaped and
+  // a truncated run could pass as a sibling again.
+  const source = readFileSync(new URL('./records.ts', import.meta.url), 'utf8')
+    .split('\n')
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join('\n');
+  const written = new Set([...source.matchAll(/recordType: '([a-z_]+)'/g)].map((match) => match[1]!));
+  assert.ok(written.size > 1, 'the extraction matched nothing, so this asserts nothing');
+  written.delete('run_meta'); // the identity record itself, not a shape marker
+  assert.deepEqual([...written].sort(), [...RUN_RECORD_TYPES].sort());
+});
+
+test('the library refuses the unrecognised shape too, not only the CLI', () => {
+  // The exported reader is the API a future caller reaches for; a guard that
+  // lived only in the CLI would leave it reporting the vacuous verdict.
+  assert.throws(() => replaySearchAudits([oneLineObject()]), /not a harness run file/);
+  // ...and the sibling tier RETURNS rather than throwing, which is what keeps
+  // the directory sweep quiet. Paired here so one cannot be changed alone.
+  assert.doesNotThrow(() => replaySearchAudits(['{"recordType":"scored_run_meta"}']));
+  assert.equal(replaySearchAudits(['{"recordType":"scored_run_meta"}']).isRunFile, false);
 });
