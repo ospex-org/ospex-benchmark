@@ -335,6 +335,7 @@ export function replaySearchAudits(
   let sawRunRecord = false;
   let runMeta: Record<string, unknown> | null = null;
   const recordCounts = new Map<string, number>();
+  const armsWithoutAttempt: string[] = [];
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
@@ -360,6 +361,18 @@ export function replaySearchAudits(
     const participantId = typeof record['participantId'] === 'string' ? record['participantId'] : '';
     const gameId = typeof record['gameId'] === 'string' ? record['gameId'] : '';
     const provider = typeof record['provider'] === 'string' ? record['provider'] : '';
+    // ⚠ THE INITIAL ATTEMPT IS MANDATORY; the repair is not. `asRecord` returns
+    //   null for absent, explicit `null`, an array and a scalar alike, and the
+    //   `continue` below then skips the leg — which is right for `repair`, since
+    //   most records legitimately carry `repair: null`, and WRONG for `attempt`.
+    //   The record still counts toward `armGameResults`, so the manifest keeps
+    //   agreeing while a mandatory evidence leg is gone. Measured on a real
+    //   376-record run: `attempt: null`, a deleted `attempt` key, and a row
+    //   reduced to `{"recordType":"arm_game_response"}` each left exit 0 with
+    //   zero bytes under `--quiet`. The scorer refuses all three.
+    if (asRecord(record['attempt']) === null) {
+      armsWithoutAttempt.push(`${participantId || '(no participantId)'}:${gameId || '(no gameId)'}`);
+    }
     for (const name of ['attempt', 'repair'] as const) {
       const attempt = asRecord(record[name]);
       if (attempt === null) continue;
@@ -459,6 +472,15 @@ export function replaySearchAudits(
   //   legitimately declares `armGameResults: 0` and carries no arm records, and
   //   passes. Measured: 42/42 run files in `out/` carry all four fields and all
   //   four agree exactly, so this costs the documented sweep nothing.
+  if (armsWithoutAttempt.length > 0) {
+    const shown = armsWithoutAttempt.slice(0, 10);
+    throw new Error(
+      `${armsWithoutAttempt.length} arm_game_response record(s) carry no readable initial attempt: ` +
+        `${shown.join(', ')}${armsWithoutAttempt.length > shown.length ? ' …' : ''} ` +
+        '(the record still counts toward armGameResults, so the manifest agrees while the evidence ' +
+        'it is counting is gone)',
+    );
+  }
   const incomplete: string[] = [];
   for (const [field, recordType] of RUN_MANIFEST_COUNTS) {
     const meta = runMeta ?? {};

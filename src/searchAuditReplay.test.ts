@@ -1101,6 +1101,42 @@ test('...and NO FLOOR is imposed: a run that produced no arm records is whole', 
   assert.ok(out.some((line) => line.includes('0 replayed')), out.join('\n'));
 });
 
+test('an arm record with no readable initial attempt blocks, in all three shapes', () => {
+  // ⚠ A REVIEWER'S BLOCKER. The record still carries `recordType`, so it counts
+  //   toward `armGameResults` and the manifest keeps AGREEING while the leg it
+  //   is counting is gone. Measured on a real 376-record run: each of these
+  //   three left exit 0 with zero bytes under `--quiet`. The scorer refuses all
+  //   three ("Expected object, received null" / "Required").
+  const [meta, arm] = runLines([archivedLeg()], { era: false });
+  const record = JSON.parse(arm!) as Record<string, unknown>;
+  const absent = { ...record };
+  delete absent['attempt'];
+  const shapes: Array<[string, string]> = [
+    ['attempt: null', JSON.stringify({ ...record, attempt: null })],
+    ['attempt absent', JSON.stringify(absent)],
+    ['bare record', JSON.stringify({ recordType: 'arm_game_response' })],
+  ];
+  for (const [name, line] of shapes) {
+    const text = [meta!, line, ''].join('\n');
+    const { code, out } = cli({ 'arm.ndjson': text }, ['--quiet', 'arm.ndjson']);
+    assert.equal(code, REPLAY_EXIT.blocking, `${name}: ${out.join(' | ')}`);
+    assert.ok(
+      out.some((l) => l.includes('carry no readable initial attempt')),
+      `${name}: ${out.join(' | ')}`,
+    );
+  }
+});
+
+test('...and a null REPAIR stays legitimate — every clean record carries one', () => {
+  // The over-blocking control. `records.ts` writes `repair: null` for every
+  // attempt that needed none, so applying the same rule to both legs would
+  // refuse every run file in existence.
+  const text = [...runLines([archivedLeg()], { era: false }), ''].join('\n');
+  assert.ok(text.includes('"repair":null'), 'or this control does not exercise the case');
+  const { code, out } = cli({ 'ok.ndjson': text }, ['--quiet', 'ok.ndjson']);
+  assert.equal(code, REPLAY_EXIT.ok, out.join(' | '));
+});
+
 test('RUN_MANIFEST_COUNTS is coupled to both of its sources', () => {
   // Two drift assertions, because the map has two ends and either can rot.
   const source = readFileSync(new URL('./records.ts', import.meta.url), 'utf8')
