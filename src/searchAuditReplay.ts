@@ -79,6 +79,29 @@ export const RUN_RECORD_TYPES: ReadonlySet<string> = new Set([
   'run_failure',
 ]);
 
+/**
+ * The counts a run file declares about ITSELF, mapped to the record type each
+ * one counts. `records.ts` writes all four into `run_meta` unconditionally.
+ *
+ * This is what gives an NDJSON file a length header. Identity (`run_meta`
+ * present, exactly once) says the file is a run; these say the file is WHOLE.
+ * They are an INDEPENDENT witness rather than a restatement: `records.ts`
+ * computes each from the run context at write time — the slate, the excluded
+ * list, the results array — not from the record array a reader would be
+ * counting. A reader comparing them is comparing two derivations, which is the
+ * only kind of cross-check worth having.
+ *
+ * Three of the four are REQUIRED by the scorer's own `runMetaSchema`, so a
+ * `run_meta` lacking them is a hand edit rather than an era. `excludedGames` is
+ * the exception, and the drift test holds it.
+ */
+export const RUN_MANIFEST_COUNTS: ReadonlyMap<string, string> = new Map([
+  ['eligibleGames', 'bundle_game'],
+  ['armGameResults', 'arm_game_response'],
+  ['baselineDecisionCount', 'baseline_decision'],
+  ['excludedGames', 'excluded_game'],
+]);
+
 /** Why an attempt could not be replayed, or that it could. */
 export type ReplayEnvelopeState =
   | 'retained'
@@ -310,6 +333,8 @@ export function replaySearchAudits(
   let runMetaCount = 0;
   let sawRecordType = false;
   let sawRunRecord = false;
+  let runMeta: Record<string, unknown> | null = null;
+  const recordCounts = new Map<string, number>();
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
@@ -319,9 +344,11 @@ export function replaySearchAudits(
     if (typeof recordType === 'string') {
       sawRecordType = true;
       if (RUN_RECORD_TYPES.has(recordType)) sawRunRecord = true;
+      recordCounts.set(recordType, (recordCounts.get(recordType) ?? 0) + 1);
     }
     if (recordType === 'run_meta') {
       runMetaCount += 1;
+      runMeta = record;
       if (typeof record['runId'] === 'string') runId = record['runId'];
       // Presence, not type: a stamp of the wrong type is still a stamp, and
       // reading it as absent would hand a modern file the archive exemption.
@@ -400,6 +427,59 @@ export function replaySearchAudits(
       legs: [],
       counts: { retained: 0, unavailable: 0, unretained: 0, unreadable: 0, changed: 0 },
     };
+  }
+  // ⚠ COMPLETENESS, AFTER IDENTITY. The gate above catches a run file that lost
+  //   its `run_meta`; this catches one that KEPT it and lost the records.
+  //
+  //   Measured on a real 62-record run, truncating at line boundaries from the
+  //   end: the leg count walked 15 → 14 → 12 → 9 → 2 → 0 with exit 0 and ZERO
+  //   bytes under `--quiet` at every rung. On the era-stamped run it printed
+  //   "evidence era response-envelope-v1, 0 replayed, 0 unretained, 0
+  //   unreadable" — an affirmative clean verdict, carrying a REAL runId, on a
+  //   file that had lost all 15 legs. That is the same output this file's own
+  //   fire-artifact case asserts must never appear.
+  //
+  //   Only the shape gate can carry this. Every blocking signal below is
+  //   PER-LEG (`blocking += counts.unreadable + counts.unretained`), so a file
+  //   with zero legs cannot block — and deleting evidence is the one corruption
+  //   that makes a file QUIETER.
+  //
+  //   The manifest is an INDEPENDENT witness (3d-witness): `records.ts` computes
+  //   these four from the run context at write time — the slate, the excluded
+  //   list, the results array — not from the record array this reader counts.
+  //
+  //   ABSENCE BLOCKS (rule 3k — a skip is an opt-out unless the skipped case is
+  //   unreachable). `records.ts` writes all four unconditionally and three are
+  //   required by the scorer's own schema, so a `run_meta` without them is a
+  //   hand edit, not an era. That also closes the cheapest bypass of the gate
+  //   above: appending a bare `{"recordType":"run_meta"}` to a truncated run
+  //   restored it to exit 0 before this existed.
+  //
+  //   NO FLOOR IS IMPOSED. A run where every arm failed identity binding
+  //   legitimately declares `armGameResults: 0` and carries no arm records, and
+  //   passes. Measured: 42/42 run files in `out/` carry all four fields and all
+  //   four agree exactly, so this costs the documented sweep nothing.
+  const incomplete: string[] = [];
+  for (const [field, recordType] of RUN_MANIFEST_COUNTS) {
+    const meta = runMeta ?? {};
+    if (!Object.hasOwn(meta, field)) {
+      incomplete.push(`run_meta declares no ${field}`);
+      continue;
+    }
+    const declared = meta[field];
+    const actual = recordCounts.get(recordType) ?? 0;
+    if (declared !== actual) {
+      incomplete.push(
+        `run_meta says ${String(declared)} ${field} but ${String(actual)} ${recordType} records survive`,
+      );
+    }
+  }
+  if (incomplete.length > 0) {
+    throw new Error(
+      `this run file is incomplete: ${incomplete.join('; ')} ` +
+        '(records were deleted after the run wrote it, so any envelope verdict would describe ' +
+        'a subset of the evidence without saying so)',
+    );
   }
   const preRetentionArchive = isCoherentPreRetentionArchive({
     evidenceEraStamped,

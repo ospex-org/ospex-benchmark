@@ -10,6 +10,7 @@ import {
   REPLAY_ENVELOPE_STATES,
   REPLAY_EXIT,
   replaySearchAudits,
+  RUN_MANIFEST_COUNTS,
   RUN_RECORD_TYPES,
   runReplayMain,
 } from './searchAuditReplay.js';
@@ -101,8 +102,37 @@ function attemptRecord(fixture: LegFixture): Record<string, unknown> {
   return record;
 }
 
+/**
+ * A `run_meta` line carrying the manifest the completeness gate requires.
+ * HAND-BUILT fixtures must use this: a meta without the manifest blocks, which
+ * is the gate working rather than a fixture bug, and every case below that is
+ * about something else needs to get past it.
+ */
+const metaLine = (extra: Record<string, unknown>, armRecords = 1): string =>
+  JSON.stringify({
+    recordType: 'run_meta',
+    runId: RUN_ID,
+    eligibleGames: 0,
+    armGameResults: armRecords,
+    baselineDecisionCount: 0,
+    excludedGames: 0,
+    ...extra,
+  });
+
 function runLines(fixtures: LegFixture[], options: { era?: boolean } = {}): string[] {
-  const meta: Record<string, unknown> = { recordType: 'run_meta', runId: RUN_ID };
+  // ⚠ THE MANIFEST AGREES BY CONSTRUCTION HERE, and that makes every fixture
+  //   built from this helper a PASS control rather than a test of the
+  //   completeness gate. Any case that must BLOCK has to create the mismatch
+  //   EXPLICITLY — delete a record line without touching the meta — or it is
+  //   asserting against a file this helper could never produce.
+  const meta: Record<string, unknown> = {
+    recordType: 'run_meta',
+    runId: RUN_ID,
+    eligibleGames: 0,
+    armGameResults: fixtures.length,
+    baselineDecisionCount: 0,
+    excludedGames: 0,
+  };
   if (options.era !== false) meta['evidenceEra'] = EVIDENCE_ERA;
   return [
     JSON.stringify(meta),
@@ -468,7 +498,7 @@ test('an era key of the WRONG TYPE is still a stamp — presence, not type', () 
   // are archive-shaped, so nothing but how the stamp is READ can decide this:
   // by presence the file is not an archive and is enforced, by type it would
   // be exempt. Every era carrier can only raise enforcement.
-  const meta = JSON.stringify({ recordType: 'run_meta', runId: RUN_ID, evidenceEra: null });
+  const meta = metaLine({ evidenceEra: null });
   const legLine = JSON.stringify({
     recordType: 'arm_game_response',
     runId: RUN_ID,
@@ -626,7 +656,7 @@ test('the repair leg is replayed too, with its own envelope', () => {
     answerText: 'grounded answer',
   });
   const report = replaySearchAudits([
-    JSON.stringify({ recordType: 'run_meta', runId: RUN_ID, evidenceEra: EVIDENCE_ERA }),
+    metaLine({ evidenceEra: EVIDENCE_ERA }),
     JSON.stringify({
       recordType: 'arm_game_response',
       runId: RUN_ID,
@@ -1005,6 +1035,89 @@ test('a run_meta with no runId still reports its legs, under "run (unknown)"', (
   assert.ok(out.some((line) => line.includes('run (unknown)')), out.join('\n'));
   // The legs are the point: a build that blocked here would report none.
   assert.ok(out.some((line) => line.includes('1 envelope-unavailable')), out.join('\n'));
+});
+
+// ── a run file that kept its identity and lost its EVIDENCE ────────────────
+// ⚠ THE SECOND BLOCKER, and the sharper one. `run_meta` is line 1; the
+//   `arm_game_response` records run through the tail. So TAIL truncation — a
+//   full disk, `head -n`, an interrupted copy — keeps the identity record and
+//   destroys the evidence, and the gate above only guards identity.
+//
+//   Measured on a real 62-record run before this existed: truncating from the
+//   end walked the leg count 15 → 14 → 12 → 9 → 2 → 0 with exit 0 and ZERO
+//   bytes under `--quiet` at EVERY rung. On the era-stamped run it printed
+//   "evidence era response-envelope-v1, 0 replayed, 0 unretained, 0 unreadable"
+//   — an affirmative clean verdict carrying a real runId, on a file that had
+//   lost all 15 legs. That is the same output the fire-artifact case above
+//   asserts must never appear.
+//
+//   Root cause: every blocking signal is PER-LEG, so a file with zero legs
+//   cannot block, and deleting evidence is the one corruption that makes a file
+//   quieter. Only the shape gate can carry it.
+
+test('a run file whose RECORDS were truncated blocks, at the first missing one', () => {
+  // The mismatch is created EXPLICITLY — a record line deleted without touching
+  // the meta — because `runLines` makes the manifest agree by construction, so
+  // a fixture built any other way would be asserting against a file this helper
+  // could never produce.
+  const lines = runLines([archivedLeg(), archivedLeg()], { era: false });
+  assert.equal(lines.length, 3, 'one meta and two arm records, or the truncation below is not one');
+  const truncated = `${lines.slice(0, -1).join('\n')}\n`;
+
+  const { code, out } = cli({ 'cut.ndjson': truncated }, ['cut.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(
+    out.some((line) => line.includes('says 2 armGameResults but 1 arm_game_response records survive')),
+    out.join('\n'),
+  );
+  // The verdict the intact file would have printed must NOT appear: naming the
+  // count is the point, and a partial envelope verdict beside it would be the
+  // thing this gate exists to prevent.
+  assert.ok(!out.some((line) => line.includes('replayed,')), out.join('\n'));
+});
+
+test('a truncated run cannot be restored by appending a bare run_meta', () => {
+  // The cheapest bypass of the identity gate, and it is 26 bytes: a truncated
+  // run has no `run_meta`, so appending an empty one makes the count exactly
+  // one and the file reads as whole again. The manifest is what closes it —
+  // absence blocks, because records.ts writes all four unconditionally and
+  // three are required by the scorer's own schema.
+  const truncated = runLines([archivedLeg()], { era: false }).slice(1).join('\n');
+  const bypass = `${truncated}\n{"recordType":"run_meta"}\n`;
+
+  const { code, out } = cli({ 'bypass.ndjson': bypass }, ['--quiet', 'bypass.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(out.some((line) => line.includes('declares no armGameResults')), out.join('\n'));
+});
+
+test('...and NO FLOOR is imposed: a run that produced no arm records is whole', () => {
+  // The over-blocking control for the two cases above. A run where every arm
+  // failed identity binding legitimately declares `armGameResults: 0` and
+  // carries no arm records. Blocking it would refuse a real run for having
+  // nothing to say, which is a different claim from having lost what it said.
+  const empty = `${metaLine({ evidenceEra: EVIDENCE_ERA }, 0)}\n`;
+  const { code, out } = cli({ 'empty.ndjson': empty }, ['empty.ndjson']);
+  assert.equal(code, REPLAY_EXIT.ok, out.join('\n'));
+  assert.ok(out.some((line) => line.includes('0 replayed')), out.join('\n'));
+});
+
+test('RUN_MANIFEST_COUNTS is coupled to both of its sources', () => {
+  // Two drift assertions, because the map has two ends and either can rot.
+  const source = readFileSync(new URL('./records.ts', import.meta.url), 'utf8')
+    .split('\n')
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join('\n');
+  for (const field of RUN_MANIFEST_COUNTS.keys()) {
+    // KEY end: the field must still be one records.ts writes into run_meta. If
+    // it stops writing one, this reddens in CI rather than blocking an operator
+    // at runtime — CI and the runtime gate must not disagree.
+    assert.ok(source.includes(`${field}:`), `records.ts no longer writes ${field}`);
+  }
+  for (const recordType of RUN_MANIFEST_COUNTS.values()) {
+    // VALUE end: counting a record type the shape gate does not recognise would
+    // let the two sets drift apart independently.
+    assert.ok(RUN_RECORD_TYPES.has(recordType), `${recordType} is not a run record type`);
+  }
 });
 
 test('RUN_RECORD_TYPES tracks what records.ts actually writes', () => {
