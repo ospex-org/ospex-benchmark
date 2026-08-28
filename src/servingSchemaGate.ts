@@ -460,6 +460,29 @@ async function countsOrNull(query: GateQuery): Promise<string | null> {
  * gain one: `servingSchemaGate.test.ts` refuses any entry for them by
  * construction.
  *
+ * ON PUBLISHING THESE SIGNATURES, which this file is the first public place to
+ * do. The repository defining these routines is private, so committing the
+ * exact `role -> function(arguments)` pairs here is a disclosure, and it is a
+ * deliberate one rather than an incidental one.
+ *
+ * A function name is not a credential. Reaching any of these requires EXECUTE,
+ * and every one has had EXECUTE revoked from `PUBLIC`, `anon` and
+ * `authenticated` and granted to `service_role` alone, under a pinned
+ * `search_path`, by the indexer's RPC-lockdown migrations. The control is that
+ * privilege grid — which is exactly what the check below re-verifies on every
+ * run against the live catalog — and not the obscurity of the names.
+ *
+ * That the grid is the real control was measured rather than assumed: before
+ * the lockdown, an anon-key POST to one of these RPCs through PostgREST
+ * returned 200. What closed it was the REVOKE. Nothing about the names changed,
+ * and nothing about them would have helped.
+ *
+ * The alternatives were considered and rejected for the same reason. A digest
+ * per entry, or an operator-side file, would move this list out of review
+ * without moving the reachability of anything in it — and an exemption nobody
+ * can read is an exemption nobody can challenge, which is the opposite of what
+ * declaring them here is for.
+ *
  * First measured against the live project 2026-08-21, immediately after the
  * scores-capability migration: these eighteen were the whole list, none of
  * their names carried a second overload, the writer and browser keys held
@@ -1046,17 +1069,48 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
         [[...FORBIDDEN_READERS, READ_API_ROLE]],
       );
       if (rows.length === 0) {
-        return { ok: true, detail: 'no role this gate checks may execute a SECURITY DEFINER function' };
+        // ⚠ THE UNMATCHED COUNT IS REPORTED HERE TOO, AND NEVER AS A PRUNE
+        //   INSTRUCTION. An empty census is the state in which a stale
+        //   acceptance matters MOST on the live projection — every declared
+        //   entry is unmatched, which is what a wholesale EXECUTE revoke looks
+        //   like — and it is also exactly what a clean scratch catalog looks
+        //   like on its first run. From here the gate cannot tell those apart,
+        //   so it states the count and says nothing about what to do with it.
+        //   Eighteen pruning instructions on a healthy scratch database is how
+        //   a gate teaches people to skip it.
+        //
+        //   Anyone extending this branch should know the conformance suite's
+        //   empty-scratch scenario anchors its assertion with `^`, so an
+        //   appended suffix passes it SILENTLY and it cannot be relied on to
+        //   catch a regression here. `servingSchemaGate.test.ts` pins this
+        //   branch instead, and that file is in `yarn test`.
+        const declared = DECLARED_DEFINER_EXEMPTIONS.size;
+        return {
+          ok: true,
+          detail:
+            'no role this gate checks may execute a SECURITY DEFINER function' +
+            (declared > 0 ? `; ${declared} declared exemption(s) matched nothing here` : ''),
+        };
       }
       const exempt: string[] = [];
+      const exemptFromExtension: string[] = [];
       const violating: string[] = [];
       const present = new Set<string>();
       for (const row of rows) {
         const entry = `${String(row['role'])} -> ${String(row['fn'])}`;
         present.add(entry);
-        const platform = row['from_extension'] === true ? ' [extension]' : '';
-        (isExemptDefiner(String(row['role']), String(row['fn'])) ? exempt : violating)
-          .push(`${entry}${platform}`);
+        const fromExtension = row['from_extension'] === true;
+        const platform = fromExtension ? ' [extension]' : '';
+        if (isExemptDefiner(String(row['role']), String(row['fn']))) {
+          exempt.push(`${entry}${platform}`);
+          // Tracked as it is classified rather than recovered afterwards by
+          // matching the ' [extension]' suffix back off the string: a function
+          // whose own name ended that way would be miscounted, and the two
+          // would drift the first time the annotation's wording changed.
+          if (fromExtension) exemptFromExtension.push(`${entry}${platform}`);
+        } else {
+          violating.push(`${entry}${platform}`);
+        }
       }
       if (violating.length > 0) {
         // The verdict was computed over EVERY row; only the display truncates,
@@ -1078,11 +1132,23 @@ export const SERVING_SCHEMA_CHECKS: readonly GateCheck[] = [
       // be removed, but a gate that reddens on a healthy database because the
       // protocol refactored an RPC is a gate people learn to skip.
       const unused = [...DECLARED_DEFINER_EXEMPTIONS].filter((entry) => !present.has(entry));
+      // ⚠ `[extension]` IS READ ON THIS PATH TOO, or it is computed for every
+      //   accepted row and printed for none — live on the fail branch above and
+      //   dead here, which is a state no fixture in either suite ever set and
+      //   no assertion ever noticed. Naming the extension-owned acceptances
+      //   rather than all eighteen keeps the detail short while surfacing the
+      //   one CATEGORY that differs: an extension's function is not the
+      //   protocol's own write path, which is the reason the entries above are
+      //   argued safe, so an exemption covering one deserves re-reading.
       return {
         ok: true,
         detail:
           `${exempt.length} definer grant(s), every one a declared exemption ` +
           `(service_role's own protocol write path)` +
+          (exemptFromExtension.length > 0
+            ? `; ${exemptFromExtension.length} owned by an installed extension: ` +
+              `${exemptFromExtension.join(', ')}`
+            : '') +
           (unused.length > 0 ? `; declared but no longer present, prune: ${unused.join(', ')}` : ''),
       };
     },

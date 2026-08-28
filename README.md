@@ -447,6 +447,19 @@ It also asks the questions a privilege grid alone cannot answer:
   Such a function runs as its owner, so `EXECUTE` on one is a door around the
   whole grid — and `EXECUTE` is granted to `PUBLIC` by default.
 
+**When that last check fires, it is telling you a definer function is reachable
+that nobody has reviewed.** The fix is to revoke `EXECUTE`, or — if the grant is
+genuinely wanted — to add the exact `role -> schema.function(identity
+arguments)` pair to `DECLARED_DEFINER_EXEMPTIONS` in `src/servingSchemaGate.ts`
+with its own reasoning. The declared entries are the read API's own protocol
+write path; they are committed here, in a public repository, deliberately. A
+function name is not a credential, the privilege grid this check re-reads on
+every run is the actual control, and an exemption nobody can read is an
+exemption nobody can challenge. That docblock carries the full argument and the
+measurement behind it. On a healthy database the check also reports any declared
+entry the catalog no longer carries, so a stale exemption is visible rather than
+silently widening.
+
 It is read-only and proves it: the connection carries
 `default_transaction_read_only=on`, the server is made to refuse a write before
 anything else is asked, and the row counts are compared before and after. That

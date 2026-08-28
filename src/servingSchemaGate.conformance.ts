@@ -457,6 +457,19 @@ try {
     const verdict = await definerCheck!.run(probeQuery);
     assert.equal(verdict.ok, true);
     assert.match(verdict.detail, /^no role this gate checks may execute/);
+    // ⚠ THE `^` ABOVE ANCHORS THE HEAD AND SEES NOTHING APPENDED AFTER IT, so
+    //   on its own it passes silently through any change to this branch — it
+    //   would have accepted eighteen pruning instructions printed onto a
+    //   healthy scratch catalog. The two assertions below are what actually
+    //   hold the branch: the unmatched count is REPORTED here, because on the
+    //   live projection an empty census means every declared entry is stale;
+    //   and it is never phrased as an instruction, because from here the gate
+    //   cannot tell a wholesale revoke from a scratch database's first run.
+    assert.ok(
+      verdict.detail.includes(`${DECLARED_DEFINER_EXEMPTIONS.size} declared exemption(s) matched nothing here`),
+      'the unmatched declared count is reported on the empty-census branch',
+    );
+    assert.ok(!verdict.detail.includes('prune'), 'and this branch never instructs a prune');
   });
 
   await check('every declared exemption string round-trips through a real catalog', async () => {
