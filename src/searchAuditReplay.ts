@@ -365,6 +365,16 @@ export function replaySearchAudits(
   //     today and one more per scored run forever.
   //   - A file carrying no record stream at all was pointed at by mistake. That
   //     blocks, so it prints under `--quiet` and the exit code says so.
+  //   ⚠ EXACTLY ONE, COUNTED — and validity beyond presence is deliberately NOT
+  //     required here. A `run_meta` carrying no `runId` still reports its legs,
+  //     under `run (unknown)`. That is not an oversight: this command's subject
+  //     is the LEGS, and a damaged identity record hides none of them — the
+  //     honest answer is the leg report plus "I do not know which run". Refusing
+  //     it would throw away a readable evidence report over a cosmetic defect,
+  //     and would make this reader stricter than the file shapes it exists to
+  //     read. The scorer, whose subject IS the run, does strict-parse it.
+  //     Measured: all 42 run files in `out/` carry a string `runId`, so nothing
+  //     here rests on tolerating the damaged shape — only on not over-blocking.
   if (runMetaCount !== 1) {
     // `run_meta` counts as run-shaped in its own right, so TWO of them are
     // caught here too — the scorer refuses that as "identity is ambiguous", and

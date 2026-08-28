@@ -982,6 +982,31 @@ test('...and the negative control: exactly one run_meta still replays normally',
   assert.ok(out.some((line) => line.includes('PRE-RETENTION')), out.join('\n'));
 });
 
+test('a run_meta with no runId still reports its legs, under "run (unknown)"', () => {
+  // ⚠ THE OVER-BLOCKING CONTROL for the three cases above, and a deliberate
+  //   limit on how strict this gate gets. The blocker they close is evidence
+  //   being HIDDEN; a damaged identity record hides nothing — every leg is still
+  //   read and reported. Refusing it would throw away a readable evidence report
+  //   over a cosmetic defect and make this reader stricter than the shapes it
+  //   exists to read. The scorer, whose subject IS the run rather than the legs,
+  //   strict-parses run_meta and is the right place for that.
+  //
+  //   Asked adversarially rather than assumed: what does tolerating this let
+  //   someone do that "run-shaped evidence cannot be disguised" forbids?
+  //   Nothing — the legs are all reported, and the identity is printed as
+  //   unknown rather than guessed.
+  const lines = runLines([archivedLeg()], { era: false });
+  const meta = JSON.parse(lines[0]!) as Record<string, unknown>;
+  delete meta['runId'];
+  const text = `${[JSON.stringify(meta), ...lines.slice(1)].join('\n')}\n`;
+
+  const { code, out } = cli({ 'noid.ndjson': text }, ['noid.ndjson']);
+  assert.equal(code, REPLAY_EXIT.ok, out.join('\n'));
+  assert.ok(out.some((line) => line.includes('run (unknown)')), out.join('\n'));
+  // The legs are the point: a build that blocked here would report none.
+  assert.ok(out.some((line) => line.includes('1 envelope-unavailable')), out.join('\n'));
+});
+
 test('RUN_RECORD_TYPES tracks what records.ts actually writes', () => {
   // Drift guard, anchored on executable object-literal syntax rather than on
   // prose. `records.ts` is the only producer of a run file, so its
