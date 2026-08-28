@@ -52,6 +52,33 @@ export const CURRENT_EXTRACTORS: Readonly<Record<string, SearchAuditExtractor>> 
   xai: extractResponsesSearchAudit,
 });
 
+/**
+ * The record types `src/records.ts` writes into a harness run file, MINUS
+ * `run_meta` itself — the markers whose presence means "this IS a run file, so
+ * it owes exactly one `run_meta`".
+ *
+ * Taken from the PRODUCER, not from the scorer's reader. `records.ts` is the
+ * only module that writes any of these, whereas `parseRunRecords`'s switch ends
+ * in `default: break` — the scorer TOLERATES record types it does not know, so
+ * its cases are recognition markers rather than a closed vocabulary. The drift
+ * test in `searchAuditReplay.test.ts` re-derives this set from `records.ts` and
+ * reddens if that file gains or loses one.
+ *
+ * Why a SET and not "some recordType is present": every other producer in this
+ * repo writes its own families into the same directory — `scored_run_meta` and
+ * `participant_scorecard` from the scorer, `close_schedule_audit*` from the
+ * schedule audit, `retrosheet_*`, `inhouse_totals_meta`, `closing_total` — and
+ * those must stay silent at exit 0. Only these six say "a run wrote this".
+ */
+export const RUN_RECORD_TYPES: ReadonlySet<string> = new Set([
+  'arm_game_response',
+  'baseline_decision',
+  'bundle_game',
+  'decision',
+  'excluded_game',
+  'run_failure',
+]);
+
 /** Why an attempt could not be replayed, or that it could. */
 export type ReplayEnvelopeState =
   | 'retained'
@@ -280,16 +307,21 @@ export function replaySearchAudits(
   let runId: string | null = null;
   let evidenceEraStamped = false;
   let evidenceEra: string | null = null;
-  let sawRunMeta = false;
+  let runMetaCount = 0;
   let sawRecordType = false;
+  let sawRunRecord = false;
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
     const record = asRecord(JSON.parse(trimmed));
     if (record === null) continue;
-    if (typeof record['recordType'] === 'string') sawRecordType = true;
-    if (record['recordType'] === 'run_meta') {
-      sawRunMeta = true;
+    const recordType = record['recordType'];
+    if (typeof recordType === 'string') {
+      sawRecordType = true;
+      if (RUN_RECORD_TYPES.has(recordType)) sawRunRecord = true;
+    }
+    if (recordType === 'run_meta') {
+      runMetaCount += 1;
       if (typeof record['runId'] === 'string') runId = record['runId'];
       // Presence, not type: a stamp of the wrong type is still a stamp, and
       // reading it as absent would hand a modern file the archive exemption.
@@ -315,18 +347,35 @@ export function replaySearchAudits(
   //   at exit 0 — an evidence verdict about bytes that were never read as
   //   evidence, which is exactly the conflation this command exists to prevent.
   //
-  //   TWO TIERS, because they are two different mistakes:
+  //   THREE OUTCOMES, because they are three different mistakes:
   //
+  //   - A stream carrying RUN RECORDS but not exactly one `run_meta` is a
+  //     TRUNCATED OR AMBIGUOUS RUN FILE, and it blocks. A reviewer deleted only
+  //     the `run_meta` line from a real 62-record run and an earlier version of
+  //     this gate — which asked only whether ANY `recordType` was present —
+  //     called the remainder a benign sibling at exit 0, silent under `--quiet`,
+  //     hiding 15 replayable legs. Whole-record truncation must not be able to
+  //     disguise run-shaped evidence as somebody else's file.
   //   - A record stream that is not THIS stream is a normal inhabitant of an
   //     evidence directory: `yarn score` writes `<runId>-scored.ndjson` beside
   //     its input by default, and `yarn audit:closes` writes into `out/` too.
   //     Name it, do NOT block — `--quiet out/*.ndjson` is the documented sweep
   //     and must stay silent at exit 0 where nothing is wrong. Measured: keying
-  //     this gate on `run_meta` instead would refuse 5 files sitting in `out/`
+  //     this gate on `run_meta` alone would refuse 5 files sitting in `out/`
   //     today and one more per scored run forever.
   //   - A file carrying no record stream at all was pointed at by mistake. That
   //     blocks, so it prints under `--quiet` and the exit code says so.
-  if (!sawRunMeta) {
+  if (runMetaCount !== 1) {
+    // `run_meta` counts as run-shaped in its own right, so TWO of them are
+    // caught here too — the scorer refuses that as "identity is ambiguous", and
+    // a file this reader cannot attribute to one run is not evidence about one.
+    if (sawRunRecord || runMetaCount > 0) {
+      throw new Error(
+        `this is a harness run file carrying ${String(runMetaCount)} run_meta records, not exactly one ` +
+          '(run records are present, so a missing or duplicated run_meta is a truncated or ' +
+          'ambiguous run file, not another stream)',
+      );
+    }
     if (!sawRecordType) {
       throw new Error(
         'no NDJSON record carried a recordType, so this is not a harness run file ' +

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
 import { EVIDENCE_ERA, sealResponseEnvelope } from './providers/responseEnvelope.js';
 import { extractGoogleSearchAudit } from './providers/searchAudit.js';
 import { AUDIT_REASON } from './providers/searchAudit.js';
@@ -9,6 +10,7 @@ import {
   REPLAY_ENVELOPE_STATES,
   REPLAY_EXIT,
   replaySearchAudits,
+  RUN_RECORD_TYPES,
   runReplayMain,
 } from './searchAuditReplay.js';
 import { damageEnvelope, ENVELOPE_DAMAGE } from './testFactories.js';
@@ -907,6 +909,95 @@ test('a refused artifact does not abort the sweep', () => {
   assert.equal(code, REPLAY_EXIT.blocking);
   assert.equal(out.length, 1, out.join('\n'));
   assert.ok(out[0]!.startsWith('fire.json: unreadable run file: '), out[0]);
+});
+
+// ── a truncated run must not pass as somebody else's stream ────────────────
+// ⚠ A REVIEWER'S BLOCKER, kept closed here. The first version of this gate
+//   asked only whether ANY `recordType` was present. A reviewer deleted ONLY
+//   the `run_meta` line from a real 62-record run — 12 arm_game_response, 3
+//   bundle_game, 21 decision, 24 baseline_decision — and the remainder was
+//   reported "not a harness run file … no envelope verdict" at exit 0, silent
+//   under `--quiet`, hiding the 15 legs the intact file replays. Reproduced
+//   before the fix. Whole-record truncation must not be able to disguise
+//   run-shaped evidence as a benign sibling.
+
+/** A run file with its `run_meta` line removed — `runLines` always emits one
+ *  first, so dropping index 0 is the truncation, and nothing else changes. */
+const truncatedRun = (): string => `${runLines([archivedLeg()], { era: false }).slice(1).join('\n')}\n`;
+
+test('a run file whose run_meta was deleted BLOCKS, and is not called a sibling', () => {
+  const text = truncatedRun();
+  // ⚠ THE FIXTURE MUST STILL CARRY A recordType, or this passes through the
+  //   fire-artifact tier instead and proves nothing about truncation.
+  assert.ok(text.includes('"recordType":"arm_game_response"'), 'or the run-shape tier is never reached');
+  assert.ok(!text.includes('"recordType":"run_meta"'), 'the truncation must actually have happened');
+
+  const { code, out } = cli({ 'truncated.ndjson': text }, ['truncated.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  // ⚠ THE MESSAGE, not just the exit code: a fixture that accidentally carried
+  //   no recordType at all would also exit 1, via the fire-artifact tier, and
+  //   this test would pass for a reason unrelated to truncation.
+  assert.ok(
+    out.some((line) => line.includes('carrying 0 run_meta records')),
+    out.join('\n'),
+  );
+  assert.ok(!out.some((line) => line.includes('not a harness run file')), out.join('\n'));
+});
+
+test('a truncated run is named under --quiet too', () => {
+  const { code, out } = cli({ 'truncated.ndjson': truncatedRun() }, ['--quiet', 'truncated.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.equal(out.length, 1, out.join('\n'));
+  assert.ok(out[0]!.startsWith('truncated.ndjson: unreadable run file: '), out[0]);
+});
+
+test('a MIXED stream — sibling records beside run records — blocks on the run records', () => {
+  // The case the two tiers can disagree about. A sibling family is silent, run
+  // records are not, and a stream carrying both is a run file with something
+  // else concatenated onto it — never a reason to go quiet.
+  const mixed = `{"recordType":"scored_run_meta","runId":"r"}\n${truncatedRun()}`;
+  const { code, out } = cli({ 'mixed.ndjson': mixed }, ['mixed.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(out.some((line) => line.includes('carrying 0 run_meta records')), out.join('\n'));
+});
+
+test('a run file carrying TWO run_meta records blocks — identity is ambiguous', () => {
+  // The other half of "exactly one". The scorer refuses this outright; a reader
+  // that silently took the last one would attribute legs to whichever record
+  // happened to sort later.
+  const lines = runLines([archivedLeg()], { era: false });
+  const doubled = `${[lines[0]!, ...lines].join('\n')}\n`;
+  const { code, out } = cli({ 'doubled.ndjson': doubled }, ['doubled.ndjson']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(out.some((line) => line.includes('carrying 2 run_meta records')), out.join('\n'));
+});
+
+test('...and the negative control: exactly one run_meta still replays normally', () => {
+  // Without this, every case above passes on a build that blocks everything —
+  // which is the regression the sibling tier exists to prevent.
+  const { code, out } = cli({ 'good.ndjson': `${runLines([archivedLeg()], { era: false }).join('\n')}\n` }, [
+    'good.ndjson',
+  ]);
+  assert.equal(code, REPLAY_EXIT.ok, out.join('\n'));
+  assert.ok(out.some((line) => line.includes('PRE-RETENTION')), out.join('\n'));
+});
+
+test('RUN_RECORD_TYPES tracks what records.ts actually writes', () => {
+  // Drift guard, anchored on executable object-literal syntax rather than on
+  // prose. `records.ts` is the only producer of a run file, so its
+  // `recordType: '…'` literals ARE the run vocabulary — and it is the right
+  // authority rather than the scorer's switch, whose `default: break` means it
+  // TOLERATES types it does not know. If records.ts gains one and this set does
+  // not, a stream carrying only that new type stops counting as run-shaped and
+  // a truncated run could pass as a sibling again.
+  const source = readFileSync(new URL('./records.ts', import.meta.url), 'utf8')
+    .split('\n')
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join('\n');
+  const written = new Set([...source.matchAll(/recordType: '([a-z_]+)'/g)].map((match) => match[1]!));
+  assert.ok(written.size > 1, 'the extraction matched nothing, so this asserts nothing');
+  written.delete('run_meta'); // the identity record itself, not a shape marker
+  assert.deepEqual([...written].sort(), [...RUN_RECORD_TYPES].sort());
 });
 
 test('the library refuses the unrecognised shape too, not only the CLI', () => {
