@@ -792,3 +792,95 @@ test('exemption membership is the FULL role-and-function pair, nothing looser', 
   // The bare name — the pre-fix key shape — may never match an entry again.
   assert.equal(isExemptDefiner('service_role', fn.replace(/\(.*\)$/, '')), false);
 });
+
+// ── the PASS-WITH-ROWS branch — #110 ────────────────────────────────────────
+// ⚠ NOTHING IN `yarn test` REACHED THIS BRANCH BEFORE. Every definer case above
+//   either asserts `ok: false` or hits the empty-census early return, so the
+//   prune note, the accepted count and the `[extension]` annotation were all
+//   unpinned — four mutants survived the 38-case suite on the strength of it,
+//   including `const unused: string[] = []` and `platform = ''`. The one
+//   assertion that touched the prune note lived in the conformance suite, which
+//   is in neither the `yarn test` file list nor CI.
+
+const definerCheck = (): GateCheck => {
+  const check = SERVING_SCHEMA_CHECKS.find((entry) => entry.name.includes('SECURITY DEFINER'));
+  assert.ok(check, 'the function-reachability check is gone');
+  return check;
+};
+
+/** The declared exemptions as census rows — what the live catalog returns when
+ *  the whole protocol write path is present and nothing undeclared is. */
+const declaredCensus = (): Array<{ role: string; fn: string; from_extension: boolean }> =>
+  [...DECLARED_DEFINER_EXEMPTIONS].map((entry) => {
+    const [role, fn] = entry.split(' -> ');
+    return { role: role!, fn: fn!, from_extension: false };
+  });
+
+test('a declared exemption the census no longer carries is NAMED, not merely counted', async () => {
+  const rows = declaredCensus();
+  const dropped = rows.pop()!;
+  const stale = `${dropped.role} -> ${dropped.fn}`;
+  const verdict = await definerCheck().run(async () => rows);
+  assert.equal(verdict.ok, true, 'every remaining row is still a declared exemption');
+  assert.match(verdict.detail, /declared but no longer present, prune:/);
+  assert.ok(verdict.detail.includes(stale), 'the stale acceptance is named, so it can be pruned');
+  // The accepted count is the surviving census, not a constant: this is what a
+  // `${exempt.length}` -> `0` mutation fails on.
+  assert.ok(
+    verdict.detail.startsWith(`${rows.length} definer grant(s)`),
+    'the leading count is the accepted rows actually seen',
+  );
+});
+
+test('a COMPLETE census emits no pruning note at all', async () => {
+  // The negative half of the case above. An assertion that only ever sees the
+  // note PRESENT passes on a build that emits it unconditionally — which would
+  // name all eighteen as stale on a perfectly healthy database.
+  const verdict = await definerCheck().run(async () => declaredCensus());
+  assert.equal(verdict.ok, true);
+  assert.doesNotMatch(verdict.detail, /no longer present/);
+  assert.ok(verdict.detail.startsWith(`${DECLARED_DEFINER_EXEMPTIONS.size} definer grant(s)`));
+});
+
+test('an EMPTY census reports the unmatched declared count, and instructs no prune', async () => {
+  // #110 item 2. An empty census is where a stale acceptance matters MOST on
+  // the live projection — every declared entry is unmatched, which is what a
+  // wholesale EXECUTE revoke looks like — and it is equally what a clean
+  // scratch catalog looks like on its first run, which is this repo's own first
+  // conformance scenario. So the count is stated and no prune is instructed.
+  //
+  // Both halves are asserted deliberately: dropping the count loses the report
+  // on the branch that needs it, and adding the instruction turns every healthy
+  // scratch run into eighteen false ones. The conformance suite cannot catch
+  // either — its assertion on this branch is `^`-anchored, so an appended
+  // suffix passes it silently.
+  const verdict = await definerCheck().run(async () => []);
+  assert.equal(verdict.ok, true);
+  assert.match(verdict.detail, /^no role this gate checks may execute/);
+  assert.ok(
+    verdict.detail.includes(`${DECLARED_DEFINER_EXEMPTIONS.size} declared exemption(s) matched nothing here`),
+    'the unmatched count is reported on the branch where every entry is unmatched',
+  );
+  assert.doesNotMatch(verdict.detail, /prune/, 'and it never instructs a prune from here');
+});
+
+test('an ACCEPTED grant owned by an extension is named with its annotation', async () => {
+  // #110 item 4. `platform` was computed for every accepted row and read for
+  // none — live on the fail branch, dead here. Measured: `from_extension: true`
+  // appeared in no fixture in either suite, on either path, so a build that
+  // never annotated an acceptance was indistinguishable from one that did.
+  const rows = declaredCensus();
+  rows[0] = { ...rows[0]!, from_extension: true };
+  const marked = `${rows[0]!.role} -> ${rows[0]!.fn} [extension]`;
+  const verdict = await definerCheck().run(async () => rows);
+  assert.equal(verdict.ok, true, 'a declared entry stays exempt whoever owns it');
+  assert.ok(verdict.detail.includes(marked), 'named here with the annotation the fail path carries');
+  assert.match(verdict.detail, /1 owned by an installed extension/);
+
+  // Negative pair: the same census with nothing extension-owned must say
+  // nothing, or the annotation is decoration that fires on every run.
+  const plain = await definerCheck().run(async () => declaredCensus());
+  assert.equal(plain.ok, true);
+  assert.doesNotMatch(plain.detail, /\[extension\]/);
+  assert.doesNotMatch(plain.detail, /installed extension/);
+});
