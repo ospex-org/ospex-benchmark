@@ -826,3 +826,95 @@ test('a file that cannot be parsed is named and counted, and the rest still run'
   assert.equal(out.length, 1, out.join('\n'));
   assert.ok(out[0]!.startsWith('broken.ndjson: unreadable run file: '), out[0]);
 });
+
+// ── shape before verdict — #92 ──────────────────────────────────────────────
+// A fire artifact is a single JSON object with no `arm_game_response` record,
+// so it collected zero legs, `isCoherentPreRetentionArchive` was vacuously true
+// over them, and the command reported "PRE-RETENTION (envelopes unavailable),
+// 0 replayed" at exit 0 — silent under `--quiet`. Reproduced on the real
+// artifact before the fix; that is an evidence verdict about bytes never read
+// as evidence, which is the one conflation this command exists to prevent.
+
+/** A single JSON object on ONE line — the shape a fire artifact actually has. */
+const oneLineObject = (): string => JSON.stringify({ artifactSchemaVersion: 1, arms: [] });
+
+test('a single-JSON-object artifact is REFUSED, not reported as a clean archive', () => {
+  // ⚠ THE FIXTURE MUST BE ONE LINE, and this asserts it before anything else.
+  //   Measured: `JSON.stringify(artifact, null, 2)` is 377 lines, and a
+  //   pretty-printed fixture is already refused on the UNFIXED build — the
+  //   per-line `JSON.parse` throws and the existing catch exits 1. A test
+  //   written that way passes with this whole gate deleted, and would score its
+  //   mutant KILLED while it survived. Only the one-line form discriminates.
+  const text = oneLineObject();
+  assert.equal(text.split('\n').length, 1, 'or the per-line JSON.parse refuses it instead and this proves nothing');
+
+  const { code, out } = cli({ 'fire.json': text }, ['fire.json']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.ok(
+    out.some((line) => line.includes('no NDJSON record carried a recordType')),
+    out.join('\n'),
+  );
+  // ⚠ ASSERTED IN DEFAULT MODE ON PURPOSE. Under `--quiet` this file printed
+  //   nothing at all before the fix, so an absence assertion there is satisfied
+  //   by the broken build. Default mode is where PRE-RETENTION genuinely was
+  //   printed, so this is the line that reddens without the gate.
+  assert.ok(!out.some((line) => line.includes('PRE-RETENTION')), out.join('\n'));
+  assert.ok(!out.some((line) => line.includes('0 replayed')), out.join('\n'));
+});
+
+test('a single-JSON-object artifact is named under --quiet too, and blocks', () => {
+  // Its negative pair is the existing '--quiet prints NOTHING and exits 0 on a
+  // clean file' above: this is refused loudly, that stays silent.
+  const { code, out } = cli({ 'fire.json': oneLineObject() }, ['--quiet', 'fire.json']);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.equal(out.length, 1, out.join('\n'));
+  assert.ok(out[0]!.startsWith('fire.json: unreadable run file: '), out[0]);
+});
+
+test('a SIBLING record stream is named but does NOT block', () => {
+  // ⚠ THIS CASE IS THE CONTROL FOR THE WHOLE DESIGN, and the only input that
+  //   separates the shipped gate from the obvious one. Keying the refusal on a
+  //   missing `run_meta` instead of a missing `recordType` agrees with this
+  //   build on all 42 run files and on every other fixture in this suite — and
+  //   would refuse the `-scored.ndjson` that `yarn score` writes beside its
+  //   input BY DEFAULT, plus the close-schedule audits, i.e. 5 files sitting in
+  //   `out/` today and one more per scored run forever. `--quiet out/*.ndjson`
+  //   is the documented directory sweep and is silent at exit 0 today; that
+  //   contract is what this case protects.
+  const scored = '{"recordType":"scored_run_meta","runId":"r"}\n{"recordType":"scored_decision"}\n';
+
+  const { code, out } = cli({ 'r-scored.ndjson': scored }, ['r-scored.ndjson']);
+  assert.equal(code, REPLAY_EXIT.ok, out.join('\n'));
+  assert.ok(out.some((line) => line.includes('not a harness run file')), out.join('\n'));
+  // Named, but still given no envelope verdict — the whole point of the tier.
+  assert.ok(!out.some((line) => line.includes('PRE-RETENTION')), out.join('\n'));
+
+  const quiet = cli({ 'r-scored.ndjson': scored }, ['--quiet', 'r-scored.ndjson']);
+  assert.equal(quiet.code, REPLAY_EXIT.ok);
+  assert.equal(quiet.out.length, 0, quiet.out.join('\n'));
+});
+
+test('a refused artifact does not abort the sweep', () => {
+  // The refusal must `continue`, like the parse failure above — not short-
+  // circuit the way a missing file does at REPLAY_EXIT.usage. The clean file
+  // after it is the control: if the sweep aborted, its legs would go unread.
+  const good = `${runLines([archivedLeg()], { era: false }).join('\n')}\n`;
+  const { code, out } = cli({ 'fire.json': oneLineObject(), 'good.ndjson': good }, [
+    '--quiet',
+    'fire.json',
+    'good.ndjson',
+  ]);
+  assert.equal(code, REPLAY_EXIT.blocking);
+  assert.equal(out.length, 1, out.join('\n'));
+  assert.ok(out[0]!.startsWith('fire.json: unreadable run file: '), out[0]);
+});
+
+test('the library refuses the unrecognised shape too, not only the CLI', () => {
+  // The exported reader is the API a future caller reaches for; a guard that
+  // lived only in the CLI would leave it reporting the vacuous verdict.
+  assert.throws(() => replaySearchAudits([oneLineObject()]), /not a harness run file/);
+  // ...and the sibling tier RETURNS rather than throwing, which is what keeps
+  // the directory sweep quiet. Paired here so one cannot be changed alone.
+  assert.doesNotThrow(() => replaySearchAudits(['{"recordType":"scored_run_meta"}']));
+  assert.equal(replaySearchAudits(['{"recordType":"scored_run_meta"}']).isRunFile, false);
+});

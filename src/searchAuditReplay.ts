@@ -139,6 +139,14 @@ export interface ReplayReport {
   /** Whether the WHOLE FILE reads as a coherent pre-retention archive — the one
    *  shape whose missing envelopes are `unavailable` rather than `unretained`. */
   preRetentionArchive: boolean;
+  /**
+   * Whether the file was recognised as a harness RUN file at all — a record
+   * carrying `recordType: 'run_meta'`, the same marker `parseRunRecords`
+   * requires. When false no leg was collected and NO envelope verdict is given:
+   * `preRetentionArchive` is `false` because the archive predicate was never
+   * asked, not because the file was asked and failed.
+   */
+  isRunFile: boolean;
   legs: ReplayLeg[];
   counts: {
     retained: number;
@@ -272,12 +280,16 @@ export function replaySearchAudits(
   let runId: string | null = null;
   let evidenceEraStamped = false;
   let evidenceEra: string | null = null;
+  let sawRunMeta = false;
+  let sawRecordType = false;
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === '') continue;
     const record = asRecord(JSON.parse(trimmed));
     if (record === null) continue;
+    if (typeof record['recordType'] === 'string') sawRecordType = true;
     if (record['recordType'] === 'run_meta') {
+      sawRunMeta = true;
       if (typeof record['runId'] === 'string') runId = record['runId'];
       // Presence, not type: a stamp of the wrong type is still a stamp, and
       // reading it as absent would hand a modern file the archive exemption.
@@ -295,6 +307,41 @@ export function replaySearchAudits(
       raw.push({ participantId, gameId, leg: name, provider, attempt });
     }
   }
+  // ⚠ SHAPE BEFORE VERDICT. Everything below this point is a property of a
+  //   harness RUN file. Without this gate a file with no `arm_game_response`
+  //   records collects zero legs, `isCoherentPreRetentionArchive` is VACUOUSLY
+  //   true over them, and a fire artifact, a close-schedule audit, an empty file
+  //   and `{}` all reported "PRE-RETENTION (envelopes unavailable), 0 replayed"
+  //   at exit 0 — an evidence verdict about bytes that were never read as
+  //   evidence, which is exactly the conflation this command exists to prevent.
+  //
+  //   TWO TIERS, because they are two different mistakes:
+  //
+  //   - A record stream that is not THIS stream is a normal inhabitant of an
+  //     evidence directory: `yarn score` writes `<runId>-scored.ndjson` beside
+  //     its input by default, and `yarn audit:closes` writes into `out/` too.
+  //     Name it, do NOT block — `--quiet out/*.ndjson` is the documented sweep
+  //     and must stay silent at exit 0 where nothing is wrong. Measured: keying
+  //     this gate on `run_meta` instead would refuse 5 files sitting in `out/`
+  //     today and one more per scored run forever.
+  //   - A file carrying no record stream at all was pointed at by mistake. That
+  //     blocks, so it prints under `--quiet` and the exit code says so.
+  if (!sawRunMeta) {
+    if (!sawRecordType) {
+      throw new Error(
+        'no NDJSON record carried a recordType, so this is not a harness run file ' +
+          '(a fire artifact is a single JSON object — verify one with `yarn verify:sidecar`)',
+      );
+    }
+    return {
+      runId: null,
+      evidenceEra: null,
+      preRetentionArchive: false,
+      isRunFile: false,
+      legs: [],
+      counts: { retained: 0, unavailable: 0, unretained: 0, unreadable: 0, changed: 0 },
+    };
+  }
   const preRetentionArchive = isCoherentPreRetentionArchive({
     evidenceEraStamped,
     legs: raw.map((entry) => archiveEraSignals(entry.attempt)),
@@ -306,6 +353,7 @@ export function replaySearchAudits(
     runId,
     evidenceEra,
     preRetentionArchive,
+    isRunFile: true,
     legs,
     counts: {
       retained: legs.filter((l) => l.envelope === 'retained').length,
@@ -338,7 +386,11 @@ Exit codes:
   0  nothing to report
   1  at least one leg is unretained, or an envelope is present but unreadable
      (not a well-formed envelope, digest mismatch, unparseable body, or no
-     extractor for its provider), or a named file could not be read
+     extractor for its provider), or a named file could not be read or is not a
+     record file at all. A record stream that is simply not THIS one -- a
+     scored-run sibling, a close-schedule audit -- is named at exit 0 instead,
+     so pointing this at a directory of evidence stays quiet when nothing is
+     wrong.
   2  usage -- no files given, or a named file does not exist`;
 
 export const REPLAY_EXIT = Object.freeze({ ok: 0, blocking: 1, usage: 2 });
@@ -380,12 +432,19 @@ export function runReplayMain(deps: {
       continue;
     }
     if (!quiet) {
-      deps.log.line(
-        `${file}: run ${report.runId ?? '(unknown)'}, evidence era ${report.evidenceEra ?? (report.preRetentionArchive ? 'PRE-RETENTION (envelopes unavailable)' : 'NONE (not a pre-retention archive; envelopes required)')}`,
-      );
-      deps.log.line(
-        `  ${report.counts.retained} replayed, ${report.counts.unavailable} envelope-unavailable, ${report.counts.unretained} unretained, ${report.counts.unreadable} unreadable, ${report.counts.changed} changed`,
-      );
+      if (!report.isRunFile) {
+        // No era line and no counts: both would be verdicts about a file this
+        // command did not read as evidence, and printing "0 replayed" beside
+        // an era is what made a fire artifact look like a clean archive.
+        deps.log.line(`${file}: not a harness run file (no run_meta record); no envelope verdict`);
+      } else {
+        deps.log.line(
+          `${file}: run ${report.runId ?? '(unknown)'}, evidence era ${report.evidenceEra ?? (report.preRetentionArchive ? 'PRE-RETENTION (envelopes unavailable)' : 'NONE (not a pre-retention archive; envelopes required)')}`,
+        );
+        deps.log.line(
+          `  ${report.counts.retained} replayed, ${report.counts.unavailable} envelope-unavailable, ${report.counts.unretained} unretained, ${report.counts.unreadable} unreadable, ${report.counts.changed} changed`,
+        );
+      }
     }
     for (const leg of report.legs) {
       // Quiet reports exactly what the exit code is about, and nothing else.
