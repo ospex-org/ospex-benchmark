@@ -16,6 +16,7 @@ import type { CohortTickInput, CohortTickResult } from './cohortRunner.js';
 import { FireArtifactSink } from './fireArtifactSink.js';
 import type { ArtifactFs } from './fireArtifactSink.js';
 import { STORE_SCHEMA_VERSION } from './store/constants.js';
+import { pollFreeInputs } from './inputNetworkGuard.js';
 import type { AtomicStore } from './store/contract.js';
 import type { CampaignTickJournalPort, CampaignTickOutcome, ScheduleEntry } from './campaignSchedule.js';
 import type { UnresolvedFire, UnresolvedFireRead } from './escalationLatch.js';
@@ -221,6 +222,7 @@ function deps(
   const opens = { store: 0, reads: 0 };
   const tickInputs: CohortTickInput[] = [];
   const base: CampaignDeps = {
+    enqueueNetworkAlert: () => true,
     openStore: async () => {
       opens.store += 1;
       return { store: recordingStore(storeCalls), authorizations: auth, unresolvedFires, tickJournal, close: async () => {} };
@@ -2849,4 +2851,26 @@ test('spawned CLI: status against an unreachable store fails LOUD (exit 1), neve
   assert.equal(status, 1, `an unreachable store is a loud failure; out=${out}`);
   assert.ok(!out.includes('[Y/n]'), `status never prompts; out=${out}`);
   assert.ok(!/ARMED\.|STOPPED\./.test(out), `status changed nothing; out=${out}`);
+});
+
+test('network guard: campaign returns 75 and retains a secret-safe nonhealthy journal without changing authority', async () => {
+  const {manifestPath,auth}=await armed();
+  const before=JSON.stringify([...auth.records]); let polls=0; const sleeps:number[]=[];
+  const {d,opts}=tickFixture(manifestPath,auth,{runTick:async input=>{
+    assert.ok(input.networkGuard);
+    return pollFreeInputs(input.networkGuard, input.booted.manifest.constants.pollIntervalMs, async()=>{
+      polls++;
+      await input.networkGuard!.read('games',async()=>{throw Object.assign(new Error('SECRET'),{code:'EAI_AGAIN'});});
+      throw new Error('unreachable');
+    },async ms=>{sleeps.push(ms);});
+  }});
+  const result=await captured(()=>withEnv(SYNTHETIC_ENV,()=>tickCampaign(opts,d)));
+  assert.equal(result.value,75); assert.equal(polls,3); assert.equal(sleeps.length,2);
+  assert.equal(d.tickInputs.length,1); assert.deepEqual(d.storeCalls,[]);
+  assert.equal(JSON.stringify([...auth.records]),before);
+  assert.equal(d.tickJournal.finishes.length,1);
+  const finish=d.tickJournal.finishes[0]!;
+  assert.equal(finish.outcome,'loud_failure');
+  assert.equal(JSON.parse(finish.detail!).event,'input_network_restart');
+  assert.ok(!result.errors.join('').includes('SECRET'));
 });

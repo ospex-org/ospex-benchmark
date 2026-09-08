@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { after, test } from 'node:test';
 import { buildBundle } from './bundle.js';
+import { InputNetworkGuard } from './inputNetworkGuard.js';
 import { sha256Hex } from './canonical.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
 import { verifyArtifactIntegrity } from './servingProjection.js';
@@ -1029,4 +1030,36 @@ test('a fire survives a log sink that throws on the projection line', async () =
   });
   assert.ok(run.records.length > 0, 'the fire did not produce an artifact');
   assert.equal(verifyArtifactIntegrity(readFileSync(run.runFile, 'utf8')), null);
+});
+
+test('network guard: history outage exits only after third iteration; reload never repeats an ambiguous paid fire', async () => {
+  const events: string[] = [];
+  const g = new InputNetworkGuard({lane:'watcher', emit:s => events.push(s)});
+  let paid = 0;
+  const deps = makeDeps({networkGuard:g, fireGame:async () => {
+    paid++; throw Object.assign(new Error('ambiguous provider response'), {code:'ECONNRESET'});
+  }});
+  g.beginIteration(); await watchTick(deps); assert.equal(g.finishIteration(),null);
+  assert.equal(paid,1);
+  assert.equal(g.restartRequested,false, 'paid errors are outside the guard');
+  const reloaded = loadLedger(deps.ledgerDir, () => {});
+  const diskBefore = JSON.stringify([...reloaded]);
+  const second = '00000000-0000-4000-8000-0000000wat02';
+  const board = fullBoardFor(second);
+  deps.fetchInputs = async () => fullBoardInputs({gamesRows:[gamesRow(),board.row],oddsRows:[...fullBoardInputs().oddsRows,...board.odds]});
+  deps.ledger = reloaded;
+  deps.fetchFirstBoardAppearance = () => g.read('history', async () => {
+    throw new TypeError('SECRET', {cause:Object.assign(new Error('SECRET'), {code:'EAI_AGAIN',syscall:'getaddrinfo'})});
+  });
+  for (let n=1;n<=3;n++) {
+    g.beginIteration();
+    if (n === 3) await assert.rejects(watchTick(deps), /required input transport failure/);
+    else await watchTick(deps);
+    assert.equal(g.finishIteration(),n===3 ? 75:null);
+  }
+  assert.equal(events.length,1); assert.equal(paid,1);
+  assert.equal(JSON.stringify([...loadLedger(deps.ledgerDir,()=>{})]),diskBefore);
+  assert.ok(!deps.errors.join('').includes('SECRET'));
+  const restarted = makeDeps({ledgerDir:deps.ledgerDir,ledger:loadLedger(deps.ledgerDir,()=>{}),fireGame:async()=>{paid++;throw new Error();}});
+  await watchTick(restarted); assert.equal(paid,1);
 });

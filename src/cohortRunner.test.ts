@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { cohortBoot } from './cohortBoot.js';
 import { runCohortTick } from './cohortRunner.js';
+import { InputNetworkGuard, InputTransportFailure } from './inputNetworkGuard.js';
 import { discover } from './lineOpenRead.js';
 import { assertReplayPendingRecovery, RehearsalClaimPort, replayReleaseCapabilityForRecovery, StoreClaimPort } from './lineOpenClaim.js';
 import { FireArtifactSink } from './fireArtifactSink.js';
@@ -1009,4 +1010,19 @@ test('the tick rejects a raw adapter map posing as the capability BEFORE discove
   await assert.rejects(() => runCohortTick(probed), /not a minted cohort adapter capability/);
   assert.equal(discoveryRan, false, 'the brand fails before any seam executes');
   assert.equal(store.admitCalls.length, 0);
+});
+
+test('network guard: real cohort free-read phase joins history siblings and retries no admission', async () => {
+  const store = new ScriptedStore(CODE_ARMS.length);
+  const {input} = tickInput(manifestJson(), [makeGame()], [makeOdds(),makeOdds({market:'total',line:8.5})], {claimPort:new StoreClaimPort(store)});
+  const events:string[]=[]; let joined=0; let polls=0; const sleeps:number[]=[];
+  const g = new InputNetworkGuard({lane:'campaign',emit:s=>events.push(s)});
+  await assert.rejects(runCohortTick({...input, networkGuard:g, inputSleep:async ms=>{sleeps.push(ms);},
+    discover:async b=>{polls++;return input.discover(b);},
+    readMarketEvidence:async (b,id,market)=>g.read('history',async()=>{
+      if (market==='moneyline') throw Object.assign(new Error('SECRET'),{code:'EAI_AGAIN'});
+      await new Promise(r=>setTimeout(r,5)); joined++; return input.readMarketEvidence(b,id,market);
+    })}), InputTransportFailure);
+  assert.equal(polls,3); assert.equal(joined,3); assert.equal(events.length,1);
+  assert.deepEqual(sleeps,[30000,30000]); assert.deepEqual(store.admitCalls,[]);
 });

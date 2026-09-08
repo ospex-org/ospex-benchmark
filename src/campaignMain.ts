@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { InputNetworkGuard, InputTransportFailure, TEMPORARY_NETWORK_EXIT } from './inputNetworkGuard.js';
+import { createInputNetworkEventSink, enqueueInputNetworkAlert } from './inputNetworkAlert.js';
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { basename, dirname, resolve } from 'node:path';
@@ -316,6 +318,8 @@ async function closeQuietly(close: () => Promise<void>): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export interface CampaignDeps {
+  /** Enqueue-only existing-outbox seam; tests inject a local sink, never production state. */
+  readonly enqueueNetworkAlert: (event: string) => boolean;
   /** The MUTATING open: applies the idempotent schema/function bootstrap and constructs the
    *  full store. Owned by the commands that are allowed to write (arm, tick, resume, stop). */
   readonly openStore: (databaseUrl: string) => Promise<{
@@ -977,8 +981,10 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
       // admission wrapped so EVERY admission first consults the composed latch; the sink
       // and the evidence scan share one root; the capability carries billable provenance
       // minted above and nothing else can relabel it.
-      const config: LineOpenReadConfig = { apiUrl, supabaseUrl, anonKey, now: deps.now };
+      const networkGuard = new InputNetworkGuard({lane:'campaign', emit:createInputNetworkEventSink(printError,deps.enqueueNetworkAlert), now:deps.now});
+      const config: LineOpenReadConfig = { apiUrl, supabaseUrl, anonKey, now: deps.now, networkGuard };
       const input: CohortTickInput = {
+        networkGuard,
         booted,
         publication,
         discover: createDiscoverFn(config),
@@ -998,6 +1004,12 @@ export async function tickCampaign(options: CampaignOptions, deps: CampaignDeps)
       try {
         result = await deps.runTick(input);
       } catch (error) {
+        if (error instanceof InputTransportFailure && networkGuard.lastEvent !== null) {
+          // Existing durable nonhealthy outcome retains the episode across processes.
+          // It HALTS the next invocation for review; never auto-resume paid authority.
+          await finishQuietly('loud_failure', networkGuard.lastEvent);
+          return TEMPORARY_NETWORK_EXIT;
+        }
         // The guarded claim port trips mid-tick — evidence or an unresolved fire landed
         // between the tick-level check and an admission. A typed refusal, not a loud
         // failure: the campaign halts for review exactly as if the tick-level check had
@@ -1393,6 +1405,7 @@ export async function stopCampaign(options: CampaignOptions, deps: CampaignDeps)
 // ---------------------------------------------------------------------------
 
 const PRODUCTION_DEPS: CampaignDeps = {
+  enqueueNetworkAlert: enqueueInputNetworkAlert,
   openStore: async (databaseUrl) => {
     const { Pool } = await import('pg');
     const { SqlAtomicStore, pgStoreQuery } = await import('./store/atomicStore.js');

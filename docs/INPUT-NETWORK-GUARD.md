@@ -1,0 +1,20 @@
+# Required-input transport restart guard (author-only)
+
+The watcher counts once per iteration per required alias (`games`, `current_odds`, `history`). Three consecutive failing observations of the same dependency request exit 75. Only that dependency's completed successful read resets its streak; no work and unrelated success do not. A mixed success/failure batch remains failing. Transport codes are allowlisted through bounded nested-cause traversal. HTTP 429/5xx, authentication, schema/policy, model/budget, and ambiguous dispatch failures are not classified as transport recycle signals.
+
+Admission closes on the third failure. All concurrent input reads are joined; the watcher and cohort fire loops await paid work serially. The watcher returns through serving-handle cleanup rather than forcing process exit. Claims and budgets are untouched: restart reloads the existing watch-ledger, including claimed fires whose paid response was lost.
+
+The watcher keeps unresolved episodes in `watch-network-health.json` beside, not inside, the ledger. The state is atomically replaced and fsynced, with bounded secret-safe fields. A new PID still needs three failed polls; a successful dependency read clears its unresolved episode. Corrupt health state is a startup STOP. At threshold, one structured `input_network_restart` event contains dependency, lane, count, timestamps, PID/boot ID, allowlisted codes/syscalls, episode totals, and exit code. No raw error/cause, endpoint, response body, or credential is included.
+
+Campaign tick is one-shot, not the legacy persistent watcher. Only the cohort's FREE input phase is retried, at the manifest's existing poll interval and at most three attempts. Admission, paid dispatch, settlement, publication/authority checks, database writes, and a whole tick are NEVER retried by this guard. Exit 75 retains a `loud_failure` event in the existing durable tick journal; the existing schedule HALTS for operator review on the next invocation. There is no automatic resume of paid authority.
+
+## Deliberate rollout limitations
+
+- No installation, unit modification, supervisor, network probe, paid call, or transaction is authorized by this source patch.
+- The event sink invokes an enqueue-only Python bridge into the existing MVE durable outbox; it neither sends chat nor creates another monitoring lane. The companion `ospex-mve` patch supplies `monitoring/enqueue_input_network.py`. Its intended path is `/home/vince/.ospex/heartbeat/ospex-mve/monitoring/enqueue_input_network.py`; install/repoint requires separate approval. Missing helper or enqueue failure emits a fixed secret-safe diagnostic and never vetoes the safe exit. Keys are lane/dependency/day, so process recycling does not create a fresh operator incident every minute. A queued row is not proof of delivery.
+- Existing systemd process ownership is retained: the installed unit is `Restart=always`, `RestartSec=60`, `KillMode=control-group`. No standalone watcher flock is introduced; parallel manual launch remains prohibited. Execution's separate singleton lock is tested in its owner repository. Node subprocess tests exercise exit 75, old-PID disappearance, fresh PID, and rehydrated health; they are not a live systemd restart test.
+- Existing systemd start-rate/restart/control-group settings are retained, not exercised against the installed service. A clean apply check is not an installation recommendation or process-tree proof.
+- This repository's watcher/campaign path does not submit signed chain transactions. Offline tests prove paid-claim preservation here; execution-lane ambiguous transaction reconciliation needs its separate owner and tests.
+- Startup configuration/publication/store failures retain their existing STOP/refusal behavior, not exit 75. The free-read guard never retries an ambiguous database write.
+
+Run `yarn typecheck` and `yarn test` offline. New tests are registered in the canonical test list and extend the real watcher, cohort, and campaign seams with injected reads; no live dependencies are invoked.
