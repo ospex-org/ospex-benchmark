@@ -1,4 +1,6 @@
 import { mkdtempSync } from 'node:fs';
+import { InputNetworkGuard } from './inputNetworkGuard.js';
+import { createInputNetworkEventSink } from './inputNetworkAlert.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describeServingStatus, dryRunServing, openBenchmarkServing } from './benchmarkServingClient.js';
@@ -65,6 +67,8 @@ async function main(): Promise<number> {
     printLine(`dry run: writing to ephemeral ${outDir}`);
   }
 
+  const networkGuard = new InputNetworkGuard({lane:'watcher', emit:createInputNetworkEventSink(printError), statePath:join(outDir, 'watch-network-health.json')});
+
   if (options.dryRun) {
     // Fixture inputs + mock providers + one synthetic clock anchored at the
     // fixture capture instant, mirroring the smoke's dry-run story. The
@@ -91,9 +95,9 @@ async function main(): Promise<number> {
       `watching MLB via ${apiUrl} (window ${options.windowHours}h, poll ${options.pollSeconds}s, late ${options.lateMinutes}m)`,
     );
     fetchInputs = () =>
-      fetchLiveInputs({ apiUrl, supabaseUrl, supabaseAnonKey, windowHours: options.windowHours });
+      fetchLiveInputs({ apiUrl, supabaseUrl, supabaseAnonKey, windowHours: options.windowHours, networkGuard });
     firstBoardAppearance = (gameId, market) =>
-      fetchFirstBoardAppearance(supabaseUrl, supabaseAnonKey, gameId, market);
+      networkGuard.read('history', () => fetchFirstBoardAppearance(supabaseUrl, supabaseAnonKey, gameId, market));
     nowMs = (): number => Date.now();
   }
 
@@ -139,6 +143,7 @@ async function main(): Promise<number> {
     printLine(`ledger: ${ledger.size} game(s) already handled (${ledgerDir})`);
 
     const deps: WatchDeps = {
+      networkGuard,
       fetchInputs,
       fetchFirstBoardAppearance: firstBoardAppearance,
       fireGame: (build, inputs, slateDate, provenance) =>
@@ -161,6 +166,7 @@ async function main(): Promise<number> {
       // records — never a second clock.
       const startedAt = new Date(nowMs()).toISOString();
       let tickFailed = false;
+      networkGuard.beginIteration();
       try {
         const summary = await watchTick(deps);
         printLine(
@@ -179,6 +185,10 @@ async function main(): Promise<number> {
         tickFailed = true;
         printError(`tick ${startedAt} failed: ${describeErrorWithStack(error)}`);
       }
+      // watchTick is serial and joined, including any earlier paid fire. Exit through
+      // serving.close(); a supervising lock owner can then release, never process.exit().
+      const networkExit = networkGuard.finishIteration();
+      if (networkExit !== null) return networkExit;
       if (options.once) {
         // External schedulers need the pass/fail distinction by exit code. A
         // projection problem is not one of them: it never reaches `tickFailed`,

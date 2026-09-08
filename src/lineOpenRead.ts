@@ -1,4 +1,5 @@
 import { canonicalize } from './canonical.js';
+import type { InputNetworkGuard } from './inputNetworkGuard.js';
 import { assertBootedCohort } from './cohortBoot.js';
 import { buildGameBundle } from './bundle.js';
 import { fetchCurrentOdds, fetchFullHistoryRows, fetchGamesForSport } from './fetchers.js';
@@ -360,6 +361,7 @@ export async function readMarketEvidence(
 // ---------------------------------------------------------------------------
 
 export interface LineOpenReadConfig {
+  networkGuard?: InputNetworkGuard;
   /** Core API base URL (the public `/v1/games` slate listing). */
   apiUrl: string;
   /** PostgREST base URL (the `current_odds` / `odds_history` read path). */
@@ -376,9 +378,14 @@ export function createDiscoverFn(config: LineOpenReadConfig): DiscoverFn {
   const now = config.now ?? ((): number => Date.now());
   return (booted) =>
     discover(booted, {
-      readGames: (sport, windowHours) => fetchGamesForSport(config.apiUrl, sport, windowHours),
-      readCurrentOdds: (network, gameIds) =>
-        fetchCurrentOdds(config.supabaseUrl, config.anonKey, network, gameIds),
+      readGames: (sport, windowHours) => {
+        const read = () => fetchGamesForSport(config.apiUrl, sport, windowHours);
+        return config.networkGuard?.read('games', read) ?? read();
+      },
+      readCurrentOdds: (network, gameIds) => {
+        const read = () => fetchCurrentOdds(config.supabaseUrl, config.anonKey, network, gameIds);
+        return config.networkGuard?.read('current_odds', read) ?? read();
+      },
       now,
     });
 }
@@ -387,8 +394,8 @@ export function createDiscoverFn(config: LineOpenReadConfig): DiscoverFn {
  *  bounded full-history fetch. */
 export function createReadMarketEvidenceFn(config: LineOpenReadConfig): ReadMarketEvidenceFn {
   const now = config.now ?? ((): number => Date.now());
-  return (booted, gameId, market) =>
-    readMarketEvidence(booted, gameId, market, {
+  return (booted, gameId, market) => {
+    const read = () => readMarketEvidence(booted, gameId, market, {
       fetchHistory: (gid, mkt, deadlineMs, clock) =>
         fetchFullHistoryRows({
           supabaseUrl: config.supabaseUrl,
@@ -400,4 +407,6 @@ export function createReadMarketEvidenceFn(config: LineOpenReadConfig): ReadMark
         }),
       now,
     });
+    return config.networkGuard?.read('history', read) ?? read();
+  };
 }

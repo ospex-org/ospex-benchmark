@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { InputNetworkGuard } from './inputNetworkGuard.js';
 import { CLOSE_SOURCE } from './closeSource.js';
 import { redactAndTruncate } from './config.js';
 import { parseTwoSidedHistoryRows } from './oddsHistory.js';
@@ -54,7 +55,8 @@ async function getJson(
   timeoutMs: number = FETCH_TIMEOUT_MS,
 ): Promise<unknown> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // This timer owns this read: a caller cancellation/ordinary AbortError is NOT a timeout.
+  const timer = setTimeout(() => controller.abort(Object.assign(new Error('input read timeout'), {code:'ETIMEDOUT', syscall:'read'})), timeoutMs);
   try {
     const response = await fetch(url, { headers, signal: controller.signal });
     if (!response.ok) {
@@ -516,18 +518,18 @@ export async function fetchLiveInputs(options: {
   supabaseUrl: string;
   supabaseAnonKey: string;
   windowHours: number;
+  networkGuard?: InputNetworkGuard;
 }): Promise<SlateInputs> {
   const fetchStartedAt = new Date().toISOString();
-  const gamesRows = await fetchGamesForWindow(options.apiUrl, options.windowHours);
+  const readGames = () => fetchGamesForWindow(options.apiUrl, options.windowHours);
+  const gamesRows = await (options.networkGuard?.read('games', readGames) ?? readGames());
   const oddsRows =
     gamesRows.length === 0
       ? []
-      : await fetchCurrentOdds(
-          options.supabaseUrl,
-          options.supabaseAnonKey,
-          'polygon',
-          gamesRows.map((g) => g.gameId),
-        );
+      : await (() => {
+          const read = () => fetchCurrentOdds(options.supabaseUrl, options.supabaseAnonKey, 'polygon', gamesRows.map(g => g.gameId));
+          return options.networkGuard?.read('current_odds', read) ?? read();
+        })();
   // Completion time is the bundle assembly time: every observation in the
   // inputs happened at or before this instant, never after it.
   const fetchCompletedAt = new Date().toISOString();

@@ -1,3 +1,5 @@
+import { joinInputReads, pollFreeInputs } from './inputNetworkGuard.js';
+import type { InputNetworkGuard } from './inputNetworkGuard.js';
 import { assertBootedCohort } from './cohortBoot.js';
 import { projectPreparedFires } from './lineOpenProject.js';
 import { runOneFire } from './lineOpenSpine.js';
@@ -42,6 +44,9 @@ import type { MarketKey } from './types.js';
 // ---------------------------------------------------------------------------
 
 export interface CohortTickInput {
+  /** Campaign-only free-input polling; NEVER encloses the paid phase. */
+  readonly networkGuard?: InputNetworkGuard;
+  readonly inputSleep?: (ms: number) => Promise<void>;
   readonly booted: BootedCohort;
   readonly publication: PublicationVerified;
   /** Enumerate the fire candidates for the booted cohort from the current-odds snapshot. */
@@ -168,21 +173,22 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
   assertBootedCohort(booted);
   assertCohortAdapterCapability(capability);
 
-  // (2) Discover the fire candidates from the current-odds snapshot.
-  const discovery = await discover(booted);
-
-  // (3) Read every candidate's opener evidence concurrently, keyed `${gameId}::${market}`
-  //     to match the projector's evidence lookup. A read FAULT (a rejecting read) is a
-  //     source-integrity fault per the read owner's contract: it propagates and fails the
-  //     tick loudly. An EMPTY completed read (`historyRows: []`) is normal — the projector
-  //     maps it to an `opener_not_visible` defer.
-  const evidenceEntries = await Promise.all(
-    discovery.candidates.map(async (candidate): Promise<readonly [string, MarketEvidenceRead]> => {
-      const read = await readMarketEvidence(booted, candidate.gameId, candidate.market);
-      return [`${candidate.gameId}::${candidate.market}`, read];
-    }),
-  );
-  const evidence = new Map<string, MarketEvidenceRead>(evidenceEntries);
+  // Retry only FREE inputs, never admission, dispatch, settlement, or the whole tick.
+  // Join every history sibling before retry/exit; Promise.all's early rejection is unsafe.
+  const readInputs = async () => {
+    const discovery = await discover(booted);
+    const evidenceEntries = await joinInputReads(
+      discovery.candidates.map(async (candidate): Promise<readonly [string, MarketEvidenceRead]> => {
+        const read = await readMarketEvidence(booted, candidate.gameId, candidate.market);
+        return [`${candidate.gameId}::${candidate.market}`, read];
+      }),
+    );
+    return { discovery, evidence: new Map<string, MarketEvidenceRead>(evidenceEntries) };
+  };
+  const { discovery, evidence } = input.networkGuard === undefined
+    ? await readInputs()
+    : await pollFreeInputs(input.networkGuard, booted.manifest.constants.pollIntervalMs, readInputs, input.inputSleep);
+  input.networkGuard?.assertAdmissionOpen();
 
   // (4) Project the ordered prepared fires + a disposition for EVERY discovered candidate.
   const { fires, dispositions } = projectPreparedFires({ discovery, booted, publication, evidence, now });
@@ -198,6 +204,7 @@ export async function runCohortTick(input: CohortTickInput): Promise<CohortTickR
   const fireOutcomes: FireOutcomeSummary[] = [];
   let admittedCount = 0;
   for (const fire of fires) {
+    input.networkGuard?.assertAdmissionOpen();
     if (admittedCount >= maxDispatchesPerTick) break;
     const outcome = await runOneFire({ snapshot: fire, capability, claimPort, sink, runOptions, admission, now });
     // Single-market fires: the fire's sole proposed market is `proposedMarkets[0]`. The full typed

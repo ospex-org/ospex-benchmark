@@ -243,6 +243,8 @@ export const MAX_INPUT_AGE_MS = 10 * 60_000;
 export const FRESH_FIRE_MS = 30_000;
 
 export interface WatchDeps {
+  /** Input-read admission guard only; never wraps a paid call. */
+  networkGuard?: import('./inputNetworkGuard.js').InputNetworkGuard;
   fetchInputs: () => Promise<SlateInputs>;
   /** First board appearance for (game, market); null = history not yet visible (transient). */
   fetchFirstBoardAppearance: (gameId: string, market: MarketKey) => Promise<string | null>;
@@ -473,6 +475,7 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
   };
 
   for (const candidate of candidates) {
+    deps.networkGuard?.assertAdmissionOpen();
     try {
       // Never-double-fire is enforced at the consumption site too, not just
       // in the upfront filter.
@@ -578,6 +581,7 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
       // double-billing is the failure mode that must never happen. If the
       // disk claim itself fails, the in-memory claim stands and no dispatch
       // happens — no spend, and a later process re-detects the game.
+      deps.networkGuard?.assertAdmissionOpen();
       const claimed: LedgerEntry = { ...base, decision: 'fired' };
       fireAttempts += 1;
       deps.ledger.set(row.gameId, claimed);
@@ -629,6 +633,7 @@ export async function watchTick(deps: WatchDeps): Promise<TickSummary> {
     }
   }
 
+  deps.networkGuard?.assertAdmissionOpen();
   return summary;
 }
 
