@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { nodeArtifactFs } from './fireArtifactSink.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InputNetworkGuard, InputTransportFailure, transportCause, TEMPORARY_NETWORK_EXIT, pollFreeInputs } from './inputNetworkGuard.js';
@@ -99,6 +101,94 @@ test('durable unresolved episodes rehydrate, but each new PID still takes three 
     assert.deepEqual(JSON.parse(readFileSync(statePath,'utf8')).episodes, {});
   } finally {rmSync(dir,{recursive:true,force:true});}
 });
+test('health persistence writes only changed episodes through the shared directory-sync port', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'input-network-changes-'));
+  const statePath = join(dir, 'health.json');
+  const sync = nodeArtifactFs.syncDir;
+  const snapshots: unknown[] = [];
+  t.mock.method(nodeArtifactFs, 'syncDir', (path: string) => {
+    assert.equal(path, dir);
+    // The complete final file must already be installed before its directory is synced.
+    snapshots.push(JSON.parse(readFileSync(statePath, 'utf8')).episodes);
+    if (process.platform !== 'win32') assert.equal(statSync(statePath).mode & 0o777, 0o600);
+    sync(path);
+  });
+  try {
+    const g = new InputNetworkGuard({lane:'watcher', statePath, emit:()=>{}, now:()=>1000});
+    g.beginIteration(); await g.read('games', async()=>[]); assert.equal(g.finishIteration(), null);
+    assert.equal(existsSync(statePath), false, 'first healthy tick does not create informational state');
+    g.beginIteration(); await fail(g); assert.equal(g.finishIteration(), null);
+    assert.equal(snapshots.length, 1);
+    assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).episodes.games.failureCount, 1);
+    g.beginIteration(); await g.read('current_odds', async()=>[]); g.finishIteration();
+    g.beginIteration(); g.finishIteration();
+    assert.equal(snapshots.length, 1, 'unrelated success and skipped reads do not write or clear health');
+    const reloaded = new InputNetworkGuard({lane:'watcher', statePath, emit:()=>{}, now:()=>1000});
+    reloaded.beginIteration(); await reloaded.read('history', async()=>[]); reloaded.finishIteration();
+    assert.equal(snapshots.length, 1, 'rehydrated unchanged episodes do not write');
+    reloaded.beginIteration(); await fail(reloaded); reloaded.finishIteration();
+    assert.equal(snapshots.length, 2, 'changed count writes even when the timestamp is identical');
+    assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).episodes.games.failureCount, 2);
+    reloaded.beginIteration(); await reloaded.read('games', async()=>[]); reloaded.finishIteration();
+    assert.equal(snapshots.length, 3);
+    assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')).episodes, {});
+    reloaded.beginIteration(); await reloaded.read('games', async()=>[]); reloaded.finishIteration();
+    assert.equal(snapshots.length, 3, 'repeated healthy reads do not replace an empty health file');
+    assert.deepEqual(readdirSync(dir), ['health.json']);
+  } finally { rmSync(dir, {recursive:true, force:true}); }
+});
+
+test('shared directory-sync failures remain genuine persistence STOPs', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'input-network-sync-fail-'));
+  const statePath = join(dir, 'health.json');
+  const failure = Object.assign(new Error('synthetic directory sync failure'), {code:'EIO'});
+  t.mock.method(nodeArtifactFs, 'syncDir', () => {throw failure;});
+  try {
+    const g = new InputNetworkGuard({lane:'watcher', statePath, emit:()=>assert.fail('not a network exit')});
+    g.beginIteration(); await fail(g);
+    assert.throws(()=>g.finishIteration(), error=>error===failure);
+    assert.deepEqual(readdirSync(dir), ['health.json']);
+  } finally { rmSync(dir, {recursive:true, force:true}); }
+});
+
+test('win32 directory-handle EPERM cannot break health updates or the joined exit 75', async (t) => {
+  // Exercise the real guard and production ArtifactFs branch with Windows directory
+  // semantics injected on any host. This is not a claim of native Windows execution.
+  const dir = mkdtempSync(join(tmpdir(), 'input-network-win32-'));
+  const statePath = join(dir, 'health.json');
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const open = fs.openSync;
+  let directoryOpens = 0;
+  t.mock.method(fs, 'openSync', (...args: Parameters<typeof fs.openSync>) => {
+    if (existsSync(args[0]) && statSync(args[0]).isDirectory()) {
+      directoryOpens++;
+      throw Object.assign(new Error('Windows directory handle'), {code:'EPERM'});
+    }
+    return open(...args);
+  });
+  syncBuiltinESMExports();
+  Object.defineProperty(process, 'platform', {...platform, value:'win32'});
+  try {
+    const events: string[] = [];
+    const g = new InputNetworkGuard({lane:'watcher', statePath, emit:s=>events.push(s)});
+    g.beginIteration(); await g.read('games', async()=>[]); assert.equal(g.finishIteration(), null);
+    for (let n=1; n<=3; n++) {
+      g.beginIteration(); await fail(g); assert.equal(g.finishIteration(), n===3 ? 75 : null);
+    }
+    assert.equal(directoryOpens, 0);
+    assert.equal(events.length, 1);
+    assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).episodes.games.failureCount, 3);
+    const recovered = new InputNetworkGuard({lane:'watcher', statePath, emit:()=>{}});
+    recovered.beginIteration(); await recovered.read('games', async()=>[]); recovered.finishIteration();
+    assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')).episodes, {});
+    assert.deepEqual(readdirSync(dir), ['health.json']);
+  } finally {
+    Object.defineProperty(process, 'platform', platform);
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    rmSync(dir, {recursive:true, force:true});
+  }
+});
+
 test('campaign free-input polling sleeps twice, joins reads, never repeats paid work', async () => {
   const {guard: g, events} = harness('campaign'); let reads=0; let joined=0; let paid=0; const sleeps:number[]=[];
   await assert.rejects(pollFreeInputs(g, 30000, async () => {

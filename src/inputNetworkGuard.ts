@@ -1,5 +1,6 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { nodeArtifactFs } from './fireArtifactSink.js';
 
 export const TEMPORARY_NETWORK_EXIT = 75;
 export const TRANSPORT_FAILURE_LIMIT = 3;
@@ -71,6 +72,7 @@ export class InputNetworkGuard {
   private readonly streaks = new Map<InputDependency, Streak>();
   private readonly observations = new Map<InputDependency, Observation>();
   private readonly episodes: Partial<Record<InputDependency, Episode>> = {};
+  private persistedEpisodes = '{}';
   private activeReads = 0;
   private activeIteration = false;
   private emitted = false;
@@ -99,6 +101,7 @@ export class InputNetworkGuard {
         }
       } catch {throw new Error('input-network health state unreadable; STOP for operator review');}
     }
+    this.persistedEpisodes = JSON.stringify(this.episodes);
   }
   beginIteration(): void {
     if (this.activeIteration || this.activeReads !== 0 || this.stopped) throw new Error('unsafe input-network iteration lifecycle');
@@ -162,12 +165,19 @@ export class InputNetworkGuard {
   }
   private persist(): void {
     const path = this.options.statePath; if (path === undefined || this.observations.size === 0) return;
+    // Healthy/no-change polls do not create or rewrite informational health state.
+    const episodes = JSON.stringify(this.episodes);
+    if (episodes === this.persistedEpisodes) return;
     const dir = dirname(path); mkdirSync(dir,{recursive:true}); const tmp = `${path}.${process.pid}.tmp`;
     let fd: number | undefined;
     try {
       fd = openSync(tmp,'wx',0o600);
       writeFileSync(fd,JSON.stringify({version:1,episodes:this.episodes})+'\n'); fsyncSync(fd); closeSync(fd); fd=undefined;
-      renameSync(tmp,path); const d = openSync(dir,'r'); try {fsyncSync(d);} finally {closeSync(d);}
+      renameSync(tmp,path);
+      // Reuse the existing platform-aware ArtifactFs directory durability primitive.
+      // Windows cannot fsync directory handles; genuine POSIX errors still propagate.
+      nodeArtifactFs.syncDir(dir);
+      this.persistedEpisodes = episodes;
     } finally {
       if (fd !== undefined) closeSync(fd);
       try {unlinkSync(tmp);} catch {}
