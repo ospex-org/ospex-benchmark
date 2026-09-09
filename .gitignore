@@ -18,6 +18,10 @@ yarn-error.log*
 .yarn/cache/
 .yarn/install-state.gz
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Tooling / editor
 .claude/
 .DS_Store
