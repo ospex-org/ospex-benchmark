@@ -16,22 +16,26 @@
 -- Helpers (defined first so the operation bodies resolve them at call time).
 -- ---------------------------------------------------------------------------
 
-create or replace function store._market_ord(m text) returns int language sql immutable as $$
+create or replace function store._market_ord(m text) returns int language sql immutable security invoker
+set search_path = pg_catalog, store, pg_temp as $$
   select case m when 'moneyline' then 0 when 'spread' then 1 when 'total' then 2 else 99 end;
 $$;
 
-create or replace function store._iso(t timestamptz) returns text language sql immutable as $$
+create or replace function store._iso(t timestamptz) returns text language sql immutable security invoker
+set search_path = pg_catalog, store, pg_temp as $$
   select to_char(t at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"');
 $$;
 
-create or replace function store._lease_state(p_released timestamptz, p_expires timestamptz) returns text language sql stable as $$
+create or replace function store._lease_state(p_released timestamptz, p_expires timestamptz) returns text language sql stable security invoker
+set search_path = pg_catalog, store, pg_temp as $$
   select case when p_released is not null then 'released'
               when p_expires <= now()     then 'expired'
               else 'live' end;
 $$;
 
 -- The proposed markets must be known, unique, and in canonical (ordinal) order.
-create or replace function store._markets_canonical(p jsonb) returns boolean language plpgsql as $$
+create or replace function store._markets_canonical(p jsonb) returns boolean language plpgsql security invoker
+set search_path = pg_catalog, store, pg_temp as $$
 declare m text; ord int; prev int := -1;
 begin
   for m in select value from jsonb_array_elements_text(p) loop
@@ -45,7 +49,8 @@ end $$;
 -- Every present scope reservation's spend must be a SAFE non-negative integer with a
 -- non-empty digest — a negative/fractional/unsafe spend must be rejected BEFORE the
 -- cap arithmetic, or it could decrement the reservation and free headroom (§4, case 22).
-create or replace function store._scope_spend_safe(p jsonb) returns boolean language plpgsql as $$
+create or replace function store._scope_spend_safe(p jsonb) returns boolean language plpgsql security invoker
+set search_path = pg_catalog, store, pg_temp as $$
 declare val jsonb; n numeric;
 begin
   if p is null then return true; end if;                       -- absence handled by scope_reservation_missing
@@ -63,7 +68,8 @@ end $$;
 -- initCohortBudget — insert-once from the pinned manifest (§2.3, §1.1).
 -- ---------------------------------------------------------------------------
 
-create or replace function store.init_cohort_budget(p jsonb) returns jsonb language plpgsql as $$
+create or replace function store.init_cohort_budget(p jsonb) returns jsonb language plpgsql security definer
+set search_path = pg_catalog, store, pg_temp as $$
 declare v store.cohort_budget%rowtype; v_id text := p ->> 'cohortId';
 begin
   -- Fast path: a row is already visible → lock it and compare (no insert attempt).
@@ -112,7 +118,8 @@ end $$;
 
 create or replace function store.admit_dispatch(p_cohort text, p_fire text, p_owner text, p_ver int,
                                                 p_game text, p_markets jsonb, p_scope jsonb) returns jsonb
-language plpgsql as $$
+language plpgsql security definer
+set search_path = pg_catalog, store, pg_temp as $$
 declare
   v store.cohort_budget%rowtype;
   v_retained text[]; v_scope_key text; v_call_delta bigint; v_spend_delta bigint; v_digest text;
@@ -206,7 +213,8 @@ end $$;
 -- ---------------------------------------------------------------------------
 
 create or replace function store.acquire_repair_lease(p_cohort text, p_fire text, p_owner text, p_arm int, p_ordinal int, p_ver int) returns jsonb
-language plpgsql as $$
+language plpgsql security definer
+set search_path = pg_catalog, store, pg_temp as $$
 declare v store.cohort_budget%rowtype; f store.fires%rowtype; l store.concurrency_leases%rowtype; v_slots int; v_existing int;
 begin
   if p_arm is null or p_arm < 0 or p_ordinal is null or p_ordinal < 1 then return jsonb_build_object('outcome','refused','reason','invalid_input','requestAuthorized',false); end if;
@@ -245,7 +253,8 @@ end $$;
 -- releaseLease — owner-scoped, capacity-only, no budget lock (§4.3).
 -- ---------------------------------------------------------------------------
 
-create or replace function store.release_lease(p_lease text, p_owner text) returns jsonb language plpgsql as $$
+create or replace function store.release_lease(p_lease text, p_owner text) returns jsonb language plpgsql security definer
+set search_path = pg_catalog, store, pg_temp as $$
 declare v_owner text;
 begin
   select owner_id into v_owner from store.concurrency_leases where lease_id = p_lease;
@@ -260,7 +269,8 @@ end $$;
 -- ---------------------------------------------------------------------------
 
 create or replace function store.complete_claim(p_cohort text, p_fire text, p_ver int, p_actual_calls bigint, p_actual_spend bigint) returns jsonb
-language plpgsql as $$
+language plpgsql security definer
+set search_path = pg_catalog, store, pg_temp as $$
 declare v store.cohort_budget%rowtype; f store.fires%rowtype;
 begin
   select * into v from store.cohort_budget where cohort_id = p_cohort for update;

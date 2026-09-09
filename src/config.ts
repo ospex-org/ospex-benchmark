@@ -57,6 +57,8 @@ const SECRET_ENV_VARS = [
   // the store path builds a driver config from it and reports driver errors,
   // and an unenrolled value passes through those messages verbatim.
   'STORE_DATABASE_URL',
+  'STORE_STATUS_DATABASE_URL',
+  'STORE_MIGRATION_DATABASE_URL',
 ] as const;
 
 export function envValue(name: string): string | undefined {

@@ -283,6 +283,11 @@ async function main(): Promise<void> {
   const s = storeFor((sql, params) => pool.query(sql, params));
 
   // Fresh schema each run so a rerun is deterministic.
+  // Roles are cluster-global; a scratch database name is not reset authority.
+  if ((await pool.query("select rolname from pg_roles where rolname in ('ospex_store_migrator','ospex_store_runtime','ospex_store_status')")).rows.length > 0) {
+    await pool.end();
+    throw new Error('preexisting dedicated store role: use an owned disposable cluster');
+  }
   await pool.query('drop schema if exists store cascade');
   await pool.query(SCHEMA_SQL);
   await pool.query(FUNCTIONS_SQL);

@@ -42,6 +42,7 @@ const ROSTER = defaultExpectedArms().map((a) => a.participantId);
 
 const SYNTHETIC_ENV: Record<string, string | undefined> = {
   STORE_DATABASE_URL: 'postgres://synthetic/none',
+  STORE_STATUS_DATABASE_URL: 'postgres://synthetic-status/none',
   // The tick constructs its real read seams from these (never invoked — `runTick` is
   // injected), and the gated billable mint probes each roster adapter's credential env
   // var FOR ITSELF — synthetic values satisfy the probe; no network call ever happens.
@@ -2733,6 +2734,7 @@ const UNREACHABLE_STORE_URL = 'postgres://x:x@127.0.0.1:1/nope';
 /** Synthetic credentials satisfy every pre-prompt gate; real env vars always win over .env. */
 const PROBE_ENV = {
   STORE_DATABASE_URL: UNREACHABLE_STORE_URL,
+  STORE_STATUS_DATABASE_URL: UNREACHABLE_STORE_URL,
   OPENAI_API_KEY: 'synthetic-test-credential',
   ANTHROPIC_API_KEY: 'synthetic-test-credential',
   GEMINI_API_KEY: 'synthetic-test-credential',
