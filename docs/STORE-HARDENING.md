@@ -30,6 +30,27 @@ existing-object ownership transfer are deliberately **not automated** here.
 Grant CONNECT on the selected database separately if its policy requires it.
 Do not use REASSIGN OWNED broadly in a shared database.
 
+On PostgreSQL 16+, a non-superuser CREATEROLE provisioner (including a managed
+Postgres DBA) automatically receives ADMIN membership in every role it creates.
+Those edges are also forbidden. PostgreSQL records the bootstrap superuser as
+their grantor, so **the non-superuser provisioner cannot remove them itself**.
+A superuser (or a provider-supported operation with that authority) must revoke
+them before either migration or runtime role checks can succeed. For example,
+replace `dba_provisioner` with the actual provisioner identifier (quote it if
+necessary), then execute with that grantor-level authority:
+
+```sql
+REVOKE ospex_store_migrator, ospex_store_runtime, ospex_store_status
+  FROM dba_provisioner;
+```
+
+Read back `pg_auth_members` and require no edges with any dedicated role as either
+`roleid` or `member`; do not weaken the verifier to admit an ADMIN-only edge.
+PostgreSQL's [role-attribute documentation](https://www.postgresql.org/docs/17/role-attributes.html)
+describes this grantor restriction. On managed Postgres without a supported way
+to clear these edges, **STOP before migration** and resolve provisioning with the
+provider; the local superuser drill does not prove managed-provider readiness.
+
 Keep DSNs in the canonical operator secret channel, never tracked files or CLI
 arguments. Runtime uses `STORE_DATABASE_URL`; status exclusively uses
 `STORE_STATUS_DATABASE_URL`; migration exclusively uses
@@ -43,6 +64,12 @@ migration credential to a daemon or status process.
    existing schema and transfer only its canonical store objects to the migrator.
    Foreign ownership, extra store objects, RLS, user triggers, unsafe memberships
    and unexpected privileges are refused by readback, not silently adopted.
+   Ownership alone is not usable access: readback also requires the owner's
+   effective schema, table/column, routine and sequence privileges. Explicit
+   migration restores its ordinary object ACLs, including a revoked table SELECT
+   needed by DEFINER RPCs. If schema USAGE/CREATE was revoked, restore that access
+   through reviewed DBA work before installation; it may be needed by pre-readback
+   DDL. `--check` only detects drift and never repairs it.
 2. Supply only the migration DSN securely and run `yarn store:migrate` from the
    reviewed checkout. The command uses one Client/transaction, a transaction-scoped
    advisory lock, bounded lock/statement timeouts, explicit installation, effective
@@ -61,17 +88,43 @@ revoked for the dedicated migrator. Readback checks effective ACLs, column grant
 grant options, routine identities/owners/search paths, sequence permissions, role
 attributes/membership and PG17 MAINTAIN denial. This is a bounded privilege gate,
 not a complete structural migration engine for arbitrary preexisting schemas.
+It is also **not a spend ceiling against a compromised runtime**: that role can
+initialize a new cohort with its own caps through the existing money RPC.
+
+## Explicit follow-ups (not closed by this privilege change)
+
+- **Structural adoption (review item 3):** freeze canonical columns, types,
+  nullability and constraints; reject cross-schema inheritance/partition edges
+  touching store tables and unexpected rewrite rules. Prove each drift refuses
+  `--check`/migration without partial effects. Current namespace/ACL readback does
+  not certify these properties. Before any separately authorized migration, the
+  DBA inventory must explicitly account for these still-unverified surfaces.
+- **Authorization immutability (review item 4):** a separately reviewed
+  `store.disarm_campaign(text,text)` RPC and adapter change can replace runtime
+  UPDATE on authorization `record`. Prove re-arm/cap rewriting is denied while
+  legitimate disarm stays atomic and replay-safe. Current UPDATE is column-scoped,
+  not value-scoped: authorization records are not DB-immutable today. This PR keeps
+  the reviewed five-RPC interface and does not claim to close that boundary.
+- **Conformance CI (review item 5 residual):** add an explicitly provisioned
+  disposable-Postgres job in a separate CI change. Until then, Docker conformance
+  remains required local migration evidence, not an offline-CI guarantee.
 
 ## Reproducible verification
 
 `yarn typecheck` and `yarn test` remain database-free. The explicit
 `yarn store:hardening` harness needs Docker and a pre-cached `postgres:17.10` image;
-it uses `--pull=never`, a uniquely named owned container, tmpfs data, loopback-only
+run `docker pull postgres:17.10` explicitly first if it is not already cached.
+It uses `--pull=never`, a uniquely named owned container, tmpfs data, loopback-only
 ports, synthetic credentials and an isolated temporary HOME. It accepts no input
 DSN or environment file and removes only its owned container.
 
 That harness exercises allowed money/auth/tick/status paths, denied table/column/
 DDL/helper/RPC operations for runtime/status/public roles, legacy economic/race
-conformance, migration replay, grant mutations and post-DDL rollback. PostgreSQL
+conformance, migration replay, grant mutations and post-DDL rollback. The
+owner-ACL revocation/repair, non-superuser provisioning, all three legacy reset
+guards, role-guard predicates and status-fixture cleanup/rerun are also exercised.
+The legacy status fixture uses a fresh synthetic password and removes only the
+role it successfully created, in `finally`; preexisting roles cause refusal before
+schema reset. PostgreSQL
 conformance is local explicit evidence, not part of the existing offline CI job.
 No production database was migrated as part of this PR.

@@ -14,6 +14,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -541,60 +542,69 @@ async function main(): Promise<void> {
 
     // A SELECT-only role: it cannot create schemas, tables, or functions — the exact
     // capability the monitoring read must not need.
-    await pool.query("create role ospex_store_status login password 'ro-conformance'");
-    await pool.query('grant usage on schema store to ospex_store_status');
-    await pool.query('grant select on all tables in schema store to ospex_store_status');
-    const roUrl = new URL(DATABASE_URL);
-    roUrl.username = 'ospex_store_status';
-    roUrl.password = 'ro-conformance';
+    const roPassword = randomUUID();
+    await pool.query(`create role ospex_store_status login password '${roPassword}'`);
+    // Enter cleanup only after CREATE succeeds: never drop an unowned role.
+    try {
+      await pool.query('grant usage on schema store to ospex_store_status');
+      await pool.query('grant select on all tables in schema store to ospex_store_status');
+      const roUrl = new URL(DATABASE_URL);
+      roUrl.username = 'ospex_store_status';
+      roUrl.password = roPassword;
 
-    // Fingerprint the store-function catalog rows (oid:xmin): any CREATE OR REPLACE — even
-    // one that re-installs identical source — rewrites a row and changes this string.
-    const fingerprint = async (): Promise<string> => {
-      const { rows } = await pool.query(
-        `select coalesce(string_agg(p.oid::text || ':' || p.xmin::text, ',' order by p.oid), '') as fp
-           from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-          where n.nspname = 'store'`,
+      // Fingerprint the store-function catalog rows (oid:xmin): any CREATE OR REPLACE — even
+      // one that re-installs identical source — rewrites a row and changes this string.
+      const fingerprint = async (): Promise<string> => {
+        const { rows } = await pool.query(
+          `select coalesce(string_agg(p.oid::text || ':' || p.xmin::text, ',' order by p.oid), '') as fp
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'store'`,
+        );
+        return String(rows[0]!.fp);
+      };
+      const before = await fingerprint();
+
+      // The REAL public CLI, as the read-only role, real argv/stdin.
+      const cliPath = fileURLToPath(new URL('../campaignMain.ts', import.meta.url));
+      const result = spawnSync(process.execPath, ['--import', 'tsx', cliPath, 'status', '--manifest', manifestPath], {
+        cwd: dirname(dirname(cliPath)),
+        encoding: 'utf8',
+        timeout: 120_000,
+        input: '',
+        env: {
+          ...process.env,
+          STORE_STATUS_DATABASE_URL: roUrl.toString(),
+          OPENAI_API_KEY: 'synthetic-test-credential',
+          ANTHROPIC_API_KEY: 'synthetic-test-credential',
+          GEMINI_API_KEY: 'synthetic-test-credential',
+          GOOGLE_API_KEY: '',
+          XAI_API_KEY: 'synthetic-test-credential',
+        },
+      });
+      const out = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+      assert.equal(result.status, 0, `the read-only role renders the live report and exits 0; out=${out}`);
+      assert.ok(out.includes('authorization LIVE'), `the report rendered; out=${out}`);
+      assert.ok(
+        out.includes('root   /srv/campaign-evidence (bound at arm'),
+        `the bound evidence root renders; out=${out}`,
       );
-      return String(rows[0]!.fp);
-    };
-    const before = await fingerprint();
-
-    // The REAL public CLI, as the read-only role, real argv/stdin.
-    const cliPath = fileURLToPath(new URL('../campaignMain.ts', import.meta.url));
-    const result = spawnSync(process.execPath, ['--import', 'tsx', cliPath, 'status', '--manifest', manifestPath], {
-      cwd: dirname(dirname(cliPath)),
-      encoding: 'utf8',
-      timeout: 120_000,
-      input: '',
-      env: {
-        ...process.env,
-        STORE_STATUS_DATABASE_URL: roUrl.toString(),
-        OPENAI_API_KEY: 'synthetic-test-credential',
-        ANTHROPIC_API_KEY: 'synthetic-test-credential',
-        GEMINI_API_KEY: 'synthetic-test-credential',
-        GOOGLE_API_KEY: '',
-        XAI_API_KEY: 'synthetic-test-credential',
-      },
-    });
-    const out = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-    assert.equal(result.status, 0, `the read-only role renders the live report and exits 0; out=${out}`);
-    assert.ok(out.includes('authorization LIVE'), `the report rendered; out=${out}`);
-    assert.ok(
-      out.includes('root   /srv/campaign-evidence (bound at arm'),
-      `the bound evidence root renders; out=${out}`,
-    );
-    assert.ok(
-      out.includes('latch  clear — no unresolved fire'),
-      `the escalation-latch read ran under the SELECT-only role; out=${out}`,
-    );
-    assert.ok(
-      out.includes(`ticks  last tick ${seededTick} started`) && out.includes('(dispatched)'),
-      `the RO role SELECTed the real journal row; out=${out}`,
-    );
-    assert.ok(out.includes('sched  clear — scheduling may continue'), `the schedule state rendered; out=${out}`);
-    assert.ok(out.includes('next tick would AUTHORIZE'), `the verdict rendered; out=${out}`);
-    assert.equal(await fingerprint(), before, 'the monitoring read rewrote NO store-function catalog row');
+      assert.ok(
+        out.includes('latch  clear — no unresolved fire'),
+        `the escalation-latch read ran under the SELECT-only role; out=${out}`,
+      );
+      assert.ok(
+        out.includes(`ticks  last tick ${seededTick} started`) && out.includes('(dispatched)'),
+        `the RO role SELECTed the real journal row; out=${out}`,
+      );
+      assert.ok(out.includes('sched  clear — scheduling may continue'), `the schedule state rendered; out=${out}`);
+      assert.ok(out.includes('next tick would AUTHORIZE'), `the verdict rendered; out=${out}`);
+      assert.equal(await fingerprint(), before, 'the monitoring read rewrote NO store-function catalog row');
+    } finally {
+      await pool.query('revoke select on all tables in schema store from ospex_store_status');
+      await pool.query('revoke usage on schema store from ospex_store_status');
+      await pool.query('drop role ospex_store_status');
+      assert.equal((await pool.query("select oid from pg_roles where rolname = 'ospex_store_status'")).rows.length, 0);
+    }
   });
 
   await pool.end();

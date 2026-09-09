@@ -63,7 +63,8 @@ begin
     end if;
   end loop;
 
-  -- No ACL recipient outside the owner and the two bounded roles, no grant options.
+  -- No ACL recipient outside the owner and the two bounded roles. Only the owner
+  -- may hold grant options; ownership itself does not imply effective object access.
   -- Relation checks include sequences, and column ACLs are inspected independently.
   if exists (
     select 1 from (
@@ -85,24 +86,25 @@ begin
     raise exception 'store hardening: unsafe default privileges';
   end if;
 
-  for r in select oid, rolname from pg_roles where oid in (runtime_id,status_id)
+  for r in select oid, rolname from pg_roles where oid in (owner_id,runtime_id,status_id)
     or rolname in ('anon','authenticated','service_role') loop
-    expected := r.oid in (runtime_id,status_id);
-    if has_schema_privilege(r.oid, ns, 'USAGE') <> expected or has_schema_privilege(r.oid, ns, 'CREATE')
-      or has_schema_privilege(r.oid, ns, 'USAGE WITH GRANT OPTION') then
+    expected := r.oid in (owner_id,runtime_id,status_id);
+    if has_schema_privilege(r.oid, ns, 'USAGE') <> expected
+      or has_schema_privilege(r.oid, ns, 'CREATE') <> (r.oid = owner_id)
+      or (r.oid <> owner_id and has_schema_privilege(r.oid, ns, 'USAGE WITH GRANT OPTION')) then
       raise exception 'store hardening: schema privilege mismatch %', r.rolname;
     end if;
     for t in select * from pg_class where relnamespace = ns and relkind = 'r' loop
       foreach priv in array table_privileges loop
-        expected := r.oid in (runtime_id,status_id) and priv = 'SELECT';
+        expected := r.oid = owner_id or (r.oid in (runtime_id,status_id) and priv = 'SELECT');
         if has_table_privilege(r.oid,t.oid,priv) <> expected
-          or has_table_privilege(r.oid,t.oid,priv || ' WITH GRANT OPTION') then
+          or (r.oid <> owner_id and has_table_privilege(r.oid,t.oid,priv || ' WITH GRANT OPTION')) then
           raise exception 'store hardening: table privilege mismatch %.% %', r.rolname,t.relname,priv;
         end if;
       end loop;
       for col in select attname, attnum from pg_attribute where attrelid = t.oid and attnum > 0 and not attisdropped loop
         foreach priv in array array['SELECT','INSERT','UPDATE','REFERENCES'] loop
-          expected := (r.oid in (runtime_id,status_id) and priv = 'SELECT') or
+          expected := r.oid = owner_id or (r.oid in (runtime_id,status_id) and priv = 'SELECT') or
             (r.oid = runtime_id and (
               (t.relname = 'campaign_authorizations' and
                 ((priv = 'INSERT' and col.attname in ('cohort_id','record')) or (priv = 'UPDATE' and col.attname = 'record')))
@@ -110,23 +112,23 @@ begin
                 ((priv = 'INSERT' and col.attname in ('cohort_id','kind','started_at','finished_at','outcome','detail'))
                 or (priv = 'UPDATE' and col.attname in ('finished_at','outcome','detail'))))));
           if has_column_privilege(r.oid,t.oid,col.attnum,priv) <> expected
-            or has_column_privilege(r.oid,t.oid,col.attnum,priv || ' WITH GRANT OPTION') then
+            or (r.oid <> owner_id and has_column_privilege(r.oid,t.oid,col.attnum,priv || ' WITH GRANT OPTION')) then
             raise exception 'store hardening: column privilege mismatch %.%.% %', r.rolname,t.relname,col.attname,priv;
           end if;
         end loop;
       end loop;
     end loop;
     foreach signature in array money || helpers loop
-      expected := r.oid = runtime_id and signature = any(money);
+      expected := r.oid = owner_id or (r.oid = runtime_id and signature = any(money));
       if has_function_privilege(r.oid,to_regprocedure(signature),'EXECUTE') <> expected
-        or has_function_privilege(r.oid,to_regprocedure(signature),'EXECUTE WITH GRANT OPTION') then
+        or (r.oid <> owner_id and has_function_privilege(r.oid,to_regprocedure(signature),'EXECUTE WITH GRANT OPTION')) then
         raise exception 'store hardening: routine privilege mismatch % %',r.rolname,signature;
       end if;
     end loop;
     foreach priv in array array['USAGE','SELECT','UPDATE'] loop
-      expected := r.oid = runtime_id and priv = 'USAGE';
+      expected := r.oid = owner_id or (r.oid = runtime_id and priv = 'USAGE');
       if has_sequence_privilege(r.oid,'store.campaign_ticks_id_seq',priv) <> expected
-        or has_sequence_privilege(r.oid,'store.campaign_ticks_id_seq',priv || ' WITH GRANT OPTION') then
+        or (r.oid <> owner_id and has_sequence_privilege(r.oid,'store.campaign_ticks_id_seq',priv || ' WITH GRANT OPTION')) then
         raise exception 'store hardening: sequence privilege mismatch % %',r.rolname,priv;
       end if;
     end loop;

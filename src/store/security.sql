@@ -28,6 +28,13 @@ begin
   end loop;
 end $hardening$;
 
+-- A DBA can revoke the owner's ordinary ACLs without changing ownership. The
+-- DEFINER money path needs those privileges too; explicit migration repairs them.
+grant all on schema store to ospex_store_migrator;
+grant all on all tables in schema store to ospex_store_migrator;
+grant all on all sequences in schema store to ospex_store_migrator;
+grant all on all functions in schema store to ospex_store_migrator;
+
 grant usage on schema store to ospex_store_runtime, ospex_store_status;
 grant select on store.cohort_budget, store.fires, store.claims, store.concurrency_leases,
   store.campaign_authorizations, store.campaign_ticks to ospex_store_runtime, ospex_store_status;

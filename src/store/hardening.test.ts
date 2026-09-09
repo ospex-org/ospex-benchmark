@@ -49,9 +49,9 @@ test('SH4: migration is explicit, transaction-scoped and separately credentialed
   const source = read('./migrate.ts');
   assert.match(source, /STORE_MIGRATION_DATABASE_URL/);
   assert.doesNotMatch(source, /loadDotEnv|envValue\('STORE_DATABASE_URL'\)/);
-  assert.match(source, /begin/i);
+  assert.match(source, /await client\.query\(checkOnly \? 'begin read only' : 'begin'\)/);
   assert.match(source, /verify\.sql/);
-  assert.match(source, /rollback/i);
+  assert.match(source, /await client\.query\('rollback'\)\.catch/);
   const scripts = JSON.parse(read('../../package.json')).scripts;
   assert.equal(scripts['store:migrate'], 'tsx src/store/migrate.ts');
   assert.equal(scripts['store:hardening'], 'tsx src/store/hardening.conformance.ts');
@@ -64,6 +64,8 @@ test('SH1/SH2/SH4: role guard allows only the actual standalone dedicated login 
     const client = (rows: Array<Record<string, unknown>>) => ({ query: async (statement: string) => {
       assert.match(statement, /^select /);
       assert.doesNotMatch(statement, /\b(create|alter|grant|insert|update|delete|set role)\b/i);
+      assert.match(statement, /rolsuper or rolcreaterole or rolcreatedb or rolbypassrls or rolreplication as elevated/);
+      assert.match(statement, /where member = r\.oid or roleid = r\.oid/);
       return { rows };
     } });
     await requireStoreRole(client([valid]), role);
@@ -76,13 +78,16 @@ test('SH1/SH2/SH4: role guard allows only the actual standalone dedicated login 
   }
 });
 
-test('SH6: standalone legacy harness refuses existing cluster roles before schema reset', () => {
-  const source = read('./campaignAuthStore.conformance.ts');
-  const guard = source.indexOf('preexisting dedicated store role');
-  const reset = source.indexOf("await pool.query('drop schema if exists store cascade')");
-  assert.ok(guard > 0 && guard < reset, 'role topology guard must precede destructive schema reset');
-  assert.doesNotMatch(source, /drop role if exists ospex_store_status/);
-});
+for (const path of ['./campaignAuthStore.conformance.ts', './atomicStore.conformance.ts', './spike/conformance.ts']) {
+  test(`SH6: ${path} refuses existing cluster roles before schema reset`, () => {
+    const source = read(path);
+    const guard = source.indexOf('preexisting dedicated store role');
+    const reset = source.indexOf("await pool.query('drop schema if exists store cascade')");
+    assert.ok(guard > 0 && guard < reset, 'role topology guard must precede destructive schema reset');
+    assert.match(source.slice(0, guard), /select rolname from pg_roles where rolname in \('ospex_store_migrator','ospex_store_runtime','ospex_store_status'\)/);
+    assert.doesNotMatch(source, /drop role if exists ospex_store_status/);
+  });
+}
 
 test('SH2/SH4: both new DSNs are redacted at the diagnostic boundary', () => {
   for (const key of ['STORE_STATUS_DATABASE_URL', 'STORE_MIGRATION_DATABASE_URL']) {

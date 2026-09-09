@@ -84,28 +84,51 @@ try {
   assert.ok(ready, 'owned scratch PostgreSQL not ready');
   console.log(`PostgreSQL ${(await admin.query('show server_version')).rows[0].server_version}`);
   // Prove that a preexisting production-named cluster role cannot be dropped by
-  // the standalone legacy harness. This role and sentinel belong to our test.
+  // every standalone legacy harness. This role and sentinel belong to our test.
   await admin.query('create schema store; create table store.role_guard_sentinel(x int); insert into store.role_guard_sentinel values (73); create role ospex_store_status login');
   const roleBefore = (await admin.query("select oid, rolname, rolcanlogin from pg_roles where rolname='ospex_store_status'")).rows;
-  assert.match(await run('src/store/campaignAuthStore.conformance.ts', { STORE_DATABASE_URL: url('postgres') }, [], 1), /preexisting dedicated store role/);
-  assert.deepEqual((await admin.query("select oid, rolname, rolcanlogin from pg_roles where rolname='ospex_store_status'")).rows, roleBefore);
-  assert.deepEqual((await admin.query('select x from store.role_guard_sentinel')).rows, [{ x: 73 }]);
+  for (const path of ['src/store/campaignAuthStore.conformance.ts', 'src/store/atomicStore.conformance.ts', 'src/store/spike/conformance.ts']) {
+    assert.match(await run(path, { STORE_DATABASE_URL: url('postgres') }, [], 1), /preexisting dedicated store role/);
+    assert.deepEqual((await admin.query("select oid, rolname, rolcanlogin from pg_roles where rolname='ospex_store_status'")).rows, roleBefore);
+    assert.deepEqual((await admin.query('select x from store.role_guard_sentinel')).rows, [{ x: 73 }]);
+    console.log(`SH6 role/schema sentinel preserved: ${path}`);
+  }
   await admin.query('drop role ospex_store_status; drop schema store cascade');
   console.log('SH6 legacy cluster-role refusal preserves role and schema sentinel PASS');
   // Preserve the existing economic/race gates. Their destructive resets see only our DB.
   for (const path of ['src/store/spike/conformance.ts', 'src/store/atomicStore.conformance.ts', 'src/store/campaignAuthStore.conformance.ts']) {
     await run(path, { STORE_DATABASE_URL: url('postgres'), STORE_STATUS_DATABASE_URL: url('postgres') });
   }
+  assert.equal((await admin.query("select oid from pg_roles where rolname='ospex_store_status'")).rows.length, 0);
+  await run('src/store/campaignAuthStore.conformance.ts', { STORE_DATABASE_URL: url('postgres') });
+  assert.equal((await admin.query("select oid from pg_roles where rolname='ospex_store_status'")).rows.length, 0);
+  console.log('SH6 status fixture cleanup + same-cluster repeat PASS');
   await admin.query('drop schema if exists store cascade');
-  await admin.query('drop role if exists ospex_store_status');
-  for (const role of [...roles, ...banned]) {
+  for (const role of banned) {
     await admin.query(`create role ${role} login password '${password}' nosuperuser nocreatedb nocreaterole noinherit noreplication nobypassrls`);
+  }
+  // PG16+ managed-style provisioning: CREATEROLE automatically grants the
+  // non-superuser creator ADMIN membership with the bootstrap superuser as
+  // grantor. Self-REVOKE cannot remove it; the documented DBA step is mandatory.
+  await admin.query(`create role store_test_provisioner login createrole password '${password}'`);
+  const provisioner = pool('store_test_provisioner');
+  for (const role of roles) {
+    await provisioner.query(`create role ${role} login password '${password}' nosuperuser nocreatedb nocreaterole noinherit noreplication nobypassrls`);
   }
   await admin.query('grant create on database store_hardening to ospex_store_migrator');
   const owner = pool(roles[0]);
   const runtime = pool(roles[1]);
   const status = pool(roles[2]);
   const migrateEnv = { STORE_MIGRATION_DATABASE_URL: url(roles[0]) };
+  assert.equal((await admin.query("select count(*) as n from pg_auth_members where member='store_test_provisioner'::regrole and admin_option and roleid=any($1::regrole[])", [roles])).rows[0].n, '3');
+  for (const [p, role] of [[owner, roles[0]], [runtime, roles[1]], [status, roles[2]]] as const) {
+    await assert.rejects(requireStoreRole(p, role), /requires standalone/);
+  }
+  assert.match(await run('src/store/migrate.ts', migrateEnv, [], 1), /requires standalone/);
+  await provisioner.query('revoke ospex_store_migrator, ospex_store_runtime, ospex_store_status from store_test_provisioner');
+  assert.equal((await admin.query("select count(*) as n from pg_auth_members where member='store_test_provisioner'::regrole and grantor='postgres'::regrole and admin_option and roleid=any($1::regrole[])", [roles])).rows[0].n, '3');
+  await admin.query('revoke ospex_store_migrator, ospex_store_runtime, ospex_store_status from store_test_provisioner');
+  assert.equal((await admin.query('select count(*) as n from pg_auth_members where roleid=any($1::regrole[]) or member=any($1::regrole[])', [roles])).rows[0].n, '0');
   for (const [p, role] of [[owner, roles[0]], [runtime, roles[1]], [status, roles[2]]] as const) {
     await requireStoreRole(p, role);
     await assert.rejects(requireStoreRole(admin, role), /requires standalone/);
@@ -117,6 +140,21 @@ try {
   await run('src/store/migrate.ts', migrateEnv);
   await run('src/store/migrate.ts', migrateEnv); // idempotent, no privilege widening
   await run('src/store/migrate.ts', migrateEnv, ['--check']);
+  console.log('SH2 PG17 provisioning: implicit ADMIN refused, self-REVOKE ineffective, superuser REVOKE and migration PASS');
+
+  // Ownership does not imply effective SELECT/EXECUTE after a DBA revokes it.
+  // The readonly gate must fail, and explicit migration must repair actual RPC use.
+  const repairPins = { cohortId: 'owner-acl-repair', schemaVersion: 1, callCap: 2, spendCapUsdMicros: 1000,
+    concurrencyLimit: 1, rosterSize: 1, maxRepairsPerArm: 1, initialLeaseBoundMs: 60000, repairLeaseBoundMs: 60000 };
+  await owner.query('revoke select on store.cohort_budget from ospex_store_migrator');
+  await denied(runtime, `select store.init_cohort_budget('${JSON.stringify(repairPins)}'::jsonb)`);
+  assert.match(await run('src/store/migrate.ts', migrateEnv, ['--check'], 1), /table privilege mismatch ospex_store_migrator.cohort_budget SELECT/);
+  assert.equal((await admin.query('select count(*) as n from store.cohort_budget')).rows[0].n, '0');
+  await run('src/store/migrate.ts', migrateEnv);
+  assert.equal((await admin.query('select count(*) as n from store.cohort_budget')).rows[0].n, '0');
+  assert.deepEqual(await new SqlAtomicStore(pgStoreQuery(runtime)).initCohortBudget(repairPins), { outcome: 'initialized' });
+  await run('src/store/migrate.ts', migrateEnv, ['--check']);
+  console.log('SH6 owner SELECT: dead RPC rejected, --check refused without writes, explicit migration repaired runtime RPC PASS');
 
   // Upgrade canonical tables with legacy invoker/default-path routines and broad
   // table/column/function grants, under the dedicated owner.
@@ -204,6 +242,12 @@ try {
   // Negative controls: mutate one catalog boundary, require the readback to reject,
   // observe the changed real permission, and roll the whole mutation back.
   const mutations = [
+    ['owner SELECT', 'revoke select on store.cohort_budget from ospex_store_migrator'],
+    ['owner helper EXECUTE', 'revoke execute on function store._iso(timestamptz) from ospex_store_migrator'],
+    ['owner RPC EXECUTE', 'revoke execute on function store.release_lease(text,text) from ospex_store_migrator'],
+    ['owner sequence', 'revoke usage on sequence store.campaign_ticks_id_seq from ospex_store_migrator'],
+    ['owner schema USAGE', 'revoke usage on schema store from ospex_store_migrator'],
+    ['owner schema CREATE', 'revoke create on schema store from ospex_store_migrator'],
     ['PUBLIC column', 'grant update(calls_reserved) on store.cohort_budget to public'],
     ['status delete', 'grant delete on store.fires to ospex_store_status'],
     ['helper execute', 'grant execute on function store._iso(timestamptz) to ospex_store_runtime'],
@@ -252,6 +296,25 @@ try {
   }
   await run('src/store/migrate.ts', migrateEnv, ['--check']);
   // Transaction rollback on forbidden inherited privileges: no partial function replacement.
+  // Exercise the real identity query, not only mocked result rows: each elevated
+  // attribute and membership direction must refuse before any production DDL.
+  const guardMutations = [
+    // NOLOGIN is an authentication/install-time check, not session revocation;
+    // this query checks already-connected identity, elevations and memberships.
+    ...['superuser', 'createrole', 'createdb', 'bypassrls', 'replication'].map(flag => `alter role ospex_store_runtime ${flag}`),
+    'grant outsider to ospex_store_runtime with inherit false',
+    'grant ospex_store_runtime to outsider with inherit false',
+  ];
+  for (const mutation of guardMutations) {
+    const c = await admin.connect();
+    try {
+      await c.query('begin'); await c.query(mutation);
+      await c.query('set local session authorization ospex_store_runtime');
+      await assert.rejects(requireStoreRole(c, 'ospex_store_runtime'), /requires standalone/, mutation);
+      console.log(`SH2 role guard mutation killed: ${mutation}`);
+    } finally { await c.query('rollback'); c.release(); }
+  }
+  await requireStoreRole(runtime, 'ospex_store_runtime');
   // Committed catalog mutations must also fail the actual read-only CLI, not only
   // the in-transaction verifier. Remove only the synthetic grant in each finally.
   for (const [label, grant, revoke] of [
