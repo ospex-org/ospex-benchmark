@@ -395,19 +395,6 @@ export function classifyStoreFireResult(
 // ---------------------------------------------------------------------------
 
 /**
- * Idempotently (re)apply the store schema + functions to `pool`. The checked-in DDL is
- * idempotent (`create schema/table/index if not exists`, `create or replace function`), so
- * this is safe to run on every boot WITHOUT any destructive `drop` — it makes the demo
- * self-contained against a fresh or already-provisioned scratch database.
- */
-async function applyStoreSchema(pool: Pool): Promise<void> {
-  const schemaSql = readFileSync(new URL('./store/schema.sql', import.meta.url), 'utf8');
-  const functionsSql = readFileSync(new URL('./store/functions.sql', import.meta.url), 'utf8');
-  await pool.query(schemaSql);
-  await pool.query(functionsSql);
-}
-
-/**
  * The DB-bound seams of the store-backed fire, injected so the owner-level flow — the up-front
  * option refusal, boot, budget init, the tick, the result classification, and the exit code — is
  * drivable WITHOUT a database. `openStore` provisions the durable store; `runTick` runs ONE cohort
@@ -444,14 +431,12 @@ const PRODUCTION_STORE_FIRE_DEPS: StoreFireDeps = {
     // `pg` is imported dynamically so the rehearsal path (and the importable pure helpers) never
     // pull a database driver; only the store-backed branch constructs a Pool.
     const { Pool } = await import('pg');
-    const { storeConnectionConfig } = await import('./store/connection.js');
+    const { storeConnectionConfig, requireStoreRole } = await import('./store/connection.js');
     const pool: Pool = new Pool(storeConnectionConfig(databaseUrl));
     try {
-      // Make the store self-contained: apply the idempotent DDL (no drop) before wrapping it.
-      await applyStoreSchema(pool);
+      await requireStoreRole(pool, 'ospex_store_runtime');
     } catch (error) {
-      // A schema-apply failure must not leak the Pool — close it before propagating (the original
-      // inline path closed the Pool in its `finally` on this same failure).
+      // A role/connection failure must not leak the Pool.
       await pool.end();
       throw error;
     }

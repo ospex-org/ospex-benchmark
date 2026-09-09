@@ -286,6 +286,12 @@ Two behaviours to expect and NOT treat as harness faults:
 
 ## Operating a campaign
 
+Prerequisite: complete the separately approved [store migration](STORE-HARDENING.md).
+Runtime requires `ospex_store_runtime` via `STORE_DATABASE_URL`; status requires
+`ospex_store_status` via `STORE_STATUS_DATABASE_URL`. These commands never install
+schema/functions or fall back to migration credentials. Migration and relaunch
+remain separate operator gates.
+
 1. `campaign:arm --calls <n> --days <n> --start <ISO> --artifacts <dir>` (attended). The
    manifest file it emits is the campaign's identity — every later command needs that
    exact file. `--artifacts` is the campaign's durable evidence destination, bound for

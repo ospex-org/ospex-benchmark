@@ -31,7 +31,7 @@ import { OPERATOR_RESUMED } from '../campaignSchedule.js';
  * could stay invisible to the frontier compare it finishes evaluating afterwards.
  *
  * Wire care: `id` arrives from `pg` as a bigint STRING (plain reads) or a JSON number
- * (the window read); timestamps arrive as `Date` (plain reads) or as `store._iso` text
+ * (the window read); timestamps arrive as `Date` (plain reads) or as UTC ISO text
  * (the window read). Every value converts through a checked path that refuses surprises
  * loudly, and the read side keeps `outcome` a plain string so an entry written by a newer
  * build reaches the halt rule (which fails closed on outcomes it does not recognize)
@@ -250,20 +250,20 @@ export class SqlCampaignTickJournalPort implements CampaignTickJournalPort {
        select
          (select coalesce(max(id), 0) from store.campaign_ticks where cohort_id = $1) as frontier_id,
          (select json_build_object(
-                   'id', r.id, 'kind', r.kind, 'startedAt', store._iso(r.started_at),
-                   'finishedAt', case when r.finished_at is null then null else store._iso(r.finished_at) end,
+                   'id', r.id, 'kind', r.kind, 'startedAt', pg_catalog.to_char(r.started_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                   'finishedAt', case when r.finished_at is null then null else pg_catalog.to_char(r.finished_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') end,
                    'outcome', r.outcome, 'detail', r.detail)
             from store.campaign_ticks r
            where r.cohort_id = $1 and r.kind = 'resume' and r.id = (select resume_id from boundary)) as resume_row,
          (select coalesce(json_agg(json_build_object(
-                   'id', u.id, 'kind', u.kind, 'startedAt', store._iso(u.started_at),
+                   'id', u.id, 'kind', u.kind, 'startedAt', pg_catalog.to_char(u.started_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
                    'finishedAt', null, 'outcome', u.outcome, 'detail', u.detail) order by u.id desc), '[]'::json)
             from store.campaign_ticks u
            where u.cohort_id = $1 and u.kind = 'tick' and u.finished_at is null
              and u.id > (select resume_id from boundary)) as unfinished_rows,
          (select coalesce(json_agg(json_build_object(
-                   'id', f.id, 'kind', f.kind, 'startedAt', store._iso(f.started_at),
-                   'finishedAt', store._iso(f.finished_at), 'outcome', f.outcome, 'detail', f.detail) order by f.id desc), '[]'::json)
+                   'id', f.id, 'kind', f.kind, 'startedAt', pg_catalog.to_char(f.started_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                   'finishedAt', pg_catalog.to_char(f.finished_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), 'outcome', f.outcome, 'detail', f.detail) order by f.id desc), '[]'::json)
             from store.campaign_ticks f
            where f.cohort_id = $1 and f.kind = 'tick' and f.finished_at is not null
              and f.id > (select resume_id from boundary)
@@ -325,7 +325,7 @@ function asJsonArray(label: string, value: unknown): readonly unknown[] {
 }
 
 /** Checked conversion of one window-read JSON entry (ids as JSON numbers, instants as
- *  `store._iso` text) into the ONE `ScheduleEntry` wire shape. */
+ *  UTC ISO text) into the ONE `ScheduleEntry` wire shape. */
 function asJsonEntry(value: unknown): ScheduleEntry {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error('tick journal window entry is not a JSON object');
