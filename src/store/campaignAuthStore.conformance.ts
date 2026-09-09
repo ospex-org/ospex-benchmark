@@ -85,6 +85,12 @@ async function main(): Promise<void> {
     max: 4,
     connectionTimeoutMillis: 8000,
   });
+  // A scratch DATABASE does not authorize changing cluster-global production roles.
+  const existing = await pool.query("select rolname from pg_roles where rolname in ('ospex_store_migrator','ospex_store_runtime','ospex_store_status')");
+  if (existing.rows.length !== 0) {
+    await pool.end();
+    throw new Error('refusing conformance: preexisting dedicated store role; use an owned isolated cluster');
+  }
   await pool.query('drop schema if exists store cascade');
   await pool.query(SCHEMA_SQL);
   await pool.query(FUNCTIONS_SQL);
@@ -535,12 +541,11 @@ async function main(): Promise<void> {
 
     // A SELECT-only role: it cannot create schemas, tables, or functions — the exact
     // capability the monitoring read must not need.
-    await pool.query('drop role if exists campaign_status_ro');
-    await pool.query("create role campaign_status_ro login password 'ro-conformance'");
-    await pool.query('grant usage on schema store to campaign_status_ro');
-    await pool.query('grant select on all tables in schema store to campaign_status_ro');
+    await pool.query("create role ospex_store_status login password 'ro-conformance'");
+    await pool.query('grant usage on schema store to ospex_store_status');
+    await pool.query('grant select on all tables in schema store to ospex_store_status');
     const roUrl = new URL(DATABASE_URL);
-    roUrl.username = 'campaign_status_ro';
+    roUrl.username = 'ospex_store_status';
     roUrl.password = 'ro-conformance';
 
     // Fingerprint the store-function catalog rows (oid:xmin): any CREATE OR REPLACE — even
@@ -564,7 +569,7 @@ async function main(): Promise<void> {
       input: '',
       env: {
         ...process.env,
-        STORE_DATABASE_URL: roUrl.toString(),
+        STORE_STATUS_DATABASE_URL: roUrl.toString(),
         OPENAI_API_KEY: 'synthetic-test-credential',
         ANTHROPIC_API_KEY: 'synthetic-test-credential',
         GEMINI_API_KEY: 'synthetic-test-credential',

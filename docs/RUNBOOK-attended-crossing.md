@@ -93,9 +93,10 @@ Both destinations must survive the process and be readable afterwards.
 
 - [ ] **Postgres**: create a dedicated durable database for the crossing (for
       example `ospex_crossing` on a local or managed Postgres — NOT the scratch
-      conformance default). Set `STORE_DATABASE_URL` to it explicitly. The runner
-      applies the store schema idempotently on boot (no destructive drop). This
-      database is retained after the crossing as part of the evidence. A managed
+      conformance default). Complete the separately approved migration described in
+      [STORE-HARDENING.md](STORE-HARDENING.md), then set `STORE_DATABASE_URL` to the
+      dedicated runtime login. The runner performs no schema installation on boot.
+      This database is retained after the crossing as evidence. A managed
       target is connected to over TLS automatically, and one that would end up
       unencrypted is refused — see `STORE_DATABASE_URL` in `.env.example` for the
       rules and the opt-out.

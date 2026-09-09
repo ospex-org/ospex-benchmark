@@ -1121,9 +1121,9 @@ export async function statusCampaign(options: CampaignOptions, deps: CampaignDep
     return 2;
   }
   const booted = cohortBoot({ manifestBytes: decodeManifestText(readFileSync(options.manifestPath)) });
-  const databaseUrl = envValue('STORE_DATABASE_URL');
+  const databaseUrl = envValue('STORE_STATUS_DATABASE_URL');
   if (databaseUrl === undefined) {
-    printError('status needs STORE_DATABASE_URL');
+    printError('status needs STORE_STATUS_DATABASE_URL (the SELECT-only role; no runtime fallback)');
     return 2;
   }
   // The READ-ONLY open: no schema bootstrap, no store, and (in production) a server-enforced
@@ -1411,12 +1411,10 @@ const PRODUCTION_DEPS: CampaignDeps = {
     const { SqlAtomicStore, pgStoreQuery } = await import('./store/atomicStore.js');
     const { SqlCampaignAuthorizationPort } = await import('./store/campaignAuthStore.js');
     const { SqlUnresolvedFireReadPort } = await import('./store/escalationLatchRead.js');
-    const { storeConnectionConfig } = await import('./store/connection.js');
+    const { storeConnectionConfig, requireStoreRole } = await import('./store/connection.js');
     const pool = new Pool(storeConnectionConfig(databaseUrl));
     try {
-      const { readFileSync: read } = await import('node:fs');
-      await pool.query(read(new URL('./store/schema.sql', import.meta.url), 'utf8'));
-      await pool.query(read(new URL('./store/functions.sql', import.meta.url), 'utf8'));
+      await requireStoreRole(pool, 'ospex_store_runtime');
     } catch (error) {
       await pool.end();
       throw error;
@@ -1440,11 +1438,17 @@ const PRODUCTION_DEPS: CampaignDeps = {
     // NO schema/function bootstrap here — a monitoring read must not mutate catalog state —
     // and the session itself is forced read-only at the SERVER, so even a statement smuggled
     // through this path in the future is refused by PostgreSQL rather than trusted to prose.
-    const { storeConnectionConfig } = await import('./store/connection.js');
+    const { storeConnectionConfig, requireStoreRole } = await import('./store/connection.js');
     const pool = new Pool({
       ...storeConnectionConfig(databaseUrl),
       options: '-c default_transaction_read_only=on',
     });
+    try {
+      await requireStoreRole(pool, 'ospex_store_status');
+    } catch (error) {
+      await pool.end();
+      throw error;
+    }
     const query = pgStoreQuery(pool);
     const { SqlCampaignTickJournalPort, pgStoreTransactor } = await import('./store/campaignTickJournal.js');
     return {

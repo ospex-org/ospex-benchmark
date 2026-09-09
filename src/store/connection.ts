@@ -127,13 +127,23 @@ function configuredTls(): StoreTlsOption {
   return ca === undefined ? { rejectUnauthorized: false } : { rejectUnauthorized: true, ca };
 }
 
-/**
- * Build the pg configuration for the campaign store.
- *
- * Throws `PlaintextStoreConnectionError` when the result would put the
- * credential on the wire in the clear to another machine and no explicit
- * opt-out is set.
- */
+/** A DSN must authenticate as its dedicated role, not an owner using SET ROLE.
+ * This SELECT-only identity/attribute guard is not a replacement for migration ACL readback. */
+export async function requireStoreRole(
+  client: { query(sql: string): Promise<{ rows: Array<Record<string, unknown>> }> },
+  role: 'ospex_store_migrator' | 'ospex_store_runtime' | 'ospex_store_status',
+): Promise<void> {
+  const { rows } = await client.query(`select current_user as role, session_user as login,
+    rolsuper or rolcreaterole or rolcreatedb or rolbypassrls or rolreplication as elevated,
+    exists (select 1 from pg_auth_members where member = r.oid or roleid = r.oid) as membership
+    from pg_roles r where rolname = current_user`);
+  if (rows.length !== 1 || rows[0]!.role !== role || rows[0]!.login !== role
+      || rows[0]!.elevated !== false || rows[0]!.membership !== false) {
+    throw new Error(`store connection requires standalone ${role} with no elevated role attributes; use the separately provisioned role DSN`);
+  }
+}
+
+/** Build the pg configuration; refuse remote plaintext without explicit opt-out. */
 export function storeConnectionConfig(databaseUrl: string): StoreConnectionConfig {
   const { host, tls } = dsnFacts(databaseUrl);
   if (isLocalHost(host)) return { connectionString: databaseUrl };
