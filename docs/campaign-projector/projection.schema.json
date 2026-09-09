@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Campaign projector canonical inputs v1 (contract only)",
+  "$comment": "Shape validation is not source verification, entry eligibility, execution authorization, or live parity. See CONTRACT.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contractVersion", "policyVersion", "identity", "sources", "revisionKey", "origin", "arms", "spend", "decisions", "execution", "scoring", "serving"],
+  "properties": {
+    "contractVersion": {"const": "campaign-projector/v1"},
+    "policyVersion": {"const": "campaign-projector-inputs/v1"},
+    "identity": {"$ref": "#/$defs/identity"},
+    "sources": {"$ref": "#/$defs/sources"},
+    "revisionKey": {"$ref": "#/$defs/sha256"},
+    "origin": {"enum": ["unattested", "synthetic", "campaign"]},
+    "arms": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/arm"}},
+    "spend": {"$ref": "#/$defs/spend"},
+    "decisions": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/decision"}},
+    "execution": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/execution"}},
+    "scoring": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/scoring"}},
+    "serving": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/serving"}}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"origin": {"const": "unattested"}}},
+      "then": {"properties": {"sources": {"properties": {"originAttestation": {"type": "null"}}}}},
+      "else": {"properties": {"sources": {"properties": {"originAttestation": {"$ref": "#/$defs/blob"}}}}}
+    },
+    {
+      "if": {"properties": {"spend": {"properties": {"state": {"const": "absent"}}}}},
+      "then": {"properties": {"sources": {"properties": {"spendSidecar": {"type": "null"}, "spendAssessment": {"type": "null"}}}}},
+      "else": {"properties": {"sources": {"properties": {"spendSidecar": {"$ref": "#/$defs/blob"}}}}}
+    },
+    {
+      "if": {"properties": {"spend": {"properties": {"state": {"enum": ["absent", "unverified"]}}}}},
+      "then": {"properties": {"sources": {"properties": {"spendAssessment": {"type": "null"}}}}},
+      "else": {"properties": {"sources": {"properties": {"spendAssessment": {"$ref": "#/$defs/blob"}}}}}
+    },
+    {
+      "if": {"properties": {"sources": {"properties": {"entryAssessment": {"type": "null"}}}}},
+      "then": {"properties": {"scoring": {"items": {"properties": {"entryEligibility": {"const": "unknown"}}}}}}
+    },
+    {
+      "if": {"anyOf": [
+        {"properties": {"origin": {"enum": ["unattested", "synthetic"]}}},
+        {"properties": {"spend": {"properties": {"state": {"not": {"const": "verified"}}}}}}
+      ]},
+      "then": {"properties": {"execution": {"items": {"properties": {"state": {"not": {"const": "candidate"}}}}}}}
+    }
+  ],
+  "$defs": {
+    "text": {"type": "string", "minLength": 1},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "index": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "market": {"enum": ["moneyline", "spread", "total"]},
+    "markets": {"enum": [["moneyline"], ["spread"], ["total"], ["moneyline", "spread"], ["moneyline", "total"], ["spread", "total"], ["moneyline", "spread", "total"]]},
+    "axis": {"enum": ["valuation", "trend", "consensus", "news", "softness"]},
+    "failure": {"enum": ["invalid_schema", "timeout", "credential_missing", "rate_limited", "provider_error", "cutoff_missed", "dispatch_lag_exceeded"]},
+    "outcome": {"oneOf": [{"const": "valid"}, {"$ref": "#/$defs/failure"}]},
+    "blob": {
+      "type": "object", "additionalProperties": false, "required": ["uri", "sha256"],
+      "properties": {"uri": {"type": "string", "format": "uri", "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:[^\\s]+$", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "nullableBlob": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/blob"}]},
+    "assessment": {
+      "type": "object", "additionalProperties": false, "required": ["source", "policyVersion"],
+      "properties": {"source": {"$ref": "#/$defs/blob"}, "policyVersion": {"$ref": "#/$defs/text"}}
+    },
+    "identity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cohortId", "fireId", "runId", "gameId", "network", "scopedMarkets"],
+      "properties": {
+        "cohortId": {"$ref": "#/$defs/sha256"}, "fireId": {"$ref": "#/$defs/text"},
+        "runId": {"$ref": "#/$defs/text"}, "gameId": {"$ref": "#/$defs/text"},
+        "network": {"enum": ["polygon", "amoy"]}, "scopedMarkets": {"$ref": "#/$defs/markets"}
+      }
+    },
+    "sources": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manifest", "fireArtifact", "spendSidecar", "spendAssessment", "originAttestation", "entryAssessment"],
+      "properties": {
+        "manifest": {"$ref": "#/$defs/blob"}, "fireArtifact": {"$ref": "#/$defs/blob"},
+        "spendSidecar": {"$ref": "#/$defs/nullableBlob"}, "spendAssessment": {"$ref": "#/$defs/nullableBlob"},
+        "originAttestation": {"$ref": "#/$defs/nullableBlob"}, "entryAssessment": {"$ref": "#/$defs/nullableBlob"}
+      }
+    },
+    "key": {
+      "type": "object", "additionalProperties": false, "required": ["participantId", "market"],
+      "properties": {"participantId": {"$ref": "#/$defs/text"}, "market": {"$ref": "#/$defs/market"}}
+    },
+    "probabilities": {
+      "type": "object", "additionalProperties": false, "required": ["win", "push", "loss"],
+      "properties": {"win": {"type": "number", "minimum": 0, "maximum": 1}, "push": {"type": "number", "minimum": 0, "maximum": 1}, "loss": {"type": "number", "minimum": 0, "maximum": 1}}
+    },
+    "axes": {
+      "type": "object", "additionalProperties": false, "required": ["valuation", "trend", "consensus", "news", "softness"],
+      "properties": {
+        "valuation": {"type": "integer", "minimum": 1, "maximum": 5}, "trend": {"type": "integer", "minimum": 1, "maximum": 5},
+        "consensus": {"type": "integer", "minimum": 1, "maximum": 5}, "news": {"type": "integer", "minimum": 1, "maximum": 5},
+        "softness": {"type": "integer", "minimum": 1, "maximum": 5}
+      }
+    },
+    "forecastBase": {
+      "type": "object",
+      "required": ["market", "selection", "line", "observedDecimal", "probabilities", "confidence", "wouldAbstain", "selectedForExecution", "rationale", "evidenceRefs"],
+      "properties": {
+        "market": {"$ref": "#/$defs/market"}, "selection": {"$ref": "#/$defs/text"}, "line": {"type": ["number", "null"]},
+        "observedDecimal": {"type": "number", "exclusiveMinimum": 1}, "probabilities": {"$ref": "#/$defs/probabilities"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "wouldAbstain": {"type": "boolean"},
+        "selectedForExecution": {"type": "boolean"}, "rationale": {"type": "string", "pattern": "\\S"},
+        "evidenceRefs": {"type": "array", "items": {"$ref": "#/$defs/text"}},
+        "reasonCode": {"enum": [null, "missing_information", "contradictory_information"]}
+      }
+    },
+    "forecastV1": {
+      "allOf": [{"$ref": "#/$defs/forecastBase"}], "unevaluatedProperties": false,
+      "properties": {"evidenceRefs": {"minItems": 1}}
+    },
+    "forecastV2": {
+      "allOf": [{"$ref": "#/$defs/forecastBase"}], "unevaluatedProperties": false,
+      "required": ["axes", "primaryAxis", "primaryExpectation"],
+      "properties": {
+        "axes": {"$ref": "#/$defs/axes"}, "primaryAxis": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/axis"}]},
+        "primaryExpectation": {"type": "string", "minLength": 1, "maxLength": 400, "pattern": "\\S", "not": {"pattern": "[\\r\\n]"}}
+      }
+    },
+    "forecast": {"oneOf": [{"$ref": "#/$defs/forecastV1"}, {"$ref": "#/$defs/forecastV2"}]},
+    "responseBase": {
+      "type": "object",
+      "required": ["schemaVersion", "cohortId", "participantId", "requestedModelId", "bundleSha256", "executionPolicy", "games"],
+      "properties": {
+        "cohortId": {"$ref": "#/$defs/sha256"}, "participantId": {"$ref": "#/$defs/text"}, "requestedModelId": {"$ref": "#/$defs/text"},
+        "bundleSha256": {"$ref": "#/$defs/sha256"}, "executionPolicy": {"enum": ["fixed-moneyline-total", "model-choice-side-total"]}
+      }
+    },
+    "responseV1": {
+      "allOf": [{"$ref": "#/$defs/responseBase"}], "unevaluatedProperties": false,
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "games": {"type": "array", "minItems": 1, "maxItems": 1, "items": {
+          "type": "object", "additionalProperties": false, "required": ["gameId", "forecasts"],
+          "properties": {"gameId": {"$ref": "#/$defs/text"}, "forecasts": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"$ref": "#/$defs/forecastV1"}}}
+        }}
+      }
+    },
+    "responseV2": {
+      "allOf": [{"$ref": "#/$defs/responseBase"}], "unevaluatedProperties": false,
+      "properties": {
+        "schemaVersion": {"const": 2},
+        "games": {"type": "array", "minItems": 1, "maxItems": 1, "items": {
+          "type": "object", "additionalProperties": false, "required": ["gameId", "forecasts"],
+          "properties": {"gameId": {"$ref": "#/$defs/text"}, "forecasts": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"$ref": "#/$defs/forecastV2"}}}
+        }}
+      }
+    },
+    "accepted": {
+      "type": "object", "additionalProperties": false,
+      "required": ["attemptNumber", "responseSha256", "persistedResponseBody", "parsedResponse"],
+      "properties": {
+        "attemptNumber": {"enum": [1, 2]}, "responseSha256": {"$ref": "#/$defs/sha256"},
+        "persistedResponseBody": {"$ref": "#/$defs/text"},
+        "parsedResponse": {"oneOf": [{"$ref": "#/$defs/responseV1"}, {"$ref": "#/$defs/responseV2"}]}
+      }
+    },
+    "arm": {
+      "type": "object", "additionalProperties": false,
+      "required": ["participantId", "armIndex", "armDigest", "terminalOutcome", "accepted"],
+      "properties": {
+        "participantId": {"$ref": "#/$defs/text"}, "armIndex": {"$ref": "#/$defs/index"}, "armDigest": {"$ref": "#/$defs/sha256"},
+        "terminalOutcome": {"$ref": "#/$defs/outcome"}, "accepted": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/accepted"}]}
+      },
+      "if": {"properties": {"terminalOutcome": {"const": "valid"}}},
+      "then": {"properties": {"accepted": {"$ref": "#/$defs/accepted"}}},
+      "else": {"properties": {"accepted": {"type": "null"}}}
+    },
+    "modelDecision": {
+      "type": "object", "additionalProperties": false,
+      "required": ["key", "kind", "terminalOutcome", "armIndex", "forecastIndex", "forecast"],
+      "properties": {
+        "key": {"$ref": "#/$defs/key"}, "kind": {"const": "model"}, "terminalOutcome": {"$ref": "#/$defs/outcome"},
+        "armIndex": {"$ref": "#/$defs/index"}, "forecastIndex": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/index"}]},
+        "forecast": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/forecast"}]}
+      },
+      "if": {"properties": {"terminalOutcome": {"const": "valid"}}},
+      "then": {"properties": {"forecastIndex": {"$ref": "#/$defs/index"}, "forecast": {"$ref": "#/$defs/forecast"}}},
+      "else": {"properties": {"forecastIndex": {"type": "null"}, "forecast": {"type": "null"}}}
+    },
+    "baselineDecision": {
+      "type": "object", "additionalProperties": false,
+      "required": ["key", "kind", "baselineIndex", "policyVersion", "selection", "line", "observedDecimal", "track"],
+      "properties": {
+        "key": {"$ref": "#/$defs/key"}, "kind": {"const": "baseline"}, "baselineIndex": {"$ref": "#/$defs/index"},
+        "policyVersion": {"$ref": "#/$defs/text"}, "selection": {"$ref": "#/$defs/text"}, "line": {"type": ["number", "null"]},
+        "observedDecimal": {"type": "number", "exclusiveMinimum": 1}, "track": {"const": "common-cutoff"}
+      }
+    },
+    "decision": {"oneOf": [{"$ref": "#/$defs/modelDecision"}, {"$ref": "#/$defs/baselineDecision"}]},
+    "spend": {
+      "type": "object", "additionalProperties": false, "required": ["state", "totalUsdMicros", "reason", "assessment"],
+      "properties": {
+        "state": {"enum": ["absent", "unverified", "verified", "unknown", "breach", "invalid"]},
+        "totalUsdMicros": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/index"}]},
+        "reason": {"enum": ["not_present", "not_assessed", "verified", "cost_unknown", "reservation_breach", "binding_or_integrity_failure"]},
+        "assessment": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/assessment"}]}
+      },
+      "oneOf": [
+        {"properties": {"state": {"const": "absent"}, "totalUsdMicros": {"type": "null"}, "reason": {"const": "not_present"}, "assessment": {"type": "null"}}},
+        {"properties": {"state": {"const": "unverified"}, "totalUsdMicros": {"type": "null"}, "reason": {"const": "not_assessed"}, "assessment": {"type": "null"}}},
+        {"properties": {"state": {"const": "verified"}, "totalUsdMicros": {"$ref": "#/$defs/index"}, "reason": {"const": "verified"}, "assessment": {"$ref": "#/$defs/assessment"}}},
+        {"properties": {"state": {"const": "unknown"}, "totalUsdMicros": {"type": "null"}, "reason": {"const": "cost_unknown"}, "assessment": {"$ref": "#/$defs/assessment"}}},
+        {"properties": {"state": {"const": "breach"}, "totalUsdMicros": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "reason": {"const": "reservation_breach"}, "assessment": {"$ref": "#/$defs/assessment"}}},
+        {"properties": {"state": {"const": "invalid"}, "totalUsdMicros": {"type": "null"}, "reason": {"const": "binding_or_integrity_failure"}, "assessment": {"$ref": "#/$defs/assessment"}}}
+      ]
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false, "required": ["key", "decisionIndex", "state", "authorizesExecution"],
+      "properties": {
+        "key": {"$ref": "#/$defs/key"}, "decisionIndex": {"$ref": "#/$defs/index"}, "authorizesExecution": {"const": false},
+        "state": {"enum": ["candidate", "baseline_not_executable", "failed_arm", "not_selected", "entry_ineligible", "entry_unknown", "origin_unattested", "spend_blocked"]}
+      }
+    },
+    "scoring": {
+      "type": "object", "additionalProperties": false, "required": ["key", "decisionIndex", "entryEligibility", "state", "closeStatus"],
+      "properties": {
+        "key": {"$ref": "#/$defs/key"}, "decisionIndex": {"$ref": "#/$defs/index"}, "entryEligibility": {"enum": ["eligible", "ineligible", "unknown"]},
+        "state": {"enum": ["candidate", "failed_arm", "entry_ineligible", "entry_unknown"]}, "closeStatus": {"const": "not_loaded"}
+      },
+      "oneOf": [
+        {"properties": {"state": {"const": "failed_arm"}}},
+        {"properties": {"state": {"const": "candidate"}, "entryEligibility": {"const": "eligible"}}},
+        {"properties": {"state": {"const": "entry_ineligible"}, "entryEligibility": {"const": "ineligible"}}},
+        {"properties": {"state": {"const": "entry_unknown"}, "entryEligibility": {"const": "unknown"}}}
+      ]
+    },
+    "serving": {
+      "type": "object", "additionalProperties": false, "required": ["key", "decisionIndex", "executionIndex", "scoringIndex", "display", "ranking"],
+      "properties": {
+        "key": {"$ref": "#/$defs/key"}, "decisionIndex": {"$ref": "#/$defs/index"}, "executionIndex": {"$ref": "#/$defs/index"},
+        "scoringIndex": {"$ref": "#/$defs/index"}, "display": {"enum": ["forecast", "failed_arm", "baseline"]}, "ranking": {"const": "not_evaluated"}
+      }
+    }
+  }
+}

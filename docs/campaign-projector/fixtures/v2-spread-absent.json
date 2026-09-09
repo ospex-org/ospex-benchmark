@@ -1,0 +1,256 @@
+{
+  "contractVersion": "campaign-projector/v1",
+  "policyVersion": "campaign-projector-inputs/v1",
+  "identity": {
+    "cohortId": "0f571a18ed2401ed33a9ef604be9877f0ca0e3d1d5cfabefefb4c3b133c6c38e",
+    "fireId": "09a96901a65c7410129c9e23d878377c773a343b0540b63785ec2a8d3111a1f1",
+    "runId": "fixture-run-spread",
+    "gameId": "fixture-game",
+    "network": "amoy",
+    "scopedMarkets": [
+      "spread"
+    ]
+  },
+  "sources": {
+    "manifest": {
+      "uri": "urn:fixture:manifest",
+      "sha256": "0da249e74a32fe6ad25ca0a462dbc1dc3bd9fa144421d3a0ed0ae5ed1ab10cad"
+    },
+    "fireArtifact": {
+      "uri": "urn:fixture:fire-spread",
+      "sha256": "360f91b5a73d5ee1c303968755b7c165d597e33409ef803fdad7bf34a5a7b47f"
+    },
+    "spendSidecar": null,
+    "spendAssessment": null,
+    "originAttestation": {
+      "uri": "urn:fixture:synthetic-origin",
+      "sha256": "0bf14bf8194f7c053dd0a63ca33d277a61b44fb945af789e2c731b95af9eb3df"
+    },
+    "entryAssessment": null
+  },
+  "revisionKey": "6ae447f61e23dd5f3b0af9844e1ed323a895b12c5f8abfdf2b103904a31a2423",
+  "origin": "synthetic",
+  "arms": [
+    {
+      "participantId": "fixture-model-a",
+      "armIndex": 0,
+      "armDigest": "2e481d307c870a1e4687d08f603249a2fe644dc431d8cd2ca81395ab3c2cba6d",
+      "terminalOutcome": "valid",
+      "accepted": {
+        "attemptNumber": 2,
+        "responseSha256": "6a1778939236e316c5ca6e3527dd8dacd6ec8913da057b7357951cdaf471131e",
+        "persistedResponseBody": "{\"schemaVersion\":2,\"cohortId\":\"0f571a18ed2401ed33a9ef604be9877f0ca0e3d1d5cfabefefb4c3b133c6c38e\",\"participantId\":\"fixture-model-a\",\"requestedModelId\":\"fixture-model\",\"bundleSha256\":\"92e1d23eafd87b9778cbb9bac872afa1983b76498ac10b0931af44e8da76e78e\",\"executionPolicy\":\"model-choice-side-total\",\"games\":[{\"gameId\":\"fixture-game\",\"forecasts\":[{\"market\":\"spread\",\"selection\":\"Fixture Away\",\"line\":-1.5,\"observedDecimal\":2.0,\"probabilities\":{\"win\":0.55,\"push\":0.0,\"loss\":0.45},\"confidence\":0.6,\"wouldAbstain\":true,\"selectedForExecution\":true,\"rationale\":\"Synthetic schema example only; not a model response or betting recommendation.\",\"evidenceRefs\":[],\"axes\":{\"valuation\":1,\"trend\":1,\"consensus\":1,\"news\":1,\"softness\":1},\"primaryAxis\":null,\"primaryExpectation\":\"No material movement is expected in this synthetic example.\"}]}]}",
+        "parsedResponse": {
+          "schemaVersion": 2,
+          "cohortId": "0f571a18ed2401ed33a9ef604be9877f0ca0e3d1d5cfabefefb4c3b133c6c38e",
+          "participantId": "fixture-model-a",
+          "requestedModelId": "fixture-model",
+          "bundleSha256": "92e1d23eafd87b9778cbb9bac872afa1983b76498ac10b0931af44e8da76e78e",
+          "executionPolicy": "model-choice-side-total",
+          "games": [
+            {
+              "gameId": "fixture-game",
+              "forecasts": [
+                {
+                  "market": "spread",
+                  "selection": "Fixture Away",
+                  "line": -1.5,
+                  "observedDecimal": 2.0,
+                  "probabilities": {
+                    "win": 0.55,
+                    "push": 0.0,
+                    "loss": 0.45
+                  },
+                  "confidence": 0.6,
+                  "wouldAbstain": true,
+                  "selectedForExecution": true,
+                  "rationale": "Synthetic schema example only; not a model response or betting recommendation.",
+                  "evidenceRefs": [],
+                  "axes": {
+                    "valuation": 1,
+                    "trend": 1,
+                    "consensus": 1,
+                    "news": 1,
+                    "softness": 1
+                  },
+                  "primaryAxis": null,
+                  "primaryExpectation": "No material movement is expected in this synthetic example."
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "participantId": "fixture-model-b",
+      "armIndex": 1,
+      "armDigest": "644d96009b13cd1ef6a84a3be99aca30fca04a5290b83cf4e727849315579439",
+      "terminalOutcome": "timeout",
+      "accepted": null
+    }
+  ],
+  "spend": {
+    "state": "absent",
+    "totalUsdMicros": null,
+    "reason": "not_present",
+    "assessment": null
+  },
+  "decisions": [
+    {
+      "key": {
+        "participantId": "fixture-model-a",
+        "market": "spread"
+      },
+      "kind": "model",
+      "terminalOutcome": "valid",
+      "armIndex": 0,
+      "forecastIndex": 0,
+      "forecast": {
+        "market": "spread",
+        "selection": "Fixture Away",
+        "line": -1.5,
+        "observedDecimal": 2.0,
+        "probabilities": {
+          "win": 0.55,
+          "push": 0.0,
+          "loss": 0.45
+        },
+        "confidence": 0.6,
+        "wouldAbstain": true,
+        "selectedForExecution": true,
+        "rationale": "Synthetic schema example only; not a model response or betting recommendation.",
+        "evidenceRefs": [],
+        "axes": {
+          "valuation": 1,
+          "trend": 1,
+          "consensus": 1,
+          "news": 1,
+          "softness": 1
+        },
+        "primaryAxis": null,
+        "primaryExpectation": "No material movement is expected in this synthetic example."
+      }
+    },
+    {
+      "key": {
+        "participantId": "fixture-model-b",
+        "market": "spread"
+      },
+      "kind": "model",
+      "terminalOutcome": "timeout",
+      "armIndex": 1,
+      "forecastIndex": null,
+      "forecast": null
+    },
+    {
+      "key": {
+        "participantId": "fixture-baseline",
+        "market": "spread"
+      },
+      "kind": "baseline",
+      "baselineIndex": 0,
+      "policyVersion": "fixture-baseline-v1",
+      "selection": "Fixture Away",
+      "line": -1.5,
+      "observedDecimal": 2.0,
+      "track": "common-cutoff"
+    }
+  ],
+  "execution": [
+    {
+      "key": {
+        "participantId": "fixture-model-a",
+        "market": "spread"
+      },
+      "decisionIndex": 0,
+      "state": "entry_unknown",
+      "authorizesExecution": false
+    },
+    {
+      "key": {
+        "participantId": "fixture-model-b",
+        "market": "spread"
+      },
+      "decisionIndex": 1,
+      "state": "failed_arm",
+      "authorizesExecution": false
+    },
+    {
+      "key": {
+        "participantId": "fixture-baseline",
+        "market": "spread"
+      },
+      "decisionIndex": 2,
+      "state": "baseline_not_executable",
+      "authorizesExecution": false
+    }
+  ],
+  "scoring": [
+    {
+      "key": {
+        "participantId": "fixture-model-a",
+        "market": "spread"
+      },
+      "decisionIndex": 0,
+      "entryEligibility": "unknown",
+      "state": "entry_unknown",
+      "closeStatus": "not_loaded"
+    },
+    {
+      "key": {
+        "participantId": "fixture-model-b",
+        "market": "spread"
+      },
+      "decisionIndex": 1,
+      "entryEligibility": "unknown",
+      "state": "failed_arm",
+      "closeStatus": "not_loaded"
+    },
+    {
+      "key": {
+        "participantId": "fixture-baseline",
+        "market": "spread"
+      },
+      "decisionIndex": 2,
+      "entryEligibility": "unknown",
+      "state": "entry_unknown",
+      "closeStatus": "not_loaded"
+    }
+  ],
+  "serving": [
+    {
+      "key": {
+        "participantId": "fixture-model-a",
+        "market": "spread"
+      },
+      "decisionIndex": 0,
+      "executionIndex": 0,
+      "scoringIndex": 0,
+      "display": "forecast",
+      "ranking": "not_evaluated"
+    },
+    {
+      "key": {
+        "participantId": "fixture-model-b",
+        "market": "spread"
+      },
+      "decisionIndex": 1,
+      "executionIndex": 1,
+      "scoringIndex": 1,
+      "display": "failed_arm",
+      "ranking": "not_evaluated"
+    },
+    {
+      "key": {
+        "participantId": "fixture-baseline",
+        "market": "spread"
+      },
+      "decisionIndex": 2,
+      "executionIndex": 2,
+      "scoringIndex": 2,
+      "display": "baseline",
+      "ranking": "not_evaluated"
+    }
+  ]
+}

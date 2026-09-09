@@ -1,0 +1,254 @@
+{
+  "contractVersion": "campaign-projector/v1",
+  "policyVersion": "campaign-projector-inputs/v1",
+  "identity": {
+    "cohortId": "0f571a18ed2401ed33a9ef604be9877f0ca0e3d1d5cfabefefb4c3b133c6c38e",
+    "fireId": "2e459112da8ded8681009e893be131a152c6f93cf49a6027cd001bbe4ffcf62b",
+    "runId": "fixture-run-moneyline",
+    "gameId": "fixture-game",
+    "network": "amoy",
+    "scopedMarkets": [
+      "moneyline"
+    ]
+  },
+  "sources": {
+    "manifest": {
+      "uri": "urn:fixture:manifest",
+      "sha256": "0da249e74a32fe6ad25ca0a462dbc1dc3bd9fa144421d3a0ed0ae5ed1ab10cad"
+    },
+    "fireArtifact": {
+      "uri": "urn:fixture:fire-moneyline",
+      "sha256": "542a0519abd5bdcbf17bb73d7661fc1dcf1b0b32bb0011e1762112d583d9c769"
+    },
+    "spendSidecar": {
+      "uri": "urn:fixture:zero-spend",
+      "sha256": "5e0db93c8d8a188da03571f1cdbf0ea23b3f1d652318bb57d25a2ed9a87d46cc"
+    },
+    "spendAssessment": {
+      "uri": "urn:fixture:zero-assessment",
+      "sha256": "9c07da374dd575bb99bc0f4a455df91d6b605b41233284b9bb98969ea5a7801a"
+    },
+    "originAttestation": {
+      "uri": "urn:fixture:synthetic-origin",
+      "sha256": "0bf14bf8194f7c053dd0a63ca33d277a61b44fb945af789e2c731b95af9eb3df"
+    },
+    "entryAssessment": null
+  },
+  "revisionKey": "8dc1dbb194cba7f8876bf5373a150a43060d0fa5540bccaba0c2c93d8393d567",
+  "origin": "synthetic",
+  "arms": [
+    {
+      "participantId": "fixture-model-a",
+      "armIndex": 0,
+      "armDigest": "092651700eea0e48528eb4ca9a8fbe86b2bc86ee9413a2ae933cf3d3a3bc8748",
+      "terminalOutcome": "valid",
+      "accepted": {
+        "attemptNumber": 1,
+        "responseSha256": "e45517519a50d7d3cfc46eef2b257d0cd0761de0cd5266244e17d29cf32f4b1e",
+        "persistedResponseBody": "{\"schemaVersion\":1,\"cohortId\":\"0f571a18ed2401ed33a9ef604be9877f0ca0e3d1d5cfabefefb4c3b133c6c38e\",\"participantId\":\"fixture-model-a\",\"requestedModelId\":\"fixture-model\",\"bundleSha256\":\"fe03d0ea3b6fffebbbfe816728f797d01074b142033eda56fd7603bce8cfce95\",\"executionPolicy\":\"fixed-moneyline-total\",\"games\":[{\"gameId\":\"fixture-game\",\"forecasts\":[{\"market\":\"moneyline\",\"selection\":\"Fixture Away\",\"line\":null,\"observedDecimal\":2.0,\"probabilities\":{\"win\":0.55,\"push\":0.0,\"loss\":0.45},\"confidence\":0.6,\"wouldAbstain\":true,\"selectedForExecution\":true,\"rationale\":\"Synthetic schema example only; not a model response or betting recommendation.\",\"evidenceRefs\":[\"fixture:opening-quote\"]}]}]}",
+        "parsedResponse": {
+          "schemaVersion": 1,
+          "cohortId": "0f571a18ed2401ed33a9ef604be9877f0ca0e3d1d5cfabefefb4c3b133c6c38e",
+          "participantId": "fixture-model-a",
+          "requestedModelId": "fixture-model",
+          "bundleSha256": "fe03d0ea3b6fffebbbfe816728f797d01074b142033eda56fd7603bce8cfce95",
+          "executionPolicy": "fixed-moneyline-total",
+          "games": [
+            {
+              "gameId": "fixture-game",
+              "forecasts": [
+                {
+                  "market": "moneyline",
+                  "selection": "Fixture Away",
+                  "line": null,
+                  "observedDecimal": 2.0,
+                  "probabilities": {
+                    "win": 0.55,
+                    "push": 0.0,
+                    "loss": 0.45
+                  },
+                  "confidence": 0.6,
+                  "wouldAbstain": true,
+                  "selectedForExecution": true,
+                  "rationale": "Synthetic schema example only; not a model response or betting recommendation.",
+                  "evidenceRefs": [
+                    "fixture:opening-quote"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "participantId": "fixture-model-b",
+      "armIndex": 1,
+      "armDigest": "bcdf98ce4c23c78e2261d69e2b41899bfee6dc1876b91e6fdcefadafadff3e4a",
+      "terminalOutcome": "timeout",
+      "accepted": null
+    }
+  ],
+  "spend": {
+    "state": "verified",
+    "totalUsdMicros": 0,
+    "reason": "verified",
+    "assessment": {
+      "source": {
+        "uri": "urn:fixture:zero-assessment",
+        "sha256": "9c07da374dd575bb99bc0f4a455df91d6b605b41233284b9bb98969ea5a7801a"
+      },
+      "policyVersion": "fixture-only-zero-v1"
+    }
+  },
+  "decisions": [
+    {
+      "key": {
+        "participantId": "fixture-model-a",
+        "market": "moneyline"
+      },
+      "kind": "model",
+      "terminalOutcome": "valid",
+      "armIndex": 0,
+      "forecastIndex": 0,
+      "forecast": {
+        "market": "moneyline",
+        "selection": "Fixture Away",
+        "line": null,
+        "observedDecimal": 2.0,
+        "probabilities": {
+          "win": 0.55,
+          "push": 0.0,
+          "loss": 0.45
+        },
+        "confidence": 0.6,
+        "wouldAbstain": true,
+        "selectedForExecution": true,
+        "rationale": "Synthetic schema example only; not a model response or betting recommendation.",
+        "evidenceRefs": [
+          "fixture:opening-quote"
+        ]
+      }
+    },
+    {
+      "key": {
+        "participantId": "fixture-model-b",
+        "market": "moneyline"
+      },
+      "kind": "model",
+      "terminalOutcome": "timeout",
+      "armIndex": 1,
+      "forecastIndex": null,
+      "forecast": null
+    },
+    {
+      "key": {
+        "participantId": "fixture-baseline",
+        "market": "moneyline"
+      },
+      "kind": "baseline",
+      "baselineIndex": 0,
+      "policyVersion": "fixture-baseline-v1",
+      "selection": "Fixture Away",
+      "line": null,
+      "observedDecimal": 2.0,
+      "track": "common-cutoff"
+    }
+  ],
+  "execution": [
+    {
+      "key": {
+        "participantId": "fixture-model-a",
+        "market": "moneyline"
+      },
+      "decisionIndex": 0,
+      "state": "entry_unknown",
+      "authorizesExecution": false
+    },
+    {
+      "key": {
+        "participantId": "fixture-model-b",
+        "market": "moneyline"
+      },
+      "decisionIndex": 1,
+      "state": "failed_arm",
+      "authorizesExecution": false
+    },
+    {
+      "key": {
+        "participantId": "fixture-baseline",
+        "market": "moneyline"
+      },
+      "decisionIndex": 2,
+      "state": "baseline_not_executable",
+      "authorizesExecution": false
+    }
+  ],
+  "scoring": [
+    {
+      "key": {
+        "participantId": "fixture-model-a",
+        "market": "moneyline"
+      },
+      "decisionIndex": 0,
+      "entryEligibility": "unknown",
+      "state": "entry_unknown",
+      "closeStatus": "not_loaded"
+    },
+    {
+      "key": {
+        "participantId": "fixture-model-b",
+        "market": "moneyline"
+      },
+      "decisionIndex": 1,
+      "entryEligibility": "unknown",
+      "state": "failed_arm",
+      "closeStatus": "not_loaded"
+    },
+    {
+      "key": {
+        "participantId": "fixture-baseline",
+        "market": "moneyline"
+      },
+      "decisionIndex": 2,
+      "entryEligibility": "unknown",
+      "state": "entry_unknown",
+      "closeStatus": "not_loaded"
+    }
+  ],
+  "serving": [
+    {
+      "key": {
+        "participantId": "fixture-model-a",
+        "market": "moneyline"
+      },
+      "decisionIndex": 0,
+      "executionIndex": 0,
+      "scoringIndex": 0,
+      "display": "forecast",
+      "ranking": "not_evaluated"
+    },
+    {
+      "key": {
+        "participantId": "fixture-model-b",
+        "market": "moneyline"
+      },
+      "decisionIndex": 1,
+      "executionIndex": 1,
+      "scoringIndex": 1,
+      "display": "failed_arm",
+      "ranking": "not_evaluated"
+    },
+    {
+      "key": {
+        "participantId": "fixture-baseline",
+        "market": "moneyline"
+      },
+      "decisionIndex": 2,
+      "executionIndex": 2,
+      "scoringIndex": 2,
+      "display": "baseline",
+      "ranking": "not_evaluated"
+    }
+  ]
+}
