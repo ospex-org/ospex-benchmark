@@ -9,15 +9,15 @@ import json
 from pathlib import Path
 import unittest
 
-from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema import Draft202012Validator
 
 ROOT = Path(__file__).resolve().parent
-SCHEMA = json.loads((ROOT / 'projection.schema.json').read_text())
-VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
+SCHEMA = json.loads((ROOT / 'projection.schema.json').read_text(encoding='utf-8'))
+VALIDATOR = Draft202012Validator(SCHEMA)
 
 
 def fixture(name='v2-spread-absent.json'):
-    return json.loads((ROOT / 'fixtures' / name).read_text())
+    return json.loads((ROOT / 'fixtures' / name).read_text(encoding='utf-8'))
 
 
 def changed(document, path, value):
@@ -48,7 +48,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual([p.name for p in paths], ['v1-moneyline-zero.json', 'v2-spread-absent.json'])
         for path in paths:
             with self.subTest(path=path.name):
-                d = json.loads(path.read_text())
+                d = json.loads(path.read_text(encoding='utf-8'))
                 VALIDATOR.validate(d)
                 self.assertEqual(d['origin'], 'synthetic')
                 self.assertTrue(all(not row['authorizesExecution'] for row in d['execution']))
@@ -83,7 +83,11 @@ class ContractTests(unittest.TestCase):
             ('unknown arm failure', ['arms', 1, 'terminalOutcome'], 'missing'),
             ('failed arm cannot accept', ['arms', 1, 'accepted'], d['arms'][0]['accepted']),
             ('valid arm needs accepted body', ['arms', 0, 'accepted'], None),
-            ('attempt index is safe integer', ['arms', 0, 'accepted', 'attemptNumber'], 9007199254740992),
+            ('attempt 3 exceeds the frozen repair cap', ['arms', 0, 'accepted', 'attemptNumber'], 3),
+            ('large attempt is outside enum 1/2', ['arms', 0, 'accepted', 'attemptNumber'], 9007199254740992),
+            ('manifest network alias is not a serving key', ['identity', 'network'], 'polygon-amoy'),
+            ('empty network is refused', ['identity', 'network'], ''),
+            ('synthetic requires origin attestation', ['sources', 'originAttestation'], None),
             ('unknown response schema', ['arms', 0, 'accepted', 'parsedResponse', 'schemaVersion'], 3),
             ('closed top-level fields', ['watchId'], 'forged-watch'),
         ]
@@ -102,6 +106,69 @@ class ContractTests(unittest.TestCase):
                 self.assertFalse(VALIDATOR.is_valid(changed(d, path, None)))
         self.assertIsNone(fixture()['spend']['totalUsdMicros'])
 
+    def test_spend_branches_and_breach_unknown_total(self):
+        # Shape examples, not assessments of real provider attempts. A confirmed
+        # breach and an unpriceable sibling must fit without downgrading or zero.
+        cases = [
+            ('absent', 'not_present', None),
+            ('unverified', 'not_assessed', None),
+            ('verified', 'verified', 0),
+            ('verified', 'verified', 9007199254740991),
+            ('unknown', 'cost_unknown', None),
+            ('breach', 'reservation_breach', None),
+            ('breach', 'reservation_breach', 1),
+            ('breach', 'reservation_breach', 9007199254740991),
+            ('invalid', 'binding_or_integrity_failure', None),
+        ]
+        reasons = {reason for _, reason, _ in cases}
+        for state, reason, total in cases:
+            with self.subTest(state=state, total=total):
+                d = fixture('v1-moneyline-zero.json')
+                d['spend'].update(state=state, reason=reason, totalUsdMicros=total)
+                if state in ('absent', 'unverified'):
+                    d['spend']['assessment'] = None
+                    d['sources']['spendAssessment'] = None
+                if state == 'absent':
+                    d['sources']['spendSidecar'] = None
+                VALIDATOR.validate(d)
+                for wrong in reasons - {reason}:
+                    self.assertFalse(VALIDATOR.is_valid(changed(d, ['spend', 'reason'], wrong)))
+                candidate = changed(d, ['origin'], 'campaign')
+                candidate['execution'][0]['state'] = 'candidate'
+                self.assertEqual(VALIDATOR.is_valid(candidate), state == 'verified')
+                if state == 'breach':
+                    for bad in (0, -1, 1.5, 9007199254740992, True, '1'):
+                        self.assertFalse(VALIDATOR.is_valid(changed(d, ['spend', 'totalUsdMicros'], bad)))
+                    self.assertFalse(VALIDATOR.is_valid(changed(d, ['spend', 'assessment'], None)))
+                    self.assertFalse(VALIDATOR.is_valid(changed(d, ['sources', 'spendAssessment'], None)))
+                if state in ('unknown', 'invalid', 'absent', 'unverified'):
+                    self.assertFalse(VALIDATOR.is_valid(changed(d, ['spend', 'totalUsdMicros'], 0)))
+
+    def test_network_and_attempt_policy_bounds(self):
+        for network in ('polygon', 'amoy'):
+            for attempt in (1, 2):
+                with self.subTest(network=network, attempt=attempt):
+                    d = changed(fixture(), ['identity', 'network'], network)
+                    d['arms'][0]['accepted']['attemptNumber'] = attempt
+                    VALIDATOR.validate(d)
+
+    def test_campaign_and_synthetic_require_attestation(self):
+        for origin in ('campaign', 'synthetic'):
+            d = changed(fixture(), ['origin'], origin)
+            VALIDATOR.validate(d)
+            self.assertFalse(VALIDATOR.is_valid(changed(d, ['sources', 'originAttestation'], None)))
+        d = changed(fixture(), ['origin'], 'unattested')
+        d['sources']['originAttestation'] = None
+        VALIDATOR.validate(d)
+
+    def test_uri_validation_is_lexical_not_full_rfc_validation(self):
+        # URI syntax/dereferencing remains an owner gate, not an optional-extra
+        # dependent promise from JSON Schema. This malformed IPv6 passes lexical shape.
+        self.assertNotIn('format', SCHEMA['$defs']['blob']['properties']['uri'])
+        VALIDATOR.validate(changed(fixture(), ['sources', 'manifest', 'uri'], 'http://[not-a-valid-uri'))
+        for uri in ('not a URI', 'https://has whitespace', ':missing-scheme', 'urn:'):
+            self.assertFalse(VALIDATOR.is_valid(changed(fixture(), ['sources', 'manifest', 'uri'], uri)))
+
     def test_response_version_shapes_remain_distinct(self):
         v1 = fixture('v1-moneyline-zero.json')
         v2 = fixture()
@@ -117,7 +184,7 @@ class ContractTests(unittest.TestCase):
         d['revisionKey'] = '0' * 64
         d['execution'][0]['decisionIndex'] = 100
         VALIDATOR.validate(d)
-        self.assertIn('Not verified by JSON Schema', (ROOT / 'CONTRACT.md').read_text())
+        self.assertIn('Not verified by JSON Schema', (ROOT / 'CONTRACT.md').read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':

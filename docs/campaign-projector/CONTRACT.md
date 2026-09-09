@@ -39,14 +39,23 @@ unless explicitly optional in the accepted response's historical shape. Unknown
 keys/versions fail. No network `$ref` resolution is needed. The envelope contains:
 
 - `contractVersion = campaign-projector/v1` and `policyVersion = campaign-projector-inputs/v1`.
-- `identity`: literal `cohortId`, `fireId`, `runId`, `gameId`, manifest `network`,
-  canonical `scopedMarkets`. No generation of an alternative run identifier.
+- `identity`: literal `cohortId`, `fireId`, `runId`, `gameId`, restricted serving
+  `network` (exact manifest value; see below), canonical `scopedMarkets`.
+  No generation of an alternative run identifier.
 - `sources`: immutable byte references (`uri`, lowercase SHA-256) for manifest,
   fire artifact, optional spend sidecar, origin attestation, and entry assessment.
   URIs are locators, not identity, authorization, or instructions to fetch.
+  Schema validation is **lexical only**: a scheme, colon and nonempty no-whitespace
+  suffix. It does not claim full RFC URI validity (for example, malformed IPv6
+  authority syntax can pass). No optional `format: uri` checker is relied upon.
+  A future source reader must validate supported URI syntax and access policy
+  before dereferencing; these tests never fetch a locator.
 - `origin`: `unattested`, `synthetic`, or `campaign`. Only a separately reviewed,
   bound origin attestation may justify `campaign`; artifact presence, its prompt
   label, public precommitment, and timestamps alone do not prove live execution.
+  Both `campaign` **and `synthetic`** require a non-null `sources.originAttestation`;
+  `unattested` requires null. A synthetic attestation labels fixture provenance,
+  not evidence of a campaign execution.
 - `revisionKey`: SHA-256 of repo-canonical JSON of exactly
   `{contractVersion, policyVersion, identity, sources}`. This is a projection input
   frontier key, **not** the fire ID, artifact byte hash, or cohort ID. Origin and
@@ -65,6 +74,17 @@ raw byte digest. `sources.manifest.sha256` hashes the actual file bytes, which m
 have whitespace; these hashes need not equal. Never substitute a slate day,
 `watch-v0-YYYY-MM-DD`, `smoke-v0-YYYY-MM-DD`, directory, or filename for the content
 hash. A day may be a display/filter attribute, never a join or deduplication key.
+
+`identity.network` deliberately uses the serving store's `NetworkKey` domain
+(`src/servingStore.ts` at the baseline): exactly `polygon` or `amoy`. This is a
+narrower projection domain, not the raw manifest schema's free-form domain:
+`src/manifest.ts` accepts any nonempty string, and `src/manifestValidate.ts`
+does not currently check network. The adapter must require literal equality to
+one of these two keys and copy it unchanged. A legal manifest value such as
+`polygon-amoy`, an alias, different case, or any other string is an explicit
+projection refusal with diagnostics; **never** normalize it to `amoy` or change
+the manifest/cohort identity. Tightening manifest validation is a separate runtime
+follow-up, not implemented by this freeze.
 
 Markets are exactly `moneyline < spread < total`. `spread` maps to
 `requestBundle.games[0].markets.runLine`; `runLine` is **not** a market enum.
@@ -91,6 +111,17 @@ model answer; do not assume the persisted text is directly `JSON.parse`-able.
 The retained provider envelope, its byte length/digest, all failed/initial/repair
 attempts, timing, model identity and usage remain reachable through the immutable
 fire reference. They are not replaced by this accepted-only view.
+
+`accepted.attemptNumber` is deliberately restricted to **1 or 2**: initial or
+the one repair allowed by `src/repairPolicy.ts::CODE_MAX_REPAIRS_PER_ARM = 1`,
+also mirrored by `src/crossingProfile.ts::CROSSING_PROFILE.maxRepairAttemptsPerArm`.
+`src/manifestValidate.ts` requires the manifest's repair cap to match that code
+cap. This is a v1 policy coupling, not the structural positive-integer range of
+`src/fireArtifact.ts`. The number must identify the actual persisted accepted
+attempt under the pinned manifest, not merely fit the enum. Any future repair-cap
+change that admits accepted attempt 3 requires a **new projector contract version**
+and corresponding consumer/fixture tests before projecting such fires; v1 must
+refuse them. This cross-reference lives here to keep runtime source unchanged.
 
 A model decision carries `armIndex`, `forecastIndex` into
 `parsedResponse.games[0].forecasts`, and an exact complete `forecast` copy:
@@ -161,10 +192,45 @@ for **verified** evidence with an explicitly recomputed zero total.
   frontier; the fire artifact remains immutable and unchanged.
 - Verified: exact artifact/sidecar identity and sent-attempt bijection, known
   pricing/reservation pins, and recomputation succeeded; total is explicit.
-- Unknown, breach, invalid: retain sidecar source and reason, execution blocked.
-  A numerically known breach total may remain visible. An invalid/unknown total
-  is null. Never sum nullable fields into zero or use sidecar
-  `derivedActualUsdMicros` null/pass as a zero cost; recompute all relevant costs.
+- Unknown, breach, invalid: retain sidecar source and the mapped projection reason,
+  execution blocked. A breach total is a positive safe integer when every relevant
+  cost recomputes, or **null** when the breach is confirmed but the aggregate is
+  not recomputable. One over-reservation attempt plus one unpriceable attempt is
+  therefore `breach` / `reservation_breach` / null, never `unknown` and never zero.
+  An invalid/unknown state's total is always null. Never sum nullable fields into
+  zero or use sidecar `derivedActualUsdMicros` null/pass as a zero cost; recompute
+  all relevant costs.
+
+### Normative sidecar-to-projection mapping
+
+Apply these rows in order under the future pinned assessment policy. Sidecar
+`reason` alone is not an assessment. The first three rows are evidence-lifecycle
+states; only the last three map the guard's recomputed reason vocabulary.
+
+| Condition | `spend.state` | `spend.reason` | `totalUsdMicros` |
+| --- | --- | --- | --- |
+| No selected sidecar | `absent` | `not_present` | null |
+| Sidecar selected, not yet assessed under the pinned policy | `unverified` | `not_assessed` | null |
+| Assessed sidecar fails binding, integrity, required price/reservation pins, record consistency, or agreement with the recomputed reason | `invalid` | `binding_or_integrity_failure` | null |
+| Integrity holds; recomputed guard is `breach`, matching sidecar `spend_attempt_over_reservation` | `breach` | `reservation_breach` | positive recomputed total, or null if any attempt is unpriceable |
+| Integrity holds; guard is `unknown`, matching sidecar `spend_evidence_unknown`, with no confirmed breach | `unknown` | `cost_unknown` | null |
+| Integrity holds; guard is `pass`, matching sidecar reason null; every relevant cost recomputes | `verified` | `verified` | explicit nonnegative recomputed total, including zero |
+
+`absent` and `unverified` have null assessment and `sources.spendAssessment`;
+`absent` alone has null `sources.spendSidecar`. Every assessed state keeps the
+selected sidecar and assessment byte references. Do not copy the sidecar's reason
+string into `spend.reason`: its three-value vocabulary is intentionally mapped to
+the six-state projection lifecycle above. Preserve breach-before-unknown precedence
+from `src/spendGuard.ts`; a null aggregate from `src/verifySpendSidecar.ts` does not
+erase a confirmed over-reservation attempt. Source inconsistency cannot establish
+a trusted breach; retain diagnostics and references on `invalid` instead.
+
+A failed `attempts-priceable` or `attempts-within-reservation` check is not by
+itself a binding/integrity failure: those checks encode the unknown/breach facts.
+Nor does a crossing-specific acceptance failure alone map to `invalid`. Unknown
+assessment versions, unsafe numeric totals, or contradictory purported assessments
+must be refused/reported, not repaired into a fabricated `verified` state. These
+are adapter obligations, not an implementation supplied by this schema.
 
 The current `verifySpendEvidence` additionally checks crossing-specific cap,
 roster and reasoning-observed acceptance. Do not label its entire PASS as a
@@ -240,14 +306,28 @@ and grain explicitly. No live parity or production readiness is asserted here.
 Run from repository root:
 
 ```sh
+python3 -B docs/campaign-projector/test_fixture_integrity.py -v
 python3 -B docs/campaign-projector/test_contract.py -v
 git diff --check
 ```
 
 The test file imports only Python stdlib + `jsonschema==4.26.0` (see
 `requirements-test.txt`; install into an isolated review environment if absent).
-It validates the
-schema, fixture shapes and deliberately malformed mutations. It never imports or
+All text reads explicitly use UTF-8, independent of the platform locale; no
+`-X utf8` workaround is required. It validates the schema, fixture shapes and
+deliberately malformed mutations. The separate `test_fixture_integrity.py` is
+stdlib-only: it recomputes both synthetic fixture revision keys from exactly the
+four-field frontier and detects changed inputs/hashes. Its canonical serializer
+is intentionally limited to the frontier's JSON types; it is not a runtime
+replacement for `src/canonical.ts` or evidence of real manifest/sidecar integrity.
+
+CI names both test files explicitly (missing/renamed files fail). The existing
+`ci.yml` scorer job remains stdlib-only and runs fixture integrity. The separate
+`campaign-projector.yml` workflow runs schema plus integrity tests on Linux and
+Windows, installs the exact schema-test dependency in a network-enabled setup
+step, then runs tests with a scrubbed environment. It has contents-read permission,
+no production secrets or persisted checkout credentials. Dependency setup requires
+network; the test commands do not. No Python dependency is added to scorer. It never imports or
 runs production source, opens a store, reads environment/configuration/secrets,
 fetches URIs, recomputes real manifests, or builds projections. Schema constraints
 cover closed fields/enums/hash shapes, accepted/failure nullability, response
@@ -256,7 +336,8 @@ version shapes, explicit spend states, safe integers and non-authorizing outputs
 **Not verified by JSON Schema:** digest truth, accepted parsing, relational joins,
 policy correctness, provenance authenticity, cardinality across arrays, uniqueness
 by composite key, deterministic derivation, durable publication and crash behavior.
-These are mandatory later gates, not validation PASS claims:
+Fixture-only revision/body hash checks above do not change that JSON Schema
+boundary. These are mandatory later gates, not validation PASS claims:
 
 | Gate | Minimum adversarial acceptance case |
 | --- | --- |

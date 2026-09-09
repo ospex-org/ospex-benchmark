@@ -36,6 +36,9 @@ jobs:
         # Name the test file explicitly: a rename/removal must fail, not run zero tests.
         run: env -i PATH="$PATH" python -B operations/test_score_and_publish_once.py -v
         timeout-minutes: 2
+      - name: Offline campaign fixture integrity (stdlib only)
+        run: env -i PATH="$PATH" python -B docs/campaign-projector/test_fixture_integrity.py -v
+        timeout-minutes: 2
       - name: Score publisher self-test without environment
         run: env -i "$(command -v python)" -B operations/score_and_publish_once.py --self-test
 

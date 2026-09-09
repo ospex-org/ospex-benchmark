@@ -58,7 +58,7 @@
     "outcome": {"oneOf": [{"const": "valid"}, {"$ref": "#/$defs/failure"}]},
     "blob": {
       "type": "object", "additionalProperties": false, "required": ["uri", "sha256"],
-      "properties": {"uri": {"type": "string", "format": "uri", "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:[^\\s]+$", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
+      "properties": {"uri": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:[^\\s]+$", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}
     },
     "nullableBlob": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/blob"}]},
     "assessment": {
@@ -207,7 +207,7 @@
         {"properties": {"state": {"const": "unverified"}, "totalUsdMicros": {"type": "null"}, "reason": {"const": "not_assessed"}, "assessment": {"type": "null"}}},
         {"properties": {"state": {"const": "verified"}, "totalUsdMicros": {"$ref": "#/$defs/index"}, "reason": {"const": "verified"}, "assessment": {"$ref": "#/$defs/assessment"}}},
         {"properties": {"state": {"const": "unknown"}, "totalUsdMicros": {"type": "null"}, "reason": {"const": "cost_unknown"}, "assessment": {"$ref": "#/$defs/assessment"}}},
-        {"properties": {"state": {"const": "breach"}, "totalUsdMicros": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "reason": {"const": "reservation_breach"}, "assessment": {"$ref": "#/$defs/assessment"}}},
+        {"properties": {"state": {"const": "breach"}, "totalUsdMicros": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1, "maximum": 9007199254740991}]}, "reason": {"const": "reservation_breach"}, "assessment": {"$ref": "#/$defs/assessment"}}},
         {"properties": {"state": {"const": "invalid"}, "totalUsdMicros": {"type": "null"}, "reason": {"const": "binding_or_integrity_failure"}, "assessment": {"$ref": "#/$defs/assessment"}}}
       ]
     },
