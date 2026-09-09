@@ -22,6 +22,23 @@ on:
     branches: [main]
 
 jobs:
+  scorer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      # Stdlib only. Tests scrub the environment, isolate Git configuration and
+      # use disposable roots; Yarn/publication/network calls are never real.
+      - name: Offline score publisher tests
+        # Name the test file explicitly: a rename/removal must fail, not run zero tests.
+        run: env -i PATH="$PATH" python -B operations/test_score_and_publish_once.py -v
+        timeout-minutes: 2
+      - name: Score publisher self-test without environment
+        run: env -i "$(command -v python)" -B operations/score_and_publish_once.py --self-test
+
   build:
     runs-on: ubuntu-latest
     steps:
