@@ -1,5 +1,7 @@
-import { readFileSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { readRunArtifactFile } from './runArtifactInput.js';
+import { hasMarketOpenProvenance, MARKET_OPEN_SQL_PUBLICATION_BLOCKED } from './marketOpenPublication.js';
+import { basename, dirname, join, resolve, relative, sep } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { ZodError } from 'zod';
 import {
@@ -41,6 +43,7 @@ const USAGE = `Usage: yarn score --run <path-to-run.ndjson> [options]
 
 Options:
   --run PATH   The harness run file to score (required).
+  --evidence-root ROOT  Trusted B2 root; required for market-open artifacts.
   --out DIR    Output directory. Default: the run file's directory.
   --publish    After writing the scored artifact, publish it onto the benchmark
                serving projection (the same call as \`yarn project:scores\` on
@@ -57,12 +60,14 @@ interface CliOptions {
   runPath: string;
   outDir: string | null;
   publish: boolean;
+  evidenceRoot?: string | undefined;
 }
 
 function parseArgs(argv: string[], printLine: (line: string) => void): CliOptions {
   let runPath: string | null = null;
   let outDir: string | null = null;
   let publish = false;
+  let evidenceRoot: string | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = (): string => {
@@ -78,6 +83,9 @@ function parseArgs(argv: string[], printLine: (line: string) => void): CliOption
       case '--out':
         outDir = next();
         break;
+      case '--evidence-root':
+        evidenceRoot = next();
+        break;
       case '--publish':
         publish = true;
         break;
@@ -91,7 +99,7 @@ function parseArgs(argv: string[], printLine: (line: string) => void): CliOption
     }
   }
   if (runPath === null) throw new UsageError('--run is required');
-  return { runPath, outDir, publish };
+  return { runPath, outDir, publish, evidenceRoot };
 }
 
 /**
@@ -168,7 +176,8 @@ export async function runScoreCli(
 
   let run: ReturnType<typeof parseRunRecords>;
   try {
-    run = parseRunRecords(readFileSync(options.runPath, 'utf8').split(/\r?\n/));
+    const input = readRunArtifactFile(options.runPath, { marketOpenEvidenceRoot: options.evidenceRoot });
+    run = parseRunRecords(input.text.split(/\r?\n/), { marketOpenEvidence: input.marketOpenEvidence });
   } catch (error) {
     if (error instanceof ZodError) {
       const issue = error.issues[0];
@@ -178,6 +187,17 @@ export async function runScoreCli(
       );
     }
     throw error;
+  }
+  if (run.marketOpenEvidence !== undefined) {
+    if (options.outDir === null) throw new UsageError('market-open scoring requires --out outside the evidence root');
+    const target = resolve(options.outDir);
+    let ancestor = target;
+    while (!existsSync(ancestor)) ancestor = dirname(ancestor);
+    const destination = resolve(realpathSync(ancestor), relative(ancestor, target));
+    const root = run.marketOpenEvidence.root;
+    if (destination === root || destination.startsWith(root + sep)) {
+      throw new UsageError('market-open --out must be outside the evidence root');
+    }
   }
   printLine(
     `run ${run.runId} (label ${run.label}): ${run.games.size} games, ` +
@@ -220,7 +240,7 @@ export async function runScoreCli(
   const scoredAt = new Date().toISOString();
 
   const outDir = options.outDir ?? dirname(options.runPath);
-  const base = basename(options.runPath).replace(/\.ndjson$/, '');
+  const base = basename(options.runPath).replace(/\.(?:ndjson|json)$/, '');
   const ndjsonPath = join(outDir, `${base}-scored.ndjson`);
   const scorecardPath = join(outDir, `${base}-scorecard.md`);
   writeNdjson(ndjsonPath, scoredRecords(run, scored, stats, scoredAt, ladderParams));
@@ -259,6 +279,10 @@ export async function runScoreCli(
   }
 
   if (!options.publish) return 0;
+  if (hasMarketOpenProvenance({ ...run })) {
+    printError(MARKET_OPEN_SQL_PUBLICATION_BLOCKED);
+    return 1; // Scored files remain on disk; no serving connection or write.
+  }
 
   // The publish leg runs LAST, from the FILE just written — the same bytes
   // `yarn project:scores` would read — so a one-step publish and a later

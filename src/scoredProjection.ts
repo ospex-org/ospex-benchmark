@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { hasMarketOpenProvenance, MARKET_OPEN_SQL_PUBLICATION_BLOCKED } from './marketOpenPublication.js';
 import { parseNdjsonObjects, publishableCohortId } from './servingProjection.js';
 import type { JsonRecord } from './servingProjection.js';
 import type { DecisionScore, ScoringRun, SourceRef } from './servingStore.js';
@@ -252,6 +253,7 @@ export function parseScoredArtifact(text: string): readonly JsonRecord[] {
  */
 export function publishableScoredRun(records: readonly JsonRecord[]): ScoredGate {
   const no = (reason: string): ScoredGate => ({ publishable: false, reason });
+  if (records.some(hasMarketOpenProvenance)) return no(MARKET_OPEN_SQL_PUBLICATION_BLOCKED);
 
   for (const [index, record] of records.entries()) {
     const recordType = record['recordType'];

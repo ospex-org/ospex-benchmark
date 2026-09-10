@@ -2,6 +2,8 @@
 
 B1 (#124) is accepted. **B2 received external R3 at `f52f779`; review corrections and the advisory-timing change are authorized for merge. Nothing is installed or enabled.** These dispositions close the B2 source/test items from [the #124 review](https://github.com/ospex-org/ospex-benchmark/pull/124#issuecomment-5613903597), not the remaining B3/B4 integration or activation gates. See [SPEC-market-open-mode.md](SPEC-market-open-mode.md) and [B2 admission contract](MARKET-OPEN-ADMISSION.md).
 
+**B4 sequence (source-only):** the operator authorized three PRs after the serving schema conflict was verified: benchmark discovery/scoring with SQL publication explicitly blocked; indexer attempt/timing schema prerequisite; then MVE scheduler/reveals/serving plus replay and actual anonymous FE-view readback. See [B4.1 scoring contract](MARKET-OPEN-SCORING.md). No activation or public-readback claim is implied by this first PR.
+
 ## D1 — history evidence and consumer admission (B2 implemented; B4 open)
 
 B2 adds `bundle_game.sourceOddsReference`, explicitly discriminated as `market-open-history-v1` and resolving to the same run's `run_meta.marketOpen.source`. It binds event/cohort/run/game/market, opener ID/time and source/request/game hashes. `sourceOddsRows` stays empty; it is the legacy current-odds channel, not a place to fabricate a history row. Both markets and legacy-shape preservation are tested.

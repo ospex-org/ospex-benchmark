@@ -40,6 +40,7 @@ function plainJson(value: unknown, depth = 0): void {
   }
   if (Array.isArray(value) && Object.keys(value).length !== value.length) throw new Error('sparse or extended JSON array');
 }
+export { plainJson as assertMarketOpenJson };
 const json = z.unknown().refine((v) => { try { plainJson(v); return true; } catch { return false; } }, 'invalid JSON evidence');
 const configSchema = z.object({ root: text, cohortId: text, name: text,
   slateDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), policySha256: digest,
@@ -198,6 +199,75 @@ function reduce(state: MarketOpenStoreSnapshot, op: Operation, config: MarketOpe
   }
 }
 
+function readCanonical<T>(path: string, schema: z.ZodType<T>): T {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_BYTES) throw new Error('invalid journal/config file');
+  const bytes = readFileSync(path);
+  const value: unknown = JSON.parse(bytes.toString('utf8'));
+  plainJson(value);
+  const result = schema.safeParse(value);
+  if (!result.success) throw new Error('invalid journal/config shape', { cause: result.error });
+  const parsed = result.data;
+  if (!bytes.equals(Buffer.from(canonicalize(parsed)))) throw new Error('noncanonical journal/config bytes');
+  return parsed;
+}
+
+/** A stable append-only prefix. Reading never claims a lock or recovers a writer. */
+export function readMarketOpenStore(rootInput: string): {
+  config: MarketOpenStoreConfig; snapshot: MarketOpenStoreSnapshot;
+  seq: number; previous: string | null; bytes: number;
+} {
+  const root = resolve(rootInput);
+  if (!lstatSync(root).isDirectory() || realpathSync(root) !== root) throw new Error('invalid store root');
+  const config = readCanonical(join(root, 'config.json'), configSchema);
+  if (config.root !== root) throw new Error('store config root identity conflict');
+  return { config, ...replayJournal(config) };
+}
+
+function replayJournal(config: MarketOpenStoreConfig, verify = (ref: MarketOpenArtifactReference) => {
+  readMarketOpenArtifact(config.root, ref);
+}) {
+  const journal = join(config.root, 'journal');
+  const snapshot: MarketOpenStoreSnapshot = { reservedUsdMicros: 0, knownCostUsdMicros: 0, halted: null, fires: [] };
+  let seq = 0; let previous: string | null = null; let bytes = 0;
+  if (!lstatSync(journal).isDirectory() || realpathSync(journal) !== journal) throw new Error('invalid journal directory');
+  const names = readdirSync(journal);
+  const files = names.filter((n) => /^\d{10}\.json$/.test(n)).sort();
+  if (!files.length || names.some((n) => !/^\d{10}\.json$/.test(n) && !/^\.market-open\.\d+\.[0-9a-f]{16}\.tmp$/.test(n))) {
+    throw new Error('invalid journal shape');
+  }
+  for (const file of files) {
+    if (file !== `${String(seq).padStart(10, '0')}.json`) throw new Error('journal sequence gap');
+    const path = join(journal, file);
+    const entry = readCanonical(path, entrySchema);
+    const { sha256, ...body } = entry;
+    if (entry.seq !== seq || entry.previousSha256 !== previous || sha256 !== sha256Hex(canonicalize(body)) ||
+        (entry.seq === 0) !== (entry.operation.type === 'init')) throw new Error('journal hash-chain or genesis violation');
+    bytes += lstatSync(path).size;
+    if (bytes > MAX_JOURNAL_BYTES || seq >= 100000) throw new Error('journal size limit');
+    reduce(snapshot, entry.operation, config);
+    if (entry.operation.type === 'complete') verify(entry.operation.artifact);
+    seq++; previous = sha256;
+  }
+  return { snapshot, seq, previous, bytes };
+}
+
+/** Raw-byte verification without fsync, directory creation, or lock mutation. */
+export function readMarketOpenArtifact(root: string, ref: MarketOpenArtifactReference): Buffer {
+  const path = resolve(ref.path);
+  if (!isAbsolute(ref.path) || ref.path !== path || !path.startsWith(root + sep) || realpathSync(path) !== path) {
+    throw new Error('artifact path must be a regular file under store root');
+  }
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > MAX_BYTES) throw new Error('terminal artifact SHA or shape mismatch');
+    const bytes = readFileSync(fd);
+    if (createHash('sha256').update(bytes).digest('hex') !== ref.sha256) throw new Error('terminal artifact SHA or shape mismatch');
+    return bytes;
+  } finally { closeSync(fd); }
+}
+
 /**
  * Lock ownership survives process death by intentionally remaining on disk. OFFLINE recovery:
  * stop ALL writers, preserve the entire root, remove ONLY .writer-lock, then reopen. Never
@@ -242,7 +312,7 @@ export class MarketOpenStore {
         this.append({ type: 'init', configSha256: sha256Hex(canonicalize(this.#config)) });
         this.install(root, configPath, Buffer.from(canonicalize(this.#config)));
       } else {
-        const pinned = this.readCanonical(configPath, configSchema);
+        const pinned = readCanonical(configPath, configSchema);
         if (canonicalize(pinned) !== canonicalize(this.#config)) throw new Error('store config identity conflict');
         this.replay(journal);
       }
@@ -256,38 +326,10 @@ export class MarketOpenStore {
   private install(dir: string, path: string, buffer: Buffer): void {
     installBytesNoClobber(nodeArtifactFs, { dir, finalPath: path, tmpStem: 'market-open', buffer, label: 'market-open state' });
   }
-  private readCanonical<T>(path: string, schema: z.ZodType<T>): T {
-    const stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_BYTES) throw new Error('invalid journal/config file');
-    const bytes = readFileSync(path);
-    const value: unknown = JSON.parse(bytes.toString('utf8'));
-    plainJson(value);
-    const result = schema.safeParse(value);
-    if (!result.success) throw new Error('invalid journal/config shape', { cause: result.error });
-    const parsed = result.data;
-    if (!bytes.equals(Buffer.from(canonicalize(parsed)))) throw new Error('noncanonical journal/config bytes');
-    return parsed;
-  }
-  private replay(journal: string): void {
-    if (!lstatSync(journal).isDirectory() || realpathSync(journal) !== journal) throw new Error('invalid journal directory');
-    const names = readdirSync(journal);
-    const files = names.filter((n) => /^\d{10}\.json$/.test(n)).sort();
-    if (!files.length || names.some((n) => !/^\d{10}\.json$/.test(n) && !/^\.market-open\.\d+\.[0-9a-f]{16}\.tmp$/.test(n))) {
-      throw new Error('invalid journal shape');
-    }
-    for (const file of files) {
-      if (file !== this.filename()) throw new Error('journal sequence gap');
-      const path = join(journal, file);
-      const entry = this.readCanonical(path, entrySchema);
-      const { sha256, ...body } = entry;
-      if (entry.seq !== this.#seq || entry.previousSha256 !== this.#previous || sha256 !== sha256Hex(canonicalize(body)) ||
-          (entry.seq === 0) !== (entry.operation.type === 'init')) throw new Error('journal hash-chain or genesis violation');
-      this.#bytes += lstatSync(path).size;
-      if (this.#bytes > MAX_JOURNAL_BYTES || this.#seq >= 100000) throw new Error('journal size limit');
-      reduce(this.#state, entry.operation, this.#config);
-      if (entry.operation.type === 'complete') this.verifyArtifact(entry.operation.artifact);
-      this.#seq++; this.#previous = sha256;
-    }
+  private replay(_journal: string): void {
+    const replay = replayJournal(this.#config, (ref) => this.verifyArtifact(ref));
+    this.#state = replay.snapshot; this.#seq = replay.seq;
+    this.#previous = replay.previous; this.#bytes = replay.bytes;
   }
   private filename(): string { return `${String(this.#seq).padStart(10, '0')}.json`; }
   private healthy(): void {

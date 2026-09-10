@@ -77,4 +77,6 @@ fixture is no-network, synthetic, and non-authorizing, not production evidence.
   publish initial-plus-repair cost/status/version to existing FE ledger views, and
   prove replay and actual public-view readback.
 
+**B4 sequence (source-only):** the operator authorized three PRs after the serving schema conflict was verified: benchmark discovery/scoring with SQL publication explicitly blocked; indexer attempt/timing schema prerequisite; then MVE scheduler/reveals/serving plus replay and actual anonymous FE-view readback. See [B4.1 scoring contract](MARKET-OPEN-SCORING.md). No activation or public-readback claim is implied by this first PR.
+
 **B1: R2 review. B2–B4: R3. Nothing activated; final relaunch is a separate gate.**
