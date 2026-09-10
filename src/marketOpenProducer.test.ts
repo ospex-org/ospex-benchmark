@@ -119,8 +119,14 @@ test('D4 billable initial and repair evidence, immutable artifact, exact replay 
 
 test('two independent bounded workers start sibling markets while a slow market is held; third queues', async () => {
   let release!: () => void;
+  let releaseTotal!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
-  const f = fixture(async (response, call) => { if (call.market === 'moneyline' && call.gameId === GAME) await held; return response; });
+  const heldTotal = new Promise<void>((resolve) => { releaseTotal = resolve; });
+  const f = fixture(async (response, call) => {
+    if (call.market === 'moneyline' && call.gameId === GAME) await held;
+    if (call.market === 'total') await heldTotal;
+    return response;
+  });
   try {
     const first = f.producer.observe(observation());
     const second = f.producer.observe(observation('total'));
@@ -128,12 +134,14 @@ test('two independent bounded workers start sibling markets while a slow market 
     const third = f.producer.observe(observation('moneyline', thirdId));
     await new Promise((r) => setImmediate(r));
     assert.ok(f.calls.some((c) => c.market === 'total'), 'no wait for moneyline');
+    assert.ok(!f.calls.some((c) => c.gameId === thirdId), 'third market cannot start while both workers are occupied');
+    releaseTotal();
     assert.equal((await second).state, 'completed');
     // The second worker becoming idle is allowed to drain the third without waiting for first.
     assert.equal((await third).state, 'completed');
     assert.equal(f.producer.snapshot().reservedUsdMicros, RESERVATION * 3);
     release(); assert.equal((await first).state, 'completed');
-  } finally { release(); await f.cleanup(); }
+  } finally { release(); releaseTotal(); await f.cleanup(); }
 });
 
 test('cap refusal is durable and never sends; replay cannot evade cumulative reservations', async () => {
