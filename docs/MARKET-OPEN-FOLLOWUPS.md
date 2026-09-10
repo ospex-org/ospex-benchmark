@@ -1,61 +1,31 @@
 # Market-open integration follow-ups
 
-B1 remains fixture-only. These are bounded B2–B4 admission gates from
-[PR #124's external review](https://github.com/ospex-org/ospex-benchmark/pull/124#issuecomment-5613903597),
-not authorization to implement or activate those slices. The reviewed predecessor
-is `1b57ae2ea1b8896f89e9791161c5ff739d55481a`; the governing mechanic remains
-[SPEC-market-open-mode.md](SPEC-market-open-mode.md).
+B1 (#124) is accepted. **B2 implementation below awaits external R3; nothing is installed or enabled.** These dispositions close the B2 source/test items from [the #124 review](https://github.com/ospex-org/ospex-benchmark/pull/124#issuecomment-5613903597), not the remaining B3/B4 integration or activation gates. See [SPEC-market-open-mode.md](SPEC-market-open-mode.md) and [B2 admission contract](MARKET-OPEN-ADMISSION.md).
 
-## D1 — history evidence and consumer admission (B2 → B4)
+## D1 — history evidence and consumer admission (B2 implemented; B4 open)
 
-B1 deliberately leaves `bundle_game.sourceOddsRows` empty: that legacy channel
-holds `current_odds` rows, not history openers. The authoritative evidence is
-`run_meta.marketOpen.source`, joined by `runId` and bound to event game/market,
-request and source hashes. Empty `sourceOddsRows` alone is neither evidence of a
-missing opener nor permission to score a market-open run. B1 tests pin the empty
-array, matching run ID, and complete `run_meta` provenance together.
+B2 adds `bundle_game.sourceOddsReference`, explicitly discriminated as `market-open-history-v1` and resolving to the same run's `run_meta.marketOpen.source`. It binds event/cohort/run/game/market, opener ID/time and source/request/game hashes. `sourceOddsRows` stays empty; it is the legacy current-odds channel, not a place to fabricate a history row. Both markets and legacy-shape preservation are tested.
 
-Before B4 admits live market-open artifacts, B2 must provide an explicit
-history-source discriminator/reference on the game record, without fabricating a
-`CurrentOddsRow`. B4 must require that reference to resolve to the same run's
-immutable opener, validate game/market/request/source identity, and reject a
-missing, crossed, or inconsistent reference. Preserve legacy record behavior and
-historical replay. B1 does not change the record format to pre-implement B2.
+**B4 still required:** require the reference and immutable opener to resolve consistently; reject missing/crossed/inconsistent evidence before scoring or publication. Preserve historical replay. This PR does not enable consumer admission.
 
-## D2 — identity versus dispatch permission (B2)
+## D2 — identity versus dispatch permission (B2 implemented)
 
-Before adding paid admission, split the permanent prepared-run identity checks
-from the temporary dry-run/synthetic-clock gate. Keep the provenance membership,
-run/cohort/build, request, roster and original observation-time bindings intact;
-B1 tests now pin the previously uncovered roster and both fetch-time clauses.
-Opening a mode gate must not weaken any identity check. B2 must prove those
-negative cases still fail and separately prove durable claim/budget admission
-before any initial or repair send. No live permission is added by B1.
+`assertMarketOpenPreparedRecordIdentity` owns permanent preparation/provenance/run/cohort/build/request/roster/fetch-time identity. `marketOpenRecordBoundary` separately enforces fixture or durable producer permission. B1's identity negative tests remain; the new boundary tests exercise independent context mutations, absent provenance, namespace squatting, copied preparation/receipt, unjournalled sends and changed producer context. Every actual initial/repair call additionally requires an already durable claim/reservation and single-use attempt intent.
 
-## D3 — shared record validator ownership (B2 integration)
+## D3 — shared record validator ownership (B2 implemented)
 
-Retain the current cheap, non-circular feature import for B1; do not introduce a
-registry solely for this test correction. When separating admission from identity,
-keep a small owned validation boundary rather than making the shared record
-primitive import each future runtime. If an injected validator/registry is used,
-it must be code-owned and mandatory for the market-open namespace, not an optional
-caller hook that bypasses validation. Test legacy compatibility and namespace
-squatting/absent-provenance rejection before consumer admission.
+`buildRecords` imports one small owned boundary and calls it unconditionally. The boundary is not an optional injected validator or caller registry. Producer permission requires the store's unforgeable in-process receipt for the exact prepared run/envelope and matching settled attempt evidence. Type-only reverse dependencies remain erased. Legacy records retain their exact prior game-record shape.
 
-## D4 — fixture spend evidence (B2)
+## D4 — fixture versus billable spend evidence (B2 implemented)
 
-The canned fixture uses `billingClass: 'known-zero'`. Its passing spend verdict
-proves shared-guard composition only; it cannot prove billable usage accounting or
-cap enforcement. The separately pinned reservation is an administrative upper
-reservation, not an invoice. B2 must exercise billable initial/repair/search costs,
-missing/unknown usage, cumulative reservations, over-cap halt, and durable recovery
-through the real admission path before any paid operation.
+The B1 canned fixture remains known-zero and non-authorizing. `MarketOpenProducer` uses the real admission path and shared **billable** guard/pricing math in synthetic tests: initial plus repair costs, search evidence, missing initial/repair usage, missing search count, known over-cap actuals without clamping, cumulative reservation refusal, persistent halt, artifact failure, and SIGKILL/replay recovery. Attempts are durably claimed before every synthetic send. Unknown is never priced as zero; reservations are never automatically released. This proves code behavior, not actual provider invoices or production filesystem conformance.
 
-## P2 — immutable opener age is not dispatch lag (B2)
+## P2 — opener age versus dispatch lag (B2 implemented; bound proposed for R3)
 
-B1 intentionally accepts an old opener as the historical reference, retaining its
-original timestamp. Assembly at that instant makes the shared current-quote age
-check zero; it imposes no maximum opener age. Future-openers and at/after-first-
-pitch observations are still refused. B2 must bound observation-to-send lag and
-preserve the first observation through recovery, not impose an accidental
-current-quote freshness gate on historical openers or refresh source timestamps.
+Proposed maximum observation-to-send lag: **120,000 ms inclusive (two minutes)**, for every initial and repair. First pitch is an independent strict cutoff. Recheck after durable attempt-intent fsync; at 120,001 ms refuse without sending. Queue/recovery uses the original persisted first observation, never a refreshed time. Refused events keep their cumulative reservation and identity. An old opener remains the reference; no current-quote age gate is imposed on its timestamp. Tests cover both sides of the lag boundary, repairs, fsync delay and recovery.
+
+## Remaining admission gates
+
+- **B3:** execution intent extraction requires exact completed claim/run/market/source/accepted decision, with existing stake, first-pitch, line, liquidity and receipt safety unchanged.
+- **B4:** namespace discovery, history-reference verification, scorer/denominator handling, reveals/writeups and serving cost/status publication plus actual public-view readback.
+- **Activation:** separately approved source acquisition and service wiring, one authoritative local POSIX evidence root, credential isolation, deployment/recovery checks and operational relaunch. No automatic stale-lock stealing or unknown-spend override is implemented. Campaign/#122/#123 remain set aside, not deleted.

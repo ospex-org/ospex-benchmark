@@ -49,7 +49,10 @@ fixture is no-network, synthetic, and non-authorizing, not production evidence.
 
 - **B2, admission/producer:** single enforced writer, durable atomic claims and
   cumulative reservations, bounded independent workers, real usage/search evidence,
-  immutable artifacts, unknown-spend halt, and crash/replay recovery.
+  immutable artifacts, unknown-spend halt, and crash/replay recovery. Source-only
+  [B2 implementation](MARKET-OPEN-ADMISSION.md) proposes a 120,000 ms inclusive
+  observation-to-send bound on each initial/repair; late work refuses, preserving
+  the original observation and reservation. Awaiting R3; not installed/enabled.
 - **B3, execution `scan_intents`:** require exact completed claim, cohort, market,
   run/source hash, and accepted arm decision—not “game fired” or newest file. Retain
   stake, cutoff, exact-line, and receipt controls; no liquidity remains explicit.

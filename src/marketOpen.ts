@@ -7,6 +7,7 @@ import { firstTwoSided, parseTwoSidedHistoryRows, SOURCE_QUERY_VERSION } from '.
 import { prepareGameRequest } from './preparedRequest.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { ARMS } from './providers/index.js';
+import { authenticateRun } from './runner.js';
 import { CURRENT_RESPONSE_SCHEMA_VERSION } from './schema.js';
 import { buildGameRequest } from './scopedRequest.js';
 import { easternCalendarDay, isValidSlateDate } from './slateDate.js';
@@ -177,17 +178,47 @@ export function assertPreparedMarketOpenRun(run: PreparedMarketOpenRun): void {
   if (!preparedRuns.has(run)) throw new Error('market-open run was not prepared by this policy');
 }
 
-/** Additive record boundary; legacy runs are unchanged. Not a disk replay API. */
-export function assertMarketOpenRecordContext(env: RunEnvelope, ctx: RunContext, build: BuildResult): void {
+/**
+ * Permanent identity only, independent of fixture/producer permission. The
+ * registry stays private to the preparation owner: there is no register hook.
+ * This is not a disk replay API; even a byte-identical copied provenance fails.
+ */
+export function assertMarketOpenPreparedRecordIdentity(
+  env: RunEnvelope, ctx: RunContext, build: BuildResult,
+): PreparedMarketOpenRun | undefined {
   const p = ctx.marketOpen;
-  if (p === undefined && !ctx.cohortId.startsWith('market-open-')) return;
+  const reserved = [ctx.cohortId, ctx.runId, env.dispatch.cohortId]
+    .some((id) => id.startsWith('market-open-'));
+  if (p === undefined && !reserved) return undefined;
   const run = p === undefined ? undefined : provenanceRuns.get(p);
-  if (run === undefined || p === undefined || ctx.watch !== undefined || ctx.mode !== 'dry-run' ||
-      ctx.clockMode !== 'synthetic-fixture' || ctx.runId !== p.runId || ctx.cohortId !== p.event.cohortId ||
+  if (run === undefined || p === undefined) {
+    throw new Error('market-open record context has absent or unprepared provenance');
+  }
+  authenticateRun(env, ctx);
+  const dispatched = env.snapshot.prepared[0];
+  if (ctx.watch !== undefined || ctx.runId !== p.runId || ctx.cohortId !== p.event.cohortId ||
+      ctx.slateDate !== run.cohort.slateDate ||
       ctx.fetchStartedAt !== p.observedAt || ctx.fetchCompletedAt !== p.observedAt ||
       env.baselinePolicyVersion !== MARKET_OPEN_POLICY.baselinePolicyVersion || build !== run.build ||
-      env.snapshot.prepared.length !== 1 || env.snapshot.prepared[0]?.requestSha256 !== p.requestSha256 ||
+      env.snapshot.prepared.length !== 1 || dispatched?.requestSha256 !== p.requestSha256 ||
+      dispatched.gameSha256 !== p.gameSha256 || dispatched.gameId !== p.event.gameId ||
+      canonicalize(dispatched) !== canonicalize(run.request) ||
+      canonicalize(Object.keys(dispatched.game.markets)) !== canonicalize([p.event.market]) ||
+      p.source.row.jsonodds_id !== p.event.gameId || p.source.row.market !== p.event.market ||
+      p.source.sha256 !== sha256Hex(canonicalize(p.source.row)) ||
+      p.claim.requestSha256 !== p.requestSha256 || p.claim.sourceSha256 !== p.source.sha256 ||
+      p.claim.key !== p.event.eventId ||
+      canonicalize(env.expectedArms) !== canonicalize(MARKET_OPEN_POLICY.roster.map((arm) => arm.participantId)) ||
       canonicalize(env.results.map((r) => r.arm)) !== canonicalize(MARKET_OPEN_POLICY.roster)) {
-    throw new Error('market-open record context does not match its prepared event (B1 is fixture-only)');
+    throw new Error('market-open record context does not match its prepared event');
+  }
+  return run;
+}
+
+/** B1 compatibility assertion; shared records use the owned B2 boundary. */
+export function assertMarketOpenRecordContext(env: RunEnvelope, ctx: RunContext, build: BuildResult): void {
+  const run = assertMarketOpenPreparedRecordIdentity(env, ctx, build);
+  if (run !== undefined && (ctx.mode !== 'dry-run' || ctx.clockMode !== 'synthetic-fixture')) {
+    throw new Error('market-open record context is fixture-only without producer permission');
   }
 }
