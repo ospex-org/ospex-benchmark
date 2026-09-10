@@ -57,10 +57,10 @@ const finishSchema = z.object({ eventId: digest, slot: slotSchema, finishedAt: i
   costUsdMicros: money.nullable(), evidence: json }).strict();
 const operationSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('init'), configSha256: digest }).strict(),
-  z.object({ type: z.literal('claim'), input: claimSchema }).strict(),
+  z.object({ type: z.literal('claim'), input: claimSchema, claimedAt: instant }).strict(),
   z.object({ type: z.literal('begin'), input: beginSchema }).strict(),
   z.object({ type: z.literal('finish'), input: finishSchema }).strict(),
-  z.object({ type: z.literal('complete'), eventId: digest, artifact: artifactSchema }).strict(),
+  z.object({ type: z.literal('complete'), eventId: digest, artifact: artifactSchema, installedAt: instant }).strict(),
   z.object({ type: z.literal('terminal'), eventId: digest, status: z.enum(['failed', 'unknown', 'refused']), reason: text }).strict(),
 ]);
 const entrySchema = z.object({ version: z.literal(1), seq: z.number().int().safe().nonnegative(),
@@ -74,7 +74,7 @@ export interface MarketOpenAttempt {
   costUsdMicros: number | null; evidence: unknown;
 }
 export interface MarketOpenFire {
-  claim: MarketOpenClaimInput; admitted: boolean;
+  claim: MarketOpenClaimInput; admitted: boolean; claimedAt: string; artifactInstalledAt: string | null;
   status: 'claimed' | 'running' | 'completed' | 'failed' | 'unknown' | 'refused';
   attempts: MarketOpenAttempt[]; knownCostUsdMicros: number;
   terminalArtifact: MarketOpenArtifactReference | null; reason: string | null;
@@ -141,7 +141,7 @@ function reduce(state: MarketOpenStoreSnapshot, op: Operation, config: MarketOpe
     if (state.fires.length >= 1024) throw new Error('store fire limit');
     const reason = state.halted ?? (op.input.reservationUsdMicros > config.capUsdMicros - state.reservedUsdMicros ? 'cap_exceeded' : null);
     const admitted = reason === null;
-    state.fires.push({ claim: op.input, admitted, status: admitted ? 'claimed' : 'refused', attempts: [],
+    state.fires.push({ claim: op.input, admitted, claimedAt: op.claimedAt, artifactInstalledAt: null, status: admitted ? 'claimed' : 'refused', attempts: [],
       knownCostUsdMicros: 0, terminalArtifact: null, reason });
     if (admitted) state.reservedUsdMicros = add(state.reservedUsdMicros, op.input.reservationUsdMicros);
     return;
@@ -187,6 +187,7 @@ function reduce(state: MarketOpenStoreSnapshot, op: Operation, config: MarketOpe
     }
     // Evidence may attach to a dirty terminal, but never promotes it to clean completion.
     fire.terminalArtifact = op.artifact;
+    fire.artifactInstalledAt = op.installedAt;
   } else {
     if (!['claimed', 'running'].includes(fire.status)) throw new Error('fire is terminal');
     if (op.status === 'refused' && fire.attempts.length) throw new Error('cannot refuse sent fire');
@@ -333,7 +334,7 @@ export class MarketOpenStore {
     nodeArtifactFs.syncDir(dirname(path));
   }
 
-  claim(input: MarketOpenClaimInput): { created: boolean; fire: MarketOpenFire } {
+  claim(input: MarketOpenClaimInput, claimedAt = new Date().toISOString()): { created: boolean; fire: MarketOpenFire } {
     this.healthy(); plainJson(input);
     const parsed = claimSchema.parse(input);
     validateClaim(parsed, this.#config);
@@ -342,7 +343,7 @@ export class MarketOpenStore {
       if (canonicalize(existing.claim) !== canonicalize(parsed)) throw new Error('claim identity/input conflict');
       return { created: false, fire: structuredClone(existing) };
     }
-    this.append({ type: 'claim', input: parsed });
+    this.append({ type: 'claim', input: parsed, claimedAt });
     return { created: true, fire: structuredClone(lookup(this.#state, parsed.eventId)) };
   }
   beginAttempt(input: z.infer<typeof beginSchema>): MarketOpenAttempt {
@@ -353,13 +354,13 @@ export class MarketOpenStore {
     this.append({ type: 'finish', input });
     return structuredClone(lookup(this.#state, input.eventId));
   }
-  complete(eventId: string, artifact: MarketOpenArtifactReference): MarketOpenFire {
+  complete(eventId: string, artifact: MarketOpenArtifactReference, installedAt = new Date().toISOString()): MarketOpenFire {
     this.healthy(); plainJson(artifact);
     const ref = artifactSchema.parse(artifact);
     const existing = lookup(this.#state, eventId);
     if (existing.terminalArtifact !== null && canonicalize(existing.terminalArtifact) !== canonicalize(ref)) throw new Error('terminal artifact conflict');
     try { this.verifyArtifact(ref); } catch (e) { this.#poisoned = true; throw e; }
-    if (existing.terminalArtifact === null) this.append({ type: 'complete', eventId, artifact: ref });
+    if (existing.terminalArtifact === null) this.append({ type: 'complete', eventId, artifact: ref, installedAt });
     return structuredClone(lookup(this.#state, eventId));
   }
   fail(eventId: string, reason: string): MarketOpenFire { return this.terminal(eventId, 'failed', reason); }

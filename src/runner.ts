@@ -378,7 +378,7 @@ async function boundedChat(
   if (refusal !== null) {
     return { ...emptyAttempt(), errorDetail: refusal, response: null, failure: 'provider_error', refusedAt: started };
   }
-  // fsync may have crossed the time bound. Compare and stamp this fresh reading;
+  // fsync may have crossed first pitch. Compare and stamp this fresh reading;
   // there is no await or further persistence between confirmation and adapter.chat.
   const sendMs = nowMs();
   const sendAt = new Date(sendMs).toISOString();

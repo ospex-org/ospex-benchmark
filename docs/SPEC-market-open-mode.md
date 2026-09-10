@@ -10,16 +10,16 @@ One event is **one `(game, market)` within an immutable cohort/policy identity**
 Dispatch at that market's **first eligible observation**, never waiting for sibling
 markets, responses, or publication. Simultaneous openers are separate events.
 Eligibility means a valid two-sided opener, an upcoming game before first pitch,
-and the frozen sport/market allowlist. B2 must bound detection-to-send lag and
-record late/refused/unknown outcomes; an earlier moneyline cannot suppress a total.
+and the frozen sport/market allowlist. B2 records detection-to-send lag and
+explicit outcomes; an earlier moneyline cannot suppress a total.
 
 Use shared `buildGameBundle`, `buildGameRequest`, and `prepareGameRequest` for the
 singleton market. Preserve the **actual history opener**: row ID, exact source
 timestamp, prices/line, and canonical hash, separately from observation and model
 request/response times. Never substitute current odds, invent sibling blocks,
 refresh source timestamps, or relabel `boardCompletedAt` as opener evidence.
-An old opener remains the reference: B1 has no maximum opener age; B2 bounds
-observation-to-send lag. [Integration gates](MARKET-OPEN-FOLLOWUPS.md) cover history
+An old opener remains the reference: B1 has no maximum opener age; B2 monitors
+observation-to-send lag without gating it. [Integration gates](MARKET-OPEN-FOLLOWUPS.md) cover history
 record references, validator ownership, and known-zero versus billable spend.
 Bind game, market, policy, request, claim, and run. Cohorts use the new
 **`market-open-v1` namespace**, never `watch-v0`; historical runs retain their method.
@@ -28,6 +28,19 @@ The scoped policy reuses the existing allowlist and **`baselines-v0.3.0`**. The
 shared response wire token remains `fixed-moneyline-total`; selected decisions must
 be supplied and policy-enabled. Absent siblings are not passes or opportunities.
 No spread betting, stake changes, or off-line totals pricing is authorized.
+
+## Timestamps, not trip wires
+
+Standing rule for this mode and future PRs: **timestamps, not trip wires;
+monitoring, not gating.** Record a timestamp at every relevant hop: opener present
+in the feed (actual source capture), first observation, claim, each arm's send and
+response, and artifact installation. Never refuse or halt work because of elapsed
+time. Observation-to-send lag is recorded on the run; its configurable threshold
+(default two minutes) emits a status/heartbeat warning only. First pitch and spend
+caps remain hard stops. Integrity and unknown-spend safeguards remain intact;
+this rule supplies no authority to resend an uncertain attempt or bypass a claim.
+Persist the original timestamps through recovery, with final artifact-install time
+in the completion journal/status rather than rewriting immutable pre-install records.
 
 ## Claim, run, and reuse
 
@@ -50,13 +63,14 @@ fixture is no-network, synthetic, and non-authorizing, not production evidence.
 - **B2, admission/producer:** single enforced writer, durable atomic claims and
   cumulative reservations, bounded independent workers, real usage/search evidence,
   immutable artifacts, unknown-spend halt, and crash/replay recovery. Source-only
-  [B2 implementation](MARKET-OPEN-ADMISSION.md) proposes a 120,000 ms inclusive
-  observation-to-send bound on each initial/repair; late work refuses, preserving
-  the original observation and reservation. Awaiting R3; not installed/enabled.
+  [B2 implementation](MARKET-OPEN-ADMISSION.md) records observation-to-send lag
+  on each initial/repair; a configurable 120,000 ms default warns without refusing.
+  Original observations and cumulative reservations persist. R3 corrections and
+  advisory timing are authorized for merge; not installed/enabled.
 - **B3, execution `scan_intents`:** require exact completed claim, cohort, market,
   run/source hash, and accepted arm decision—not “game fired” or newest file. Retain
   stake, cutoff, exact-line, and receipt controls; no liquidity remains explicit.
-- **B4, scorer/scheduler:** admit the namespace and opener provenance, update file
+- **B4, scorer/scheduler:** require live/wall labels, admit the namespace and opener provenance, update file
   discovery and per-market denominators, preserve scoring math and failed arms.
   **Reveals/writeups and serving publisher:** their per-decision grain tolerates
   sibling runs; update admission/integrity gates, retain rationale/seal/reveal hashes,

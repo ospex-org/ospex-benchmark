@@ -9,6 +9,7 @@ import { nodeArtifactFs } from './fireArtifactSink.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { MarketOpenStore, type MarketOpenClaimInput, type MarketOpenStoreConfig } from './marketOpenStore.js';
 
+const posixOnly = { skip: process.platform === 'win32' ? 'POSIX durability required' : false };
 const AT = '2026-09-10T14:05:00.000Z';
 const SLOT = { armId: 'arm-a', role: 'initial' as const, ordinal: 0 };
 function fixture() {
@@ -29,7 +30,7 @@ function fixture() {
   return { config, claim, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-test('atomic claim reserves once; exact replay preserves first observation and original input', () => {
+test('atomic claim reserves once; exact replay preserves first observation and original input', posixOnly, () => {
   const f = fixture();
   try {
     let store = new MarketOpenStore(f.config);
@@ -48,7 +49,47 @@ test('atomic claim reserves once; exact replay preserves first observation and o
   } finally { f.cleanup(); }
 });
 
-test('exclusive writer and stale lock never automatically stolen', () => {
+test('settlement-time cohort cap marks the second in-flight fire breached even within its own reservation', posixOnly, () => {
+  const f = fixture();
+  try {
+    const store = new MarketOpenStore(f.config);
+    const a = { ...f.claim('game-a'), reservationUsdMicros: 50 };
+    const b = { ...f.claim('game-b'), reservationUsdMicros: 50 };
+    store.claim(a); store.claim(b);
+    for (const c of [a, b]) store.beginAttempt({ eventId: c.eventId, slot: SLOT, startedAt: AT });
+    store.finishAttempt({ eventId: a.eventId, slot: SLOT, finishedAt: AT, costUsdMicros: 60, evidence: { billable: true } });
+    assert.equal(store.getFire(a.eventId)?.reason, 'spend_breach');
+    assert.equal(store.getFire(b.eventId)?.status, 'running');
+    // Already-sent B must still settle after A halts new work: 60 + 50 > 100,
+    // while B's 50 does NOT exceed its own 50 reservation.
+    store.finishAttempt({ eventId: b.eventId, slot: SLOT, finishedAt: AT, costUsdMicros: 50, evidence: { billable: true } });
+    assert.equal(store.snapshot().knownCostUsdMicros, 110);
+    assert.equal(store.snapshot().reservedUsdMicros, 100);
+    assert.equal(store.getFire(b.eventId)?.knownCostUsdMicros, 50);
+    assert.equal(store.getFire(b.eventId)?.status, 'unknown');
+    assert.equal(store.getFire(b.eventId)?.reason, 'spend_breach');
+    assert.equal(store.snapshot().halted, 'spend_breach');
+    store.close();
+  } finally { f.cleanup(); }
+});
+
+test('causal timestamps and sent-fire evidence cannot be rewritten as an unsent refusal', posixOnly, () => {
+  const f = fixture();
+  try {
+    const store = new MarketOpenStore(f.config); const c = f.claim(); store.claim(c);
+    assert.throws(() => store.beginAttempt({ eventId: c.eventId, slot: SLOT,
+      startedAt: '2026-09-10T14:04:59.999Z' }), /attempt predates observation/);
+    assert.equal(store.getFire(c.eventId)?.attempts.length, 0);
+    store.beginAttempt({ eventId: c.eventId, slot: SLOT, startedAt: AT });
+    store.finishAttempt({ eventId: c.eventId, slot: SLOT, finishedAt: AT, costUsdMicros: 1, evidence: { retained: true } });
+    const before = store.snapshot();
+    assert.throws(() => store.refuse(c.eventId, 'fabricated-unsent'), /cannot refuse sent fire/);
+    assert.deepEqual(store.snapshot(), before);
+    store.close();
+  } finally { f.cleanup(); }
+});
+
+test('exclusive writer and stale lock never automatically stolen', posixOnly, () => {
   const f = fixture();
   try {
     const store = new MarketOpenStore(f.config);
@@ -62,7 +103,7 @@ test('exclusive writer and stale lock never automatically stolen', () => {
   } finally { f.cleanup(); }
 });
 
-test('durable attempt start precedes evidence; initial plus repair costs survive restart', () => {
+test('durable attempt start precedes evidence; initial plus repair costs survive restart', posixOnly, () => {
   const f = fixture();
   try {
     let store = new MarketOpenStore(f.config);
@@ -88,20 +129,26 @@ test('durable attempt start precedes evidence; initial plus repair costs survive
   } finally { f.cleanup(); }
 });
 
-test('unknown cost retains evidence and blocks every later send, including repairs', () => {
+test('unknown cost retains evidence and blocks every later send, including repairs', posixOnly, () => {
   const f = fixture();
   try {
     const store = new MarketOpenStore(f.config); const c = f.claim(); store.claim(c);
     store.beginAttempt({ eventId: c.eventId, slot: SLOT, startedAt: AT });
     store.finishAttempt({ eventId: c.eventId, slot: SLOT, finishedAt: AT, costUsdMicros: null, evidence: { response: 'unpriced' } });
     assert.equal(store.getFire(c.eventId)?.status, 'unknown');
-    assert.ok(store.snapshot().halted);
+    assert.equal(store.snapshot().halted, 'unknown_attempt_cost');
+    const reserved = store.snapshot().reservedUsdMicros;
+    const next = store.claim({ ...f.claim('game-b'), reservationUsdMicros: 1 }).fire;
+    assert.equal(next.status, 'refused');
+    assert.equal(next.admitted, false);
+    assert.equal(next.reason, 'unknown_attempt_cost');
+    assert.equal(store.snapshot().reservedUsdMicros, reserved);
     assert.throws(() => store.beginAttempt({ eventId: c.eventId, slot: c.slots[1]!, startedAt: AT }), /halted/);
     store.close();
   } finally { f.cleanup(); }
 });
 
-test('replay rejects changed bytes and missing journal prefixes without resetting reservations', () => {
+test('replay rejects changed bytes and missing journal prefixes without resetting reservations', posixOnly, () => {
   for (const mutate of ['bytes', 'gap']) {
     const f = fixture();
     try {

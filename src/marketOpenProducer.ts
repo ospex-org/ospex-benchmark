@@ -17,14 +17,16 @@ import type { RunContext } from './records.js';
 import type { AttemptBoundary } from './runner.js';
 import type { ArmSpec, AttemptRecord, GamesEndpointRow, MarketKey, ProviderAdapter, ProviderName } from './types.js';
 
-/** Proposed for R3: two minutes inclusive from FIRST eligible observation to
- * EACH HTTP start, including repairs. This does not change B1 policy bytes. */
+/** Timestamps, not trip wires: elapsed lag is advisory, never send authority.
+ * Monitoring configuration is recorded, never part of durable send authority. */
 export const MARKET_OPEN_ADMISSION_POLICY = deepFreeze({
-  version: 'market-open-admission-v1', maxObservationToSendLagMs: 120_000,
-  workers: 2, timeoutMs: 60_000, maxOutputTokens: 6_000,
+  version: 'market-open-admission-v2',
+  workers: 2, transportDeadline: 'first-pitch', maxOutputTokens: 6_000,
   unknownSpend: 'halt-cohort', recovery: 'never-replay-started-attempt',
 } as const);
 export const MARKET_OPEN_ADMISSION_POLICY_SHA256 = sha256Hex(canonicalize(MARKET_OPEN_ADMISSION_POLICY));
+
+export const MARKET_OPEN_MONITORING_DEFAULTS = deepFreeze({ observationToSendWarningMs: 120_000 });
 
 export interface MarketOpenObservation {
   game: GamesEndpointRow; market: MarketKey; historyRows: unknown; observedAt: string;
@@ -34,7 +36,16 @@ export interface MarketOpenProducerOptions {
   /** Trusted transport boundary. No provider factory, environment or credential IO here. */
   adapters: ReadonlyMap<string, ProviderAdapter>;
   nowMs?: () => number;
+  /** Monitoring threshold only. No expiry, refusal, retry or reservation effect. */
+  observationToSendWarningMs?: number;
 }
+export interface MarketOpenTiming {
+  openerPresentAt: string; firstObservedAt: string; claimedAt: string;
+  artifactInstalledAt: string | null; observationToSendWarningMs: number; lagWarning: boolean;
+  attempts: Array<{ armId: string; role: 'initial' | 'repair'; intentAt: string;
+    sendAt: string | null; responseAt: string | null; observationToSendLagMs: number | null; lagWarning: boolean }>;
+}
+type AdmissionResult = { state: 'admitted'; eventId: string } | { state: 'refused'; reason: string; eventId?: string };
 export type MarketOpenProductionResult =
   | { state: 'refused'; reason: string; eventId?: string; artifactPath?: string | null }
   | { state: 'completed' | 'failed' | 'unknown' | 'claimed' | 'running'; eventId: string; artifactPath: string | null };
@@ -49,6 +60,12 @@ export class MarketOpenProducer {
   private readonly adapters: Map<string, ProviderAdapter>;
   private readonly artifactRoot: string;
   private readonly nowMs: () => number;
+  private readonly admissionPolicy = MARKET_OPEN_ADMISSION_POLICY;
+  private readonly admissionPolicySha256 = MARKET_OPEN_ADMISSION_POLICY_SHA256;
+  private readonly observationToSendWarningMs: number;
+  // The actual send reading is immediately visible to status while HTTP is pending.
+  // It becomes durable in the existing settled evidence, never a new send transition.
+  private readonly activeAttempts = new Map<string, string>();
   private readonly jobs = new Map<string, Promise<MarketOpenProductionResult>>();
   private readonly queue: Array<() => Promise<void>> = [];
   private active = 0;
@@ -58,6 +75,9 @@ export class MarketOpenProducer {
   constructor(options: MarketOpenProducerOptions) {
     this.cohort = createMarketOpenCohort(options);
     this.nowMs = options.nowMs ?? Date.now;
+    const warningMs = options.observationToSendWarningMs ?? MARKET_OPEN_MONITORING_DEFAULTS.observationToSendWarningMs;
+    if (!Number.isSafeInteger(warningMs) || warningMs < 0) throw new Error('invalid observation-to-send warning threshold');
+    this.observationToSendWarningMs = warningMs;
     this.artifactRoot = resolve(options.root);
     this.adapters = new Map(options.adapters);
     for (const arm of MARKET_OPEN_POLICY.roster) {
@@ -71,11 +91,35 @@ export class MarketOpenProducer {
     }
     this.store = new MarketOpenStore({
       root: options.root, ...this.cohort, capUsdMicros: options.capUsdMicros,
-      admissionPolicySha256: MARKET_OPEN_ADMISSION_POLICY_SHA256,
+      admissionPolicySha256: this.admissionPolicySha256,
     });
   }
 
   snapshot() { return this.store.snapshot(); }
+
+  /** Read-only heartbeat payload for B3/B4 wiring; this library installs no monitor. */
+  status() {
+    const snapshot = this.store.snapshot();
+    return { ...snapshot, fires: snapshot.fires.map((fire) => ({ ...fire, timing: this.timing(fire) })) };
+  }
+
+  private timing(fire: MarketOpenFire, preparedRun?: PreparedMarketOpenRun): MarketOpenTiming {
+    const prepared = preparedRun === undefined ? prepareMarketOpenRun({ ...fire.claim.preparation, historyRows: fire.claim.preparation.historyRows, cohort: this.cohort }) : null;
+    const run = preparedRun ?? (prepared?.state === 'prepared' ? prepared.run : undefined);
+    if (run === undefined) throw new Error('persisted timing source does not prepare');
+    const attempts = fire.attempts.map((a) => {
+      const evidence = a.evidence as { attempt?: AttemptRecord } | null;
+      const sendAt = evidence?.attempt?.requestAt ?? this.activeAttempts.get(canonicalize({ eventId: fire.claim.eventId, ...a.slot })) ?? null;
+      const observationToSendLagMs = sendAt === null ? null : instantMs(sendAt) - instantMs(run.provenance.observedAt);
+      return { armId: a.slot.armId, role: a.slot.role, intentAt: a.startedAt, sendAt,
+        responseAt: evidence?.attempt?.responseAt ?? null, observationToSendLagMs,
+        lagWarning: observationToSendLagMs !== null && observationToSendLagMs > this.observationToSendWarningMs };
+    });
+    return { openerPresentAt: run.provenance.source.row.captured_at, firstObservedAt: run.provenance.observedAt,
+      claimedAt: fire.claimedAt, artifactInstalledAt: fire.artifactInstalledAt,
+      observationToSendWarningMs: this.observationToSendWarningMs,
+      lagWarning: attempts.some((a) => a.lagWarning), attempts };
+  }
 
   /** The first eligible preparation, including exact observedAt, is persisted
    * before queuing. Duplicate observations never replace its source or clock. */
@@ -87,12 +131,12 @@ export class MarketOpenProducer {
 
   /** Durable admission is separately callable so a reader can commit before
    * handing off to workers. It never sends; recover() drains admitted events. */
-  admit(observation: MarketOpenObservation): { state: 'admitted'; eventId: string } | { state: 'refused'; reason: string } {
+  admit(observation: MarketOpenObservation): AdmissionResult {
     this.assertOpen();
     const eventId = sha256Hex(canonicalize({ cohortId: this.cohort.cohortId,
       gameId: observation.game.gameId, market: observation.market }));
     const existing = this.store.getFire(eventId);
-    if (existing !== undefined) return { state: 'admitted', eventId };
+    if (existing !== undefined) return admissionOf(existing);
     const prepared = prepareMarketOpenRun({ cohort: this.cohort, ...observation });
     if (prepared.state === 'refused') return prepared;
     const run = prepared.run;
@@ -103,8 +147,7 @@ export class MarketOpenProducer {
       slots: MARKET_OPEN_POLICY.roster.flatMap((arm) => [slot(arm, 'initial'), slot(arm, 'repair')]),
       preparation: structuredClone({ name: this.cohort.name, slateDate: this.cohort.slateDate, ...observation }),
     };
-    this.store.claim(claim);
-    return { state: 'admitted', eventId };
+    return admissionOf(this.store.claim(claim, new Date(this.nowMs()).toISOString()).fire);
   }
 
   /** Explicit recovery only: unsent claims use the persisted FIRST observation.
@@ -175,10 +218,6 @@ export class MarketOpenProducer {
   private refusal(run: PreparedMarketOpenRun, at: string): string | null {
     if (this.fault !== null || this.store.snapshot().halted) return 'cohort_halted';
     const atMs = instantMs(at);
-    const observedMs = instantMs(run.provenance.observedAt);
-    if (atMs < observedMs || atMs - observedMs > MARKET_OPEN_ADMISSION_POLICY.maxObservationToSendLagMs) {
-      return 'observation_to_send_lag';
-    }
     if (atMs >= instantMs(run.request.game.scheduledStartUtc)) return 'at_or_after_first_pitch';
     return null;
   }
@@ -200,7 +239,11 @@ export class MarketOpenProducer {
         this.store.beginAttempt({ eventId: id, slot: slot(arm, role), startedAt: at });
         return null;
       },
-      confirm: (_arm, _role, at) => this.refusal(run, at),
+      confirm: (arm, role, at) => {
+        const reason = this.refusal(run, at);
+        if (reason === null) this.activeAttempts.set(attemptKey(id, arm, role), at);
+        return reason;
+      },
       settled: (arm, role, attempt) => {
         // Real admission always uses billable accounting, even in synthetic tests.
         // Never copy B1's closed mock-only known-zero classification here.
@@ -216,6 +259,7 @@ export class MarketOpenProducer {
           finishedAt: attempt.responseAt ?? new Date(this.nowMs()).toISOString(),
           costUsdMicros: cost,
           evidence: { version: 'market-open-attempt-v1', role, arm, attempt, spend: guard } });
+        this.activeAttempts.delete(attemptKey(id, arm, role));
         if (guard.kind === 'breach' && this.store.snapshot().halted === null) {
           this.store.markUnknown(id, 'per_attempt_reservation_breach');
         }
@@ -224,7 +268,8 @@ export class MarketOpenProducer {
     const options = {
       cohortId: this.cohort.cohortId, executionPolicy: MARKET_OPEN_POLICY.executionPolicy,
       baselinePolicyVersion: MARKET_OPEN_POLICY.baselinePolicyVersion,
-      timeoutMs: MARKET_OPEN_ADMISSION_POLICY.timeoutMs,
+      // Each send/response remains bounded by the real game deadline, not a made-up duration.
+      timeoutMs: Math.max(1, instantMs(run.request.game.scheduledStartUtc) - this.nowMs()),
       maxOutputTokens: MARKET_OPEN_ADMISSION_POLICY.maxOutputTokens,
       nowMs: this.nowMs, attemptBoundary: boundary,
     };
@@ -233,7 +278,7 @@ export class MarketOpenProducer {
       ...options, runId: run.provenance.runId, slateDate: this.cohort.slateDate,
       mode: 'live', clockMode: 'wall', createdAt: new Date(this.nowMs()).toISOString(),
       fetchStartedAt: run.provenance.observedAt, fetchCompletedAt: run.provenance.observedAt,
-      marketOpen: run.provenance,
+      marketOpen: run.provenance, marketOpenTiming: this.timing(this.store.getFire(id)!, run),
     };
     const receipt = this.store.recordReceipt(id, run, envelope);
     authorizeMarketOpenProducerRecords(run, envelope, context, receipt);
@@ -245,7 +290,7 @@ export class MarketOpenProducer {
       priceVersion: MARKET_OPEN_POLICY.priceVersion, perAttemptReservationUsdMicros: perAttempt,
     });
     const bytes = Buffer.from(canonicalize({ version: 'market-open-produced-v1',
-      admissionPolicy: MARKET_OPEN_ADMISSION_POLICY, admissionPolicySha256: MARKET_OPEN_ADMISSION_POLICY_SHA256,
+      admissionPolicy: this.admissionPolicy, admissionPolicySha256: this.admissionPolicySha256,
       eventId: id, runId: run.provenance.runId, records, spend,
       admission: this.store.getFire(id),
     }) + '\n', 'utf8');
@@ -253,17 +298,26 @@ export class MarketOpenProducer {
     const installed = installBytesNoClobber(nodeArtifactFs, { dir, finalPath: join(dir, `${id}.json`),
       tmpStem: id, buffer: bytes, label: 'market-open produced artifact' });
     // The immutable artifact is present AND durable before terminal state advances.
+    const artifactInstalledAt = new Date(this.nowMs()).toISOString();
     const reference = { path: installed.path, sha256: sha256Hex(bytes.toString('utf8')) };
     const latest = this.store.getFire(id)!;
     if (latest.status === 'running' || latest.status === 'claimed') {
       if (envelope.results.some((r) => r.outcome !== 'valid')) this.store.fail(id, 'arm_outcome_failure');
     }
     // Dirty terminals also bind their evidence, without promoting to completed.
-    this.store.complete(id, reference);
+    this.store.complete(id, reference, artifactInstalledAt);
     return { ...resultOf(this.store.getFire(id)!), artifactPath: installed.path };
   }
 }
 
+function admissionOf(fire: MarketOpenFire): AdmissionResult {
+  return fire.status === 'refused'
+    ? { state: 'refused', eventId: fire.claim.eventId, reason: fire.reason ?? 'refused' }
+    : { state: 'admitted', eventId: fire.claim.eventId };
+}
+function attemptKey(eventId: string, arm: ArmSpec, role: 'initial' | 'repair'): string {
+  return canonicalize({ eventId, ...slot(arm, role) });
+}
 function slot(arm: ArmSpec, role: 'initial' | 'repair'): MarketOpenAttemptSlot {
   return { armId: arm.participantId, role, ordinal: role === 'initial' ? 0 : 1 };
 }

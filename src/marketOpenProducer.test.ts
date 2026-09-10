@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { MarketOpenProducer, MARKET_OPEN_ADMISSION_POLICY } from './marketOpenProducer.js';
+import { MarketOpenProducer, MARKET_OPEN_MONITORING_DEFAULTS } from './marketOpenProducer.js';
 import { MARKET_OPEN_POLICY, createMarketOpenCohort } from './marketOpen.js';
 import { parseRequestPayload, buildValidResponse } from './mock.js';
 import { canonicalize, sha256Hex } from './canonical.js';
@@ -15,6 +15,7 @@ import { sealResponseEnvelope } from './providers/responseEnvelope.js';
 import type { MarketOpenObservation } from './marketOpenProducer.js';
 import type { ProviderAdapter, ProviderResponse, ProviderCallOptions } from './types.js';
 
+const posixOnly = { skip: process.platform === 'win32' ? 'POSIX durability required' : false };
 const OBSERVED = '2026-09-10T14:05:00.000Z';
 const NOW = Date.parse(OBSERVED);
 const GAME = '00000000-0000-4000-8000-000000000004';
@@ -37,9 +38,9 @@ function observation(market: 'moneyline' | 'total' = 'moneyline', gameId = GAME)
       away_odds_decimal: 1 + 100 / 110, home_odds_decimal: 1 + 100 / 105,
       away_odds_american: -110, home_odds_american: -105, captured_at: '2026-09-10T11:00:00.000Z' }] };
 }
-interface Call { armId: string; gameId: string; market: string; role: 'initial' | 'repair'; options: ProviderCallOptions | undefined }
+interface Call { armId: string; gameId: string; market: string; role: 'initial' | 'repair'; options: ProviderCallOptions | undefined; timeoutMs: number }
 type Transform = (response: ProviderResponse, call: Call) => Promise<ProviderResponse> | ProviderResponse;
-function fixture(transform?: Transform, cap = RESERVATION * 8) {
+function fixture(transform?: Transform, cap = RESERVATION * 8, observationToSendWarningMs?: number) {
   const root = mkdtempSync(join(tmpdir(), 'market-open-producer-'));
   let clock = NOW;
   const calls: Call[] = [];
@@ -47,11 +48,11 @@ function fixture(transform?: Transform, cap = RESERVATION * 8) {
   const adapters = new Map<string, ProviderAdapter>();
   for (const arm of MARKET_OPEN_POLICY.roster) adapters.set(arm.participantId, {
     provider: arm.provider, requestedModelId: arm.requestedModelId, credentialEnvVar: 'SYNTHETIC_UNUSED', hasCredential: () => true,
-    async chat(turns, _timeout, options) {
+    async chat(turns, timeoutMs, options) {
       const { payload, gameId } = parseRequestPayload(turns);
       const market = payload.bundle.games[0]!.markets.total !== undefined ? 'total' : 'moneyline';
       const role = turns.length > 2 ? 'repair' : 'initial';
-      const call: Call = { armId: arm.participantId, gameId, market, role, options };
+      const call: Call = { armId: arm.participantId, gameId, market, role, options, timeoutMs };
       const fire = producer.snapshot().fires.find((f) => f.claim.preparation.game.gameId === gameId && f.claim.preparation.market === market)!;
       assert.ok(fire, 'durable per-market claim precedes chat');
       assert.equal(fire.status, 'running');
@@ -70,9 +71,9 @@ function fixture(transform?: Transform, cap = RESERVATION * 8) {
       return transform ? transform(response, call) : response;
     },
   });
-  const options = { root, name: COHORT.name, slateDate: COHORT.slateDate, capUsdMicros: cap, adapters, nowMs: () => clock };
+  const options = { root, name: COHORT.name, slateDate: COHORT.slateDate, capUsdMicros: cap, adapters, nowMs: () => clock, ...(observationToSendWarningMs === undefined ? {} : { observationToSendWarningMs }) };
   producer = new MarketOpenProducer(options);
-  return { root, calls, get producer() { return producer; }, setClock: (value: number) => { clock = value; },
+  return { root, calls, options, get producer() { return producer; }, setClock: (value: number) => { clock = value; },
     reopen: () => { producer = new MarketOpenProducer(options); },
     cleanup: async () => { try { await producer.close(); } catch { /* intentional poisoned state preserved until fixture deletion */ }
       rmSync(root, { recursive: true, force: true }); } };
@@ -80,7 +81,7 @@ function fixture(transform?: Transform, cap = RESERVATION * 8) {
 function artifact(path: string | null | undefined) { assert.ok(path); return JSON.parse(readFileSync(path, 'utf8')); }
 
 // These are synthetic adapters on the actual admission, runner, accounting, record and sink path.
-test('D4 billable initial and repair evidence, immutable artifact, exact replay and cumulative reservation', async () => {
+test('D4 billable initial and repair evidence, immutable artifact, exact replay and cumulative reservation', posixOnly, async () => {
   const target = MARKET_OPEN_POLICY.roster[0]!.participantId;
   const f = fixture((response, call) => call.armId === target && call.role === 'initial'
     ? { ...response, rawText: response.rawText.replace(/"cohortId":"[^"]*"/, '"cohortId":"wrong"') } : response);
@@ -117,7 +118,7 @@ test('D4 billable initial and repair evidence, immutable artifact, exact replay 
   } finally { await f.cleanup(); }
 });
 
-test('two independent bounded workers start sibling markets while a slow market is held; third queues', async () => {
+test('two independent bounded workers start sibling markets while a slow market is held; third queues', posixOnly, async () => {
   let release!: () => void;
   let releaseTotal!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
@@ -144,7 +145,7 @@ test('two independent bounded workers start sibling markets while a slow market 
   } finally { release(); releaseTotal(); await f.cleanup(); }
 });
 
-test('cap refusal is durable and never sends; replay cannot evade cumulative reservations', async () => {
+test('cap refusal is durable and never sends; replay cannot evade cumulative reservations', posixOnly, async () => {
   const f = fixture(undefined, RESERVATION);
   try {
     assert.equal((await f.producer.observe(observation())).state, 'completed');
@@ -157,7 +158,7 @@ test('cap refusal is durable and never sends; replay cannot evade cumulative res
   } finally { await f.cleanup(); }
 });
 
-test('unknown usage retains evidence, halts repairs and subsequent markets through actual producer', async () => {
+test('unknown usage retains evidence, halts repairs and subsequent markets through actual producer', posixOnly, async () => {
   const f = fixture((response) => ({ ...response, rawText: '{}', usageRaw: null }));
   try {
     const result = await f.producer.observe(observation());
@@ -166,14 +167,22 @@ test('unknown usage retains evidence, halts repairs and subsequent markets throu
     assert.ok(f.calls.every((c) => c.role === 'initial'));
     assert.ok(f.producer.snapshot().fires[0]!.attempts.every((a) => a.evidence !== null));
     const doc = artifact(result.artifactPath); assert.equal(doc.spend.kind, 'unknown');
-    assert.equal((await f.producer.observe(observation('total'))).state, 'refused');
+    const reserved = f.producer.snapshot().reservedUsdMicros;
+    const admission = f.producer.admit(observation('total'));
+    assert.equal(admission.state, 'refused');
+    if (admission.state === 'refused') assert.equal(admission.reason, 'unknown_attempt_cost');
+    const refused = f.producer.snapshot().fires.find((fire) => fire.claim.preparation.market === 'total')!;
+    assert.equal(refused.admitted, false);
+    assert.equal(refused.reason, 'unknown_attempt_cost');
+    assert.equal(f.producer.snapshot().reservedUsdMicros, reserved);
+    assert.deepEqual(f.producer.admit(observation('total')), admission);
     await f.producer.close(); f.reopen();
     assert.equal((await f.producer.recover())[0]?.state, 'unknown');
     assert.equal(f.calls.length, MARKET_OPEN_POLICY.roster.length);
   } finally { await f.cleanup(); }
 });
 
-test('missing search count is unknown even with usable token evidence', async () => {
+test('missing search count is unknown even with usable token evidence', posixOnly, async () => {
   const f = fixture((response) => ({ ...response, searchAudit: null }));
   try {
     assert.equal((await f.producer.observe(observation())).state, 'unknown');
@@ -181,7 +190,7 @@ test('missing search count is unknown even with usable token evidence', async ()
   } finally { await f.cleanup(); }
 });
 
-test('known over-reservation actual is recorded without clamping and halts later admission', async () => {
+test('known over-reservation actual is recorded without clamping and halts later admission', posixOnly, async () => {
   const first = MARKET_OPEN_POLICY.roster[0]!;
   const f = fixture((response, call) => call.armId === first.participantId
     ? { ...response, usageRaw: { input_tokens: 100_000_000, output_tokens: 10, total_tokens: 100_000_010 } } : response);
@@ -194,84 +203,208 @@ test('known over-reservation actual is recorded without clamping and halts later
   } finally { await f.cleanup(); }
 });
 
-test('P2 120000ms inclusive bound; 120001ms refuses with zero sends and no observation refresh', async () => {
-  for (const delta of [120_000, 120_001]) {
+test('P2 advisory default records both threshold sides without refusing sends or halting', posixOnly, async () => {
+  for (const delta of [120_000, 120_001, 1_200_000]) {
     const f = fixture();
     try {
       f.setClock(NOW + delta);
       const result = await f.producer.observe(observation());
-      assert.equal(result.state, delta === 120_000 ? 'completed' : 'refused');
-      assert.equal(f.calls.length, delta === 120_000 ? MARKET_OPEN_POLICY.roster.length : 0);
-      assert.equal(f.producer.snapshot().fires[0]?.claim.preparation.observedAt, OBSERVED);
+      assert.equal(result.state, 'completed');
+      assert.equal(f.calls.length, MARKET_OPEN_POLICY.roster.length);
+      assert.equal(f.producer.snapshot().halted, null);
+      const timing = artifact(result.artifactPath).records.find((r: { recordType: string }) => r.recordType === 'run_meta').marketOpenTiming;
+      assert.equal(timing.firstObservedAt, OBSERVED);
+      assert.equal(timing.artifactInstalledAt, null, 'immutable records do not invent their own future installation time');
+      assert.equal(timing.openerPresentAt, '2026-09-10T11:00:00.000Z');
+      assert.equal(timing.claimedAt, new Date(NOW + delta).toISOString());
+      assert.equal(timing.observationToSendWarningMs, 120_000);
+      assert.equal(timing.lagWarning, delta > 120_000);
+      for (const attempt of timing.attempts) {
+        assert.equal(attempt.observationToSendLagMs, delta);
+        assert.equal(attempt.lagWarning, delta > 120_000);
+        assert.equal(attempt.sendAt, new Date(NOW + delta).toISOString());
+        assert.equal(attempt.responseAt, attempt.sendAt);
+      }
+      const status = f.producer.status().fires[0]!;
+      assert.equal(status.timing.lagWarning, delta > 120_000);
+      assert.equal(status.artifactInstalledAt, new Date(NOW + delta).toISOString());
+      assert.equal(status.timing.artifactInstalledAt, status.artifactInstalledAt);
+      const before = f.producer.status();
+      await f.producer.close(); f.reopen();
+      assert.deepEqual(f.producer.status(), before, 'all recorded milestones survive replay');
     } finally { await f.cleanup(); }
   }
-  assert.equal(MARKET_OPEN_ADMISSION_POLICY.maxObservationToSendLagMs, 120_000);
+  assert.equal(MARKET_OPEN_MONITORING_DEFAULTS.observationToSendWarningMs, 120_000);
 });
 
-test('P2 expired repair is refused without a second send; first observation is unchanged', async () => {
-  const f = fixture((response, call) => { if (call.role === 'initial') f.setClock(NOW + 120_001); return { ...response, rawText: '{}' }; });
+test('P2 configurable warning and in-flight heartbeat record sends without waiting for responses', posixOnly, async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const f = fixture(async (response) => { await held; return response; }, RESERVATION * 8, 1_000);
   try {
-    assert.equal((await f.producer.observe(observation())).state, 'failed');
-    assert.ok(f.calls.length > 0); assert.ok(f.calls.every((c) => c.role === 'initial'));
-    assert.equal(f.producer.snapshot().fires[0]?.claim.preparation.observedAt, OBSERVED);
+    f.setClock(NOW + 1_001);
+    const pending = f.producer.observe(observation());
+    await new Promise((r) => setImmediate(r));
+    const status = f.producer.status();
+    assert.equal(status.halted, null);
+    assert.equal(status.fires[0]!.timing.observationToSendWarningMs, 1_000);
+    assert.equal(status.fires[0]!.timing.lagWarning, true);
+    assert.ok(status.fires[0]!.timing.attempts.every((a) => a.sendAt === new Date(NOW + 1_001).toISOString() && a.responseAt === null));
+    release();
+    const result = await pending;
+    assert.equal(result.state, 'completed');
+    assert.equal(artifact(result.artifactPath).records.find((r: { recordType: string }) => r.recordType === 'run_meta').marketOpenTiming.observationToSendWarningMs, 1_000);
+  } finally { release(); await f.cleanup(); }
+});
+
+test('P2 slow initial response and late repair continue before first pitch with recorded lag', posixOnly, async () => {
+  const target = MARKET_OPEN_POLICY.roster[0]!.participantId;
+  const f = fixture((response, call) => {
+    if (call.role === 'initial') f.setClock(NOW + 1_200_001);
+    return call.armId === target && call.role === 'initial'
+      ? { ...response, rawText: response.rawText.replace(/"cohortId":"[^"]*"/, '"cohortId":"wrong"') } : response;
+  });
+  try {
+    const result = await f.producer.observe(observation());
+    assert.equal(result.state, 'completed');
+    assert.equal(f.calls.filter((c) => c.role === 'repair').length, 1);
+    assert.ok(f.calls.every((c) => c.timeoutMs > 1_200_001), 'transport deadline is first pitch, not an arbitrary 60 seconds');
+    const timing = f.producer.status().fires[0]!.timing;
+    const repair = timing.attempts.find((a) => a.role === 'repair')!;
+    assert.equal(repair.observationToSendLagMs, 1_200_001);
+    assert.equal(repair.lagWarning, true);
+    assert.equal(timing.firstObservedAt, OBSERVED);
+    assert.equal(f.producer.snapshot().halted, null);
   } finally { await f.cleanup(); }
 });
 
-test('P2 recovery dispatches only original unsent claims and does not restart their lag clock', async () => {
-  for (const delta of [60_000, 120_001]) {
+test('P2 recovery preserves first observation and claim time; elapsed lag is only recorded', posixOnly, async () => {
+  for (const delta of [60_000, 120_001, 1_200_001]) {
     const f = fixture();
     try {
-      const admission = f.producer.admit(observation()); assert.equal(admission.state, 'admitted');
+      assert.equal(f.producer.admit(observation()).state, 'admitted');
       await f.producer.close(); f.reopen(); f.setClock(NOW + delta);
       const [result] = await f.producer.recover();
-      assert.equal(result?.state, delta <= 120_000 ? 'completed' : 'refused');
-      assert.equal(f.calls.length, delta <= 120_000 ? MARKET_OPEN_POLICY.roster.length : 0);
-      assert.equal(f.producer.snapshot().fires[0]?.claim.preparation.observedAt, OBSERVED);
+      assert.equal(result?.state, 'completed');
+      assert.equal(f.calls.length, MARKET_OPEN_POLICY.roster.length);
+      const timing = f.producer.status().fires[0]!.timing;
+      assert.equal(timing.firstObservedAt, OBSERVED);
+      assert.equal(timing.claimedAt, OBSERVED);
+      assert.ok(timing.attempts.every((a) => a.observationToSendLagMs === delta && a.lagWarning === (delta > 120_000)));
     } finally { await f.cleanup(); }
   }
 });
 
-test('fsync crossing lag bound is rechecked at actual send: never sent evidence has zero known cost', async () => {
-  const f = fixture();
-  const original = nodeArtifactFs.syncDir;
-  try {
-    const admission = f.producer.admit(observation()); assert.equal(admission.state, 'admitted');
-    let crossed = false;
-    nodeArtifactFs.syncDir = (dir) => { original(dir); if (dir.endsWith('/journal') && !crossed) { crossed = true; f.setClock(NOW + 120_001); } };
-    const [result] = await f.producer.recover();
-    assert.equal(result?.state, 'failed'); assert.equal(f.calls.length, 0);
-    const snapshot = f.producer.snapshot(); assert.equal(snapshot.knownCostUsdMicros, 0); assert.equal(snapshot.halted, null);
-    assert.equal(snapshot.fires[0]?.attempts[0]?.costUsdMicros, 0);
-  } finally { nodeArtifactFs.syncDir = original; await f.cleanup(); }
-});
+for (const role of ['initial', 'repair'] as const) {
+  test(`P2 ${role} intent fsync crossing threshold records actual send, not the pre-fsync reading`, posixOnly, async () => {
+    const target = MARKET_OPEN_POLICY.roster[0]!.participantId;
+    const f = fixture((response, call) => role === 'repair' && call.armId === target && call.role === 'initial'
+      ? { ...response, rawText: response.rawText.replace(/"cohortId":"[^"]*"/, '"cohortId":"wrong"') } : response);
+    const original = nodeArtifactFs.syncDir;
+    try {
+      nodeArtifactFs.syncDir = (dir) => {
+        original(dir);
+        if (dir.endsWith('/journal')) {
+          const names = readdirSync(dir).filter((n) => n.endsWith('.json')).sort();
+          const operation = JSON.parse(readFileSync(join(dir, names.at(-1)!), 'utf8')).operation;
+          if (operation.type === 'begin' && operation.input.slot.role === role) f.setClock(NOW + 120_001);
+        }
+      };
+      const result = await f.producer.observe(observation());
+      assert.equal(result.state, 'completed');
+      assert.equal(f.calls.length, MARKET_OPEN_POLICY.roster.length + (role === 'repair' ? 1 : 0));
+      const snapshot = f.producer.snapshot();
+      assert.equal(snapshot.halted, null);
+      const attempt = f.producer.status().fires[0]!.timing.attempts.find((a) => a.role === role)!;
+      assert.equal(attempt.intentAt, OBSERVED);
+      assert.equal(attempt.sendAt, new Date(NOW + 120_001).toISOString());
+      assert.equal(attempt.observationToSendLagMs, 120_001);
+      assert.equal(attempt.lagWarning, true);
+      assert.ok(snapshot.knownCostUsdMicros > 0);
+    } finally { nodeArtifactFs.syncDir = original; await f.cleanup(); }
+  });
+}
 
-test('repair-intent fsync crossing the lag bound retains a zero-cost refusal, not an unknown send', async () => {
-  const target = MARKET_OPEN_POLICY.roster[0]!.participantId;
-  const f = fixture((response, call) => call.armId === target && call.role === 'initial'
-    ? { ...response, rawText: response.rawText.replace(/"cohortId":"[^"]*"/, '"cohortId":"wrong"') } : response);
+for (const role of ['initial', 'repair'] as const) {
+  test(`first pitch during ${role} intent fsync still refuses the send with known-zero evidence`, posixOnly, async () => {
+    const target = MARKET_OPEN_POLICY.roster[0]!.participantId;
+    const f = fixture((response, call) => role === 'repair' && call.armId === target && call.role === 'initial'
+      ? { ...response, rawText: response.rawText.replace(/"cohortId":"[^"]*"/, '"cohortId":"wrong"') } : response);
+    const original = nodeArtifactFs.syncDir;
+    try {
+      nodeArtifactFs.syncDir = (dir) => {
+        original(dir);
+        if (dir.endsWith('/journal')) {
+          const names = readdirSync(dir).filter((n) => n.endsWith('.json')).sort();
+          const operation = JSON.parse(readFileSync(join(dir, names.at(-1)!), 'utf8')).operation;
+          if (operation.type === 'begin' && operation.input.slot.role === role) f.setClock(Date.parse(observation().game.matchTime));
+        }
+      };
+      const result = await f.producer.observe(observation());
+      assert.equal(result.state, 'failed');
+      assert.equal(f.calls.filter((c) => c.role === role).length, 0);
+      const attempt = f.producer.snapshot().fires[0]!.attempts.find((a) => a.slot.role === role)!;
+      assert.equal(attempt.costUsdMicros, 0);
+      assert.equal((attempt.evidence as { attempt: { requestAt: null } }).attempt.requestAt, null);
+      assert.equal(f.producer.snapshot().halted, null);
+    } finally { nodeArtifactFs.syncDir = original; await f.cleanup(); }
+  });
+}
+
+test('artifact installation is a separate persisted hop, not the last send or response', posixOnly, async () => {
+  const f = fixture();
   const original = nodeArtifactFs.syncDir;
   try {
     nodeArtifactFs.syncDir = (dir) => {
       original(dir);
-      if (dir.endsWith('/journal')) {
-        const names = readdirSync(dir).filter((n) => n.endsWith('.json')).sort();
-        const operation = JSON.parse(readFileSync(join(dir, names.at(-1)!), 'utf8')).operation;
-        if (operation.type === 'begin' && operation.input.slot.role === 'repair') f.setClock(NOW + 120_001);
-      }
+      if (dir === join(f.root, 'artifacts')) f.setClock(NOW + 300_001);
     };
     const result = await f.producer.observe(observation());
-    assert.equal(result.state, 'failed');
-    assert.equal(f.calls.filter((c) => c.role === 'repair').length, 0);
-    const snapshot = f.producer.snapshot();
-    assert.equal(snapshot.halted, null);
-    const repair = snapshot.fires[0]!.attempts.find((a) => a.slot.role === 'repair')!;
-    assert.equal(repair.costUsdMicros, 0);
-    assert.equal((repair.evidence as { attempt: { requestAt: null } }).attempt.requestAt, null);
-    assert.equal(artifact(result.artifactPath).spend.kind, 'pass');
+    assert.equal(result.state, 'completed');
+    const timing = f.producer.status().fires[0]!.timing;
+    assert.equal(timing.claimedAt, OBSERVED);
+    assert.ok(timing.attempts.every((a) => a.sendAt === OBSERVED && a.responseAt === OBSERVED));
+    assert.equal(timing.artifactInstalledAt, new Date(NOW + 300_001).toISOString());
+    assert.equal(f.producer.snapshot().halted, null, 'a slow artifact install does not halt the cohort');
+    await f.producer.close(); f.reopen();
+    assert.deepEqual(f.producer.status().fires[0]!.timing, timing);
   } finally { nodeArtifactFs.syncDir = original; await f.cleanup(); }
 });
 
-test('artifact install fault cannot mark completed; restart preserves reservation and never resends', async () => {
+test('admit reports over-cap durable refusal directly without dispatch or extra reservation', posixOnly, async () => {
+  const f = fixture(undefined, RESERVATION);
+  try {
+    assert.equal(f.producer.admit(observation()).state, 'admitted');
+    const result = f.producer.admit(observation('total'));
+    assert.equal(result.state, 'refused');
+    assert.equal(result.state === 'refused' && result.reason, 'cap_exceeded');
+    assert.equal(f.producer.snapshot().reservedUsdMicros, RESERVATION);
+    assert.deepEqual(f.producer.admit(observation('total')), result);
+    assert.equal(f.calls.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test('monitoring threshold changes on replay without changing claims or admission authority', posixOnly, async () => {
+  const f = fixture(undefined, RESERVATION * 8, 10_000);
+  try {
+    f.producer.admit(observation());
+    const before = f.producer.snapshot();
+    await f.producer.close();
+    const reopened = new MarketOpenProducer({ ...f.options, observationToSendWarningMs: 20_000 });
+    try {
+      assert.deepEqual(reopened.snapshot(), before, 'monitoring changes cannot consume or replace claims');
+      assert.equal(reopened.status().fires[0]!.timing.observationToSendWarningMs, 20_000);
+      assert.equal(reopened.status().fires[0]!.timing.firstObservedAt, OBSERVED);
+    } finally { await reopened.close(); }
+    for (const warning of [-1, NaN, Infinity, 0.5]) {
+      assert.throws(() => new MarketOpenProducer({ ...f.options, observationToSendWarningMs: warning }), /warning threshold/);
+    }
+    f.reopen();
+    assert.equal(f.producer.status().fires[0]!.timing.observationToSendWarningMs, 10_000);
+  } finally { await f.cleanup(); }
+});
+
+test('artifact install fault cannot mark completed; restart preserves reservation and never resends', posixOnly, async () => {
   const f = fixture();
   const original = nodeArtifactFs.link;
   try {
@@ -287,7 +420,7 @@ test('artifact install fault cannot mark completed; restart preserves reservatio
   } finally { nodeArtifactFs.link = original; await f.cleanup(); }
 });
 
-test('single writer is enforced through producer constructor, not caller convention', async () => {
+test('single writer is enforced through producer constructor, not caller convention', posixOnly, async () => {
   const f = fixture();
   try {
     assert.throws(() => f.reopen(), /writer lock/);
@@ -295,7 +428,7 @@ test('single writer is enforced through producer constructor, not caller convent
   } finally { await f.cleanup(); }
 });
 
-test('unknown repair retains separate billable evidence and halts subsequent admission', async () => {
+test('unknown repair retains separate billable evidence and halts subsequent admission', posixOnly, async () => {
   const target = MARKET_OPEN_POLICY.roster[0]!.participantId;
   const f = fixture((response, call) => call.armId !== target ? response : call.role === 'initial'
     ? { ...response, rawText: response.rawText.replace(/"cohortId":"[^"]*"/, '"cohortId":"wrong"') }
@@ -314,7 +447,7 @@ test('unknown repair retains separate billable evidence and halts subsequent adm
 });
 
 for (const point of ['claim', 'send'] as const) {
-  test(`SIGKILL at ${point}: lock is not stolen; offline restart preserves claim and never repeats an uncertain send`, async () => {
+  test(`SIGKILL at ${point}: lock is not stolen; offline restart preserves claim and never repeats an uncertain send`, posixOnly, async () => {
     const f = fixture();
     try {
       await f.producer.close();

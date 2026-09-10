@@ -1,12 +1,12 @@
 # Market-open integration follow-ups
 
-B1 (#124) is accepted. **B2 implementation below awaits external R3; nothing is installed or enabled.** These dispositions close the B2 source/test items from [the #124 review](https://github.com/ospex-org/ospex-benchmark/pull/124#issuecomment-5613903597), not the remaining B3/B4 integration or activation gates. See [SPEC-market-open-mode.md](SPEC-market-open-mode.md) and [B2 admission contract](MARKET-OPEN-ADMISSION.md).
+B1 (#124) is accepted. **B2 received external R3 at `f52f779`; review corrections and the advisory-timing change are authorized for merge. Nothing is installed or enabled.** These dispositions close the B2 source/test items from [the #124 review](https://github.com/ospex-org/ospex-benchmark/pull/124#issuecomment-5613903597), not the remaining B3/B4 integration or activation gates. See [SPEC-market-open-mode.md](SPEC-market-open-mode.md) and [B2 admission contract](MARKET-OPEN-ADMISSION.md).
 
 ## D1 — history evidence and consumer admission (B2 implemented; B4 open)
 
 B2 adds `bundle_game.sourceOddsReference`, explicitly discriminated as `market-open-history-v1` and resolving to the same run's `run_meta.marketOpen.source`. It binds event/cohort/run/game/market, opener ID/time and source/request/game hashes. `sourceOddsRows` stays empty; it is the legacy current-odds channel, not a place to fabricate a history row. Both markets and legacy-shape preservation are tested.
 
-**B4 still required:** require the reference and immutable opener to resolve consistently; reject missing/crossed/inconsistent evidence before scoring or publication. Preserve historical replay. This PR does not enable consumer admission.
+**B4 still required:** require the reference and immutable opener to resolve consistently; reject missing/crossed/inconsistent evidence before scoring or publication. Require `mode === 'live'` and `clockMode === 'wall'`; fixture-labelled streams must not enter production. Preserve historical replay. This PR does not enable consumer admission.
 
 ## D2 — identity versus dispatch permission (B2 implemented)
 
@@ -20,9 +20,17 @@ B2 adds `bundle_game.sourceOddsReference`, explicitly discriminated as `market-o
 
 The B1 canned fixture remains known-zero and non-authorizing. `MarketOpenProducer` uses the real admission path and shared **billable** guard/pricing math in synthetic tests: initial plus repair costs, search evidence, missing initial/repair usage, missing search count, known over-cap actuals without clamping, cumulative reservation refusal, persistent halt, artifact failure, and SIGKILL/replay recovery. Attempts are durably claimed before every synthetic send. Unknown is never priced as zero; reservations are never automatically released. This proves code behavior, not actual provider invoices or production filesystem conformance.
 
-## P2 — opener age versus dispatch lag (B2 implemented; bound proposed for R3)
+## P2 — timestamps and advisory dispatch lag (B2 implemented)
 
-Proposed maximum observation-to-send lag: **120,000 ms inclusive (two minutes)**, for every initial and repair. First pitch is an independent strict cutoff. Recheck after durable attempt-intent fsync; at 120,001 ms refuse without sending. Queue/recovery uses the original persisted first observation, never a refreshed time. Refused events keep their cumulative reservation and identity. An old opener remains the reference; no current-quote age gate is imposed on its timestamp. Tests cover both sides of the lag boundary, repairs, fsync delay and recovery.
+**Timestamps, not trip wires. Monitoring, not gating.** Record opener presence (the history row's actual capture timestamp), first observation, claim, each arm's initial/repair send and response, and artifact installation. Observation-to-send lag remains on the run and `status()` heartbeat payload. Its configurable warning threshold defaults to **120,000 ms**; exceeding it records/surfaces a warning and never refuses or halts work. No lag-refusal or held-reservation-on-lag-refusal path remains. First pitch and spend caps remain hard stops; unknown spend is never permission to spend again.
+
+The actual send reading follows intent fsync. Queue/recovery preserves the original first observation and claim time and continues before first pitch regardless of elapsed lag. An old opener remains the reference; no current-quote age gate applies. Transport timeout is the remaining time to first pitch, not a fixed duration. Tests pin both threshold sides, configurable/in-flight status, late initial/repair sends, post-fsync readings, recovery and preserved first-pitch stops. Final artifact installation time lives in the completion journal/status because immutable pre-install records cannot contain their future installation time.
+
+**B4 status note:** initial hard-cutoff refusals use the shared `dispatch_lag_exceeded` arm category; repairs can retain `invalid_schema` plus the cutoff detail. Neither represents an advisory-lag refusal now. Diagnose lag using the timing fields/warnings across both roles, not just the arm's terminal category. B4 still owns service heartbeat/public status wiring.
+
+## R3 filesystem follow-up (not enforced by B2)
+
+The store rejects Windows and protects canonical local paths, but POSIX does not prove a local filesystem class. Before activation verify the evidence root is not NFS/SMB/9p/DrvFs. A future deployment-hardening change should enforce and pin supported mount types at open/replay; this PR does not claim network-filesystem detection or conformance.
 
 ## Remaining admission gates
 

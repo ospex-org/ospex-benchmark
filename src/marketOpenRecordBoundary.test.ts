@@ -81,6 +81,26 @@ test('D2 permanent identity still refuses each context mutation separately', asy
   assert.throws(() => buildRecords({ ...envelope }, context, run.build, collision), /envelope/);
 });
 
+test('D2 authenticated alternative arm models and IDs cannot replace the pinned roster', async () => {
+  const run = prepared();
+  const fixture = await runMarketOpenFixture(run);
+  for (const changedIds of [false, true]) {
+    const arms = MARKET_OPEN_POLICY.roster.map((arm, i) => i !== 0 ? arm : changedIds
+      ? { ...arm, participantId: 'foreign-arm' }
+      : { ...arm, requestedModelId: 'foreign-model' });
+    const mocks = createMockAdapters({ simulateCollision: false });
+    const adapters = new Map(arms.map((arm, i) => {
+      const original = mocks.get(MARKET_OPEN_POLICY.roster[i]!.participantId)!;
+      return [arm.participantId, { ...original, requestedModelId: arm.requestedModelId }];
+    }));
+    let clock = Date.parse(OBSERVED);
+    const envelope = await runSlate(arms, adapters, run.build.requests, {
+      ...fixture.context, baselinePolicyVersion: MARKET_OPEN_POLICY.baselinePolicyVersion, nowMs: () => clock++,
+    });
+    assert.throws(() => buildRecords(envelope, fixture.context, run.build, collision), /market-open record context does not match its prepared event/);
+  }
+});
+
 test('D3 namespace cannot be squatted or concealed by dropping provenance', async () => {
   const run = prepared();
   const fixture = await runMarketOpenFixture(run);
@@ -115,7 +135,7 @@ test('D3 legacy records retain exactly the pre-boundary game shape', async () =>
   assert.ok(!('sourceOddsReference' in bundle));
 });
 
-test('durable receipt binds a producer envelope and exact context', async () => {
+test('durable receipt binds a producer envelope and exact context', { skip: process.platform === 'win32' ? 'POSIX durability required' : false }, async () => {
   const run = prepared();
   const root = mkdtempSync(join(tmpdir(), 'market-open-boundary-'));
   const store = new MarketOpenStore({ admissionPolicySha256: 'a'.repeat(64), root, name: run.cohort.name, slateDate: run.cohort.slateDate,
@@ -156,6 +176,11 @@ test('durable receipt binds a producer envelope and exact context', async () => 
     const context: RunContext = { ...options, runId: run.provenance.runId, slateDate: run.cohort.slateDate,
       mode: 'live', clockMode: 'wall', createdAt: new Date(clock++).toISOString(),
       fetchStartedAt: OBSERVED, fetchCompletedAt: OBSERVED, marketOpen: run.provenance };
+    const mismatched = { ...envelope, results: envelope.results.map((r, i) => i !== 0 ? r :
+      { ...r, attempt: { ...r.attempt, providerResponseId: 'present-but-forged' } }) };
+    assert.throws(() => store.recordReceipt(eventId, run, mismatched), /attempt does not match durable send evidence/);
+    const omitted = { ...envelope, results: envelope.results.slice(1) };
+    assert.throws(() => store.recordReceipt(eventId, run, omitted), /omitted durable attempts/);
     const receipt = store.recordReceipt(eventId, run, envelope);
     assert.throws(() => buildRecords(envelope, context, run.build, collision), /permission/);
     assert.throws(() => authorizeMarketOpenProducerRecords(run, envelope, context, { ...receipt }), /receipt|claim/);
