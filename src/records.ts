@@ -7,6 +7,8 @@ import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
 import { runBaselines } from './baselines.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { authenticateRun } from './runner.js';
+import { assertMarketOpenRecordContext } from './marketOpen.js';
+import type { MarketOpenProvenance } from './marketOpen.js';
 import { EVIDENCE_ERA } from './providers/responseEnvelope.js';
 import { SMOKE_LABEL } from './types.js';
 import type { BuildResult } from './bundle.js';
@@ -51,6 +53,8 @@ export interface RunContext {
   clockMode: 'wall' | 'synthetic-fixture';
   /** Present on watch-mode runs only. */
   watch?: WatchProvenance | undefined;
+  /** First-class singleton event evidence; never historical WatchProvenance. */
+  marketOpen?: MarketOpenProvenance | undefined;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -170,6 +174,7 @@ export function buildRecords(
   // emitting anything. A context that disagrees on any of the five has already
   // failed closed; `bound` carries the authoritative values the records stamp.
   const bound = authenticateRun(env, ctx);
+  assertMarketOpenRecordContext(env, ctx, build);
   const { snapshot, results } = env;
   const { prepared, slate, slateSha256 } = snapshot;
   const { excluded, provenance } = build;
@@ -296,6 +301,7 @@ export function buildRecords(
       ? { baselinePolicyVersion: baselineDecisions[0]?.policyVersion }
       : {}),
     ...(ctx.watch !== undefined ? { watch: ctx.watch } : {}),
+    ...(ctx.marketOpen !== undefined ? { marketOpen: ctx.marketOpen } : {}),
   });
 
   for (const request of prepared) {
