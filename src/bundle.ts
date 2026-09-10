@@ -77,8 +77,12 @@ function evidenceRef(gameId: string, field: string): string {
 export const MAX_QUOTE_AGE_MS = 30 * 60 * 1000;
 export const FUTURE_QUOTE_SKEW_MS = 2 * 60 * 1000;
 
+/** Quote fields the scoped builder consumes; source provenance stays with its caller. */
+export type BundleQuote = Pick<CurrentOddsRow,
+  'line' | 'away_odds_american' | 'home_odds_american' | 'upstream_last_updated'>;
+
 function quoteTimestampProblem(
-  row: CurrentOddsRow,
+  row: BundleQuote,
   market: string,
   assembledAtMs: number,
 ): string | null {
@@ -140,7 +144,7 @@ export function extractProbablePitchers(row: GamesEndpointRow): ProbablePitchers
  */
 export function buildGameBundle(
   game: GamesEndpointRow,
-  odds: Map<string, CurrentOddsRow>,
+  odds: Map<string, BundleQuote>,
   assembledAtMs: number,
   requestedMarkets: Iterable<MarketKey>,
 ): GameBundleResult {
@@ -176,7 +180,7 @@ export function buildGameBundle(
     }
     if (total.line === null) return { reason: 'missing_line:total' };
   }
-  const presentRows: Array<readonly [MarketKey, CurrentOddsRow]> = [];
+  const presentRows: Array<readonly [MarketKey, BundleQuote]> = [];
   if (moneyline) presentRows.push(['moneyline', moneyline]);
   if (spread) presentRows.push(['spread', spread]);
   if (total) presentRows.push(['total', total]);

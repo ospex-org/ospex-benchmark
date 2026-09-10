@@ -1,10 +1,14 @@
-# Campaign activation — the activated contract
+# Campaign activation — retained, non-production path
 
-Status as of this document: **scheduled campaign activation is LIVE.** `campaign:tick`,
-given a live durable authorization, verified public-Git publication evidence, and a clear
-escalation latch, assembles the real tick input and dispatches under the armed caps: real
-discovery, store-arbitrated admission, billable provider adapters, durable fire artifacts.
-Everything below states the contract that holds it.
+**Status: the campaign path is set aside, NOT the production lane.** The selected
+replacement is [market-open mode](SPEC-market-open-mode.md); it is not installed
+or enabled. The full-board watch stays retired. Campaign runtime, store hardening
+(#122), and projector contracts (#123) are retained, not deleted. This document
+describes the retained campaign implementation, not permission to arm or restart it.
+
+If separately authorized, `campaign:tick` can dispatch billable provider calls under
+a live durable authorization, verified public-Git publication evidence, and a clear
+escalation latch. The implementation contract below is preserved for reference.
 
 ## The command surface
 
