@@ -7,7 +7,8 @@ import { FUTURE_QUOTE_SKEW_MS, MAX_QUOTE_AGE_MS } from './bundle.js';
 import { runBaselines } from './baselines.js';
 import { PROMPT_SCAFFOLD_VERSION, promptScaffoldSha256 } from './prompt.js';
 import { authenticateRun } from './runner.js';
-import { assertMarketOpenRecordContext } from './marketOpen.js';
+import { assertMarketOpenRecordContext, marketOpenHistoryReference } from './marketOpenRecordBoundary.js';
+import type { MarketOpenTiming } from './marketOpenProducer.js';
 import type { MarketOpenProvenance } from './marketOpen.js';
 import { EVIDENCE_ERA } from './providers/responseEnvelope.js';
 import { SMOKE_LABEL } from './types.js';
@@ -55,6 +56,8 @@ export interface RunContext {
   watch?: WatchProvenance | undefined;
   /** First-class singleton event evidence; never historical WatchProvenance. */
   marketOpen?: MarketOpenProvenance | undefined;
+  /** Advisory only; completion-journal timestamp follows immutable record installation. */
+  marketOpenTiming?: MarketOpenTiming | undefined;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -302,6 +305,7 @@ export function buildRecords(
       : {}),
     ...(ctx.watch !== undefined ? { watch: ctx.watch } : {}),
     ...(ctx.marketOpen !== undefined ? { marketOpen: ctx.marketOpen } : {}),
+    ...(ctx.marketOpen !== undefined && ctx.marketOpenTiming !== undefined ? { marketOpenTiming: ctx.marketOpenTiming } : {}),
   });
 
   for (const request of prepared) {
@@ -320,6 +324,7 @@ export function buildRecords(
       slug: request.slug,
       bundle: request.game,
       sourceOddsRows: provenance[request.gameId]?.oddsRows ?? [],
+      ...(ctx.marketOpen !== undefined ? { sourceOddsReference: marketOpenHistoryReference(ctx.marketOpen) } : {}),
     });
   }
 

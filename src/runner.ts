@@ -240,7 +240,18 @@ export function sealDispatch(prepared: readonly PreparedGameRequest[]): Dispatch
   return snapshot;
 }
 
+export interface AttemptBoundary {
+  /** Synchronous durable intent. A refusal authorizes no send. */
+  begin(arm: ArmSpec, role: 'initial' | 'repair', requestAt: string): string | null;
+  /** Recheck AFTER the durable write, at the actual send reading (no await follows). */
+  confirm(arm: ArmSpec, role: 'initial' | 'repair', requestAt: string): string | null;
+  /** Called before validation/repair, including a post-intent never-sent refusal. */
+  settled(arm: ArmSpec, role: 'initial' | 'repair', attempt: AttemptRecord): void;
+}
+
 export interface SlateRunOptions {
+  /** Producer-owned durable send boundary; legacy callers remain unchanged. */
+  attemptBoundary?: AttemptBoundary | undefined;
   cohortId: string;
   timeoutMs: number;
   /** Explicit output-token bound applied to every live call and recorded. */
@@ -348,6 +359,39 @@ interface DispatchTarget {
   readonly arm: ArmSpec;
   hasCredential(): boolean;
   chat(turns: ChatTurn[], timeoutMs: number, options?: ProviderCallOptions): Promise<ProviderResponse>;
+}
+
+/** The same chat/normalization owner for legacy and durable producers. Journal
+ * faults stay OUTSIDE timedChat's transport catch: a failed durable write is not
+ * a provider error and must stop the producer after all launched arms settle. */
+async function boundedChat(
+  target: DispatchTarget, turns: ChatTurn[], timeoutMs: number, maxOutputTokens: number,
+  nowMs: () => number, startMs: number, cutoffMs: number,
+  role: 'initial' | 'repair', boundary: AttemptBoundary | undefined,
+): Promise<Awaited<ReturnType<typeof timedChat>> & { refusedAt: string | null }> {
+  const tools = role === 'repair' ? 'none' : 'declared';
+  if (boundary === undefined) {
+    return { ...await timedChat(target, turns, timeoutMs, maxOutputTokens, nowMs, startMs, tools), refusedAt: null };
+  }
+  const started = new Date(startMs).toISOString();
+  const refusal = boundary.begin(target.arm, role, started);
+  if (refusal !== null) {
+    return { ...emptyAttempt(), errorDetail: refusal, response: null, failure: 'provider_error', refusedAt: started };
+  }
+  // fsync may have crossed first pitch. Compare and stamp this fresh reading;
+  // there is no await or further persistence between confirmation and adapter.chat.
+  const sendMs = nowMs();
+  const sendAt = new Date(sendMs).toISOString();
+  const late = sendMs >= cutoffMs ? 'at_or_after_first_pitch' : boundary.confirm(target.arm, role, sendAt);
+  if (late !== null) {
+    const neverSent = { ...emptyAttempt(), errorDetail: late };
+    boundary.settled(target.arm, role, neverSent);
+    return { ...neverSent, response: null, failure: 'provider_error', refusedAt: sendAt };
+  }
+  const result = await timedChat(target, turns, Math.min(timeoutMs, cutoffMs - sendMs), maxOutputTokens, nowMs, sendMs, tools);
+  const { response: _response, failure: _failure, ...evidence } = result;
+  boundary.settled(target.arm, role, evidence);
+  return { ...result, refusedAt: null };
 }
 
 async function timedChat(
@@ -681,20 +725,28 @@ async function dispatchArmCore(
 
   // Each request is bounded by the remaining time to cutoff. The persisted `requestAt` IS the
   // gated reading (`initialStartMs`), so the gate decision and the recorded start never disagree.
-  const attempt = await timedChat(
+  const attempt = await boundedChat(
     target,
     baseTurns,
     Math.min(options.timeoutMs, remainingAtDispatch),
     options.maxOutputTokens,
     nowMs,
     initialStartMs,
+    cutoffMs,
+    'initial',
+    options.attemptBoundary,
   );
   // The initial request has SETTLED (by response, timeout, or transport failure): free its
   // slot now — before any validation, fingerprint, or repair work — so capacity is never held
   // by this process's own bookkeeping. A release failure is a lifecycle fault: it propagates
   // and no repair begins.
   await releaseInitial();
-  const { response: firstResponse, failure: firstFailure, ...attemptRecord } = attempt;
+  const { response: firstResponse, failure: firstFailure, refusedAt, ...attemptRecord } = attempt;
+  if (refusedAt !== null) {
+    const outcome = attemptRecord.errorDetail === 'at_or_after_first_pitch' ? 'cutoff_missed'
+      : attemptRecord.errorDetail === 'observation_to_send_lag' ? 'dispatch_lag_exceeded' : 'provider_error';
+    return failed(outcome, attemptRecord, null, false, null, [], refusedAt);
+  }
   if (firstFailure !== null || firstResponse === null) {
     return failed(firstFailure ?? 'provider_error', attemptRecord, null, false, null, []);
   }
@@ -856,17 +908,21 @@ async function dispatchArmCore(
       'repair not dispatched: decision cutoff passed at repair start',
     ]);
   }
-  const repair = await timedChat(
+  const repair = await boundedChat(
     target,
     repairTurns,
     Math.min(options.timeoutMs, remainingMs, remainingAtRepairStart),
     options.maxOutputTokens,
     nowMs,
     repairStartMs,
-    // Format-only: the repair carries NO declared tools, so it cannot search.
-    'none',
+    cutoffMs,
+    'repair',
+    options.attemptBoundary,
   );
-  const { response: repairResponse, failure: repairFailure, ...repairRecord } = repair;
+  const { response: repairResponse, failure: repairFailure, refusedAt: repairRefusedAt, ...repairRecord } = repair;
+  if (repairRefusedAt !== null) {
+    return failed('invalid_schema', attemptRecord, repairRecord, false, null, [...firstValidation.errors, repairRecord.errorDetail ?? 'repair refused']);
+  }
   if (repairFailure !== null || repairResponse === null) {
     // Transport outcome recorded separately: a throttled/failed repair is
     // never readable as a schema failure alone.
@@ -1072,9 +1128,8 @@ export async function runSlate(
     // pre-existing `Promise.all` rejection identity AND timing. Routing it through the
     // canonical helper to share code would silently make a legacy caller wait for a slow
     // sibling and change the error it sees.
-    const results = await Promise.all(
-      targets.map((target) => dispatchArm(target, request, options, null, null, 0)),
-    );
+    const tasks = targets.map((target) => dispatchArm(target, request, options, null, null, 0));
+    const results = await (options.attemptBoundary === undefined ? Promise.all(tasks) : settleAllArms(tasks));
     all.push(...results);
     if (options.onGameComplete) {
       const cells = results
