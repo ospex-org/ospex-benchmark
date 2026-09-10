@@ -132,8 +132,10 @@ export function prepareMarketOpenRun(input: {
   if (opener === undefined) return refuse('opener_missing');
   if (opener.captured_at_ms > observedMs) return refuse('opener_future');
   // Adapt only the builder's quote INPUT vocabulary, never claim this is a
-  // current_odds observation. Builder freshness is checked at the opener instant;
-  // provenance below retains the history row and real, separate observation time.
+  // current_odds observation. Assembly at the opener instant deliberately makes
+  // quote age zero: current-quote freshness is NOT an opener-age limit, even for
+  // old openers. Future/first-pitch bounds above still apply; B2 owns observation-
+  // to-send lag. Retain the history timestamp and separate real observation time.
   const quote: BundleQuote = {
     line: opener.line,
     away_odds_american: opener.away_odds_american, home_odds_american: opener.home_odds_american,

@@ -38,6 +38,7 @@ export async function runMarketOpenFixture(run: PreparedMarketOpenRun) {
       participantId: r.arm.participantId, provider: r.arm.provider,
       requestedModelId: r.arm.requestedModelId,
       // Proven by this closed composition, not a caller-supplied billing flag.
+      // A known-zero verdict checks wiring, not billable usage/cap enforcement.
       billingClass: 'known-zero' as const, attempt: r.attempt, repair: r.repair,
     })),
     priceVersion: MARKET_OPEN_POLICY.priceVersion,

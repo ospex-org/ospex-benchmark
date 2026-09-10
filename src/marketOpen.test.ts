@@ -5,7 +5,9 @@ import { canonicalize, sha256Hex } from './canonical.js';
 import { buildGameRequest } from './scopedRequest.js';
 import { prepareGameRequest } from './preparedRequest.js';
 import { MARKET_POLICY_DIGEST } from './marketPolicy.js';
+import { createMockAdapters } from './mock.js';
 import { buildRecords } from './records.js';
+import { authenticateRun, runSlate } from './runner.js';
 import {
   createMarketOpenCohort,
   MARKET_OPEN_POLICY,
@@ -61,7 +63,43 @@ test('market-open policy has a distinct frozen namespace and shared scoped polic
   assert.notEqual(cohort().cohortId, createMarketOpenCohort({ name: 'other', slateDate: '2026-09-10' }).cohortId);
 });
 
+test('rejects handmade cohorts even with a valid policy digest or a legacy-watch ID', () => {
+  const legitimate = cohort();
+  for (const cohortId of [legitimate.cohortId, 'watch-v0-2026-09-10']) {
+    const forged = { name: legitimate.name, slateDate: legitimate.slateDate,
+      policySha256: legitimate.policySha256, cohortId };
+    assert.throws(() => prepareMarketOpenRun({ ...input(), cohort: forged }), /market-open cohort was not created by this policy/);
+  }
+});
+
+test('market-open v1 policy and cohort identity have explicit golden pins', () => {
+  // A policy/roster/prompt/price change requires an intentional identity review,
+  // not automatic regeneration of this pin to make a failing test pass.
+  const digest = '063596c704c034036d727e93f356436995639608aae8575fa36ab9f5c4a9ce51';
+  assert.equal(cohort().policySha256, digest);
+  assert.equal(prepared().provenance.policySha256, digest);
+  assert.equal(cohort().cohortId, `market-open-v1-b1-fixture-2026-09-10-${digest}`);
+});
+
+test('market-open v1 reservation pins the shared four-arm initial-plus-repair budget', () => {
+  // Four arms, one initial plus one repair, fixed-attempt-v1 USD-micros.
+  // This is a conservative reservation, not measured usage or provider invoices.
+  assert.equal(prepared().provenance.reservationUsdMicros, 800_000_000);
+});
+
 for (const market of ['moneyline', 'total'] as const) {
+  test(`${market} keeps an immutable opener older than two hours as its reference`, () => {
+    const capturedAt = '2026-09-10T11:00:00+00:00';
+    assert.ok(Date.parse(OBSERVED) - Date.parse(capturedAt) > 2 * 60 * 60 * 1_000);
+    const result = prepareMarketOpenRun({ ...input(market), historyRows: [{ ...opener(market), captured_at: capturedAt }] });
+    assert.equal(result.state, 'prepared');
+    if (result.state !== 'prepared') return;
+    assert.equal(result.run.provenance.source.openedAt, capturedAt);
+    assert.equal(result.run.provenance.observedAt, OBSERVED);
+    assert.equal(result.run.provenance.source.row.captured_at, capturedAt);
+    assert.deepEqual(Object.keys(result.run.request.game.markets), [market]);
+  });
+
   test(`${market} opens independently with exactly its own forecast scope`, () => {
     const run = prepared(market);
     assert.deepEqual(Object.keys(run.request.game.markets), [market]);
@@ -93,7 +131,12 @@ test('identity is cohort/game/market, not observation time or opener payload', (
 
 test('first history opener retains source id, exact time and canonical row hash independently of observation', () => {
   const raw = input();
-  raw.historyRows = [{ ...opener(), id: 20, captured_at: '2026-09-10T14:03:00Z' }, opener()];
+  // Earliest is in the middle: neither first nor last input position is correct.
+  raw.historyRows = [
+    { ...opener(), id: 20, captured_at: '2026-09-10T14:03:00Z' },
+    opener(),
+    { ...opener(), id: 30, captured_at: '2026-09-10T14:04:00Z' },
+  ];
   const result = prepareMarketOpenRun(raw);
   assert.equal(result.state, 'prepared');
   if (result.state !== 'prepared') return;
@@ -109,8 +152,30 @@ test('first history opener retains source id, exact time and canonical row hash 
   assert.ok(!('boardCompletedAt' in p));
 });
 
+test('equal-instant opener ties use the lowest row ID regardless of input ordering', () => {
+  const winner = opener();
+  const tied = { ...opener(), id: 12 };
+  const later = { ...opener(), id: 1, captured_at: '2026-09-10T14:03:00Z' };
+  for (const historyRows of [[winner, tied, later], [tied, winner, later], [later, tied, winner]]) {
+    const result = prepareMarketOpenRun({ ...input(), historyRows });
+    assert.equal(result.state, 'prepared');
+    if (result.state !== 'prepared') continue;
+    assert.equal(result.run.provenance.source.openerId, 11);
+    assert.equal(result.run.provenance.source.openedAt, OPENED);
+  }
+});
+
+test('opener captured exactly at observation is eligible', () => {
+  const result = prepareMarketOpenRun({ ...input(), historyRows: [{ ...opener(), captured_at: OBSERVED }] });
+  assert.equal(result.state, 'prepared');
+  if (result.state !== 'prepared') return;
+  assert.equal(result.run.provenance.source.openedAt, OBSERVED);
+  assert.equal(result.run.provenance.observedAt, OBSERVED);
+});
+
 const refusals = [
   ['disabled spread', () => input('spread'), 'market_disabled'],
+  ['wrong slate date', () => ({ ...input(), cohort: createMarketOpenCohort({ name: 'b1-fixture', slateDate: '2026-09-11' }) }), 'wrong_slate_date'],
   ['missing opener', () => ({ ...input(), historyRows: [] }), 'opener_missing'],
   ['unready opener', () => ({ ...input(), historyRows: [{ ...opener(), home_odds_american: null }] }), 'opener_missing'],
   ['future opener', () => ({ ...input(), historyRows: [{ ...opener(), captured_at: '2026-09-10T14:05:00.001Z' }] }), 'opener_future'],
@@ -160,6 +225,7 @@ for (const market of ['moneyline', 'total'] as const) {
       const result = await runMarketOpenFixture(run);
       assert.equal(result.context.mode, 'dry-run');
       assert.equal(result.context.clockMode, 'synthetic-fixture');
+      // Known-zero mocks prove wiring only, not billable cost/over-cap enforcement.
       assert.equal(result.spend.kind, 'pass');
       const types = new Set(result.records.map((r) => r['recordType']));
       for (const type of ['run_meta', 'bundle_game', 'arm_game_response', 'decision', 'baseline_decision']) assert.ok(types.has(type), type);
@@ -169,6 +235,9 @@ for (const market of ['moneyline', 'total'] as const) {
       assert.equal(meta['cohortId'], run.cohort.cohortId);
       assert.ok(!('watch' in meta));
       const bundle = result.records.find((r) => r['recordType'] === 'bundle_game')!;
+      // History evidence is in run_meta.marketOpen.source, not current_odds rows.
+      assert.deepEqual(bundle['sourceOddsRows'], []);
+      assert.equal(bundle['runId'], meta['runId']);
       assert.equal(bundle['requestSha256'], run.request.requestSha256);
       assert.equal(bundle['gameSha256'], run.request.gameSha256);
       for (const r of result.records.filter((r) => r['recordType'] === 'baseline_decision' || r['recordType'] === 'decision')) assert.equal(r['market'], market);
@@ -189,6 +258,22 @@ for (const market of ['moneyline', 'total'] as const) {
       assert.throws(() => buildRecords(result.envelope, { ...result.context, mode: 'live' }, run.build, collision), /market.open/);
       assert.throws(() => buildRecords(result.envelope, { ...result.context, runId: 'wrong' }, run.build, collision), /market.open/);
       assert.throws(() => buildRecords(result.envelope, result.context, prepared(market === 'total' ? 'moneyline' : 'total').build, collision), /market.open/);
+      // Isolate each observation pin; changing one must not hide behind the other.
+      for (const field of ['fetchStartedAt', 'fetchCompletedAt'] as const) {
+        for (const timestamp of [OPENED, '2026-09-10T14:06:00Z']) {
+          assert.throws(() => buildRecords(result.envelope, { ...result.context, [field]: timestamp }, run.build, collision), /market-open record context/);
+        }
+      }
+      // A genuinely branded subset envelope passes shared authentication, but is
+      // not this policy's roster. A forged envelope would test the wrong guard.
+      let clock = Date.parse(OBSERVED);
+      const subset = await runSlate(
+        MARKET_OPEN_POLICY.roster.slice(0, 1), createMockAdapters({ simulateCollision: false }),
+        run.build.requests, { ...result.context, nowMs: () => clock++ },
+      );
+      assert.equal(subset.results.length, 1);
+      assert.doesNotThrow(() => authenticateRun(subset, result.context));
+      assert.throws(() => buildRecords(subset, result.context, run.build, collision), /market-open record context/);
     } finally { globalThis.fetch = previousFetch; }
   });
 }

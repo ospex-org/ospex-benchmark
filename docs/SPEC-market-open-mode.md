@@ -18,6 +18,9 @@ singleton market. Preserve the **actual history opener**: row ID, exact source
 timestamp, prices/line, and canonical hash, separately from observation and model
 request/response times. Never substitute current odds, invent sibling blocks,
 refresh source timestamps, or relabel `boardCompletedAt` as opener evidence.
+An old opener remains the reference: B1 has no maximum opener age; B2 bounds
+observation-to-send lag. [Integration gates](MARKET-OPEN-FOLLOWUPS.md) cover history
+record references, validator ownership, and known-zero versus billable spend.
 Bind game, market, policy, request, claim, and run. Cohorts use the new
 **`market-open-v1` namespace**, never `watch-v0`; historical runs retain their method.
 
