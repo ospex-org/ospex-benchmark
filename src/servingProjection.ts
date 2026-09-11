@@ -2,6 +2,7 @@ import { PROJECTION_SCALES, quantizeForProjection } from './projectionNumeric.js
 import { participantFacts, projectionParticipant } from './servingIdentity.js';
 import { baselineDigest, decisionDigest, forecastDigest, suppliedMarkets } from './schema.js';
 import { sha256Hex } from './canonical.js';
+import { hasMarketOpenProvenance, MARKET_OPEN_SQL_PUBLICATION_BLOCKED } from './marketOpenPublication.js';
 import { describeError } from './config.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
 import type { AxisName, AxesScores, GameBundle, MarketKey } from './types.js';
@@ -269,6 +270,7 @@ const NETWORKS: readonly string[] = ['polygon', 'amoy'];
  */
 export function publishableRun(records: readonly JsonRecord[]): RunGate {
   const no = (reason: string): RunGate => ({ publishable: false, reason });
+  if (records.some(hasMarketOpenProvenance)) return no(MARKET_OPEN_SQL_PUBLICATION_BLOCKED);
 
   const meta = typed(records, 'run_meta')[0];
   if (meta === undefined) return no('the artifact carries no run_meta record');

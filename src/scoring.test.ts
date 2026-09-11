@@ -44,6 +44,23 @@ import type { MarketStats, ScoredPick } from './scoring.js';
 import type { BenchmarkServingPort } from './servingStore.js';
 import type { ClosingLineRow, GameBundle, SlateBundle } from './types.js';
 
+test('market-open provenance cannot opt into legacy scoring without completed evidence', () => {
+  const { lines } = fixtureRun();
+  const original = parseRunRecords(lines);
+  assert.deepEqual(verifyRunIntegrity(original, { expectedArms: FIXTURE_ARMS }), []);
+  const tagged = lines.map((line) => {
+    const record = JSON.parse(line);
+    if (record.recordType === 'run_meta') {
+      record.marketOpen = { version: 'market-open-v1' };
+      record.clockMode = 'wall';
+    }
+    return JSON.stringify(record);
+  });
+  const run = parseRunRecords(tagged);
+  assert(verifyRunIntegrity(run, { expectedArms: FIXTURE_ARMS }).some((v) => v.includes('market-open')));
+  assert.throws(() => scoreRun(run, [], TEST_LADDER), /market-open/);
+});
+
 // Fixture ladder parameter: the real committed k so ladder goldens are
 // stable, threaded explicitly like the CLI threads the loaded artifact.
 const TEST_LADDER = { k: 8.101061957791782, parameterVersion: 'TOTALS_V1_PROVISIONAL' };

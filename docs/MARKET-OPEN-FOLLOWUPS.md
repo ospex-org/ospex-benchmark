@@ -2,6 +2,8 @@
 
 B1 (#124) is accepted. **B2 received external R3 at `f52f779`; review corrections and the advisory-timing change are authorized for merge. Nothing is installed or enabled.** These dispositions close the B2 source/test items from [the #124 review](https://github.com/ospex-org/ospex-benchmark/pull/124#issuecomment-5613903597), not the remaining B3/B4 integration or activation gates. See [SPEC-market-open-mode.md](SPEC-market-open-mode.md) and [B2 admission contract](MARKET-OPEN-ADMISSION.md).
 
+**B4 sequence (source-only):** the operator authorized three PRs after the serving schema conflict was verified: benchmark discovery/scoring with SQL publication explicitly blocked; indexer attempt/timing schema prerequisite; then MVE scheduler/reveals/serving plus replay and actual anonymous FE-view readback. See [B4.1 scoring contract](MARKET-OPEN-SCORING.md). No activation or public-readback claim is implied by this first PR.
+
 ## D1 — history evidence and consumer admission (B2 implemented; B4 open)
 
 B2 adds `bundle_game.sourceOddsReference`, explicitly discriminated as `market-open-history-v1` and resolving to the same run's `run_meta.marketOpen.source`. It binds event/cohort/run/game/market, opener ID/time and source/request/game hashes. `sourceOddsRows` stays empty; it is the legacy current-odds channel, not a place to fabricate a history row. Both markets and legacy-shape preservation are tested.
@@ -31,6 +33,35 @@ The actual send reading follows intent fsync. Queue/recovery preserves the origi
 ## R3 filesystem follow-up (not enforced by B2)
 
 The store rejects Windows and protects canonical local paths, but POSIX does not prove a local filesystem class. Before activation verify the evidence root is not NFS/SMB/9p/DrvFs. A future deployment-hardening change should enforce and pin supported mount types at open/replay; this PR does not claim network-filesystem detection or conformance.
+
+## B4 third PR — bounded publisher no-change exit
+
+Scope added after the accepted Supabase I/O investigation: in **ospex-mve serving**,
+return early when no relevant input changed since the last successfully published
+watermark, **before** rebuilding source/key/version/latest/aggregate working sets.
+Caller-side or function-side is permitted; a function-side change is a migration
+for the operator to apply, not permission for an agent to execute production SQL.
+This is a narrow no-change fast path, **not** a full incremental publisher redesign.
+
+- The watermark/change boundary must cover every input that can change the existing
+  ledger or aggregates, including new evidence, late scoring/corrections, repairs,
+  statuses and publication versions. A max game/creation timestamp alone is not
+  proof of no change. Preserve append-only versions and historical/as-of semantics.
+- Advance durable publication state only after successful publication; failures
+  must remain retryable. Inputs arriving during a publication must still be seen
+  on the next invocation. Missing/uncertain watermark takes the existing full path.
+- Synthetic regressions: unchanged second invocation performs no working-set
+  rebuild and no append; new evidence and a late correction each force the old
+  publication path; failed publication retries; racing input is not lost. Prove
+  replay equivalence and actual anonymous FE-view readback as already required.
+- This is change detection, not freshness gating: timestamps remain monitoring
+  labels. Never skip a changed completed run because it is old.
+
+Operational containment is separate: the operator moved compute from Micro to
+Small and authorized an hourly publisher timer while the benchmark is paused.
+Use the next 24-hour observability graphs as the monitoring signal; no I/O root
+cause is claimed by the capacity/cadence changes. No pruning, VACUUM FULL, new
+indexes, support ticket or automatic activation belongs to this scope.
 
 ## Remaining admission gates
 

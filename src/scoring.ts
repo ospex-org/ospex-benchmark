@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import { hasMarketOpenProvenance } from './marketOpenPublication.js';
+import { assertMarketOpenRecords } from './marketOpenEvidence.js';
+import type { MarketOpenRunEvidence } from './marketOpenEvidence.js';
+import { MARKET_OPEN_POLICY } from './marketOpen.js';
+import { marketOpenTimingForPick } from './marketOpenScoreTiming.js';
 import { BASELINE_POLICY_VERSION, isBaselinePolicyVersion, runBaselines } from './baselines.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { PROPORTIONAL_DEVIG_METHOD, scoreDecision, SHIN_DEVIG_METHOD } from './clv.js';
@@ -155,6 +160,9 @@ const runMetaSchema = z
     cohortId: z.string().min(1),
     label: z.string().min(1),
     mode: z.string().min(1),
+    clockMode: z.string().min(1).optional(),
+    marketOpen: z.unknown().optional(),
+    marketOpenTiming: z.unknown().optional(),
     slateDate: z.string().min(1),
     slateSha256: z.string().min(1),
     bundleTimestamp: z.string().min(1),
@@ -576,6 +584,11 @@ export interface SourceRun {
   cohortId: string;
   label: string;
   mode: string;
+  clockMode?: string | null;
+  marketOpen?: unknown;
+  marketOpenTiming?: unknown;
+  marketOpenEvidence?: MarketOpenRunEvidence | undefined;
+  sourceRecords?: readonly Record<string, unknown>[];
   slateDate: string;
   slateSha256: string;
   bundleTimestamp: string;
@@ -621,7 +634,10 @@ function parseRecordLine(trimmed: string, lineNumber: number): { recordType?: un
   }
 }
 
-export function parseRunRecords(lines: string[]): SourceRun {
+export function parseRunRecords(
+  lines: string[], options?: { marketOpenEvidence?: MarketOpenRunEvidence | undefined },
+): SourceRun {
+  const sourceRecords: Record<string, unknown>[] = [];
   let meta: z.infer<typeof runMetaSchema> | null = null;
   const games = new Map<string, SourceGame>();
   const picks: SourcePick[] = [];
@@ -635,6 +651,7 @@ export function parseRunRecords(lines: string[]): SourceRun {
     const trimmed = line.trim();
     if (trimmed === '') continue;
     const record = parseRecordLine(trimmed, lineNumber);
+    sourceRecords.push(record as Record<string, unknown>);
     switch (record.recordType) {
       case 'run_meta':
         if (meta !== null) {
@@ -850,11 +867,16 @@ export function parseRunRecords(lines: string[]): SourceRun {
   if (games.size === 0) {
     throw new Error('run file has no bundle_game records — nothing to score against');
   }
-  return {
+  const run: SourceRun = {
     runId: meta.runId,
     cohortId: meta.cohortId,
     label: meta.label,
     mode: meta.mode,
+    clockMode: meta.clockMode ?? null,
+    marketOpen: meta.marketOpen ?? null,
+    marketOpenTiming: meta.marketOpenTiming ?? null,
+    marketOpenEvidence: options?.marketOpenEvidence,
+    sourceRecords,
     slateDate: meta.slateDate,
     slateSha256: meta.slateSha256,
     bundleTimestamp: meta.bundleTimestamp,
@@ -873,6 +895,30 @@ export function parseRunRecords(lines: string[]): SourceRun {
     runFailures,
     identities,
   };
+  if (isMarketOpenSourceRun(run)) marketOpenBindings.set(run, marketOpenBinding(run));
+  return run;
+}
+
+// Keep the parsed representation tied to its verified records. A later edit to
+// a parsed decision must not borrow the unchanged artifact's evidence context.
+const marketOpenBindings = new WeakMap<SourceRun, string>();
+function marketOpenBinding(run: SourceRun): string {
+  const { marketOpenEvidence: _evidence, sourceRecords: _records, ...fields } = run;
+  return canonicalize({ ...fields, games: [...run.games] });
+}
+export function isMarketOpenSourceRun(run: SourceRun): boolean {
+  return hasMarketOpenProvenance(run);
+}
+function marketOpenViolations(run: SourceRun): string[] {
+  if (!isMarketOpenSourceRun(run)) return [];
+  try {
+    if (run.mode !== 'live' || run.clockMode !== 'wall') throw new Error('market-open scoring requires live mode and wall clock');
+    assertMarketOpenRecords(run.sourceRecords ?? [], run.marketOpenEvidence);
+    if (marketOpenBindings.get(run) !== marketOpenBinding(run)) throw new Error('market-open parsed run differs from its evidence');
+    return [];
+  } catch (error) {
+    return [`market-open evidence: ${error instanceof Error ? error.message : String(error)}`];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -979,7 +1025,7 @@ export function verifyRunIntegrity(
   run: SourceRun,
   options?: { expectedArms?: ExpectedArm[] },
 ): string[] {
-  const violations: string[] = [];
+  const violations: string[] = marketOpenViolations(run);
   // Archived bodies re-validate under the response-schema era THIS run was
   // produced in (see responseSchemaVersionForRun) — never the current-only
   // default, which is the new-run gate.
@@ -2316,6 +2362,10 @@ export function scoreRun(
   closeRows: ClosingLineRow[],
   ladderParams: LadderParams,
 ): ScoredPick[] {
+  if (isMarketOpenSourceRun(run)) {
+    const violations = verifyRunIntegrity(run);
+    if (violations.length) throw new Error(`market-open run integrity: ${violations.join('; ')}`);
+  }
   const closes = closesByKey(closeRows);
   return run.picks.map((pick) => {
     const game = run.games.get(pick.gameId);
@@ -2911,6 +2961,10 @@ export function scoredRecords(
   scoredAt: string,
   ladderParams: LadderParams,
 ): Array<Record<string, unknown>> {
+  if (isMarketOpenSourceRun(run)) {
+    const violations = verifyRunIntegrity(run);
+    if (violations.length) throw new Error(`market-open run integrity: ${violations.join('; ')}`);
+  }
   const records: Array<Record<string, unknown>> = [];
   records.push({
     recordType: 'scored_run_meta',
@@ -2926,6 +2980,21 @@ export function scoredRecords(
     slateDate: run.slateDate,
     slateSha256: run.slateSha256,
     sourceMode: run.mode,
+    sourceClockMode: run.clockMode ?? null,
+    ...(run.marketOpenEvidence === undefined ? {} : { marketOpen: {
+      ...run.marketOpenEvidence.prepared.provenance,
+      artifactSha256: run.marketOpenEvidence.artifactSha256,
+      timing: run.marketOpenTiming,
+      artifactInstalledAt: run.marketOpenEvidence.fire.artifactInstalledAt,
+      status: run.marketOpenEvidence.fire.status, reason: run.marketOpenEvidence.fire.reason,
+      cost: { version: 'market-open-scored-cost-v1', priceVersion: MARKET_OPEN_POLICY.priceVersion,
+        knownCostUsdMicros: run.marketOpenEvidence.fire.knownCostUsdMicros,
+        attempts: run.marketOpenEvidence.fire.attempts.map((attempt) => ({
+          armId: attempt.slot.armId, role: attempt.slot.role, ordinal: attempt.slot.ordinal,
+          costUsdMicros: attempt.costUsdMicros,
+        })),
+      },
+    } }),
     scoredAt,
     scoringPolicyVersion: SCORING_POLICY_VERSION,
     integrityVerified: true,
@@ -3021,6 +3090,7 @@ export function scoredRecords(
     const game = run.games.get(pick.gameId);
     records.push({
       recordType: 'scored_decision',
+      ...(run.marketOpenEvidence === undefined ? {} : { marketOpenTiming: marketOpenTimingForPick(run.marketOpenEvidence, pick) }),
       label: run.label,
       runId: run.runId,
       scoredAt,
