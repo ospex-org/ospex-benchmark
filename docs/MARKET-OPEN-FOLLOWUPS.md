@@ -34,6 +34,35 @@ The actual send reading follows intent fsync. Queue/recovery preserves the origi
 
 The store rejects Windows and protects canonical local paths, but POSIX does not prove a local filesystem class. Before activation verify the evidence root is not NFS/SMB/9p/DrvFs. A future deployment-hardening change should enforce and pin supported mount types at open/replay; this PR does not claim network-filesystem detection or conformance.
 
+## B4 third PR — bounded publisher no-change exit
+
+Scope added after the accepted Supabase I/O investigation: in **ospex-mve serving**,
+return early when no relevant input changed since the last successfully published
+watermark, **before** rebuilding source/key/version/latest/aggregate working sets.
+Caller-side or function-side is permitted; a function-side change is a migration
+for the operator to apply, not permission for an agent to execute production SQL.
+This is a narrow no-change fast path, **not** a full incremental publisher redesign.
+
+- The watermark/change boundary must cover every input that can change the existing
+  ledger or aggregates, including new evidence, late scoring/corrections, repairs,
+  statuses and publication versions. A max game/creation timestamp alone is not
+  proof of no change. Preserve append-only versions and historical/as-of semantics.
+- Advance durable publication state only after successful publication; failures
+  must remain retryable. Inputs arriving during a publication must still be seen
+  on the next invocation. Missing/uncertain watermark takes the existing full path.
+- Synthetic regressions: unchanged second invocation performs no working-set
+  rebuild and no append; new evidence and a late correction each force the old
+  publication path; failed publication retries; racing input is not lost. Prove
+  replay equivalence and actual anonymous FE-view readback as already required.
+- This is change detection, not freshness gating: timestamps remain monitoring
+  labels. Never skip a changed completed run because it is old.
+
+Operational containment is separate: the operator moved compute from Micro to
+Small and authorized an hourly publisher timer while the benchmark is paused.
+Use the next 24-hour observability graphs as the monitoring signal; no I/O root
+cause is claimed by the capacity/cadence changes. No pruning, VACUUM FULL, new
+indexes, support ticket or automatic activation belongs to this scope.
+
 ## Remaining admission gates
 
 - **B3:** execution intent extraction requires exact completed claim/run/market/source/accepted decision, with existing stake, first-pitch, line, liquidity and receipt safety unchanged.

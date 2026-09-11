@@ -4,8 +4,11 @@
 export const MARKET_OPEN_SQL_PUBLICATION_BLOCKED =
   'market-open SQL publication is blocked pending the serving-schema migration (attempt grain and timing columns)';
 
-export function hasMarketOpenProvenance(record: Record<string, unknown>): boolean {
-  return record.marketOpen != null || record.marketOpenTiming != null
+export function hasMarketOpenProvenance(record: {
+  runId?: unknown; cohortId?: unknown; marketOpen?: unknown;
+  marketOpenTiming?: unknown; marketOpenEvidence?: unknown;
+}): boolean {
+  return record.marketOpen != null || record.marketOpenTiming != null || record.marketOpenEvidence !== undefined
     || (typeof record.runId === 'string' && record.runId.startsWith('market-open-'))
     || (typeof record.cohortId === 'string' && record.cohortId.startsWith('market-open-'));
 }

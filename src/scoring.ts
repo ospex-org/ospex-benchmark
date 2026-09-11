@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { hasMarketOpenProvenance } from './marketOpenPublication.js';
 import { assertMarketOpenRecords } from './marketOpenEvidence.js';
 import type { MarketOpenRunEvidence } from './marketOpenEvidence.js';
 import { MARKET_OPEN_POLICY } from './marketOpen.js';
@@ -906,8 +907,7 @@ function marketOpenBinding(run: SourceRun): string {
   return canonicalize({ ...fields, games: [...run.games] });
 }
 export function isMarketOpenSourceRun(run: SourceRun): boolean {
-  return run.runId.startsWith('market-open-') || run.cohortId.startsWith('market-open-')
-    || run.marketOpen != null || run.marketOpenTiming != null || run.marketOpenEvidence !== undefined;
+  return hasMarketOpenProvenance(run);
 }
 function marketOpenViolations(run: SourceRun): string[] {
   if (!isMarketOpenSourceRun(run)) return [];

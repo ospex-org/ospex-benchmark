@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { hasMarketOpenProvenance } from './marketOpenPublication.js';
 import { canonicalize } from './canonical.js';
 import { assertMarketOpenRecords, discoverMarketOpenRuns, readMarketOpenRun } from './marketOpenEvidence.js';
 import type { MarketOpenRunEvidence } from './marketOpenEvidence.js';
@@ -17,9 +18,7 @@ export function readRunArtifactFile(path: string, options?: { marketOpenEvidence
     return { text: evidence.records.map((r) => canonicalize(r)).join('\n') + '\n', marketOpenEvidence: evidence };
   }
   const records = text.split(/\r?\n/).filter((line) => line.trim() !== '').map((line) => JSON.parse(line) as Record<string, unknown>);
-  const marketOpen = records.some((r) => r.marketOpen != null || r.marketOpenTiming != null
-    || (typeof r.runId === 'string' && r.runId.startsWith('market-open-'))
-    || (typeof r.cohortId === 'string' && r.cohortId.startsWith('market-open-')));
+  const marketOpen = records.some(hasMarketOpenProvenance);
   if (!marketOpen) return { text };
   if (root === undefined) throw new Error('market-open input requires --evidence-root');
   const runId = records.find((r) => r.recordType === 'run_meta')?.runId;

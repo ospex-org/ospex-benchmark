@@ -76,6 +76,27 @@ Market-open scoring requires an output directory **outside the evidence root**;
 existing symlink ancestors are resolved before accepting the destination. A score
 pass must not write derived artifacts into the producer's immutable input root.
 Discovery itself is offline, read-only and silent for an empty initialized root.
+
+### Root compatibility and input contract
+
+B4.1 accepts **exactly one store root**, not a parent directory of stores. Its
+shared B2 replay requires `config.root === resolve(evidenceRoot)`, so copying or
+moving a store fails closed. B3's Python reader also accepts a parent of stores
+and can resolve a relocated copy within its supplied root. These interfaces are
+not interchangeable: B4's third PR must explicitly enumerate concrete store roots
+for benchmark scoring and reconcile portability before wiring one setting to both
+consumers. Do not repair journal/config paths in place or weaken hash checks.
+
+The wrapper's top-level shape, record types and cardinalities are closed. Individual
+record identity checks validate the expected **subset** of fields, allowing extra
+record fields inside the hash-verified bytes; this is not a claim of closed record
+schemas. Loader, scorer and publication share the same provenance-marker predicate,
+including an in-memory evidence marker, so marker-only input cannot downgrade to
+legacy publication.
+
+A `score --publish` failure can leave successfully written scored files: SQL refusal
+happens after scoring/output and before opening a serving connection. A caller must
+not interpret exit 1 as “nothing happened” or blindly re-score on every retry.
 The real score command still uses the existing closing-lines read path; tests
 inject synthetic closes and never contact it.
 

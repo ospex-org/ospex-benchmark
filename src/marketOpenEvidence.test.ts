@@ -1,5 +1,11 @@
 import assert from 'node:assert/strict';
-import { readdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, statSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { MarketOpenStore, readMarketOpenStore } from './marketOpenStore.js';
+import { MARKET_OPEN_POLICY } from './marketOpen.js';
+import { deriveConservativeActualUsdMicros } from './conservativeSpend.js';
+import { computeFireSpendGuard } from './spendGuard.js';
+import { spendReservationPolicyForVersion } from './spendReservationPolicy.js';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
@@ -24,10 +30,10 @@ function rechain(entries: ReturnType<typeof journal>): void {
     writeFileSync(path, canonicalize({ ...body, sha256 })); previous = sha256;
   }
 }
-function rewriteArtifact(root: string, path: string, edit: (doc: Json) => void): void {
-  const doc = JSON.parse(readFileSync(path, 'utf8')) as Json; edit(doc);
-  const bytes = canonicalize(doc) + '\n'; writeFileSync(path, bytes);
+function rewriteArtifact(root: string, path: string, edit: (doc: Json, entries: ReturnType<typeof journal>) => void): void {
   const entries = journal(root);
+  const doc = JSON.parse(readFileSync(path, 'utf8')) as Json; edit(doc, entries);
+  const bytes = canonicalize(doc) + '\n'; writeFileSync(path, bytes);
   for (const { row } of entries) if (row.operation.type === 'complete' && row.operation.artifact.path === path) {
     row.operation.artifact.sha256 = sha256Hex(bytes);
   }
@@ -111,5 +117,131 @@ test('market-open evidence is read-only under the active writer and cannot be ca
     assert.throws(() => assertMarketOpenRecords(evidence.records.slice(1), evidence), /records/);
     writeFileSync(fixture.artifactPaths[0]!, readFileSync(fixture.artifactPaths[0]!, 'utf8') + '\n');
     assert.throws(() => assertMarketOpenRecords(evidence.records, evidence), /artifact|canonical/);
+  } finally { await fixture.cleanup(); }
+});
+
+// Exercise the public store's dirty-terminal + artifact attachment contract using
+// actual producer claim/attempt records, not a second hand-written reducer.
+for (const status of ['unknown', 'refused', 'failed'] as const) test(`market-open discovery excludes installed ${status} terminal`, { skip: process.platform === 'win32' }, async () => {
+  const source = await createMarketOpenEvidenceFixture({ failedArm: status === 'failed' });
+  const root = mkdtempSync(join(tmpdir(), 'market-open-terminal-'));
+  const { config, snapshot } = readMarketOpenStore(source.root);
+  const original = snapshot.fires[0]!;
+  const store = new MarketOpenStore({ ...config, root });
+  try {
+    for (const { row } of journal(source.root)) {
+      const op = row.operation;
+      if (op.type === 'claim') store.claim(op.input, op.claimedAt);
+      if (status !== 'refused') {
+        if (op.type === 'begin') store.beginAttempt(op.input);
+        if (op.type === 'finish') store.finishAttempt(op.input);
+      }
+    }
+    const eventId = original.claim.eventId;
+    if (status === 'unknown') store.markUnknown(eventId, 'synthetic_durability_fault');
+    if (status === 'refused') store.refuse(eventId, 'synthetic_first_pitch');
+    if (status === 'failed') store.fail(eventId, 'synthetic_operational_failure');
+    mkdirSync(join(root, 'artifacts'));
+    const path = join(root, 'artifacts', `${eventId}.json`);
+    const bytes = readFileSync(source.artifactPaths[0]!, 'utf8');
+    writeFileSync(path, bytes);
+    store.complete(eventId, { path, sha256: sha256Hex(bytes) }, original.artifactInstalledAt!);
+    const fire = readMarketOpenStore(root).snapshot.fires[0]!;
+    assert.equal(fire.status, status);
+    assert.equal(fire.terminalArtifact?.path, path);
+    assert.notEqual(fire.artifactInstalledAt, null);
+    let discovered: unknown;
+    assert.doesNotThrow(() => { discovered = discoverMarketOpenRuns(root); }, 'excluded terminals must not enter artifact admission');
+    assert.deepEqual(discovered, [], 'an installed artifact never promotes a dirty terminal to scoreable');
+    assert.throws(() => readMarketOpenRun(root, path), /target is not a completed journal-installed artifact/);
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); await source.cleanup(); }
+});
+
+test('market-open canonical artifact bytes are required independently of a matching installed digest', { skip: process.platform === 'win32' }, async () => {
+  const fixture = await createMarketOpenEvidenceFixture();
+  try {
+    const path = fixture.artifactPaths[0]!;
+    const bytes = JSON.stringify(JSON.parse(readFileSync(path, 'utf8')), null, 2) + '\n';
+    writeFileSync(path, bytes);
+    const entries = journal(fixture.root);
+    entries.find((e) => e.row.operation.type === 'complete')!.row.operation.artifact.sha256 = sha256Hex(bytes);
+    rechain(entries);
+    assert.doesNotThrow(() => readMarketOpenStore(fixture.root), 'journal/hash validation still passes');
+    assert.throws(() => discoverMarketOpenRuns(fixture.root), /noncanonical artifact bytes/);
+  } finally { await fixture.cleanup(); }
+});
+
+test('market-open pre-install admission must match the replayed fire', { skip: process.platform === 'win32' }, async () => {
+  const fixture = await createMarketOpenEvidenceFixture();
+  try {
+    rewriteArtifact(fixture.root, fixture.artifactPaths[0]!, (doc) => { doc.admission.reason = 'foreign'; });
+    assert.throws(() => discoverMarketOpenRuns(fixture.root), /pre-install admission mismatch/);
+  } finally { await fixture.cleanup(); }
+});
+
+for (const [field, value] of [['mode', 'dry-run'], ['clockMode', 'fixture']] as const) test(`market-open independently requires run metadata ${field}`, { skip: process.platform === 'win32' }, async () => {
+  const fixture = await createMarketOpenEvidenceFixture();
+  try {
+    rewriteArtifact(fixture.root, fixture.artifactPaths[0]!, (doc) => { record(doc, 'run_meta')[field] = value; });
+    assert.throws(() => discoverMarketOpenRuns(fixture.root), new RegExp(`run metadata\\.${field} mismatch`));
+  } finally { await fixture.cleanup(); }
+});
+
+test('market-open independently recomputes durable billable cost', { skip: process.platform === 'win32' }, async () => {
+  const fixture = await createMarketOpenEvidenceFixture();
+  try {
+    rewriteArtifact(fixture.root, fixture.artifactPaths[0]!, (doc, entries) => {
+      entries.find((e) => e.row.operation.type === 'finish')!.row.operation.input.costUsdMicros += 1;
+      doc.admission.attempts[0].costUsdMicros += 1;
+      doc.admission.knownCostUsdMicros += 1;
+    });
+    assert.doesNotThrow(() => readMarketOpenStore(fixture.root));
+    assert.throws(() => discoverMarketOpenRuns(fixture.root), /billable attempt cost mismatch/);
+  } finally { await fixture.cleanup(); }
+});
+
+test('market-open independently recomputes aggregate spend', { skip: process.platform === 'win32' }, async () => {
+  const fixture = await createMarketOpenEvidenceFixture({ repair: true });
+  try {
+    rewriteArtifact(fixture.root, fixture.artifactPaths[0]!, (doc) => { doc.spend = { kind: 'unknown', offenders: [] }; });
+    assert.throws(() => discoverMarketOpenRuns(fixture.root), /aggregate spend mismatch/);
+  } finally { await fixture.cleanup(); }
+});
+
+test('market-open rejects a coherent non-pass completed attempt spend', { skip: process.platform === 'win32' }, async () => {
+  const fixture = await createMarketOpenEvidenceFixture();
+  try {
+    rewriteArtifact(fixture.root, fixture.artifactPaths[0]!, (doc, entries) => {
+      const durable = doc.admission.attempts[0], evidence = durable.evidence, arm = evidence.arm;
+      assert.equal(arm.provider, 'openai');
+      const perAttempt = spendReservationPolicyForVersion(MARKET_OPEN_POLICY.spendReservationPolicyVersion).providerAttemptReservationUsdMicros;
+      const previous = durable.costUsdMicros;
+      // A single over-reservation attempt can fit inside the whole-fire reserve.
+      // Bind usage and exact recomputation everywhere so only the pass guard rejects.
+      do {
+        evidence.attempt.usageRaw.input_tokens *= 2;
+        evidence.attempt.usageRaw.total_tokens = evidence.attempt.usageRaw.input_tokens + evidence.attempt.usageRaw.output_tokens;
+        durable.costUsdMicros = deriveConservativeActualUsdMicros({ ...arm, priceVersion: MARKET_OPEN_POLICY.priceVersion,
+          usageRaw: evidence.attempt.usageRaw, searchCount: evidence.attempt.searchAudit.searchCount });
+      } while (durable.costUsdMicros <= perAttempt);
+      assert.ok(durable.costUsdMicros < doc.admission.claim.reservationUsdMicros);
+      const guardInput = (a: Json) => ({ requestAt: a.requestAt, usageRaw: a.usageRaw, searchCount: a.searchAudit.searchCount });
+      evidence.spend = computeFireSpendGuard({ arms: [{ ...arm, billingClass: 'billable', attempt: guardInput(evidence.attempt), repair: null }],
+        priceVersion: MARKET_OPEN_POLICY.priceVersion, perAttemptReservationUsdMicros: perAttempt });
+      assert.equal(evidence.spend.kind, 'breach');
+      doc.admission.knownCostUsdMicros += durable.costUsdMicros - previous;
+      const finish = entries.find((e) => e.row.operation.type === 'finish')!.row.operation.input;
+      finish.costUsdMicros = durable.costUsdMicros; finish.evidence = structuredClone(evidence);
+      const response = doc.records.find((r: Json) => r.recordType === 'arm_game_response' && r.participantId === arm.participantId);
+      response.attempt.usageRaw = structuredClone(evidence.attempt.usageRaw);
+      for (const decision of doc.records.filter((r: Json) => r.recordType === 'decision' && r.participantId === arm.participantId)) {
+        decision.usageRaw = structuredClone(evidence.attempt.usageRaw);
+      }
+      const arms = doc.admission.attempts.map((a: Json) => ({ ...a.evidence.arm, billingClass: 'billable',
+        attempt: guardInput(a.evidence.attempt), repair: null }));
+      doc.spend = computeFireSpendGuard({ arms, priceVersion: MARKET_OPEN_POLICY.priceVersion, perAttemptReservationUsdMicros: perAttempt });
+    });
+    assert.doesNotThrow(() => readMarketOpenStore(fixture.root));
+    assert.throws(() => discoverMarketOpenRuns(fixture.root), /non-pass completed attempt spend/);
   } finally { await fixture.cleanup(); }
 });

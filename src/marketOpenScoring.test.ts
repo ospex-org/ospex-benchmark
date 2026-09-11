@@ -7,13 +7,15 @@ import { canonicalize } from './canonical.js';
 import { createMarketOpenEvidenceFixture, MARKET_OPEN_FIXTURE_GAME_ID } from './testFixtures/marketOpenEvidenceFixture.js';
 import { discoverScoreableMarketOpenRuns, runMarketOpenDiscoveryCli } from './discoverMarketOpenMain.js';
 import { readRunArtifactFile } from './runArtifactInput.js';
-import { aggregateByParticipant, parseRunRecords, scoredRecords, scoreRun, verifyRunIntegrity } from './scoring.js';
+import { aggregateByParticipant, isMarketOpenSourceRun, parseRunRecords, scoredRecords, scoreRun, verifyRunIntegrity } from './scoring.js';
+import type { SourceRun } from './scoring.js';
 import { runScoreCli } from './scoreRun.js';
 import { publishableRun } from './servingProjection.js';
 import { publishableScoredRun } from './scoredProjection.js';
 import { publishRunArtifact, publishScoredArtifact } from './servingPublisher.js';
 import type { BenchmarkServingPort } from './servingStore.js';
-import { MARKET_OPEN_SQL_PUBLICATION_BLOCKED } from './marketOpenPublication.js';
+import { hasMarketOpenProvenance, MARKET_OPEN_SQL_PUBLICATION_BLOCKED } from './marketOpenPublication.js';
+import { marketOpenTimingForPick } from './marketOpenScoreTiming.js';
 import type { ClosingLineRow, MarketKey } from './types.js';
 
 const posix = process.platform === 'win32' ? { skip: 'real B2 fixture requires POSIX durable store' } : {};
@@ -245,4 +247,41 @@ test('legacy NDJSON loader preserves exact text without an evidence root', () =>
     writeFileSync(path, text); assert.deepEqual(readRunArtifactFile(path), { text });
     assert.equal(readFileSync(path, 'utf8'), text);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const field of ['gameId', 'market'] as const) test(`market-open scored timing requires pick ${field} identity`, posix, async () => {
+  const fixture = await createMarketOpenEvidenceFixture();
+  try {
+    const run = load(fixture.artifactPaths[0]!, fixture.root), pick = run.picks.find((p) => p.kind === 'model')!;
+    assert.throws(() => marketOpenTimingForPick(run.marketOpenEvidence!, { ...pick, [field]: field === 'market' ? 'total' : 'foreign' }), /timing pick identity mismatch/);
+  } finally { await fixture.cleanup(); }
+});
+
+test('market-open detection shares every marker across loading scoring and publication', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'market-open-markers-'));
+  try {
+    const path = join(dir, 'run.ndjson');
+    for (const marker of [{ runId: 'market-open-v1-test' }, { cohortId: 'market-open-v1-test' },
+      { marketOpen: {} }, { marketOpenTiming: {} }, { marketOpenEvidence: {} }]) {
+      assert.equal(hasMarketOpenProvenance(marker), true, JSON.stringify(marker));
+      // A marker-only object is not a valid run; these probes isolate detection.
+      assert.equal(isMarketOpenSourceRun({ runId: 'legacy', cohortId: 'legacy', ...marker } as unknown as SourceRun), true);
+      writeFileSync(path, JSON.stringify({ recordType: 'run_meta', ...marker }) + '\n');
+      assert.throws(() => readRunArtifactFile(path), /market-open input requires --evidence-root/);
+      assert.deepEqual(publishableScoredRun([{ recordType: 'scored_run_meta', ...marker }]),
+        { publishable: false, reason: MARKET_OPEN_SQL_PUBLICATION_BLOCKED });
+    }
+    assert.equal(hasMarketOpenProvenance({ runId: 'legacy', marketOpenEvidence: undefined }), false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+for (const [field, value] of [['mode', 'dry-run'], ['clockMode', 'fixture']] as const) test(`market-open parsed scorer independently requires ${field}`, posix, async () => {
+  const fixture = await createMarketOpenEvidenceFixture();
+  try {
+    const run = load(fixture.artifactPaths[0]!, fixture.root);
+    Object.assign(run, { [field]: value });
+    const integrity = verifyRunIntegrity(run);
+    assert.ok(integrity.length > 0);
+    assert.match(integrity.join('\n'), /market-open scoring requires live mode and wall clock/);
+  } finally { await fixture.cleanup(); }
 });
