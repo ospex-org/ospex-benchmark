@@ -7,6 +7,10 @@ import { canonicalize } from './canonical.js';
 import { createMarketOpenEvidenceFixture, MARKET_OPEN_FIXTURE_GAME_ID } from './testFixtures/marketOpenEvidenceFixture.js';
 import { discoverScoreableMarketOpenRuns, runMarketOpenDiscoveryCli } from './discoverMarketOpenMain.js';
 import { readRunArtifactFile } from './runArtifactInput.js';
+import { MARKET_OPEN_DAILY_BUDGET_POLICY, MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256 } from './marketOpenDailyBudget.js';
+import { readMarketOpenStore } from './marketOpenStore.js';
+import { spendReservationPolicyForVersion } from './spendReservationPolicy.js';
+import { MARKET_OPEN_POLICY } from './marketOpen.js';
 import { aggregateByParticipant, isMarketOpenSourceRun, parseRunRecords, scoredRecords, scoreRun, verifyRunIntegrity } from './scoring.js';
 import type { SourceRun } from './scoring.js';
 import { runScoreCli } from './scoreRun.js';
@@ -21,6 +25,74 @@ import type { ClosingLineRow, MarketKey } from './types.js';
 const posix = process.platform === 'win32' ? { skip: 'real B2 fixture requires POSIX durable store' } : {};
 const ladder = { k: 8.101061957791782, parameterVersion: 'TOTALS_V1_PROVISIONAL' };
 const scoredAt = '2026-09-11T01:00:00.000Z';
+for (const costEvidence of [undefined, 'unknown', 'above-estimate'] as const) {
+  test(`daily producer artifact discovers, scores and projects ${costEvidence ?? 'known'} spend without legacy admission`, posix, async () => {
+    const fixture = await createMarketOpenEvidenceFixture({ dailyBudgetCapUsdMicros: 60_000_000,
+      repair: true, ...(costEvidence === undefined ? {} : { costEvidence }) });
+    try {
+      assert.equal(fixture.results[0]!.state, 'completed');
+      const [descriptor] = discoverScoreableMarketOpenRuns(fixture.root);
+      assert.ok(descriptor);
+      assert.throws(() => readRunArtifactFile(descriptor.artifactPath), /evidence-root/);
+      const run = load(descriptor.artifactPath, fixture.root), evidence = run.marketOpenEvidence!;
+      assert.deepEqual(verifyRunIntegrity(run), []);
+      const artifact = JSON.parse(readFileSync(descriptor.artifactPath, 'utf8'));
+      assert.equal(artifact.version, 'market-open-daily-produced-v1');
+      assert.deepEqual(artifact.admissionPolicy, MARKET_OPEN_DAILY_BUDGET_POLICY);
+      assert.equal(artifact.admissionPolicySha256, MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256);
+      assert.equal(evidence.fire.claim.reservationUsdMicros, evidence.prepared.provenance.reservationUsdMicros,
+        'historical preparation reserve remains provenance, not daily spend authority');
+      const picks = scoreRun(run, [marketOpenScoringClose('moneyline')], ladder);
+      const stats = aggregateByParticipant(picks, run, ladder);
+      const rows = scoredRecords(run, picks, stats, scoredAt, ladder);
+      assert.equal(rows.filter((r) => r.recordType === 'scored_decision' && r.kind === 'model').length, MARKET_OPEN_POLICY.roster.length);
+      const projected = rows[0]!.marketOpen as Record<string, any>;
+      assert.equal(projected.admissionPolicySha256, MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256);
+      assert.deepEqual(projected.admissionPolicy, MARKET_OPEN_DAILY_BUDGET_POLICY);
+      assert.equal(projected.cost.knownCostUsdMicros, evidence.fire.knownCostUsdMicros);
+      assert.equal(projected.cost.attempts.length, evidence.fire.attempts.length);
+      for (const [i, attempt] of evidence.fire.attempts.entries()) {
+        assert.equal(projected.cost.attempts[i].costUsdMicros, attempt.costUsdMicros);
+        assert.deepEqual(projected.cost.attempts[i].spend, (attempt.evidence as { spend: unknown }).spend);
+      }
+      const target = projected.cost.attempts.filter((a: Record<string, any>) => a.armId === MARKET_OPEN_POLICY.roster[0]!.participantId);
+      assert.equal(target.length, 2, 'daily repair evidence is retained');
+      if (costEvidence === 'unknown') assert(target.every((a: Record<string, any>) => a.costUsdMicros === null && a.spend.unknownCost === true));
+      if (costEvidence === 'above-estimate') {
+        const legacyCap = spendReservationPolicyForVersion(MARKET_OPEN_POLICY.spendReservationPolicyVersion).providerAttemptReservationUsdMicros;
+        assert(target.every((a: Record<string, any>) => a.costUsdMicros > legacyCap && a.spend.aboveEstimate === true));
+      }
+      assert.deepEqual(scoredRecords(load(descriptor.artifactPath, fixture.root), picks, stats, scoredAt, ladder), rows);
+      assert.deepEqual(publishableScoredRun(rows), { publishable: false, reason: MARKET_OPEN_SQL_PUBLICATION_BLOCKED });
+    } finally { await fixture.cleanup(); }
+  });
+}
+
+test('shared daily ledger discovers and builds each artifact with its preparation cohort, not genesis metadata', posix, async () => {
+  const fixture = await createMarketOpenEvidenceFixture({ dailyBudgetCapUsdMicros: 60_000_000,
+    name: 'daily-first', additionalCohortNames: ['daily-second'], markets: ['moneyline', 'total'], failedArm: true });
+  try {
+    const genesis = readMarketOpenStore(fixture.root).config;
+    assert.equal(genesis.name, 'daily-first');
+    const descriptors = discoverScoreableMarketOpenRuns(fixture.root);
+    assert.equal(descriptors.length, 4);
+    assert.equal(new Set(descriptors.map((d) => d.cohortId)).size, 2);
+    for (const descriptor of descriptors) {
+      const run = load(descriptor.artifactPath, fixture.root), evidence = run.marketOpenEvidence!;
+      assert.equal(descriptor.cohortId, evidence.prepared.cohort.cohortId);
+      assert.equal(run.cohortId, evidence.prepared.provenance.event.cohortId);
+      assert.equal(descriptor.status, 'failed');
+      const picks = scoreRun(run, [marketOpenScoringClose(descriptor.market)], ladder);
+      const stats = aggregateByParticipant(picks, run, ladder);
+      assert.equal(stats.filter((s) => s.kind === 'model').length, MARKET_OPEN_POLICY.roster.length);
+      assert.equal(stats.find((s) => s.kind === 'model' && s.validDecisions === 0)!.eligibleMarkets, 1);
+      const rows = scoredRecords(run, picks, stats, scoredAt, ladder);
+      assert.equal(rows[0]!.cohortId, descriptor.cohortId);
+      if (evidence.prepared.cohort.name === 'daily-second') assert.notEqual(descriptor.cohortId, genesis.cohortId);
+    }
+    assert.deepEqual(discoverScoreableMarketOpenRuns(fixture.root), descriptors, 'no changes on replay');
+  } finally { await fixture.cleanup(); }
+});
 export function marketOpenScoringClose(market: MarketKey): ClosingLineRow {
   return { network: 'polygon', jsonodds_id: MARKET_OPEN_FIXTURE_GAME_ID, market,
     line: market === 'moneyline' ? null : 8.5, away_odds_decimal: 2, home_odds_decimal: 2,

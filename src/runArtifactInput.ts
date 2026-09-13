@@ -12,7 +12,7 @@ export function readRunArtifactFile(path: string, options?: { marketOpenEvidence
   let envelope: { version?: unknown; records?: unknown } | null = null;
   try { envelope = JSON.parse(text) as { version?: unknown; records?: unknown } | null; } catch { /* ordinary NDJSON */ }
   const root = options?.marketOpenEvidenceRoot;
-  if (envelope?.version === 'market-open-produced-v1') {
+  if (envelope?.version === 'market-open-produced-v1' || envelope?.version === 'market-open-daily-produced-v1') {
     if (root === undefined) throw new Error('market-open input requires --evidence-root');
     const evidence = readMarketOpenRun(root, path);
     return { text: evidence.records.map((r) => canonicalize(r)).join('\n') + '\n', marketOpenEvidence: evidence };
