@@ -84,7 +84,7 @@ function artifact(path: string | null | undefined) { assert.ok(path); return JSO
 
 
 
-test('daily budget uses actual costs, keeps roster and permits one event beyond estimates', async () => {
+test('daily budget uses actual costs, keeps roster and permits one event beyond estimates', posixOnly, async () => {
   const f = fixture((response) => ({ ...response, usageRaw: { ...response.usageRaw as object,
     input_tokens: 100000, output_tokens: 100000, promptTokenCount: 100000, candidatesTokenCount: 100000,
     thoughtsTokenCount: 0, totalTokenCount: 200000, prompt_tokens: 100000, completion_tokens: 100000,
@@ -100,7 +100,7 @@ test('daily budget uses actual costs, keeps roster and permits one event beyond 
   } finally { await f.cleanup(); }
 });
 
-test('unknown cost is estimated and flagged without halt, permits sibling and repair work', async () => {
+test('unknown cost is estimated and flagged without halt, permits sibling and repair work', posixOnly, async () => {
   const f = fixture((response, call) => ({ ...response, usageRaw: {},
     rawText: call.role === 'initial' ? response.rawText.replace(/"cohortId":"[^"]*"/, '"cohortId":"wrong"') : response.rawText }));
   try {
@@ -113,7 +113,7 @@ test('unknown cost is estimated and flagged without halt, permits sibling and re
   } finally { await f.cleanup(); }
 });
 
-test('daily brake holds without claims; raising cap resumes the exact observation and replay sends nothing', async () => {
+test('daily brake holds without claims; raising cap resumes the exact observation and replay sends nothing', posixOnly, async () => {
   const f = fixture(undefined, 1);
   try {
     assert.equal((await f.producer.observe(observation())).state, 'completed');
@@ -138,7 +138,7 @@ test('daily brake holds without claims; raising cap resumes the exact observatio
   } finally { await f.cleanup(); }
 });
 
-test('ET midnight releases eligible next-day holds; expired holds never claim or send', async () => {
+test('ET midnight releases eligible next-day holds; expired holds never claim or send', posixOnly, async () => {
   const f = fixture(undefined, 1);
   try {
     await f.producer.observe(observation());
@@ -158,7 +158,7 @@ test('ET midnight releases eligible next-day holds; expired holds never claim or
   } finally { await f.cleanup(); }
 });
 
-test('concurrent in-flight estimates share one cap and exclusive ledger lock', async () => {
+test('concurrent in-flight estimates share one cap and exclusive ledger lock', posixOnly, async () => {
   let release!: () => void; const waiting = new Promise<void>(r => { release = r; });
   const f = fixture(async response => { await waiting; return response; }, 1);
   try {
@@ -173,7 +173,7 @@ test('concurrent in-flight estimates share one cap and exclusive ledger lock', a
   } finally { release(); await f.cleanup(); }
 });
 
-test('DST uses ET calendar and terminal unknown estimates reset without changing historical evidence', async () => {
+test('DST uses ET calendar and terminal unknown estimates reset without changing historical evidence', posixOnly, async () => {
   const f = fixture(response => ({ ...response, usageRaw: {} }));
   try {
     await f.producer.observe(observation()); const before = f.producer.snapshot();

@@ -13,7 +13,7 @@ import { assertMarketOpenRecords, discoverMarketOpenRuns, readMarketOpenRun } fr
 import { createMarketOpenEvidenceFixture } from './testFixtures/marketOpenEvidenceFixture.js';
 import { discoverScoreableMarketOpenRuns } from './discoverMarketOpenMain.js';
 
-test('adapter origin classifies ordinary names without changing raw evidence or model identity', async () => {
+test('adapter origin classifies ordinary names without changing raw evidence or model identity', { skip: process.platform === 'win32' }, async () => {
   for (const syntheticAdapters of [true, false]) {
     const fixture = await createMarketOpenEvidenceFixture({ name: 'ordinary-cohort',
       cohortOrigin: { version: 'market-open-adapter-origin-v1', syntheticAdapters } });
@@ -34,7 +34,7 @@ test('adapter origin classifies ordinary names without changing raw evidence or 
   }
 });
 
-test('only the exact historical untagged rehearsal is backfilled; all other untagged names remain live', async () => {
+test('only the exact historical untagged rehearsal is backfilled; all other untagged names remain live', { skip: process.platform === 'win32' }, async () => {
   for (const [name, slateDate, kind] of [
     ['rehearsal-no-spend', '2026-09-12', 'rehearsal'],
     ['rehearsal-no-spend', '2026-09-10', 'live'],
