@@ -6,7 +6,10 @@ import { z } from 'zod';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { installBytesNoClobber, nodeArtifactFs } from './fireArtifactSink.js';
 import { instantMs } from './time.js';
-import { assertPreparedMarketOpenRun } from './marketOpen.js';
+import { assertPreparedMarketOpenRun, createMarketOpenCohort, prepareMarketOpenRun } from './marketOpen.js';
+import { assertDailyBudgetCap, computeDailyBudgetStatus, estimateMarketOpenDailyAttempts,
+  MARKET_OPEN_DAILY_BUDGET_POLICY, MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256 } from './marketOpenDailyBudget.js';
+import type { DailyAttemptEstimate } from './marketOpenDailyBudget.js';
 import type { PreparedMarketOpenRun } from './marketOpen.js';
 import type { RunEnvelope } from './runner.js';
 
@@ -42,9 +45,31 @@ function plainJson(value: unknown, depth = 0): void {
 }
 export { plainJson as assertMarketOpenJson };
 const json = z.unknown().refine((v) => { try { plainJson(v); return true; } catch { return false; } }, 'invalid JSON evidence');
+const cohortOriginSchema = z.object({ version: z.literal('market-open-adapter-origin-v1'),
+  syntheticAdapters: z.boolean() }).strict();
+export type MarketOpenCohortOrigin = z.infer<typeof cohortOriginSchema>;
+export type MarketOpenCohortKind = 'live' | 'rehearsal';
+export const HISTORICAL_MARKET_OPEN_REHEARSAL = 'market-open-v1-rehearsal-no-spend-2026-09-12-063596c704c034036d727e93f356436995639608aae8575fa36ab9f5c4a9ce51';
+
+/** Classification is cohort metadata, never request/model identity or run mode.
+ * Untagged history stays byte-exact; only this known cohort is backfilled.
+ * Like the journal itself, the local root is an operator-owned trust boundary. */
+export function marketOpenCohortKind(cohortId: string, origin?: MarketOpenCohortOrigin): MarketOpenCohortKind {
+  if (origin !== undefined) {
+    plainJson(origin); cohortOriginSchema.parse(origin);
+    if (cohortId === HISTORICAL_MARKET_OPEN_REHEARSAL && !origin.syntheticAdapters) {
+      throw new Error('market-open cohort origin conflict with historical rehearsal');
+    }
+    return origin.syntheticAdapters ? 'rehearsal' : 'live';
+  }
+  return cohortId === HISTORICAL_MARKET_OPEN_REHEARSAL ? 'rehearsal' : 'live';
+}
+
 const configSchema = z.object({ root: text, cohortId: text, name: text,
   slateDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), policySha256: digest,
-  admissionPolicySha256: digest, capUsdMicros: money.positive() }).strict();
+  admissionPolicySha256: digest, capUsdMicros: money.positive(),
+  dailyBudgetVersion: z.literal('market-open-daily-budget-v1').optional(),
+  cohortOrigin: cohortOriginSchema.optional() }).strict();
 const slotSchema = z.object({ armId: text, role: z.enum(['initial', 'repair']), ordinal: z.number().int().min(0).max(1) }).strict()
   .refine((s) => s.ordinal === (s.role === 'initial' ? 0 : 1), 'invalid role ordinal');
 const preparationSchema = z.object({ name: text, slateDate: text, game,
@@ -56,7 +81,11 @@ const artifactSchema = z.object({ path: text, sha256: digest }).strict();
 const beginSchema = z.object({ eventId: digest, slot: slotSchema, startedAt: instant }).strict();
 const finishSchema = z.object({ eventId: digest, slot: slotSchema, finishedAt: instant,
   costUsdMicros: money.nullable(), evidence: json }).strict();
+const estimateSchema = z.object({ slot: slotSchema, usdMicros: money.positive() }).strict();
 const operationSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('daily_budget'), at: instant, capUsdMicros: money.positive() }).strict(),
+  z.object({ type: z.literal('daily_observe'), input: claimSchema, estimates: z.array(estimateSchema).min(1).max(32), recordedAt: instant }).strict(),
+  z.object({ type: z.literal('daily_evaluate'), eventId: digest, at: instant, capUsdMicros: money.positive() }).strict(),
   z.object({ type: z.literal('init'), configSha256: digest }).strict(),
   z.object({ type: z.literal('claim'), input: claimSchema, claimedAt: instant }).strict(),
   z.object({ type: z.literal('begin'), input: beginSchema }).strict(),
@@ -80,7 +109,13 @@ export interface MarketOpenFire {
   attempts: MarketOpenAttempt[]; knownCostUsdMicros: number;
   terminalArtifact: MarketOpenArtifactReference | null; reason: string | null;
 }
+export interface MarketOpenDailyObservation {
+  input: MarketOpenClaimInput; estimates: DailyAttemptEstimate[]; recordedAt: string;
+  state: 'held' | 'admitted' | 'expired'; reason: string | null; budgetHeld: boolean;
+}
 export interface MarketOpenStoreSnapshot {
+  dailyBudget?: { version: 'market-open-daily-budget-v1'; observations: MarketOpenDailyObservation[];
+    reaches: Array<{ dayET: string; at: string; amountUsdMicros: number; gamesSent: number }>; currentCapUsdMicros: number };
   reservedUsdMicros: number; knownCostUsdMicros: number; halted: string | null; fires: MarketOpenFire[];
 }
 export interface MarketOpenCompletionReceipt {
@@ -116,10 +151,13 @@ function lookup(state: MarketOpenStoreSnapshot, id: string): MarketOpenFire {
   if (!fire) throw new Error('unknown event');
   return fire;
 }
+function claimCohortId(input: MarketOpenClaimInput, config: MarketOpenStoreConfig): string {
+  return config.dailyBudgetVersion ? createMarketOpenCohort(input.preparation).cohortId : config.cohortId;
+}
 function validateClaim(input: MarketOpenClaimInput, config: MarketOpenStoreConfig): void {
   const p = input.preparation;
-  if (p.name !== config.name || p.slateDate !== config.slateDate || input.policySha256 !== config.policySha256 ||
-      input.eventId !== sha256Hex(canonicalize({ cohortId: config.cohortId, gameId: p.game.gameId, market: p.market })) ||
+  if ((!config.dailyBudgetVersion && (p.name !== config.name || p.slateDate !== config.slateDate)) || input.policySha256 !== config.policySha256 ||
+      input.eventId !== sha256Hex(canonicalize({ cohortId: claimCohortId(input, config), gameId: p.game.gameId, market: p.market })) ||
       input.runId !== `market-open-v1-${input.eventId}`) throw new Error('claim identity conflict');
   const keys = new Set(input.slots.map(slotKey));
   if (keys.size !== input.slots.length) throw new Error('duplicate attempt slot');
@@ -130,13 +168,69 @@ function validateClaim(input: MarketOpenClaimInput, config: MarketOpenStoreConfi
   }
 }
 
+function recordDailyReach(state: MarketOpenStoreSnapshot, at: string): void {
+  if (!state.dailyBudget) return;
+  const status = computeDailyBudgetStatus(state, at, state.dailyBudget.currentCapUsdMicros);
+  if (status.reached && status.gamesSent > 0 && !state.dailyBudget.reaches.some((r) => r.dayET === status.dayET)) {
+    state.dailyBudget.reaches.push({ dayET: status.dayET, at, amountUsdMicros: status.accountedUsdMicros, gamesSent: status.gamesSent });
+  }
+}
+
 /** One semantic reducer is used both before installation and on every replayed transition. */
 function reduce(state: MarketOpenStoreSnapshot, op: Operation, config: MarketOpenStoreConfig): void {
+  if (op.type === 'daily_budget') {
+    if (!state.dailyBudget) throw new Error('daily operation in legacy ledger');
+    state.dailyBudget.currentCapUsdMicros = op.capUsdMicros;
+    recordDailyReach(state, op.at);
+    return;
+  }
   if (op.type === 'init') {
     if (op.configSha256 !== sha256Hex(canonicalize(config))) throw new Error('journal config identity conflict');
+    if (config.dailyBudgetVersion) {
+      if (config.admissionPolicySha256 !== MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256) throw new Error('daily budget policy identity conflict');
+      state.dailyBudget = { version: config.dailyBudgetVersion, observations: [], reaches: [], currentCapUsdMicros: config.capUsdMicros };
+    }
+    return;
+  }
+  if (op.type === 'daily_observe' || op.type === 'daily_evaluate') {
+    if (!config.dailyBudgetVersion || !state.dailyBudget) throw new Error('daily operation in legacy ledger');
+    const observations = state.dailyBudget.observations;
+    if (op.type === 'daily_observe') {
+      validateClaim(op.input, config);
+      if (observations.some((o) => o.input.eventId === op.input.eventId)) throw new Error('duplicate daily observation');
+
+      if (instantMs(op.recordedAt) < instantMs(op.input.preparation.observedAt)) throw new Error('daily observation clock regression');
+      const prepared = prepareMarketOpenRun({ ...op.input.preparation, historyRows: op.input.preparation.historyRows, cohort: createMarketOpenCohort(op.input.preparation) });
+      if (prepared.state !== 'prepared' || prepared.run.provenance.requestSha256 !== op.input.requestSha256 ||
+          prepared.run.provenance.source.sha256 !== op.input.sourceSha256 || prepared.run.provenance.gameSha256 !== op.input.gameSha256 ||
+          canonicalize(estimateMarketOpenDailyAttempts(prepared.run)) !== canonicalize(op.estimates) ||
+          canonicalize(op.estimates.map((e) => e.slot)) !== canonicalize(op.input.slots)) throw new Error('daily observation preparation/estimate conflict');
+      observations.push({ input: op.input, estimates: op.estimates, recordedAt: op.recordedAt, state: 'held', reason: null, budgetHeld: false });
+    } else {
+      const observation = observations.find((o) => o.input.eventId === op.eventId);
+      if (!observation || observation.state !== 'held') throw new Error('daily observation not pending');
+      if (instantMs(op.at) < instantMs(observation.recordedAt)) throw new Error('daily evaluation clock regression');
+      if (instantMs(op.at) >= instantMs(observation.input.preparation.game.matchTime)) {
+        observation.state = 'expired'; observation.reason = observation.budgetHeld ? 'daily_budget_held_expired' : 'at_or_after_first_pitch'; return;
+      }
+      state.dailyBudget.currentCapUsdMicros = op.capUsdMicros;
+      recordDailyReach(state, op.at);
+      const status = computeDailyBudgetStatus(state, op.at, op.capUsdMicros);
+      const reason = state.halted ?? (status.reached ? 'daily_budget_reached' :
+        status.activeEvents >= MARKET_OPEN_DAILY_BUDGET_POLICY.workers ? 'event_worker_capacity' : null);
+      observation.reason = reason;
+      if (reason === 'daily_budget_reached') observation.budgetHeld = true;
+      if (reason !== null) return;
+      observation.state = 'admitted';
+      state.fires.push({ claim: observation.input, admitted: true, claimedAt: op.at, artifactInstalledAt: null,
+        status: 'claimed', attempts: [], knownCostUsdMicros: 0, terminalArtifact: null, reason: null });
+      // Legacy field is retained as historical metadata, never daily send authority.
+      state.reservedUsdMicros = add(state.reservedUsdMicros, observation.input.reservationUsdMicros);
+    }
     return;
   }
   if (op.type === 'claim') {
+    if (config.dailyBudgetVersion) throw new Error('daily permission required before claim');
     validateClaim(op.input, config);
     if (state.fires.some((f) => f.claim.eventId === op.input.eventId)) throw new Error('duplicate journal claim');
     if (state.fires.length >= 1024) throw new Error('store fire limit');
@@ -157,30 +251,32 @@ function reduce(state: MarketOpenStoreSnapshot, op: Operation, config: MarketOpe
     if (instantMs(op.input.startedAt) < instantMs(fire.claim.preparation.observedAt)) throw new Error('attempt predates observation');
     if (op.input.slot.role === 'repair') {
       const initial = fire.attempts.find((a) => a.slot.armId === op.input.slot.armId && a.slot.role === 'initial');
-      if (!initial || initial.finishedAt === null || initial.costUsdMicros === null ||
+      if (!initial || initial.finishedAt === null || (!config.dailyBudgetVersion && initial.costUsdMicros === null) ||
           instantMs(op.input.startedAt) < instantMs(initial.finishedAt)) throw new Error('repair requires settled known initial');
     }
     fire.attempts.push({ slot: op.input.slot, startedAt: op.input.startedAt, finishedAt: null, costUsdMicros: null, evidence: null });
     fire.status = 'running';
+    recordDailyReach(state, op.input.startedAt);
   } else if (op.type === 'finish') {
     const attempt = fire.attempts.find((a) => slotKey(a.slot) === slotKey(op.input.slot));
     if (!attempt || attempt.finishedAt !== null || !['running', 'unknown'].includes(fire.status)) throw new Error('attempt is not pending');
     if (instantMs(op.input.finishedAt) < instantMs(attempt.startedAt)) throw new Error('finish predates start');
     attempt.finishedAt = op.input.finishedAt; attempt.costUsdMicros = op.input.costUsdMicros; attempt.evidence = op.input.evidence;
     if (op.input.costUsdMicros === null) {
-      fire.status = 'unknown'; fire.reason = 'unknown_attempt_cost'; state.halted ??= fire.reason;
+      if (!config.dailyBudgetVersion) { fire.status = 'unknown'; fire.reason = 'unknown_attempt_cost'; state.halted ??= fire.reason; }
     } else {
       fire.knownCostUsdMicros = add(fire.knownCostUsdMicros, op.input.costUsdMicros);
       state.knownCostUsdMicros = add(state.knownCostUsdMicros, op.input.costUsdMicros);
-      if (fire.knownCostUsdMicros > fire.claim.reservationUsdMicros || state.knownCostUsdMicros > config.capUsdMicros) {
+      if (!config.dailyBudgetVersion && (fire.knownCostUsdMicros > fire.claim.reservationUsdMicros || state.knownCostUsdMicros > config.capUsdMicros)) {
         fire.status = 'unknown'; fire.reason = 'spend_breach'; state.halted ??= fire.reason;
       }
     }
+    recordDailyReach(state, op.input.finishedAt);
   } else if (op.type === 'complete') {
     if (fire.terminalArtifact !== null) throw new Error('terminal artifact already bound');
     if (!['running', 'unknown', 'failed', 'refused'].includes(fire.status)) throw new Error('cannot complete unsent fire');
     if (fire.status === 'running') {
-      if (fire.attempts.some((a) => a.finishedAt === null || a.costUsdMicros === null) ||
+      if (fire.attempts.some((a) => a.finishedAt === null || (!config.dailyBudgetVersion && a.costUsdMicros === null)) ||
           fire.claim.slots.filter((s) => s.role === 'initial').some((s) => !fire.attempts.some((a) => slotKey(s) === slotKey(a.slot)))) {
         throw new Error('incomplete attempt evidence');
       }
@@ -195,7 +291,7 @@ function reduce(state: MarketOpenStoreSnapshot, op: Operation, config: MarketOpe
     const pending = fire.attempts.some((a) => a.finishedAt === null);
     fire.status = pending ? 'unknown' : op.status;
     fire.reason = op.reason;
-    if (fire.status === 'unknown') state.halted ??= op.reason;
+    if (fire.status === 'unknown' && !(config.dailyBudgetVersion && op.reason === 'recovered_interrupted_run')) state.halted ??= op.reason;
   }
 }
 
@@ -222,6 +318,10 @@ export function readMarketOpenStore(rootInput: string): {
   const config = readCanonical(join(root, 'config.json'), configSchema);
   if (config.root !== root) throw new Error('store config root identity conflict');
   return { config, ...replayJournal(config) };
+}
+
+export function readMarketOpenDailyBudgetStatus(root: string, at: string, capUsdMicros: number) {
+  return computeDailyBudgetStatus(readMarketOpenStore(root).snapshot, at, capUsdMicros);
 }
 
 function replayJournal(config: MarketOpenStoreConfig, verify = (ref: MarketOpenArtifactReference) => {
@@ -289,6 +389,7 @@ export class MarketOpenStore {
   constructor(input: MarketOpenStoreConfig) {
     plainJson(input);
     const config = configSchema.parse(input);
+    marketOpenCohortKind(config.cohortId, config.cohortOrigin);
     if (process.platform === 'win32') throw new Error('market-open store requires POSIX durability');
     const root = resolve(config.root);
     try { mkdirSync(root, { mode: 0o700 }); nodeArtifactFs.syncDir(dirname(root)); }
@@ -313,7 +414,24 @@ export class MarketOpenStore {
         this.install(root, configPath, Buffer.from(canonicalize(this.#config)));
       } else {
         const pinned = readCanonical(configPath, configSchema);
-        if (canonicalize(pinned) !== canonicalize(this.#config)) throw new Error('store config identity conflict');
+        // Never let daily name/cap rollover bypass the shared ledger's origin.
+        // An untagged historical root is NOT rewritten just to add metadata:
+        // compare its exact compatibility classification then replay old genesis.
+        if (pinned.cohortOrigin !== undefined ? config.cohortOrigin === undefined ||
+            canonicalize(pinned.cohortOrigin) !== canonicalize(config.cohortOrigin) :
+            config.cohortOrigin !== undefined && (marketOpenCohortKind(pinned.cohortId) !==
+              marketOpenCohortKind(pinned.cohortId, config.cohortOrigin) ||
+              marketOpenCohortKind(config.cohortId) !== marketOpenCohortKind(config.cohortId, config.cohortOrigin))) {
+          throw new Error('market-open cohort origin conflict');
+        }
+        const { cohortOrigin: _origin, ...legacyConfig } = this.#config;
+        const comparable = pinned.cohortOrigin === undefined ? legacyConfig : this.#config;
+        // In a daily ledger cohort metadata describes its FIRST writer, not a
+        // budget boundary. The pinned genesis bytes never change on cap/slate/name changes.
+        if (pinned.dailyBudgetVersion && config.dailyBudgetVersion && pinned.root === root &&
+            pinned.policySha256 === config.policySha256 && pinned.admissionPolicySha256 === config.admissionPolicySha256) this.#config = pinned;
+        else if (canonicalize(pinned) !== canonicalize(comparable)) throw new Error('store config identity conflict');
+        else this.#config = pinned;
         this.replay(journal);
       }
       for (const fire of this.#state.fires) {
@@ -374,6 +492,42 @@ export class MarketOpenStore {
       fsyncSync(fd);
     } finally { closeSync(fd); }
     nodeArtifactFs.syncDir(dirname(path));
+  }
+
+  /** Persist effective cap/reach changes, but not every polling timestamp. */
+  updateDailyBudget(at: string, capUsdMicros: number): void {
+    this.healthy(); assertDailyBudgetCap(capUsdMicros);
+    const operation = { type: 'daily_budget' as const, at, capUsdMicros };
+    const next = structuredClone(this.#state);
+    reduce(next, operation, this.#config);
+    if (canonicalize(next) !== canonicalize(this.#state)) this.append(operation);
+  }
+
+  /** Persist a FIRST observation, without reserving/claiming an event. */
+  observeDaily(input: MarketOpenClaimInput, estimates: DailyAttemptEstimate[], recordedAt: string): MarketOpenDailyObservation {
+    this.healthy();
+    if (!this.#state.dailyBudget) throw new Error('not a daily budget ledger');
+    const existing = this.getDailyObservation(input.eventId);
+    if (existing) return existing;
+    this.append({ type: 'daily_observe', input, estimates, recordedAt });
+    return this.getDailyObservation(input.eventId)!;
+  }
+  getDailyObservation(eventId: string): MarketOpenDailyObservation | undefined {
+    this.healthy(); return structuredClone(this.#state.dailyBudget?.observations.find((o) => o.input.eventId === eventId));
+  }
+  /** The same locked reducer checks cap + two-event capacity AND creates the
+   * claim. There is no independent caller-provided permission token to bypass. */
+  evaluateDaily(eventId: string, at: string, capUsdMicros: number): MarketOpenDailyObservation {
+    this.healthy(); assertDailyBudgetCap(capUsdMicros);
+    const existing = this.getDailyObservation(eventId);
+    if (!existing) throw new Error('unknown daily observation');
+    if (existing.state !== 'held') return existing;
+    const operation = { type: 'daily_evaluate' as const, eventId, at, capUsdMicros };
+    const next = structuredClone(this.#state);
+    reduce(next, operation, this.#config);
+    // Repeated paused heartbeat ticks do not exhaust the append-only journal.
+    if (canonicalize(next) !== canonicalize(this.#state)) this.append(operation);
+    return this.getDailyObservation(eventId)!;
   }
 
   claim(input: MarketOpenClaimInput, claimedAt = new Date().toISOString()): { created: boolean; fire: MarketOpenFire } {
@@ -438,14 +592,14 @@ export class MarketOpenStore {
       }
     }
     if (matched.size !== fire.attempts.length) throw new Error('record receipt omitted durable attempts');
-    if (p.event.eventId !== eventId || p.event.cohortId !== this.#config.cohortId || p.runId !== claim.runId ||
+    if (p.event.eventId !== eventId || p.event.cohortId !== claimCohortId(claim, this.#config) || p.runId !== claim.runId ||
         p.event.gameId !== claim.preparation.game.gameId || p.event.market !== claim.preparation.market ||
         p.observedAt !== claim.preparation.observedAt || p.source.sha256 !== claim.sourceSha256 ||
         p.requestSha256 !== claim.requestSha256 || p.gameSha256 !== claim.gameSha256 ||
         p.policySha256 !== claim.policySha256 || p.reservationUsdMicros !== claim.reservationUsdMicros) {
       throw new Error('record receipt prepared identity conflict');
     }
-    const receipt = Object.freeze({ cohortId: this.#config.cohortId, eventId, runId: claim.runId,
+    const receipt = Object.freeze({ cohortId: claimCohortId(claim, this.#config), eventId, runId: claim.runId,
       requestSha256: claim.requestSha256, sourceSha256: claim.sourceSha256, gameSha256: claim.gameSha256,
       gameId: p.event.gameId, market: p.event.market, observedAt: p.observedAt, reservationUsdMicros: claim.reservationUsdMicros });
     recordReceipts.set(receipt, { store: this, run, env }); return receipt;
@@ -453,7 +607,7 @@ export class MarketOpenStore {
   completionReceipt(eventId: string): MarketOpenCompletionReceipt {
     this.healthy(); const fire = lookup(this.#state, eventId);
     if (fire.status !== 'completed' || fire.terminalArtifact === null) throw new Error('no clean completion receipt');
-    const receipt = Object.freeze({ cohortId: this.#config.cohortId, eventId, runId: fire.claim.runId,
+    const receipt = Object.freeze({ cohortId: claimCohortId(fire.claim, this.#config), eventId, runId: fire.claim.runId,
       requestSha256: fire.claim.requestSha256, artifact: Object.freeze({ ...fire.terminalArtifact }) });
     receipts.add(receipt); return receipt;
   }

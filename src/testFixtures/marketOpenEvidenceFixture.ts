@@ -7,6 +7,7 @@ import { deriveFireSpendReservationUsdMicros } from '../spendReservationPolicy.j
 import { MARKET_OPEN_POLICY } from '../marketOpen.js';
 import { MarketOpenProducer } from '../marketOpenProducer.js';
 import type { MarketOpenObservation } from '../marketOpenProducer.js';
+import type { MarketOpenStoreConfig } from '../marketOpenStore.js';
 import { parseRequestPayload, buildValidResponse } from '../mock.js';
 import { sealResponseEnvelope } from '../providers/responseEnvelope.js';
 import type { ProviderAdapter, ProviderResponse } from '../types.js';
@@ -23,12 +24,17 @@ export interface MarketOpenEvidenceFixtureOptions {
   sendAt?: string;
   attemptStepMs?: number;
   name?: string;
+  slateDate?: string;
+  cohortOrigin?: MarketOpenStoreConfig['cohortOrigin'];
+  dailyBudgetCapUsdMicros?: number;
+  additionalCohortNames?: readonly string[];
+  costEvidence?: 'unknown' | 'above-estimate';
 }
 export function marketOpenEvidenceObservation(market: 'moneyline' | 'total' = 'moneyline',
-  options: Pick<MarketOpenEvidenceFixtureOptions, 'observedAt' | 'openerCapturedAt'> = {}): MarketOpenObservation {
+  options: Pick<MarketOpenEvidenceFixtureOptions, 'observedAt' | 'openerCapturedAt' | 'slateDate'> = {}): MarketOpenObservation {
   const gameId = MARKET_OPEN_FIXTURE_GAME_ID;
   return { observedAt: options.observedAt ?? MARKET_OPEN_FIXTURE_OBSERVED_AT, market,
-    game: { gameId, slug: 'mil-pit', sport: 'mlb', matchTime: '2026-09-10T20:00:00.000Z', status: 'upcoming',
+    game: { gameId, slug: 'mil-pit', sport: 'mlb', matchTime: `${options.slateDate ?? '2026-09-10'}T20:00:00.000Z`, status: 'upcoming',
       homeTeam: { name: 'Pirates', abbreviation: 'PIT' }, awayTeam: { name: 'Brewers', abbreviation: 'MIL' },
       hasOdds: true, contestCreated: false, contestId: null, canCreateContest: true,
       externalIds: { jsonodds: gameId, sportspage: null, rundown: null } },
@@ -60,30 +66,43 @@ export async function createMarketOpenEvidenceFixture(options: MarketOpenEvidenc
       const { payload, gameId } = parseRequestPayload(turns);
       const market = payload.bundle.games[0]!.markets.total === undefined ? 'moneyline' : 'total';
       const role = turns.length > 2 ? 'repair' : 'initial';
-      const fire = producer.snapshot().fires.find((f) => f.claim.preparation.game.gameId === gameId && f.claim.preparation.market === market);
+      const fire = producer.snapshot().fires.find((f) => f.claim.preparation.name === producer.cohort.name &&
+        f.claim.preparation.game.gameId === gameId && f.claim.preparation.market === market);
       assert.ok(fire?.attempts.some((a) => a.slot.armId === arm.participantId && a.slot.role === role && a.finishedAt === null), 'durable intent precedes synthetic transport');
       calls.push({ armId: arm.participantId, market, role });
       let rawText = JSON.stringify(buildValidResponse(payload));
       if (options.failedArm && arm.participantId === (typeof options.failedArm === 'string' ? options.failedArm : target)) rawText = '{}';
       else if (options.repair && arm.participantId === target && role === 'initial') rawText = rawText.replace(/"cohortId":"[^"]*"/, '"cohortId":"wrong"');
+      const specialCost = arm.participantId === target ? options.costEvidence : undefined;
+      const usageRaw = specialCost === 'unknown' ? null : specialCost === 'above-estimate'
+        ? { input_tokens: 100_000_000, output_tokens: 10, total_tokens: 100_000_010 } : structuredClone(usage[arm.provider]);
       const response: ProviderResponse = { rawText, reportedModelId: arm.requestedModelId,
         providerResponseId: `synthetic-${arm.participantId}-${market}-${role}`,
-        responseEnvelope: sealResponseEnvelope(JSON.stringify({ synthetic: true, usage: usage[arm.provider] })), httpStatus: 200,
-        usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20, reasoningTokens: 0, billableOutputTokens: 10 },
-        usageRaw: structuredClone(usage[arm.provider]), requestParams: structuredClone(planArmRequest(arm, turns, callOptions).requestParams),
+        responseEnvelope: sealResponseEnvelope(JSON.stringify({ synthetic: true, usage: usageRaw })), httpStatus: 200,
+        usage: { inputTokens: specialCost === 'above-estimate' ? 100_000_000 : 10, outputTokens: 10,
+          totalTokens: specialCost === 'above-estimate' ? 100_000_010 : 20, reasoningTokens: 0, billableOutputTokens: 10 },
+        usageRaw, requestParams: structuredClone(planArmRequest(arm, turns, callOptions).requestParams),
         searchAudit: { queries: [{ query: `${role} synthetic query` }], results: [{ url: 'https://example.invalid/synthetic', title: 'synthetic' }], searchCount: 1, incomplete: [] } };
       clock += options.attemptStepMs ?? 0;
       return response;
     },
   });
-  const producerOptions = { root, name: options.name ?? 'evidence-test', slateDate: '2026-09-10', capUsdMicros: deriveFireSpendReservationUsdMicros({ rosterSize: MARKET_OPEN_POLICY.roster.length, maxRepairsPerArm: 1, version: MARKET_OPEN_POLICY.spendReservationPolicyVersion }) * 8,
+  const producerOptions = { root, name: options.name ?? 'evidence-test', slateDate: options.slateDate ?? '2026-09-10', capUsdMicros: deriveFireSpendReservationUsdMicros({ rosterSize: MARKET_OPEN_POLICY.roster.length, maxRepairsPerArm: 1, version: MARKET_OPEN_POLICY.spendReservationPolicyVersion }) * 8,
+    ...(options.cohortOrigin === undefined ? {} : { cohortOrigin: options.cohortOrigin }),
+    ...(options.dailyBudgetCapUsdMicros === undefined ? {} : { dailyBudget: { capUsdMicros: options.dailyBudgetCapUsdMicros, ledgerRoot: root } }),
     adapters, nowMs: () => clock };
   producer = new MarketOpenProducer(producerOptions);
   const cleanup = async () => { try { await producer.close(); } finally { rmSync(root, { recursive: true, force: true }); } };
   try {
     const results = [];
-    for (const market of options.markets ?? [options.market ?? 'moneyline']) {
-      results.push(await producer.observe(marketOpenEvidenceObservation(market, options)));
+    for (const name of [producerOptions.name, ...options.additionalCohortNames ?? []]) {
+      if (name !== producer.cohort.name) {
+        await producer.close();
+        producer = new MarketOpenProducer({ ...producerOptions, name });
+      }
+      for (const market of options.markets ?? [options.market ?? 'moneyline']) {
+        results.push(await producer.observe(marketOpenEvidenceObservation(market, options)));
+      }
     }
     const artifactPaths = results.flatMap((r) => 'artifactPath' in r && r.artifactPath ? [r.artifactPath] : []);
     const artifacts = artifactPaths.map((path) => JSON.parse(readFileSync(path, 'utf8')) as { records: Record<string, unknown>[] });

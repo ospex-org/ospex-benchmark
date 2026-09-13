@@ -6,13 +6,15 @@ import { runBaselines } from './baselines.js';
 import { createMarketOpenCohort, MARKET_OPEN_POLICY, prepareMarketOpenRun } from './marketOpen.js';
 import type { PreparedMarketOpenRun } from './marketOpen.js';
 import { MARKET_OPEN_ADMISSION_POLICY, MARKET_OPEN_ADMISSION_POLICY_SHA256 } from './marketOpenProducer.js';
+import { estimateMarketOpenDailyAttempts, MARKET_OPEN_DAILY_BUDGET_POLICY,
+  MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256 } from './marketOpenDailyBudget.js';
 import { marketOpenHistoryReference } from './marketOpenRecordBoundary.js';
-import { assertMarketOpenJson, readMarketOpenArtifact, readMarketOpenStore } from './marketOpenStore.js';
-import type { MarketOpenFire, MarketOpenStoreConfig } from './marketOpenStore.js';
+import { assertMarketOpenJson, marketOpenCohortKind, readMarketOpenArtifact, readMarketOpenStore } from './marketOpenStore.js';
+import type { MarketOpenAttemptSlot, MarketOpenFire, MarketOpenStoreConfig, MarketOpenCohortKind, MarketOpenCohortOrigin } from './marketOpenStore.js';
 import { configurationSha256, CONFIGURATION_DIGEST_VERSION } from './participantConfiguration.js';
 import { validateResponseText, extractDecisionFingerprint, fingerprintFromParsed, compareFingerprints } from './schema.js';
 import { computeFireSpendGuard } from './spendGuard.js';
-import { deriveConservativeActualUsdMicros } from './conservativeSpend.js';
+import { ConservativeSpendUnknownError, deriveConservativeActualUsdMicros } from './conservativeSpend.js';
 import { spendReservationPolicyForVersion } from './spendReservationPolicy.js';
 import { instantMs } from './time.js';
 import type { AttemptRecord } from './types.js';
@@ -21,6 +23,20 @@ export type MarketOpenRunEvidence = {
   readonly root: string; readonly artifactPath: string; readonly artifactSha256: string;
   readonly records: readonly Record<string, unknown>[];
   readonly fire: MarketOpenFire; readonly prepared: PreparedMarketOpenRun;
+  readonly cohortKind: MarketOpenCohortKind;
+  readonly cohortOrigin?: MarketOpenCohortOrigin;
+  readonly dailyBudget?: {
+    readonly admissionPolicy: typeof MARKET_OPEN_DAILY_BUDGET_POLICY;
+    readonly admissionPolicySha256: string;
+    readonly spend: { readonly policyVersion: typeof MARKET_OPEN_DAILY_BUDGET_POLICY.version;
+      readonly attempts: readonly { readonly slot: MarketOpenAttemptSlot; readonly costUsdMicros: number | null;
+        readonly spend: DailyAttemptSpend }[] };
+  };
+};
+type DailyAttemptSpend = {
+  readonly policyVersion: typeof MARKET_OPEN_DAILY_BUDGET_POLICY.version;
+  readonly estimateUsdMicros: number; readonly actualUsdMicros: number | null;
+  readonly unknownCost: boolean; readonly aboveEstimate: boolean;
 };
 const genuine = new WeakSet<MarketOpenRunEvidence>();
 type Row = Record<string, unknown>;
@@ -79,11 +95,20 @@ export function assertMarketOpenRecords(records: readonly Row[], evidence: Marke
   const current = readMarketOpenRun(evidence.root, evidence.artifactPath);
   equal(current.artifactSha256, evidence.artifactSha256, 'immutable artifact');
   equal(current.fire, evidence.fire, 'immutable fire');
+  equal(current.cohortKind, evidence.cohortKind, 'immutable cohort kind');
+  equal(current.cohortOrigin ?? null, evidence.cohortOrigin ?? null, 'immutable cohort origin');
 }
 
 function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenRunEvidence {
-  const cohort = createMarketOpenCohort(config);
-  fields(config, { ...cohort, admissionPolicySha256: MARKET_OPEN_ADMISSION_POLICY_SHA256 }, 'config');
+  // The persisted policy selects the verifier, never a caller or artifact label.
+  // Daily ledger genesis retains the first cohort only; each claim owns its cohort.
+  const daily = config.dailyBudgetVersion !== undefined;
+  const admissionPolicy = daily ? MARKET_OPEN_DAILY_BUDGET_POLICY : MARKET_OPEN_ADMISSION_POLICY;
+  const admissionPolicySha256 = daily ? MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256 : MARKET_OPEN_ADMISSION_POLICY_SHA256;
+  const genesisCohort = createMarketOpenCohort(config);
+  fields(config, { ...genesisCohort, admissionPolicySha256 }, 'config');
+  if (daily) equal(config.dailyBudgetVersion, MARKET_OPEN_DAILY_BUDGET_POLICY.version, 'daily budget version');
+  const cohort = daily ? createMarketOpenCohort(fire.claim.preparation) : genesisCohort;
   const prepared = prepareMarketOpenRun({ ...fire.claim.preparation, historyRows: fire.claim.preparation.historyRows, cohort });
   requireThat(prepared.state === 'prepared', 'claim history no longer prepares');
   const run = prepared.run; const p = run.provenance; const request = run.request;
@@ -101,7 +126,7 @@ function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenR
   assertMarketOpenJson(doc);
   requireThat(bytes.equals(Buffer.from(canonicalize(doc) + '\n')), 'noncanonical artifact bytes');
   equal(Object.keys(doc).sort(), ['version', 'admissionPolicy', 'admissionPolicySha256', 'eventId', 'runId', 'records', 'spend', 'admission'].sort(), 'artifact shape');
-  fields(doc, { version: 'market-open-produced-v1', admissionPolicy: MARKET_OPEN_ADMISSION_POLICY,
+  fields(doc, { version: daily ? 'market-open-daily-produced-v1' : 'market-open-produced-v1', admissionPolicy,
     admissionPolicySha256: config.admissionPolicySha256, eventId: p.event.eventId, runId: p.runId }, 'artifact identity');
   equal(doc.admission, { ...fire, status: 'running', reason: null, terminalArtifact: null, artifactInstalledAt: null }, 'pre-install admission');
   requireThat(Array.isArray(doc.records), 'missing records');
@@ -114,7 +139,7 @@ function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenR
     marketOpen: p, slateSha256: run.build.slateSha256, bundleTimestamp: request.requestBundle.bundleTimestamp,
     slateCutoffAt: request.requestBundle.cutoffAt, executionPolicy: MARKET_OPEN_POLICY.executionPolicy,
     promptScaffoldVersion: MARKET_OPEN_POLICY.promptScaffoldVersion, promptScaffoldSha256: MARKET_OPEN_POLICY.promptScaffoldSha256,
-    maxOutputTokens: MARKET_OPEN_ADMISSION_POLICY.maxOutputTokens,
+    maxOutputTokens: admissionPolicy.maxOutputTokens,
     eligibleGames: 1, excludedGames: 0, armGameResults: MARKET_OPEN_POLICY.roster.length,
     baselinePolicyVersion: MARKET_OPEN_POLICY.baselinePolicyVersion,
     armRoster: MARKET_OPEN_POLICY.roster.map((arm) => ({ participantId: arm.participantId,
@@ -141,6 +166,8 @@ function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenR
   const matched = new Set<string>();
   let expectedDecisions = 0;
   const perAttempt = spendReservationPolicyForVersion(MARKET_OPEN_POLICY.spendReservationPolicyVersion).providerAttemptReservationUsdMicros;
+  const dailyEstimates = daily ? estimateMarketOpenDailyAttempts(run) : [];
+  const dailySpendBySlot = new Map<string, DailyAttemptSpend>();
   MARKET_OPEN_POLICY.roster.forEach((arm, i) => {
     const response = responses[i]!;
     const identity = { ...common, participantId: arm.participantId, provider: arm.provider,
@@ -151,9 +178,9 @@ function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenR
       const durable = fire.attempts.find((a) => a.slot.armId === arm.participantId && a.slot.role === role);
       if (raw === null) { requireThat(role === 'repair' && durable === undefined, 'omitted initial/durable attempt'); return null; }
       const recorded = object(raw);
-      requireThat(durable !== undefined && durable.finishedAt !== null && durable.costUsdMicros !== null, 'missing settled attempt');
+      requireThat(durable !== undefined && durable.finishedAt !== null && (daily || durable.costUsdMicros !== null), 'missing settled attempt');
       const e = object(durable.evidence);
-      fields(e, { version: 'market-open-attempt-v1', role, arm }, 'attempt identity');
+      fields(e, { version: daily ? 'market-open-daily-attempt-v1' : 'market-open-attempt-v1', role, arm }, 'attempt identity');
       const a = object(e.attempt) as unknown as AttemptRecord;
       const { rawText, usage, ...rest } = a;
       equal({ ...recorded, acceptedAt: null }, { ...rest, answerText: rawText, tokens: usage }, 'durable response attempt');
@@ -167,13 +194,27 @@ function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenR
       if (recorded.acceptedAt !== null) requireThat(typeof recorded.acceptedAt === 'string' && a.responseAt !== null &&
         instantMs(recorded.acceptedAt) >= instantMs(a.responseAt) && instantMs(recorded.acceptedAt) < instantMs(request.cutoffAt) &&
         instantMs(recorded.acceptedAt) <= instantMs(meta.createdAt as string), 'accepted clock');
-      const cost = a.requestAt === null ? 0 : deriveConservativeActualUsdMicros({ provider: arm.provider,
-        requestedModelId: arm.requestedModelId, priceVersion: MARKET_OPEN_POLICY.priceVersion,
-        usageRaw: a.usageRaw, searchCount: a.searchAudit?.searchCount ?? null });
+      let cost: number | null = null;
+      try {
+        cost = a.requestAt === null ? 0 : deriveConservativeActualUsdMicros({ provider: arm.provider,
+          requestedModelId: arm.requestedModelId, priceVersion: MARKET_OPEN_POLICY.priceVersion,
+          usageRaw: a.usageRaw, searchCount: a.searchAudit?.searchCount ?? null });
+      } catch (error) {
+        if (!daily || !(error instanceof ConservativeSpendUnknownError)) throw error;
+      }
       equal(durable.costUsdMicros, cost, 'billable attempt cost');
-      const guard = computeFireSpendGuard({ arms: [{ ...arm, billingClass: 'billable', attempt: guardAttempt(a), repair: null }],
-        priceVersion: MARKET_OPEN_POLICY.priceVersion, perAttemptReservationUsdMicros: perAttempt });
-      equal(e.spend, guard, 'attempt spend'); requireThat(guard.kind === 'pass', 'non-pass completed attempt spend');
+      if (daily) {
+        const estimate = dailyEstimates.find((estimate) => canonicalize(estimate.slot) === canonicalize(durable.slot));
+        requireThat(estimate !== undefined, 'missing daily attempt estimate');
+        const spend = { policyVersion: MARKET_OPEN_DAILY_BUDGET_POLICY.version, estimateUsdMicros: estimate.usdMicros,
+          actualUsdMicros: cost, unknownCost: cost === null, aboveEstimate: cost !== null && cost > estimate.usdMicros };
+        equal(e.spend, spend, 'daily attempt spend');
+        dailySpendBySlot.set(canonicalize(durable.slot), spend);
+      } else {
+        const guard = computeFireSpendGuard({ arms: [{ ...arm, billingClass: 'billable', attempt: guardAttempt(a), repair: null }],
+          priceVersion: MARKET_OPEN_POLICY.priceVersion, perAttemptReservationUsdMicros: perAttempt });
+        equal(e.spend, guard, 'attempt spend'); requireThat(guard.kind === 'pass', 'non-pass completed attempt spend');
+      }
       matched.add(canonicalize(durable.slot));
       return recorded;
     });
@@ -218,7 +259,11 @@ function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenR
   equal(matched.size, fire.attempts.length, 'complete attempt correspondence');
   equal(decisions.length, expectedDecisions, 'complete decision correspondence');
   equal(fire.status === 'failed', responses.some((r) => r.outcome !== 'valid'), 'terminal outcome');
-  equal(doc.spend, computeFireSpendGuard({ arms: guardArms, priceVersion: MARKET_OPEN_POLICY.priceVersion,
+  const dailyBudget = daily ? { admissionPolicy: MARKET_OPEN_DAILY_BUDGET_POLICY, admissionPolicySha256,
+    spend: { policyVersion: MARKET_OPEN_DAILY_BUDGET_POLICY.version,
+      attempts: fire.attempts.map((attempt) => ({ slot: attempt.slot, costUsdMicros: attempt.costUsdMicros,
+        spend: dailySpendBySlot.get(canonicalize(attempt.slot))! })) } } : undefined;
+  equal(doc.spend, dailyBudget?.spend ?? computeFireSpendGuard({ arms: guardArms, priceVersion: MARKET_OPEN_POLICY.priceVersion,
     perAttemptReservationUsdMicros: perAttempt }), 'aggregate spend');
   const timing = object(meta.marketOpenTiming);
   requireThat(Number.isSafeInteger(timing.observationToSendWarningMs) && (timing.observationToSendWarningMs as number) >= 0, 'invalid advisory threshold');
@@ -232,7 +277,10 @@ function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenR
   });
   equal(timing, { openerPresentAt: p.source.row.captured_at, firstObservedAt: p.observedAt, claimedAt: fire.claimedAt,
     artifactInstalledAt: null, observationToSendWarningMs: warning, lagWarning: timings.some((a) => a.lagWarning), attempts: timings }, 'recomputed timing');
-  const evidence = deepFreeze({ root: config.root, artifactPath: ref.path, artifactSha256: ref.sha256, records, fire, prepared: run });
+  const evidence = deepFreeze({ root: config.root, artifactPath: ref.path, artifactSha256: ref.sha256, records, fire, prepared: run,
+    cohortKind: marketOpenCohortKind(cohort.cohortId, config.cohortOrigin),
+    ...(config.cohortOrigin === undefined ? {} : { cohortOrigin: config.cohortOrigin }),
+    ...(dailyBudget === undefined ? {} : { dailyBudget }) });
   genuine.add(evidence); return evidence;
 }
 function guardAttempt(a: AttemptRecord) {

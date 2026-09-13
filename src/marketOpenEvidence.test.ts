@@ -11,6 +11,48 @@ import { test } from 'node:test';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { assertMarketOpenRecords, discoverMarketOpenRuns, readMarketOpenRun } from './marketOpenEvidence.js';
 import { createMarketOpenEvidenceFixture } from './testFixtures/marketOpenEvidenceFixture.js';
+import { discoverScoreableMarketOpenRuns } from './discoverMarketOpenMain.js';
+
+test('adapter origin classifies ordinary names without changing raw evidence or model identity', { skip: process.platform === 'win32' }, async () => {
+  for (const syntheticAdapters of [true, false]) {
+    const fixture = await createMarketOpenEvidenceFixture({ name: 'ordinary-cohort',
+      cohortOrigin: { version: 'market-open-adapter-origin-v1', syntheticAdapters } });
+    try {
+      const bytes = readFileSync(fixture.artifactPath!);
+      const before = readMarketOpenStore(fixture.root);
+      const evidence = discoverMarketOpenRuns(fixture.root)[0]!;
+      const kind = syntheticAdapters ? 'rehearsal' : 'live';
+      assert.equal(evidence.cohortKind, kind);
+      assert.equal(discoverScoreableMarketOpenRuns(fixture.root)[0]!.cohortKind, kind);
+      assert.deepEqual(evidence.records, fixture.records);
+      assert.equal(evidence.records[0]!.mode, 'live', 'runtime mode is not adapter origin');
+      assert.deepEqual((evidence.records[0]!.armRoster as any[]).map(a => a.participantId), MARKET_OPEN_POLICY.roster.map(a => a.participantId));
+      assert.deepEqual(readFileSync(fixture.artifactPath!), bytes);
+      assert.deepEqual(readMarketOpenStore(fixture.root), before);
+      assert.equal(before.config.cohortOrigin!.syntheticAdapters, syntheticAdapters);
+    } finally { await fixture.cleanup(); }
+  }
+});
+
+test('only the exact historical untagged rehearsal is backfilled; all other untagged names remain live', { skip: process.platform === 'win32' }, async () => {
+  for (const [name, slateDate, kind] of [
+    ['rehearsal-no-spend', '2026-09-12', 'rehearsal'],
+    ['rehearsal-no-spend', '2026-09-10', 'live'],
+    ['synthetic-test', '2026-09-12', 'live'],
+  ] as const) {
+    const fixture = await createMarketOpenEvidenceFixture({ name, slateDate, observedAt: `${slateDate}T14:05:00.000Z` });
+    try {
+      const paths = [join(fixture.root, 'config.json'), fixture.artifactPath!, ...journal(fixture.root).map(e => e.path)];
+      const bytes = paths.map(path => readFileSync(path));
+      const evidence = discoverMarketOpenRuns(fixture.root)[0]!;
+      assert.equal(evidence.cohortKind, kind);
+      assert.equal(evidence.cohortOrigin, undefined);
+      if (kind === 'rehearsal') assert.equal(evidence.prepared.provenance.event.cohortId,
+        'market-open-v1-rehearsal-no-spend-2026-09-12-063596c704c034036d727e93f356436995639608aae8575fa36ab9f5c4a9ce51');
+      assert.deepEqual(paths.map(path => readFileSync(path)), bytes);
+    } finally { await fixture.cleanup(); }
+  }
+});
 
 // These adversarial mutations apply only to caller-owned synthetic fixtures.
 // Rehash all journal entries when changing an artifact so digest rejection

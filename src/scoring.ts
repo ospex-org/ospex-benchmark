@@ -2987,11 +2987,19 @@ export function scoredRecords(
       timing: run.marketOpenTiming,
       artifactInstalledAt: run.marketOpenEvidence.fire.artifactInstalledAt,
       status: run.marketOpenEvidence.fire.status, reason: run.marketOpenEvidence.fire.reason,
-      cost: { version: 'market-open-scored-cost-v1', priceVersion: MARKET_OPEN_POLICY.priceVersion,
+      ...(run.marketOpenEvidence.dailyBudget === undefined ? {} : {
+        admissionPolicy: run.marketOpenEvidence.dailyBudget.admissionPolicy,
+        admissionPolicySha256: run.marketOpenEvidence.dailyBudget.admissionPolicySha256,
+      }),
+      cost: { version: run.marketOpenEvidence.dailyBudget === undefined ? 'market-open-scored-cost-v1' : 'market-open-daily-scored-cost-v1',
+        priceVersion: MARKET_OPEN_POLICY.priceVersion,
         knownCostUsdMicros: run.marketOpenEvidence.fire.knownCostUsdMicros,
-        attempts: run.marketOpenEvidence.fire.attempts.map((attempt) => ({
+        attempts: run.marketOpenEvidence.fire.attempts.map((attempt, index) => ({
           armId: attempt.slot.armId, role: attempt.slot.role, ordinal: attempt.slot.ordinal,
           costUsdMicros: attempt.costUsdMicros,
+          ...(run.marketOpenEvidence!.dailyBudget === undefined ? {} : {
+            spend: run.marketOpenEvidence!.dailyBudget.spend.attempts[index]!.spend,
+          }),
         })),
       },
     } }),

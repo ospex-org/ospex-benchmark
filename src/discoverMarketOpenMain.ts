@@ -11,6 +11,8 @@ export function discoverScoreableMarketOpenRuns(root: string) {
     if (violations.length) throw new Error(`market-open run integrity: ${violations.join('; ')}`);
     return { version: 'market-open-score-discovery-v1' as const, runId: run.runId, cohortId: run.cohortId,
       artifactPath: evidence.artifactPath, artifactSha256: evidence.artifactSha256,
+      cohortKind: evidence.cohortKind,
+      ...(evidence.cohortOrigin === undefined ? {} : { cohortOrigin: evidence.cohortOrigin }),
       eventId: evidence.prepared.provenance.event.eventId, market: evidence.prepared.provenance.event.market,
       mode: run.mode, clockMode: run.clockMode, status: evidence.fire.status, reason: evidence.fire.reason };
   });
