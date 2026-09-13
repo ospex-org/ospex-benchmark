@@ -9,8 +9,8 @@ import { MARKET_OPEN_ADMISSION_POLICY, MARKET_OPEN_ADMISSION_POLICY_SHA256 } fro
 import { estimateMarketOpenDailyAttempts, MARKET_OPEN_DAILY_BUDGET_POLICY,
   MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256 } from './marketOpenDailyBudget.js';
 import { marketOpenHistoryReference } from './marketOpenRecordBoundary.js';
-import { assertMarketOpenJson, readMarketOpenArtifact, readMarketOpenStore } from './marketOpenStore.js';
-import type { MarketOpenAttemptSlot, MarketOpenFire, MarketOpenStoreConfig } from './marketOpenStore.js';
+import { assertMarketOpenJson, marketOpenCohortKind, readMarketOpenArtifact, readMarketOpenStore } from './marketOpenStore.js';
+import type { MarketOpenAttemptSlot, MarketOpenFire, MarketOpenStoreConfig, MarketOpenCohortKind, MarketOpenCohortOrigin } from './marketOpenStore.js';
 import { configurationSha256, CONFIGURATION_DIGEST_VERSION } from './participantConfiguration.js';
 import { validateResponseText, extractDecisionFingerprint, fingerprintFromParsed, compareFingerprints } from './schema.js';
 import { computeFireSpendGuard } from './spendGuard.js';
@@ -23,6 +23,8 @@ export type MarketOpenRunEvidence = {
   readonly root: string; readonly artifactPath: string; readonly artifactSha256: string;
   readonly records: readonly Record<string, unknown>[];
   readonly fire: MarketOpenFire; readonly prepared: PreparedMarketOpenRun;
+  readonly cohortKind: MarketOpenCohortKind;
+  readonly cohortOrigin?: MarketOpenCohortOrigin;
   readonly dailyBudget?: {
     readonly admissionPolicy: typeof MARKET_OPEN_DAILY_BUDGET_POLICY;
     readonly admissionPolicySha256: string;
@@ -93,6 +95,8 @@ export function assertMarketOpenRecords(records: readonly Row[], evidence: Marke
   const current = readMarketOpenRun(evidence.root, evidence.artifactPath);
   equal(current.artifactSha256, evidence.artifactSha256, 'immutable artifact');
   equal(current.fire, evidence.fire, 'immutable fire');
+  equal(current.cohortKind, evidence.cohortKind, 'immutable cohort kind');
+  equal(current.cohortOrigin ?? null, evidence.cohortOrigin ?? null, 'immutable cohort origin');
 }
 
 function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenRunEvidence {
@@ -274,6 +278,8 @@ function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenR
   equal(timing, { openerPresentAt: p.source.row.captured_at, firstObservedAt: p.observedAt, claimedAt: fire.claimedAt,
     artifactInstalledAt: null, observationToSendWarningMs: warning, lagWarning: timings.some((a) => a.lagWarning), attempts: timings }, 'recomputed timing');
   const evidence = deepFreeze({ root: config.root, artifactPath: ref.path, artifactSha256: ref.sha256, records, fire, prepared: run,
+    cohortKind: marketOpenCohortKind(cohort.cohortId, config.cohortOrigin),
+    ...(config.cohortOrigin === undefined ? {} : { cohortOrigin: config.cohortOrigin }),
     ...(dailyBudget === undefined ? {} : { dailyBudget }) });
   genuine.add(evidence); return evidence;
 }

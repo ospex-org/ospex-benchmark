@@ -16,7 +16,7 @@ import { spendReservationPolicyForVersion } from './spendReservationPolicy.js';
 import { instantMs } from './time.js';
 import { easternCalendarDay } from './slateDate.js';
 import type { MarketOpenCohort, PreparedMarketOpenRun } from './marketOpen.js';
-import type { MarketOpenClaimInput, MarketOpenFire, MarketOpenAttemptSlot, MarketOpenDailyObservation } from './marketOpenStore.js';
+import type { MarketOpenClaimInput, MarketOpenFire, MarketOpenAttemptSlot, MarketOpenDailyObservation, MarketOpenCohortOrigin } from './marketOpenStore.js';
 import type { RunContext } from './records.js';
 import type { AttemptBoundary } from './runner.js';
 import type { ArmSpec, AttemptRecord, GamesEndpointRow, MarketKey, ProviderAdapter, ProviderName } from './types.js';
@@ -43,6 +43,9 @@ export interface MarketOpenProducerOptions {
   dailyBudget?: { capUsdMicros: number; ledgerRoot: string };
   /** Trusted transport boundary. No provider factory, environment or credential IO here. */
   adapters: ReadonlyMap<string, ProviderAdapter>;
+  /** Trusted bridge derives this from adapter construction, never operator config.
+   * Optional only for byte-compatible historical library callers. */
+  cohortOrigin?: MarketOpenCohortOrigin;
   nowMs?: () => number;
   /** Monitoring threshold only. No expiry, refusal, retry or reservation effect. */
   observationToSendWarningMs?: number;
@@ -110,6 +113,7 @@ export class MarketOpenProducer {
     this.store = new MarketOpenStore({
       root: this.artifactRoot, ...this.cohort, capUsdMicros: this.dailyCapUsdMicros ?? options.capUsdMicros!,
       admissionPolicySha256: this.admissionPolicySha256,
+      ...(options.cohortOrigin === undefined ? {} : { cohortOrigin: options.cohortOrigin }),
       ...(options.dailyBudget ? { dailyBudgetVersion: MARKET_OPEN_DAILY_BUDGET_POLICY.version } : {}),
     });
   }

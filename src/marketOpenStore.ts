@@ -45,10 +45,31 @@ function plainJson(value: unknown, depth = 0): void {
 }
 export { plainJson as assertMarketOpenJson };
 const json = z.unknown().refine((v) => { try { plainJson(v); return true; } catch { return false; } }, 'invalid JSON evidence');
+const cohortOriginSchema = z.object({ version: z.literal('market-open-adapter-origin-v1'),
+  syntheticAdapters: z.boolean() }).strict();
+export type MarketOpenCohortOrigin = z.infer<typeof cohortOriginSchema>;
+export type MarketOpenCohortKind = 'live' | 'rehearsal';
+export const HISTORICAL_MARKET_OPEN_REHEARSAL = 'market-open-v1-rehearsal-no-spend-2026-09-12-063596c704c034036d727e93f356436995639608aae8575fa36ab9f5c4a9ce51';
+
+/** Classification is cohort metadata, never request/model identity or run mode.
+ * Untagged history stays byte-exact; only this known cohort is backfilled.
+ * Like the journal itself, the local root is an operator-owned trust boundary. */
+export function marketOpenCohortKind(cohortId: string, origin?: MarketOpenCohortOrigin): MarketOpenCohortKind {
+  if (origin !== undefined) {
+    plainJson(origin); cohortOriginSchema.parse(origin);
+    if (cohortId === HISTORICAL_MARKET_OPEN_REHEARSAL && !origin.syntheticAdapters) {
+      throw new Error('market-open cohort origin conflict with historical rehearsal');
+    }
+    return origin.syntheticAdapters ? 'rehearsal' : 'live';
+  }
+  return cohortId === HISTORICAL_MARKET_OPEN_REHEARSAL ? 'rehearsal' : 'live';
+}
+
 const configSchema = z.object({ root: text, cohortId: text, name: text,
   slateDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), policySha256: digest,
   admissionPolicySha256: digest, capUsdMicros: money.positive(),
-  dailyBudgetVersion: z.literal('market-open-daily-budget-v1').optional() }).strict();
+  dailyBudgetVersion: z.literal('market-open-daily-budget-v1').optional(),
+  cohortOrigin: cohortOriginSchema.optional() }).strict();
 const slotSchema = z.object({ armId: text, role: z.enum(['initial', 'repair']), ordinal: z.number().int().min(0).max(1) }).strict()
   .refine((s) => s.ordinal === (s.role === 'initial' ? 0 : 1), 'invalid role ordinal');
 const preparationSchema = z.object({ name: text, slateDate: text, game,
@@ -368,6 +389,7 @@ export class MarketOpenStore {
   constructor(input: MarketOpenStoreConfig) {
     plainJson(input);
     const config = configSchema.parse(input);
+    marketOpenCohortKind(config.cohortId, config.cohortOrigin);
     if (process.platform === 'win32') throw new Error('market-open store requires POSIX durability');
     const root = resolve(config.root);
     try { mkdirSync(root, { mode: 0o700 }); nodeArtifactFs.syncDir(dirname(root)); }
@@ -392,11 +414,24 @@ export class MarketOpenStore {
         this.install(root, configPath, Buffer.from(canonicalize(this.#config)));
       } else {
         const pinned = readCanonical(configPath, configSchema);
+        // Never let daily name/cap rollover bypass the shared ledger's origin.
+        // An untagged historical root is NOT rewritten just to add metadata:
+        // compare its exact compatibility classification then replay old genesis.
+        if (pinned.cohortOrigin !== undefined ? config.cohortOrigin === undefined ||
+            canonicalize(pinned.cohortOrigin) !== canonicalize(config.cohortOrigin) :
+            config.cohortOrigin !== undefined && (marketOpenCohortKind(pinned.cohortId) !==
+              marketOpenCohortKind(pinned.cohortId, config.cohortOrigin) ||
+              marketOpenCohortKind(config.cohortId) !== marketOpenCohortKind(config.cohortId, config.cohortOrigin))) {
+          throw new Error('market-open cohort origin conflict');
+        }
+        const { cohortOrigin: _origin, ...legacyConfig } = this.#config;
+        const comparable = pinned.cohortOrigin === undefined ? legacyConfig : this.#config;
         // In a daily ledger cohort metadata describes its FIRST writer, not a
         // budget boundary. The pinned genesis bytes never change on cap/slate/name changes.
         if (pinned.dailyBudgetVersion && config.dailyBudgetVersion && pinned.root === root &&
             pinned.policySha256 === config.policySha256 && pinned.admissionPolicySha256 === config.admissionPolicySha256) this.#config = pinned;
-        else if (canonicalize(pinned) !== canonicalize(this.#config)) throw new Error('store config identity conflict');
+        else if (canonicalize(pinned) !== canonicalize(comparable)) throw new Error('store config identity conflict');
+        else this.#config = pinned;
         this.replay(journal);
       }
       for (const fire of this.#state.fires) {

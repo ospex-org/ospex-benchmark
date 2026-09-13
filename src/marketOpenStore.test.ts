@@ -8,9 +8,11 @@ import { once } from 'node:events';
 import { nodeArtifactFs } from './fireArtifactSink.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { MarketOpenStore, type MarketOpenClaimInput, type MarketOpenStoreConfig } from './marketOpenStore.js';
+import { MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256 } from './marketOpenDailyBudget.js';
 
 const posixOnly = { skip: process.platform === 'win32' ? 'POSIX durability required' : false };
 const AT = '2026-09-10T14:05:00.000Z';
+const origin = (syntheticAdapters: boolean) => ({ version: 'market-open-adapter-origin-v1' as const, syntheticAdapters });
 const SLOT = { armId: 'arm-a', role: 'initial' as const, ordinal: 0 };
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'market-open-store-'));
@@ -29,6 +31,35 @@ function fixture() {
   });
   return { config, claim, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
+
+test('new tagged stores reject origin changes or omission, including daily-ledger cohort rollover', posixOnly, () => {
+  for (const daily of [false, true]) for (const synthetic of [true, false]) for (const omit of [false, true]) {
+    const f = fixture();
+    try {
+      const config = { ...f.config, cohortOrigin: origin(synthetic),
+        ...(daily ? { dailyBudgetVersion: 'market-open-daily-budget-v1' as const,
+          admissionPolicySha256: MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256 } : {}) };
+      new MarketOpenStore(config).close();
+      new MarketOpenStore(config).close();
+      const changed = { ...config, ...(daily ? { name: 'next-name', slateDate: '2026-09-11' } : {}) };
+      if (omit) delete (changed as Partial<typeof changed>).cohortOrigin;
+      else changed.cohortOrigin = origin(!synthetic);
+      assert.throws(() => new MarketOpenStore(changed), /origin.*conflict/);
+    } finally { f.cleanup(); }
+  }
+});
+
+test('historical config and journal bytes survive matching automatic origin on reopen', posixOnly, () => {
+  const f = fixture();
+  try {
+    new MarketOpenStore(f.config).close();
+    const paths = [join(f.config.root, 'config.json'), join(f.config.root, 'journal', '0000000000.json')];
+    const before = paths.map(path => readFileSync(path));
+    new MarketOpenStore({ ...f.config, cohortOrigin: origin(false) }).close();
+    assert.deepEqual(paths.map(path => readFileSync(path)), before);
+    assert.throws(() => new MarketOpenStore({ ...f.config, cohortOrigin: origin(true) }), /origin.*conflict/);
+  } finally { f.cleanup(); }
+});
 
 test('atomic claim reserves once; exact replay preserves first observation and original input', posixOnly, () => {
   const f = fixture();

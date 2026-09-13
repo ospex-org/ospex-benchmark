@@ -7,6 +7,7 @@ import { deriveFireSpendReservationUsdMicros } from '../spendReservationPolicy.j
 import { MARKET_OPEN_POLICY } from '../marketOpen.js';
 import { MarketOpenProducer } from '../marketOpenProducer.js';
 import type { MarketOpenObservation } from '../marketOpenProducer.js';
+import type { MarketOpenStoreConfig } from '../marketOpenStore.js';
 import { parseRequestPayload, buildValidResponse } from '../mock.js';
 import { sealResponseEnvelope } from '../providers/responseEnvelope.js';
 import type { ProviderAdapter, ProviderResponse } from '../types.js';
@@ -23,15 +24,17 @@ export interface MarketOpenEvidenceFixtureOptions {
   sendAt?: string;
   attemptStepMs?: number;
   name?: string;
+  slateDate?: string;
+  cohortOrigin?: MarketOpenStoreConfig['cohortOrigin'];
   dailyBudgetCapUsdMicros?: number;
   additionalCohortNames?: readonly string[];
   costEvidence?: 'unknown' | 'above-estimate';
 }
 export function marketOpenEvidenceObservation(market: 'moneyline' | 'total' = 'moneyline',
-  options: Pick<MarketOpenEvidenceFixtureOptions, 'observedAt' | 'openerCapturedAt'> = {}): MarketOpenObservation {
+  options: Pick<MarketOpenEvidenceFixtureOptions, 'observedAt' | 'openerCapturedAt' | 'slateDate'> = {}): MarketOpenObservation {
   const gameId = MARKET_OPEN_FIXTURE_GAME_ID;
   return { observedAt: options.observedAt ?? MARKET_OPEN_FIXTURE_OBSERVED_AT, market,
-    game: { gameId, slug: 'mil-pit', sport: 'mlb', matchTime: '2026-09-10T20:00:00.000Z', status: 'upcoming',
+    game: { gameId, slug: 'mil-pit', sport: 'mlb', matchTime: `${options.slateDate ?? '2026-09-10'}T20:00:00.000Z`, status: 'upcoming',
       homeTeam: { name: 'Pirates', abbreviation: 'PIT' }, awayTeam: { name: 'Brewers', abbreviation: 'MIL' },
       hasOdds: true, contestCreated: false, contestId: null, canCreateContest: true,
       externalIds: { jsonodds: gameId, sportspage: null, rundown: null } },
@@ -84,7 +87,8 @@ export async function createMarketOpenEvidenceFixture(options: MarketOpenEvidenc
       return response;
     },
   });
-  const producerOptions = { root, name: options.name ?? 'evidence-test', slateDate: '2026-09-10', capUsdMicros: deriveFireSpendReservationUsdMicros({ rosterSize: MARKET_OPEN_POLICY.roster.length, maxRepairsPerArm: 1, version: MARKET_OPEN_POLICY.spendReservationPolicyVersion }) * 8,
+  const producerOptions = { root, name: options.name ?? 'evidence-test', slateDate: options.slateDate ?? '2026-09-10', capUsdMicros: deriveFireSpendReservationUsdMicros({ rosterSize: MARKET_OPEN_POLICY.roster.length, maxRepairsPerArm: 1, version: MARKET_OPEN_POLICY.spendReservationPolicyVersion }) * 8,
+    ...(options.cohortOrigin === undefined ? {} : { cohortOrigin: options.cohortOrigin }),
     ...(options.dailyBudgetCapUsdMicros === undefined ? {} : { dailyBudget: { capUsdMicros: options.dailyBudgetCapUsdMicros, ledgerRoot: root } }),
     adapters, nowMs: () => clock };
   producer = new MarketOpenProducer(producerOptions);
