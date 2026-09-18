@@ -167,7 +167,7 @@ test('concurrent in-flight estimates share one cap and exclusive ledger lock', p
     assert.ok(f.producer.dailyBudgetStatus()!.inflightEstimateUsdMicros > 0);
     assert.equal((await f.producer.observe(observation('total'))).state, 'held');
     assert.equal(f.producer.snapshot().fires.length, 1);
-    assert.throws(() => new MarketOpenProducer(f.options), /writer lock occupied/);
+    assert.throws(() => new MarketOpenProducer(f.options), /market-open writer lock:.*kernel guard/);
     release(); assert.equal((await first).state, 'completed');
     assert.equal(f.producer.snapshot().halted, null);
   } finally { release(); await f.cleanup(); }

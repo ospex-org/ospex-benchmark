@@ -1,10 +1,11 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync,
-  readdirSync, realpathSync, rmdirSync, unlinkSync } from 'node:fs';
+  readdirSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { installBytesNoClobber, nodeArtifactFs } from './fireArtifactSink.js';
+import { LocalProcessLock } from './localProcessLock.js';
 import { instantMs } from './time.js';
 import { assertPreparedMarketOpenRun, createMarketOpenCohort, prepareMarketOpenRun } from './marketOpen.js';
 import { assertDailyBudgetCap, computeDailyBudgetStatus, estimateMarketOpenDailyAttempts,
@@ -13,7 +14,7 @@ import type { DailyAttemptEstimate } from './marketOpenDailyBudget.js';
 import type { PreparedMarketOpenRun } from './marketOpen.js';
 import type { RunEnvelope } from './runner.js';
 
-/** Private persistent local POSIX root only. No shared/network FS or automatic stale-lock recovery. */
+/** Private persistent local Linux root only. No shared/network FS or multi-host writers. */
 const MAX_BYTES = 8 * 1024 * 1024;
 const MAX_JOURNAL_BYTES = 256 * 1024 * 1024;
 const digest = z.string().regex(/^[0-9a-f]{64}$/);
@@ -384,16 +385,13 @@ export function readMarketOpenArtifact(root: string, ref: MarketOpenArtifactRefe
 }
 
 /**
- * Lock ownership survives process death by intentionally remaining on disk. OFFLINE recovery:
- * stop ALL writers, preserve the entire root, remove ONLY .writer-lock, then reopen. Never
- * reset config/journal/reservations. PID liveness is NOT sufficient authority to steal a lock.
- * Disk uncertainty permanently poisons this handle and leaves the lock for that procedure.
+ * Automatically reclaim only a provably dead local owner, retaining a durable recovery
+ * record and the previous marker. Never reset config/journal/reservations or resend an
+ * uncertain attempt. Live/unknown owners and disk uncertainty still refuse plainly.
  */
 export class MarketOpenStore {
   readonly #config: MarketOpenStoreConfig;
-  readonly #lock: string;
-  readonly #owner: string;
-  readonly #lockInode: number;
+  readonly #lock: LocalProcessLock;
   #state: MarketOpenStoreSnapshot = { reservedUsdMicros: 0, knownCostUsdMicros: 0, halted: null, fires: [] };
   #seq = 0;
   #previous: string | null = null;
@@ -411,19 +409,15 @@ export class MarketOpenStore {
     catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
     if (!lstatSync(root).isDirectory() || realpathSync(root) !== root) throw new Error('store root must be a real local directory');
     this.#config = { ...config, root };
-    this.#lock = join(root, '.writer-lock');
-    try { mkdirSync(this.#lock, { mode: 0o700 }); }
-    catch { throw new Error('market-open writer lock occupied; OFFLINE recovery required, never automatically stolen'); }
-    this.#lockInode = lstatSync(this.#lock).ino;
-    this.#owner = canonicalize({ nonce: randomBytes(32).toString('hex'), pid: process.pid });
+    this.#lock = new LocalProcessLock(root, '.writer-lock', 'market-open writer lock');
     try {
-      nodeArtifactFs.syncDir(root);
-      this.install(this.#lock, join(this.#lock, 'owner.json'), Buffer.from(this.#owner));
       const configPath = join(root, 'config.json');
       const journal = join(root, 'journal');
       const names = readdirSync(root);
       if (!names.includes('config.json')) {
-        if (names.some((n) => n !== '.writer-lock')) throw new Error('incomplete store initialization; OFFLINE recovery required');
+        if (names.some((n) => !['.writer-lock', '.writer-lock.guard', '.writer-lock-recoveries'].includes(n))) {
+          throw new Error('incomplete store initialization; OFFLINE recovery required');
+        }
         mkdirSync(journal, { mode: 0o700 }); nodeArtifactFs.syncDir(root);
         this.append({ type: 'init', configSha256: sha256Hex(canonicalize(this.#config)) });
         this.install(root, configPath, Buffer.from(canonicalize(this.#config)));
@@ -453,7 +447,7 @@ export class MarketOpenStore {
         if (fire.status === 'running') this.append({ type: 'terminal', eventId: fire.claim.eventId,
           status: 'unknown', reason: 'recovered_interrupted_run' });
       }
-    } catch (e) { this.#poisoned = true; throw e; }
+    } catch (e) { this.#poisoned = true; this.#lock.abandon(); throw e; }
   }
 
   private install(dir: string, path: string, buffer: Buffer): void {
@@ -469,10 +463,7 @@ export class MarketOpenStore {
     if (this.#poisoned) throw new Error('market-open store poisoned; OFFLINE recovery required');
     if (this.#closed) throw new Error('market-open store closed');
     try {
-      const lock = lstatSync(this.#lock);
-      if (!lock.isDirectory() || lock.ino !== this.#lockInode || readFileSync(join(this.#lock, 'owner.json'), 'utf8') !== this.#owner) {
-        throw new Error('writer lock ownership changed');
-      }
+      this.#lock.assertOwned();
     } catch (e) { this.#poisoned = true; throw e; }
   }
   private append(op: Operation): void {
@@ -628,7 +619,7 @@ export class MarketOpenStore {
   }
   close(): void {
     this.healthy();
-    try { unlinkSync(join(this.#lock, 'owner.json')); rmdirSync(this.#lock); nodeArtifactFs.syncDir(this.#config.root); }
+    try { this.#lock.release(); }
     catch (e) { this.#poisoned = true; throw e; }
     this.#closed = true;
   }
