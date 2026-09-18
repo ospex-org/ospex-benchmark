@@ -1,3 +1,4 @@
+import { withMarketOpenEvidenceAdmission } from './marketOpenEvidence.js';
 import { readRunArtifactFile } from './runArtifactInput.js';
 import { hasMarketOpenProvenance, MARKET_OPEN_SQL_PUBLICATION_BLOCKED } from './marketOpenPublication.js';
 import { basename, dirname, join, resolve, relative, sep } from 'node:path';
@@ -152,6 +153,10 @@ export async function runScoreCli(
   argv: string[],
   deps: ScoreCliDeps = DEFAULT_DEPS,
 ): Promise<number> {
+  return withMarketOpenEvidenceAdmission(() => runScoreCliInInvocation(argv, deps));
+}
+
+async function runScoreCliInInvocation(argv: string[], deps: ScoreCliDeps): Promise<number> {
   const { fetchCloses, printLine, printError } = deps;
   const loaded = loadDotEnv();
   const options = parseArgs(argv, printLine);

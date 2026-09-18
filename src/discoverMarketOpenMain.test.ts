@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { test } from 'node:test';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -41,6 +43,23 @@ test('market-open discovery preserves installed failed-arm outcome instead of si
     const rows = discoverScoreableMarketOpenRuns(fixture.root);
     assert.equal(rows.length, 1); assert.equal(rows[0]!.status, 'failed'); assert.equal(rows[0]!.reason, 'arm_outcome_failure');
   } finally { await fixture.cleanup(); }
+});
+
+test('multi-artifact discovery admits the root exactly once per invocation', posix, async (t) => {
+  const fixture = await createMarketOpenEvidenceFixture({ markets: ['moneyline', 'total'] });
+  const original = fs.readFileSync;
+  let admissions = 0;
+  const spy = t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+    if (args[0] === resolve(fixture.root, 'config.json')) admissions++;
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.equal(discoverScoreableMarketOpenRuns(fixture.root).length, 2);
+    assert.equal(admissions, 1);
+    assert.equal(discoverScoreableMarketOpenRuns(fixture.root).length, 2);
+    assert.equal(admissions, 2, 'a new invocation re-verifies the root');
+  } finally { spy.mock.restore(); syncBuiltinESMExports(); await fixture.cleanup(); }
 });
 
 test('market-open discovery empty initialized root emits no descriptors', posix, async () => {
