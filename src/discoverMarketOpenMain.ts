@@ -1,11 +1,11 @@
 import { pathToFileURL } from 'node:url';
-import { discoverMarketOpenRuns } from './marketOpenEvidence.js';
+import { discoverMarketOpenRuns, withMarketOpenEvidenceAdmission } from './marketOpenEvidence.js';
 import { canonicalize } from './canonical.js';
 import { parseRunRecords, verifyRunIntegrity } from './scoring.js';
 
 /** Source-only scheduler input: no providers, closes, credentials, writes, or freshness selector. */
 export function discoverScoreableMarketOpenRuns(root: string) {
-  return discoverMarketOpenRuns(root).map((evidence) => {
+  return withMarketOpenEvidenceAdmission(() => discoverMarketOpenRuns(root).map((evidence) => {
     const run = parseRunRecords(evidence.records.map((r) => canonicalize(r)), { marketOpenEvidence: evidence });
     const violations = verifyRunIntegrity(run);
     if (violations.length) throw new Error(`market-open run integrity: ${violations.join('; ')}`);
@@ -15,7 +15,7 @@ export function discoverScoreableMarketOpenRuns(root: string) {
       ...(evidence.cohortOrigin === undefined ? {} : { cohortOrigin: evidence.cohortOrigin }),
       eventId: evidence.prepared.provenance.event.eventId, market: evidence.prepared.provenance.event.market,
       mode: run.mode, clockMode: run.clockMode, status: evidence.fire.status, reason: evidence.fire.reason };
-  });
+  }));
 }
 
 export function runMarketOpenDiscoveryCli(argv: string[], print = console.log): number {

@@ -1,17 +1,19 @@
 import { readFileSync } from 'node:fs';
 import { hasMarketOpenProvenance } from './marketOpenPublication.js';
 import { canonicalize } from './canonical.js';
-import { assertMarketOpenRecords, discoverMarketOpenRuns, readMarketOpenRun } from './marketOpenEvidence.js';
+import { assertMarketOpenRecords, discoverMarketOpenRuns, readMarketOpenRun, readInvocationMarketOpenRun } from './marketOpenEvidence.js';
 import type { MarketOpenRunEvidence } from './marketOpenEvidence.js';
 
 export interface RunArtifactInput { text: string; marketOpenEvidence?: MarketOpenRunEvidence }
 
 /** Resolve the installed wrapper (or its exact extracted records) against an explicit trusted root. */
 export function readRunArtifactFile(path: string, options?: { marketOpenEvidenceRoot?: string | undefined }): RunArtifactInput {
+  const root = options?.marketOpenEvidenceRoot;
+  const admitted = root === undefined ? undefined : readInvocationMarketOpenRun(root, path);
+  if (admitted) return { text: admitted.records.map((r) => canonicalize(r)).join('\n') + '\n', marketOpenEvidence: admitted };
   const text = readFileSync(path, 'utf8');
   let envelope: { version?: unknown; records?: unknown } | null = null;
   try { envelope = JSON.parse(text) as { version?: unknown; records?: unknown } | null; } catch { /* ordinary NDJSON */ }
-  const root = options?.marketOpenEvidenceRoot;
   if (envelope?.version === 'market-open-produced-v1' || envelope?.version === 'market-open-daily-produced-v1') {
     if (root === undefined) throw new Error('market-open input requires --evidence-root');
     const evidence = readMarketOpenRun(root, path);

@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { types } from 'node:util';
 import { lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { canonicalize } from './canonical.js';
@@ -9,7 +11,7 @@ import { MARKET_OPEN_ADMISSION_POLICY, MARKET_OPEN_ADMISSION_POLICY_SHA256 } fro
 import { estimateMarketOpenDailyAttempts, MARKET_OPEN_DAILY_BUDGET_POLICY,
   MARKET_OPEN_DAILY_BUDGET_POLICY_SHA256 } from './marketOpenDailyBudget.js';
 import { marketOpenHistoryReference } from './marketOpenRecordBoundary.js';
-import { assertMarketOpenJson, marketOpenCohortKind, readMarketOpenArtifact, readMarketOpenStore } from './marketOpenStore.js';
+import { assertMarketOpenJson, marketOpenCohortKind, readMarketOpenArtifact, readMarketOpenStore, readMarketOpenStoreWithArtifacts } from './marketOpenStore.js';
 import type { MarketOpenAttemptSlot, MarketOpenFire, MarketOpenStoreConfig, MarketOpenCohortKind, MarketOpenCohortOrigin } from './marketOpenStore.js';
 import { configurationSha256, CONFIGURATION_DIGEST_VERSION } from './participantConfiguration.js';
 import { validateResponseText, extractDecisionFingerprint, fingerprintFromParsed, compareFingerprints } from './schema.js';
@@ -39,6 +41,67 @@ type DailyAttemptSpend = {
   readonly unknownCost: boolean; readonly aboveEstimate: boolean;
 };
 const genuine = new WeakSet<MarketOpenRunEvidence>();
+type RootAdmission = {
+  store: ReturnType<typeof readMarketOpenStoreWithArtifacts> | null;
+  evidence: Map<string, MarketOpenRunEvidence>;
+};
+type Invocation = { active: boolean; roots: Map<string, RootAdmission> };
+const invocation = new AsyncLocalStorage<Invocation>();
+
+/** One read-only invocation owns one verified prefix per root. Nesting shares
+ * that prefix; independent calls (including concurrent async calls) never do.
+ * Return/await all work: settlement clears the bytes and deactivates inherited
+ * async contexts. No evidence capability retains this invocation's authority. */
+export function withMarketOpenEvidenceAdmission<T>(operation: () => T): T {
+  if (invocation.getStore()?.active) return operation();
+  const scope: Invocation = { active: true, roots: new Map() };
+  const close = () => { scope.active = false; scope.roots.clear(); };
+  return invocation.run(scope, () => {
+    try {
+      const result = operation();
+      if (types.isPromise(result)) return result.finally(close) as T;
+      close();
+      return result;
+    } catch (error) { close(); throw error; }
+  });
+}
+
+function admittedRoot(rootInput: string): RootAdmission | undefined {
+  const scope = invocation.getStore();
+  if (!scope?.active) return undefined;
+  const root = resolve(rootInput);
+  let admitted = scope.roots.get(root);
+  if (!admitted) {
+    requireThat(lstatSync(root).isDirectory() && realpathSync(root) === root, 'invalid evidence root');
+    admitted = { store: readdirSync(root).length === 0 ? null : readMarketOpenStoreWithArtifacts(root), evidence: new Map() };
+    scope.roots.set(root, admitted);
+  }
+  return admitted;
+}
+
+function admitFromRoot(root: RootAdmission, fire: MarketOpenFire): MarketOpenRunEvidence {
+  const path = fire.terminalArtifact!.path;
+  let evidence = root.evidence.get(path);
+  if (!evidence) {
+    const store = root.store!;
+    const bytes = store.artifacts.get(path);
+    requireThat(bytes !== undefined, 'missing verified artifact bytes');
+    evidence = admit(store.config, fire, bytes);
+    root.evidence.set(path, evidence);
+  }
+  return evidence;
+}
+
+/** Fast path only for an installed artifact in the current invocation. Extracted
+ * records and standalone callers must still use the ordinary input boundary. */
+export function readInvocationMarketOpenRun(root: string, artifactPath: string): MarketOpenRunEvidence | undefined {
+  const admitted = admittedRoot(root);
+  if (!admitted) return undefined;
+  const matches = admitted.store?.snapshot.fires.filter((f) => installedOutcome(f) && f.terminalArtifact?.path === resolve(artifactPath)) ?? [];
+  if (!matches.length) return undefined;
+  requireThat(matches.length === 1, 'target is not a completed journal-installed artifact');
+  return admitFromRoot(admitted, matches[0]!);
+}
 type Row = Record<string, unknown>;
 function object(value: unknown): Row {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid market-open evidence object');
@@ -68,6 +131,10 @@ function installedOutcome(fire: MarketOpenFire): boolean {
  * is an empty source; a partial initialization or corrupt root fails closed.
  * The root is an operator-owned trust boundary, not cryptographic attestation. */
 export function discoverMarketOpenRuns(rootInput: string): MarketOpenRunEvidence[] {
+  const admitted = admittedRoot(rootInput);
+  if (admitted) return (admitted.store?.snapshot.fires ?? []).filter(installedOutcome)
+    .sort((a, b) => a.claim.eventId < b.claim.eventId ? -1 : a.claim.eventId > b.claim.eventId ? 1 : 0)
+    .map((fire) => admitFromRoot(admitted, fire));
   const root = resolve(rootInput);
   requireThat(lstatSync(root).isDirectory() && realpathSync(root) === root, 'invalid evidence root');
   if (readdirSync(root).length === 0) return [];
@@ -78,6 +145,11 @@ export function discoverMarketOpenRuns(rootInput: string): MarketOpenRunEvidence
 }
 
 export function readMarketOpenRun(root: string, artifactPath: string): MarketOpenRunEvidence {
+  if (invocation.getStore()?.active) {
+    const evidence = readInvocationMarketOpenRun(root, artifactPath);
+    requireThat(evidence !== undefined, 'target is not a completed journal-installed artifact');
+    return evidence;
+  }
   const target = resolve(artifactPath);
   const { config, snapshot } = readMarketOpenStore(root);
   const matches = snapshot.fires.filter((f) => installedOutcome(f) && f.terminalArtifact?.path === target);
@@ -86,8 +158,9 @@ export function readMarketOpenRun(root: string, artifactPath: string): MarketOpe
 }
 
 /** Authentication precedes every property read. A structural copy, caller-minted
- * wrapper, or extracted subset cannot become evidence. Re-read the exact target
- * before use so a deleted/tampered root cannot retain admission through a cache. */
+ * wrapper, or extracted subset cannot become evidence. Inside an invocation,
+ * compare against that invocation's verified immutable prefix. Outside it (or
+ * in the next invocation), re-admit so escaped evidence never grants freshness. */
 export function assertMarketOpenRecords(records: readonly Row[], evidence: MarketOpenRunEvidence | undefined): void {
   requireThat(evidence !== undefined && genuine.has(evidence), 'requires genuine locally read completed evidence');
   assertMarketOpenJson(records);
@@ -99,7 +172,7 @@ export function assertMarketOpenRecords(records: readonly Row[], evidence: Marke
   equal(current.cohortOrigin ?? null, evidence.cohortOrigin ?? null, 'immutable cohort origin');
 }
 
-function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenRunEvidence {
+function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire, verifiedBytes?: Buffer): MarketOpenRunEvidence {
   // The persisted policy selects the verifier, never a caller or artifact label.
   // Daily ledger genesis retains the first cohort only; each claim owns its cohort.
   const daily = config.dailyBudgetVersion !== undefined;
@@ -121,7 +194,7 @@ function admit(config: MarketOpenStoreConfig, fire: MarketOpenFire): MarketOpenR
   requireThat(instantMs(fire.claimedAt) >= instantMs(p.observedAt), 'claim predates observation');
   const ref = fire.terminalArtifact!;
   equal(ref.path, join(config.root, 'artifacts', `${p.event.eventId}.json`), 'artifact event path');
-  const bytes = readMarketOpenArtifact(config.root, ref);
+  const bytes = verifiedBytes ?? readMarketOpenArtifact(config.root, ref);
   const doc = object(JSON.parse(bytes.toString('utf8')));
   assertMarketOpenJson(doc);
   requireThat(bytes.equals(Buffer.from(canonicalize(doc) + '\n')), 'noncanonical artifact bytes');

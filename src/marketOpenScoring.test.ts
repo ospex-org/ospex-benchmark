@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { withMarketOpenEvidenceAdmission } from './marketOpenEvidence.js';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -25,6 +28,112 @@ import type { ClosingLineRow, MarketKey } from './types.js';
 const posix = process.platform === 'win32' ? { skip: 'real B2 fixture requires POSIX durable store' } : {};
 const ladder = { k: 8.101061957791782, parameterVersion: 'TOTALS_V1_PROVISIONAL' };
 const scoredAt = '2026-09-11T01:00:00.000Z';
+for (const daily of [false, true]) test(`one root replay and artifact read across every phase (${daily ? 'daily' : 'cohort'})`, posix, async (t) => {
+  const fixture = await createMarketOpenEvidenceFixture({ markets: ['moneyline', 'total'],
+    ...(daily ? { dailyBudgetCapUsdMicros: 60_000_000 } : {}) });
+  const build = () => {
+    const descriptors = discoverScoreableMarketOpenRuns(fixture.root);
+    assert.equal(descriptors.length, 2);
+    return descriptors.map(d => {
+      const run = load(d.artifactPath, fixture.root);
+      assert.deepEqual(verifyRunIntegrity(run), []);
+      const picks = scoreRun(run, [marketOpenScoringClose(d.market)], ladder);
+      return scoredRecords(run, picks, aggregateByParticipant(picks, run, ladder), scoredAt, ladder).map(canonicalize).join('\n');
+    });
+  };
+  try {
+    const expected = build();
+    const originalRead = fs.readFileSync, originalOpen = fs.openSync;
+    let admissions = 0;
+    const artifactReads = new Map<string, number>();
+    const readSpy = t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+      if (args[0] === join(fixture.root, 'config.json')) admissions++;
+      return originalRead(...args);
+    });
+    const openSpy = t.mock.method(fs, 'openSync', (...args: Parameters<typeof fs.openSync>) => {
+      const path = String(args[0]);
+      if (fixture.artifactPaths.includes(path)) artifactReads.set(path, (artifactReads.get(path) ?? 0) + 1);
+      return originalOpen(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      for (let pass = 1; pass <= 2; pass++) {
+        await withMarketOpenEvidenceAdmission(async () => {
+          assert.equal(discoverScoreableMarketOpenRuns(fixture.root).length, 2);
+          await Promise.resolve(); // Scope survives real async separation of phases.
+          assert.deepEqual(withMarketOpenEvidenceAdmission(build), expected);
+          assert.equal(admissions, pass, 'exactly one root admission per invocation, including nested discovery');
+          assert.deepEqual([...artifactReads.values()], [pass, pass], 'every installed artifact verified once');
+        });
+      }
+    } finally { readSpy.mock.restore(); openSpy.mock.restore(); syncBuiltinESMExports(); }
+  } finally { await fixture.cleanup(); }
+});
+
+test('invocation retains verified bytes, not later disk contents; next invocation rejects corruption', posix, async () => {
+  const fixture = await createMarketOpenEvidenceFixture({ markets: ['moneyline', 'total'] });
+  try {
+    await withMarketOpenEvidenceAdmission(async () => {
+      const [target, sibling] = discoverScoreableMarketOpenRuns(fixture.root);
+      const run = load(target!.artifactPath, fixture.root);
+      const before = readRunArtifactFile(target!.artifactPath, { marketOpenEvidenceRoot: fixture.root });
+      writeFileSync(target!.artifactPath, 'corrupt');
+      writeFileSync(sibling!.artifactPath, 'also corrupt');
+      await Promise.resolve();
+      assert.equal(readRunArtifactFile(target!.artifactPath, { marketOpenEvidenceRoot: fixture.root }).text, before.text);
+      assert.deepEqual(verifyRunIntegrity(run), []);
+      run.sourceRecords = [{ ...run.sourceRecords![0], runId: 'forged' }, ...run.sourceRecords!.slice(1)];
+      assert.notDeepEqual(verifyRunIntegrity(run), [], 'caller records remain bound to verified bytes');
+    });
+    assert.throws(() => withMarketOpenEvidenceAdmission(() => discoverScoreableMarketOpenRuns(fixture.root)), /SHA|shape/);
+  } finally { await fixture.cleanup(); }
+});
+
+test('reading one artifact still verifies a corrupt sibling; no capability persists after settlement', posix, async () => {
+  const fixture = await createMarketOpenEvidenceFixture({ markets: ['moneyline', 'total'] });
+  try {
+    const run = withMarketOpenEvidenceAdmission(() => load(fixture.artifactPaths[0]!, fixture.root));
+    writeFileSync(fixture.artifactPaths[1]!, 'corrupt sibling');
+    assert.notDeepEqual(verifyRunIntegrity(run), []);
+    assert.throws(() => withMarketOpenEvidenceAdmission(() => load(fixture.artifactPaths[0]!, fixture.root)), /SHA|shape/);
+  } finally { await fixture.cleanup(); }
+});
+
+test('independent overlapping async invocations and failed invocations never share admissions', posix, async (t) => {
+  const fixture = await createMarketOpenEvidenceFixture({ markets: ['moneyline', 'total'] });
+  const original = fs.readFileSync;
+  let admissions = 0;
+  const spy = t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+    if (args[0] === join(fixture.root, 'config.json')) admissions++;
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const first = withMarketOpenEvidenceAdmission(async () => {
+      discoverScoreableMarketOpenRuns(fixture.root);
+      await blocked;
+      discoverScoreableMarketOpenRuns(fixture.root);
+    });
+    await withMarketOpenEvidenceAdmission(async () => {
+      discoverScoreableMarketOpenRuns(fixture.root);
+      await Promise.resolve();
+      discoverScoreableMarketOpenRuns(fixture.root);
+    });
+    release(); await first;
+    assert.equal(admissions, 2);
+    assert.throws(() => withMarketOpenEvidenceAdmission(() => {
+      discoverScoreableMarketOpenRuns(fixture.root); throw new Error('sync failure');
+    }), /sync failure/);
+    await assert.rejects(withMarketOpenEvidenceAdmission(async () => {
+      discoverScoreableMarketOpenRuns(fixture.root); await Promise.resolve(); throw new Error('async failure');
+    }), /async failure/);
+    withMarketOpenEvidenceAdmission(() => discoverScoreableMarketOpenRuns(fixture.root));
+    assert.equal(admissions, 5);
+  } finally { spy.mock.restore(); syncBuiltinESMExports(); await fixture.cleanup(); }
+});
+
 for (const costEvidence of [undefined, 'unknown', 'above-estimate'] as const) {
   test(`daily producer artifact discovers, scores and projects ${costEvidence ?? 'known'} spend without legacy admission`, posix, async () => {
     const fixture = await createMarketOpenEvidenceFixture({ dailyBudgetCapUsdMicros: 60_000_000,

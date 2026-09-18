@@ -309,7 +309,19 @@ function readCanonical<T>(path: string, schema: z.ZodType<T>): T {
 }
 
 /** A stable append-only prefix. Reading never claims a lock or recovers a writer. */
-export function readMarketOpenStore(rootInput: string): {
+export function readMarketOpenStore(rootInput: string) {
+  return readStore(rootInput);
+}
+
+/** Capture exactly the artifact bytes verified by this journal replay. The
+ * caller owns this in-memory snapshot; it is not a cross-invocation cache. */
+export function readMarketOpenStoreWithArtifacts(rootInput: string) {
+  const artifacts = new Map<string, Buffer>();
+  const store = readStore(rootInput, artifacts);
+  return { ...store, artifacts };
+}
+
+function readStore(rootInput: string, artifacts?: Map<string, Buffer>): {
   config: MarketOpenStoreConfig; snapshot: MarketOpenStoreSnapshot;
   seq: number; previous: string | null; bytes: number;
 } {
@@ -317,7 +329,10 @@ export function readMarketOpenStore(rootInput: string): {
   if (!lstatSync(root).isDirectory() || realpathSync(root) !== root) throw new Error('invalid store root');
   const config = readCanonical(join(root, 'config.json'), configSchema);
   if (config.root !== root) throw new Error('store config root identity conflict');
-  return { config, ...replayJournal(config) };
+  return { config, ...replayJournal(config, (ref) => {
+    const bytes = readMarketOpenArtifact(config.root, ref);
+    artifacts?.set(ref.path, bytes);
+  }) };
 }
 
 export function readMarketOpenDailyBudgetStatus(root: string, at: string, capUsdMicros: number) {
