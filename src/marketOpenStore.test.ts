@@ -3,8 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
+import { spawnSync } from 'node:child_process';
 import { nodeArtifactFs } from './fireArtifactSink.js';
 import { canonicalize, sha256Hex } from './canonical.js';
 import { MarketOpenStore, type MarketOpenClaimInput, type MarketOpenStoreConfig } from './marketOpenStore.js';
@@ -120,7 +119,7 @@ test('causal timestamps and sent-fire evidence cannot be rewritten as an unsent 
   } finally { f.cleanup(); }
 });
 
-test('exclusive writer and stale lock never automatically stolen', posixOnly, () => {
+test('exclusive writer and malformed owner records never grant a takeover', posixOnly, () => {
   const f = fixture();
   try {
     const store = new MarketOpenStore(f.config);
@@ -137,21 +136,28 @@ test('exclusive writer and stale lock never automatically stolen', posixOnly, ()
 test('durable attempt start precedes evidence; initial plus repair costs survive restart', posixOnly, () => {
   const f = fixture();
   try {
-    let store = new MarketOpenStore(f.config);
-    const c = f.claim(); store.claim(c);
-    const repair = c.slots[1]!;
-    assert.throws(() => store.beginAttempt({ eventId: c.eventId, slot: repair, startedAt: AT }), /initial/);
-    store.beginAttempt({ eventId: c.eventId, slot: SLOT, startedAt: AT });
-    assert.throws(() => store.beginAttempt({ eventId: c.eventId, slot: SLOT, startedAt: AT }), /already/);
-    store.finishAttempt({ eventId: c.eventId, slot: SLOT, finishedAt: AT, costUsdMicros: 20, evidence: { usage: 1, response: 'initial' } });
-    store.beginAttempt({ eventId: c.eventId, slot: repair, startedAt: AT });
-    store.finishAttempt({ eventId: c.eventId, slot: repair, finishedAt: AT, costUsdMicros: 10, evidence: { search: 1, response: 'repair' } });
-    const path = join(f.config.root, 'terminal.json'); writeFileSync(path, 'terminal bytes');
-    assert.throws(() => store.complete(c.eventId, { path, sha256: 'd'.repeat(64) }), /artifact/);
-    // Artifact uncertainty poisons the handle; no clean unlock after failed verification.
-    assert.throws(() => store.close(), /poison/);
-    rmSync(join(f.config.root, '.writer-lock'), { recursive: true }); // OFFLINE synthetic recovery only
-    store = new MarketOpenStore(f.config);
+    const c = f.claim();
+    const code = `
+      import assert from 'node:assert/strict';
+      import { writeFileSync } from 'node:fs';
+      import { MarketOpenStore } from ${JSON.stringify(new URL('./marketOpenStore.ts', import.meta.url).href)};
+      const store = new MarketOpenStore(${JSON.stringify(f.config)});
+      const c = ${JSON.stringify(c)}, repair = c.slots[1], SLOT = ${JSON.stringify(SLOT)}, AT = ${JSON.stringify(AT)};
+      store.claim(c);
+      assert.throws(() => store.beginAttempt({ eventId: c.eventId, slot: repair, startedAt: AT }), /initial/);
+      store.beginAttempt({ eventId: c.eventId, slot: SLOT, startedAt: AT });
+      assert.throws(() => store.beginAttempt({ eventId: c.eventId, slot: SLOT, startedAt: AT }), /already/);
+      store.finishAttempt({ eventId: c.eventId, slot: SLOT, finishedAt: AT, costUsdMicros: 20, evidence: { usage: 1, response: 'initial' } });
+      store.beginAttempt({ eventId: c.eventId, slot: repair, startedAt: AT });
+      store.finishAttempt({ eventId: c.eventId, slot: repair, finishedAt: AT, costUsdMicros: 10, evidence: { search: 1, response: 'repair' } });
+      const path = ${JSON.stringify(join(f.config.root, 'terminal.json'))}; writeFileSync(path, 'terminal bytes');
+      assert.throws(() => store.complete(c.eventId, { path, sha256: 'd'.repeat(64) }), /artifact/);
+      assert.throws(() => store.close(), /poison/);
+    `;
+    const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code], { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(child.status, 0, child.stderr);
+    // Owner process really exited: no deletion of a live poisoned owner's lock.
+    const store = new MarketOpenStore(f.config);
     assert.equal(store.snapshot().knownCostUsdMicros, 30);
     assert.equal(store.snapshot().reservedUsdMicros, 60);
     assert.equal(store.getFire(c.eventId)?.status, 'unknown');

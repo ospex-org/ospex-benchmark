@@ -447,7 +447,7 @@ test('unknown repair retains separate billable evidence and halts subsequent adm
 });
 
 for (const point of ['claim', 'send'] as const) {
-  test(`SIGKILL at ${point}: lock is not stolen; offline restart preserves claim and never repeats an uncertain send`, posixOnly, async () => {
+  test(`SIGKILL at ${point}: unattended restart preserves claim and never repeats an uncertain send`, posixOnly, async () => {
     const f = fixture();
     try {
       await f.producer.close();
@@ -469,10 +469,7 @@ for (const point of ['claim', 'send'] as const) {
         env: { PATH: process.env['PATH'], LANG: 'C', NODE_NO_WARNINGS: '1' },
       });
       assert.equal(child.signal, 'SIGKILL', child.stderr);
-      assert.throws(() => f.reopen(), /writer lock/);
-      // Test-only offline clearance AFTER waitpid proved this child dead.
-      // Runtime never steals a lock based on PID, mtime or elapsed time.
-      rmSync(join(f.root, '.writer-lock'), { recursive: true });
+      // Real waitpid proved the child exited. No operator deletion or timeout gate.
       f.reopen(); f.setClock(NOW + 60_000);
       const result = (await f.producer.recover())[0]!;
       assert.equal(result.state, point === 'claim' ? 'completed' : 'unknown');
